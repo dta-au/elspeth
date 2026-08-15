@@ -76,8 +76,12 @@ describe("CompletionBar", () => {
     expect(css).toMatch(
       /\.workspace-action-bar\s+\.completion-bar\s*\{[^}]*flex-direction:\s*row;[^}]*flex-wrap:\s*wrap;[^}]*padding:\s*0;/s,
     );
+    // Recut 2026-08-15: members are content-sized (no grow) and Run is
+    // pushed to the bar's right edge by its auto inline-start margin —
+    // workspaceChrome.test.ts pins the full contract; this pin only keeps
+    // the override scoped to the workspace action bar.
     expect(css).toMatch(
-      /\.workspace-action-bar\s+\.completion-bar\s*>\s*\*\s*\{[^}]*flex:\s*1 1 [^;]+;[^}]*width:\s*auto;/s,
+      /\.workspace-action-bar\s+\.completion-bar\s*>\s*\*\s*\{[^}]*flex:\s*0 0 auto;[^}]*width:\s*auto;/s,
     );
     expect(css).not.toMatch(
       /(?:^|\n)\.completion-bar\s*\{[^}]*flex-direction:\s*row;/s,
@@ -89,7 +93,7 @@ describe("CompletionBar", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  it("renders three co-equal buttons as DIRECT children of the group (elspeth-929fc5d4a7)", () => {
+  it("renders the three verbs as DIRECT children with Run last (elspeth-929fc5d4a7; recut 2026-08-15)", () => {
     useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
@@ -100,15 +104,18 @@ describe("CompletionBar", () => {
     render(<CompletionBar />);
     const bar = screen.getByTestId("completion-bar");
     const buttons = within(bar).getAllByRole("button");
+    // Run pipeline is LAST because it renders right-isolated at the bar's
+    // edge and visual order must stay tab order (WCAG 2.4.3 — no CSS
+    // `order` on interactive controls).
     expect(buttons.map((b) => b.textContent)).toEqual([
       "Save for review",
-      "Run pipeline",
       "Import YAML",
+      "Run pipeline",
     ]);
     // Structural symmetry contract: a wrapper <div> around any verb makes
     // flexbox treat the three asymmetrically (the bare sibling stretches to
     // the tallest wrapper — the 98px slab). All three must be direct flex
-    // children so the equal-width/height rules reach the buttons themselves.
+    // children so the row's sizing rules reach the buttons themselves.
     for (const button of buttons) {
       expect(button.parentElement).toBe(bar);
     }

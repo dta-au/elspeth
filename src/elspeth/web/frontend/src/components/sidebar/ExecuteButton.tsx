@@ -589,10 +589,12 @@ export function ExecuteButton(): JSX.Element | null {
         // egress and spend), so it carries the danger-family red fill to
         // stand out in both themes. Never "correct" this back to secondary
         // or swap it for variant="primary" — green-as-valid was the exact
-        // reading 0d37694c8c removed. The co-equal contract survives as
-        // GEOMETRY only (equal widths, workspaceChrome.test.ts). Disabled
+        // reading 0d37694c8c removed. The co-equal contract retired fully
+        // in the 2026-08-15 recut: Run is isolated at the action bar's
+        // right edge (workspace.css, workspaceChrome.test.ts). Disabled
         // and aria-disabled states still win by specificity (.btn:disabled
-        // is (0,2,0) vs .btn-danger (0,1,0)), so the red reads as "this
+        // is (0,2,0) vs .btn-danger (0,1,0)), so the fill is grey until
+        // the pipeline is actually runnable and the red reads as "this
         // will actually fire".
         variant="danger"
         className="side-rail-execute-btn"

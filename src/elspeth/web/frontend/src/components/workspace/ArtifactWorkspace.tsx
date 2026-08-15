@@ -10,6 +10,7 @@ import {
 
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { InlineRunResults } from "@/components/execution/InlineRunResults";
+import { CatalogButton } from "@/components/sidebar/CatalogButton";
 import { Button } from "@/components/ui";
 import { GraphView } from "@/components/inspector/GraphView";
 import { YamlView } from "@/components/inspector/YamlView";
@@ -141,16 +142,22 @@ function badgeTone(status: RunStatus): "success" | "warning" | "error" | "neutra
 
 export function ArtifactWorkspace({
   runAvailable = false,
+  catalogAvailable = false,
 }: {
   /** True only when the REQUEST_RUN_EVENT owner (ExecuteButton) is mounted —
    *  App passes capabilities.completion; the tutorial shell leaves it false. */
   runAvailable?: boolean;
+  /** Mounts the Plugin-catalog trigger in the toolbar. App passes the same
+   *  availability fact that used to gate the action bar's More-actions
+   *  popover (!guidedBuildActive); the tutorial shell leaves it false. */
+  catalogAvailable?: boolean;
 } = {}): JSX.Element {
   const activeSessionId = useSessionStore((state) => state.activeSessionId);
   return (
     <ArtifactWorkspaceSurface
       activeSessionId={activeSessionId}
       runAvailable={runAvailable}
+      catalogAvailable={catalogAvailable}
     />
   );
 }
@@ -158,9 +165,11 @@ export function ArtifactWorkspace({
 export function ArtifactWorkspaceSurface({
   activeSessionId,
   runAvailable = false,
+  catalogAvailable = false,
 }: {
   activeSessionId: string | null;
   runAvailable?: boolean;
+  catalogAvailable?: boolean;
 }): JSX.Element {
   const { state, actions } = useWorkspacePaneController();
   const { activeArtifactTab, availableArtifactTabs } = state;
@@ -429,9 +438,22 @@ export function ArtifactWorkspaceSurface({
             );
           })}
         </div>
-        <Button compact onClick={focusGraph}>
-          Focus graph
-        </Button>
+        {/* Right cluster (2026-08-15 UX review): Plugin catalog precedes
+            Focus graph in DOM order — visual order IS tab order (WCAG 2.4.3;
+            no CSS `order` on interactive controls), and Focus graph keeps
+            its long-standing terminal-edge position whether or not the
+            catalog renders. Focus graph itself must NEVER be removed in
+            favour of a canvas gesture: it is the only keyboard-operable
+            trigger for GraphModal (palette "Show graph" and Ctrl+Shift+G
+            deliberately pass focusMode:false), and the canvas's click
+            gestures are already bound (empty-click deselects, double-click
+            zooms). */}
+        <div className="artifact-toolbar-actions">
+          {catalogAvailable && <CatalogButton />}
+          <Button compact onClick={focusGraph}>
+            Focus graph
+          </Button>
+        </div>
       </div>
       <p
         key={announcement.id}

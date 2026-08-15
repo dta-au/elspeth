@@ -93,7 +93,7 @@ async function assertScenario(
         composer.authoringPane().getByRole("log", { name: "Guided wizard step" }),
       ).toBeVisible();
       await expect(page.getByTestId("completion-bar")).toHaveCount(0);
-      await expect(composer.moreActions()).toHaveCount(0);
+      await expect(composer.catalogButton()).toHaveCount(0);
       break;
     case "validation-audit-issues": {
       await expect(composer.validationStatus()).toHaveAccessibleName(
@@ -180,7 +180,7 @@ test.describe("Composer deterministic workspace geometry", () => {
           await assertScenario(scenario, composer);
           await expectPrimaryControlsInViewport(page, composer, {
             completion: scenario !== "active-guided-decision",
-            moreActions: scenario !== "active-guided-decision",
+            catalog: scenario !== "active-guided-decision",
           });
           await expectIntendedPaneScrollers(page, {
             transcriptMustScroll: scenario === "populated-long-transcript",
@@ -628,23 +628,31 @@ test.describe("Composer deterministic workspace geometry", () => {
           "Validation: Passed",
         );
         await expect(composer.auditStatus()).toHaveAccessibleName("Audit: Ready");
-        const controls = [
-          composer.artifactTab("Graph"),
-          composer.artifactTab("Spec"),
-          composer.artifactTab("YAML"),
-          composer.artifactTab("Run"),
-          page.getByRole("button", { name: "Focus graph" }),
-          composer.validationStatus(),
-          composer.auditStatus(),
-          composer.moreActions(),
+        // Two registers, both pinned: the artifact toolbar runs at the
+        // 36px compact rung, while the action-bar status chips were
+        // PROMOTED to the 44px --size-control rung (elspeth-5413e4221e,
+        // ux-polish wave B) so the whole bottom strip shares one register
+        // with the completion buttons. This spec asserted a single flat 36
+        // long after that promotion — a stale pin, not the design.
+        const controls: Array<[ReturnType<ComposerPage["catalogButton"]>, number]> = [
+          [composer.artifactTab("Graph"), 36],
+          [composer.artifactTab("Spec"), 36],
+          [composer.artifactTab("YAML"), 36],
+          [composer.artifactTab("Run"), 36],
+          [composer.catalogButton(), 36],
+          [page.getByRole("button", { name: "Focus graph" }), 36],
+          [composer.validationStatus(), 44],
+          [composer.auditStatus(), 44],
         ];
         const boxes = await Promise.all(
-          controls.map((control) => control.boundingBox()),
+          controls.map(([control]) => control.boundingBox()),
         );
         for (const [index, box] of boxes.entries()) {
           expect(box, `control ${index} at ${width}px`).not.toBeNull();
-          expect(box!.height, `control ${index} at ${width}px`).toBe(36);
-          const hit = await controls[index]!.evaluate((element) => {
+          expect(box!.height, `control ${index} at ${width}px`).toBe(
+            controls[index]![1],
+          );
+          const hit = await controls[index]![0].evaluate((element) => {
             const bounds = element.getBoundingClientRect();
             const hitElement = document.elementFromPoint(
               bounds.left + bounds.width / 2,

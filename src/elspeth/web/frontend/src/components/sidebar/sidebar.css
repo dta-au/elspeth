@@ -1,7 +1,7 @@
 /* sidebar.css — Side-rail slots, suggestion buttons, completion bar, graph mini-view.
    Owners: .side-rail-suggestion-*, .side-rail-execute-btn,
-   .side-rail-import-yaml-btn, .side-rail-catalog-btn, .catalog-reference-*,
-   .completion-bar, .graph-mini*, .side-rail-error-banner.
+   .side-rail-import-yaml-btn, .completion-bar, .graph-mini*,
+   .side-rail-error-banner.
    (.side-rail-error-banner was sandwiched into the version-selector block
    in App.css; moved here under Path B because it is a sidebar concern.) */
 
@@ -138,69 +138,10 @@
   color: var(--color-text-muted);
 }
 
-.side-rail-catalog-btn {
-  width: calc(100% - (2 * var(--space-sm)));
-  min-height: var(--size-control);
-  margin: var(--space-sm);
-  padding: var(--space-sm);
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--space-sm);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  background-color: var(--color-surface);
-  color: var(--color-text);
-  cursor: pointer;
-  text-align: left;
-  /* Hover changes fill + border, so both ease at the .btn rung
-     (elspeth-616a236fc3). */
-  transition: background-color var(--transition-fast),
-    border-color var(--transition-fast);
-}
-
-.side-rail-catalog-btn:hover {
-  border-color: var(--color-border-strong);
-  background-color: var(--color-surface-hover);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .side-rail-catalog-btn {
-    transition: none;
-  }
-}
-
-/* One focus colour app-wide (elspeth-eaa8c0dc73). --color-accent (#1a7a52)
-   on the menu surface (#122f37) computes to 2.65:1 — below the WCAG 1.4.11
-   3:1 non-text floor — while the sibling item in the same two-item popover
-   got the ~14:1 --color-focus-ring. The offset is unchanged. */
-.side-rail-catalog-btn:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: 2px;
-}
-
-.catalog-reference-label {
-  min-width: 0;
-  overflow: hidden;
-  font-size: var(--font-size-sm);
-  font-weight: 650;
-  line-height: 1.25;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.catalog-reference-meta {
-  padding: var(--space-2xs) var(--space-1-5);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  /* secondary not muted: muted is ~3.84:1 on elevated at 10px (fails AA). */
-  color: var(--color-text-secondary);
-  background-color: var(--color-surface-elevated);
-  font-size: var(--font-size-xs);
-  font-weight: 700;
-  line-height: 1.2;
-  text-transform: uppercase;
-}
+/* The catalog trigger's rail-card styling (.side-rail-catalog-btn,
+   .catalog-reference-*) left with the More-actions popover (2026-08-15):
+   CatalogButton is now a plain compact button in the artifact-workspace
+   toolbar (workspace.css .artifact-toolbar-actions). */
 
 /* CompletionBar (TSX: src/components/composer/CompletionBar.tsx) mounts
    Save-for-review (.btn), ExecuteButton (.btn .side-rail-execute-btn), and

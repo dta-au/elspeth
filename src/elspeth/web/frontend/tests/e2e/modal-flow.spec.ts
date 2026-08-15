@@ -287,10 +287,11 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         await composer.goto(sessionId);
         await composer.waitForChatReady();
 
-        // State hydration is asynchronous. The shortcut uses the same
-        // composition-content gate as this button, so wait for that gate.
+        // State hydration is asynchronous. The enabled YAML artifact tab is
+        // the visible fact that the seeded composition has loaded (the tab
+        // is disabled while empty) — same content gate the shortcut uses.
         await page.getByRole("tab", { name: "Pipeline", exact: true }).click();
-        await expect(page.getByRole("button", { name: /export yaml/i })).toBeEnabled();
+        await expect(page.getByRole("tab", { name: "YAML" })).toBeEnabled();
         await page.getByRole("tab", { name: "Compose", exact: true }).click();
         await page.keyboard.press("Control+Shift+Y");
 
@@ -346,7 +347,7 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
   // Deep-link assertion is skipped per the task brief.
 
   test.describe("Catalog modal", () => {
-    test("Catalog (reference) button opens the Catalog drawer; Escape closes it", async ({
+    test("Plugin catalog button opens the Catalog drawer; Escape closes it", async ({
       page,
     }) => {
       const storageState = await page.context().storageState();
@@ -360,9 +361,10 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         await composer.goto(sessionId);
         await composer.waitForChatReady();
 
-        await page.getByRole("button", { name: "More actions" }).click();
+        // Direct toolbar trigger — the More-actions popover retired
+        // (2026-08-15 UX review); the catalog sits beside Focus graph.
         const catalogBtn = page.getByRole("button", {
-          name: /catalog \(reference\)/i,
+          name: "Plugin catalog",
         });
         await expect(catalogBtn).toBeVisible();
         await catalogBtn.click();

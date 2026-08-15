@@ -138,7 +138,7 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
   const gapBearingSelectors = [
     ".workspace-action-bar",
     ".workspace-action-bar .completion-bar",
-    ".workspace-status-controls, .workspace-more-actions",
+    ".workspace-status-controls",
   ];
 
   it.each(gapBearingSelectors)("drives %s's gap from one property", (selector) => {
@@ -177,36 +177,57 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
   });
 });
 
-describe("workspace completion group (elspeth-c6fd722d2f)", () => {
-  it("caps the group's growth while keeping its three members equal", () => {
-    // Equal width is a documented contract (CompletionBar.tsx's docstring,
-    // sidebar.css, ExecuteButton.tsx): the three verbs share geometry
-    // (emphasis is tonal only — Run's danger fill). The uncapped
-    // flex-grow — not the flex-basis —
-    // is what produced 588x44 slabs at 2560, so cap the GROUP and divide it
-    // evenly, rather than dropping the members to content width.
+describe("workspace completion group (recut 2026-08-15, supersedes elspeth-c6fd722d2f)", () => {
+  it("isolates Run at the right edge from content-sized members", () => {
+    // The equal-width co-equal contract retired 2026-08-15 (operator
+    // decision): Run pipeline sits alone at the bar's right edge, registered
+    // with the toolbar's Focus graph button through the shared
+    // --artifact-gutter inline inset, while Save/Import cluster left. The
+    // group is the bar's filler and the auto margin on the Run button is
+    // what spends the free space as the isolating void. Members size to
+    // content (no grow), so the 2560 slab overshoot the old cap existed for
+    // cannot recur — which is also why the cap itself is gone.
     const group = ".workspace-action-bar .completion-bar";
-    expect(declaration(group, "flex")).toBe("0 1 auto");
-    expect(declaration(group, "max-width")).toMatch(/^\d+px$/);
-
-    // flex-basis 0 with an equal grow factor is what keeps them equal; any
-    // non-zero basis reintroduces content-proportional widths.
-    expect(declaration(`${group} > *`, "flex")).toBe("1 1 0");
+    expect(declaration(group, "flex")).toBe("1 1 auto");
+    expect(declaration(`${group} > *`, "flex")).toBe("0 0 auto");
+    expect(
+      declaration(`${group} .side-rail-execute-btn`, "margin-inline-start"),
+    ).toBe("auto");
+    expect(ruleFor(group)).not.toContain("max-width");
   });
 
   it("keeps the bar's composition stable when the middle group is absent", () => {
-    // Capping the group makes the bar's justify-content live for the first
-    // time. space-between would fling the three groups to the ends — two
-    // ~700px voids at 2560 with the primary actions marooned between them —
-    // and would ALSO change the arrangement depending on whether guided mode
-    // rendered a completion bar. An auto margin on the overflow gives the same
-    // status/overflow arrangement either way.
+    // space-between would change the arrangement depending on whether guided
+    // mode rendered a completion bar. flex-start keeps status and the
+    // Save/Import cluster as one left-anchored run; the completion group's
+    // own grow + Run's auto margin (above) are what hold the right edge, and
+    // they do it identically whether or not the status cluster renders.
     expect(declaration(".workspace-action-bar", "justify-content")).toBe(
       "flex-start",
     );
-    expect(
-      declaration(".workspace-more-actions", "margin-inline-start"),
-    ).toBe("auto");
+  });
+
+  it("tints settled status-chip verdicts with the matching semantic pair", () => {
+    // Recut 2026-08-15: success/warning/error chips carry the banner-family
+    // alpha background beside their border so the good/bad verdict reads at
+    // a glance (text stays the information carrier, WCAG 1.4.1). busy and
+    // neutral deliberately stay untinted — in-flight and not-yet-checked are
+    // neither good nor bad. The pair must come from the SAME semantic family
+    // or the chip's border and fill would disagree about the verdict.
+    const chip = ".workspace-status-control";
+    expect(declaration(`${chip}[data-tone="success"]`, "background-color")).toBe(
+      "var(--color-success-bg, transparent)",
+    );
+    expect(declaration(`${chip}[data-tone="success"]`, "border-color")).toContain(
+      "--color-success",
+    );
+    expect(declaration(`${chip}[data-tone="warning"]`, "background-color")).toBe(
+      "var(--color-warning-bg, transparent)",
+    );
+    expect(declaration(`${chip}[data-tone="error"]`, "background-color")).toBe(
+      "var(--color-error-bg, transparent)",
+    );
+    expect(ruleFor(`${chip}[data-tone="busy"]`)).not.toContain("background");
   });
 
   it("centers the members instead of stretching them to the bar's height", () => {

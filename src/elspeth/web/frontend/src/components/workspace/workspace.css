@@ -147,6 +147,19 @@
   min-height: var(--size-control-compact);
 }
 
+/* Right cluster: [Plugin catalog][Focus graph] (2026-08-15 UX review; the
+   catalog was promoted here from the retired More-actions popover). Plain
+   flex wrapper with explicit centering — the wrapper-stretch slab bug
+   (elspeth-929fc5d4a7) is why alignment is stated, not inherited. The
+   `.artifact-workspace-toolbar button` register rule above reaches through
+   this wrapper, so both controls stay on the row's 36px register. */
+.artifact-toolbar-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--space-sm);
+  align-items: center;
+}
+
 /* Run-tab outcome/live badge (elspeth-3a7b7c7b37). aria-hidden dot appended
    inside the Run tab button; tones mirror ProgressView's terminal colour
    mapping, "live" is the neutral in-flight pulse.
@@ -274,52 +287,57 @@
   background: var(--color-surface, Canvas);
 }
 
-/* Completion actions in the horizontal bar. The side rail stacks these three
-   vertically; here they run as a row.
+/* Completion actions in the horizontal bar (recut 2026-08-15, operator
+   decision): Run pipeline is ISOLATED at the bar's right edge while Save and
+   Import stay clustered on the left beside the status chips. The group is
+   the bar's filler (flex: 1 1 auto) and the auto inline-start margin on the
+   Run button spends that space as a void between the neutral verbs and the
+   consequential one. Because the bar and the artifact toolbar share the same
+   --artifact-gutter inline inset (elspeth-87195dda2c), Run's right edge
+   registers with the toolbar's Focus graph button above it. This supersedes
+   the equal-width co-equal contract (elspeth-c6fd722d2f): members now size
+   to content (flex: 0 0 auto), so the 2560 slab overshoot that contract's
+   cap existed to stop cannot recur — no member grows at all. DOM order is
+   Save → Import → Run (CompletionBar.tsx) so the visual order stays the tab
+   order with no CSS `order` on interactive controls.
 
-   THE THREE STAY EQUAL-WIDTH — that is a documented contract, stated in
-   CompletionBar.tsx's docstring (equal geometry; Run's danger fill is the
-   one tonal emphasis), in sidebar.css and at ExecuteButton.tsx. So the fix for
-   the unbounded growth (588x44 slabs carrying a ~110px label at 2560, a 4.5x
-   overshoot) CAPS the group and keeps the members equal, rather than dropping
-   to content width: flex: 0 1 auto sizes the group to its content, flex:
-   1 1 0 on the members divides that content evenly between them, and the
-   max-width backstops any future label set (elspeth-c6fd722d2f).
-
-   align-items: center is load-bearing too: .completion-bar carries
+   align-items: center is load-bearing: .completion-bar carries
    align-items: stretch for its vertical rail layout, which in this row
    context stretched each button to the bar's full height — a 98px slab
    whenever the bar wrapped (elspeth-929fc5d4a7). */
 .workspace-action-bar .completion-bar {
-  flex: 0 1 auto;
+  flex: 1 1 auto;
   flex-direction: row;
   flex-wrap: wrap;
   gap: var(--workspace-bar-gap);
   align-items: center;
-  max-width: 768px; /* the 48rem cap, in this file's px idiom */
   padding: 0;
 }
 
 .workspace-action-bar .completion-bar > * {
-  flex: 1 1 0;
+  flex: 0 0 auto;
   width: auto;
+}
+
+.workspace-action-bar .completion-bar .side-rail-execute-btn {
+  margin-inline-start: auto;
 }
 
 /* The run-gate reason line is part of ExecuteButton's fragment and, now that
    CompletionBar renders the three verbs as DIRECT children (no wrapper divs),
    it is a flex item of this row. Riding inside the Run column was what made
-   that column ~98px and dragged its co-equal siblings with it
-   (elspeth-929fc5d4a7); here it takes its own full-width line BELOW the
-   buttons instead — `order` lifts it past the Import button that follows it
-   in DOM order, so the three verbs stay one unbroken row. The line is not
-   focusable, so visual order and tab order cannot diverge. */
+   that column ~98px and dragged its siblings with it (elspeth-929fc5d4a7);
+   here it takes its own full-width line BELOW the buttons instead. It
+   follows the Run button in DOM order, so no `order` lift is needed, and
+   text-align: end keeps the reason optically bound to the right-isolated
+   Run button it explains. The line is not focusable, so visual order and
+   tab order cannot diverge. */
 .workspace-action-bar .completion-bar .side-rail-execute-reason {
-  order: 1;
   flex: 0 0 100%;
+  text-align: end;
 }
 
-.workspace-status-controls,
-.workspace-more-actions {
+.workspace-status-controls {
   display: flex;
   gap: var(--workspace-bar-gap);
   align-items: center;
@@ -343,65 +361,42 @@
    border made an ordinary in-flight readiness check ("Audit Checking") read as
    a genuine warning on a screen with nothing wrong with it. --color-info is
    the hue this app already spends on in-progress (--color-status-running is
-   the same token) (elspeth-7161879770). */
+   the same token) (elspeth-7161879770).
+
+   Settled verdicts also carry a fill tint (recut 2026-08-15, operator
+   decision): green when good, amber/red when not, using the same 10-14%
+   alpha semantic-bg tokens the inline banners spend, so a glance at the bar
+   answers "is this pipeline clean" without reading the chip text. The text
+   itself stays the information carrier (WCAG 1.4.1) — the tint is
+   reinforcement, never the sole signal. busy and neutral deliberately keep
+   the plain surface: in-flight and not-yet-checked are neither good nor
+   bad, and tinting them would dilute the verdict states. warning and error
+   stay DISTINCT hues (amber vs red) — that split is the same deliberate
+   information the border colors already encode. */
 .workspace-status-control[data-tone="busy"] {
   border-color: var(--color-info, currentcolor);
 }
 
+.workspace-status-control[data-tone="success"] {
+  border-color: var(--color-success-border, currentcolor);
+  background-color: var(--color-success-bg, transparent);
+}
+
 .workspace-status-control[data-tone="warning"] {
   border-color: var(--color-warning, currentcolor);
+  background-color: var(--color-warning-bg, transparent);
 }
 
 .workspace-status-control[data-tone="error"] {
   border-color: var(--color-error, currentcolor);
+  background-color: var(--color-error-bg, transparent);
 }
 
-/* The overflow holds the bar's right edge; see the composition note on
-   .workspace-action-bar. An auto margin rather than space-between, so the
-   status and completion groups stay one cluster on the left. */
-.workspace-more-actions {
-  position: relative;
-  margin-inline-start: auto;
-}
-
-/* Same one-register rule as the status chips above (elspeth-5413e4221e). */
-.workspace-more-actions > button {
-  min-height: var(--size-control);
-}
-
-.workspace-more-actions-menu {
-  position: absolute;
-  z-index: var(--z-panel-controls);
-  right: 0;
-  bottom: calc(100% + var(--space-xs));
-  display: grid;
-  gap: var(--space-xs);
-  min-width: 192px;
-  padding: var(--space-sm);
-  border: 1px solid var(--color-border, currentcolor);
-  border-radius: var(--radius-md, 6px);
-  background: var(--color-surface, Canvas);
-  box-shadow: var(--shadow-dropdown);
-}
-
-/* Both menu items are side-rail controls borrowed into a popover, and they
-   arrived carrying the rail's full-width geometry (width: calc(100% - 16px)
-   plus 8px side margins). Those margins DOUBLED this menu's 8px inset to 16px
-   and QUINTUPLED its 4px row gap to 20px, and the two items read as different
-   control species — a centred --font-size-base pill above a left-aligned
-   --font-size-sm grid row. Strip the rail geometry and settle both on one
-   species: left-aligned, --font-size-sm, the compact radius. The sibling
-   overflow menu in chat.css already ships the equivalent normalising rule
-   (elspeth-3d87be9d02). Heights are untouched — both items are already
-   --size-control. */
-.workspace-more-actions-menu > * {
-  width: auto;
-  margin: 0;
-  border-radius: var(--radius-sm);
-  justify-content: flex-start;
-  font-size: var(--font-size-sm);
-  text-align: left;
-}
+/* The More-actions popover that used to hold the bar's right edge was
+   retired 2026-08-15 (its last item, the Plugin catalog, moved to
+   .artifact-toolbar-actions above); the bar's clusters now sit
+   flex-start with trailing space at wide viewports — deliberate, not
+   unfinished. */
 
 .workspace-collapse-control {
   position: relative;

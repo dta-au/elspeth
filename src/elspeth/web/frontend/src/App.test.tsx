@@ -50,6 +50,7 @@ const tutorialMountSpy = vi.hoisted(() => vi.fn());
 const tutorialPropsSpy = vi.hoisted(() => vi.fn());
 const workspaceMountSpy = vi.hoisted(() => vi.fn());
 const workspaceCapabilitiesSpy = vi.hoisted(() => vi.fn());
+const artifactWorkspacePropsSpy = vi.hoisted(() => vi.fn());
 
 vi.mock("./components/workspace/ComposerWorkspace", () => ({
   ComposerWorkspace: (props: {
@@ -87,7 +88,21 @@ vi.mock("./components/workspace/WorkspacePaneContext", () => ({
 }));
 
 vi.mock("./components/workspace/ArtifactWorkspace", () => ({
-  ArtifactWorkspace: () => <div data-testid="artifact-workspace-stub" />,
+  ArtifactWorkspace: (props: {
+    runAvailable?: boolean;
+    catalogAvailable?: boolean;
+  }) => {
+    artifactWorkspacePropsSpy(props);
+    return (
+      <div data-testid="artifact-workspace-stub">
+        {/* The Plugin-catalog trigger lives in the artifact toolbar since
+            the More-actions popover retired (2026-08-15). */}
+        {props.catalogAvailable === true ? (
+          <button type="button">Plugin catalog</button>
+        ) : null}
+      </div>
+    );
+  },
 }));
 
 vi.mock("./components/workspace/WorkspaceInspector", () => ({
@@ -103,10 +118,7 @@ vi.mock("./components/workspace/WorkspaceActionBar", () => ({
   WorkspaceActionBar: ({
     capabilities,
   }: {
-    capabilities: {
-      completion: boolean;
-      catalog: boolean;
-    };
+    capabilities: { completion: boolean };
   }) => {
     workspaceCapabilitiesSpy(capabilities);
     return (
@@ -118,7 +130,6 @@ vi.mock("./components/workspace/WorkspaceActionBar", () => ({
             <button type="button">Import YAML</button>
           </div>
         ) : null}
-        {capabilities.catalog ? <button type="button">Catalog (reference)</button> : null}
       </div>
     );
   },
@@ -327,6 +338,7 @@ describe("App banner roles", () => {
     tutorialMountSpy.mockClear();
     workspaceMountSpy.mockClear();
     workspaceCapabilitiesSpy.mockClear();
+    artifactWorkspacePropsSpy.mockClear();
   });
 
   it("uses role=alert for the backend-unavailable banner (hard outage)", async () => {
@@ -548,8 +560,10 @@ describe("App banner roles", () => {
     expect(workspaceMountSpy).toHaveBeenCalled();
     expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
       completion: true,
-      catalog: true,
     });
+    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ catalogAvailable: true }),
+    );
   });
 
   it("moves skip-link focus to the stable main workspace without changing session routing", async () => {
@@ -625,8 +639,10 @@ describe("App banner roles", () => {
     expect(workspaceMountSpy).toHaveBeenCalled();
     expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
       completion: false,
-      catalog: false,
     });
+    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ catalogAvailable: false }),
+    );
   });
 
   it("keeps the same common workspace and restores actions after guided completion", async () => {
@@ -661,8 +677,10 @@ describe("App banner roles", () => {
     expect(workspaceMountSpy).toHaveBeenCalled();
     expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
       completion: true,
-      catalog: true,
     });
+    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ catalogAvailable: true }),
+    );
   });
 
   it("loads sessions on startup after SessionSidebar removal", async () => {
@@ -783,8 +801,10 @@ describe("App banner roles", () => {
     );
     expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
       completion: false,
-      catalog: false,
     });
+    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ catalogAvailable: false }),
+    );
   });
 
   it("routes Graph and YAML shortcuts to the active session's persistent artifact tabs", async () => {

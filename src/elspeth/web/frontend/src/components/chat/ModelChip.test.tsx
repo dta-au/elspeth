@@ -26,6 +26,10 @@ describe("ModelChip", () => {
       screen.getByLabelText("Composer model: anthropic/claude-sonnet-4.6"),
     ).toBeInTheDocument();
     expect(screen.getByText("anthropic/claude-sonnet-4.6")).toBeInTheDocument();
+    // The visible label says "Composer:", not "Model:" — the chip names the
+    // composing model, which must stay distinguishable from LLM models
+    // configured inside the pipeline being authored.
+    expect(screen.getByText("Composer:")).toBeInTheDocument();
   });
 
   it("renders nothing while no model is known", () => {

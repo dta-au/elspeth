@@ -228,10 +228,12 @@ function App() {
       // completion also admits the CompletionBar's Import YAML trigger; in
       // this mount (shared/tutorial/empty all excluded above) it reduces to
       // the same !guidedBuildActive fact a separate importYaml flag carried.
+      // catalogAvailable is passed to ArtifactWorkspace directly — the
+      // Plugin-catalog trigger lives in the artifact toolbar since the
+      // More-actions popover was retired (2026-08-15 UX review).
       completion: runAdmissionAvailable,
-      catalog: catalogAvailable,
     }),
-    [catalogAvailable, runAdmissionAvailable],
+    [runAdmissionAvailable],
   );
 
   useEffect(() => {
@@ -779,6 +781,7 @@ function App() {
                 // zero-listener surface (App.tsx REQUEST_RUN_EVENT doctrine).
                 <ArtifactWorkspace
                   runAvailable={workspaceActionCapabilities.completion}
+                  catalogAvailable={catalogAvailable}
                 />
               }
               inspector={<WorkspaceInspector />}

@@ -113,8 +113,12 @@ export class ComposerPage {
     return this.page.getByRole("button", { name: /^Audit: / });
   }
 
-  moreActions(): Locator {
-    return this.page.getByRole("button", { name: "More actions" });
+  catalogButton(): Locator {
+    return this.page.getByRole("button", { name: "Plugin catalog" });
+  }
+
+  focusGraph(): Locator {
+    return this.page.getByRole("button", { name: "Focus graph" });
   }
 
   runPipeline(): Locator {
