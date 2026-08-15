@@ -249,6 +249,39 @@ class DataFlowRepository:
             coordination_token=coordination_token,
         )
 
+    def create_quarantine_row_with_token(
+        self,
+        run_id: str,
+        source_node_id: str,
+        row_index: int,
+        data: Mapping[str, object],
+        *,
+        source_row_index: int,
+        ingest_sequence: int,
+        validation_error_id: str | None = None,
+        coordination_token: CoordinationToken | None = None,
+    ) -> tuple[Row, Token]:
+        """Create a quarantine row/token and optional error link atomically."""
+        with self.tokens.create_row_with_token_transaction(coordination_token) as conn:
+            row, token = self.tokens.insert_row_with_token_on(
+                conn,
+                run_id=run_id,
+                source_node_id=source_node_id,
+                row_index=row_index,
+                data=data,
+                source_row_index=source_row_index,
+                ingest_sequence=ingest_sequence,
+                quarantined=True,
+            )
+            if validation_error_id is not None:
+                self.errors.link_validation_error_to_row_on(
+                    conn,
+                    run_id=run_id,
+                    error_id=validation_error_id,
+                    row_id=row.row_id,
+                )
+            return row, token
+
     def insert_row_with_token_on(
         self,
         conn: Connection,

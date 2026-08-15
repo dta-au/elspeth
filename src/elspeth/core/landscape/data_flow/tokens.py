@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
@@ -237,27 +238,7 @@ class RowTokenRepository:
         ``ingest_row_with_initial_claim`` instead). ``None`` preserves the
         unfenced legacy arm for direct repository-level callers.
         """
-        if coordination_token is None:
-            with self._db.write_connection() as conn:
-                return self.insert_row_with_token_on(
-                    conn,
-                    run_id=run_id,
-                    source_node_id=source_node_id,
-                    row_index=row_index,
-                    data=data,
-                    source_row_index=source_row_index,
-                    ingest_sequence=ingest_sequence,
-                    row_id=row_id,
-                    token_id=token_id,
-                    quarantined=quarantined,
-                )
-        with fenced_leader_transaction(
-            self._db.engine,
-            token=coordination_token,
-            now=now(),
-            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-            verb="create_row_with_token",
-        ) as conn:
+        with self.create_row_with_token_transaction(coordination_token) as conn:
             return self.insert_row_with_token_on(
                 conn,
                 run_id=run_id,
@@ -270,6 +251,21 @@ class RowTokenRepository:
                 token_id=token_id,
                 quarantined=quarantined,
             )
+
+    def create_row_with_token_transaction(
+        self,
+        coordination_token: CoordinationToken | None,
+    ) -> AbstractContextManager[Connection]:
+        """Return the row/token write boundary for caller-owned composition."""
+        if coordination_token is None:
+            return self._db.write_connection()
+        return fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            now=now(),
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="create_row_with_token",
+        )
 
     def insert_row_with_token_on(
         self,
