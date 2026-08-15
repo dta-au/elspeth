@@ -86,16 +86,24 @@ is a working document under the normal delivery posture.
   emits `slice` objects as code constants, so preserve all three normalized
   bounds rather than falling back to repr or narrowing supported Python.
 
-- **2026-08-15 — adding a field to the composer spec/tool contract fires two
-  whole-tree pins**: any new field on SourceSpec/NodeSpec/OutputSpec or a
-  composer tool argument model must ALSO land in (a) the
-  `canonical-field-inventory` table in
+- **2026-08-15 — adding a field to the composer spec/tool contract fires THREE
+  pins, and the third is a PRODUCTION wire decoder, not a test**: any new
+  field on SourceSpec/NodeSpec/OutputSpec or a composer tool argument model
+  must ALSO land in (a) the `canonical-field-inventory` table in
   `src/elspeth/web/composer/skills/pipeline_capabilities.md`
-  (test_capability_skill_identity derives the real schema and diffs the table)
-  and (b) the redaction-policy snapshot — regenerate via
+  (test_capability_skill_identity derives the real schema and diffs the table),
+  (b) the redaction-policy snapshot — regenerate via
   `scripts/cicd/bootstrap_redaction_snapshot.py --write` and review that only
   hashes moved, never `sensitive_path_count`, unless you intended a new
-  Sensitive path. Serialise optional spec fields as omitted-when-None so
+  Sensitive path — and (c) the frontend's strict guided wire decoder
+  (`frontend/src/api/guidedDecoder.ts`, `decodeCompositionState`), whose
+  `exactRecord` key lists reject any unenumerated key AT RUNTIME. Missing (c)
+  is invisible to every backend suite and to frontend tests that stub
+  `composition_state: null`: the first guided re-plan after deploy emits the
+  new key and every `/guided` response becomes "received but could not be
+  read" while the server keeps returning 200 (elspeth-b48212113e, fixed
+  7694f5f1b). Grep the frontend for `exactRecord` lists naming your
+  sibling keys before calling a wire-contract change done. Serialise optional spec fields as omitted-when-None so
   pre-existing persisted states and their `composition_content_hash` values
   stay byte-identical (see `description`, 80fa17fed). The guided planner's
   advertised full-document schema derives from the registered `set_pipeline`
