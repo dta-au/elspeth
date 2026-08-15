@@ -18,6 +18,8 @@ export type IconName =
   | "check"
   | "chevron-down"
   | "chevron-up"
+  | "chevrons-left"
+  | "chevrons-right"
   | "cross"
   | "download"
   | "eye"
@@ -80,6 +82,23 @@ function renderIcon(name: IconName) {
       return <path d="m6 9.5 6 6 6-6" />;
     case "chevron-up":
       return <path d="m6 14.5 6-6 6 6" />;
+    // Doubled chevrons: the sidebar collapse/expand vocabulary (points the
+    // way the pane moves). 5.5-unit arms (slightly tighter than the single
+    // chevrons' 6) so the pair centers on the canvas without crowding it.
+    case "chevrons-left":
+      return (
+        <>
+          <path d="m11 17.5-5.5-5.5 5.5-5.5" />
+          <path d="m18.5 17.5-5.5-5.5 5.5-5.5" />
+        </>
+      );
+    case "chevrons-right":
+      return (
+        <>
+          <path d="m5.5 17.5 5.5-5.5-5.5-5.5" />
+          <path d="m13 17.5 5.5-5.5-5.5-5.5" />
+        </>
+      );
     case "cross":
       return (
         <>

@@ -182,6 +182,56 @@ describe("ComposerWorkspace", () => {
     consoleError.mockRestore();
   });
 
+  it("honours a pre-mount authoring focus request over the stored collapsed preference", () => {
+    // createSession can run while ComposerWorkspace is UNMOUNTED (the
+    // empty-landing "+ New session" button, tutorial graduation) — a window
+    // event dispatched there lands on zero listeners, so the request is a
+    // STORE FLAG the workspace reconciles on mount instead. Without it, the
+    // globally-persisted collapsed preference would open the brand-new
+    // session with the composer hidden.
+    localStorage.setItem(
+      WORKSPACE_LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        preferredAuthoringWidth: 420,
+        authoringCollapsed: true,
+      }),
+    );
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      authoringFocusRequested: true,
+    });
+    renderWorkspace();
+    emitWidth(1280);
+
+    expect(
+      screen.queryByRole("button", { name: "Restore authoring pane" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "Authoring pane" }),
+    ).not.toHaveAttribute("inert");
+    // Consumed exactly once — a later remount must not re-fire it.
+    expect(useSessionStore.getState().authoringFocusRequested).toBe(false);
+  });
+
+  it("keeps the stored collapsed preference when no focus request is pending", () => {
+    localStorage.setItem(
+      WORKSPACE_LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        preferredAuthoringWidth: 420,
+        authoringCollapsed: true,
+      }),
+    );
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    renderWorkspace();
+    emitWidth(1280);
+
+    expect(
+      screen.getByRole("button", { name: "Restore authoring pane" }),
+    ).toBeInTheDocument();
+  });
+
   it("clamps observed geometry and ignores a later zero-width observation", () => {
     localStorage.setItem(
       WORKSPACE_LAYOUT_STORAGE_KEY,
@@ -382,9 +432,57 @@ describe("ComposerWorkspace", () => {
     ).toMatchObject({ authoringCollapsed: false });
   });
 
+  it("renders the collapse/restore pair as icon controls with disclosure semantics", async () => {
+    // 2026-08-15 UX review: the full-text secondary-chrome collapse button
+    // read as a sixth action-bar button. Both controls are now icon-only
+    // (chevrons pointing the way the pane moves), keep their full names as
+    // aria-label + title, and carry aria-expanded/aria-controls so the
+    // disclosure state is machine-readable.
+    const user = userEvent.setup();
+    renderWorkspace({});
+    emitWidth(1280);
+
+    const collapse = screen.getByRole("button", {
+      name: "Collapse authoring pane",
+    });
+    expect(collapse).toHaveAttribute("aria-expanded", "true");
+    expect(collapse).toHaveAttribute("aria-controls", "workspace-authoring-pane");
+    expect(collapse).toHaveAttribute("title", "Collapse authoring pane");
+    expect(
+      collapse.querySelector('svg[data-icon="chevrons-left"]'),
+    ).not.toBeNull();
+    // Icon-only: the visible label is gone; the accessible name survives via
+    // aria-label (pinned by every getByRole lookup in this file).
+    expect(collapse.textContent).toBe("");
+
+    await user.click(collapse);
+
+    const restore = screen.getByRole("button", {
+      name: "Restore authoring pane",
+    });
+    expect(restore).toHaveAttribute("aria-expanded", "false");
+    expect(restore).toHaveAttribute("aria-controls", "workspace-authoring-pane");
+    expect(restore).toHaveAttribute("title", "Restore authoring pane");
+    expect(
+      restore.querySelector('svg[data-icon="chevrons-right"]'),
+    ).not.toBeNull();
+    expect(restore.textContent).toBe("");
+    // aria-controls must reference a real element — the pane stays in the
+    // DOM (hidden) while collapsed.
+    expect(document.getElementById("workspace-authoring-pane")).not.toBeNull();
+  });
+
   it("renders an App-owned collapsed projection inside the pane provider and resets it on restore", async () => {
     const user = userEvent.setup();
-    useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+    // compositionStateLoaded models a hydrated session: the unread
+    // projection deliberately ignores deltas measured against a
+    // pre-hydration (empty) store, so a live-update fixture must mark the
+    // history as loaded the way selectSession's fetch does.
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [],
+      compositionStateLoaded: true,
+    });
 
     function ContextStatus() {
       const { state } = useWorkspacePaneController();

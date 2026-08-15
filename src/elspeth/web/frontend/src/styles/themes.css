@@ -61,6 +61,16 @@
     stroke: ButtonText;
   }
 
+  /* Workspace pane toggles (collapse/restore, 2026-08-15 recut): bare-variant
+     icon buttons whose only chrome is a translucent border on a transparent
+     fill — exactly the shape that can wash out under a system palette.
+     Explicit system-color border/glyph for parity with every other stateful
+     control in this block. */
+  .workspace-pane-toggle {
+    border-color: ButtonText;
+    color: ButtonText;
+  }
+
   :focus-visible {
     outline: 2px solid Highlight;
   }

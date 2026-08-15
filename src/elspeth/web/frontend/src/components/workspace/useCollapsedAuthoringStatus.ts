@@ -17,6 +17,12 @@ interface UnreadBaseline {
   sessionId: string | null;
   messageSequence: number;
   acknowledgementCount: number;
+  /** True only when this baseline was captured AFTER the session's message
+   *  history hydrated (compositionStateLoaded). A pre-hydration baseline is
+   *  measured against an empty store, so counting deltas from it would
+   *  report the entire fetched transcript as "new messages" on a
+   *  refresh-while-collapsed (2026-08-15). */
+  historyLoaded: boolean;
 }
 
 function plural(count: number, singular: string, pluralForm: string): string {
@@ -35,6 +41,12 @@ export function useCollapsedAuthoringStatus({
   authoringCollapsed,
 }: UseCollapsedAuthoringStatusOptions): CollapsedAuthoringStatus {
   const messages = useSessionStore((state) => state.messages);
+  // selectSession sets this false when it clears the store for a new
+  // selection and true in the SAME set() that lands the fetched history, so
+  // it marks the hydration boundary for messages and guided state alike.
+  const historyLoaded = useSessionStore(
+    (state) => state.compositionStateLoaded,
+  );
   const guidedTurnSequence = useSessionStore(
     (state) => state.guidedSession?.chat_turn_seq ?? 0,
   );
@@ -55,23 +67,32 @@ export function useCollapsedAuthoringStatus({
     sessionId: activeSessionId,
     messageSequence,
     acknowledgementCount,
+    historyLoaded,
   });
 
   useLayoutEffect(() => {
+    // Re-baseline until a baseline is captured (a) while collapsed, (b) for
+    // this session, AND (c) after history hydration — only such a baseline
+    // measures activity the user has actually missed. The !historyLoaded arm
+    // keeps the pre-hydration baseline tracking the (empty) store so the
+    // hydration set() itself never reads as unread activity.
     if (
       !authoringCollapsed ||
-      baselineRef.current.sessionId !== activeSessionId
+      baselineRef.current.sessionId !== activeSessionId ||
+      !baselineRef.current.historyLoaded
     ) {
       baselineRef.current = {
         sessionId: activeSessionId,
         messageSequence,
         acknowledgementCount,
+        historyLoaded,
       };
     }
   }, [
     acknowledgementCount,
     activeSessionId,
     authoringCollapsed,
+    historyLoaded,
     messageSequence,
   ]);
 
@@ -83,7 +104,16 @@ export function useCollapsedAuthoringStatus({
   }
 
   const baseline = baselineRef.current;
-  if (authoringCollapsed && baseline.sessionId === activeSessionId) {
+  // baseline.historyLoaded (not just historyLoaded): the hydration render
+  // itself still carries the PRE-hydration baseline — the layout effect
+  // above re-baselines only after this render, and a ref update triggers no
+  // re-render, so trusting the live flag here would flash the whole
+  // transcript as unread for exactly one frame and then stick.
+  if (
+    authoringCollapsed &&
+    baseline.sessionId === activeSessionId &&
+    baseline.historyLoaded
+  ) {
     const newMessages = Math.max(0, messageSequence - baseline.messageSequence);
     const newAcknowledgements = Math.max(
       0,

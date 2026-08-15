@@ -398,6 +398,55 @@
    flex-start with trailing space at wide viewports — deliberate, not
    unfinished. */
 
+/* Icon-form pane toggles (recut 2026-08-15): shared chrome for the collapse
+   and restore buttons, mirroring the chat pane's .chat-input-icon-btn recipe
+   (same-pane convention) at the same 44px register. The buttons render
+   variant="bare", so this class is their ONLY chrome — the previous
+   secondary-.btn treatment made the collapse control read as a sixth
+   action-bar button (same height/border/background/spacing as the workflow
+   verbs one gutter away). Focus ring comes from base.css's global
+   :focus-visible. */
+.workspace-pane-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--size-control);
+  min-height: var(--size-control);
+  padding: var(--space-xs);
+  /* --color-input-border, NOT --color-border-strong: with a transparent
+     fill the border is the toggle's only resting boundary, so WCAG 1.4.11's
+     3:1 floor applies to it directly. border-strong is ~1.7:1 on
+     --color-surface in both themes — the exact defect M04 minted
+     --color-input-border to fix on form inputs (2026-08-15 a11y audit;
+     pinned by workspaceChrome.test.ts + colorContrast.test.ts). */
+  border: 1px solid var(--color-input-border);
+  border-radius: var(--radius-md);
+  background-color: transparent;
+  color: var(--color-text);
+  cursor: pointer;
+  /* Same 100ms hover ease as .chat-input-icon-btn and the .btn family the
+     action-bar row still uses — the registered rows must ease together.
+     Reset in the prefers-reduced-motion block below. */
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.workspace-pane-toggle:hover:where(:not(:disabled)) {
+  background-color: var(--color-surface-hover);
+}
+
+/* 20px rendered size, matching the chat family's .chat-input-icon (the
+   Icon component's stroke scales with rendered size — see Icon.tsx).
+   pointer-events: none keeps the decorative svg transparent to hit-testing,
+   so elementFromPoint and event.target resolve to the BUTTON — the geometry
+   e2e's center-point hit probe reads the target's aria-label and an
+   aria-hidden svg would answer with nothing. */
+.workspace-pane-toggle-icon {
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
+}
+
 .workspace-collapse-control {
   position: relative;
   align-self: flex-end;
@@ -405,8 +454,8 @@
 
   /* Vertical registration with the action bar across the divider: both rows
      take the same --workspace-bar-inset standoff and the full --size-control
-     height (overriding .btn-compact's 36px floor — workspace.css imports
-     after shared.css), so they share one bottom edge and one optical center.
+     height (the shared .workspace-pane-toggle chrome above carries the
+     min-height), so they share one bottom edge and one optical center.
      Expressed in tokens on both sides of the seam, so the contract no longer
      depends on the browser root staying at 16px (elspeth-fca731fb28).
      position: relative keeps this control painted above the band that
@@ -752,6 +801,10 @@
   .composer-workspace,
   .workspace-collapsed-affordance {
     scroll-behavior: auto;
+  }
+
+  .workspace-pane-toggle {
+    transition: none;
   }
 
   .artifact-tab-badge[data-tone="live"] {

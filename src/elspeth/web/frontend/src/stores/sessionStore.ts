@@ -1131,6 +1131,18 @@ interface SessionState {
   selectedNodeId: string | null;
   selectNode: (nodeId: string | null) => void;
 
+  /**
+   * One-shot request for ComposerWorkspace to un-collapse the authoring
+   * pane and focus the chat input. Set by createSession (a new session's
+   * composer must never open hidden behind the globally-persisted collapsed
+   * preference); consumed by ComposerWorkspace on mount or change via
+   * consumeAuthoringFocusRequest. A store flag rather than a window event
+   * because createSession can run while the workspace is unmounted (empty
+   * landing, tutorial graduation) — an event there has zero listeners.
+   */
+  authoringFocusRequested: boolean;
+  consumeAuthoringFocusRequest: () => void;
+
   loadSessions: () => Promise<void>;
   createSession: () => Promise<void>;
   selectSession: (id: string) => Promise<void>;
@@ -1300,6 +1312,7 @@ const initialState = {
   error: null as string | null,
   errorDetails: null as string[] | null,
   selectedNodeId: null as string | null,
+  authoringFocusRequested: false,
   ...clearedGuidedState(),
   ...clearedRecoveryState(),
 };
@@ -1394,6 +1407,19 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       stateVersions: [],
       error: null,
       selectedNodeId: null, // Clear selection for new session
+      // A collapsed authoring pane is a GLOBAL persisted preference
+      // (useWorkspacePaneState's localStorage layout), so without this a
+      // user who collapsed the pane once would find every NEW session
+      // opening with the composer — the primary authoring surface — hidden
+      // (2026-08-15 UX review). A STORE FLAG, not a window event:
+      // createSession can run while ComposerWorkspace is unmounted (the
+      // empty-landing "+ New session" button, tutorial graduation), where a
+      // dispatched event lands on zero listeners and the request is lost.
+      // ComposerWorkspace consumes the flag on mount or change,
+      // un-collapsing the pane and focusing the chat input. Session
+      // SWITCHES deliberately do not set it: revisiting an existing session
+      // honours the standing collapsed preference.
+      authoringFocusRequested: true,
       ...clearedGuidedState(),
       ...clearedRecoveryState(),
     }));
@@ -3868,6 +3894,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   selectNode(nodeId: string | null) {
     set({ selectedNodeId: nodeId });
+  },
+
+  consumeAuthoringFocusRequest() {
+    set({ authoringFocusRequested: false });
   },
 
   injectSystemMessage(content: string, stableId?: string) {

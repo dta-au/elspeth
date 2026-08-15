@@ -266,7 +266,9 @@ describe("CommandPalette guided-mode commands", () => {
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
     );
 
-    fireEvent.click(screen.getByText("Focus chat input"));
+    fireEvent.click(
+      screen.getByText("Focus chat input (restores collapsed pane)"),
+    );
 
     await waitFor(() => {
       expect(onFocusAuthoring).toHaveBeenCalledTimes(1);

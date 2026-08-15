@@ -133,7 +133,13 @@ export function CommandPalette({
 
     cmds.push({
       id: "focus-chat",
-      title: "Focus chat input",
+      // The parenthetical is load-bearing: this chord ALSO un-collapses a
+      // collapsed authoring pane (dispatchAuthoringFocusIntent), and a user
+      // hunting for "how do I get the chat back" would never connect a bare
+      // "Focus chat input" with restoring the pane (2026-08-15 UX review).
+      // commandRegister.test.tsx pins word-for-word agreement with the
+      // shortcuts sheet's Ctrl+/ entry.
+      title: "Focus chat input (restores collapsed pane)",
       category: "action",
       shortcut: "Ctrl+/",
       action: () => {
