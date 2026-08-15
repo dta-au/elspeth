@@ -26,6 +26,7 @@ from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
 from elspeth.engine.orchestrator.types import ExecutionCounters
+from elspeth.engine.spans import SpanFactory
 from elspeth.testing import make_token_info
 
 
@@ -449,7 +450,7 @@ class TestPendingTokenConsumption:
 
     def _make_orchestrator(self) -> SinkFlushCoordinator:
         """Build a coordinator with inert dependencies for direct method tests."""
-        return SinkFlushCoordinator(span_factory=object(), checkpoints=object())
+        return SinkFlushCoordinator(span_factory=SpanFactory(), checkpoints=object())
 
     def test_successful_write_consumes_live_pending_tokens(self) -> None:
         """Successfully written groups are removed from the live pending map."""

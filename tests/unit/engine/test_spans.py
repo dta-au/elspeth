@@ -18,12 +18,14 @@ class TestTelemetrySpanFactory:
     """Engine spans flow through the configured telemetry event fan-out."""
 
     def test_rejects_competing_tracer_and_telemetry_ownership(self) -> None:
-        from unittest.mock import Mock
+        from unittest.mock import create_autospec
+
+        from opentelemetry.trace import Tracer
 
         from elspeth.engine.spans import SpanFactory
 
         with pytest.raises(ValueError, match="mutually exclusive"):
-            SpanFactory(tracer=Mock(), telemetry_emit=lambda _event: None)
+            SpanFactory(tracer=create_autospec(Tracer, instance=True, spec_set=True), telemetry_emit=lambda _event: None)
 
     def test_emits_nested_spans_with_real_timing_and_safe_failure(self) -> None:
         from elspeth.contracts.events import EngineSpanName, EngineSpanStatus
