@@ -1124,6 +1124,12 @@ export interface ApiError {
    * how long ELSPETH actually ran.
    */
   timeout_seconds?: number;
+  /**
+   * Seconds until the per-user rate-limit window frees a slot; present only
+   * on `rate_limited` envelopes. Drives the single delayed retry in
+   * preferencesStore.markTutorialGraduated.
+   */
+  retry_after?: number;
   partial_state?: CompositionState | null;
   failed_turn?: FailedTurn | null;
   partial_state_save_failed?: boolean;

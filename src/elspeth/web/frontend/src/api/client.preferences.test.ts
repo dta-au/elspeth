@@ -141,4 +141,26 @@ describe("api/client user composer preferences", () => {
       tutorial_source_data_hash: null,
     });
   });
+
+  it("lifts retry_after from a rate-limited 429 envelope into the thrown ApiError", async () => {
+    // REAL wire shape: FastAPI renders the limiter's dict detail NESTED
+    // under "detail". A flat mock here would falsely pass a flat-only read.
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          detail: {
+            error_type: "rate_limited",
+            detail: "Rate limit exceeded. Try again in 26 seconds.",
+            retry_after: 26,
+          },
+        }),
+        { status: 429, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    await expect(updateUserComposerPreferences({})).rejects.toMatchObject({
+      status: 429,
+      error_type: "rate_limited",
+      retry_after: 26,
+    });
+  });
 });

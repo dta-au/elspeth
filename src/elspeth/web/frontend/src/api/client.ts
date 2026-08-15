@@ -244,6 +244,7 @@ export async function parseResponse<T>(
     let reason: string | undefined;
     let recoveryText: ApiError["recovery_text"];
     let timeoutSeconds: number | undefined;
+    let retryAfter: number | undefined;
     let partialState: ApiError["partial_state"];
     let failedTurn: ApiError["failed_turn"];
     let partialStateSaveFailed: ApiError["partial_state_save_failed"];
@@ -280,6 +281,12 @@ export async function parseResponse<T>(
         rawTimeoutSeconds > 0
           ? rawTimeoutSeconds
           : undefined;
+
+      const rawRetryAfter = firstDefined(
+        ownField(body, "retry_after"),
+        ownField(nestedDetail, "retry_after"),
+      );
+      retryAfter = typeof rawRetryAfter === "number" ? rawRetryAfter : undefined;
 
       const rawComponentId = firstDefined(
         ownField(body, "component_id"),
@@ -397,6 +404,7 @@ export async function parseResponse<T>(
       reason,
       recovery_text: recoveryText,
       timeout_seconds: timeoutSeconds,
+      retry_after: retryAfter,
       partial_state: partialState,
       failed_turn: failedTurn,
       partial_state_save_failed: partialStateSaveFailed,
