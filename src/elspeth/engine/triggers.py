@@ -391,6 +391,9 @@ class TriggerEvaluator:
                 raise ValueError("condition_fire_offset cannot exceed elapsed_age_seconds")
             if self._config.condition is None:
                 raise ValueError("condition_fire_offset requires a configured condition trigger")
+        if batch_count == 0:
+            self.reset()
+            return
 
         current_time = self._clock.monotonic()
 
