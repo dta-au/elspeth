@@ -209,9 +209,10 @@
    wide (--siderail-width, tokens.css), the three labels need ~436px of min-content
    width at --font-size-base with white-space:nowrap, and the row overflowed
    into .layout-siderail's overflow:hidden region — making the third button
-   invisible. The three-co-equal-verbs intent is preserved by stacking them
-   vertically: each button takes full rail width, all three are visible, no
-   button gets primary emphasis. */
+   invisible. The equal-geometry intent is preserved by stacking them
+   vertically: each button takes full rail width and all three are visible
+   (Run's danger fill is the one deliberate tonal emphasis; see
+   ExecuteButton.tsx). */
 .completion-bar {
   display: flex;
   flex-direction: column;

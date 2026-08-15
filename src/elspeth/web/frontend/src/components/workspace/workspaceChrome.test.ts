@@ -180,8 +180,9 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
 describe("workspace completion group (elspeth-c6fd722d2f)", () => {
   it("caps the group's growth while keeping its three members equal", () => {
     // Equal width is a documented contract (CompletionBar.tsx's docstring,
-    // sidebar.css, ExecuteButton.tsx): the three are co-equal verbs and none
-    // takes primary emphasis. The uncapped flex-grow — not the flex-basis —
+    // sidebar.css, ExecuteButton.tsx): the three verbs share geometry
+    // (emphasis is tonal only — Run's danger fill). The uncapped
+    // flex-grow — not the flex-basis —
     // is what produced 588x44 slabs at 2560, so cap the GROUP and divide it
     // evenly, rather than dropping the members to content width.
     const group = ".workspace-action-bar .completion-bar";

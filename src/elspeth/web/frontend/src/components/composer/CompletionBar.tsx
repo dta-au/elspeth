@@ -13,8 +13,12 @@
  *                        command palette; a toolbar Export button duplicated
  *                        them, so the slot carries Import instead.)
  *
- * Per plan 19b §"Scope boundaries": no primary emphasis — all three are
- * co-equal verbs. The "Save for review" button follows the backend-owned
+ * Per plan 19b §"Scope boundaries" the three verbs were fully co-equal (no
+ * emphasis). Since 2026-08-15 that contract is GEOMETRY only: the three
+ * still share equal widths and baseline, but Run pipeline carries the
+ * danger-family red fill (a deliberate operator decision — it is the one
+ * verb with consequences outside the composer; see ExecuteButton.tsx).
+ * The "Save for review" button follows the backend-owned
  * completion-readiness axis. This is deliberately stricter than Run: an
  * advisor checkpoint can allow execution while still blocking completion.
  *

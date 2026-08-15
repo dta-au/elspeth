@@ -278,8 +278,8 @@
    vertically; here they run as a row.
 
    THE THREE STAY EQUAL-WIDTH — that is a documented contract, stated in
-   CompletionBar.tsx's docstring ("no primary emphasis — all three are
-   co-equal verbs"), in sidebar.css and at ExecuteButton.tsx. So the fix for
+   CompletionBar.tsx's docstring (equal geometry; Run's danger fill is the
+   one tonal emphasis), in sidebar.css and at ExecuteButton.tsx. So the fix for
    the unbounded growth (588x44 slabs carrying a ~110px label at 2560, a 4.5x
    overshoot) CAPS the group and keeps the members equal, rather than dropping
    to content width: flex: 0 1 auto sizes the group to its content, flex:
