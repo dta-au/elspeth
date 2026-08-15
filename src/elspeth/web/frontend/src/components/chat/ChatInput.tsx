@@ -422,7 +422,9 @@ export function ChatInput({
   // the box to the content (capped) so the whole locked prompt is visible
   // without an obscure inner scroll.
   //
-  // Editable mode is 3 rows, not 2 (elspeth-244b8ba932). The placeholder is the
+  // Editable mode is 4 rows: raised from 2 to 3 (elspeth-244b8ba932) because
+  // placeholders clipped, then to 4 so multi-line prompts read without an
+  // immediate inner scroll. The placeholder is the
   // instruction telling the user what to type, and a placeholder produces no
   // scroll overflow — no scrollbar, no ellipsis — so a placeholder longer than
   // the box is simply cut mid-word with no cue that anything is missing. Every
@@ -439,8 +441,8 @@ export function ChatInput({
   // 240px)` ceiling in chat.css still does real work — it bounds the box the
   // user drags with `resize: vertical`.
   const rows = readOnly
-    ? Math.min(10, Math.max(3, text.split("\n").length + 1))
-    : 3;
+    ? Math.min(10, Math.max(4, text.split("\n").length + 1))
+    : 4;
 
   // Phase 5b Task 8 (extends Phase 5a Task 1) — derive the effective
   // placeholder.  Precedence (highest wins):

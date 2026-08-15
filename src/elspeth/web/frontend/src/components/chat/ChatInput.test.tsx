@@ -1161,9 +1161,9 @@ describe("ChatInput placeholder legibility (elspeth-244b8ba932)", () => {
   // pending-interpretation cue), and two rows clipped them in the 360px
   // authoring pane. Autosizing cannot rescue this: there is no scrollHeight to
   // measure when the box is empty. The row count IS the fix, so pin it.
-  it("gives the editable composer three rows, not two", () => {
+  it("gives the editable composer four rows", () => {
     renderInput();
-    expect(screen.getByLabelText(/message input/i)).toHaveAttribute("rows", "3");
+    expect(screen.getByLabelText(/message input/i)).toHaveAttribute("rows", "4");
   });
 
   it("still sizes the read-only tutorial prompt to its content", () => {
