@@ -115,6 +115,17 @@ known:
 - `split/expand -> gate-route per branch`: source, splitter/expander, branch
   gates, one route per requested branch, and every requested sink/output.
 
+### Step Descriptions
+
+Every source, node, and output accepts an optional `description`: one short
+sentence of plain prose saying what that step does, shown to human reviewers on
+the Spec tab beside the raw config. Supply it whenever you create a step, and
+refresh it whenever you change what the step does — a stale description is
+worse than none. Describe the step's purpose in the user's terms ("Fetch each
+page at its url"), not its plugin mechanics. Descriptions are informational
+only: they never affect validation, routing, or execution, and they are not a
+substitute for review — the reviewer approves the actual configuration.
+
 ## Requested Workflow Integrity
 
 Validation repair must preserve the user's requested workflow shape. Do not

@@ -339,6 +339,7 @@ async def _state_with_imported_source_blobs(
             on_success=source.on_success,
             options=options,
             on_validation_failure=source.on_validation_failure,
+            description=source.description,
         )
 
     return CompositionState(

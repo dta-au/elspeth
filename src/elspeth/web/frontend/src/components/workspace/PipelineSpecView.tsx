@@ -9,6 +9,7 @@ interface SpecRow {
   plugin: string | null;
   routing: Record<string, unknown>;
   options: Record<string, unknown>;
+  description: string | null;
 }
 
 interface SpecSectionProps {
@@ -45,6 +46,11 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                 aria-label={`${singular} ${row.id}`}
               >
                 <h4>{row.id}</h4>
+                {row.description !== null && row.description.trim() !== "" && (
+                  <p className="pipeline-spec-step-description">
+                    {row.description}
+                  </p>
+                )}
                 <dl>
                   <div>
                     <dt>id</dt>
@@ -99,6 +105,7 @@ function sourceRows(state: CompositionState): SpecRow[] {
         on_validation_failure: source.on_validation_failure ?? null,
       },
       options: source.options,
+      description: source.description ?? null,
     }));
 }
 
@@ -115,6 +122,7 @@ function nodeRows(state: CompositionState): SpecRow[] {
       fork_to: node.fork_to ?? null,
     },
     options: node.options,
+    description: node.description ?? null,
   }));
 }
 
@@ -127,6 +135,7 @@ function outputRows(state: CompositionState): SpecRow[] {
       on_write_failure: output.on_write_failure ?? null,
     },
     options: output.options,
+    description: output.description ?? null,
   }));
 }
 

@@ -1423,6 +1423,10 @@ class SetSourceArgumentsModel(BaseModel):
     on_success: str
     options: _LlmJsonObject
     on_validation_failure: str
+    # One-sentence composer-authored prose for the Spec tab. Free-text scalar
+    # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+    # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+    description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1747,6 +1751,10 @@ class _SetPipelineNamedSourceModel(BaseModel):
     on_success: str
     options: _LlmJsonObject = Field(default_factory=dict)
     on_validation_failure: str | None = None
+    # One-sentence composer-authored prose for the Spec tab. Free-text scalar
+    # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+    # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+    description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1911,6 +1919,10 @@ class _PipelineNodeModel(BaseModel):
     output_mode: str | None = None
     expected_output_count: int | None = None
     timeout_seconds: _StrictTimeoutSeconds | None = None
+    # One-sentence composer-authored prose for the Spec tab. Free-text scalar
+    # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+    # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+    description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1963,6 +1975,10 @@ class _PipelineOutputModel(BaseModel):
     plugin: str
     options: _LlmJsonObject = Field(default_factory=dict)
     on_write_failure: str | None = None
+    # One-sentence composer-authored prose for the Spec tab. Free-text scalar
+    # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+    # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+    description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -4372,6 +4388,10 @@ class _SpliceTransformNodeModel(_AuthoringNodeOptionsModel):
 
     plugin: str
     options: _LlmJsonObject
+    # One-sentence composer-authored prose for the Spec tab. Free-text scalar
+    # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+    # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+    description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 

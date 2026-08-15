@@ -18084,3 +18084,126 @@ class TestBlobCompositionReferenceGuards:
         result = self._delete(_empty_state())
         assert result.success is True, f"delete of an unreferenced blob must succeed: {result.data}"
         assert not self.storage_path.exists()
+
+
+class TestStepDescriptionAuthoring:
+    """The optional per-step ``description`` lands on the committed spec from
+    every incremental authoring tool and from set_pipeline, and an option-only
+    patch preserves it (elspeth-051eadb901)."""
+
+    def test_upsert_node_carries_description(self) -> None:
+        result = execute_tool(
+            "upsert_node",
+            {
+                "id": "t1",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "source_out",
+                "on_success": "main",
+                "options": {"schema": {"mode": "observed"}},
+                "description": "Pass rows through unchanged.",
+            },
+            _empty_state(),
+            _mock_catalog(),
+        )
+        assert result.success is True
+        assert result.updated_state.nodes[0].description == "Pass rows through unchanged."
+
+    def test_set_source_and_set_output_carry_descriptions(self) -> None:
+        catalog = _mock_catalog()
+        sourced = execute_tool(
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+                "description": "Read the input CSV.",
+            },
+            _empty_state(),
+            catalog,
+        )
+        assert sourced.success is True
+        assert sourced.updated_state.sources["source"].description == "Read the input CSV."
+
+        sunk = execute_tool(
+            "set_output",
+            {
+                "sink_name": "rows",
+                "plugin": "json",
+                "options": {"path": "/data/out.json", "schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
+                "description": "Write results to JSON.",
+            },
+            sourced.updated_state,
+            catalog,
+        )
+        assert sunk.success is True
+        assert sunk.updated_state.outputs[0].description == "Write results to JSON."
+
+    def test_set_pipeline_carries_descriptions_on_every_step_kind(self) -> None:
+        result = execute_tool(
+            "set_pipeline",
+            {
+                "source": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                    "on_validation_failure": "discard",
+                    "description": "Read the input CSV.",
+                },
+                "nodes": [
+                    {
+                        "id": "t1",
+                        "node_type": "transform",
+                        "plugin": "passthrough",
+                        "input": "rows",
+                        "on_success": "main",
+                        "options": {"schema": {"mode": "observed"}},
+                        "description": "Pass rows through unchanged.",
+                    }
+                ],
+                "edges": [],
+                "outputs": [
+                    {
+                        "sink_name": "main",
+                        "plugin": "json",
+                        "options": {"path": "/data/out.json", "schema": {"mode": "observed"}},
+                        "on_write_failure": "discard",
+                        "description": "Write results to JSON.",
+                    }
+                ],
+            },
+            _empty_state(),
+            _mock_catalog(),
+        )
+        assert result.success is True
+        assert result.updated_state.sources["source"].description == "Read the input CSV."
+        assert result.updated_state.nodes[0].description == "Pass rows through unchanged."
+        assert result.updated_state.outputs[0].description == "Write results to JSON."
+
+    def test_patch_node_options_preserves_description(self) -> None:
+        catalog = _mock_catalog()
+        created = execute_tool(
+            "upsert_node",
+            {
+                "id": "t1",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "source_out",
+                "on_success": "main",
+                "options": {"schema": {"mode": "observed"}},
+                "description": "Pass rows through unchanged.",
+            },
+            _empty_state(),
+            catalog,
+        )
+        assert created.success is True
+        patched = execute_tool(
+            "patch_node_options",
+            {"node_id": "t1", "patch": {"required_input_fields": ["new"]}},
+            created.updated_state,
+            catalog,
+        )
+        assert patched.success is True
+        assert patched.updated_state.nodes[0].description == "Pass rows through unchanged."

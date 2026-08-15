@@ -53,6 +53,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools._common import (
     _FULL_STATE_COMPONENT_ALIAS_SET,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
+    _STEP_DESCRIPTION_DESCRIPTION,
     ReviewedSourceAuthority,
     ToolContext,
     ToolResult,
@@ -740,6 +741,7 @@ def build_set_pipeline_candidate(
                 on_success=source_model.on_success,
                 options=src_options,
                 on_validation_failure=src_on_vf,
+                description=source_model.description,
             )
     else:
         legacy_source_model = validated.source
@@ -934,6 +936,7 @@ def build_set_pipeline_candidate(
             on_success=legacy_source_model.on_success,
             options=legacy_src_options,
             on_validation_failure=src_on_vf,
+            description=legacy_source_model.description,
         )
 
     # 2. Validate node plugins and options
@@ -1198,6 +1201,7 @@ def build_set_pipeline_candidate(
             output_mode=n.output_mode,
             expected_output_count=n.expected_output_count,
             timeout_seconds=n.timeout_seconds,
+            description=n.description,
         )
         # Validate every queue's intrinsic shape via the single shared guard
         # BEFORE the new state is assembled/assigned below, so a malformed
@@ -1236,6 +1240,7 @@ def build_set_pipeline_candidate(
                 plugin=o.plugin,
                 options=canonical_out_options[output_index],
                 on_write_failure=o.on_write_failure if o.on_write_failure is not None else "discard",
+                description=o.description,
             )
         )
 
@@ -1565,6 +1570,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "type": ["string", "null"],
                         "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
                     },
+                    "description": {
+                        "type": ["string", "null"],
+                        "description": _STEP_DESCRIPTION_DESCRIPTION,
+                    },
                     "inline_blob": {
                         "type": ["object", "null"],
                         "description": "Inline source content to create as a session blob before binding. Fields mirror create_blob.",
@@ -1597,6 +1606,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "on_validation_failure": {
                             "type": ["string", "null"],
                             "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
+                        },
+                        "description": {
+                            "type": ["string", "null"],
+                            "description": _STEP_DESCRIPTION_DESCRIPTION,
                         },
                     },
                     "required": ["plugin", "on_success"],
@@ -1674,6 +1687,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "exclusiveMinimum": 0,
                             "description": ("Optional finite positive timeout for structural barrier nodes (coalesce or row_union)."),
                         },
+                        "description": {
+                            "type": ["string", "null"],
+                            "description": _STEP_DESCRIPTION_DESCRIPTION,
+                        },
                     },
                     "required": ["id", "node_type", "input"],
                 },
@@ -1726,6 +1743,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "description": "Plugin-specific sink config.",
                         },
                         "on_write_failure": {"type": ["string", "null"]},
+                        "description": {
+                            "type": ["string", "null"],
+                            "description": _STEP_DESCRIPTION_DESCRIPTION,
+                        },
                     },
                     "required": ["sink_name", "plugin"],
                     "examples": [

@@ -10659,3 +10659,143 @@ class TestForwardingTransformExtrasReachTheLockedSink:
         assert entry.component == "node:shout"
         assert entry.contract is not None
         assert entry.contract.extra_fields == ("announcement_model", "announcement_usage")
+
+
+class TestStepDescriptions:
+    """Contract for the optional composer-authored per-step ``description``.
+
+    Three invariants (elspeth-051eadb901):
+      * every spec kind round-trips the field through to_dict/from_dict;
+      * a dict persisted BEFORE the field existed deserialises to None; and
+      * to_dict omits the key when None, so pre-existing serialised states —
+        and therefore their composition_content_hash values — are unchanged.
+    """
+
+    def _node(self, description: str | None = None) -> NodeSpec:
+        return NodeSpec(
+            id="summarize",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="summarized",
+            on_error="discard",
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            description=description,
+        )
+
+    def test_source_round_trips_description(self) -> None:
+        source = SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={},
+            on_validation_failure="discard",
+            description="Read the three project-brief pages.",
+        )
+        d = {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {},
+            "on_validation_failure": "discard",
+            "description": "Read the three project-brief pages.",
+        }
+        assert SourceSpec.from_dict(d) == source
+
+    def test_node_round_trips_description(self) -> None:
+        node = self._node("Have an LLM write a short summary of each page.")
+        restored = NodeSpec.from_dict(
+            {
+                "id": "summarize",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "rows",
+                "on_success": "summarized",
+                "on_error": "discard",
+                "options": {},
+                "description": "Have an LLM write a short summary of each page.",
+            }
+        )
+        assert restored == node
+
+    def test_output_round_trips_description(self) -> None:
+        output = OutputSpec(
+            name="results",
+            plugin="json",
+            options={},
+            on_write_failure="discard",
+            description="Write url and summary to a JSON file.",
+        )
+        d = {
+            "name": "results",
+            "plugin": "json",
+            "options": {},
+            "on_write_failure": "discard",
+            "description": "Write url and summary to a JSON file.",
+        }
+        assert OutputSpec.from_dict(d) == output
+
+    def test_legacy_dicts_without_the_key_deserialise_to_none(self) -> None:
+        source = SourceSpec.from_dict({"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"})
+        node = NodeSpec.from_dict(
+            {
+                "id": "summarize",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "rows",
+                "on_success": "summarized",
+                "on_error": "discard",
+                "options": {},
+            }
+        )
+        output = OutputSpec.from_dict({"name": "results", "plugin": "json", "options": {}, "on_write_failure": "discard"})
+        assert source.description is None
+        assert node.description is None
+        assert output.description is None
+
+    def test_state_to_dict_omits_the_key_when_none_and_carries_it_when_set(self) -> None:
+        undescribed = CompositionState(
+            sources={"source": SourceSpec(plugin="csv", on_success="rows", options={}, on_validation_failure="discard")},
+            nodes=(self._node(None),),
+            edges=(),
+            outputs=(OutputSpec(name="summarized", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        d = undescribed.to_dict()
+        assert "description" not in d["sources"]["source"]
+        assert "description" not in d["nodes"][0]
+        assert "description" not in d["outputs"][0]
+
+        described = CompositionState(
+            sources={
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={},
+                    on_validation_failure="discard",
+                    description="Read the pages.",
+                )
+            },
+            nodes=(self._node("Summarise each page."),),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="summarized",
+                    plugin="json",
+                    options={},
+                    on_write_failure="discard",
+                    description="Write the results.",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        restored = CompositionState.from_dict(described.to_dict())
+        assert restored.sources["source"].description == "Read the pages."
+        assert restored.nodes[0].description == "Summarise each page."
+        assert restored.outputs[0].description == "Write the results."

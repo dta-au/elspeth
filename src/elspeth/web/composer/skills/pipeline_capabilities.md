@@ -146,13 +146,13 @@ The terminal schema is authoritative. Its covered structural families are:
 | Family | Fields |
 | --- | --- |
 | pipeline | `source`, `sources`, `nodes`, `edges`, `outputs`, `metadata` |
-| source | `plugin`, `blob_id`, `options`, `on_success`, `on_validation_failure`, `inline_blob` |
-| named_source | `plugin`, `options`, `on_success`, `on_validation_failure` |
+| source | `plugin`, `blob_id`, `options`, `on_success`, `on_validation_failure`, `description`, `inline_blob` |
+| named_source | `plugin`, `options`, `on_success`, `on_validation_failure`, `description` |
 | inline_blob | `filename`, `mime_type`, `content`, `description` |
-| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds` |
+| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds`, `description` |
 | trigger | `count`, `timeout_seconds`, `condition` |
 | edge | `id`, `from_node`, `to_node`, `edge_type`, `label` |
-| output | `sink_name`, `plugin`, `options`, `on_write_failure` |
+| output | `sink_name`, `plugin`, `options`, `on_write_failure`, `description` |
 | metadata | `name`, `description` |
 <!-- canonical-field-inventory:end -->
 
@@ -163,6 +163,12 @@ Use `source` only for the canonical single-source custody shape; use `sources`
 for plural named roots. Use stable, descriptive source/node/output ids. Edges
 state reviewed graph relationships, while routing fields still determine the
 runtime connection contract. Do not invent fields outside the terminal schema.
+
+Every source, node, and output accepts an optional `description`: one short
+sentence of plain prose saying what that step does, shown to human reviewers
+beside the raw config. Supply it when authoring a step and refresh it when the
+step's behavior changes. It is informational only — never routing, validation,
+or a substitute for review.
 
 ## Field contracts and structured plugin output
 

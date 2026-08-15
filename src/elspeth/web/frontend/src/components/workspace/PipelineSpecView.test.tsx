@@ -260,4 +260,82 @@ describe("PipelineSpecView", () => {
     );
     expect(screen.queryByRole("article")).not.toBeInTheDocument();
   });
+
+  it("renders composer-authored step descriptions as prose above the config and omits the node when absent or blank", () => {
+    useSessionStore.setState({
+      compositionState: makeComposition(4, {
+        sources: {
+          source: {
+            plugin: "csv_file",
+            options: { path: "x.csv" },
+            description: "Read the three project-brief pages.",
+          },
+        },
+        nodes: [
+          {
+            id: "summarize_page",
+            node_type: "transform",
+            plugin: "llm",
+            input: "source",
+            on_success: null,
+            on_error: null,
+            options: {},
+            description: "Have an LLM write a short summary of each page.",
+          },
+          {
+            id: "undescribed_node",
+            node_type: "transform",
+            plugin: "passthrough",
+            input: "source",
+            on_success: null,
+            on_error: null,
+            options: {},
+            description: "   ",
+          },
+        ],
+        outputs: [
+          {
+            name: "results",
+            plugin: "json",
+            options: {},
+            description: "Write url and summary to a JSON file.",
+          },
+        ],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const sourceCard = screen.getByRole("article", { name: "Source source" });
+    const sourceProse = within(sourceCard).getByText(
+      "Read the three project-brief pages.",
+    );
+    expect(sourceProse).toHaveClass("pipeline-spec-step-description");
+    // Prose sits between the card caption and the config grid.
+    const sourceHeading = within(sourceCard).getByRole("heading", { level: 4 });
+    expect(
+      sourceHeading.compareDocumentPosition(sourceProse) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+
+    const nodeCard = screen.getByRole("article", { name: "Node summarize_page" });
+    expect(
+      within(nodeCard).getByText(
+        "Have an LLM write a short summary of each page.",
+      ),
+    ).toBeInTheDocument();
+
+    const outputCard = screen.getByRole("article", { name: "Output results" });
+    expect(
+      within(outputCard).getByText("Write url and summary to a JSON file."),
+    ).toBeInTheDocument();
+
+    // A missing or whitespace-only description renders no prose node at all.
+    const undescribedCard = screen.getByRole("article", {
+      name: "Node undescribed_node",
+    });
+    expect(
+      undescribedCard.querySelector(".pipeline-spec-step-description"),
+    ).toBeNull();
+  });
 });

@@ -176,24 +176,33 @@ class SourceSpec:
         on_success: Named connection point for the first downstream node.
         options: Plugin-specific configuration (path, schema, etc.).
         on_validation_failure: How to handle rows that fail schema validation.
+        description: Optional composer-authored one-sentence prose describing
+            what this step does, rendered on the Spec tab. Informational only:
+            it never participates in validation, lowering, or review hashes.
     """
 
     plugin: str
     on_success: str
     options: Mapping[str, Any]
     on_validation_failure: str
+    description: str | None = None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "options")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
-        """Reconstruct from a plain dict (inverse of to_dict serialisation)."""
+        """Reconstruct from a plain dict (inverse of to_dict serialisation).
+
+        ``description`` defaults to None when absent so sessions persisted
+        before the field existed deserialise unchanged.
+        """
         return cls(
             plugin=d["plugin"],
             on_success=d["on_success"],
             options=d["options"],
             on_validation_failure=d["on_validation_failure"],
+            description=d["description"] if "description" in d else None,
         )
 
 
@@ -223,6 +232,9 @@ class NodeSpec:
         output_mode: Aggregation output mode ("passthrough" or "transform"). None for non-aggregation nodes.
         expected_output_count: Aggregation expected output count. None for non-aggregation nodes.
         timeout_seconds: Structural barrier timeout. None for other node types.
+        description: Optional composer-authored one-sentence prose describing
+            what this step does, rendered on the Spec tab. Informational only:
+            it never participates in validation, lowering, or review hashes.
     """
 
     id: str
@@ -242,6 +254,7 @@ class NodeSpec:
     output_mode: str | None = None
     expected_output_count: int | None = None
     timeout_seconds: float | None = None
+    description: str | None = None
 
     def __post_init__(self) -> None:
         # ``CoalesceSettings`` DEFAULTS both optional coalesce fields —
@@ -337,6 +350,7 @@ class NodeSpec:
             output_mode=d["output_mode"] if "output_mode" in d else None,
             expected_output_count=d["expected_output_count"] if "expected_output_count" in d else None,
             timeout_seconds=d["timeout_seconds"] if "timeout_seconds" in d else None,
+            description=d["description"] if "description" in d else None,
         )
 
 
@@ -508,24 +522,33 @@ class OutputSpec:
         plugin: Sink plugin name (e.g. "csv", "json", "database").
         options: Plugin-specific configuration.
         on_write_failure: How to handle write failures ("discard" or a sink name).
+        description: Optional composer-authored one-sentence prose describing
+            what this step does, rendered on the Spec tab. Informational only:
+            it never participates in validation, lowering, or review hashes.
     """
 
     name: str
     plugin: str
     options: Mapping[str, Any]
     on_write_failure: str
+    description: str | None = None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "options")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
-        """Reconstruct from a plain dict (inverse of to_dict serialisation)."""
+        """Reconstruct from a plain dict (inverse of to_dict serialisation).
+
+        ``description`` defaults to None when absent so sessions persisted
+        before the field existed deserialise unchanged.
+        """
         return cls(
             name=d["name"],
             plugin=d["plugin"],
             options=d["options"],
             on_write_failure=d["on_write_failure"],
+            description=d["description"] if "description" in d else None,
         )
 
 
@@ -4879,12 +4902,18 @@ class CompositionState:
         }
 
         for source_name, source in self.sources.items():
-            result["sources"][source_name] = {
+            source_dict: dict[str, Any] = {
                 "plugin": source.plugin,
                 "on_success": source.on_success,
                 "options": deep_thaw(source.options),
                 "on_validation_failure": source.on_validation_failure,
             }
+            # Optional fields serialise only when present so states authored
+            # before ``description`` existed keep byte-identical dicts (and
+            # therefore stable composition_content_hash values).
+            if source.description is not None:
+                source_dict["description"] = source.description
+            result["sources"][source_name] = source_dict
 
         for node in self.nodes:
             node_dict: dict[str, Any] = {
@@ -4916,6 +4945,8 @@ class CompositionState:
                 node_dict["expected_output_count"] = node.expected_output_count
             if node.timeout_seconds is not None:
                 node_dict["timeout_seconds"] = node.timeout_seconds
+            if node.description is not None:
+                node_dict["description"] = node.description
             result["nodes"].append(node_dict)
 
         for edge in self.edges:
@@ -4930,14 +4961,15 @@ class CompositionState:
             )
 
         for output in self.outputs:
-            result["outputs"].append(
-                {
-                    "name": output.name,
-                    "plugin": output.plugin,
-                    "options": deep_thaw(output.options),
-                    "on_write_failure": output.on_write_failure,
-                }
-            )
+            output_dict: dict[str, Any] = {
+                "name": output.name,
+                "plugin": output.plugin,
+                "options": deep_thaw(output.options),
+                "on_write_failure": output.on_write_failure,
+            }
+            if output.description is not None:
+                output_dict["description"] = output.description
+            result["outputs"].append(output_dict)
 
         return result
 

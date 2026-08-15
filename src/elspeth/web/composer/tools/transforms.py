@@ -33,6 +33,7 @@ from elspeth.web.composer.state import (
     queue_node_contract_error,
 )
 from elspeth.web.composer.tools._common import (
+    _STEP_DESCRIPTION_DESCRIPTION,
     ToolContext,
     ToolResult,
     _apply_merge_patch,
@@ -90,6 +91,7 @@ class _UpsertNodeArgumentsModel(BaseModel):
     output_mode: str | None = None
     expected_output_count: int | None = None
     timeout_seconds: _StrictTimeoutSeconds | None = None
+    description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -286,6 +288,10 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "type": ["number", "null"],
             "exclusiveMinimum": 0,
             "description": "A finite positive structural-barrier timeout in seconds (coalesce/row_union only).",
+        },
+        "description": {
+            "type": ["string", "null"],
+            "description": _STEP_DESCRIPTION_DESCRIPTION,
         },
     },
     "required": ["id", "node_type", "input"],
@@ -516,6 +522,7 @@ def _execute_upsert_queue_node(
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
         timeout_seconds=validated.timeout_seconds,
+        description=validated.description,
     )
     contract_error = queue_node_contract_error(node)
     if contract_error is not None:
@@ -663,6 +670,7 @@ def _execute_upsert_node(
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
         timeout_seconds=validated.timeout_seconds,
+        description=validated.description,
     )
 
     row_union_contract_error = _row_union_node_contract_error(
@@ -1039,6 +1047,7 @@ def _execute_splice_transform(
             on_error=node_args.on_error,
             options=node_args.options,
             existing_options=existing.options,
+            description=node_args.description,
         )
         if type(prepared_replay) is ToolResult:
             return prepared_replay
@@ -1102,6 +1111,7 @@ def _execute_splice_transform(
         on_success=connection_name,
         on_error=node_args.on_error,
         options=node_args.options,
+        description=node_args.description,
     )
     if type(prepared) is ToolResult:
         return prepared
@@ -1579,6 +1589,7 @@ def _prepare_transform_candidate(
     trigger: Mapping[str, Any] | None = None,
     output_mode: str | None = None,
     expected_output_count: int | None = None,
+    description: str | None = None,
 ) -> NodeSpec | ToolResult:
     """Validate and prepare one transform candidate without mutating state."""
     if plugin is None:
@@ -1670,6 +1681,7 @@ def _prepare_transform_candidate(
         trigger=trigger,
         output_mode=output_mode,
         expected_output_count=expected_output_count,
+        description=description,
     )
 
 
@@ -1723,6 +1735,10 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
                     "on_error": {
                         "type": ["string", "null"],
                         "description": "Optional error route; defaults to discard.",
+                    },
+                    "description": {
+                        "type": ["string", "null"],
+                        "description": _STEP_DESCRIPTION_DESCRIPTION,
                     },
                 },
                 "required": ["id", "plugin", "options"],

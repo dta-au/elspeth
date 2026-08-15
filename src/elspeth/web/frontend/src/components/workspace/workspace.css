@@ -984,6 +984,16 @@
   line-height: var(--line-height-tight);
 }
 
+/* Composer-authored step prose: the human-readable "what this step does" line
+   above the mono config. Same reading-band cap and secondary colour as the
+   pipeline-level description so the two prose registers match. */
+.pipeline-spec-step-description {
+  margin: 0 0 var(--space-sm);
+  max-width: 74ch;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
 .pipeline-spec-card dl {
   display: grid;
   grid-column: 1 / -1;

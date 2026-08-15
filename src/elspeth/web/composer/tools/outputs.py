@@ -18,6 +18,7 @@ from elspeth.web.composer.state import (
     OutputSpec,
 )
 from elspeth.web.composer.tools._common import (
+    _STEP_DESCRIPTION_DESCRIPTION,
     ToolContext,
     ToolResult,
     _apply_merge_patch,
@@ -45,6 +46,7 @@ class _SetOutputArgumentsModel(BaseModel):
     plugin: str
     options: dict[str, Any]
     on_write_failure: str = "discard"
+    description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -91,6 +93,10 @@ _SET_OUTPUT_DECLARATION = ToolDeclaration(
                 "type": "string",
                 "description": "Per-row write-failure policy: 'discard' drops with an audit record; a sink name diverts failed rows to that failsink.",
                 "default": "discard",
+            },
+            "description": {
+                "type": ["string", "null"],
+                "description": _STEP_DESCRIPTION_DESCRIPTION,
             },
         },
         "required": ["sink_name", "plugin", "options"],
@@ -172,6 +178,7 @@ def _execute_set_output(
         plugin=plugin,
         options=sink_options,
         on_write_failure=validated.on_write_failure,
+        description=validated.description,
     )
     new_state = state.with_output(output)
     invariant_error = _post_mutation_invariant_error(new_state)

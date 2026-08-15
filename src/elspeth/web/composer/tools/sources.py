@@ -41,6 +41,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools._common import (
     _DEFAULT_SOURCE_VALIDATION_FAILURE,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
+    _STEP_DESCRIPTION_DESCRIPTION,
     PendingCustodyBlobView,
     ToolContext,
     ToolResult,
@@ -207,6 +208,10 @@ _SET_SOURCE_DECLARATION = ToolDeclaration(
             "on_validation_failure": {
                 "type": "string",
                 "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
+            },
+            "description": {
+                "type": ["string", "null"],
+                "description": _STEP_DESCRIPTION_DESCRIPTION,
             },
         },
         "required": ["plugin", "on_success", "options", "on_validation_failure"],
@@ -723,6 +728,7 @@ def _execute_set_source(
         on_success=validated.on_success,
         options=options,
         on_validation_failure=on_vf,
+        description=validated.description,
     )
     new_state = state.with_named_source(source_name, source)
     affected = (_source_component_id(source_name),)

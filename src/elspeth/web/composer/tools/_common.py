@@ -1256,6 +1256,7 @@ def _serialize_source(source: SourceSpec) -> dict[str, Any]:
         "on_success": source.on_success,
         "options": deep_thaw(source.options),
         "on_validation_failure": source.on_validation_failure,
+        "description": source.description,
     }
 
 
@@ -1282,6 +1283,7 @@ def _serialize_node(node: NodeSpec) -> dict[str, Any]:
         "output_mode": node.output_mode,
         "expected_output_count": node.expected_output_count,
         "timeout_seconds": node.timeout_seconds,
+        "description": node.description,
     }
 
 
@@ -1292,6 +1294,7 @@ def _serialize_output(output: OutputSpec) -> dict[str, Any]:
         "plugin": output.plugin,
         "options": deep_thaw(output.options),
         "on_write_failure": output.on_write_failure,
+        "description": output.description,
     }
 
 
@@ -1332,6 +1335,12 @@ _DEFAULT_SOURCE_VALIDATION_FAILURE: Final[str] = "discard"
 
 _SOURCE_VALIDATION_FAILURE_DESCRIPTION: Final[str] = (
     "'discard' drops rows that fail source validation. Any other value, including 'quarantine', must match a configured output/sink name."
+)
+
+_STEP_DESCRIPTION_DESCRIPTION: Final[str] = (
+    "One short sentence of plain prose saying what this step does, shown to reviewers "
+    "on the Spec tab. Supply it when creating the step and refresh it whenever you "
+    "change what the step does. Informational only — never affects validation or execution."
 )
 
 
@@ -2935,6 +2944,7 @@ class _SetPipelineNodePayload(TypedDict):
     output_mode: str | None
     expected_output_count: int | None
     timeout_seconds: float | None
+    description: str | None
 
 
 def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonValue]:
@@ -3055,6 +3065,7 @@ def _serialize_set_pipeline_source(
                 "blob_id": blob_ref,
                 "options": options,
                 "on_validation_failure": source.on_validation_failure,
+                "description": source.description,
             },
             None,
         )
@@ -3072,6 +3083,7 @@ def _serialize_set_pipeline_source(
             "on_success": source.on_success,
             "options": options,
             "on_validation_failure": source.on_validation_failure,
+            "description": source.description,
         },
         None,
     )

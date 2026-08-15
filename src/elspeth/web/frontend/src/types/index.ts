@@ -137,6 +137,8 @@ export interface SourceSpec {
   options: Record<string, unknown>;
   on_success?: string;
   on_validation_failure?: string;
+  /** Composer-authored one-sentence prose shown on the Spec tab. Absent on states authored before the field existed. */
+  description?: string | null;
 }
 
 /**
@@ -179,6 +181,8 @@ export interface NodeSpec {
   output_mode?: "default" | "passthrough" | "transform" | null;
   expected_output_count?: number | null;
   timeout_seconds?: number | null;
+  /** Composer-authored one-sentence prose shown on the Spec tab. Absent on states authored before the field existed. */
+  description?: string | null;
 }
 
 /** An edge connecting two nodes in the DAG. */
@@ -196,6 +200,8 @@ export interface OutputSpec {
   plugin: string;
   options: Record<string, unknown>;
   on_write_failure?: string;
+  /** Composer-authored one-sentence prose shown on the Spec tab. Absent on states authored before the field existed. */
+  description?: string | null;
 }
 
 /** Pipeline-level metadata attached to a composition. */
