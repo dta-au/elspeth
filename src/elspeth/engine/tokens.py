@@ -198,29 +198,23 @@ class TokenManager:
         # Create PipelineRow with minimal contract
         pipeline_row = PipelineRow(row_data, quarantine_contract)
 
-        # Create the row record AND the initial token in ONE transaction —
+        # Create the row record, initial token, and optional validation-error
+        # association in ONE transaction —
         # epoch-fenced when a coordination token is threaded (ADR-030 §C.4
         # row 9: the quarantine arm is an ingest-adjacent durable rows write
         # at sequence N; historically this was TWO separate transactions).
         # quarantined=True enables safe hashing for Tier-3 external data that
         # may contain non-canonical values (NaN, Infinity).
-        row, token = self._data_flow.create_row_with_token(
+        row, token = self._data_flow.create_quarantine_row_with_token(
             run_id=run_id,
             source_node_id=source_node_id,
             row_index=row_index,
             source_row_index=source_row_index,
             ingest_sequence=ingest_sequence,
             data=pipeline_row.to_dict(),
-            quarantined=True,
+            validation_error_id=validation_error_id,
             coordination_token=coordination_token,
         )
-
-        if validation_error_id is not None:
-            self._data_flow.link_validation_error_to_row(
-                run_id=run_id,
-                error_id=validation_error_id,
-                row_id=row.row_id,
-            )
 
         return TokenInfo(
             row_id=row.row_id,

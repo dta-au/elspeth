@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
+from sqlalchemy.engine import Connection
 
 from elspeth.contracts import (
     TransformErrorReason,
@@ -151,64 +152,73 @@ class ErrorAuditRepository:
         # transaction.  Splitting the read and update allowed two same-run
         # linkers to observe NULL and silently overwrite one another.
         with self._ops.write_connection() as conn:
-            row = conn.execute(select(rows_table.c.run_id).where(rows_table.c.row_id == row_id)).one_or_none()
-            if row is None:
-                raise AuditIntegrityError(
-                    f"Validation error linkage references row {row_id!r}, which does not exist in rows. This is Tier 1 data corruption."
-                )
-            if row.run_id != run_id:
-                raise AuditIntegrityError(
-                    f"Validation error linkage prevented cross-run contamination: row {row_id!r} belongs to "
-                    f"run {row.run_id!r}, but caller supplied run_id={run_id!r}."
-                )
+            self.link_validation_error_to_row_on(conn, run_id=run_id, error_id=error_id, row_id=row_id)
 
-            error_row = conn.execute(
-                select(
-                    validation_errors_table.c.run_id,
-                    validation_errors_table.c.row_id,
-                )
-                .where(validation_errors_table.c.error_id == error_id)
-                .with_for_update()
-            ).one_or_none()
-            if error_row is None:
-                raise AuditIntegrityError(
-                    f"Validation error {error_id!r} does not exist in validation_errors. This is Tier 1 data corruption."
-                )
-            if error_row.run_id != run_id:
-                raise AuditIntegrityError(
-                    f"Validation error linkage prevented cross-run contamination: error {error_id!r} belongs to "
-                    f"run {error_row.run_id!r}, but caller supplied run_id={run_id!r}."
-                )
-            if error_row.row_id is not None:
-                if error_row.row_id != row_id:
-                    raise AuditIntegrityError(
-                        f"Validation error {error_id!r} is already linked to row {error_row.row_id!r}; refusing to relink it to {row_id!r}."
-                    )
-                return
-
-            result = conn.execute(
-                validation_errors_table.update()
-                .where(
-                    validation_errors_table.c.error_id == error_id,
-                    validation_errors_table.c.run_id == run_id,
-                    validation_errors_table.c.row_id.is_(None),
-                )
-                .values(row_id=row_id)
+    def link_validation_error_to_row_on(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        error_id: str,
+        row_id: str,
+    ) -> None:
+        """Attach a quarantine row inside the caller's write transaction."""
+        row = conn.execute(select(rows_table.c.run_id).where(rows_table.c.row_id == row_id)).one_or_none()
+        if row is None:
+            raise AuditIntegrityError(
+                f"Validation error linkage references row {row_id!r}, which does not exist in rows. This is Tier 1 data corruption."
             )
-            if result.rowcount != 1:
-                # Defensive CAS validation for dialects/drivers whose lock
-                # behavior differs from PostgreSQL SELECT FOR UPDATE or
-                # SQLite BEGIN IMMEDIATE.
-                current_row_id = conn.execute(
-                    select(validation_errors_table.c.row_id).where(validation_errors_table.c.error_id == error_id)
-                ).scalar_one_or_none()
-                if current_row_id == row_id:
-                    return
-                if current_row_id is not None:
-                    raise AuditIntegrityError(
-                        f"Validation error {error_id!r} is already linked to row {current_row_id!r}; refusing to relink it to {row_id!r}."
-                    )
-                raise AuditIntegrityError(f"Validation error {error_id!r} linkage compare-and-set affected zero rows")
+        if row.run_id != run_id:
+            raise AuditIntegrityError(
+                f"Validation error linkage prevented cross-run contamination: row {row_id!r} belongs to "
+                f"run {row.run_id!r}, but caller supplied run_id={run_id!r}."
+            )
+
+        error_row = conn.execute(
+            select(
+                validation_errors_table.c.run_id,
+                validation_errors_table.c.row_id,
+            )
+            .where(validation_errors_table.c.error_id == error_id)
+            .with_for_update()
+        ).one_or_none()
+        if error_row is None:
+            raise AuditIntegrityError(f"Validation error {error_id!r} does not exist in validation_errors. This is Tier 1 data corruption.")
+        if error_row.run_id != run_id:
+            raise AuditIntegrityError(
+                f"Validation error linkage prevented cross-run contamination: error {error_id!r} belongs to "
+                f"run {error_row.run_id!r}, but caller supplied run_id={run_id!r}."
+            )
+        if error_row.row_id is not None:
+            if error_row.row_id != row_id:
+                raise AuditIntegrityError(
+                    f"Validation error {error_id!r} is already linked to row {error_row.row_id!r}; refusing to relink it to {row_id!r}."
+                )
+            return
+
+        result = conn.execute(
+            validation_errors_table.update()
+            .where(
+                validation_errors_table.c.error_id == error_id,
+                validation_errors_table.c.run_id == run_id,
+                validation_errors_table.c.row_id.is_(None),
+            )
+            .values(row_id=row_id)
+        )
+        if result.rowcount != 1:
+            # Defensive CAS validation for dialects/drivers whose lock
+            # behavior differs from PostgreSQL SELECT FOR UPDATE or
+            # SQLite BEGIN IMMEDIATE.
+            current_row_id = conn.execute(
+                select(validation_errors_table.c.row_id).where(validation_errors_table.c.error_id == error_id)
+            ).scalar_one_or_none()
+            if current_row_id == row_id:
+                return
+            if current_row_id is not None:
+                raise AuditIntegrityError(
+                    f"Validation error {error_id!r} is already linked to row {current_row_id!r}; refusing to relink it to {row_id!r}."
+                )
+            raise AuditIntegrityError(f"Validation error {error_id!r} linkage compare-and-set affected zero rows")
 
     def record_transform_error(
         self,
