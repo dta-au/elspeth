@@ -24,7 +24,7 @@ export function ModelChip() {
   return (
     <span className="chat-model-chip" aria-label={`Composer model: ${model}`}>
       <span className="chat-model-chip-label" aria-hidden="true">
-        Model:
+        Composer:
       </span>{" "}
       {model}
     </span>
