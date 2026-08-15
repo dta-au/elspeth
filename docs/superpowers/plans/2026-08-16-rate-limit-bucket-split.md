@@ -4,7 +4,7 @@
 
 **Goal:** Stop cheap DB-write endpoints from sharing (and exhausting) the per-user rate-limit bucket sized for LLM-backed composer calls, and make the tutorial-completion save survive a transient 429.
 
-**Architecture:** Add a second `ComposerRateLimiter` instance (`app.state.write_rate_limiter`, default 60/min) for cheap authenticated DB writes; the existing `app.state.rate_limiter` (deployed at 10/min) stays dedicated to LLM/execution-backed endpoints. On the frontend, surface the 429 envelope's `retry_after` in `ApiError` and give `markTutorialComplete` one delayed retry.
+**Architecture:** Add a second `ComposerRateLimiter` instance (`app.state.write_rate_limiter`, default 60/min) for cheap authenticated DB writes; the existing `app.state.rate_limiter` (deployed at 10/min) stays dedicated to LLM/execution-backed endpoints. On the frontend, surface the 429 envelope's `retry_after` in `ApiError` and give `markTutorialGraduated` one delayed retry.
 
 **Tech Stack:** FastAPI dependencies + pydantic `WebSettings` (backend); zustand store + typed fetch client (frontend); pytest + vitest.
 
@@ -42,7 +42,7 @@ Bucket assignment after this plan:
 ## Global Constraints
 
 - New settings name is `write_rate_limit_per_minute` → env `ELSPETH_WEB__WRITE_RATE_LIMIT_PER_MINUTE`; default **60**, `ge=1`. It MUST have a default (a required field would brick every existing deployment env file).
-- Adding ANY `ELSPETH_WEB__` settings name moves the minimum-image floor: `tests/unit/deployment/test_aws_iam_policy_oracles.py` is not affected, but `test_documented_minimum_image_revision_is_the_true_settings_floor` WILL fail until the "Minimum image revision" paragraph in `deploy/aws-ecs/terraform/README.md` names the new floor commit. Fix the paragraph, never just the SHA (see docs/agents/recent-code-hints.md, 2026-08-11 entry).
+- The minimum-image floor does NOT move: `test_documented_minimum_image_revision_is_the_true_settings_floor` (`tests/unit/deployment/test_aws_ecs_terraform_package.py`, `_shipped_web_settings_environment` ~lines 148–161/3564–3659) derives the required-settings set ONLY from git-tracked `.tf` files under `deploy/aws-ecs/terraform/` — and this plan deliberately does NOT wire the new var into terraform (safe default; AWS stack is torn down). Do NOT edit the README "Minimum image revision" paragraph: with `required` unchanged, naming a newer commit would break the test's minimality assertion (`assert not required <= earlier`).
 - Read `docs/agents/recent-code-hints.md` before writing code (repo rule). Run the FULL `pytest tests/` (CI-equivalent) before calling the branch done — whole-tree gates (masquerade, attribute-contracts) scan tests too: no new `getattr`/`hasattr` anywhere, including test files.
 - Work on `release/0.7.2` in the shared checkout: stage by pathspec only (never `git add -A`), verify `git log -1` after each commit.
 - Frontend tests: run vitest from `src/elspeth/web/frontend/` (repo-root vitest walks everything).
@@ -55,7 +55,7 @@ Bucket assignment after this plan:
 - Modify: `src/elspeth/web/config.py` (beside `composer_rate_limit_per_minute: int = Field(..., ge=1)`, ~line 285)
 - Modify: `src/elspeth/web/middleware/rate_limit.py` (beside `get_rate_limiter`, ~line 142)
 - Modify: `src/elspeth/web/app.py` (rate-limiter block, ~lines 1399–1410)
-- Test: `tests/unit/web/middleware/test_rate_limit.py` (create if absent — check `git grep -l ComposerRateLimiter tests/unit/web` first and co-locate with existing middleware tests)
+- Test: `tests/unit/web/middleware/test_rate_limit.py` — this file ALREADY EXISTS (~246 lines). Append the new tests and MERGE any new imports into the existing top-of-file import block; a duplicate `ComposerRateLimiter` import (or re-declared `from fastapi import ...`) trips ruff F811 in pre-commit.
 
 **Interfaces:**
 - Produces: `WebSettings.write_rate_limit_per_minute: int` (default 60); `app.state.write_rate_limiter: ComposerRateLimiter`; async dependency `get_write_rate_limiter(request: Request) -> ComposerRateLimiter` returning `request.app.state.write_rate_limiter`.
@@ -63,14 +63,10 @@ Bucket assignment after this plan:
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/unit/web/middleware/test_rate_limit.py (add)
-from fastapi import FastAPI, Request
-
-from elspeth.web.middleware.rate_limit import (
-    ComposerRateLimiter,
-    get_rate_limiter,
-    get_write_rate_limiter,
-)
+# tests/unit/web/middleware/test_rate_limit.py (append; imports shown here
+# must be MERGED into the file's existing import block, not re-declared)
+# needs: FastAPI, Request, ComposerRateLimiter, get_rate_limiter,
+#        get_write_rate_limiter
 
 
 def test_write_rate_limiter_dependency_reads_distinct_app_state() -> None:
@@ -177,7 +173,8 @@ git log -1  # shared checkout: confirm the commit is yours and complete
 **Files:**
 - Modify: `src/elspeth/web/preferences/routes.py` (~lines 23, 47, 54)
 - Modify: `tests/unit/web/preferences/test_routes_mode_telemetry.py` (~line 63 wires `app.state.rate_limiter`)
-- Test: same file (new test) — plus sweep `git grep -ln "rate_limiter" tests/ | xargs grep -l composer-preferences` for other fixtures wiring the old bucket for this route.
+- Modify: `tests/integration/web/test_preferences_routes.py` — `_make_app` (~lines 38–90) also wires only `app.state.rate_limiter` and serves ~15 tests. Its current signature takes `rate_limit: int = 100` sizing the strict bucket, and `test_patch_enforces_rate_limit_returns_429` (~line 311) passes `rate_limit=2` to starve it. Required change: keep `rate_limit` sizing the strict bucket, ADD a second parameter `write_rate_limit: int = 100` sizing `app.state.write_rate_limiter = ComposerRateLimiter(limit=write_rate_limit)`, and re-point `test_patch_enforces_rate_limit_returns_429` to pass `write_rate_limit=2` (leaving the strict bucket at its default) with its docstring updated — it now pins the WRITE bucket.
+- Test: `tests/unit/web/preferences/test_routes_mode_telemetry.py` (new test) — plus sweep `git grep -ln "rate_limiter" tests/ | xargs grep -l composer-preferences` for any other fixtures wiring the old bucket for this route.
 
 **Interfaces:**
 - Consumes: `get_write_rate_limiter` from Task 1.
@@ -239,7 +236,7 @@ wires the old bucket).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/elspeth/web/preferences/routes.py tests/unit/web/preferences/
+git add src/elspeth/web/preferences/routes.py tests/unit/web/preferences/ tests/integration/web/test_preferences_routes.py
 git commit -m "fix(web): meter composer-preferences PATCH on the write bucket so tutorial bursts cannot 429 the completion save"
 git log -1
 ```
@@ -249,7 +246,8 @@ git log -1
 ### Task 3: Move shareable-review mark-ready + link-mint to the write bucket
 
 **Files:**
-- Modify: `src/elspeth/web/shareable_reviews/routes.py` (check sites at ~lines 72 and 106 move; ~line 140 — `resolve_token` — STAYS on the strict bucket)
+- Modify: `src/elspeth/web/shareable_reviews/routes.py` (check sites at ~lines 72 and 106 move; ~line 140 — inside `get_shared_inspect` — STAYS on the strict bucket)
+- Modify: `tests/unit/web/shareable_reviews/test_routes.py` — `_app_with_share_service` (~lines 61–69) wires only `app.state.rate_limiter`; after the flip, the shareable-link route reads `app.state.write_rate_limiter`, and Starlette `State` raises `AttributeError` on an unset attribute (verified live) — under `ASGITransport(..., raise_app_exceptions=False)` that degrades `test_get_shareable_link_maps_unmarked_current_snapshot_to_409` to a 500. Add `app.state.write_rate_limiter = ComposerRateLimiter(limit=100)` to the fixture.
 - Test: `tests/integration/web/test_shareable_reviews_routes.py`
 
 **Interfaces:**
@@ -259,14 +257,14 @@ git log -1
 - [ ] **Step 1: Write the failing test**
 
 Add to `tests/integration/web/test_shareable_reviews_routes.py`, reusing
-its existing authenticated-client fixture (read the file first; mirror
-the fixture names it actually uses):
+its existing fixture `audit_readiness_client_with_state: tuple[TestClient, UUID]`
+(named in that file's own module docstring):
 
 ```python
 def test_review_write_endpoints_use_write_bucket_and_resolve_stays_strict(
-    shareable_review_client_with_state,  # match the module's real fixture
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
 ) -> None:
-    client, session_id = shareable_review_client_with_state
+    client, session_id = audit_readiness_client_with_state
     client.app.state.rate_limiter = ComposerRateLimiter(limit=1)
     client.app.state.write_rate_limiter = ComposerRateLimiter(limit=100)
     # Two consecutive write-side calls succeed on a starved strict bucket:
@@ -287,39 +285,41 @@ def test_review_write_endpoints_use_write_bucket_and_resolve_stays_strict(
 
 - [ ] **Step 2: Run to verify it fails** — `python -m pytest tests/integration/web/test_shareable_reviews_routes.py -q`; expected: 429 on `r2` (strict bucket shared today).
 
-- [ ] **Step 3: Flip the two write-side dependencies** to `Depends(get_write_rate_limiter)`; leave `resolve_token` untouched; add a one-line comment on each stating the bucket and why (`cheap DB write / token mint` vs `abuse-sensitive token probe stays strict`).
+- [ ] **Step 3: Flip the two write-side dependencies** to `Depends(get_write_rate_limiter)`; leave `get_shared_inspect` untouched; add a one-line comment on each stating the bucket and why (`cheap DB write / token mint` vs `abuse-sensitive token probe stays strict`). Add `app.state.write_rate_limiter = ComposerRateLimiter(limit=100)` to `_app_with_share_service` in `tests/unit/web/shareable_reviews/test_routes.py`.
 
-- [ ] **Step 4: Verify green** — same command; expected PASS.
+- [ ] **Step 4: Verify green** — `python -m pytest tests/integration/web/test_shareable_reviews_routes.py tests/unit/web/shareable_reviews/ -q`; expected PASS (the unit sweep is the guard for the fixture this flip breaks — do not narrow it).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/elspeth/web/shareable_reviews/routes.py tests/integration/web/test_shareable_reviews_routes.py
+git add src/elspeth/web/shareable_reviews/routes.py tests/integration/web/test_shareable_reviews_routes.py tests/unit/web/shareable_reviews/test_routes.py
 git commit -m "fix(web): meter shareable-review writes on the write bucket; token resolve stays strict"
 git log -1
 ```
 
 ---
 
-### Task 4: Deployment + docs tail for the new settings name
+### Task 4: Document the new env name on the non-terraform deploy surfaces
+
+**Scope note (reality-checked):** the minimum-image-floor test
+(`test_documented_minimum_image_revision_is_the_true_settings_floor`,
+`tests/unit/deployment/test_aws_ecs_terraform_package.py`) derives its
+required-settings set ONLY from git-tracked `.tf` files under
+`deploy/aws-ecs/terraform/`. This task deliberately does NOT touch
+terraform or the README "Minimum image revision" paragraph: the new
+setting has a safe default (60), the AWS stack is torn down, and — with
+`required` unchanged — advancing the README commit would BREAK the
+test's minimality assertion. If a future task ships the var through
+`deploy/aws-ecs/terraform/modules/scenario/locals.tf`, THAT task owns
+the floor/README update.
 
 **Files:**
-- Modify: `deploy/aws-ecs/terraform/README.md` ("Minimum image revision" paragraph)
 - Modify: `deploy/linux-systemd/elspeth-web.env.example` (beside `ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=10`)
 - Modify: `deploy/compose/web-postgres.yaml` (beside the same key)
-- Modify: `docs/agents/recent-code-hints.md` (only if you hit a NEW whole-tree trap while landing this — repo rule)
 
-- [ ] **Step 1: Run the floor test to see it fail**
+- [ ] **Step 1: Add the env lines**
 
-Run: `python -m pytest tests/unit/deployment/ -k minimum_image_revision -q`
-Expected: FAIL naming the commit that must become the new floor (the
-Task 1 commit — the first commit defining `write_rate_limit_per_minute`).
-
-- [ ] **Step 2: Update the README paragraph** to name that commit SHA and the setting that moved the floor, following the paragraph's existing prose shape exactly (the test parses it).
-
-- [ ] **Step 3: Add the env lines**
-
-In both env surfaces, under the existing composer rate-limit line:
+In `elspeth-web.env.example`, under the existing composer rate-limit line:
 
 ```bash
 # Cheap DB-write bucket (preferences PATCH, review mark-ready/link).
@@ -327,15 +327,19 @@ In both env surfaces, under the existing composer rate-limit line:
 ELSPETH_WEB__WRITE_RATE_LIMIT_PER_MINUTE=60
 ```
 
-(YAML form in `web-postgres.yaml`: `ELSPETH_WEB__WRITE_RATE_LIMIT_PER_MINUTE: "60"`.)
+In `web-postgres.yaml` (YAML form): `ELSPETH_WEB__WRITE_RATE_LIMIT_PER_MINUTE: "60"` — copy the quoting style of the sibling `COMPOSER_RATE_LIMIT_PER_MINUTE` line exactly.
 
-- [ ] **Step 4: Verify green** — `python -m pytest tests/unit/deployment/ -q`; expected PASS.
+- [ ] **Step 2: Verify the floor test still passes untouched**
 
-- [ ] **Step 5: Commit**
+Run: `python -m pytest tests/unit/deployment/ -k minimum_image_revision -q`
+Expected: PASS — this task must not move the floor. If it FAILS, stop:
+something outside this plan changed terraform; surface it, don't fix it here.
+
+- [ ] **Step 3: Commit**
 
 ```bash
-git add deploy/aws-ecs/terraform/README.md deploy/linux-systemd/elspeth-web.env.example deploy/compose/web-postgres.yaml
-git commit -m "docs(deploy): document ELSPETH_WEB__WRITE_RATE_LIMIT_PER_MINUTE and advance the image floor"
+git add deploy/linux-systemd/elspeth-web.env.example deploy/compose/web-postgres.yaml
+git commit -m "docs(deploy): document ELSPETH_WEB__WRITE_RATE_LIMIT_PER_MINUTE on the env-file surfaces"
 git log -1
 ```
 
@@ -353,16 +357,37 @@ git log -1
 
 - [ ] **Step 1: Write the failing test**
 
-In `client.preferences.test.ts`, following that file's existing
-fetch-mocking pattern (read it first and reuse its helpers):
+**Wire-shape fact (reality-checked, load-bearing):** the limiter raises
+`HTTPException(detail={"error_type": ..., "detail": ..., "retry_after": ...})`
+(`rate_limit.py:128-136`), and `handle_http_exception` (`app.py:~1717-1739`)
+delegates to FastAPI's default renderer — so the REAL wire body is
+**nested**: `{"detail": {"error_type": ..., "detail": ..., "retry_after": 26}}`.
+A flat-body mock would green a broken extraction. `parseResponse` already
+handles exactly this dual-site case for `timeout_seconds` via
+`firstDefined(ownField(body, "timeout_seconds"), ownField(nestedDetail, "timeout_seconds"))`
+(`client.ts:~271-282`) — mirror that idiom.
+
+In `client.preferences.test.ts`, following that file's documented
+convention (`vi.spyOn(globalThis, "fetch")` + `mockResolvedValueOnce(new Response(...))` —
+there is NO `mockFetchOnce` helper in this repo; read the file's existing
+tests and reuse its exact spy setup):
 
 ```typescript
-it("lifts retry_after from a 429 envelope into the thrown ApiError", async () => {
-  mockFetchOnce(429, {
-    error_type: "rate_limited",
-    detail: "Rate limit exceeded. Try again in 26 seconds.",
-    retry_after: 26,
-  });
+it("lifts retry_after from a rate-limited 429 envelope into the thrown ApiError", async () => {
+  // REAL wire shape: FastAPI renders the limiter's dict detail NESTED
+  // under "detail". A flat mock here would falsely pass a flat-only read.
+  fetchSpy.mockResolvedValueOnce(
+    new Response(
+      JSON.stringify({
+        detail: {
+          error_type: "rate_limited",
+          detail: "Rate limit exceeded. Try again in 26 seconds.",
+          retry_after: 26,
+        },
+      }),
+      { status: 429, headers: { "Content-Type": "application/json" } },
+    ),
+  );
   await expect(updateUserComposerPreferences({})).rejects.toMatchObject({
     status: 429,
     error_type: "rate_limited",
@@ -371,9 +396,25 @@ it("lifts retry_after from a 429 envelope into the thrown ApiError", async () =>
 });
 ```
 
+(`fetchSpy` = whatever the file's existing beforeEach names its
+`vi.spyOn(globalThis, "fetch")` handle — reuse it, don't create a second spy.)
+
 - [ ] **Step 2: Verify it fails** — `cd src/elspeth/web/frontend && npx vitest run src/api/client.preferences.test.ts`; expected: `retry_after` is `undefined`.
 
-- [ ] **Step 3: Implement** — add `retry_after?: number;` to `ApiError` with a docstring ("Seconds until the per-user rate-limit window frees a slot; present only on `rate_limited` envelopes. Drives the single delayed retry in preferencesStore.markTutorialComplete."); in `parseResponse`'s envelope block, extract it beside the other numeric fields: `retryAfter = typeof raw.retry_after === "number" ? raw.retry_after : undefined;` (match the surrounding extraction idiom exactly — the block reads a parsed `body` object with per-field type guards) and add `retry_after: retryAfter,` to the constructed `error` object.
+- [ ] **Step 3: Implement** — add `retry_after?: number;` to `ApiError` with a docstring ("Seconds until the per-user rate-limit window frees a slot; present only on `rate_limited` envelopes. Drives the single delayed retry in preferencesStore.markTutorialGraduated."); in `parseResponse`, extract it EXACTLY like `timeout_seconds` (the established dual-site idiom at `client.ts:~271-282`):
+
+```typescript
+      const rawRetryAfter = firstDefined(
+        ownField(body, "retry_after"),
+        ownField(nestedDetail, "retry_after"),
+      );
+      retryAfter = typeof rawRetryAfter === "number" ? rawRetryAfter : undefined;
+```
+
+declare `let retryAfter: number | undefined;` beside the other envelope
+locals and add `retry_after: retryAfter,` to the constructed `error`
+object. Match the surrounding code's exact helper names — if the
+`timeout_seconds` block spells them differently, copy ITS spelling.
 
 - [ ] **Step 4: Verify green** — same vitest command; expected PASS. Also run `npx vitest run src/api/` to catch envelope-shape snapshot tests.
 
@@ -387,11 +428,11 @@ git log -1
 
 ---
 
-### Task 6: Frontend — markTutorialComplete retries once after a 429
+### Task 6: Frontend — markTutorialGraduated retries once after a 429
 
 **Files:**
-- Modify: `src/elspeth/web/frontend/src/stores/preferencesStore.ts` (`markTutorialComplete`, ~lines 330–396)
-- Test: `src/elspeth/web/frontend/src/stores/preferencesStore.test.ts` (or the store's existing test file — locate with `git grep -l markTutorialComplete src/elspeth/web/frontend/src`)
+- Modify: `src/elspeth/web/frontend/src/stores/preferencesStore.ts` (`markTutorialGraduated`, ~lines 325–396; its options type takes `via?: "exit"` ONLY — a plain no-args call IS the first-time completion, there is no `"first_time"` value)
+- Test: `src/elspeth/web/frontend/src/stores/preferencesStore.test.ts` (mock handle at line ~32: `mockUpdate = vi.mocked(updateUserComposerPreferences)`)
 
 **Interfaces:**
 - Consumes: `ApiError.retry_after` from Task 5.
@@ -399,35 +440,36 @@ git log -1
 
 - [ ] **Step 1: Write the failing tests**
 
-Follow the store test file's existing mocking pattern for
-`updateUserComposerPreferences` (it is vi.mock'd at module level in the
-existing tests — reuse that):
+Use the test file's existing module-level mock handle `mockUpdate`
+(line ~32) and its existing completed-payload fixture (read the file;
+reuse whatever fixture its current graduation tests pass to
+`mockUpdate.mockResolvedValueOnce`):
 
 ```typescript
-it("retries the completion PATCH once after a rate-limited failure", async () => {
+it("retries the graduation PATCH once after a rate-limited failure", async () => {
   vi.useFakeTimers();
-  mockedUpdate
+  mockUpdate
     .mockRejectedValueOnce({ status: 429, error_type: "rate_limited", detail: "…", retry_after: 2 })
     .mockResolvedValueOnce(completedPayload); // reuse the file's payload fixture
-  const promise = usePreferencesStore.getState().markTutorialComplete({ via: "first_time" });
+  const promise = usePreferencesStore.getState().markTutorialGraduated();
   await vi.advanceTimersByTimeAsync(2_000);
   await expect(promise).resolves.toBe(completedPayload.tutorial_completed_at);
-  expect(mockedUpdate).toHaveBeenCalledTimes(2);
+  expect(mockUpdate).toHaveBeenCalledTimes(2);
   expect(usePreferencesStore.getState().writeError).toBeNull();
   vi.useRealTimers();
 });
 
 it("gives up after the second rate-limited failure and surfaces the detail", async () => {
   vi.useFakeTimers();
-  mockedUpdate.mockRejectedValue({
+  mockUpdate.mockRejectedValue({
     status: 429, error_type: "rate_limited",
     detail: "Rate limit exceeded. Try again in 2 seconds.", retry_after: 2,
   });
-  const promise = usePreferencesStore.getState().markTutorialComplete({ via: "first_time" });
+  const promise = usePreferencesStore.getState().markTutorialGraduated();
   promise.catch(() => undefined); // assertion happens via store state below
   await vi.advanceTimersByTimeAsync(2_000);
   await expect(promise).rejects.toMatchObject({ status: 429 });
-  expect(mockedUpdate).toHaveBeenCalledTimes(2); // exactly one retry, no loop
+  expect(mockUpdate).toHaveBeenCalledTimes(2); // exactly one retry, no loop
   expect(usePreferencesStore.getState().writeError).toContain("Rate limit exceeded");
   expect(usePreferencesStore.getState().writing).toBe(false);
   vi.useRealTimers();
@@ -455,7 +497,7 @@ function isRateLimitedApiError(
 const MAX_RETRY_AFTER_WAIT_MS = 30_000;
 ```
 
-In `markTutorialComplete`, wrap the existing
+In `markTutorialGraduated`, wrap the existing
 `updateUserComposerPreferences` call in a small once-retrying helper —
 keep `writing: true` across the wait so the graduation card's busy state
 ("Saving tutorial completion") stays honest:
