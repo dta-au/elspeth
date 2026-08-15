@@ -209,6 +209,41 @@ test.describe("Composer workspace visual baselines", () => {
     });
   }
 
+  // The collapsed state had NO visual baseline before 2026-08-15 — the
+  // restore affordance (collapsed strip + icon toggle) shipped and was
+  // recut without a pixel oracle (flagged by that day's UX review). The
+  // graph re-fits when the pane collapses, so the whole canvas is masked;
+  // this baseline pins the chrome — collapsed strip, restore toggle, action
+  // bar — not the graph.
+  test("collapsed authoring at 1280x720", async ({ page }) => {
+    const { composer, sessionId } = await openStableVisualScenario(
+      page,
+      "populated-long-transcript",
+      { width: 1280, height: 720 },
+      2,
+    );
+    try {
+      await composer.collapseAuthoring().click();
+      await expect(composer.restoreAuthoring()).toBeFocused();
+      await settleGraphViewport(page);
+      // Mask the canvas ROOT (.react-flow — sized to the panel), never the
+      // transformed .react-flow__viewport layer: after the post-collapse
+      // re-fit that layer's bounding box extends over the action bar, and a
+      // mask there paints out the very chrome this baseline exists to pin.
+      await expect(composer.workspace()).toHaveScreenshot(
+        "collapsed-authoring-1280x720.png",
+        {
+          animations: "disabled",
+          caret: "hide",
+          mask: [page.locator(".react-flow")],
+          maskColor: "#0f2d35",
+        },
+      );
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
+
   test("inspector open at 1280x720", async ({ page }) => {
     const { composer, sessionId } = await openStableVisualScenario(
       page,

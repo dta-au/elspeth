@@ -51,7 +51,61 @@ describe("useCollapsedAuthoringStatus", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
     resetStore(useInterpretationEventsStore);
-    useSessionStore.setState({ activeSessionId: SESSION_A });
+    // compositionStateLoaded: the store flips this true in the SAME set()
+    // that lands the fetched message history (selectSession), so it is the
+    // hook's "history has hydrated" signal. The live-update tests below
+    // model a loaded session receiving new activity.
+    useSessionStore.setState({
+      activeSessionId: SESSION_A,
+      compositionStateLoaded: true,
+    });
+  });
+
+  it("does not count history hydration as unread on a collapsed refresh", () => {
+    // Refresh-while-collapsed (2026-08-15): the page mounts collapsed with
+    // an EMPTY store (selectSession clears messages and sets
+    // compositionStateLoaded false before its fetch), then the WHOLE
+    // transcript lands in one set(). Those messages are history, not news —
+    // a 12-message transcript read as "12 new messages" with zero actual
+    // authoring activity.
+    useSessionStore.setState({
+      compositionStateLoaded: false,
+      messages: [],
+    });
+    const { result } = renderHook(() =>
+      useCollapsedAuthoringStatus({
+        activeSessionId: SESSION_A,
+        authoringCollapsed: true,
+      }),
+    );
+    expect(result.current).toEqual({
+      text: "Authoring pane collapsed",
+      tone: "neutral",
+    });
+
+    act(() =>
+      useSessionStore.setState({
+        messages: [message("m1"), message("m2"), message("m3")],
+        compositionStateLoaded: true,
+      }),
+    );
+    expect(result.current).toEqual({
+      text: "Authoring pane collapsed",
+      tone: "neutral",
+    });
+
+    // A message arriving AFTER hydration is genuinely new.
+    act(() =>
+      useSessionStore.setState({
+        messages: [
+          message("m1"),
+          message("m2"),
+          message("m3"),
+          message("m4"),
+        ],
+      }),
+    );
+    expect(result.current).toEqual({ text: "1 new message", tone: "busy" });
   });
 
   it("uses error, busy, unread, then neutral priority", () => {

@@ -7,6 +7,8 @@ const ALL_NAMES: IconName[] = [
   "check",
   "chevron-down",
   "chevron-up",
+  "chevrons-left",
+  "chevrons-right",
   "cross",
   "download",
   "eye",

@@ -52,7 +52,7 @@ const GROUPS: ShortcutGroup[] = [
     name: "Navigation",
     items: [
       { keys: "Ctrl+K", action: "Command palette" },
-      { keys: "Ctrl+/", action: "Focus chat input" },
+      { keys: "Ctrl+/", action: "Focus chat input (restores collapsed pane)" },
       { keys: "Ctrl/Cmd+Shift+G", action: "Show graph" },
       { keys: "Ctrl/Cmd+Shift+Y", action: "Show YAML" },
       { keys: "Alt+1-3", action: "Switch catalog tab (Sources / Transforms / Sinks)" },

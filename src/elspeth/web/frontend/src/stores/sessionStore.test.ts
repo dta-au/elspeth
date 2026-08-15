@@ -399,6 +399,41 @@ describe("sessionStore", () => {
       expect(useSessionStore.getState().compositionState).toBeNull();
     });
 
+    it("createSession requests authoring focus so a collapsed pane cannot hide a new session's composer", async () => {
+      // The collapsed-pane preference persists globally (localStorage), so
+      // without this a user who collapsed the pane once would find EVERY new
+      // session opening with the chat — the primary composing surface —
+      // hidden (2026-08-15 UX review). The request is a STORE FLAG, not a
+      // window event: createSession can run while ComposerWorkspace is
+      // unmounted (empty landing, tutorial graduation), where an event
+      // would land on zero listeners. ComposerWorkspace consumes the flag
+      // on mount or change (its truth-test lives beside that consumer).
+      // Session SWITCHES deliberately do not set it, so the standing
+      // preference still applies when revisiting existing sessions.
+      const apiMod = await import("@/api/client");
+      (apiMod.createSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: "new-2",
+        title: "Session — 2 Jul 2026",
+        created_at: "2026-07-02T00:00:00Z",
+        updated_at: "2026-07-02T00:00:00Z",
+      });
+
+      await useSessionStore.getState().createSession();
+
+      expect(useSessionStore.getState().authoringFocusRequested).toBe(true);
+    });
+
+    it("createSession does not request authoring focus when session creation fails", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.createSession as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error("boom"),
+      );
+
+      await useSessionStore.getState().createSession();
+
+      expect(useSessionStore.getState().authoringFocusRequested).toBe(false);
+    });
+
     it("createSession transfers blob ownership before the new session can upload", async () => {
       const apiMod = await import("@/api/client");
       const blobA = {

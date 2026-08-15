@@ -161,6 +161,32 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
     expect(densityBlock![1]).not.toContain(".workspace-collapse-control");
   });
 
+  it("gives both pane toggles the shared icon chrome at the 44px register", () => {
+    // Recut 2026-08-15: the toggles render variant="bare", so
+    // .workspace-pane-toggle is their ONLY chrome. It must carry the full
+    // --size-control register on BOTH axes (the collapse control's
+    // registration contract needs the height; icon-only needs the width for
+    // the 44px target the geometry e2e hit-tests), and it must NOT recreate
+    // the .btn surface fill that made the old control read as a sixth
+    // action-bar button — transparent ground, hover-only wash.
+    const toggle = ".workspace-pane-toggle";
+    expect(declaration(toggle, "min-width")).toBe("var(--size-control)");
+    expect(declaration(toggle, "min-height")).toBe("var(--size-control)");
+    expect(declaration(toggle, "background-color")).toBe("transparent");
+    // The border is the toggle's ONLY resting boundary (transparent fill), so
+    // WCAG 1.4.11 applies to it directly: --color-border-strong is ~1.7:1 on
+    // --color-surface in both themes (2026-08-15 a11y audit), which is why
+    // the toggles borrow --color-input-border — the token M04 created for
+    // exactly this defect on form inputs. colorContrast.test.ts proves the
+    // token clears 3:1; this pin proves the toggles actually use it.
+    expect(declaration(toggle, "border")).toBe(
+      "1px solid var(--color-input-border)",
+    );
+    expect(
+      declaration(`${toggle}:hover:where(:not(:disabled))`, "background-color"),
+    ).toBe("var(--color-surface-hover)");
+  });
+
   it("takes the bar's padding and the collapse control's standoff from one inset", () => {
     // The two rows meet across the pane divider and must share one bottom edge
     // and one optical center — a BLOCK-axis contract: both sides express the

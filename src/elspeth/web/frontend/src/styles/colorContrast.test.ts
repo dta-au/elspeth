@@ -733,6 +733,21 @@ describe("design-review contrast remediation (2026-06-29)", () => {
       ).toBeGreaterThanOrEqual(3);
     }
   });
+
+  it("gives the workspace pane toggles a resting boundary clearing WCAG 1.4.11 (3:1)", () => {
+    // .workspace-pane-toggle (collapse/restore, 2026-08-15 recut) has a
+    // transparent fill, so its --color-input-border boundary is the only
+    // resting affordance. It sits on --color-surface (the pane band and the
+    // collapsed strip), a step darker than the elevated surface M04 proves
+    // against — pin the actual ground. workspaceChrome.test.ts pins that the
+    // class really uses this token.
+    for (const theme of themes) {
+      expect(
+        contrastRatio(resolveHex(theme, "--color-input-border"), resolveHex(theme, "--color-surface")),
+        `pane-toggle border on surface (${theme})`,
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

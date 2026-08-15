@@ -9,7 +9,7 @@ import {
 } from "react";
 
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
-import { Button } from "@/components/ui";
+import { Button, Icon } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import { hasCompositionContent } from "@/utils/compositionState";
 import {
@@ -197,16 +197,36 @@ export function ComposerWorkspace({
       ?.focus({ preventScroll: true });
   }, [authoringFocusRequest, authoringHidden]);
 
+  const focusAuthoring = useCallback((): void => {
+    claimWorkspaceViewIntent();
+    setNarrowView("compose");
+    paneState.setAuthoringCollapsed(false);
+    setAuthoringFocusRequest((current) => current + 1);
+  }, [paneState]);
+
   useLayoutEffect(() => {
-    const focusAuthoring = (): void => {
-      claimWorkspaceViewIntent();
-      setNarrowView("compose");
-      paneState.setAuthoringCollapsed(false);
-      setAuthoringFocusRequest((current) => current + 1);
-    };
     window.addEventListener(FOCUS_AUTHORING_EVENT, focusAuthoring);
     return () => window.removeEventListener(FOCUS_AUTHORING_EVENT, focusAuthoring);
-  }, [paneState]);
+  }, [focusAuthoring]);
+
+  // Store-flag twin of the FOCUS_AUTHORING_EVENT listener above:
+  // createSession sets authoringFocusRequested because it can run while this
+  // component is UNMOUNTED (empty landing, tutorial graduation), where the
+  // window event has zero listeners and the request would be lost — leaving
+  // the brand-new session's composer hidden behind the globally-persisted
+  // collapsed preference. Consumed exactly once; the consume comes FIRST so
+  // a re-render triggered by focusAuthoring cannot re-enter.
+  const authoringFocusRequested = useSessionStore(
+    (state) => state.authoringFocusRequested,
+  );
+  const consumeAuthoringFocusRequest = useSessionStore(
+    (state) => state.consumeAuthoringFocusRequest,
+  );
+  useLayoutEffect(() => {
+    if (!authoringFocusRequested) return;
+    consumeAuthoringFocusRequest();
+    focusAuthoring();
+  }, [authoringFocusRequested, consumeAuthoringFocusRequest, focusAuthoring]);
 
   const collapseAuthoring = (): void => {
     claimWorkspaceViewIntent();
@@ -316,6 +336,7 @@ export function ComposerWorkspace({
         >
           <section
             ref={authoringPaneRef}
+            id="workspace-authoring-pane"
             className="workspace-authoring-pane"
             role="region"
             aria-label="Authoring pane"
@@ -333,14 +354,27 @@ export function ComposerWorkspace({
               <ErrorBoundary label="Authoring pane">{authoring}</ErrorBoundary>
             </div>
             <div className="workspace-authoring-status">{authoringStatus}</div>
+            {/* Icon-form pane toggles (2026-08-15 UX review): the earlier
+                full-text secondary-chrome button shared height, border,
+                background, and spacing rhythm with the action-bar buttons one
+                gutter away, so Gestalt grouping read it as a sixth workflow
+                action. Both toggles now follow the pane's own icon+tooltip
+                convention (ChatInput's Upload/More buttons): icon-only, full
+                name kept as aria-label + title, chevrons pointing the way the
+                pane moves. aria-expanded/aria-controls make the disclosure
+                state machine-readable; the pair is two buttons (one per
+                state), each reporting the state it acts from. */}
             <Button
               ref={collapseControlRef}
-              compact
-              className="workspace-collapse-control"
+              variant="bare"
+              className="workspace-pane-toggle workspace-collapse-control"
+              title="Collapse authoring pane"
               aria-label="Collapse authoring pane"
+              aria-expanded={!paneState.authoringCollapsed}
+              aria-controls="workspace-authoring-pane"
               onClick={collapseAuthoring}
             >
-              Collapse authoring pane
+              <Icon name="chevrons-left" className="workspace-pane-toggle-icon" />
             </Button>
           </section>
           {paneState.authoringCollapsed && (
@@ -353,12 +387,19 @@ export function ComposerWorkspace({
               </div>
               <Button
                 ref={restoreControlRef}
-                compact
+                variant="bare"
+                className="workspace-pane-toggle"
+                title="Restore authoring pane"
                 aria-label="Restore authoring pane"
+                aria-expanded={false}
+                aria-controls="workspace-authoring-pane"
                 aria-describedby="workspace-collapsed-status"
                 onClick={restoreAuthoring}
               >
-                Restore authoring pane
+                <Icon
+                  name="chevrons-right"
+                  className="workspace-pane-toggle-icon"
+                />
               </Button>
             </div>
           )}
