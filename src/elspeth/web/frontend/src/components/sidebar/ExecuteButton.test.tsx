@@ -275,12 +275,14 @@ describe("ExecuteButton", () => {
     expect(document.querySelector("[data-run-block-reason]")).toBeNull();
   });
 
-  it("stays a co-equal plain .btn (never btn-primary) even when runnable (elspeth-0d37694c8c)", () => {
-    // CompletionBar's contract (its docstring, per plan 19b §"Scope
-    // boundaries"): Save-for-review / Run / Import YAML are co-equal verbs
-    // with no primary emphasis. A conditional btn-primary previously singled
-    // Run out as the lone filled accent button whenever the composition was
-    // valid — the common case.
+  it("carries the danger emphasis (btn-danger, never btn-primary) when runnable", () => {
+    // Deliberate 2026-08-15 operator decision superseding the earlier
+    // no-emphasis rule (elspeth-0d37694c8c): Run is the one verb with
+    // consequences outside the composer (provider egress and spend), so it
+    // is the lone red-filled button in the bar in both themes. btn-primary
+    // stays forbidden — green-as-valid was the exact reading 0d37694c8c
+    // removed. The co-equal contract survives as geometry only
+    // (workspaceChrome.test.ts pins the equal widths).
     useExecutionStore.setState({
       validationResult: {
         is_valid: true,
@@ -299,6 +301,7 @@ describe("ExecuteButton", () => {
     const button = screen.getByRole("button", { name: /run pipeline/i });
     expect(button).not.toBeDisabled();
     expect(button).toHaveClass("btn");
+    expect(button).toHaveClass("btn-danger");
     expect(button).not.toHaveClass("btn-primary");
   });
 
