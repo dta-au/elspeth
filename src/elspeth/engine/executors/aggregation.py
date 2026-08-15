@@ -923,6 +923,8 @@ class AggregationExecutor:
                 barrier_blocked_at, duplicate journal rows, membership
                 mismatch, duplicate member_order entries, missing attempt
                 offset, batch_id/items inconsistency, impossible counters.
+            ValueError: If the restored trigger latch contradicts its trigger
+                configuration or restored batch state.
             OrchestrationInvariantError: If node_id is not a configured aggregation.
         """
         node = self._get_node(node_id, "restore_from_journal")
@@ -940,28 +942,24 @@ class AggregationExecutor:
             now=now,
         )
 
-        # Apply the validated state — the restorer has already raised on any
-        # journal/audit disagreement (validate-before-mutate: a failed restore
-        # leaves this node's in-memory state intact).
-        node.tokens = list(restored.tokens)
-        node.batch_id = restored.batch_id
-        node.member_count = len(restored.tokens)
-        node.accepted_count_total = restored.accepted_count_total
-        node.completed_flush_count = restored.completed_flush_count
-
+        restored_trigger = TriggerEvaluator(node.settings.trigger, clock=self._clock)
         latch = restored.trigger_latch
         if latch is not None:
-            node.trigger.restore_from_checkpoint(
+            restored_trigger.restore_from_checkpoint(
                 batch_count=latch.batch_count,
                 elapsed_age_seconds=latch.elapsed_age_seconds,
                 count_fire_offset=latch.count_fire_offset,
                 condition_fire_offset=latch.condition_fire_offset,
             )
-        else:
-            # Counter-only node: the restorer produced no latch (stale
-            # checkpoint scalars are dropped-with-log there) — leave the
-            # trigger fully unlatched for the next genuine batch.
-            node.trigger.reset()
+
+        # Apply only after both the journal state and trigger state validate.
+        # A failed restore must leave every existing node field untouched.
+        node.tokens = list(restored.tokens)
+        node.batch_id = restored.batch_id
+        node.member_count = len(restored.tokens)
+        node.accepted_count_total = restored.accepted_count_total
+        node.completed_flush_count = restored.completed_flush_count
+        node.trigger = restored_trigger
 
         slog.info(
             "aggregation_journal_restored",
