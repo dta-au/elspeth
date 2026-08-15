@@ -40,6 +40,7 @@ def _make_app(
     *,
     engine: object | None = None,
     rate_limit: int = 100,
+    write_rate_limit: int = 100,
 ) -> FastAPI:
     """Build a minimal FastAPI app wired for preferences tests.
 
@@ -47,9 +48,11 @@ def _make_app(
     client apps (Panel C3 — cross-user isolation must observe both users
     on the same DB).
 
-    ``rate_limit``: per-user PATCH rate. Default of 100/min is high enough
-    that ordinary tests don't bump into it; the rate-limit test overrides
-    to a low value.
+    ``rate_limit``: per-user strict (composer LLM) bucket size.
+    ``write_rate_limit``: per-user WRITE bucket size — the bucket the
+    preferences PATCH actually checks. Defaults of 100/min are high
+    enough that ordinary tests don't bump into either; the rate-limit
+    test overrides ``write_rate_limit`` to a low value.
     """
     if engine is None:
         engine = create_session_engine(
@@ -62,6 +65,7 @@ def _make_app(
     app.state.preferences_service = PreferencesService(engine)
     app.state.session_engine = engine
     app.state.rate_limiter = ComposerRateLimiter(limit=rate_limit)
+    app.state.write_rate_limiter = ComposerRateLimiter(limit=write_rate_limit)
     # Phase 8 Task 2: the PATCH route emits ``record_mode_opted_*``
     # via ``request.app.state.sessions_telemetry``. Attach a fresh
     # fake-counter container per app build (function-scoped per Q10).
@@ -309,8 +313,10 @@ def test_users_cannot_see_each_others_preferences(
 
 
 def test_patch_enforces_rate_limit_returns_429() -> None:
-    """Panel C1: PATCH must call the shared ComposerRateLimiter."""
-    app = _make_app("alice-rate-limit", rate_limit=2)
+    """Panel C1: PATCH must be metered by the WRITE bucket
+    (``app.state.write_rate_limiter``) — the strict composer bucket
+    stays at its default and must not be what trips here."""
+    app = _make_app("alice-rate-limit", write_rate_limit=2)
     client = TestClient(app)
 
     # Two PATCHes inside the 60s window succeed.
