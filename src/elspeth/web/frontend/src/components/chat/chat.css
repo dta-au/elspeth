@@ -2606,7 +2606,20 @@
 
 .ack-card-view-toggle {
   align-self: flex-start;
-  padding: var(--space-2xs) var(--space-sm);
+  /* Compact control floor (36px, same rung as .bubble-copy-btn above): with
+     only 2px block padding and no min-height the intrinsic box sat around
+     20px — under the WCAG 2.5.8 AA 24×24 target floor. Deliberately NOT the
+     44px .btn rung: the full-size filled button is reserved for the control
+     that resolves a card (Approve/Acknowledge), and this toggle must stay
+     dimensionally subordinate to it in both its quiet and gated-emphasis
+     states (ux review 2026-08-16). The explicit floor also keeps the box
+     height constant across the gated→unlocked colour handoff — no reflow
+     under the pointer inside the scrolling stack. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--size-control-compact);
+  padding: var(--space-xs) var(--space-md);
   background: none;
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-sm);
@@ -2615,8 +2628,33 @@
   cursor: pointer;
 }
 
-.ack-card-view-toggle:hover {
+/* :where() zeroes the class selector, holding this at (0,1,0) against the
+   --next hover's (0,2,0) below — the emphasis hover wins by specificity, not
+   source order (the same fragility .btn's base hover documents in
+   shared.css, guarded the same way). The :not() inside also keeps this
+   text-colour hover off the filled state entirely. */
+:where(.ack-card-view-toggle:not(.ack-card-view-toggle--next)):hover {
   color: var(--color-text);
+}
+
+/* Gated-primary phase: while Approve is locked, View prompt is the card's one
+   live action, so it carries the filled active-control treatment the sibling
+   cards' Acknowledge buttons have. The first view latches the unlock and the
+   component drops this class, returning the toggle to the quiet outline above
+   while the now-active Approve takes the emphasis (one filled control per
+   card at a time). */
+.ack-card-view-toggle--next {
+  background: var(--color-btn-primary-bg);
+  border-color: var(--color-btn-primary-bg);
+  color: var(--color-text-inverse);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+.ack-card-view-toggle--next:hover {
+  background: var(--color-btn-primary-bg-hover);
+  border-color: var(--color-btn-primary-bg-hover);
+  color: var(--color-text-inverse);
 }
 
 .ack-card-prompt-template {

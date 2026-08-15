@@ -610,6 +610,45 @@ describe("AcknowledgementCard — prompt-template View/Approve controls", () => 
     expect(approve.disabled).toBe(false);
   });
 
+  // Operator report 2026-08-16: pre-view, "View prompt" was the card's ONLY
+  // live control yet the only one not drawn as one — users did not know how
+  // to clear the card. The --next modifier hands it the filled active
+  // treatment exactly while Approve is gated, and hands the emphasis back
+  // (class dropped, permanently — viewing latches) once viewed.
+  it("carries the active-control emphasis exactly while Approve is gated", async () => {
+    const user = userEvent.setup();
+    renderCard(
+      makeEvent({
+        kind: "llm_prompt_template",
+        llm_draft: "Summarise {{ row.body }}.",
+      }),
+      { showAmend: false },
+    );
+
+    const toggle = screen.getByRole("button", { name: "View prompt" });
+    expect(toggle.classList.contains("ack-card-view-toggle--next")).toBe(true);
+
+    await user.click(toggle);
+    expect(toggle.classList.contains("ack-card-view-toggle--next")).toBe(false);
+
+    // Collapsing does not re-gate Approve, so the emphasis must not return.
+    await user.click(screen.getByRole("button", { name: "Hide prompt" }));
+    expect(toggle.classList.contains("ack-card-view-toggle--next")).toBe(false);
+  });
+
+  it("never applies the gated emphasis to a non-prompt View expander", () => {
+    renderCard(
+      makeEvent({
+        kind: "invented_source",
+        llm_draft: JSON.stringify({ rows: "x".repeat(200) }),
+      }),
+      { showAmend: false },
+    );
+
+    const toggle = screen.getByRole("button", { name: "View" });
+    expect(toggle.classList.contains("ack-card-view-toggle--next")).toBe(false);
+  });
+
   // Successor of elspeth-3b35abf148 variant 2: the gate says WHY in visible
   // text wired to the Approve button via aria-describedby.
   it("explains the gate in visible text wired to Approve, cleared once viewed", async () => {

@@ -317,7 +317,19 @@ export function AcknowledgementCard({
           morphing-primary design worked around is gone structurally. */}
       <Button
         variant="bare"
-        className="ack-card-view-toggle"
+        // While Approve is gated, this disclosure IS the card's next action —
+        // and it was the only control on the card NOT drawn as one (xs quiet
+        // outline beside a big primary-styled-but-inert Approve, next to
+        // sibling cards' filled active Acknowledge buttons). The --next
+        // modifier gives it the filled active treatment until the first view
+        // latches promptViewed; after that it recedes to the quiet toggle and
+        // the unlocked Approve takes the emphasis back — one filled control
+        // per card at a time (operator report 2026-08-16).
+        className={
+          approveGated
+            ? "ack-card-view-toggle ack-card-view-toggle--next"
+            : "ack-card-view-toggle"
+        }
         aria-expanded={expanded}
         aria-controls={valueRegionId}
         onClick={() => {
