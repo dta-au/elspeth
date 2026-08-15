@@ -265,10 +265,41 @@ _ENGINE_SPAN_ALLOWED_ATTRIBUTES: Mapping[EngineSpanName, frozenset[str]] = Mappi
         EngineSpanName.RUN: frozenset({"run.id"}),
         EngineSpanName.SOURCE: frozenset({"plugin.name", "plugin.type"}),
         EngineSpanName.ROW: frozenset({"row.id", "token.id"}),
-        EngineSpanName.TRANSFORM: frozenset({"plugin.name", "plugin.type", "node.id", "input.hash", "token.id", "token.ids"}),
+        EngineSpanName.TRANSFORM: frozenset(
+            {
+                "plugin.name",
+                "plugin.type",
+                "node.id",
+                "input.hash",
+                "token.id",
+                "token.ids",
+                "token.ids.total_count",
+                "token.ids.truncated_count",
+            }
+        ),
         EngineSpanName.GATE: frozenset({"plugin.name", "plugin.type", "node.id", "input.hash", "token.id"}),
-        EngineSpanName.AGGREGATION: frozenset({"plugin.name", "plugin.type", "node.id", "input.hash", "batch.id", "token.ids"}),
-        EngineSpanName.SINK: frozenset({"plugin.name", "plugin.type", "node.id", "token.ids"}),
+        EngineSpanName.AGGREGATION: frozenset(
+            {
+                "plugin.name",
+                "plugin.type",
+                "node.id",
+                "input.hash",
+                "batch.id",
+                "token.ids",
+                "token.ids.total_count",
+                "token.ids.truncated_count",
+            }
+        ),
+        EngineSpanName.SINK: frozenset(
+            {
+                "plugin.name",
+                "plugin.type",
+                "node.id",
+                "token.ids",
+                "token.ids.total_count",
+                "token.ids.truncated_count",
+            }
+        ),
     }
 )
 
@@ -301,28 +332,22 @@ def _validate_engine_span_exception_type(value: object) -> None:
         raise ValueError("exception_type must be a bounded exception class name")
 
 
-def _freeze_engine_span_attributes(
+def _validate_engine_span_attributes(
     name: EngineSpanName,
     attributes: Mapping[str, str | tuple[str, ...]],
-) -> Mapping[str, str | tuple[str, ...]]:
-    if not isinstance(attributes, Mapping):
-        raise TypeError("attributes must be a mapping")
+) -> None:
     allowed = _ENGINE_SPAN_ALLOWED_ATTRIBUTES[name]
-    frozen: dict[str, str | tuple[str, ...]] = {}
     for key, value in attributes.items():
         if type(key) is not str or key not in allowed:
             raise ValueError(f"engine span attribute {key!r} is not allowed for {name.value}")
         if type(value) is str:
             if len(value) > _ENGINE_SPAN_ATTRIBUTE_MAX_CHARS:
                 raise ValueError(f"engine span attribute {key!r} exceeds the bounded string limit")
-            frozen[key] = value
             continue
         if type(value) is not tuple or len(value) > _ENGINE_SPAN_ATTRIBUTE_SEQUENCE_LIMIT:
             raise ValueError(f"engine span attribute {key!r} must be a bounded string or string tuple")
         if any(type(item) is not str or len(item) > _ENGINE_SPAN_ATTRIBUTE_MAX_CHARS for item in value):
             raise ValueError(f"engine span attribute {key!r} contains an invalid string")
-        frozen[key] = tuple(value)
-    return MappingProxyType(frozen)
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,9 +370,9 @@ class EngineSpanCompleted(TelemetryEvent):
     def __post_init__(self) -> None:
         if type(self.run_id) is not str or not self.run_id or len(self.run_id) > _ENGINE_SPAN_ATTRIBUTE_MAX_CHARS:
             raise ValueError("run_id must be a bounded non-empty string")
-        if not isinstance(self.name, EngineSpanName):
+        if type(self.name) is not EngineSpanName:
             raise TypeError("name must be EngineSpanName")
-        if not isinstance(self.status, EngineSpanStatus):
+        if type(self.status) is not EngineSpanStatus:
             raise TypeError("status must be EngineSpanStatus")
         _validate_engine_span_datetime(self.timestamp, "timestamp")
         _validate_engine_span_datetime(self.started_at, "started_at")
@@ -361,7 +386,10 @@ class EngineSpanCompleted(TelemetryEvent):
         _validate_engine_span_exception_type(self.exception_type)
         if self.status is EngineSpanStatus.OK and self.exception_type is not None:
             raise ValueError("successful engine spans cannot carry exception_type")
-        object.__setattr__(self, "attributes", _freeze_engine_span_attributes(self.name, self.attributes))
+        freeze_fields(self, "attributes")
+        if type(self.attributes) is not MappingProxyType:
+            raise TypeError("attributes must freeze to an exact MappingProxyType")
+        _validate_engine_span_attributes(self.name, self.attributes)
 
 
 _CLEANUP_FIELD_MAX_CHARS = 64

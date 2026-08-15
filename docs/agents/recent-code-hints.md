@@ -17,8 +17,12 @@ is a working document under the normal delivery posture.
   parent. SQLite may return that timestamp without `tzinfo`; normalize it as
   UTC at the span boundary, but tolerate cross-host wall-clock skew. Row spans
   live at the universal scheduler-claim seam so fresh, resumed, and follower
-  work share one path. Telemetry shutdown must not evict a queued event merely
-  to make room for its sentinel.
+  work share one path, and an operation span stays open through the engine's
+  validation, authority, disposition, and terminal audit work — plugin return
+  alone is not success. A telemetry callback failure must not replace an active
+  workload failure. Telemetry shutdown must not evict a queued event merely to
+  make room for its sentinel, and its wait for an exporter that ignores I/O
+  timeouts must remain bounded.
 
 - **2026-08-15 — a selector lane may contain SEVERAL trusted profile probes**:
   the state-engine profile reporter accepts repeated observations that agree on

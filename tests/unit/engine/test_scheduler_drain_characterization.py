@@ -54,6 +54,7 @@ from elspeth.contracts import RowResult, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError, RunWorkerEvictedError, SchedulerLeaseLostError
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import BranchLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -136,6 +137,7 @@ def _build(
     bind_run_coordination: bool = False,
     heartbeat_seconds: int = 60,
     mode: ProcessorMode = ProcessorMode.LEADER,
+    span_factory: SpanFactory | None = None,
 ) -> tuple[RowProcessor, _RecordingScheduler, RecorderSetup, MockClock]:
     """Real RowProcessor over a real scheduler DB behind the recording wrapper."""
     setup = make_recorder_with_run(
@@ -149,7 +151,7 @@ def _build(
     processor = RowProcessor(
         execution=setup.execution,
         data_flow=setup.data_flow,
-        span_factory=SpanFactory(),
+        span_factory=span_factory if span_factory is not None else SpanFactory(),
         run_id=setup.run_id,
         source_node_id=NodeID(setup.source_node_id),
         source_on_success="default",
@@ -521,6 +523,37 @@ def test_child_ready_enqueue_rolls_back_when_parent_terminal_event_fails() -> No
     assert child_events == []
 
 
+def test_row_span_covers_terminal_disposition_failure() -> None:
+    """A durable disposition write is part of the claimed row operation."""
+    events: list[EngineSpanCompleted] = []
+    spans = SpanFactory(telemetry_emit=events.append)
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, span_factory=spans)
+    _work_item_id, _parent_token = _enqueue_ready(setup, spy, clock, sequence=0)
+
+    def dropped(**kwargs: Any) -> tuple[RowResult, list[WorkItem]]:
+        return _dropped_result(kwargs["token"]), []
+
+    real_record = setup.factory.scheduler.events.record
+
+    def reject_terminal_event(conn: Any, *, event_type: SchedulerEventType, **kwargs: Any) -> None:
+        if event_type is SchedulerEventType.MARK_TERMINAL:
+            raise RuntimeError("injected row disposition failure")
+        real_record(conn, event_type=event_type, **kwargs)
+
+    with (
+        spans.trace_scope(setup.run_id, datetime.now(UTC)),
+        patch.object(processor, "_process_single_token", new=dropped),
+        patch.object(setup.factory.scheduler.events, "record", new=reject_terminal_event),
+        pytest.raises(RuntimeError, match="injected row disposition failure"),
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    assert len(events) == 1
+    assert events[0].name is EngineSpanName.ROW
+    assert events[0].status is EngineSpanStatus.ERROR
+    assert events[0].exception_type == "RuntimeError"
+
+
 def test_child_and_parent_disposition_roll_back_when_branch_loss_write_fails() -> None:
     """The child, parent event, and §E.5 loss share one commit boundary."""
     processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
@@ -777,6 +810,28 @@ def test_lease_lost_mid_processing_abandons_result_and_writes_no_disposition() -
     status, owner = _row_status(setup, work_item_id)
     assert status == TokenWorkStatus.LEASED.value
     assert owner == LEADER_OWNER
+
+
+def test_handled_scheduler_lease_loss_marks_row_span_error() -> None:
+    """Clean abandonment is handled control flow but not a successful row claim."""
+    events: list[EngineSpanCompleted] = []
+    spans = SpanFactory(telemetry_emit=events.append)
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, span_factory=spans)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+
+    def lose_claim(**_kwargs: Any) -> tuple[RowResult, list[Any]]:
+        raise SchedulerLeaseLostError(work_item_id=work_item_id, lease_owner=LEADER_OWNER, run_id=setup.run_id)
+
+    with (
+        spans.trace_scope(setup.run_id, datetime.now(UTC)),
+        patch.object(processor, "_process_single_token", new=lose_claim),
+    ):
+        assert processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False) == []
+
+    assert len(events) == 1
+    assert events[0].name is EngineSpanName.ROW
+    assert events[0].status is EngineSpanStatus.ERROR
+    assert events[0].exception_type == "SchedulerLeaseLostError"
 
 
 @pytest.mark.parametrize("surviving_peer", [False, True], ids=["sole-row-deletion", "n-greater-than-zero-absence"])

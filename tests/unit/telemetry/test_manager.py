@@ -6,6 +6,7 @@ import queue
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
+from time import monotonic
 from types import MappingProxyType
 from unittest.mock import create_autospec, patch
 
@@ -1376,6 +1377,36 @@ class TestClose:
         assert not closer.is_alive()
         assert len(exporter.events) == 1
         assert manager._queue.empty()
+
+    def test_close_returns_without_racing_exporter_close_when_export_is_permanently_stalled(self, monkeypatch) -> None:
+        exporter = TelemetryTestExporter()
+        export_entered = threading.Event()
+        release_export = threading.Event()
+        original_export = exporter.export
+
+        def blocking_export(event):
+            export_entered.set()
+            assert release_export.wait(timeout=5.0)
+            return original_export(event)
+
+        object.__setattr__(exporter, "export", blocking_export)
+        monkeypatch.setattr("elspeth.telemetry.manager._SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.05)
+        manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        manager.handle_event(_lifecycle_event())
+        assert export_entered.wait(timeout=2.0)
+
+        started_at = monotonic()
+        manager.close()
+        elapsed = monotonic() - started_at
+
+        assert elapsed < 1.0
+        assert manager._export_thread.is_alive()
+        assert manager._export_thread.daemon is True
+        assert exporter.close_count == 0
+
+        release_export.set()
+        manager._export_thread.join(timeout=2.0)
+        assert not manager._export_thread.is_alive()
 
     @pytest.mark.parametrize(
         ("result", "expected_delivered", "expected_failed", "expected_dropped"),

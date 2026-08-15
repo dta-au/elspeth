@@ -725,6 +725,8 @@ class TestOTLPExporterSpanConversion:
         exported = [call[0][0][0] for call in mock_sdk.export.call_args_list]
         assert len(exported) == 2
         assert exported[0].context.trace_id == exported[1].context.trace_id
+        assert "joined-run" not in exporter._trace_started_at
+        assert "joined-run" not in exporter._fresh_run_ids
 
     def test_failed_engine_span_sets_error_status_with_safe_exception_type_only(self) -> None:
         exporter, mock_sdk = self._create_configured_exporter()
@@ -769,6 +771,47 @@ class TestOTLPExporterSpanConversion:
         finish_span = mock_sdk.export.call_args_list[1][0][0][0]
         assert start_span.context.trace_id == finish_span.context.trace_id
         assert finish_span.context.trace_id >> 96 == int(started_at.timestamp())
+        assert "run-123" not in exporter._trace_started_at
+        assert "run-123" not in exporter._fresh_run_ids
+
+    @pytest.mark.parametrize("terminal_order", ["finish-first", "run-span-first"])
+    def test_fresh_run_terminal_pair_keeps_one_trace_then_releases_registry(self, terminal_order: str) -> None:
+        """RunFinished and the enclosing run span may arrive in either order."""
+        exporter, mock_sdk = self._create_configured_exporter()
+        run_id = f"run-terminal-{terminal_order}"
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        run_finished = RunFinished(
+            timestamp=trace_started_at + timedelta(seconds=3),
+            run_id=run_id,
+            status=RunStatus.COMPLETED,
+            row_count=1,
+            duration_ms=3000.0,
+        )
+        run_span = EngineSpanCompleted(
+            timestamp=trace_started_at + timedelta(seconds=4),
+            run_id=run_id,
+            name=EngineSpanName.RUN,
+            started_at=trace_started_at,
+            trace_started_at=trace_started_at,
+            span_id="1234567890abcdef",
+            parent_span_id=None,
+            status=EngineSpanStatus.OK,
+            exception_type=None,
+            attributes={"run.id": run_id},
+        )
+
+        exporter.export(RunStarted(timestamp=trace_started_at, run_id=run_id, config_hash="abc", source_plugin="csv"))
+        if terminal_order == "finish-first":
+            exporter.export(run_finished)
+            exporter.export(run_span)
+        else:
+            exporter.export(run_span)
+            exporter.export(run_finished)
+
+        exported = [call[0][0][0] for call in mock_sdk.export.call_args_list]
+        assert len({span.context.trace_id for span in exported}) == 1
+        assert run_id not in exporter._trace_started_at
+        assert run_id not in exporter._fresh_run_ids
 
     def test_span_attributes_contain_event_fields(self) -> None:
         """Span attributes contain all event fields."""

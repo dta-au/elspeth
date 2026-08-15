@@ -391,7 +391,7 @@ class TestDatadogExporterSpanCreation:
             f"Span finish time should be event timestamp ({expected_unix_seconds}) for instant span. Got: {finish_time}"
         )
 
-    def test_engine_span_uses_real_duration_and_correlation_tags(self) -> None:
+    def test_engine_span_uses_real_duration_and_explicit_tag_only_hierarchy(self) -> None:
         exporter, mock_tracer, mock_span = self._create_configured_exporter()
         trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
         started_at = datetime(2026, 7, 24, 1, 2, 4, 123456, tzinfo=UTC)
@@ -414,6 +414,10 @@ class TestDatadogExporterSpanCreation:
         start_kwargs = mock_tracer.start_span.call_args[1]
         assert start_kwargs["name"] == "transform"
         assert start_kwargs["resource"] == "transform"
+        # ddtrace's public start_span API cannot accept ELSPETH's current
+        # span ID. Supplying only child_of would therefore point at an ID that
+        # no native Datadog span owns, so this exporter declares tag-only
+        # hierarchy instead of emitting an incoherent native parent link.
         assert "child_of" not in start_kwargs
         assert mock_span.start_ns == int(started_at.timestamp() * 1_000_000_000)
         assert mock_span.finish.call_args[1]["finish_time"] == completed_at.timestamp()
@@ -421,6 +425,7 @@ class TestDatadogExporterSpanCreation:
         mock_span.set_tag.assert_any_call("elspeth.trace_id", f"{expected_trace_id:032x}")
         mock_span.set_tag.assert_any_call("elspeth.span_id", "1234567890abcdef")
         mock_span.set_tag.assert_any_call("elspeth.parent_span_id", "fedcba0987654321")
+        mock_span.set_tag.assert_any_call("elspeth.hierarchy_mode", "correlation_tags")
         mock_span.set_tag.assert_any_call("elspeth.trace_started_at", trace_started_at.isoformat())
         mock_span.set_tag.assert_any_call("plugin.name", "field_mapper")
 

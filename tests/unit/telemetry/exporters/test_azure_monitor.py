@@ -401,6 +401,75 @@ class TestAzureMonitorExporterSpanConversion:
         exported = azure_monitor_trace_exporter.instance.export_calls[0]
         assert len(exported) == 2
         assert exported[0].context.trace_id == exported[1].context.trace_id
+        assert "joined-run" not in configured_exporter._trace_started_at
+        assert "joined-run" not in configured_exporter._fresh_run_ids
+
+    def test_run_finished_without_run_span_releases_fresh_trace_registry(
+        self,
+        configured_exporter: AzureMonitorExporter,
+        azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
+    ) -> None:
+        started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        configured_exporter.export(RunStarted(timestamp=started_at, run_id="run-no-span", config_hash="abc", source_plugin="csv"))
+        configured_exporter.export(
+            RunFinished(
+                timestamp=started_at + timedelta(seconds=3),
+                run_id="run-no-span",
+                status=RunStatus.COMPLETED,
+                row_count=1,
+                duration_ms=3000.0,
+            )
+        )
+        configured_exporter.flush()
+
+        exported = azure_monitor_trace_exporter.instance.export_calls[0]
+        assert exported[0].context.trace_id == exported[1].context.trace_id
+        assert "run-no-span" not in configured_exporter._trace_started_at
+        assert "run-no-span" not in configured_exporter._fresh_run_ids
+
+    @pytest.mark.parametrize("terminal_order", ["finish-first", "run-span-first"])
+    def test_fresh_run_terminal_pair_keeps_one_trace_then_releases_registry(
+        self,
+        terminal_order: str,
+        configured_exporter: AzureMonitorExporter,
+        azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
+    ) -> None:
+        """RunFinished and the enclosing run span may arrive in either order."""
+        run_id = f"run-terminal-{terminal_order}"
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        run_finished = RunFinished(
+            timestamp=trace_started_at + timedelta(seconds=3),
+            run_id=run_id,
+            status=RunStatus.COMPLETED,
+            row_count=1,
+            duration_ms=3000.0,
+        )
+        run_span = EngineSpanCompleted(
+            timestamp=trace_started_at + timedelta(seconds=4),
+            run_id=run_id,
+            name=EngineSpanName.RUN,
+            started_at=trace_started_at,
+            trace_started_at=trace_started_at,
+            span_id="1234567890abcdef",
+            parent_span_id=None,
+            status=EngineSpanStatus.OK,
+            exception_type=None,
+            attributes={"run.id": run_id},
+        )
+
+        configured_exporter.export(RunStarted(timestamp=trace_started_at, run_id=run_id, config_hash="abc", source_plugin="csv"))
+        if terminal_order == "finish-first":
+            configured_exporter.export(run_finished)
+            configured_exporter.export(run_span)
+        else:
+            configured_exporter.export(run_span)
+            configured_exporter.export(run_finished)
+        configured_exporter.flush()
+
+        exported = azure_monitor_trace_exporter.instance.export_calls[0]
+        assert len({span.context.trace_id for span in exported}) == 1
+        assert run_id not in configured_exporter._trace_started_at
+        assert run_id not in configured_exporter._fresh_run_ids
 
     def test_failed_engine_span_sets_error_status_with_safe_exception_type_only(
         self,

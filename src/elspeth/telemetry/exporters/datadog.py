@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
@@ -263,10 +263,13 @@ class DatadogExporter:
         if self._tracer is None:
             return
 
-        if isinstance(event, EngineSpanCompleted):
-            event_type = event.name.value
-            started_at = event.started_at
+        event_class = type(event)
+        if event_class is EngineSpanCompleted:
+            engine_event = cast("EngineSpanCompleted", event)
+            event_type = engine_event.name.value
+            started_at = engine_event.started_at
         else:
+            engine_event = None
             event_type = type(event).__name__
             started_at = event.timestamp
 
@@ -296,24 +299,28 @@ class DatadogExporter:
             span.set_tag("elspeth.run_id", event.run_id)
             span.set_tag("elspeth.event_type", event_type)
 
-            if isinstance(event, EngineSpanCompleted):
-                trace_id = derive_trace_id(event.run_id, started_at=event.trace_started_at)
-                # ddtrace.start_span does not accept a caller-selected span ID.
-                # Keep ELSPETH's cross-export identity as explicit correlation
-                # tags instead of mutating private SDK state or opening a
-                # second provider-specific parent lifecycle.
+            if engine_event is not None:
+                trace_id = derive_trace_id(engine_event.run_id, started_at=engine_event.trace_started_at)
+                # The public ddtrace Tracer.start_span API accepts a parent
+                # Context but always generates the current span ID. ELSPETH's
+                # post-hoc completion events need their caller-selected IDs so
+                # later events can reference them. A child_of Context alone
+                # would therefore create orphaned native links. Preserve the
+                # coherent cross-export hierarchy as explicit correlation tags
+                # without private SDK mutation or provider-specific buffering.
                 span.set_tag("elspeth.trace_id", f"{trace_id:032x}")
-                span.set_tag("elspeth.span_id", event.span_id)
-                if event.parent_span_id is not None:
-                    span.set_tag("elspeth.parent_span_id", event.parent_span_id)
-                span.set_tag("elspeth.trace_started_at", event.trace_started_at.isoformat())
-                span.set_tag("elspeth.span_status", event.status.value)
-                for key, value in event.attributes.items():
+                span.set_tag("elspeth.span_id", engine_event.span_id)
+                if engine_event.parent_span_id is not None:
+                    span.set_tag("elspeth.parent_span_id", engine_event.parent_span_id)
+                span.set_tag("elspeth.hierarchy_mode", "correlation_tags")
+                span.set_tag("elspeth.trace_started_at", engine_event.trace_started_at.isoformat())
+                span.set_tag("elspeth.span_status", engine_event.status.value)
+                for key, value in engine_event.attributes.items():
                     self._set_tag_value(span, key, value)
-                if event.status is EngineSpanStatus.ERROR:
+                if engine_event.status is EngineSpanStatus.ERROR:
                     span.error = 1
-                    if event.exception_type is not None:
-                        span.set_tag("error.type", event.exception_type)
+                    if engine_event.exception_type is not None:
+                        span.set_tag("error.type", engine_event.exception_type)
             else:
                 # Set all event fields as tags
                 self._set_event_tags(span, event)
