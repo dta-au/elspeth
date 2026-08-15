@@ -86,6 +86,22 @@ is a working document under the normal delivery posture.
   emits `slice` objects as code constants, so preserve all three normalized
   bounds rather than falling back to repr or narrowing supported Python.
 
+- **2026-08-15 — adding a field to the composer spec/tool contract fires two
+  whole-tree pins**: any new field on SourceSpec/NodeSpec/OutputSpec or a
+  composer tool argument model must ALSO land in (a) the
+  `canonical-field-inventory` table in
+  `src/elspeth/web/composer/skills/pipeline_capabilities.md`
+  (test_capability_skill_identity derives the real schema and diffs the table)
+  and (b) the redaction-policy snapshot — regenerate via
+  `scripts/cicd/bootstrap_redaction_snapshot.py --write` and review that only
+  hashes moved, never `sensitive_path_count`, unless you intended a new
+  Sensitive path. Serialise optional spec fields as omitted-when-None so
+  pre-existing persisted states and their `composition_content_hash` values
+  stay byte-identical (see `description`, 80fa17fed). The guided planner's
+  advertised full-document schema derives from the registered `set_pipeline`
+  JSON schema via `canonical_set_pipeline_schema()`, so extending that schema
+  + the redaction.py models covers the planner lane automatically.
+
 ## Whole-tree gates: a green scoped run proves NOTHING
 
 These gates assert over the ENTIRE tree with exact expected sets. Your change
