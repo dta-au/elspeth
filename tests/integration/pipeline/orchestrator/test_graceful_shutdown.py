@@ -1352,12 +1352,15 @@ class TestInterruptAndResume:
         from sqlalchemy import select
 
         from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName
         from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
         from elspeth.core.config import CheckpointSettings
         from elspeth.core.landscape.schema import runs_table
         from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
         from elspeth.plugins.sources.null_source import NullSource
         from elspeth.plugins.transforms.passthrough import PassThrough
+        from elspeth.telemetry import TelemetryManager
+        from tests.fixtures.telemetry import MockTelemetryConfig, TelemetryTestExporter
 
         run_id = "resume-no-shutdown-test"
         total_rows = 10
@@ -1394,18 +1397,24 @@ class TestInterruptAndResume:
             sinks={"default": as_sink(resume_sink)},
         )
 
+        telemetry_exporter = TelemetryTestExporter()
+        telemetry_manager = TelemetryManager(MockTelemetryConfig(), exporters=[telemetry_exporter])
         orchestrator = Orchestrator(
             db=landscape_db,
             checkpoint_manager=checkpoint_mgr,
             checkpoint_config=checkpoint_config,
+            telemetry_manager=telemetry_manager,
         )
 
-        result = orchestrator.resume(
-            resume_point=resume_point,
-            config=resume_config,
-            graph=graph,
-            payload_store=payload_store,
-        )
+        try:
+            result = orchestrator.resume(
+                resume_point=resume_point,
+                config=resume_config,
+                graph=graph,
+                payload_store=payload_store,
+            )
+        finally:
+            telemetry_manager.close()
 
         remaining_rows = total_rows - processed_count
         # F2 (resume-fork-reemit): the resume RunResult now reports CUMULATIVE
@@ -1420,6 +1429,15 @@ class TestInterruptAndResume:
 
         # Run is COMPLETED in database
         with landscape_db.engine.connect() as conn:
-            run = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
+            run = conn.execute(select(runs_table.c.status, runs_table.c.started_at).where(runs_table.c.run_id == run_id)).fetchone()
         assert run is not None
         assert run.status == RunStatus.COMPLETED
+
+        engine_spans = [event for event in telemetry_exporter.events if isinstance(event, EngineSpanCompleted)]
+        assert EngineSpanName.RUN not in {event.name for event in engine_spans}
+        assert EngineSpanName.SOURCE not in {event.name for event in engine_spans}
+        assert {EngineSpanName.ROW, EngineSpanName.TRANSFORM, EngineSpanName.SINK} <= {event.name for event in engine_spans}
+        durable_started_at = run.started_at.replace(tzinfo=UTC) if run.started_at.tzinfo is None else run.started_at
+        assert all(event.trace_started_at == durable_started_at for event in engine_spans)
+        row_span_ids = {event.span_id for event in engine_spans if event.name is EngineSpanName.ROW}
+        assert all(event.parent_span_id in row_span_ids for event in engine_spans if event.name is EngineSpanName.TRANSFORM)

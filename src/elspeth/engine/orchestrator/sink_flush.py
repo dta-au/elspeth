@@ -278,20 +278,26 @@ class SinkFlushCoordinator:
                 failsink_effect_mode = None
                 if failsink_config_name is not None:
                     failsink_effect_mode = effect_modes[failsink_config_name]
-                _, diversion_counts = sink_executor.write(
-                    sink=sink,
-                    tokens=group_tokens,
-                    ctx=ctx,
-                    step_in_pipeline=step,
-                    sink_name=sink_name,
-                    pending_outcome=pending_outcome,
-                    effect_mode=effect_modes[sink_name],
-                    failsink=failsink,
-                    failsink_name=failsink_config_name,
-                    failsink_effect_mode=failsink_effect_mode,
-                    failsink_edge_id=failsink_edge_id,
-                    on_token_written=on_token_written,
-                )
+                with self._span_factory.sink_span(
+                    sink_name,
+                    node_id=sink_node_id,
+                    token_ids=tuple(token.token_id for token in group_tokens),
+                    run_id=run_id,
+                ):
+                    _, diversion_counts = sink_executor.write(
+                        sink=sink,
+                        tokens=group_tokens,
+                        ctx=ctx,
+                        step_in_pipeline=step,
+                        sink_name=sink_name,
+                        pending_outcome=pending_outcome,
+                        effect_mode=effect_modes[sink_name],
+                        failsink=failsink,
+                        failsink_name=failsink_config_name,
+                        failsink_effect_mode=failsink_effect_mode,
+                        failsink_edge_id=failsink_edge_id,
+                        on_token_written=on_token_written,
+                    )
                 if on_token_written is not None:
                     on_token_written.flush()
                 consume_group(token_outcome_pairs, group_pairs)

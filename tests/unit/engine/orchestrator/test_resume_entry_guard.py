@@ -44,6 +44,7 @@ from elspeth.core.checkpoint.recovery import NonResumableRunError, check_run_sta
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import runs_table
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
+from elspeth.engine.spans import SpanFactory
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
 
@@ -109,6 +110,7 @@ def _coordinator(db: LandscapeDB) -> tuple[ResumeCoordinator, _RecordingCheckpoi
         checkpoints=cast(Any, checkpoints),
         context_factory=cast(Any, object()),
         sink_flush=cast(Any, object()),
+        span_factory=SpanFactory(),
         # None is the post-guard tripwire: an ADMITTED resume raises
         # OrchestrationInvariantError("CheckpointManager is required...")
         # inside reconstruct_resume_state, proving it got past the guard.
@@ -171,6 +173,7 @@ def _currency_coordinator(db: LandscapeDB, latest: Any) -> tuple[ResumeCoordinat
         checkpoints=cast(Any, checkpoints),
         context_factory=cast(Any, object()),
         sink_flush=cast(Any, object()),
+        span_factory=SpanFactory(),
         checkpoint_manager=cast(Any, _StubCheckpointManager(latest)),
     )
     return coordinator, checkpoints

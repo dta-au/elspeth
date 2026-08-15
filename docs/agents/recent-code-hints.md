@@ -8,6 +8,18 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-15 — engine span correlation belongs to the durable run lifecycle**:
+  production engine spans are completion events emitted through the existing
+  `TelemetryManager`; do not create a second tracer/provider lifecycle beside
+  its exporter fan-out. A fresh run binds trace identity to persisted
+  `Run.started_at`. Resume and follower paths use `SpanFactory.trace_scope(...)`
+  and deliberately do not emit a second whole-run span or fabricate a leader
+  parent. SQLite may return that timestamp without `tzinfo`; normalize it as
+  UTC at the span boundary, but tolerate cross-host wall-clock skew. Row spans
+  live at the universal scheduler-claim seam so fresh, resumed, and follower
+  work share one path. Telemetry shutdown must not evict a queued event merely
+  to make room for its sentinel.
+
 - **2026-08-15 — a selector lane may contain SEVERAL trusted profile probes**:
   the state-engine profile reporter accepts repeated observations that agree on
   every profile-identity field (case, store, deployment, backend version,

@@ -16,9 +16,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import pytest
+
 from elspeth.contracts import Determinism
 from elspeth.contracts.enums import RunStatus, TelemetryGranularity
-from elspeth.contracts.events import RunStarted
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus, RunStarted
 from elspeth.core.landscape import LandscapeDB
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -96,6 +98,61 @@ class TestOrchestratorWiresTelemetryToContext:
         run_finished = exporter.get_events_of_type("RunFinished")[0]
         assert run_started.run_id == result.run_id
         assert run_finished.run_id == result.run_id
+
+        engine_spans = [event for event in exporter.events if isinstance(event, EngineSpanCompleted)]
+        names = {event.name for event in engine_spans}
+        assert {
+            EngineSpanName.RUN,
+            EngineSpanName.SOURCE,
+            EngineSpanName.ROW,
+            EngineSpanName.TRANSFORM,
+            EngineSpanName.SINK,
+        } <= names
+        assert {event.run_id for event in engine_spans} == {result.run_id}
+        run_span = next(event for event in engine_spans if event.name is EngineSpanName.RUN)
+        assert all(event.trace_started_at == run_span.trace_started_at for event in engine_spans)
+        assert all(
+            event.parent_span_id == run_span.span_id
+            for event in engine_spans
+            if event.name in {EngineSpanName.SOURCE, EngineSpanName.ROW, EngineSpanName.SINK}
+        )
+
+    def test_run_span_covers_terminal_audit_and_finalization_failures(
+        self,
+        landscape_db: LandscapeDB,
+        payload_store: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        exporter = TelemetryTestExporter()
+        telemetry_manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        source = ListSource([{"id": 1}], on_success="output")
+        pipeline_config = PipelineConfig(
+            sources={"primary": as_source(source)},
+            transforms=[as_transform(PassTransform())],
+            sinks={"output": as_sink(CollectSink())},
+        )
+        orchestrator = Orchestrator(landscape_db, telemetry_manager=telemetry_manager)
+
+        def fail_terminal_audit(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("terminal audit failed")
+
+        monkeypatch.setattr(
+            "elspeth.engine.orchestrator.run_lifecycle.derive_terminal_status_from_audit",
+            fail_terminal_audit,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="terminal audit failed"):
+                orchestrator.run(
+                    pipeline_config,
+                    graph=create_test_graph(pipeline_config),
+                    payload_store=payload_store,
+                )
+        finally:
+            telemetry_manager.close()
+
+        run_span = next(event for event in exporter.events if isinstance(event, EngineSpanCompleted) and event.name is EngineSpanName.RUN)
+        assert run_span.status is EngineSpanStatus.ERROR
+        assert run_span.exception_type == "RuntimeError"
 
     def test_context_telemetry_emit_is_callable(
         self,

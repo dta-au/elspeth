@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from elspeth.engine.barrier_coordination import _LiveBarrierHold
     from elspeth.engine.clock import Clock
     from elspeth.engine.scheduler_work_codec import SchedulerWorkCodec
+    from elspeth.engine.spans import SpanFactory
     from elspeth.engine.work_items import WorkItem
 
 # Iteration guard to prevent infinite loops from bugs.
@@ -276,6 +277,7 @@ class SchedulerDrainCoordinator:
         execution: ExecutionRepository,
         barrier_restore_reads: BarrierRestoreReadModel | ExecutionRepository,
         clock: Clock,
+        span_factory: SpanFactory,
         run_coordination: RunCoordinationRepository | None,
         coordination_token: CoordinationToken | None,
         scheduler_lease_owner: str,
@@ -297,6 +299,7 @@ class SchedulerDrainCoordinator:
         self._execution = execution
         self._barrier_restore_reads = barrier_restore_reads
         self._clock = clock
+        self._spans = span_factory
         self._run_coordination = run_coordination
         self._coordination_token = coordination_token
         self._scheduler_lease_owner = scheduler_lease_owner
@@ -590,17 +593,22 @@ class SchedulerDrainCoordinator:
             try:
                 try:
                     try:
-                        result, child_items = self._processor._process_single_token(
-                            token=item.token,
-                            ctx=ctx,
-                            current_node_id=item.current_node_id,
-                            coalesce_node_id=item.coalesce_node_id,
-                            coalesce_name=item.coalesce_name,
-                            on_success_sink=item.on_success_sink,
-                            attempt_offset=max(claimed.attempt - 1, 0),
-                            row_union_node_id=item.row_union_node_id,
-                            row_union_name=item.row_union_name,
-                        )
+                        with self._spans.row_span(
+                            item.token.row_id,
+                            item.token.token_id,
+                            run_id=self._run_id,
+                        ):
+                            result, child_items = self._processor._process_single_token(
+                                token=item.token,
+                                ctx=ctx,
+                                current_node_id=item.current_node_id,
+                                coalesce_node_id=item.coalesce_node_id,
+                                coalesce_name=item.coalesce_name,
+                                on_success_sink=item.on_success_sink,
+                                attempt_offset=max(claimed.attempt - 1, 0),
+                                row_union_node_id=item.row_union_node_id,
+                                row_union_name=item.row_union_name,
+                            )
                     except (SchedulerLeaseLostError, RunWorkerEvictedError):
                         # A traversal-boundary heartbeat already classified
                         # the claim loss. Do not issue a duplicate heartbeat.

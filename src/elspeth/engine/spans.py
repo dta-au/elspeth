@@ -1,7 +1,7 @@
-"""OpenTelemetry span factory for SDA Engine.
+"""Engine span factory with OpenTelemetry and TelemetryManager delivery modes.
 
 Provides structured span creation for pipeline execution.
-Falls back to no-op mode when no tracer is configured.
+Falls back to no-op mode when neither delivery owner is configured.
 
 Span Hierarchy (span names are static; plugin identity is in attributes):
     run                          [run.id=<run_id>]
@@ -12,9 +12,17 @@ Span Hierarchy (span names are static; plugin identity is in attributes):
     └── aggregation              [plugin.name=<name>]
 """
 
-from collections.abc import Iterator, Sequence
+import secrets
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
+
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus, _freeze_engine_span_attributes
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span, Tracer
@@ -31,13 +39,101 @@ class NoOpSpan:
         """No-op."""
         pass
 
-    def record_exception(self, exception: Exception) -> None:
+    def record_exception(self, exception: BaseException) -> None:
         """No-op."""
         pass
 
     def is_recording(self) -> bool:
         """Always False for no-op."""
         return False
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveEngineSpan:
+    """Correlation state for one active telemetry-backed engine span."""
+
+    run_id: str
+    trace_started_at: datetime
+    span_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RunTrace:
+    """Cross-thread correlation for one active run or resume/follower scope."""
+
+    trace_started_at: datetime
+    root_span_id: str | None
+
+
+class _TelemetrySpan:
+    """Minimal mutable span facade retained for call-site compatibility."""
+
+    def __init__(self, name: EngineSpanName, attributes: dict[str, str | tuple[str, ...]]) -> None:
+        self._name = name
+        self._attributes = attributes
+        self._status = EngineSpanStatus.OK
+        self._exception_type: str | None = None
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        candidate = dict(self._attributes)
+        candidate.update(_bounded_span_attributes({key: value}))
+        _freeze_engine_span_attributes(self._name, candidate)
+        self._attributes.clear()
+        self._attributes.update(candidate)
+
+    def set_status(self, status: Any) -> None:
+        if not isinstance(status, EngineSpanStatus):
+            raise TypeError("telemetry-backed engine span status must be EngineSpanStatus")
+        self._status = status
+
+    def record_exception(self, exception: BaseException) -> None:
+        self._status = EngineSpanStatus.ERROR
+        self._exception_type = _safe_exception_type(exception)
+
+    def is_recording(self) -> bool:
+        return True
+
+
+def _safe_exception_type(exception: BaseException) -> str:
+    """Return a bounded ASCII class name without rendering exception text."""
+    name = type(exception).__name__
+    if not name or len(name) > 128:
+        return "Exception"
+    if not (name[0].isascii() and (name[0].isalpha() or name[0] == "_")):
+        return "Exception"
+    if any(not (character.isascii() and (character.isalnum() or character == "_")) for character in name[1:]):
+        return "Exception"
+    return name
+
+
+def _canonical_trace_started_at(value: datetime) -> datetime:
+    """Normalize the durable database timestamp to an aware UTC instant."""
+    if type(value) is not datetime:
+        raise TypeError("trace_started_at must be a datetime")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _new_span_id() -> str:
+    """Generate a valid non-zero OpenTelemetry span identifier."""
+    span_id = secrets.token_hex(8)
+    while span_id == "0000000000000000":
+        span_id = secrets.token_hex(8)
+    return span_id
+
+
+def _bounded_span_attributes(attributes: Mapping[str, Any]) -> dict[str, str | tuple[str, ...]]:
+    """Project existing span attributes into the bounded telemetry wire shape."""
+    bounded: dict[str, str | tuple[str, ...]] = {}
+    for key, value in attributes.items():
+        if type(value) is str:
+            bounded[key] = value[:256]
+        elif type(value) in (list, tuple) and all(type(item) is str for item in value):
+            bounded[key] = tuple(item[:256] for item in value[:128])
+        else:
+            raise TypeError(f"engine span attribute {key!r} must be a string or string sequence")
+    return bounded
 
 
 class SpanFactory:
@@ -58,25 +154,89 @@ class SpanFactory:
     # Singleton no-op span to avoid repeated allocations
     _NOOP_SPAN = NoOpSpan()
 
-    def __init__(self, tracer: "Tracer | None" = None) -> None:
-        """Initialize with optional tracer.
+    def __init__(
+        self,
+        tracer: "Tracer | None" = None,
+        *,
+        telemetry_emit: Callable[[EngineSpanCompleted], None] | None = None,
+    ) -> None:
+        """Initialize with one optional span delivery owner.
 
         Args:
             tracer: OpenTelemetry tracer. If None, spans are no-ops.
+            telemetry_emit: Existing TelemetryManager event entry point. This
+                keeps engine spans inside the configured exporter lifecycle.
         """
+        if tracer is not None and telemetry_emit is not None:
+            raise ValueError("tracer and telemetry_emit are mutually exclusive span delivery owners")
         self._tracer = tracer
+        self._telemetry_emit = telemetry_emit
+        self._active_span: ContextVar[_ActiveEngineSpan | None] = ContextVar(
+            f"elspeth_engine_span_{id(self)}",
+            default=None,
+        )
+        self._run_traces: dict[str, _RunTrace] = {}
+        self._trace_scope_references: dict[str, int] = {}
+        self._run_traces_lock = threading.RLock()
 
     @property
     def enabled(self) -> bool:
         """Whether tracing is enabled."""
-        return self._tracer is not None
+        return self._tracer is not None or self._telemetry_emit is not None
+
+    @staticmethod
+    def mark_error(span: "Span | NoOpSpan | _TelemetrySpan", exception: BaseException) -> None:
+        """Mark a handled engine failure without recording exception content."""
+        if isinstance(span, _TelemetrySpan):
+            span.record_exception(exception)
+            return
+        if isinstance(span, NoOpSpan):
+            return
+        from opentelemetry.trace import Status, StatusCode
+
+        span.set_status(Status(StatusCode.ERROR))
+
+    @contextmanager
+    def trace_scope(self, run_id: str, trace_started_at: datetime) -> Iterator[None]:
+        """Bind durable run correlation without emitting a duplicate run span.
+
+        Resume and follower execution use this scope. Their work belongs to the
+        original run trace, but neither lifecycle is a second whole-run span.
+        """
+        if self._telemetry_emit is None:
+            yield
+            return
+        binding = _RunTrace(trace_started_at=_canonical_trace_started_at(trace_started_at), root_span_id=None)
+        with self._run_traces_lock:
+            existing = self._run_traces.get(run_id)
+            if existing is not None and existing != binding:
+                raise ValueError(f"run_id {run_id!r} already has different active trace correlation")
+            if existing is None:
+                self._run_traces[run_id] = binding
+                self._trace_scope_references[run_id] = 1
+            else:
+                self._trace_scope_references[run_id] = self._trace_scope_references.get(run_id, 0) + 1
+        try:
+            yield
+        finally:
+            with self._run_traces_lock:
+                remaining = self._trace_scope_references.get(run_id, 0) - 1
+                if remaining > 0:
+                    self._trace_scope_references[run_id] = remaining
+                elif self._run_traces.get(run_id) == binding:
+                    self._trace_scope_references.pop(run_id, None)
+                    self._run_traces.pop(run_id)
 
     @contextmanager
     def _make_span(
         self,
-        name: str,
+        name: EngineSpanName,
         attributes: dict[str, Any],
-    ) -> Iterator["Span | NoOpSpan"]:
+        *,
+        run_id: str | None = None,
+        trace_started_at: datetime | None = None,
+        register_run_root: bool = False,
+    ) -> Iterator["Span | NoOpSpan | _TelemetrySpan"]:
         """Create a span with attributes, or yield no-op if tracing is disabled.
 
         Args:
@@ -84,17 +244,108 @@ class SpanFactory:
             attributes: Key-value pairs to set on the span. Values must already
                 be in their final form (e.g., token_ids already converted to tuple).
         """
-        if self._tracer is None:
+        if self._tracer is not None:
+            with self._tracer.start_as_current_span(name.value) as tracer_span:
+                for key, value in attributes.items():
+                    tracer_span.set_attribute(key, value)
+                yield tracer_span
+            return
+
+        if self._telemetry_emit is None:
             yield self._NOOP_SPAN
             return
 
-        with self._tracer.start_as_current_span(name) as span:
-            for key, value in attributes.items():
-                span.set_attribute(key, value)
-            yield span
+        active_parent = self._active_span.get()
+        if active_parent is not None:
+            if register_run_root:
+                raise ValueError("run span cannot be nested inside another engine span")
+            if run_id is not None and run_id != active_parent.run_id:
+                raise ValueError("explicit run_id disagrees with active engine span")
+            resolved_run_id = active_parent.run_id
+            resolved_trace_started_at = active_parent.trace_started_at
+            parent_span_id = active_parent.span_id
+        else:
+            if run_id is None:
+                raise ValueError("telemetry-backed top-level engine span requires explicit run_id")
+            resolved_run_id = run_id
+            with self._run_traces_lock:
+                run_trace = self._run_traces.get(run_id)
+            if register_run_root:
+                if trace_started_at is None:
+                    raise ValueError("run span requires canonical trace_started_at")
+                resolved_trace_started_at = _canonical_trace_started_at(trace_started_at)
+                parent_span_id = None
+            elif run_trace is not None:
+                normalized_trace_started_at = _canonical_trace_started_at(trace_started_at) if trace_started_at is not None else None
+                if normalized_trace_started_at is not None and normalized_trace_started_at != run_trace.trace_started_at:
+                    raise ValueError("explicit trace_started_at disagrees with active run correlation")
+                resolved_trace_started_at = run_trace.trace_started_at
+                parent_span_id = run_trace.root_span_id
+            elif trace_started_at is not None:
+                resolved_trace_started_at = _canonical_trace_started_at(trace_started_at)
+                parent_span_id = None
+            else:
+                raise ValueError(f"run_id {run_id!r} has no active trace correlation")
+
+        span_id = _new_span_id()
+        root_binding: _RunTrace | None = None
+        if register_run_root:
+            root_binding = _RunTrace(trace_started_at=resolved_trace_started_at, root_span_id=span_id)
+            with self._run_traces_lock:
+                if resolved_run_id in self._run_traces:
+                    raise ValueError(f"run_id {resolved_run_id!r} already has active trace correlation")
+                self._run_traces[resolved_run_id] = root_binding
+
+        started_at = datetime.now(UTC)
+        started_monotonic = perf_counter()
+        safe_attributes = _bounded_span_attributes(attributes)
+        telemetry_span = _TelemetrySpan(name, safe_attributes)
+        token = self._active_span.set(
+            _ActiveEngineSpan(
+                run_id=resolved_run_id,
+                trace_started_at=resolved_trace_started_at,
+                span_id=span_id,
+            )
+        )
+        caught: BaseException | None = None
+        try:
+            yield telemetry_span
+        except BaseException as exc:
+            caught = exc
+            raise
+        finally:
+            self._active_span.reset(token)
+            completed_at = started_at + timedelta(seconds=perf_counter() - started_monotonic)
+            status = EngineSpanStatus.ERROR if caught is not None else telemetry_span._status
+            exception_type = _safe_exception_type(caught) if caught is not None else telemetry_span._exception_type
+            try:
+                self._telemetry_emit(
+                    EngineSpanCompleted(
+                        timestamp=completed_at,
+                        run_id=resolved_run_id,
+                        name=name,
+                        started_at=started_at,
+                        trace_started_at=resolved_trace_started_at,
+                        span_id=span_id,
+                        parent_span_id=parent_span_id,
+                        status=status,
+                        exception_type=exception_type,
+                        attributes=safe_attributes,
+                    )
+                )
+            finally:
+                if root_binding is not None:
+                    with self._run_traces_lock:
+                        if self._run_traces.get(resolved_run_id) == root_binding:
+                            self._run_traces.pop(resolved_run_id)
 
     @contextmanager
-    def run_span(self, run_id: str) -> Iterator["Span | NoOpSpan"]:
+    def run_span(
+        self,
+        run_id: str,
+        *,
+        trace_started_at: datetime | None = None,
+    ) -> Iterator["Span | NoOpSpan | _TelemetrySpan"]:
         """Create a span for the entire run.
 
         Args:
@@ -103,11 +354,22 @@ class SpanFactory:
         Yields:
             Span or NoOpSpan if tracing disabled (never None - uniform interface)
         """
-        with self._make_span("run", {"run.id": run_id}) as span:
+        with self._make_span(
+            EngineSpanName.RUN,
+            {"run.id": run_id},
+            run_id=run_id,
+            trace_started_at=trace_started_at,
+            register_run_root=True,
+        ) as span:
             yield span
 
     @contextmanager
-    def source_span(self, source_name: str) -> Iterator["Span | NoOpSpan"]:
+    def source_span(
+        self,
+        source_name: str,
+        *,
+        run_id: str | None = None,
+    ) -> Iterator["Span | NoOpSpan | _TelemetrySpan"]:
         """Create a span for source loading.
 
         Args:
@@ -116,7 +378,11 @@ class SpanFactory:
         Yields:
             Span or NoOpSpan
         """
-        with self._make_span("source", {"plugin.name": source_name, "plugin.type": "source"}) as span:
+        with self._make_span(
+            EngineSpanName.SOURCE,
+            {"plugin.name": source_name, "plugin.type": "source"},
+            run_id=run_id,
+        ) as span:
             yield span
 
     @contextmanager
@@ -124,7 +390,9 @@ class SpanFactory:
         self,
         row_id: str,
         token_id: str,
-    ) -> Iterator["Span | NoOpSpan"]:
+        *,
+        run_id: str | None = None,
+    ) -> Iterator["Span | NoOpSpan | _TelemetrySpan"]:
         """Create a span for processing a row.
 
         Args:
@@ -134,7 +402,11 @@ class SpanFactory:
         Yields:
             Span or NoOpSpan
         """
-        with self._make_span("row", {"row.id": row_id, "token.id": token_id}) as span:
+        with self._make_span(
+            EngineSpanName.ROW,
+            {"row.id": row_id, "token.id": token_id},
+            run_id=run_id,
+        ) as span:
             yield span
 
     @contextmanager
@@ -146,7 +418,8 @@ class SpanFactory:
         input_hash: str | None = None,
         token_id: str | None = None,
         token_ids: Sequence[str] | None = None,
-    ) -> Iterator["Span | NoOpSpan"]:
+        run_id: str | None = None,
+    ) -> Iterator["Span | NoOpSpan | _TelemetrySpan"]:
         """Create a span for a transform operation.
 
         Args:
@@ -177,7 +450,7 @@ class SpanFactory:
             attrs["token.ids"] = tuple(token_ids)
         elif token_id is not None:
             attrs["token.id"] = token_id
-        with self._make_span("transform", attrs) as span:
+        with self._make_span(EngineSpanName.TRANSFORM, attrs, run_id=run_id) as span:
             yield span
 
     @contextmanager
@@ -188,7 +461,8 @@ class SpanFactory:
         node_id: str | None = None,
         input_hash: str | None = None,
         token_id: str | None = None,
-    ) -> Iterator["Span | NoOpSpan"]:
+        run_id: str | None = None,
+    ) -> Iterator["Span | NoOpSpan | _TelemetrySpan"]:
         """Create a span for a gate operation.
 
         Args:
@@ -207,7 +481,7 @@ class SpanFactory:
             attrs["input.hash"] = input_hash
         if token_id is not None:
             attrs["token.id"] = token_id
-        with self._make_span("gate", attrs) as span:
+        with self._make_span(EngineSpanName.GATE, attrs, run_id=run_id) as span:
             yield span
 
     @contextmanager
@@ -219,7 +493,8 @@ class SpanFactory:
         input_hash: str | None = None,
         batch_id: str | None = None,
         token_ids: Sequence[str] | None = None,
-    ) -> Iterator["Span | NoOpSpan"]:
+        run_id: str | None = None,
+    ) -> Iterator["Span | NoOpSpan | _TelemetrySpan"]:
         """Create a span for an aggregation flush.
 
         Args:
@@ -245,7 +520,7 @@ class SpanFactory:
             attrs["batch.id"] = batch_id
         if token_ids is not None:
             attrs["token.ids"] = tuple(token_ids)
-        with self._make_span("aggregation", attrs) as span:
+        with self._make_span(EngineSpanName.AGGREGATION, attrs, run_id=run_id) as span:
             yield span
 
     @contextmanager
@@ -255,7 +530,8 @@ class SpanFactory:
         *,
         node_id: str | None = None,
         token_ids: Sequence[str] | None = None,
-    ) -> Iterator["Span | NoOpSpan"]:
+        run_id: str | None = None,
+    ) -> Iterator["Span | NoOpSpan | _TelemetrySpan"]:
         """Create a span for a sink write.
 
         Args:
@@ -275,5 +551,5 @@ class SpanFactory:
             attrs["node.id"] = node_id
         if token_ids is not None:
             attrs["token.ids"] = tuple(token_ids)
-        with self._make_span("sink", attrs) as span:
+        with self._make_span(EngineSpanName.SINK, attrs, run_id=run_id) as span:
             yield span

@@ -314,7 +314,8 @@ class GateExecutor:
                 node_id=node_id,
                 input_hash=input_hash,
                 token_id=token.token_id,
-            ):
+                run_id=ctx.run_id,
+            ) as gate_span:
                 start = time.perf_counter()
                 try:
                     parser = self._get_condition_parser(gate_config=gate_config, node_id=node_id)
@@ -323,6 +324,7 @@ class GateExecutor:
                     eval_result = parser.evaluate(token.row_data)
                     duration_ms = (time.perf_counter() - start) * 1000
                 except ExpressionEvaluationError as exc:
+                    self._spans.mark_error(gate_span, exc)
                     duration_ms = (time.perf_counter() - start) * 1000
                     on_error = gate_config.on_error
                     if on_error is None:

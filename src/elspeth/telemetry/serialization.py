@@ -207,6 +207,7 @@ class SyntheticReadableSpan(_ReadableSpanBase):
         start_time: int,
         end_time: int,
         kind: Any,  # SpanKind
+        parent: Any | None = None,  # SpanContext for reconstructed hierarchy
         resource: Any | None = None,  # Resource - optional, defaults to empty
         status: Any | None = None,  # Status - optional, defaults to OK
     ) -> None:
@@ -222,7 +223,7 @@ class SyntheticReadableSpan(_ReadableSpanBase):
         super().__init__(
             name=name,
             context=context,
-            parent=None,  # Synthetic spans have no parent
+            parent=parent,
             resource=span_resource,
             attributes=attributes,
             events=(),
