@@ -2036,7 +2036,7 @@ def materialize_guided_authorized_candidate(
         edges = _incident_edges(admitted["edges"], owners=frozenset({authority.owner_key}))
         raw_sources = predecessor.sources
         raw_nodes = predecessor.nodes
-        reconnected_slots: dict[str, set[str]] = {}
+        reconnected_slots: list[tuple[str, str]] = []
         for edge in edges:
             if edge.to_node != authority.owner_key:
                 raise _guided_delta_rejection("guided_delta_nonincident_route", facts={"edge_id": edge.edge_id})
@@ -2044,7 +2044,7 @@ def materialize_guided_authorized_candidate(
             edge_type = edge.edge_type
             if origin in raw_sources and edge_type == "on_success":
                 raw_sources[origin]["on_success"] = authority.owner_key
-                reconnected_slots.setdefault(origin, set()).add(edge_type)
+                reconnected_slots.append((origin, edge_type))
                 continue
             positions = [index for index, item in enumerate(raw_nodes) if item["id"] == origin]
             if len(positions) != 1 or edge_type not in {"on_success", "on_error"}:
@@ -2053,17 +2053,17 @@ def materialize_guided_authorized_candidate(
                     facts={"from_node": origin, "edge_type": edge_type},
                 )
             raw_nodes[positions[0]][edge_type] = authority.owner_key
-            reconnected_slots.setdefault(origin, set()).add(edge_type)
+            reconnected_slots.append((origin, edge_type))
         _replace_incident_edges(predecessor, owners=frozenset({authority.owner_key}), replacements=edges)
         # Reconnecting a producer to THIS sink leaves its mirror to the sink it
         # left behind untouched — that edge is not incident to the correction
         # owner, so the replacement above retains it. Reconcile exactly the
         # slots this delta rewrote (elspeth-a0a830fc95).
-        for reconnected_origin in sorted(reconnected_slots):
+        for reconnected_origin in sorted({origin for origin, _ in reconnected_slots}):
             _reconcile_draft_sink_mirror_edges(
                 predecessor,
                 origin_key=reconnected_origin,
-                edge_types=frozenset(reconnected_slots[reconnected_origin]),
+                edge_types=frozenset(slot for origin, slot in reconnected_slots if origin == reconnected_origin),
             )
     # Source-route and output-reconnection candidates above were constructed
     # from the private predecessor by this materializer, not reconstructed by
