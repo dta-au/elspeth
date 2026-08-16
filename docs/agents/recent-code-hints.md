@@ -234,6 +234,50 @@ sites against `config/cicd/masquerade_baseline.yaml`. Traps that have fired:
   store; re-resolving the RHS after a target-side walrus creates paired false
   positives and false negatives.
 
+**Do NOT rewrite the probe resolver. That road is closed** (decided
+2026-08-09; re-walked by accident and re-confirmed 2026-08-16). Two full
+attempts were built and rejected by independent review: a partial-CPython
+state model (Freezes 1-5, 5,216 lines, never merged) and then a sparse-SSA
+definition/phi/value-graph solver (Freeze 6). The Freeze 6 rejection found
+late-global, try/match, annotation-timing, loop-header, star-import and
+callee/argument misses, plus non-monotone `PROJECT` output and `CALL_RESULT`
+role collision — while its adversarial *scaling* was fine. The systems review
+classified Freezes 1-5 as a Fixes-that-Fail / Limits-to-Growth loop: local
+cases converge while the state model expands faster, producing new fail-open
+families. `inventory.py` is therefore the single authority, and the standing
+stop rules (`elspeth-02cd60d8cd`) are: **no CFG/SSA/history/replay/lazy-cache/
+object-emulator growth, and <=2.5x runtime per input doubling.** New semantic
+coverage lands as narrow, ticket-level RED tests against the existing visitor —
+see the open siblings `elspeth-682e0c6581` (definition-header replay),
+`elspeth-f1def53d38` (PEP 695/696 scopes) and `elspeth-2a72512454`
+(destructured RHS alias evidence).
+
+That entire history exists ONLY in `filigree get-comments elspeth-de6f571887`
+(a CLOSED issue); git messages, this file and the module said nothing until
+now, which is exactly why it got re-attempted. **Read that comment stream
+before touching resolution.**
+
+Three facts a future attempt will want, all measured 2026-08-16:
+
+- **Corpus agreement cannot validate a change here.** A candidate resolver
+  matched the shipped one on all 2,866 files (474/474 sites, zero false
+  positives) while still being fail-open on late-global. The evasion shapes
+  are absent from a tree that currently passes the gate, so the oracle must be
+  adversarial hand-written cases; the corpus run only answers "would today's
+  findings change".
+- **The gate is fail-open today** (`elspeth-34ac84b4b6`): loop back-edges get
+  no fixpoint, so a probe used before its rebind inside a loop is invisible,
+  and `_resolve_binding_expression` discards evidence when resolution fails
+  (`p = wrap(getattr); p(o,'a')` reports nothing). Fixable in place.
+- **`probe_shape` is invariant under a resolver change** — it is computed from
+  the AST node and kind, neither of which passes through resolution (verified:
+  354 distinct / 474 total digests, zero differing files). That is what makes
+  resolver work safe to attempt at all, since drift would reset the baseline's
+  39 human adjudications; land the digest comparison as a test before changing
+  anything. Cost context: one whole-tree scan is ~63s and
+  `test_masquerade_gate.py` runs four of them (~6 min), ~12% of which is a
+  separate quadratic with a ~5-line fix (`elspeth-df09888129`).
+
 ### 3. Trust-tier lint corpus (standing)
 
 `elspeth-lints check --rules all --root src/elspeth` is fail-closed (exit 1,
