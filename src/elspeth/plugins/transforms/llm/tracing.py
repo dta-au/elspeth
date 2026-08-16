@@ -35,6 +35,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+
 SUPPORTED_TRACING_PROVIDERS = frozenset({"none", "azure_ai", "langfuse"})
 
 
@@ -101,7 +103,15 @@ class LangfuseTracingConfig(TracingConfig):
         provider: Always 'langfuse'
         public_key: Langfuse public API key (REQUIRED - use ${LANGFUSE_PUBLIC_KEY})
         secret_key: Langfuse secret API key (REQUIRED - use ${LANGFUSE_SECRET_KEY})
-        host: Langfuse host URL (REQUIRED - operator must specify)
+        host: Langfuse host URL (REQUIRED - operator must specify).
+            ``create_langfuse_tracer`` hands this host to the Langfuse client
+            together with ``public_key`` and ``secret_key``, so it is a
+            credential-egress destination and is validated fail-closed at
+            settings load: HTTPS is required, embedded credentials
+            (``https://user:pass@host``) are rejected, and the URL must carry
+            a hostname. Plaintext ``http://`` is permitted ONLY for a loopback
+            hostname (``localhost``, ``127.0.0.0/8``, ``::1``), which is the
+            legitimate self-hosted-Langfuse-in-development case.
         tracing_enabled: Whether tracing is enabled (v3 parameter, default: True)
     """
 
@@ -120,6 +130,21 @@ class LangfuseTracingConfig(TracingConfig):
             raise ValueError("LangfuseTracingConfig requires secret_key. Use ${LANGFUSE_SECRET_KEY} in YAML.")
         if self.host is None:
             raise ValueError("LangfuseTracingConfig requires host (e.g. 'https://cloud.langfuse.com' or your on-prem URL).")
+        # ``parse_tracing_config`` splats untrusted YAML into this dataclass, so
+        # a non-string host would reach the shared validator's ``.strip()`` as an
+        # AttributeError rather than a configuration rejection.
+        if type(self.host) is not str:
+            raise ValueError(f"LangfuseTracingConfig requires host to be a URL string, got {type(self.host).__name__}.")
+        # The host is a credential-egress destination: it travels to the Langfuse
+        # client alongside public_key and secret_key. Fail closed on plaintext
+        # transport off the loopback interface, on embedded credentials, and on a
+        # value that carries no hostname (elspeth-f54b6a6f55). Store the
+        # validated string so the client cannot receive an unstripped variant.
+        object.__setattr__(
+            self,
+            "host",
+            validate_credential_safe_https_url(self.host, field_name="host", allow_http_loopback=True),
+        )
 
 
 def parse_tracing_config(config: dict[str, Any] | None) -> TracingConfig | None:

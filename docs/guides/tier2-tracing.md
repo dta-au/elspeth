@@ -118,6 +118,30 @@ transforms:
         tracing_enabled: true  # v3: Can be disabled per-plugin (default: true)
 ```
 
+### Host Constraints
+
+ELSPETH sends `public_key` and `secret_key` to `host`, so the host is a
+credential-egress destination and is validated fail-closed when settings load.
+A pipeline whose `host` breaks any of these rules refuses to start:
+
+| Rule | Rejected example |
+| --- | --- |
+| The scheme must be `https` | `http://langfuse.example.com` |
+| The URL must not carry embedded credentials | `https://user:pass@langfuse.example.com` |
+| The URL must resolve to a hostname | `https://`, `langfuse.example.com` |
+
+**Loopback exception.** Plaintext `http://` is permitted when — and only when —
+the hostname is a loopback address (`localhost`, `127.0.0.0/8`, `::1`), so a
+self-hosted Langfuse running on the same machine during development works
+without a certificate:
+
+```yaml
+        host: http://localhost:3000  # Permitted: loopback only
+```
+
+A non-loopback hostname over `http://` is refused even on a private network,
+because plaintext transport exposes both API keys to anything on the path.
+
 ### Required Dependency
 
 ```bash

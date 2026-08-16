@@ -190,3 +190,111 @@ class TestTracingConfigValidation:
         assert len(errors) == 1
         assert "Unknown tracing provider" in errors[0]
         assert "unknown_provider" in errors[0]
+
+
+def _langfuse(host: object) -> LangfuseTracingConfig:
+    """Construct a Langfuse tracing config that varies only in ``host``."""
+    return LangfuseTracingConfig(public_key="pk-xxx", secret_key="sk-xxx", host=host)  # type: ignore[arg-type]
+
+
+class TestLangfuseHostEgressGuard:
+    """The Langfuse host carries public_key/secret_key to a network peer.
+
+    ``create_langfuse_tracer`` hands ``host`` to ``Langfuse(...)`` alongside
+    both API keys, so a plaintext or credential-bearing host is a secret-egress
+    channel. The settings-load boundary must fail closed (elspeth-f54b6a6f55).
+    """
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "https://cloud.langfuse.com",
+            "https://langfuse.example.com/",
+            "https://langfuse.example.com:3000",
+            "https://langfuse.example.com/observability",
+            "https://langfuse.example.com:3000/observability/",
+        ],
+        ids=["bare", "trailing-slash", "port", "path-prefix", "port-and-path"],
+    )
+    def test_accepts_https_hosts(self, host: str) -> None:
+        """HTTPS hosts — including port and path-prefix forms — stay accepted."""
+        assert _langfuse(host).host == host
+
+    @pytest.mark.parametrize(
+        "host",
+        ["http://localhost", "http://localhost:3000", "http://127.0.0.1:3000", "http://[::1]:3000"],
+        ids=["localhost", "localhost-port", "ipv4-loopback", "ipv6-loopback"],
+    )
+    def test_accepts_http_loopback_hosts(self, host: str) -> None:
+        """Self-hosted local Langfuse over plaintext loopback is legitimate."""
+        assert _langfuse(host).host == host
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "http://langfuse.example.invalid",
+            "http://127.0.0.1.evil.invalid",
+            "http://localhost.evil.invalid",
+            "http://10.0.0.5",
+        ],
+        ids=["public-host", "loopback-prefixed-host", "localhost-prefixed-host", "private-non-loopback"],
+    )
+    def test_rejects_plaintext_non_loopback_hosts(self, host: str) -> None:
+        """Plaintext HTTP off the loopback interface would egress both API keys."""
+        with pytest.raises(ValueError, match="HTTPS"):
+            _langfuse(host)
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "https://user:s3cr3t-p4ssw0rd@langfuse.example.com",
+            "http://user:s3cr3t-p4ssw0rd@localhost:3000",
+            "https://s3cr3t-p4ssw0rd@langfuse.example.com",
+        ],
+        ids=["https-userinfo", "http-loopback-userinfo", "username-only"],
+    )
+    def test_rejects_embedded_credentials_without_echoing_them(self, host: str) -> None:
+        """Userinfo is rejected, and the rejection never echoes the credential."""
+        with pytest.raises(ValueError, match="embedded credentials") as excinfo:
+            _langfuse(host)
+        assert "s3cr3t-p4ssw0rd" not in str(excinfo.value)
+        assert "user" not in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "host",
+        ["https://", "langfuse.example.com", "/observability", "not a url"],
+        ids=["scheme-only", "bare-authority", "bare-path", "unparseable"],
+    )
+    def test_rejects_hosts_without_a_hostname(self, host: str) -> None:
+        """A value urlsplit cannot resolve to a hostname is not addressable."""
+        with pytest.raises(ValueError, match="hostname"):
+            _langfuse(host)
+
+    def test_rejects_empty_host(self) -> None:
+        """An empty host is a configuration mistake, not an implicit default."""
+        with pytest.raises(ValueError, match="host"):
+            _langfuse("")
+
+    @pytest.mark.parametrize("host", [123, ["https://langfuse.example.com"]], ids=["int", "list"])
+    def test_rejects_non_string_host_as_value_error(self, host: object) -> None:
+        """parse_tracing_config splats untrusted YAML, so a non-str host must
+        raise ValueError at the boundary rather than AttributeError inside it."""
+        with pytest.raises(ValueError, match="host"):
+            _langfuse(host)
+
+    def test_stores_the_stripped_host(self) -> None:
+        """The validated string is the stored string — surrounding whitespace
+        must not survive validation and reach the Langfuse client unstripped."""
+        assert _langfuse("  https://langfuse.example.com  ").host == "https://langfuse.example.com"
+
+    def test_parse_tracing_config_enforces_the_same_rule(self) -> None:
+        """The guard is reachable through the YAML parse entry point."""
+        with pytest.raises(ValueError, match="HTTPS"):
+            parse_tracing_config(
+                {
+                    "provider": "langfuse",
+                    "public_key": "pk-xxx",
+                    "secret_key": "sk-xxx",
+                    "host": "http://langfuse.example.invalid",
+                }
+            )
