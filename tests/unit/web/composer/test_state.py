@@ -1027,6 +1027,377 @@ class TestStage1Validation:
         assert entry.component == "node:Q_in"
         assert "lowercase" in entry.message
 
+    def _label_probe_state(self, **overrides: Any) -> CompositionState:
+        """source -> t1 -> main with one field overridden; the control passes no override."""
+        source = SourceSpec(
+            plugin="csv",
+            on_success=overrides.get("source_on_success", "t_in"),
+            options={},
+            on_validation_failure="discard",
+        )
+        transform = NodeSpec(
+            id="t1",
+            node_type="transform",
+            plugin="passthrough",
+            input=overrides.get("transform_input", "t_in"),
+            on_success=overrides.get("transform_on_success", "main"),
+            on_error=overrides.get("transform_on_error", "discard"),
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        output = OutputSpec(
+            name=overrides.get("output_name", "main"),
+            plugin="csv",
+            options={},
+            on_write_failure=overrides.get("on_write_failure", "discard"),
+        )
+        state = self._empty_state().with_source(source).with_node(transform)
+        return state.with_output(output)
+
+    @pytest.mark.parametrize(
+        ("overrides", "code", "fragment"),
+        [
+            pytest.param(
+                {"source_on_success": ""},
+                "connection_label_invalid",
+                "Source on_success must be a connection name or sink name",
+                id="source-on_success-empty",
+            ),
+            pytest.param({"source_on_success": "__t"}, "connection_label_invalid", "starts with '__'", id="source-on_success-dunder"),
+            pytest.param(
+                {"transform_input": ""},
+                "connection_label_invalid",
+                "Transform input connection must not be empty",
+                id="transform-input-empty",
+            ),
+            pytest.param({"transform_input": "continue"}, "connection_label_invalid", "is reserved", id="transform-input-reserved"),
+            pytest.param({"transform_input": "t" * 65}, "connection_label_invalid", "exceeds max length 64", id="transform-input-too-long"),
+            pytest.param(
+                {"transform_on_success": "has space"}, "connection_label_invalid", "invalid characters", id="transform-on_success-chars"
+            ),
+            pytest.param(
+                {"transform_on_error": ""},
+                "connection_label_invalid",
+                "on_error must be a sink name or 'discard'",
+                id="transform-on_error-empty",
+            ),
+            pytest.param({"output_name": "Main"}, "output_name_invalid", "must be lowercase", id="output-name-uppercase"),
+            pytest.param({"output_name": "__main"}, "output_name_invalid", "starts with '__'", id="output-name-dunder"),
+            pytest.param(
+                {"on_write_failure": ""},
+                "connection_label_invalid",
+                "on_write_failure must be a sink name or 'discard'",
+                id="on_write_failure-empty",
+            ),
+        ],
+    )
+    def test_label_violating_runtime_rules_is_rejected(self, overrides: dict[str, Any], code: str, fragment: str) -> None:
+        """Every routing label the runtime settings model validates must be validated by Stage 1 too.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). ``core/config.py`` runs
+        ``_validate_connection_or_sink_name`` (non-empty, <=64, connection
+        character class, not a reserved edge label, no ``__`` prefix) on every
+        connection/route/branch label and ``validate_sink_name`` (plus
+        lowercase, <=38) on every sink name. Stage 1 only noticed a bad label
+        indirectly through the dangling-reference rules — and those go silent
+        exactly when the bad label is CONSISTENT (a blank on_success feeding a
+        blank input validated green), while ``_SetOutputArgumentsModel.sink_name``
+        was an unconstrained string on the freeform path (elspeth-88a4db09f9).
+        """
+        result = self._label_probe_state(**overrides).validate()
+
+        assert not result.is_valid
+        matching = [e for e in result.errors if e.error_code == code]
+        assert matching, [(e.error_code, e.message) for e in result.errors]
+        assert any(fragment in e.message for e in matching), [e.message for e in matching]
+
+    def test_label_probe_control_is_accepted(self) -> None:
+        """Positive control for the label rules — the unmodified probe state validates green."""
+        result = self._label_probe_state().validate()
+
+        assert result.is_valid, result.errors
+
+    def test_gate_route_and_fork_labels_follow_runtime_rules(self) -> None:
+        """Route labels must be non-empty and valid; ``continue`` is a removed destination; fork branch names are labels too."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="'x'",
+                routes={"": "main", "b": "continue", "c": "fork"},
+                fork_to=("", "__hidden"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        messages = [e.message for e in result.errors if e.error_code == "connection_label_invalid"]
+        assert any("Route labels must not be empty" in m for m in messages), result.errors
+        assert any("Route destination 'continue' has been removed" in m for m in messages), result.errors
+        assert any("Fork branch names must not be empty" in m for m in messages), result.errors
+        assert any("Fork branch name '__hidden' starts with '__'" in m for m in messages), result.errors
+
+    def test_coalesce_branch_labels_follow_runtime_rules(self) -> None:
+        """Branch keys/values must be non-empty, valid, and not collide after trimming or repeat in list form."""
+
+        def coalesce(node_id: str, branches: Any) -> NodeSpec:
+            return NodeSpec(
+                id=node_id,
+                node_type="coalesce",
+                plugin=None,
+                input="cx",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=branches,
+                policy="require_all",
+                merge="union",
+            )
+
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "discard"},
+                fork_to=("x", "x ", "p", "e"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(coalesce("c_trim", {"x": "cx", "x ": "cy"}))
+        state = state.with_node(coalesce("c_empty", {"e": ""}))
+        state = state.with_node(coalesce("c_list", ("p", "p")))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        by_component: dict[str, list[str]] = {}
+        for e in result.errors:
+            if e.error_code == "connection_label_invalid":
+                by_component.setdefault(e.component, []).append(e.message)
+        assert any("collide after trimming whitespace" in m for m in by_component.get("node:c_trim", ())), result.errors
+        assert any("input connection must not be empty" in m for m in by_component.get("node:c_empty", ())), result.errors
+        assert by_component.get("node:c_list") == ["Duplicate branch names in list: ['p']"], result.errors
+
+    def test_gate_empty_fork_to_is_rejected(self) -> None:
+        """``fork_to=()`` is neither "no fork" nor a fork: the runtime rejects it, and used to crash on it."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="row['x'] > 0",
+                routes={"true": "main", "false": "discard"},
+                fork_to=(),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "gate_fork_to_empty"]
+        assert entry.component == "node:g"
+
+    @pytest.mark.parametrize("collides_with", ["sink", "source"])
+    def test_node_id_colliding_with_sink_or_source_name_is_rejected(self, collides_with: str) -> None:
+        """One namespace across nodes, sources and sinks (``validate_globally_unique_node_names``)."""
+        state = CompositionState(
+            sources={"primary": self._make_source(on_success="t_in")},
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        node_id = "primary" if collides_with == "source" else "main"
+        state = state.with_node(self._make_transform(node_id, "t_in", "main"))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "node_id_collides_with_source_or_sink"]
+        assert entry.component == f"node:{node_id}"
+        assert f"used by both transform and {collides_with}" in entry.message
+
+    def _fork_gate(self, node_id: str, input_name: str, fork_to: tuple[str, ...]) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="gate",
+            plugin=None,
+            input=input_name,
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="True",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=fork_to,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def test_fork_branch_declared_by_two_gates_over_sink_names_is_rejected(self) -> None:
+        """Fork branch names are globally unique across gates — even when they are also sink names.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). The duplicate-producer
+        accounting deliberately skips branch names that are sink names, so
+        two gates each forking to ['main', 'other'] validated green while
+        the DAG build raised "Fork branch 'main' is declared by multiple
+        gates". The control forks DISTINCT sink names from the second gate.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g1_in"))
+        state = state.with_node(self._fork_gate("g1", "g1_in", ("main", "other")))
+        state = state.with_node(self._make_transform("t1", "other", "g2_in"))
+        state = state.with_node(self._fork_gate("g2", "g2_in", ("main", "third")))
+        for name in ("main", "other", "third"):
+            state = state.with_output(self._make_output(name))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "fork_branch_declared_by_multiple_gates"]
+        assert entry.component == "node:g2"
+        assert "'g1' and 'g2'" in entry.message
+
+    def test_fork_branches_over_distinct_sink_names_are_accepted(self) -> None:
+        """Positive control for the multi-gate fork-branch rule."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g1_in"))
+        state = state.with_node(self._fork_gate("g1", "g1_in", ("main", "other")))
+        state = state.with_node(self._make_transform("t1", "other", "g2_in"))
+        state = state.with_node(self._fork_gate("g2", "g2_in", ("third", "fourth")))
+        for name in ("main", "other", "third", "fourth"):
+            state = state.with_output(self._make_output(name))
+
+        result = state.validate()
+
+        assert not any(e.error_code == "fork_branch_declared_by_multiple_gates" for e in result.errors), result.errors
+
+    def test_single_branch_coalesce_is_rejected(self) -> None:
+        """``CoalesceSettings.branches`` is ``min_length=2`` — declarative, so no raise site names it."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(self._fork_gate("g", "g_in", ("x",)))
+        state = state.with_node(self._make_transform("tx", "x", "cx"))
+        state = state.with_node(
+            NodeSpec(
+                id="c",
+                node_type="coalesce",
+                plugin=None,
+                input="cx",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"x": "cx"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "coalesce_branches_invalid"]
+        assert entry.component == "node:c"
+
+    def test_coalesce_branch_alias_no_gate_forks_is_rejected(self) -> None:
+        """A coalesce branch KEY must be some gate's fork_to entry (row_union already had this rule)."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(self._fork_gate("g", "g_in", ("b2", "b3")))
+        state = state.with_node(self._make_transform("t1", "b3", "t1_out"))
+        state = state.with_node(
+            NodeSpec(
+                id="c",
+                node_type="coalesce",
+                plugin=None,
+                input="b2",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"b1": "t1_out", "b2": "b2"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "coalesce_branch_alias_unreachable"]
+        assert entry.component == "node:c"
+        assert "['b1']" in entry.message
+
+    def test_more_sinks_than_the_runtime_cap_is_rejected(self) -> None:
+        """``ElspethSettings.sinks`` is ``Field(max_length=50)`` — declarative, no raise site; 51 sinks validated green."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="main0"))
+        for index in range(51):
+            state = state.with_output(self._make_output(f"main{index}"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "pipeline_collection_cap_exceeded"]
+        assert "51 sinks" in entry.message and "at most 50" in entry.message
+
+    def test_gate_with_more_than_32_fork_branches_is_rejected(self) -> None:
+        """``GateSettings.fork_to`` is ``Field(max_length=32)``."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        branches = tuple(f"b{i}" for i in range(33))
+        state = state.with_node(self._fork_gate("g", "g_in", branches))
+        for branch in branches:
+            state = state.with_output(self._make_output(branch))
+
+        result = state.validate()
+
+        assert any(e.error_code == "pipeline_collection_cap_exceeded" and "33 fork branches" in e.message for e in result.errors), (
+            result.errors
+        )
+
     def test_transform_cycle_is_rejected(self) -> None:
         """Two transforms feeding each other must not validate green.
 
@@ -6564,8 +6935,30 @@ class TestSchemaContractValidation:
         state = self._empty_state()
         state = state.with_source(
             self._make_source(
-                on_success="branch_a",
+                on_success="fork_in",
                 options={"schema": {"mode": "fixed", "fields": ["text: str"]}},
+            )
+        )
+        # A coalesce's branches must be produced by a gate fork_to (the
+        # runtime rejects a coalesce no gate feeds; Stage 1 mirrors that as
+        # ``coalesce_branch_alias_unreachable``, elspeth-2ed41f0a4a), so the
+        # fixture forks first — the abstention under test is about the
+        # coalesce's MERGE mode, not its wiring.
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="fork_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("branch_a", "branch_b"),
+                branches=None,
+                policy=None,
+                merge=None,
             )
         )
         state = state.with_node(
@@ -6573,6 +6966,7 @@ class TestSchemaContractValidation:
                 "after_merge",
                 "branch_a",
                 None,
+                branches=("branch_a", "branch_b"),
             )
         )
         state = state.with_node(
@@ -6584,7 +6978,7 @@ class TestSchemaContractValidation:
             )
         )
         state = state.with_output(self._make_output())
-        state = state.with_edge(self._make_edge("e1", "source", "after_merge"))
+        state = state.with_edge(self._make_edge("e1", "source", "fork_gate"))
         state = state.with_edge(self._make_edge("e2", "after_merge", "t1"))
 
         result = state.validate()
@@ -7822,7 +8216,7 @@ class TestPassThroughComposerParity:
                 options={},
                 condition="True",
                 routes={"true": "fork", "false": "fork"},
-                fork_to=("path_a", "overflow"),
+                fork_to=("path_a", "path_b", "overflow"),
                 branches=None,
                 policy=None,
                 merge=None,
@@ -7833,6 +8227,20 @@ class TestPassThroughComposerParity:
                 "pt_node",
                 "path_a",
                 "pt_out",
+                plugin="passthrough",
+                options={"schema": {"mode": "observed"}},
+            )
+        )
+        # A coalesce needs at least two branches at the runtime
+        # (``CoalesceSettings.branches`` min_length=2; Stage 1 mirrors it as
+        # ``coalesce_branches_invalid``, elspeth-2ed41f0a4a) — the second
+        # pass-through arm keeps the fixture runnable without changing what
+        # the test pins (guarantee inheritance through the fork/pass-through).
+        state = state.with_node(
+            self._make_transform(
+                "pt_node_b",
+                "path_b",
+                "pt_b_out",
                 plugin="passthrough",
                 options={"schema": {"mode": "observed"}},
             )
@@ -7849,7 +8257,7 @@ class TestPassThroughComposerParity:
                 condition=None,
                 routes=None,
                 fork_to=None,
-                branches={"path_a": "pt_out"},
+                branches={"path_a": "pt_out", "path_b": "pt_b_out"},
                 policy="require_all",
                 merge="union",
             )

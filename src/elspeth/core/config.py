@@ -852,6 +852,12 @@ class GateSettings(BaseModel):
         """
         if v is None:
             return v
+        if not v:
+            # An empty list is not "no fork": ``_GateEntry.__post_init__``
+            # rejects an empty tuple, and it must never get that far — a
+            # settings-level rejection is a structured verdict; the builder's
+            # is a crash (elspeth-2ed41f0a4a).
+            raise ValueError("fork_to must not be an empty list; omit it (or use null) for no fork")
 
         stripped = []
         for branch in v:

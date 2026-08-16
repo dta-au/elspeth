@@ -172,6 +172,255 @@ def _composer_node_id_validation_message(node_id: str, node_type: str) -> str | 
     return None
 
 
+def _label_message(value: str, *, field_label: str) -> str | None:
+    """Return the runtime's own rejection for a connection/sink label, or ``None``.
+
+    Calls ``core/config.py::_validate_connection_or_sink_name`` — the exact
+    function every ``*Settings`` validator runs on connection, route, branch
+    and sink-reference labels — and captures its ``ValueError`` text, so the
+    Stage-1 message is the runtime message by construction (max 64,
+    connection character class, reserved edge labels, ``__`` prefix).
+    Callers own the empty-check wording, which differs per field upstream.
+    """
+    try:
+        _validate_connection_or_sink_name(value, field_label=field_label)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def _routing_label_errors(
+    *,
+    sources: Mapping[str, SourceSpec],
+    nodes: tuple[NodeSpec, ...],
+    outputs: tuple[OutputSpec, ...],
+) -> list[ValidationEntry]:
+    """Mirror every label rule ``core/config.py`` applies at ``settings_load``.
+
+    Stage 1 previously noticed a bad routing label only INDIRECTLY, through
+    the dangling-reference rules — which go silent exactly when the bad
+    label is CONSISTENT: a blank ``on_success`` feeding a blank ``input``,
+    a connection named ``continue`` on both ends, an ``__``-prefixed fork
+    branch that a coalesce also declares. Each validated green and died at
+    ``settings_load`` (elspeth-2ed41f0a4a census, 2026-08-17). Sink names
+    were unvalidated on the freeform path altogether (elspeth-88a4db09f9).
+
+    Field-by-field the wording tracks the runtime validator that owns the
+    field (empty-check text is per field there too); label rules come from
+    :func:`_label_message`. Aggregation ``on_error`` and source
+    ``on_validation_failure`` carry no ``config.py`` validator — the DAG
+    builder resolves them — so they are deliberately absent here; the
+    dangling-target rules already cover them.
+    """
+    found: list[ValidationEntry] = []
+
+    def add(component: str, message: str, code: str = "connection_label_invalid") -> None:
+        found.append(ValidationEntry(component, message, "high", code))
+
+    def label(component: str, value: object, field_label: str) -> None:
+        # Malformed external values (a non-string branch value from a
+        # persisted payload) are owned by the intrinsic node-shape checks;
+        # this rule only speaks to well-typed labels.
+        if not isinstance(value, str):
+            return
+        message = _label_message(value, field_label=field_label)
+        if message is not None:
+            add(component, message)
+
+    for source_name, source in sources.items():
+        component = "source" if source_name == "source" else f"source:{source_name}"
+        if not source.on_success or not source.on_success.strip():
+            add(component, "Source on_success must be a connection name or sink name")
+        else:
+            label(component, source.on_success, "Source on_success connection name")
+
+    for node in nodes:
+        component = f"node:{node.id}"
+        if node.node_type in ("transform", "aggregation", "gate"):
+            kind = {"transform": "Transform", "aggregation": "Aggregation", "gate": "Gate"}[node.node_type]
+            if node.input is None or not node.input.strip():
+                add(component, f"{kind} input connection must not be empty")
+            else:
+                label(component, node.input, f"{kind} input connection name")
+        if node.node_type == "transform":
+            if node.on_success is not None:
+                if not node.on_success.strip():
+                    add(component, "on_success must be a connection name or sink name")
+                else:
+                    label(component, node.on_success, "Transform on_success connection name")
+            if node.on_error is not None:
+                if not node.on_error.strip():
+                    add(component, "on_error must be a sink name or 'discard'")
+                elif node.on_error != _DISCARD_ROUTE_TARGET:
+                    label(component, node.on_error, "Transform on_error sink name")
+        elif node.node_type == "aggregation":
+            if node.on_success is not None:
+                if not node.on_success.strip():
+                    add(component, "on_success must be a connection name, sink name, or omitted entirely")
+                else:
+                    label(component, node.on_success, "Aggregation on_success connection name")
+        elif node.node_type == "gate":
+            for route_label, destination in (node.routes or {}).items():
+                if not route_label:
+                    add(component, "Route labels must not be empty")
+                else:
+                    label(component, route_label, "Route label")
+                if destination in (_FORK_ROUTE_TARGET, _DISCARD_ROUTE_TARGET):
+                    continue
+                if destination == "continue":
+                    add(component, "Route destination 'continue' has been removed. Use an explicit connection name or sink name.")
+                    continue
+                label(component, destination, f"Route destination for label '{route_label}'")
+            if node.on_error is not None:
+                if not node.on_error.strip():
+                    add(component, "on_error must be a sink name, 'discard', or omitted")
+                elif node.on_error != _DISCARD_ROUTE_TARGET:
+                    label(component, node.on_error, "Gate on_error sink name")
+            for branch in node.fork_to or ():
+                if not branch or not branch.strip():
+                    add(component, "Fork branch names must not be empty")
+                else:
+                    label(component, branch, "Fork branch name")
+        elif node.node_type in ("coalesce", "row_union"):
+            kind = "Coalesce" if node.node_type == "coalesce" else "row_union"
+            raw_branches = node.branches
+            # Typed ``object`` on purpose: a persisted payload can carry a
+            # non-string branch value that ``NodeSpec.from_dict`` admits and
+            # the intrinsic node-shape checks own; the isinstance guard below
+            # keeps this rule to well-typed labels.
+            items: list[tuple[object, object]]
+            if isinstance(raw_branches, Mapping):
+                items = list(raw_branches.items())
+            elif raw_branches is not None:
+                listed = [name for name in raw_branches if isinstance(name, str)]
+                duplicates = sorted({name for name in listed if listed.count(name) > 1})
+                if duplicates:
+                    # The runtime's ``normalize_branches`` raises here before
+                    # the per-branch validator runs; report once, then walk
+                    # the distinct names so the same duplicate is not
+                    # re-reported as a trim collision.
+                    add(component, f"Duplicate branch names in list: {duplicates}")
+                items = [(name, name) for name in dict.fromkeys(listed)]
+            else:
+                items = []
+            seen_keys: set[str] = set()
+            for branch_name, connection in items:
+                if not isinstance(branch_name, str) or not isinstance(connection, str):
+                    continue
+                if not branch_name or not branch_name.strip():
+                    add(component, f"{kind} branch names must not be empty")
+                    continue
+                if not connection or not connection.strip():
+                    add(component, f"{kind} branch '{branch_name}' input connection must not be empty")
+                    continue
+                key = branch_name.strip()
+                if key in seen_keys:
+                    add(component, f"{kind} branch names collide after trimming whitespace: '{key}' is declared twice")
+                seen_keys.add(key)
+                label(component, key, f"{kind} branch name")
+                label(component, connection.strip(), f"{kind} branch '{key}' input connection")
+            if node.node_type == "coalesce":
+                if node.on_success is not None:
+                    if not node.on_success.strip():
+                        add(component, "on_success must be a sink name or omitted entirely")
+                    else:
+                        label(component, node.on_success, "Coalesce on_success sink name")
+            elif node.on_success is None or not node.on_success.strip():
+                add(component, "row_union on_success must not be empty")
+            else:
+                label(component, node.on_success, "row_union on_success connection name")
+
+    for output in outputs:
+        component = f"output:{output.name}"
+        try:
+            validate_composer_output_name(output.name)
+        except ValueError as exc:
+            add(component, str(exc), "output_name_invalid")
+        if not output.on_write_failure or not output.on_write_failure.strip():
+            add(component, "on_write_failure must be a sink name or 'discard'")
+        elif output.on_write_failure != _DISCARD_ROUTE_TARGET:
+            label(component, output.on_write_failure, "Sink on_write_failure sink name")
+
+    return found
+
+
+# ``ElspethSettings`` collection caps (``Field(max_length=...)`` in
+# core/config.py); the composer's node types map onto the runtime sections
+# they export to.
+_RUNTIME_COLLECTION_CAPS: Final[dict[str, int]] = {
+    "sources": 50,
+    "sinks": 50,
+    "queues": 100,
+    "transforms": 500,
+    "gates": 100,
+    "coalesce": 100,
+    "row_unions": 100,
+    "aggregations": 100,
+}
+_RUNTIME_SECTION_BY_NODE_TYPE: Final[dict[str, str]] = {
+    "transform": "transforms",
+    "gate": "gates",
+    "aggregation": "aggregations",
+    "coalesce": "coalesce",
+    "row_union": "row_unions",
+    "queue": "queues",
+}
+_RUNTIME_GATE_MAPPING_CAP: Final = 32  # GateSettings.routes / fork_to max_length
+
+
+def _collection_cap_errors(
+    *,
+    sources: Mapping[str, SourceSpec],
+    nodes: tuple[NodeSpec, ...],
+    outputs: tuple[OutputSpec, ...],
+) -> list[ValidationEntry]:
+    """Mirror the runtime's declarative collection caps.
+
+    ``ElspethSettings.sources/sinks/...`` and ``GateSettings.routes/fork_to``
+    carry ``Field(max_length=...)`` — a settings-load rejection with no raise
+    site, invisible to a raise census and to Stage 1 until now. A composer
+    could author a 51st sink and read ``is_valid: true``.
+    """
+    found: list[ValidationEntry] = []
+    counts: Counter[str] = Counter({"sources": len(sources), "sinks": len(outputs)})
+    for node in nodes:
+        if node.node_type in _RUNTIME_SECTION_BY_NODE_TYPE:
+            counts[_RUNTIME_SECTION_BY_NODE_TYPE[node.node_type]] += 1
+    for section, count in counts.items():
+        cap = _RUNTIME_COLLECTION_CAPS[section]
+        if count > cap:
+            found.append(
+                ValidationEntry(
+                    "pipeline",
+                    f"Pipeline declares {count} {section}; the runtime accepts at most {cap}.",
+                    "high",
+                    "pipeline_collection_cap_exceeded",
+                )
+            )
+    for node in nodes:
+        if node.node_type != "gate":
+            continue
+        if node.routes is not None and len(node.routes) > _RUNTIME_GATE_MAPPING_CAP:
+            found.append(
+                ValidationEntry(
+                    f"node:{node.id}",
+                    f"Gate '{node.id}' declares {len(node.routes)} routes; the runtime accepts at most {_RUNTIME_GATE_MAPPING_CAP}.",
+                    "high",
+                    "pipeline_collection_cap_exceeded",
+                )
+            )
+        if node.fork_to is not None and len(node.fork_to) > _RUNTIME_GATE_MAPPING_CAP:
+            found.append(
+                ValidationEntry(
+                    f"node:{node.id}",
+                    f"Gate '{node.id}' declares {len(node.fork_to)} fork branches; the runtime accepts at most {_RUNTIME_GATE_MAPPING_CAP}.",
+                    "high",
+                    "pipeline_collection_cap_exceeded",
+                )
+            )
+    return found
+
+
 def _composer_source_name_validation_message(source_name: str) -> str | None:
     """Return the runtime-equivalent source-name validation error, if any."""
     if not source_name or not source_name.strip():
@@ -5253,6 +5502,15 @@ class CompositionState:
                 component = "source" if source_name == "source" else f"source:{source_name}"
                 errors.append(_err(component, source_name_error, "high", "source_name_invalid"))
 
+        # 1b. Every routing label the runtime settings model validates
+        # (elspeth-2ed41f0a4a): connection/route/branch labels and sink names.
+        errors.extend(_routing_label_errors(sources=self.sources, nodes=self.nodes, outputs=self.outputs))
+
+        # 1c. Collection caps — ``ElspethSettings``/``GateSettings`` declare
+        # them as pydantic ``Field(max_length=...)`` constraints, which reject
+        # at settings load with no raise site of their own (elspeth-2ed41f0a4a).
+        errors.extend(_collection_cap_errors(sources=self.sources, nodes=self.nodes, outputs=self.outputs))
+
         # 2. At least one output
         if not self.outputs:
             errors.append(_err("pipeline", "No sinks configured.", "high", "no_sinks_configured"))
@@ -5284,9 +5542,25 @@ class CompositionState:
 
         # 4. Node IDs unique and runtime-valid
         seen_node_ids: set[str] = set()
+        # The runtime requires ONE namespace across every node kind, sources
+        # and sinks (ElspethSettings.validate_globally_unique_node_names);
+        # Stage 1 checked node-vs-node and queue-vs-source only
+        # (elspeth-2ed41f0a4a census, 2026-08-17).
+        source_names = frozenset(self.sources)
         for node in self.nodes:
             if node.id in seen_node_ids:
                 errors.append(_err(f"node:{node.id}", f"Duplicate node ID: '{node.id}'.", "high", "duplicate_node_id"))
+            elif node.id in output_names or (node.id in source_names and node.node_type != "queue"):
+                other = "sink" if node.id in output_names else "source"
+                errors.append(
+                    _err(
+                        f"node:{node.id}",
+                        f"Node name '{node.id}' is used by both {node.node_type} and {other}. All node names must be "
+                        "unique across transforms, gates, aggregations, coalesce nodes, row_union nodes, sources, queues, and sinks.",
+                        "high",
+                        "node_id_collides_with_source_or_sink",
+                    )
+                )
             node_id_message = _composer_node_id_validation_message(node.id, node.node_type)
             if node_id_message is not None:
                 errors.append(_err(f"node:{node.id}", node_id_message, "high", "node_id_invalid"))
@@ -5466,6 +5740,20 @@ class CompositionState:
                                 "gate_fork_to_without_fork_route",
                             )
                         )
+                    # An EMPTY fork_to is not "no fork" — the runtime settings
+                    # model rejects it (GateSettings.validate_fork_to_labels)
+                    # and, before that guard existed, it crashed the DAG
+                    # builder (elspeth-2ed41f0a4a). Both consistency checks
+                    # above read ``()`` as falsy, so this needs its own arm.
+                    if node.fork_to is not None and len(node.fork_to) == 0:
+                        errors.append(
+                            _err(
+                                f"node:{node.id}",
+                                f"Gate '{node.id}' fork_to must not be an empty list; omit it (or use null) for no fork.",
+                                "high",
+                                "gate_fork_to_empty",
+                            )
+                        )
             elif node.node_type == "transform":
                 # Negative constraints — transforms must not have gate fields
                 if node.condition is not None:
@@ -5521,6 +5809,20 @@ class CompositionState:
                             f"Coalesce '{node.id}' is missing required field 'branches'.",
                             "high",
                             "coalesce_missing_branches",
+                        )
+                    )
+                elif len(dict.fromkeys(_coalesce_branch_names(node.branches))) < 2:
+                    # ``CoalesceSettings.branches`` is ``Field(min_length=2)`` —
+                    # a DECLARATIVE constraint, so no raise site names it and
+                    # the AST census could not see it; found by probe
+                    # (elspeth-2ed41f0a4a, 2026-08-17). A one-branch coalesce
+                    # merges nothing and the runtime refuses it at settings load.
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Coalesce '{node.id}' requires at least two branches.",
+                            "high",
+                            "coalesce_branches_invalid",
                         )
                     )
                 # Mirror the engine's closed vocabularies (core/config.py
@@ -5810,6 +6112,33 @@ class CompositionState:
         }
         gate_fork_branches = {branch for branches in gate_fork_branches_by_id.values() for branch in branches}
 
+        # Fork branch names are GLOBALLY unique across gates (builder.py
+        # "Fork branch '{}' is declared by multiple gates"). The
+        # duplicate-producer accounting catches most of this incidentally, but
+        # it deliberately skips branch names that are also SINK names — so two
+        # gates each forking to ['main', 'other'] over declared sinks validated
+        # green (elspeth-2ed41f0a4a census, 2026-08-17). Check the rule
+        # directly, in gate declaration order, so the report matches the
+        # runtime's "'first' and 'second'".
+        fork_branch_owner: dict[str, str] = {}
+        for candidate in self.nodes:
+            if candidate.node_type != "gate" or candidate.fork_to is None:
+                continue
+            for branch in dict.fromkeys(candidate.fork_to):
+                owner = fork_branch_owner.get(branch)
+                if owner is not None and owner != candidate.id:
+                    errors.append(
+                        _err(
+                            f"node:{candidate.id}",
+                            f"Fork branch '{branch}' is declared by multiple gates: '{owner}' and '{candidate.id}'. "
+                            "Fork branch names must be globally unique across all gates.",
+                            "high",
+                            "fork_branch_declared_by_multiple_gates",
+                        )
+                    )
+                    continue
+                fork_branch_owner[branch] = candidate.id
+
         # Mirror the engine's one-barrier-per-fork-branch rule. The DAG builder
         # raises GraphValidationError when a branch name is claimed twice —
         # by two coalesces, by a coalesce and a row_union, or by two row_unions
@@ -5856,6 +6185,27 @@ class CompositionState:
                             f"Coalesce '{node.id}' branches {missing_branches} are not reachable from any runtime connection.",
                             "high",
                             "coalesce_branch_unreachable",
+                        )
+                    )
+                # Branch ALIASES (the mapping keys) must each be a gate
+                # fork_to name — the row_union twin of this rule already
+                # existed (``row_union_branch_alias_unreachable``); the
+                # coalesce side checked only the VALUES against runtime
+                # connections, so a coalesce declaring a branch no gate forks
+                # validated green and died at the DAG build ("Coalesce '{}'
+                # declares branch '{}', but no gate produces this branch";
+                # elspeth-2ed41f0a4a census, 2026-08-17).
+                missing_aliases = sorted(
+                    branch for branch in dict.fromkeys(_coalesce_branch_names(node.branches)) if branch not in gate_fork_branches
+                )
+                if missing_aliases:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Coalesce '{node.id}' declares branches {missing_aliases} that no gate produces via fork_to. "
+                            "Branches must be listed in a gate's fork_to.",
+                            "high",
+                            "coalesce_branch_alias_unreachable",
                         )
                     )
                 continue

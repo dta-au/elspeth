@@ -540,10 +540,31 @@ where the architectural fix landed:
     transform producers are a documented abstention (their runtime output
     schema may be computed, not the raw block). Pinned by
     ``TestComposerRuntimeCensusAgreement``.
+  - **Shape 26** — routing LABELS: every connection/route/branch label and
+    sink name the settings model validates (``_validate_connection_or_sink_name``,
+    ``validate_sink_name``: non-empty, <=64/38, character class, reserved
+    edge labels, ``__`` prefix, lowercase sinks). Stage 1 saw a bad label only
+    through the dangling-reference rules, which go silent when the bad label
+    is CONSISTENT on both ends; sink names were unvalidated on the freeform
+    path (elspeth-88a4db09f9). ``_routing_label_errors`` calls the runtime's
+    own validator per field so the wording is identical by construction.
+  - **Shape 27** — declarative ``Field(...)`` constraints, invisible to a raise
+    census: single-branch coalesce (``branches: min_length=2``) and the
+    collection caps (50 sources/sinks, 500 transforms, 100 gates/queues/
+    coalesce/row_unions/aggregations, 32 routes/fork_to). The parity scanner
+    now enumerates ``Field`` constraints as sites.
+  - **Shape 28** — ``fork_to: []`` (both surfaces: the settings model now
+    rejects it where the builder used to CRASH with a bare ``ValueError`` the
+    composer's graph phase does not catch), a node id equal to a sink/source
+    name (``validate_globally_unique_node_names``), a fork branch declared by
+    two gates when the branch names are sink names, and a coalesce branch
+    KEY no gate forks (the row_union twin already existed).
   Still open from the same census, deliberately: an unreferenced sink is a
   Stage-1 WARNING (state.py "W1"), because a sink is a passive target that
   is routinely added before it is wired; the terminal Stage-2 gate and the
   guided accept path catch it. Recorded as ``abstains`` in the parity baseline.
+  Ten sites remain ``unmirrored`` under the gate's ratchet
+  (elspeth-96e2dd023f).
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
@@ -6637,3 +6658,107 @@ class TestComposerRuntimeCensusAgreement:
 
         assert composer.is_valid, composer.errors
         assert runtime.is_valid, runtime.errors
+
+    def test_both_reject_consistent_blank_connection_label(self, tmp_path: Path) -> None:
+        """Shape 26 — a blank label on BOTH ends of an edge: dangling rules are satisfied, the settings model is not."""
+        state = CompositionState(
+            source=self._source(tmp_path, ""),
+            nodes=(self._transform("t1", "", "main"),),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "connection_label_invalid" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("must not be empty" in e.message or "must be a connection name" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_reject_uppercase_sink_name(self, tmp_path: Path) -> None:
+        """Shape 26 — sink names were unvalidated on the freeform path (elspeth-88a4db09f9)."""
+        state = CompositionState(
+            source=self._source(tmp_path, "Main"),
+            nodes=(),
+            edges=(),
+            outputs=(self._output(tmp_path, "Main"),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "output_name_invalid" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("must be lowercase" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_reject_single_branch_coalesce(self, tmp_path: Path) -> None:
+        """Shape 27 — ``CoalesceSettings.branches`` is ``Field(min_length=2)``: declarative, no raise site."""
+        state = CompositionState(
+            source=self._source(tmp_path, "g_in"),
+            nodes=(
+                self._gate("g", "g_in", ("x",)),
+                self._transform("tx", "x", "cx"),
+                self._coalesce("c", {"x": "cx"}, "main"),
+            ),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "coalesce_branches_invalid" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("at least 2 items" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_reject_empty_fork_to(self, tmp_path: Path) -> None:
+        """Shape 28 — ``fork_to: []`` used to CRASH Stage 2 (bare ValueError from ``_GateEntry``); now both reject structurally."""
+        gate = NodeSpec(
+            id="g",
+            node_type="gate",
+            plugin=None,
+            input="g_in",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="row['value'] == 'x'",
+            routes={"true": "main", "false": "discard"},
+            fork_to=(),
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=self._source(tmp_path, "g_in"),
+            nodes=(gate,),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "gate_fork_to_empty" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("fork_to must not be an empty list" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_reject_node_id_equal_to_sink_name(self, tmp_path: Path) -> None:
+        """Shape 28 — one namespace across nodes, sources and sinks."""
+        state = CompositionState(
+            source=self._source(tmp_path, "a"),
+            nodes=(self._transform("main", "a", "main"),),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "node_id_collides_with_source_or_sink" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("used by both" in e.message for e in runtime.errors), runtime.errors

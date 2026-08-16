@@ -4151,7 +4151,12 @@ async def _plan_pipeline_inner(
                     # Operator-opted diagnostic seam. Validator messages are never
                     # logged: even an opt-in diagnostic must not persist authored
                     # option values, row content, paths, or secret material. Closed
-                    # codes plus component/severity retain the useful classifier.
+                    # codes plus component KIND/severity retain the useful
+                    # classifier. The component's identifier half (a node id or
+                    # sink name) is model-authored text too — the planner picks
+                    # those names — so only the kind prefix is logged; the full
+                    # ``output:<name>`` leaked as soon as any output-attributed
+                    # rule fired (elspeth-2ed41f0a4a).
                     slog.warning(
                         "composer.planner_rejection_detail",
                         session_id=trail.session_id,
@@ -4159,7 +4164,7 @@ async def _plan_pipeline_inner(
                         attempt=trail.attempts,
                         entries=[
                             {
-                                "component": entry.component,
+                                "component": entry.component.split(":", 1)[0],
                                 "error_code": entry.error_code or "validation_error",
                                 "severity": entry.severity,
                             }

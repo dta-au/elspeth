@@ -1406,6 +1406,29 @@ class TestGateSettings:
             )
         assert "fork_to is only valid" in str(exc_info.value)
 
+    def test_gate_settings_empty_fork_to_list_is_rejected_at_settings(self) -> None:
+        """``fork_to: []`` must be a settings rejection, not a builder crash.
+
+        elspeth-2ed41f0a4a census (2026-08-17). ``validate_fork_to_labels``
+        looped zero times over an empty list and ``validate_fork_consistency``
+        only fires when a ``fork`` route is present, so ``fork_to: []`` with
+        ordinary routes reached ``build_execution_graph``, where
+        ``_GateEntry.__post_init__`` raised a bare ``ValueError`` — which the
+        composer's graph phase does not catch, so the composer preflight
+        surfaced a 500 instead of a structured verdict.
+        """
+        from elspeth.core.config import GateSettings
+
+        with pytest.raises(ValidationError) as exc_info:
+            GateSettings(
+                name="bad_gate",
+                input="source_out",
+                condition="row['x'] > 0",
+                routes={"true": "next_step", "false": "discard"},
+                fork_to=[],
+            )
+        assert "fork_to must not be an empty list" in str(exc_info.value)
+
     def test_gate_settings_fork_to_max_length_enforced(self) -> None:
         """fork_to list is capped to prevent pathological branch explosions."""
         from elspeth.core.config import GateSettings
