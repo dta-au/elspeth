@@ -29,6 +29,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
+from elspeth.web.composer.bounded_json import bounded_json_loads
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
     GuidedReviewedBlobBinding,
@@ -1370,11 +1371,18 @@ def _coerce_stringified_json_object(value: Any) -> Any:
     string that decodes to a non-object (list, scalar, ``null``) is returned
     untouched so the field's ``dict[str, Any]`` validation still rejects
     genuinely malformed input (fails closed).
+
+    Decoding runs through the shared bounded adapter: the outer tool-call
+    argument text was depth-bounded as JSON, but a stringified object hides
+    its nesting inside a JSON string, so an unbounded ``json.loads`` here
+    could still exhaust the C decoder and escape as a raw ``RecursionError``
+    (elspeth-b944d2324a, forensic audit G13). A ``JsonBoundaryError`` is a
+    ``ValueError`` and takes the same fail-closed arm as malformed text.
     """
     if not isinstance(value, str):
         return value
     try:
-        decoded = json.loads(value)
+        decoded = bounded_json_loads(value, label="stringified tool-argument object")
     except (json.JSONDecodeError, ValueError):
         return value
     return decoded if isinstance(decoded, dict) else value

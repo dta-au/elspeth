@@ -141,3 +141,44 @@ def test_non_object_string_options_still_rejected(bad: str) -> None:
 def test_non_object_string_patch_still_rejected(bad: str) -> None:
     with pytest.raises(ValidationError):
         PatchSourceOptionsArgumentsModel.model_validate({"patch": bad})
+
+
+# ---------------------------------------------------------------------------
+# Resource bounds: a stringified object nested past the shared JSON depth
+# budget is rejected as a typed argument error, never a raw RecursionError
+# (elspeth-b944d2324a, forensic audit G13).
+# ---------------------------------------------------------------------------
+
+_DEEP_STRINGIFIED_OBJECT = '{"a":' * 100_000 + "1" + "}" * 100_000
+
+
+def test_deeply_nested_stringified_object_is_rejected_without_recursion_error() -> None:
+    """The bounded decoder rejects the string before the C decoder recurses."""
+    with pytest.raises(ValidationError):
+        PatchSourceOptionsArgumentsModel.model_validate({"patch": _DEEP_STRINGIFIED_OBJECT})
+
+
+def test_deeply_nested_stringified_options_fail_closed_at_the_public_tool_seam() -> None:
+    """Public dispatch witness: typed ToolArgumentError, raw string not echoed."""
+    from elspeth.web.composer.protocol import ToolArgumentError
+    from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog, execute_tool
+
+    # set_source's argument model carries the ``_LlmJsonObject`` coercion on
+    # ``options`` (upsert_node's does not, so it never reaches the decoder).
+    with pytest.raises(ToolArgumentError) as exc_info:
+        execute_tool(
+            "set_source",
+            {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard", "options": _DEEP_STRINGIFIED_OBJECT},
+            _empty_state(),
+            _mock_catalog(),
+        )
+
+    assert isinstance(exc_info.value.__cause__, ValidationError)
+    assert '{"a":{"a":{"a":' not in str(exc_info.value)
+
+
+def test_within_budget_stringified_object_still_coerces() -> None:
+    """Control: the bound does not reject ordinary nesting."""
+    nested = '{"a":' * 8 + '{"column": "url"}' + "}" * 8
+    m = PatchSourceOptionsArgumentsModel.model_validate({"patch": nested})
+    assert m.patch["a"]["a"]["a"]["a"]["a"]["a"]["a"]["a"] == {"column": "url"}

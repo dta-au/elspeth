@@ -289,6 +289,42 @@ def test_persisted_set_pipeline_binding_rejects_recomputed_authority_member_tamp
         PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
 
 
+_DEEP_CANONICAL_OBJECT = '{"a":' * 1_500 + "1" + "}" * 1_500
+
+
+@pytest.mark.parametrize("field", ["result_canonical", "authority_arguments_canonical", "arguments_canonical"])
+def test_persisted_binding_rejects_deeply_nested_canonical_payload_as_integrity_error(field: str) -> None:
+    """A persisted canonical payload past the JSON depth budget is a typed
+    AuditIntegrityError, never a raw RecursionError (elspeth-b944d2324a, G14).
+    """
+    pipeline = _pipeline(("a", "b", "c"))
+    audit = begin_dispatch("call-deep", "set_pipeline", pipeline, version_before=1, actor="test")
+    invocation = finish_success(audit, result_payload=_dispatch_result(), version_after=2)
+    _content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+    persisted = envelope["invocation"]
+    assert type(persisted) is dict
+    persisted[field] = _DEEP_CANONICAL_OBJECT
+    hash_field = {
+        "result_canonical": "result_hash",
+        "authority_arguments_canonical": "authority_arguments_hash",
+        "arguments_canonical": "arguments_hash",
+    }[field]
+    persisted[hash_field] = hashlib.sha256(_DEEP_CANONICAL_OBJECT.encode()).hexdigest()
+
+    with pytest.raises(AuditIntegrityError, match="JSON resource bounds"):
+        PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
+
+
+def test_persisted_binding_control_round_trips_within_depth_budget() -> None:
+    """Control: an untampered envelope still restores."""
+    pipeline = _pipeline(("a", "b", "c"))
+    audit = begin_dispatch("call-control", "set_pipeline", pipeline, version_before=1, actor="test")
+    invocation = finish_success(audit, result_payload=_dispatch_result(), version_after=2)
+    _content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+    binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
+    assert binding.tool_name == "set_pipeline"
+
+
 def test_set_pipeline_list_branches_round_trips_through_generic_and_authority_audit_pairs() -> None:
     pipeline = _pipeline(("a", "b", "c"))
     pipeline["nodes"][0]["branches"] = ["a_in", "b_in"]

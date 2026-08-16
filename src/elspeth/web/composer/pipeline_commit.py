@@ -34,6 +34,7 @@ from elspeth.web.composer.authority_hashing import (
     project_composer_authority_payload,
     restore_composer_authority_payload,
 )
+from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
     PlannerSurface,
@@ -68,7 +69,18 @@ def _reject_duplicate_json_object_keys(pairs: list[tuple[str, object]]) -> dict[
 
 
 def _validate_exact_canonical_json(payload: str) -> dict[str, JsonValue]:
-    restored = json.loads(payload, object_pairs_hook=_reject_duplicate_json_object_keys)
+    # Persisted canonical text is re-read from audit storage: decode it under
+    # the shared JSON bounds so a deep or oversized payload is a typed
+    # AuditIntegrityError rather than a raw RecursionError escaping the
+    # integrity boundary (elspeth-b944d2324a, forensic audit G14).
+    try:
+        restored = bounded_json_loads(
+            payload,
+            label="persisted pipeline dispatch canonical payload",
+            object_pairs_hook=_reject_duplicate_json_object_keys,
+        )
+    except JsonBoundaryError as exc:
+        raise AuditIntegrityError("persisted pipeline dispatch canonical payload exceeds the JSON resource bounds") from exc
     if type(restored) is not dict:
         raise AuditIntegrityError("persisted pipeline dispatch canonical payload must be a JSON object")
     if primitive_canonical_json(restored) != payload:
@@ -159,9 +171,9 @@ class PipelineDispatchAuditBinding:
         invariant=(
             "raises AuditIntegrityError on any envelope with missing required fields or fields of incorrect type; "
             "every dict.get() value is type-checked before use and missing keys result in explicit type-check failures that raise AuditIntegrityError; "
-            "auxiliary validation functions (_validate_pipeline_authority_binding, _validate_exact_canonical_json) also raise AuditIntegrityError on malformed payloads; "
-            "never returns a binding without fully validating and type-checking all required fields. "
-            "Deliberately NOT claimed: RecursionError from deeply nested JSON in result_canonical or authority_arguments_canonical would escape the except block"
+            "auxiliary validation functions (_validate_pipeline_authority_binding, _validate_exact_canonical_json) also raise AuditIntegrityError on malformed payloads, "
+            "including canonical payloads that exceed the shared bounded-JSON depth/item/byte limits (decoded through bounded_json_loads, so no RecursionError escapes); "
+            "never returns a binding without fully validating and type-checking all required fields"
         ),
         test_ref="tests/unit/web/composer/test_row_union_authority_hashing.py::test_persisted_set_pipeline_binding_rejects_recomputed_authority_member_tampering",
         test_fingerprint="0e0b81af35de756ada81baa144209802092142c1adf9f5312f9fccd360c4cf78",

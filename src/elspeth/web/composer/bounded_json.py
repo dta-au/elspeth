@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -112,12 +113,19 @@ def _validate_decoded_json(value: Any, *, label: str) -> None:
         raise ValueError(f"{label} contains a value outside strict finite JSON")
 
 
-def bounded_json_loads(raw: object, *, label: str) -> Any:
+def bounded_json_loads(
+    raw: object,
+    *,
+    label: str,
+    object_pairs_hook: Callable[[list[tuple[str, Any]]], Any] | None = None,
+) -> Any:
     """Decode exact JSON text under fixed byte, depth, item, and text bounds.
 
     Syntax errors remain ``JSONDecodeError`` so existing caller taxonomies keep
     their precise malformed-JSON class. Resource violations use the closed
-    ``JsonBoundaryError`` class.
+    ``JsonBoundaryError`` class. ``object_pairs_hook`` is forwarded to the
+    decoder so callers that must reject duplicate object keys keep doing so
+    inside the same bounded decode.
     """
     if type(raw) is not str:
         raise TypeError(f"{label} must be an exact JSON string")
@@ -130,7 +138,7 @@ def bounded_json_loads(raw: object, *, label: str) -> Any:
         raise ValueError(f"{label} contains a non-finite JSON number")
 
     try:
-        value = json.loads(raw, parse_constant=reject_constant)
+        value = json.loads(raw, parse_constant=reject_constant, object_pairs_hook=object_pairs_hook)
     except RecursionError as exc:
         raise JsonBoundaryError(f"{label} exceeds the JSON decoder recursion limit") from exc
     _validate_decoded_json(value, label=label)
