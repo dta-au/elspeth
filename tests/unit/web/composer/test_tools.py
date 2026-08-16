@@ -2046,6 +2046,32 @@ class TestUpsertNode:
         assert len(result.updated_state.nodes) == 1
         assert "t1" in result.affected_nodes
 
+    @pytest.mark.parametrize("node_type", ["gate", "coalesce"])
+    def test_structural_node_with_plugin_is_rejected_atomically(self, node_type: str) -> None:
+        """A plugin on a built-in structural node is a rejected mutation, not a persisted token or a crash.
+
+        Before the guard, ``_execute_upsert_node`` accepted ``node_type='gate',
+        plugin='fork'`` and the post-call hint lookup then raised an uncaught
+        ``ValueError('plugin_not_enabled')`` from the catalog; ``set_pipeline``
+        persisted the plugin outright with ``is_valid: True``.
+        """
+        state = _empty_state()
+        arguments: dict[str, Any] = {"id": "structural", "node_type": node_type, "plugin": "authored_plugin_token", "input": "rows"}
+        if node_type == "gate":
+            arguments |= {"condition": "row['x'] > 1", "routes": {"true": "fork", "false": "main"}, "fork_to": ["main", "alt"]}
+        else:
+            arguments |= {"branches": ["path_a", "path_b"], "policy": "require_all", "merge": "union", "on_success": "main"}
+
+        result = execute_tool("upsert_node", arguments, state, _mock_catalog())
+
+        assert result.success is False
+        assert result.data is not None
+        assert result.data["error_code"] == "structural_node_plugin_forbidden"
+        assert "plugin=null" in result.data["error"]
+        assert "authored_plugin_token" not in result.data["error"], "the authored plugin token is not echoed"
+        assert state.nodes == ()
+        assert result.updated_state.nodes == ()
+
     def test_allows_llm_consuming_web_scrape_without_prompt_shield_as_advisory(self) -> None:
         state = CompositionState(
             source=None,
@@ -9189,6 +9215,20 @@ class TestSetPipeline:
                 }
             )
         return args
+
+    def test_set_pipeline_rejects_a_plugin_on_a_gate_without_mutating_state(self) -> None:
+        """The whole atomic replacement rolls back; the stray plugin never reaches the state."""
+        state = _empty_state()
+        args = self._gate_pipeline_args(on_error=None, include_on_error=False)
+        args["nodes"][0]["plugin"] = "fork"
+
+        result = execute_tool("set_pipeline", args, state, _mock_catalog())
+
+        assert result.success is False
+        assert result.data is not None
+        assert result.data["error_code"] == "structural_node_plugin_forbidden"
+        assert state.nodes == ()
+        assert result.updated_state.nodes == ()
 
     def test_set_pipeline_creates_valid_state(self) -> None:
         state = _empty_state()

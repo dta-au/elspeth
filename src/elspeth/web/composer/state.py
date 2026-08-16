@@ -430,6 +430,30 @@ def _timeout_seconds_is_invalid(value: object) -> bool:
     return not isfinite(normalized) or normalized <= 0
 
 
+_PLUGINLESS_STRUCTURAL_NODE_TYPES: Final[frozenset[str]] = frozenset({"gate", "coalesce"})
+
+
+def structural_node_plugin_error(node: NodeSpec) -> str | None:
+    """Return the contract violation for a plugin authored onto a gate or coalesce.
+
+    Every structural node type is wired with ``plugin=null`` — the tool schema
+    says so and the YAML generator never emits a plugin for them — but only
+    queues (``queue_node_contract_error``) and row_unions (their forbidden-
+    fields block in ``validate()``) enforced it. A gate or coalesce could carry
+    an authored token in ``plugin`` while validating clean, and later consumers
+    that read ``plugin or node_type`` (the composer RGR scorer, for one) would
+    classify the node by that token. The token itself is not echoed: it is
+    arbitrary authored text, not closed composer vocabulary. Returns None for
+    every other node type and for a plugin-less gate/coalesce.
+    """
+    if node.node_type not in _PLUGINLESS_STRUCTURAL_NODE_TYPES or node.plugin is None:
+        return None
+    return (
+        f"{node.node_type} '{node.id}' does not accept a plugin: '{node.node_type}' is a built-in "
+        "node_type wired with plugin=null. Re-emit the node with plugin=null."
+    )
+
+
 @observation_boundary(
     tier=3,
     source="NodeSpec carrying composer/LLM/user-authored options (untrusted options.description value)",
@@ -5156,6 +5180,10 @@ class CompositionState:
                         "node_timeout_unsupported",
                     )
                 )
+
+            structural_plugin_error = structural_node_plugin_error(node)
+            if structural_plugin_error is not None:
+                errors.append(_err(f"node:{node.id}", structural_plugin_error, "high", "structural_node_plugin_forbidden"))
 
             if node.node_type == "gate":
                 if node.condition is None:

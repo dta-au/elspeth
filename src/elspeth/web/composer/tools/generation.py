@@ -983,6 +983,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Re-emit the queue with id == input and only a description in options, or remove the queue node.",
     ),
     (
+        r"structural_node_plugin_forbidden",
+        "A gate or coalesce node carries a plugin; those are built-in node_types that take no plugin.",
+        "Re-emit the node with plugin=null. If you meant a plugin-driven step, use node_type='transform' or 'aggregation' with that plugin instead.",
+    ),
+    (
         r"queue_no_consumer",
         "A queue has no downstream consumer; a queue must feed exactly one ordinary node.",
         "Give one downstream node input='<queue id>', or remove the queue.",
@@ -1115,6 +1120,7 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "batch_required_fields_invalid",
     "batch_value_field_not_numeric",
     "queue_config_invalid",
+    "structural_node_plugin_forbidden",
     "queue_no_consumer",
     "queue_name_collision",
     "coalesce_branch_unreachable",

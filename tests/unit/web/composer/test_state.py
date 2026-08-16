@@ -1128,6 +1128,98 @@ class TestStage1Validation:
 
         assert any(error.error_code == error_code and "timeout_seconds" in error.message for error in result.errors), result.errors
 
+    @pytest.mark.parametrize(
+        "node",
+        [
+            pytest.param(
+                NodeSpec(
+                    id="gate_1",
+                    node_type="gate",
+                    plugin="fork",
+                    input="gate_1",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="row['x'] > 1",
+                    routes={"true": "fork", "false": "main"},
+                    fork_to=("main", "alt"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+                id="gate",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="coalesce_1",
+                    node_type="coalesce",
+                    plugin="passthrough",
+                    input="coalesce_1",
+                    on_success="main",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=("path_a", "path_b"),
+                    policy="require_all",
+                    merge="union",
+                ),
+                id="coalesce",
+            ),
+        ],
+    )
+    def test_structural_nodes_reject_a_plugin(self, node: NodeSpec) -> None:
+        """gate and coalesce are built-in node_types wired with plugin=null.
+
+        Queues (``queue_node_contract_error``) and row_unions (their
+        forbidden-fields block) already reject a plugin; gate and coalesce
+        silently persisted one, so a state could carry ``('g', 'gate', 'fork')``
+        while ``is_valid`` — an authored token that neither generated YAML nor
+        the runtime ever sees.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success=node.input))
+        state = state.with_node(node)
+        state = state.with_output(self._make_output("main"))
+        state = state.with_output(self._make_output("alt"))
+
+        result = state.validate()
+
+        matching = [e for e in result.errors if e.error_code == "structural_node_plugin_forbidden"]
+        assert len(matching) == 1, result.errors
+        assert matching[0].component == f"node:{node.id}"
+        assert "plugin" in matching[0].message and "plugin=null" in matching[0].message
+        assert node.plugin not in matching[0].message, "the rejected plugin token is not echoed"
+
+    def test_structural_node_without_plugin_is_not_flagged(self) -> None:
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="gate_1"))
+        state = state.with_node(
+            NodeSpec(
+                id="gate_1",
+                node_type="gate",
+                plugin=None,
+                input="gate_1",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="row['x'] > 1",
+                routes={"true": "fork", "false": "main"},
+                fork_to=("main", "alt"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+        state = state.with_output(self._make_output("alt"))
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        assert not any(e.error_code == "structural_node_plugin_forbidden" for e in result.errors)
+
     def test_multiple_fork_gates_do_not_collide_on_fork_route_keyword(self) -> None:
         """Two gates routing to the reserved 'fork' keyword are not duplicate producers.
 
