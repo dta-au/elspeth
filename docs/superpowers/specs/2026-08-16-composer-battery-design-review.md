@@ -302,3 +302,31 @@ passes per compose) is unmeasured — the fix is the same either way. All
 findings are static against `release/0.7.2`; nothing was fired, no file in
 the tree was modified by any reviewer (one reviewer's stray write into
 `docs/` was reverted; `git status docs/` is clean).
+
+---
+
+# Round 2 — review of rev 2 (`9558f27a8`), 2026-08-16
+
+Same seven lenses, mandate: closure audit + attack rev 2's new claims + over-engineering check. Panel verdict: **GO-WITH-FIXES** — all rev-1 Criticals closed at the mechanism level, 0 hallucinations, but rev 2 introduced defects of its own. All addressed in **rev 3** (same file path).
+
+## Rev-2 defects found (fixed in rev 3)
+
+| # | Finding | Lens | Rev 3 answer |
+|---|---|---|---|
+| R2-C1 | Floor's `data_setup: 0` derivation (create_blob batches into discovery) contradicts the kit: `pipeline_composer.md:289-292` binds `create_blob` to the build turn, and `set_pipeline` has a first-class `source.inline_blob` path — the true 2-call route the spec never mentioned. "Kit finding, not floor change" was not honest when the kit is explicit. | sdr2 (verified by lead) | Decision 10: `inline_blob` is the optimal data path; `create_blob`→bind = soft `data_setup_detour`. |
+| R2-C2 | `provider_error` = any non-success audit status excluded the run — but each retry attempt is its own row, so a recovered 429 voided an informative run and could false-trip the 3-consecutive abort; `malformed_response`/`bad_request_error` are model faults, not transport. | quality2, sdr2 | Split: `retried_provider_error` (soft, counted), `malformed_output` (hard), `instrument_error: transport` (excluded only when never recovered). Floor counts `status == success` rows only. |
+| R2-C3 | `meta.json` kept HTTP status and discarded the 422 body — the only durable carrier of `turns_used` / `budget_exhausted` / `reason`; `GET /messages` writes no row on convergence failure and `/_active` excludes terminal phases. `turn_exhaustion`/`wall_timeout` were unmeasurable. | determinism2 | Capture the 422 `detail`; on client timeout fetch `/composer-progress` once; `server_terminal.source ∈ {422_detail, composer_progress, none}`. |
+| R2-C4 | `surface_observed` by presence of `planner_attempt_audit` rows has a false-negative when the planner fails before persisting anything → reads as compose loop. The routing log line is server-side only. | quality2, reality2, systems2 | `surface_observed ∈ {compose_loop, planner, undetermined}`; planner iff `planner_call_ordinal != null` or planner rows; zero audit rows ⇒ `undetermined` ⇒ excluded, never defaulted. |
+| R2-H1 | Extractor cross-check re-imports the `fork` token (C3 again as a unit-test failure). | sdr2 | `fork`→`gate` normalisation. |
+| R2-H2 | `tools_spec_hash` null ⇔ advisor is false (diagnostics text call on the primary model; planner/guided carry tools). | sdr2, systems2, reality2, determinism2 | Three buckets: tool-bearing / advisor (`model_requested == advisor_model`) / other text; `advisor_model` in identity; characterization test on the advisor call path. |
+| R2-H3 | Identity block untiered: `frontend_build` (SPA noise) refused; `composer_skill_hash` refused — but it is the independent variable a kit-edit comparison changes on purpose. | systems2, sdr2, quality2 | Binding vs recorded; skill hash recorded and printed as the delta under test. |
+| R2-H4 | Oracle: fork labels are author-chosen strings ("exact" = false rejects); no correspondence algorithm once ids are ignored; coalesce `merge` missing; cardinality unstated; `option_values: ignore` too loose for threshold/top_k strata; `source`→`sources["source"]` mapping. | tsr2, quality2, sdr2 | Match = graph isomorphism, labels/ids ignored, `merge`+cardinality exact, `option_assertions`, mapping stated; comparator both-ways tests enumerated. |
+| R2-H5 | repair/backtrack discriminator named raw `success` OR envelope outcome — ambiguous, and `cancelled` unhandled. | tsr2, determinism2 | Durable pair (`composition_state_id` + audit envelope) decides; envelope outcome corroborates; full 5-value vocabulary. |
+| R2-H6 | Round-robin defeats the 3-consecutive abort for a single drifting case; canary at N=5 cannot detect degradation and only reports after the firing; repeat-1 cache-cold asymmetry unreported. | systems2, tsr2, quality2 | Per-case 2-repeat streak flag; canary as N=10 pre-flight; per-repeat bins with cached-token medians; 15 % exclusion flag. |
+| R2-M | `provider_calls_total` misnomer + auto-title unaudited call suppressed only by PATCH-before-POST ordering; `wall_ms` unsourced; tokens null on failed calls; `report.json` schema missing; stale "100-run"; pooling formula; exact-500 follow-up fetch; `--resume` must never re-fetch; `--order` flag / `driver_version` / quarterly clause = ceremony; two file paths wrong; `provider_error` defined three ways; term drift. | doccritic2, determinism2, tsr2, sdr2 | All folded into rev 3; change log moved to an appendix. |
+
+## Independently vindicated in round 2
+`?state_id=` on validate is real (`execution/routes.py:855-858`); `planner_attempt_audit` rides the same `include_llm_audit` gate; mixed data+discovery tool batches are executed (`tool_batch.py:625`, cap is pure cardinality); `set_pipeline` authors every non-blob topology in one call; `set_source_from_blobs` exists as the 13/14 v2 route; pagination is idempotent (three INSERT sites, no DELETE/UPDATE on ordering columns, `MAX(sequence_no)+1` under a per-session lock); `composer_skill_hash` is SHA-256 of the *rendered* system prompt (better identity than the file hash the schema comments claim); the args→state path is hermetic for `path`-sourced payloads.
+
+## Still open for the user
+Decision 7 (compose loop only; the planner is where "Build a pipeline that…" requests go) — now with its selection tension stated in the spec.
