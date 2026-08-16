@@ -436,6 +436,29 @@ sequentially per worktree.
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-17 — worker-pool admission follows the WORKER's lifetime, and the
+  preflight coordinator owns the caller's budget** (elspeth-5269b43bca /
+  elspeth-8607553d3b): `run_sync_in_worker` bounds outstanding submissions at
+  `ADMISSION_CAPACITY` (16 running + 16 queued), released when the sync work
+  actually finishes — never when the awaiter times out or is cancelled. Past
+  capacity it waits `ADMISSION_WAIT_SECONDS` then raises
+  `AsyncWorkerAdmissionTimeoutError` (a `TimeoutError` subclass, so every
+  deadline arm already classifies it as its own TIMEOUT). An awaiter that
+  gives up while its submission is still QUEUED drops it — it never runs; a
+  RUNNING one completes but its outcome is discarded (the cancelled wrapper
+  also carries the old elspeth-e4949acbe1 "no unretrieved exception"
+  contract, the drain callback is gone). Consequence: a write that MUST land
+  goes through a shielded/deferred-cancellation wrapper
+  (`_await_custody_settlement`, `_await_pipeline_staging_write_with_deferred_cancellation`,
+  `_run_sync_with_post_commit_projection`); do not rely on "the worker runs
+  anyway" for a bare `run_sync_in_worker` call. `RuntimePreflightCoordinator.run`
+  takes the per-caller budget as `timeout=` and returns
+  `RuntimePreflightFailure(TimeoutError)` on expiry while the in-flight entry
+  stays until the sync preflight completes, so a same-key retry JOINS it.
+  Never wrap `asyncio.wait_for` inside the shared worker coroutine again —
+  that made the timeout the shared task's outcome and evicted the entry while
+  the thread still ran (every retry queued another hung worker).
+
 - **2026-08-14 — adding ANY index to the Landscape metadata is a
   delete-and-recreate boundary, and the epoch bump has a docs/website tail**:
   `_validate_schema` compares the FULL metadata shape, not just

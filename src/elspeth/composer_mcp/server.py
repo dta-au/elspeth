@@ -338,9 +338,11 @@ async def _mcp_preview_runtime_preflight(
     )
 
     async def worker() -> ValidationResult:
-        return await asyncio.wait_for(run_preflight(state), timeout=timeout_seconds)
+        return await run_preflight(state)
 
-    entry = await coordinator.run(key, worker)
+    # The budget is per caller; the coordinator keeps the preflight admitted
+    # until it actually finishes (elspeth-5269b43bca).
+    entry = await coordinator.run(key, worker, timeout=timeout_seconds)
     if isinstance(entry, RuntimePreflightFailure):
         raise entry.original_exc
     return entry

@@ -6232,6 +6232,63 @@ class TestComposerRuntimePreflightCacheAndTimeout:
         finally:
             release.set()
 
+    @pytest.mark.asyncio
+    async def test_timed_out_preflight_stays_admitted_so_a_retry_joins_it(self) -> None:
+        """elspeth-5269b43bca: the caller's timeout must not release admission.
+
+        A retry (a NEW compose call, so a fresh per-call cache) for the same
+        state while the first sync preflight is still running must join that
+        worker through the coordinator, not submit a second copy to the
+        shared pool. Before the fix the timeout was the shared task's own
+        outcome, so the in-flight entry was evicted while the thread still
+        ran and every retry queued another hung worker.
+        """
+        settings = _make_settings(composer_runtime_preflight_timeout_seconds=0.02)
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
+        state = _empty_state()
+        started = threading.Event()
+        release = threading.Event()
+        expected = ValidationResult(is_valid=True, checks=[], errors=[])
+
+        def hung_preflight(candidate: CompositionState, user_id: str | None, session_id: str | None) -> ValidationResult:
+            started.set()
+            release.wait(timeout=30)
+            return expected
+
+        try:
+            with patch.object(service, "_runtime_preflight", side_effect=hung_preflight) as mock_preflight:
+                for _ in range(3):
+                    with pytest.raises(ComposerRuntimePreflightError) as failure:
+                        await service._cached_runtime_preflight(
+                            state,
+                            session_id=None,
+                            user_id="user-1",
+                            cache=service._new_runtime_preflight_cache(),
+                            initial_version=state.version - 1,
+                            session_scope="session:test",
+                        )
+                    assert failure.value.exc_class == "TimeoutError"
+                assert started.is_set()
+                # One sync worker for three timed-out compose calls.
+                mock_preflight.assert_called_once()
+                key = service._runtime_preflight_key(state, session_scope="session:test", plugin_snapshot=None)
+                assert key in service._runtime_preflight_coordinator._inflight
+
+                # A retry that arrives with budget to spare joins the running
+                # worker and receives its real result.
+                async def must_not_start() -> ValidationResult:
+                    raise AssertionError("retry started a second preflight instead of joining the running one")
+
+                patient = asyncio.create_task(
+                    service._runtime_preflight_coordinator.run(key, must_not_start, timeout=5.0),
+                )
+                await asyncio.sleep(0)
+                release.set()
+                assert await patient is expected
+                mock_preflight.assert_called_once()
+        finally:
+            release.set()
+
     def test_runtime_preflight_settings_hash_is_non_secret(self) -> None:
         class FakeSettings:
             data_dir = Path("/tmp/elspeth-data")

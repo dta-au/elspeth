@@ -2548,20 +2548,21 @@ class ComposerServiceImpl:
                 else self._runtime_preflight
             )
             args = (state, user_id, session_id) if plugin_snapshot is None else (state, user_id, session_id, plugin_snapshot)
-            # ``deadline`` (event-loop clock, elspeth-ac85b0ab0e review) caps
-            # the worker timeout at the compose budget's remaining share so a
-            # last-chance turn cannot overrun its deadline by a full preflight
-            # timeout; expiry surfaces as the same TimeoutError -> cached
-            # RuntimePreflightFailure envelope a configured timeout produces.
-            timeout = self._runtime_preflight_timeout_seconds
-            if deadline is not None:
-                timeout = max(0.0, min(timeout, deadline - asyncio.get_running_loop().time()))
-            return await asyncio.wait_for(
-                run_sync_in_worker(preflight, *args),
-                timeout=timeout,
-            )
+            return await run_sync_in_worker(preflight, *args)
 
-        entry = await self._runtime_preflight_coordinator.run(key, worker)
+        # ``deadline`` (event-loop clock, elspeth-ac85b0ab0e review) caps the
+        # per-caller timeout at the compose budget's remaining share so a
+        # last-chance turn cannot overrun its deadline by a full preflight
+        # timeout; expiry surfaces as the same TimeoutError -> cached
+        # RuntimePreflightFailure envelope a configured timeout produces.
+        # The budget belongs to THIS caller, not to the shared worker
+        # (elspeth-5269b43bca): the coordinator keeps the sync preflight
+        # admitted until it actually finishes, so a same-key retry after a
+        # timeout joins the running worker instead of submitting a second one.
+        timeout = self._runtime_preflight_timeout_seconds
+        if deadline is not None:
+            timeout = max(0.0, min(timeout, deadline - asyncio.get_running_loop().time()))
+        entry = await self._runtime_preflight_coordinator.run(key, worker, timeout=timeout)
         cache[key] = entry
         if isinstance(entry, RuntimePreflightFailure):
             exc_name = type(entry.original_exc).__name__
@@ -4154,11 +4155,11 @@ class ComposerServiceImpl:
         # and a human still reads it. The one thing withheld is the authority
         # to commit unreviewed.
         # ``ComposerRuntimePreflightError`` is the ONLY failure to catch here:
-        # ``RuntimePreflightCoordinator._capture`` converts every ``Exception``
-        # — timeouts included — into a ``RuntimePreflightFailure`` that
-        # ``_cached_runtime_preflight`` re-raises in that one envelope. Catching
-        # ``TimeoutError`` alongside it would be dead code that implies a second
-        # live path. ``asyncio.CancelledError`` is a ``BaseException``, escapes
+        # ``RuntimePreflightCoordinator`` converts every ``Exception`` — the
+        # worker's own via ``_capture``, this caller's timeout via ``run`` —
+        # into a ``RuntimePreflightFailure`` that ``_cached_runtime_preflight``
+        # re-raises in that one envelope. Catching ``TimeoutError`` alongside
+        # it would be dead code that implies a second live path. ``asyncio.CancelledError`` is a ``BaseException``, escapes
         # ``_capture``, and is deliberately NOT caught: a cancelled request must
         # abort, not stage a proposal on a verdict nobody waited for.
         runtime_result: ValidationResult | None = None

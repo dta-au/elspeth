@@ -368,8 +368,9 @@ async def test_preflight_failure_is_not_run_and_blocks_auto_commit() -> None:
 async def test_preflight_timeout_is_not_run() -> None:
     """A timeout reaches the caller as ComposerRuntimePreflightError, not TimeoutError.
 
-    ``RuntimePreflightCoordinator._capture`` converts every ``Exception`` into
-    a ``RuntimePreflightFailure``, which ``_cached_runtime_preflight`` re-raises
+    ``RuntimePreflightCoordinator`` converts every ``Exception`` — the worker's
+    via ``_capture``, the caller's timeout via ``run`` — into a
+    ``RuntimePreflightFailure``, which ``_cached_runtime_preflight`` re-raises
     in that single envelope. Scripting a bare ``TimeoutError`` here would test
     a path production cannot produce and would license a dead ``except`` arm.
     """

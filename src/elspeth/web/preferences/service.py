@@ -19,8 +19,9 @@ upsert construct is dialect-specific. The write path selects the matching
 insert builder from the active connection before constructing the statement.
 
 Async/sync bridge: uses ``run_sync_in_worker`` from
-``elspeth.web.async_workers`` (single-worker pool with cancellation
-drain). See ``sessions/service.py`` for the canonical usage pattern.
+``elspeth.web.async_workers`` (bounded shared pool; a running worker
+survives caller cancellation, a still-queued one is dropped). See
+``sessions/service.py`` for the canonical usage pattern.
 """
 
 from __future__ import annotations

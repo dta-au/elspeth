@@ -5596,13 +5596,16 @@ class SessionServiceImpl:
         """Async dispatcher for :meth:`persist_compose_turn`.
 
         Bridges to the sync primitive via ``_run_sync``, which dispatches
-        to a worker thread. The worker is shielded from caller
+        to a worker thread. A running worker is shielded from caller
         cancellation: a ``CancelledError`` raised in the awaiter does NOT
         interrupt the in-flight sync transaction (see
-        ``elspeth.web.async_workers.run_sync_in_worker``).
+        ``elspeth.web.async_workers.run_sync_in_worker``). A submission the
+        pool has not yet started when the awaiter is cancelled is dropped
+        and never begins — the "rolled back" arm below, reached without a
+        transaction (elspeth-5269b43bca).
 
         **Commit-wins cancellation contract (Q-F2).** When the caller is
-        cancelled mid-flight, the underlying worker continues to run to
+        cancelled mid-flight, an already-started worker continues to run to
         completion. Either:
 
         1. The transaction commits — the assistant + tool rows are durably

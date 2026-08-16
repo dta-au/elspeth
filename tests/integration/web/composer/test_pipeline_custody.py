@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -10,7 +12,7 @@ from uuid import uuid4
 
 import pytest
 import structlog
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
@@ -19,6 +21,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.web.blobs.service import content_hash
 from elspeth.web.composer.pipeline_custody import (
     PipelineCustodyPreparation,
+    finalize_pipeline_custody,
     finalize_pipeline_custody_on_connection,
     inline_custody_audit_projection,
     prepare_pipeline_custody,
@@ -26,6 +29,7 @@ from elspeth.web.composer.pipeline_custody import (
 )
 from elspeth.web.composer.tools.blobs import _PreparedBlobCreate
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.locking import sqlite_process_session_lock
 from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -192,6 +196,105 @@ async def test_failed_commit_reconciliation_preserves_a_committed_inline_stage(t
 
     assert publication.storage.read_bytes() == custody.request.content
     assert not publication.staging.exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """elspeth-8607553d3b: custody settlement follows the WORKER, not the request.
+
+    Block the custody worker at the filesystem write — it already holds the
+    session custody lock and the pending row — then cancel the awaiting
+    planner task (deadline / request cancel). The settlement must be neither
+    released early (the task stays pending and the session lock stays held
+    while the worker runs) nor retained forever (once the worker finishes,
+    the row is ``ready`` exactly once, the lock is free, and the caller's
+    cancellation is re-raised). A retry then settles idempotently onto the
+    same row.
+    """
+    from elspeth.web.blobs import service as blobs_service
+    from elspeth.web.composer.pipeline_planner import _await_custody_settlement
+
+    engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+    initialize_session_schema(engine)
+    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session = await sessions.create_session("test-user", "Blocked inline custody", "local")
+    message = await sessions.add_message(
+        session.id,
+        "user",
+        "Create the inline source.",
+        writer_principal="route_user_message",
+    )
+    session_id = str(session.id)
+    prepared = _prepared(tmp_path, session_id=session_id, created_from_message_id=str(message.id))
+    custody = prepare_pipeline_custody(
+        _arguments(),
+        prepared,
+        session_id=session_id,
+        max_storage_per_session=500 * 1024 * 1024,
+    )
+
+    blocked = threading.Event()
+    release = threading.Event()
+    real_write = blobs_service._write_or_validate_reserved_blob
+
+    def gated_write(**kwargs: object) -> bool:
+        blocked.set()
+        assert release.wait(timeout=30), "test harness never released the custody worker"
+        return real_write(**kwargs)
+
+    monkeypatch.setattr(blobs_service, "_write_or_validate_reserved_blob", gated_write)
+
+    async def finalize() -> BlobRecord:
+        return await finalize_pipeline_custody(
+            custody,
+            engine=engine,
+            data_dir=tmp_path,
+            max_storage_per_session=500 * 1024 * 1024,
+            write_fence=None,
+        )
+
+    try:
+        settlement = asyncio.create_task(_await_custody_settlement(finalize()))
+        assert await asyncio.to_thread(blocked.wait, 5), "custody worker never reached the blocked write"
+
+        # The planner gives up on the request while the worker is mid-flight.
+        settlement.cancel()
+        await asyncio.sleep(0.2)
+        assert not settlement.done(), "settlement was released before the custody worker finished"
+
+        # The session custody lock is still held by the running worker: a
+        # competing same-session writer must wait, not slip in.
+        competitor_entered = threading.Event()
+
+        def competitor() -> None:
+            with sqlite_process_session_lock(engine, session_id):
+                competitor_entered.set()
+
+        competitor_thread = threading.Thread(target=competitor, daemon=True)
+        competitor_thread.start()
+        assert not competitor_entered.wait(0.3), "session lock was released while the custody worker still ran"
+
+        # Actual worker completion: settle once, free the lock, then re-raise
+        # the caller's cancellation.
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await settlement
+        assert competitor_entered.wait(5), "session lock was not released after the custody worker finished"
+        competitor_thread.join(timeout=5)
+    finally:
+        release.set()
+
+    with engine.connect() as conn:
+        rows = conn.execute(select(blobs_table.c.id, blobs_table.c.status).where(blobs_table.c.session_id == session_id)).all()
+    assert [(str(row.id), row.status) for row in rows] == [(str(custody.blob_id), "ready")]
+    storage = tmp_path.expanduser().resolve() / "blobs" / session_id / f"{custody.blob_id}_candidate.csv"
+    assert storage.read_bytes() == custody.request.content
+
+    # The retry (next planner attempt) is idempotent: same row, no duplicate.
+    retried = await finalize()
+    assert str(retried.id) == str(custody.blob_id)
+    with engine.connect() as conn:
+        assert conn.execute(select(blobs_table.c.id).where(blobs_table.c.session_id == session_id)).all() == [(str(custody.blob_id),)]
 
 
 @pytest.mark.asyncio
