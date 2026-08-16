@@ -111,10 +111,14 @@ ids identify components; they are not implicit connections.
   `policy`/`merge` semantics and publishes its merged rows under its own node
   id — a downstream consumer sets `input` to the coalesce id. Its optional
   `on_success` may only name a sink (never another node's input). `policy` and
-  `merge` are closed engine vocabularies: `policy` is one of `require_all`,
-  `quorum`, `best_effort`, `first`; `merge` is one of `union`, `nested`,
-  `select`. `best_effort` merges whichever branches arrive, where
-  `require_all` drops the row when any branch is missing. A coalesce consumes
+  `merge` are closed engine vocabularies, narrowed to what this surface can
+  make runnable: `policy` is one of `require_all`, `best_effort`, `first`
+  (`best_effort` REQUIRES `timeout_seconds`; the engine's `quorum` needs a
+  `quorum_count` the composer cannot author and is rejected); `merge` is one
+  of `union`, `nested` (the engine's `select` needs a `select_branch` the
+  composer cannot author and is rejected). `best_effort` merges whichever
+  branches arrive before the timeout, where `require_all` drops the row when
+  any branch is missing. A coalesce consumes
   ONLY the connections named in its `branches` values; its own `input` field
   is schema-required but is not a consuming binding — set it to the first
   branch's arriving connection by convention.

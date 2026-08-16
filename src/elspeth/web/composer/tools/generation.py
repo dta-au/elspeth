@@ -702,9 +702,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Key the coalesce branches by the gate's fork branch names — e.g. fork_to=['branch_a','branch_b'] pairs with branches={'branch_a': '<connection arriving from that branch>', 'branch_b': '<connection>'} — where each value is the connection reaching the coalesce after any per-branch transforms (the transform's on_success).",
     ),
     (
-        r"coalesce_policy_invalid|coalesce_merge_invalid",
-        "Coalesce policy and merge use the engine's closed vocabularies.",
-        "Set policy to one of: require_all, quorum, best_effort, first — and merge to one of: union, nested, select. For an A/B rejoin that combines branch fields into one row: policy='require_all', merge='union'.",
+        r"coalesce_policy_invalid|coalesce_merge_invalid|coalesce_policy_quorum_unsupported|coalesce_merge_select_unsupported|coalesce_best_effort_requires_timeout",
+        "Coalesce policy and merge use the engine's closed vocabularies, narrowed to what the composer can make runnable.",
+        "Set policy to one of: require_all, best_effort (requires timeout_seconds), first — and merge to one of: union, nested. The engine's quorum (needs quorum_count) and select (needs select_branch) cannot be authored here. For an A/B rejoin that combines branch fields into one row: policy='require_all', merge='union'.",
     ),
     (
         r"pipeline_decision_unregistered",

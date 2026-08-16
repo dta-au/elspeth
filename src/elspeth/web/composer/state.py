@@ -128,6 +128,50 @@ def validate_composer_output_name(output_name: str) -> None:
     validate_sink_name(output_name, field_label="Output name")
 
 
+_NODE_TYPE_NAME_LABELS: Final[dict[str, str]] = {
+    "transform": "Transform name",
+    "gate": "Gate name",
+    "aggregation": "Aggregation name",
+    "coalesce": "Coalesce name",
+    "row_union": "row_union name",
+    "queue": "Queue name",
+}
+_LOWERCASE_ONLY_NODE_TYPES: Final[frozenset[str]] = frozenset({"queue"})
+
+
+def _composer_node_id_validation_message(node_id: str, node_type: str) -> str | None:
+    """Return the runtime-equivalent node-name rejection for a composer node id, if any.
+
+    Mirrors ``core/config.py::validate_runtime_node_name`` — the rule every
+    runtime node kind (Transform/Gate/Aggregation/Coalesce/row_union settings
+    and the ``queues`` mapping) applies to its ``name``: non-empty, at most
+    ``_MAX_NODE_NAME_LENGTH`` characters, ``_VALID_NODE_NAME_RE``, not a
+    reserved edge label, no ``__`` prefix. Queue names are additionally
+    lowercase-only (``ElspethSettings.validate_queue_names``). Stage 1
+    mirrored these for SOURCE names only; a 60-character transform id
+    validated green and died at ``settings_load`` (elspeth-2ed41f0a4a).
+    Wording tracks the runtime's so a repair loop reads one message on both
+    surfaces.
+    """
+    label = _NODE_TYPE_NAME_LABELS.get(node_type, "Node name")
+    if not node_id or not node_id.strip():
+        return f"{label} must not be empty"
+    if node_type in _LOWERCASE_ONLY_NODE_TYPES and node_id != node_id.lower():
+        return f"{label} '{node_id}' must be lowercase. Suggested fix: '{node_id.lower()}'."
+    if len(node_id) > _MAX_NODE_NAME_LENGTH:
+        return f"{label} exceeds max length {_MAX_NODE_NAME_LENGTH} (got {len(node_id)})"
+    if not _VALID_NODE_NAME_RE.match(node_id):
+        return (
+            f"{label} '{node_id}' contains invalid characters. "
+            "Node names must start with a letter and contain only letters, digits, underscores, and hyphens."
+        )
+    if node_id in _RESERVED_EDGE_LABELS:
+        return f"{label} '{node_id}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}"
+    if node_id.startswith("__"):
+        return f"{label} '{node_id}' starts with '__', which is reserved for system edges"
+    return None
+
+
 def _composer_source_name_validation_message(source_name: str) -> str | None:
     """Return the runtime-equivalent source-name validation error, if any."""
     if not source_name or not source_name.strip():
@@ -1347,6 +1391,93 @@ def _runtime_nodes_downstream_of_connection(
             if node.fork_to is not None:
                 reachable_connections.update(node.fork_to)
     return tuple(ordered_nodes)
+
+
+def _node_published_connections(node: NodeSpec) -> frozenset[str]:
+    """Connections a node publishes rows to — the forward edges of the runtime graph walk.
+
+    Mirrors :func:`_runtime_nodes_downstream_of_connection`'s edge model
+    exactly: a coalesce without ``on_success`` publishes under its own id;
+    ``on_error`` and gate ``routes`` skip the ``discard``/``fork`` keywords;
+    ``fork_to`` branch names are connections. Sinks are terminal and never
+    consume, so a sink-named target contributes no node edge.
+    """
+    published: set[str] = set()
+    if node.node_type == "coalesce" and node.on_success is None:
+        published.add(node.id)
+    elif node.on_success is not None:
+        published.add(node.on_success)
+    if node.on_error is not None and node.on_error != _DISCARD_ROUTE_TARGET:
+        published.add(node.on_error)
+    if node.routes is not None:
+        published.update(target for target in node.routes.values() if target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET))
+    if node.fork_to is not None:
+        published.update(node.fork_to)
+    return frozenset(published)
+
+
+def _node_topology_cycle(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...] | None:
+    """Return one processing-node cycle as an ordered id path, or ``None`` when acyclic.
+
+    Mirrors ``ExecutionGraph.validate()``'s cycle rejection
+    (``core/dag/graph.py``, ``nx.find_cycle``) on the composer's connection
+    model. Stage 1 had NO cycle detection (elspeth-2ed41f0a4a): the per-node
+    "input has a producer" check is satisfied on every node of a cycle, so
+    ``t1.input=b, t1.on_success=c; t2.input=c, t2.on_success=b`` validated
+    green with no warning and died at the DAG build.
+
+    Edges are node -> node through connections: ``a -> b`` when ``a``
+    publishes a connection ``b`` consumes (``input`` for ordinary nodes,
+    ``branches`` values for coalesce/row_union). A structural queue is
+    transparent, exactly as in the downstream walker — its producers reach its
+    consumers directly. Iterative three-colour DFS; the returned path starts
+    and ends on the same node so the message reads like the runtime's
+    ``a -> b -> a``.
+    """
+    consumers_by_connection: dict[str, list[str]] = {}
+    for node in nodes:
+        if node.node_type == "queue":
+            continue
+        inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
+        for connection in inputs:
+            if connection is not None:
+                consumers_by_connection.setdefault(connection, []).append(node.id)
+    successors: dict[str, list[str]] = {}
+    for node in nodes:
+        if node.node_type == "queue":
+            continue
+        targets: list[str] = []
+        for connection in sorted(_node_published_connections(node)):
+            targets.extend(consumers_by_connection.get(connection, ()))
+        successors[node.id] = targets
+
+    white, grey, black = 0, 1, 2
+    colour: dict[str, int] = dict.fromkeys(successors, white)
+    for root in successors:
+        if colour[root] != white:
+            continue
+        path: list[str] = [root]
+        cursors: list[int] = [0]
+        colour[root] = grey
+        while path:
+            current = path[-1]
+            index = cursors[-1]
+            children = successors[current]
+            if index < len(children):
+                cursors[-1] = index + 1
+                child = children[index]
+                if colour[child] == grey:
+                    start = path.index(child)
+                    return (*path[start:], child)
+                if colour[child] == white:
+                    colour[child] = grey
+                    path.append(child)
+                    cursors.append(0)
+                continue
+            colour[current] = black
+            path.pop()
+            cursors.pop()
+    return None
 
 
 def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, Any]]:
@@ -2899,8 +3030,18 @@ def _check_schema_contracts(
         finally:
             transform.close()
 
-    def _probe_transform_declared_input_fields(plugin: str, options: Mapping[str, Any]) -> frozenset[str]:
-        """Read ``plugin``'s ``declared_input_fields``, closing the probe instance.
+    class _DeclaredInputs(NamedTuple):
+        fields: frozenset[str]
+        string_fields: frozenset[str]
+
+    def _probe_transform_declared_inputs(plugin: str, options: Mapping[str, Any]) -> _DeclaredInputs:
+        """Read ``plugin``'s ``declared_input_fields`` AND ``declared_string_input_fields`` in one probe.
+
+        Both live only on a constructed instance (``keyword_filter`` sets its
+        string-typed scan fields from ``fields``; the Azure document
+        transforms from ``source_field``), and one construction is enough to
+        read both — the lifecycle tests pin exactly one probe instance per
+        site.
 
         Input-side twin of ``_probe_transform_declared_output_fields``. Six
         transform configs compute this as a property over their own options
@@ -2929,11 +3070,52 @@ def _check_schema_contracts(
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
-            return frozenset()
+            return _DeclaredInputs(frozenset(), frozenset())
         try:
-            return transform.declared_input_fields
+            return _DeclaredInputs(transform.declared_input_fields, transform.declared_string_input_fields)
         finally:
             transform.close()
+
+    def _string_input_field_type_conflict(
+        producer: ProducerEntry,
+        node: NodeSpec,
+        declared_string_input: frozenset[str],
+    ) -> ValidationEntry | None:
+        """Mirror ``validate_transform_string_typed_input_fields`` for a typed-source producer.
+
+        A transform that names explicit scan fields (``keyword_filter``
+        ``fields``, document-intelligence ``source_field``) fails closed on the
+        first non-string value, so a producer that provably types one of them
+        non-string quarantines every row. The runtime checks EVERY live
+        predecessor's output schema config; Stage 1 checks the typed-SOURCE
+        producer only (the same gate as ``_edge_field_type_conflict``), because
+        a transform producer's runtime output config may be computed rather
+        than its raw ``schema:`` block and a raw-block comparison there would
+        risk a false red. That narrower reach is a documented abstention, not
+        parity (elspeth-2ed41f0a4a).
+        """
+        try:
+            producer_schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
+        except ValueError:
+            return None
+        if producer_schema_config is None or producer_schema_config.fields is None:
+            return None
+        mismatches = sorted(
+            (field.name, field.field_type)
+            for field in producer_schema_config.fields
+            if field.name in declared_string_input and field.field_type not in ("str", "any")
+        )
+        if not mismatches:
+            return None
+        described = ", ".join(f"'{name}' is declared {field_type}" for name, field_type in mismatches)
+        return _err(
+            f"node:{node.id}",
+            f"Transform '{node.plugin}' (node '{node.id}') scans input fields that must be text, but its upstream "
+            f"'{producer.producer_id}' declares them non-string: {described}. Point the scan option at a text column, "
+            "or declare the field as 'str' in the upstream schema if the values are genuinely text.",
+            "high",
+            "transform_string_input_field_type_incompatible",
+        )
 
     def _effective_producer_vote(
         producer: ProducerEntry,
@@ -4179,11 +4361,13 @@ def _check_schema_contracts(
         # block never names it. Probed only for transforms — sinks declare
         # their input requirements through ``get_raw_sink_required_fields``,
         # checked in the outputs loop below.
-        declared_input = (
-            _probe_transform_declared_input_fields(node.plugin, node.options)
+        declared_inputs = (
+            _probe_transform_declared_inputs(node.plugin, node.options)
             if node.node_type == "transform" and node.plugin is not None
-            else frozenset()
+            else _DeclaredInputs(frozenset(), frozenset())
         )
+        declared_input = declared_inputs.fields
+        declared_string_input = declared_inputs.string_fields
 
         # ``consumer_effective_required`` folds in a fixed/flexible consumer's
         # *implicitly* required declared fields (which the explicit-only
@@ -4194,7 +4378,13 @@ def _check_schema_contracts(
         # explicit contract and an unlocked input carries its requirement
         # ONLY there, and omitting it here would leave the rule permanently
         # inert.
-        if not consumer_required and consumer_locked_input is None and not consumer_effective_required and not declared_input:
+        if (
+            not consumer_required
+            and consumer_locked_input is None
+            and not consumer_effective_required
+            and not declared_input
+            and not declared_string_input
+        ):
             continue
 
         actual_producer = _walk_to_real_producer(
@@ -4237,6 +4427,10 @@ def _check_schema_contracts(
             type_error = _edge_field_type_conflict(actual_producer, node)
             if type_error is not None:
                 errors.append(type_error)
+            if declared_string_input:
+                string_type_error = _string_input_field_type_conflict(actual_producer, node, declared_string_input)
+                if string_type_error is not None:
+                    errors.append(string_type_error)
 
         if contract_required:
             contract_missing_fields = contract_required - producer_guaranteed
@@ -5088,11 +5282,14 @@ class CompositionState:
                     )
                 )
 
-        # 4. Node IDs unique
+        # 4. Node IDs unique and runtime-valid
         seen_node_ids: set[str] = set()
         for node in self.nodes:
             if node.id in seen_node_ids:
                 errors.append(_err(f"node:{node.id}", f"Duplicate node ID: '{node.id}'.", "high", "duplicate_node_id"))
+            node_id_message = _composer_node_id_validation_message(node.id, node.node_type)
+            if node_id_message is not None:
+                errors.append(_err(f"node:{node.id}", node_id_message, "high", "node_id_invalid"))
             if node.id == "source" or node.id.startswith("source:"):
                 errors.append(
                     _err(
@@ -5332,21 +5529,61 @@ class CompositionState:
                 # pre-run validation — valid-but-not-runnable. An UNSET policy
                 # is not one of those values: ``__post_init__`` has already
                 # normalised it to the runtime's own default.
-                if node.policy not in ("require_all", "quorum", "best_effort", "first"):
+                #
+                # A value INSIDE the runtime vocabulary can still be unrunnable
+                # as authored (elspeth-2ed41f0a4a census, 2026-08-17). The
+                # runtime couples ``quorum`` to ``quorum_count`` and ``select``
+                # to ``select_branch`` (``CoalesceSettings.validate_policy_requirements``
+                # / ``validate_merge_requirements``); ``NodeSpec`` carries
+                # neither field and the YAML importer lists both as
+                # unsupported, so those two menu items can NEVER run from this
+                # surface and are rejected outright with the reason. ``best_effort``
+                # is coupled to ``timeout_seconds``, which NodeSpec CAN carry, so
+                # that one is a plain coupling check.
+                if node.policy == "quorum":
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Coalesce '{node.id}' policy 'quorum' requires quorum_count, which the composer cannot author. "
+                            "Use require_all, best_effort (with timeout_seconds), or first.",
+                            "high",
+                            "coalesce_policy_quorum_unsupported",
+                        )
+                    )
+                elif node.policy not in ("require_all", "best_effort", "first"):
                     errors.append(
                         _err(
                             f"node:{node.id}",
                             f"Coalesce '{node.id}' policy {node.policy!r} is not a valid policy. "
-                            "Valid values: require_all, quorum, best_effort, first.",
+                            "Valid values: require_all, best_effort, first.",
                             "high",
                             "coalesce_policy_invalid",
                         )
                     )
-                if node.merge is not None and node.merge not in ("union", "nested", "select"):
+                if node.policy == "best_effort" and node.timeout_seconds is None:
                     errors.append(
                         _err(
                             f"node:{node.id}",
-                            f"Coalesce '{node.id}' merge {node.merge!r} is not a valid merge mode. Valid values: union, nested, select.",
+                            f"Coalesce '{node.id}': best_effort policy requires timeout_seconds.",
+                            "high",
+                            "coalesce_best_effort_requires_timeout",
+                        )
+                    )
+                if node.merge == "select":
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Coalesce '{node.id}' merge 'select' requires select_branch, which the composer cannot author. "
+                            "Use union or nested.",
+                            "high",
+                            "coalesce_merge_select_unsupported",
+                        )
+                    )
+                elif node.merge is not None and node.merge not in ("union", "nested"):
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Coalesce '{node.id}' merge {node.merge!r} is not a valid merge mode. Valid values: union, nested.",
                             "high",
                             "coalesce_merge_invalid",
                         )
@@ -5784,6 +6021,20 @@ class CompositionState:
                         "node_input_not_reachable",
                     )
                 )
+
+        # Cycles (elspeth-2ed41f0a4a). Every node of a cycle passes the
+        # per-node reachability check above, so this is a whole-graph rule.
+        cycle = _node_topology_cycle(self.nodes)
+        if cycle is not None:
+            errors.append(
+                _err(
+                    f"node:{cycle[0]}",
+                    f"Pipeline contains a cycle: {' -> '.join(cycle)}. Rows would loop forever; "
+                    "route the last node's on_success/routes to a sink or a downstream connection instead.",
+                    "high",
+                    "pipeline_cycle",
+                )
+            )
 
         # Structural queue topology (elspeth-a5b86149d4). At-least-one-producer
         # is covered by the input-reachability check above (a queue's input is

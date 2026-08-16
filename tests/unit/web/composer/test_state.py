@@ -950,6 +950,182 @@ class TestStage1Validation:
         result = state.validate()
         assert result.is_valid, result.errors
 
+    def _single_transform_state(self, node_id: str) -> CompositionState:
+        """source -> <node_id> -> sink; the two-call pair differs ONLY in the node id."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="t_in"))
+        state = state.with_node(self._make_transform(node_id, "t_in", "main"))
+        return state.with_output(self._make_output("main"))
+
+    @pytest.mark.parametrize(
+        ("node_id", "reason"),
+        [
+            pytest.param("t" * 39, "exceeds max length 38", id="too-long"),
+            pytest.param("1abc", "start with a letter", id="leading-digit"),
+            pytest.param("has space", "invalid characters", id="whitespace"),
+            # The runtime's ``__`` branch is unreachable for node names (the
+            # character class already demands a leading letter); the mirror
+            # keeps the same order, so this trips the same rule the runtime does.
+            pytest.param("__private", "invalid characters", id="dunder-prefix"),
+            pytest.param("continue", "is reserved", id="reserved-edge-label"),
+            pytest.param("fork", "is reserved", id="reserved-fork"),
+        ],
+    )
+    def test_node_id_violating_runtime_name_rules_is_rejected(self, node_id: str, reason: str) -> None:
+        """A node id the runtime settings model rejects must not validate green.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). Every runtime node kind
+        (transform/gate/aggregation/coalesce/row_union/queue) validates its
+        ``name`` through ``core/config.py::validate_runtime_node_name`` — max
+        38, ``^[a-zA-Z][a-zA-Z0-9_-]*$``, not a reserved edge label, no ``__``
+        prefix. Stage 1 mirrored those rules for SOURCE names only
+        (``_composer_source_name_validation_message``); a 60-character
+        transform id validated green and died at ``settings_load`` with
+        "Transform name exceeds max length 38".
+        """
+        result = self._single_transform_state(node_id).validate()
+
+        assert not result.is_valid
+        [entry] = [e for e in result.errors if e.error_code == "node_id_invalid"]
+        assert entry.component == f"node:{node_id}"
+        assert reason in entry.message
+
+    def test_node_id_at_runtime_limits_is_accepted(self) -> None:
+        """Positive control: a 38-char id with every permitted character class validates green."""
+        node_id = "T" + "a1_-" * 9 + "z"
+        assert len(node_id) == 38
+        result = self._single_transform_state(node_id).validate()
+
+        assert result.is_valid, result.errors
+
+    def test_queue_node_id_must_be_lowercase_like_the_runtime(self) -> None:
+        """Queue names are lowercase-only at the runtime; transform names are not."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="Q_in"))
+        queue = NodeSpec(
+            id="Q_in",
+            node_type="queue",
+            plugin=None,
+            input="Q_in",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = state.with_node(queue)
+        state = state.with_node(self._make_transform("t1", "Q_in", "main"))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "node_id_invalid"]
+        assert entry.component == "node:Q_in"
+        assert "lowercase" in entry.message
+
+    def test_transform_cycle_is_rejected(self) -> None:
+        """Two transforms feeding each other must not validate green.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). Stage 1 had NO cycle detection
+        at all: ``t1.input=b, t1.on_success=c; t2.input=c, t2.on_success=b``
+        satisfies the per-node "input has a producer" check on both sides, so
+        the pipeline validated ``is_valid=True`` with no warning, while the
+        DAG build raised ``GraphValidationError`` "Pipeline contains a cycle".
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="main"))
+        state = state.with_node(self._make_transform("t1", "b", "c"))
+        state = state.with_node(self._make_transform("t2", "c", "b"))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert not result.is_valid
+        [entry] = [e for e in result.errors if e.error_code == "pipeline_cycle"]
+        assert "t1" in entry.message and "t2" in entry.message
+        assert entry.component in ("node:t1", "node:t2")
+
+    def test_gate_routing_back_upstream_is_rejected_as_a_cycle(self) -> None:
+        """A gate whose route re-enters an ancestor's input connection is a cycle through the gate."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="t_in"))
+        state = state.with_node(self._make_transform("t1", "t_in", "g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "main", "false": "t_in"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        cycle_errors = [e for e in result.errors if e.error_code == "pipeline_cycle"]
+        assert len(cycle_errors) == 1, result.errors
+        assert "g" in cycle_errors[0].message and "t1" in cycle_errors[0].message
+
+    def test_fork_and_coalesce_diamond_is_not_a_cycle(self) -> None:
+        """Positive control: a fork/coalesce diamond revisits no node and must stay green."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("a", "b"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(self._make_transform("ta", "a", "a_done"))
+        state = state.with_node(self._make_transform("tb", "b", "b_done"))
+        state = state.with_node(
+            NodeSpec(
+                id="c",
+                node_type="coalesce",
+                plugin=None,
+                input="a_done",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"a": "a_done", "b": "b_done"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert not any(e.error_code == "pipeline_cycle" for e in result.errors), result.errors
+        assert result.is_valid, result.errors
+
     def test_connection_only_runtime_pipeline_is_valid_without_ui_edges(self) -> None:
         """Runtime connection fields, not UI edges, determine Stage 1 validity."""
         state = self._empty_state()
@@ -3652,6 +3828,56 @@ class TestSchemaContractValidation:
             (e.error_code, e.message) for e in result.errors
         ]
 
+    def _make_string_scan_state(self, upstream_type: str) -> CompositionState:
+        """Build csv(fixed value:<upstream_type>) -> keyword_filter(fields=[value]) -> sink.
+
+        The two calls differ ONLY in the source's declared type for the scanned
+        field, so the mismatch test is pinned against its own control.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="kf_in",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": [f"value: {upstream_type}"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "kf",
+                "kf_in",
+                "main",
+                plugin="keyword_filter",
+                options={"schema": {"mode": "observed"}, "fields": ["value"], "blocked_patterns": ["forbidden"]},
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_string_scan_field_typed_non_string_upstream_is_rejected(self) -> None:
+        """A transform scanning a field its typed producer declares non-string must not validate green.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). ``keyword_filter`` declares its
+        ``fields`` as ``declared_string_input_fields``; the runtime's
+        ``validate_transform_string_typed_input_fields`` rejects a live
+        predecessor that provably types one of them non-string, because the
+        transform fails closed on the first non-string value and every row from
+        that producer would be quarantined. Stage 1 had no counterpart: this
+        state validated green and died at the DAG build.
+        """
+        result = self._make_string_scan_state("int").validate()
+
+        assert not result.is_valid
+        [entry] = [e for e in result.errors if e.error_code == "transform_string_input_field_type_incompatible"]
+        assert entry.component == "node:kf"
+        assert "value" in entry.message and "int" in entry.message
+
+    def test_string_scan_field_str_upstream_is_accepted(self) -> None:
+        """Positive control: the same scan over a ``str``-typed upstream field validates green."""
+        result = self._make_string_scan_state("str").validate()
+
+        assert not any(e.error_code == "transform_string_input_field_type_incompatible" for e in result.errors), result.errors
+        assert result.is_valid, result.errors
+
     def _make_unreferenced_source_schema_state(self, source_fields: list[str]) -> CompositionState:
         """Build csv(fixed, <source_fields>) -> sink, where the SINK DECLARES NO SCHEMA.
 
@@ -3820,6 +4046,7 @@ class TestSchemaContractValidation:
         policy: str | None = "require_all",
         branch_order: tuple[str, str] = ("path_a", "path_b"),
         branch_plugin: str = "value_transform",
+        timeout_seconds: float | None = None,
     ) -> CompositionState:
         """Build a legal transformed fork/coalesce shape for schema-mode parity tests."""
         state = self._empty_state()
@@ -3874,6 +4101,7 @@ class TestSchemaContractValidation:
                 branches={branch_name: branch_connections[branch_name] for branch_name in branch_order},
                 policy=policy,
                 merge=merge,
+                timeout_seconds=timeout_seconds,
             )
         )
         state = state.with_output(self._make_output("main"))
@@ -5635,6 +5863,72 @@ class TestSchemaContractValidation:
         assert len(entries) == 1, result.errors
         assert entries[0].component == "node:merge_results"
 
+    def test_coalesce_merge_select_is_rejected_as_unauthorable(self) -> None:
+        """``merge: select`` cannot be made runnable from the composer, so Stage 1 must say so.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). The runtime's ``select`` merge
+        requires ``select_branch`` (``CoalesceSettings.validate_merge_requirements``);
+        ``NodeSpec`` carries no such field and the YAML importer lists it as
+        unsupported, so a coalesce authored with ``merge: select`` validated
+        green and died at ``settings_load`` with "select merge strategy
+        requires select_branch". A closed-vocabulary check that ADVERTISES a
+        value the surface can never run is the defect, not a feature.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge="select",
+        )
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "coalesce_merge_select_unsupported"]
+        assert entry.component == "node:merge_results"
+        assert "select_branch" in entry.message
+        assert not any(e.error_code == "coalesce_merge_invalid" for e in result.errors)
+
+    def test_coalesce_policy_quorum_is_rejected_as_unauthorable(self) -> None:
+        """``policy: quorum`` needs ``quorum_count``, which no NodeSpec field carries."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy="quorum",
+        )
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "coalesce_policy_quorum_unsupported"]
+        assert entry.component == "node:merge_results"
+        assert "quorum_count" in entry.message
+        assert not any(e.error_code == "coalesce_policy_invalid" for e in result.errors)
+
+    def test_coalesce_best_effort_without_timeout_is_rejected(self) -> None:
+        """``policy: best_effort`` requires ``timeout_seconds`` at the runtime; the composer CAN set it."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy="best_effort",
+        )
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "coalesce_best_effort_requires_timeout"]
+        assert entry.component == "node:merge_results"
+        assert "timeout_seconds" in entry.message
+
+    def test_coalesce_best_effort_with_timeout_is_accepted(self) -> None:
+        """Positive control for the best_effort/timeout coupling — same state plus ``timeout_seconds``."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy="best_effort",
+            timeout_seconds=5.0,
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
     def test_unset_coalesce_policy_survives_yaml_generation(self) -> None:
         """The normalised value must be byte-visible in the exported YAML.
 
@@ -6906,7 +7200,7 @@ class TestSchemaContractValidation:
         )
         state = state.with_node(
             NodeSpec(
-                id="fork",
+                id="fork_gate",
                 node_type="gate",
                 plugin=None,
                 input="gate_in",

@@ -493,6 +493,57 @@ where the architectural fix landed:
   exported YAML and the ``upsert_node`` tool schema, mirroring merge's
   disclosure. Pinned by
   ``TestComposerRuntimeCoalescePolicyDefaultAgreement``.
+* Shapes 21-25 — the 2026-08-17 CENSUS closures (``elspeth-2ed41f0a4a``).
+  Found by direct probing rather than by an eval: the panel review's census
+  named the unmirrored graph-build predicates and a probe run over each
+  (Stage 1 ``state.validate()`` vs the real Stage 2, with a type-agreeing /
+  valid control per shape) confirmed six live validate-green / runtime-red
+  predicates needing no special topology. Closed for NodeSpec-/OutputSpec-
+  constructed state; every closure is a Stage-1 mirror in
+  ``web/composer/state.py`` and each is pinned both-reject WITH its control
+  by the class named. The inflow is now gated: every raise site under
+  ``core/dag/`` and ``core/config.py`` carries a reviewed disposition in
+  ``config/cicd/runtime_rejection_parity.yaml``
+  (``tests/unit/scripts/cicd/test_runtime_rejection_parity_gate.py``).
+  - **Shape 21** — producer -> SINK field-type conflict (``csv(value: str)
+    -> sink(value: int)``). The node-consumer mirror (elspeth-f2eb8fef9f)
+    stopped at nodes; ``_edge_field_type_conflict`` now takes
+    ``NodeSpec | OutputSpec`` under the same typed-source gate. Pinned by
+    ``test_both_reject_sink_field_type_mismatch`` — the test that previously
+    PINNED the divergence, amended per ADR-040 §6.
+  - **Shape 22** — processing-node CYCLE (``t1.input=b, on_success=c; t2.input
+    =c, on_success=b``). Stage 1 had no cycle detection; every node of a
+    cycle passes the per-node reachability check. ``_node_topology_cycle``
+    mirrors ``ExecutionGraph.validate()``. Pinned by
+    ``TestComposerRuntimeCensusAgreement`` (diamond control in
+    ``test_state.py``).
+  - **Shape 23** — node id outside the runtime NAME rule (max 38, leading
+    letter, node-name character class, not a reserved edge label; queues
+    lowercase). Stage 1 mirrored these for SOURCE names only.
+    ``_composer_node_id_validation_message`` mirrors
+    ``validate_runtime_node_name``. Pinned by ``TestComposerRuntimeCensusAgreement``.
+  - **Shape 24** — coalesce menu items inside the runtime vocabulary that
+    cannot run as authored: ``merge: select`` (needs ``select_branch``) and
+    ``policy: quorum`` (needs ``quorum_count``) — neither field exists on
+    ``NodeSpec`` and the importer lists both unsupported, so they are rejected
+    outright as unauthorable; ``policy: best_effort`` without
+    ``timeout_seconds`` (which NodeSpec CAN carry) is a coupling check. The
+    advertised vocabulary in ``pipeline_capabilities.md`` and the repair hint
+    were narrowed to match. Pinned by ``TestComposerRuntimeCensusAgreement``
+    with all four runnable menu combinations as controls.
+  - **Shape 25** — a transform's explicit string-typed scan fields
+    (``keyword_filter`` ``fields``, document-intelligence ``source_field``)
+    against a typed SOURCE that declares one non-string
+    (``validate_transform_string_typed_input_fields``). Stage 1 reads
+    ``declared_string_input_fields`` off the same probe instance as
+    ``declared_input_fields`` and checks the typed-source producer only —
+    transform producers are a documented abstention (their runtime output
+    schema may be computed, not the raw block). Pinned by
+    ``TestComposerRuntimeCensusAgreement``.
+  Still open from the same census, deliberately: an unreferenced sink is a
+  Stage-1 WARNING (state.py "W1"), because a sink is a passive target that
+  is routinely added before it is wired; the terminal Stage-2 gate and the
+  guided accept path catch it. Recorded as ``abstains`` in the parity baseline.
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
@@ -1528,6 +1579,11 @@ class TestComposerRuntimeAgreement:
                 branches=("path_a", "path_b"),
                 policy="best_effort",
                 merge="union",
+                # The runtime half below sets timeout_seconds=1; best_effort
+                # REQUIRES it (CoalesceSettings.validate_policy_requirements)
+                # and Stage 1 now mirrors that coupling (elspeth-2ed41f0a4a),
+                # so the composer half must author the same pipeline.
+                timeout_seconds=1,
             )
         )
         state = state.with_node(
@@ -6311,3 +6367,273 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
         assert len(entries) == 1, composer_result.errors
         assert entries[0].contract is not None
         assert entries[0].contract.extra_fields == ("id", "product")
+
+
+class TestComposerRuntimeCensusAgreement:
+    """Shapes 21-25 — the 2026-08-17 census closures (elspeth-2ed41f0a4a).
+
+    Each test runs the SAME composer state through both surfaces — Stage 1
+    (``state.validate()``) and the real Stage 2 (``validate_pipeline`` via the
+    trained-operator root) — and asserts both reject, with a control that
+    differs only in the predicate under test and is accepted by both. That is
+    the clean-probe rule from the module docstring, and it is what makes each
+    rejection falsifiable: a blanket red would fail its own control.
+
+    Bug verification protocol, per shape (each Stage-1 mirror named here was
+    reverted in turn and the corresponding ``assert not composer.is_valid``
+    failed with ``is_valid=True, errors=()``):
+
+    * Shape 22 cycle — ``_node_topology_cycle`` call in ``validate()``.
+    * Shape 23 node id — ``_composer_node_id_validation_message`` call in
+      ``validate()`` check 4.
+    * Shape 24 coalesce menu — the ``quorum``/``select``/``best_effort``
+      arms in the coalesce block of ``validate()``.
+    * Shape 25 string scan — the ``declared_string_input`` branch under
+      ``producer_is_typed_source`` in ``_check_schema_contracts``.
+    """
+
+    @staticmethod
+    def _settings(tmp_path: Path) -> SimpleNamespace:
+        return SimpleNamespace(data_dir=tmp_path)
+
+    @staticmethod
+    def _csv_input(tmp_path: Path) -> Path:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "input.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("value\n1\n", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _output_path(tmp_path: Path, name: str = "out.jsonl") -> Path:
+        out_dir = tmp_path / "outputs" / _AGREEMENT_SESSION_ID
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / name
+
+    def _source(self, tmp_path: Path, on_success: str, *, fields: tuple[str, ...] = ("value: str",)) -> SourceSpec:
+        return SourceSpec(
+            plugin="csv",
+            on_success=on_success,
+            options={"path": str(self._csv_input(tmp_path)), "schema": {"mode": "fixed", "fields": list(fields)}},
+            on_validation_failure="discard",
+        )
+
+    def _output(self, tmp_path: Path, name: str = "main") -> OutputSpec:
+        return OutputSpec(
+            name=name,
+            plugin="json",
+            options={"path": str(self._output_path(tmp_path)), "format": "jsonl", "schema": {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    @staticmethod
+    def _transform(
+        node_id: str, input_name: str, on_success: str, plugin: str = "value_transform", options: dict[str, Any] | None = None
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin=plugin,
+            input=input_name,
+            on_success=on_success,
+            on_error="discard",
+            options=options or {"schema": {"mode": "observed"}, "operations": [{"target": "value", "expression": "row['value']"}]},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    @staticmethod
+    def _gate(node_id: str, input_name: str, fork_to: tuple[str, ...]) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="gate",
+            plugin=None,
+            input=input_name,
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="True",
+            routes={"true": "fork", "false": "discard"},
+            fork_to=fork_to,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    @staticmethod
+    def _coalesce(
+        node_id: str,
+        branches: dict[str, str],
+        on_success: str,
+        *,
+        policy: str = "require_all",
+        merge: str = "union",
+        timeout_seconds: float | None = None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="coalesce",
+            plugin=None,
+            input=next(iter(branches.values())),
+            on_success=on_success,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=branches,
+            policy=policy,
+            merge=merge,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _both(self, state: CompositionState, tmp_path: Path) -> tuple[Any, Any]:
+        composer = state.validate()
+        runtime = validate_pipeline_for_trained_operator(
+            state,
+            self._settings(tmp_path),
+            composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
+        )
+        return composer, runtime
+
+    def _fork_coalesce_state(self, tmp_path: Path, **coalesce_kwargs: Any) -> CompositionState:
+        return CompositionState(
+            source=self._source(tmp_path, "g_in"),
+            nodes=(
+                self._gate("g", "g_in", ("x", "y")),
+                self._transform("tx", "x", "cx"),
+                self._transform("ty", "y", "cy"),
+                self._coalesce("c", {"x": "cx", "y": "cy"}, "main", **coalesce_kwargs),
+            ),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+
+    def test_both_reject_transform_cycle(self, tmp_path: Path) -> None:
+        """Shape 22 — t1 -> t2 -> t1, both fed: Stage 1 had no cycle detection at all."""
+        state = CompositionState(
+            source=self._source(tmp_path, "main"),
+            nodes=(self._transform("t1", "b", "c"), self._transform("t2", "c", "b")),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "pipeline_cycle" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("cycle" in e.message.lower() for e in runtime.errors), runtime.errors
+
+    def test_both_reject_overlong_node_id(self, tmp_path: Path) -> None:
+        """Shape 23 — a 60-char transform id: runtime max is 38 (``_MAX_NODE_NAME_LENGTH``)."""
+        long_id = "t" * 60
+        state = CompositionState(
+            source=self._source(tmp_path, "a"),
+            nodes=(self._transform(long_id, "a", "main"),),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        [entry] = [e for e in composer.errors if e.error_code == "node_id_invalid"]
+        assert "exceeds max length 38" in entry.message
+        assert not runtime.is_valid
+        assert any("exceeds max length 38" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_accept_node_id_at_the_runtime_limit(self, tmp_path: Path) -> None:
+        """Shape 23 control — 38 chars is accepted by both surfaces."""
+        node_id = "t" * 38
+        state = CompositionState(
+            source=self._source(tmp_path, "a"),
+            nodes=(self._transform(node_id, "a", "main"),),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert composer.is_valid, composer.errors
+        assert runtime.is_valid, runtime.errors
+
+    @pytest.mark.parametrize(
+        ("coalesce_kwargs", "composer_code", "runtime_fragment"),
+        [
+            pytest.param({"merge": "select"}, "coalesce_merge_select_unsupported", "requires select_branch", id="merge-select"),
+            pytest.param({"policy": "quorum"}, "coalesce_policy_quorum_unsupported", "requires quorum_count", id="policy-quorum"),
+            pytest.param(
+                {"policy": "best_effort"}, "coalesce_best_effort_requires_timeout", "requires timeout_seconds", id="best-effort-no-timeout"
+            ),
+        ],
+    )
+    def test_both_reject_unrunnable_coalesce_menu_items(
+        self, tmp_path: Path, coalesce_kwargs: dict[str, Any], composer_code: str, runtime_fragment: str
+    ) -> None:
+        """Shape 24 — values inside the runtime vocabulary that cannot run as authored."""
+        composer, runtime = self._both(self._fork_coalesce_state(tmp_path, **coalesce_kwargs), tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == composer_code for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any(runtime_fragment in e.message for e in runtime.errors), runtime.errors
+
+    @pytest.mark.parametrize(
+        "coalesce_kwargs",
+        [
+            pytest.param({}, id="require_all-union"),
+            pytest.param({"merge": "nested"}, id="nested"),
+            pytest.param({"policy": "best_effort", "timeout_seconds": 5.0}, id="best-effort-with-timeout"),
+            pytest.param({"policy": "first"}, id="first"),
+        ],
+    )
+    def test_both_accept_runnable_coalesce_menu_items(self, tmp_path: Path, coalesce_kwargs: dict[str, Any]) -> None:
+        """Shape 24 control — every advertised policy/merge value is runnable as authored."""
+        composer, runtime = self._both(self._fork_coalesce_state(tmp_path, **coalesce_kwargs), tmp_path)
+
+        assert composer.is_valid, composer.errors
+        assert runtime.is_valid, runtime.errors
+
+    def _string_scan_state(self, tmp_path: Path, upstream_type: str) -> CompositionState:
+        return CompositionState(
+            source=self._source(tmp_path, "kf_in", fields=(f"value: {upstream_type}",)),
+            nodes=(
+                self._transform(
+                    "kf",
+                    "kf_in",
+                    "main",
+                    plugin="keyword_filter",
+                    options={"schema": {"mode": "observed"}, "fields": ["value"], "blocked_patterns": ["forbidden"]},
+                ),
+            ),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+
+    def test_both_reject_string_scan_over_non_string_upstream(self, tmp_path: Path) -> None:
+        """Shape 25 — keyword_filter scanning an ``int``-typed source field."""
+        composer, runtime = self._both(self._string_scan_state(tmp_path, "int"), tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "transform_string_input_field_type_incompatible" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("must be text" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_accept_string_scan_over_string_upstream(self, tmp_path: Path) -> None:
+        """Shape 25 control."""
+        composer, runtime = self._both(self._string_scan_state(tmp_path, "str"), tmp_path)
+
+        assert composer.is_valid, composer.errors
+        assert runtime.is_valid, runtime.errors

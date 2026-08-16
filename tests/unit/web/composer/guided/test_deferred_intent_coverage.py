@@ -338,7 +338,13 @@ def test_node_edge_shared_id_does_not_hide_node(constraint: DeferredConstraint) 
         nodes=(_node(node_id=NODE_ID, on_error="discard"),),
         edges=(EdgeSpec(id=NODE_ID, from_node="primary", to_node=NODE_ID, edge_type="on_success", label=None),),
     )
-    assert candidate.validate().is_valid
+    # Fixture sanity: the shared node/edge id must be the ONLY thing Stage 1
+    # objects to. ``NODE_ID`` doubles as a ``StableSubject.stable_id`` (which
+    # must be a UUID) and as the ``NodeSpec.id`` (which the runtime rejects
+    # for its leading digit); Stage 1 now mirrors that name rule
+    # (elspeth-2ed41f0a4a), so a UUID-named node is correctly not runnable.
+    # The coverage evaluator under test never consults ``is_valid``.
+    assert {e.error_code for e in candidate.validate().errors} == {"node_id_invalid"}
 
     _assert_unproven(candidate, constraint)
 
