@@ -302,11 +302,27 @@ Three facts a future attempt will want, all measured 2026-08-16:
     pins the enumerator to the interpreter — note it must `compile(...,
     dont_inherit=True)` because the test module itself imports
     `annotations` from `__future__`, which `compile` otherwise inherits.
-  - Still open in this family: `elspeth-f1def53d38` (PEP 695/696 type-parameter
-    scopes) and `elspeth-2a72512454` (destructured literal RHS timing). Not
-    modelled and not claimed: `getattr.__call__(...)`, `a, b = wrap(getattr)`
-    (destructuring a laundered value), reflective laundering
-    (`getattr(builtins, "getattr")` — the outer call is itself a site).
+  - *PEP 695/696 annotation scopes are modelled* (`elspeth-f1def53d38`).
+    Bounds, constraints, PEP 696 defaults and `type` alias values are LAZY:
+    inventoried against the deferred bindings, with the declared self-name
+    bound and — when the scope is immediately inside a class body — the class
+    dict consulted first (position-aware: `_ClassBodyCursor` projects the body
+    once and suffix-joins, so states from the def onward count and names the
+    class bound before it shadow the globals). Generic annotations and class
+    bases/keywords are EAGER inside the annotation scope (type params shadow,
+    the enclosing class IS visible); generic *defaults* evaluate in the
+    enclosing scope (type params do NOT shadow them, a walrus there binds
+    outside). Type params are closure cells of the body and every nested
+    scope (`_push_binding_scope` shadows every active one and skips
+    `"annotation"` frames like `"class"` frames). A walrus is a SyntaxError in
+    bounds/annotations/alias values, so the projection needs nothing. 3.12 =
+    3.13 on all of this (verified with an interpreter oracle); do not add a
+    lazy-force cache, a CFG, or a second evaluator to "improve" it.
+  - Still open in this family: `elspeth-2a72512454` (destructured literal RHS
+    timing). Not modelled and not claimed: `getattr.__call__(...)`,
+    `a, b = wrap(getattr)` (destructuring a laundered value), reflective
+    laundering (`getattr(builtins, "getattr")` — the outer call is itself a
+    site).
 - **`probe_shape` is invariant under a resolver change** — it is computed from
   the AST node and kind, neither of which passes through resolution (verified:
   354 distinct / 474 total digests, zero differing files). That is what makes

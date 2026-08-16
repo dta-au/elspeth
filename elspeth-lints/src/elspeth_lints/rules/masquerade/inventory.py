@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -154,6 +154,35 @@ def _annotation_expressions(arguments: ast.arguments, returns: ast.expr | None) 
     return expressions
 
 
+def _class_header_arguments(node: ast.ClassDef) -> list[ast.expr]:
+    """Return the class bases (starred included) then keyword values, in evaluation order."""
+    return [*node.bases, *(keyword.value for keyword in node.keywords)]
+
+
+def _type_parameter_names(type_params: Sequence[ast.type_param]) -> frozenset[str]:
+    return frozenset(parameter.name for parameter in type_params if isinstance(parameter, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)))
+
+
+def _lazy_type_parameter_expressions(type_params: Sequence[ast.type_param]) -> list[ast.expr]:
+    """Return every bound, constraint tuple, and PEP 696 default among ``type_params``.
+
+    All of them are evaluated lazily, on first access, in their own annotation
+    scope. ``default_value`` exists only on Python 3.13+ ASTs; the node's own
+    ``_fields`` manifest is the version-neutral way to ask.
+    """
+    expressions: list[ast.expr] = []
+    for parameter in type_params:
+        if isinstance(parameter, ast.TypeVar) and parameter.bound is not None:
+            expressions.append(parameter.bound)
+        if (
+            isinstance(parameter, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple))
+            and "default_value" in parameter._fields
+            and parameter.default_value is not None
+        ):
+            expressions.append(parameter.default_value)
+    return expressions
+
+
 def definition_header_expressions(
     node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef,
     *,
@@ -166,11 +195,13 @@ def definition_header_expressions(
     bases (starred included), then keyword values; a function or lambda
     evaluates decorators, then defaults, then — when ``annotations`` is set,
     i.e. outside ``from __future__ import annotations`` — its signature
-    annotations. PEP 695 type parameters are a separate annotation scope and
-    are deliberately not enumerated here (elspeth-f1def53d38).
+    annotations. PEP 695 type parameters are not header *effects*: their
+    bounds, constraints, and defaults are lazy, and a walrus is a syntax error
+    inside them, so they never bind anything in the enclosing scope; the
+    visitor inventories them separately (:meth:`_MasqueradeVisitor._visit_type_parameters`).
     """
     if isinstance(node, ast.ClassDef):
-        return [*node.decorator_list, *node.bases, *(keyword.value for keyword in node.keywords)]
+        return [*node.decorator_list, *_class_header_arguments(node)]
     decorators = node.decorator_list if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else []
     expressions: list[ast.expr] = [*decorators, *(default for _parameter, default in _parameter_defaults(node.args))]
     if annotations and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -815,13 +846,27 @@ def _possible_and_final_runtime_bindings(
     again for its exit state.
     """
     possible = dict(incoming)
+    final = dict(incoming)
+    for reachable, after in _iter_statement_states(nodes, incoming, context):
+        possible = _join_binding_states((possible, reachable))
+        final = after
+    return possible, final
+
+
+def _iter_statement_states(
+    nodes: Sequence[ast.stmt],
+    incoming: dict[str, BindingTargets],
+    context: _ExecutionContext,
+) -> Iterator[tuple[dict[str, BindingTargets], dict[str, BindingTargets]]]:
+    """Yield ``(reachable, after)`` per statement: every state reachable while it runs, and the state after it."""
     current = dict(incoming)
-
-    def merge(state: dict[str, BindingTargets]) -> None:
-        nonlocal possible
-        possible = _join_binding_states((possible, state))
-
     for node in nodes:
+        reachable: dict[str, BindingTargets] = {}
+
+        def merge(state: dict[str, BindingTargets]) -> None:
+            nonlocal reachable
+            reachable = _join_binding_states((reachable, state))
+
         if isinstance(node, ast.If):
             merge(_possible_runtime_bindings(node.body, current, context))
             merge(_possible_runtime_bindings(node.orelse, current, context))
@@ -837,6 +882,7 @@ def _possible_and_final_runtime_bindings(
                 merge(_possible_runtime_bindings(node.orelse, states.normal_exit, context))
             current = states.exit
             merge(current)
+            yield reachable, current
             continue
         elif isinstance(node, (ast.Try, ast.TryStar)):
             merge(_possible_runtime_bindings(node.body, current, context))
@@ -846,7 +892,61 @@ def _possible_and_final_runtime_bindings(
             merge(_possible_runtime_bindings(node.finalbody, current, context))
         current = _runtime_bindings_after((node,), current, context)
         merge(current)
-    return possible, current
+        yield reachable, current
+
+
+class _ClassBodyCursor:
+    """Position within a class body suite while the visitor walks it.
+
+    Answers, for a lazily evaluated annotation-scope expression at the current
+    statement, which class-dict states are reachable from here on and which
+    names the class dict already holds. Both are derived once per class body
+    (a single projection plus suffix joins, prefix binder sets) the first time
+    a lazy expression asks, so a class with many generic members stays
+    linear in its length rather than re-projecting its tail per member.
+    """
+
+    __slots__ = ("_context", "_entry", "_kept_prefix", "_suffix_states", "index", "statements")
+
+    def __init__(self, statements: Sequence[ast.stmt], entry: dict[str, BindingTargets], context: _ExecutionContext) -> None:
+        self.statements = statements
+        self.index = 0
+        self._entry = entry
+        self._context = context
+        self._suffix_states: list[dict[str, BindingTargets]] | None = None
+        self._kept_prefix: list[frozenset[str]] | None = None
+
+    def states_from_current(self) -> dict[str, BindingTargets]:
+        """Every class-dict state reachable while or after the current statement runs."""
+        if self._suffix_states is None:
+            per_statement = [reachable for reachable, _after in _iter_statement_states(self.statements, self._entry, self._context)]
+            suffix: list[dict[str, BindingTargets]] = [{} for _ in per_statement]
+            accumulated: dict[str, BindingTargets] = {}
+            for position in range(len(per_statement) - 1, -1, -1):
+                accumulated = _join_binding_states((per_statement[position], accumulated))
+                suffix[position] = accumulated
+            self._suffix_states = suffix
+        return self._suffix_states[self.index] if self.index < len(self._suffix_states) else {}
+
+    def names_bound_before_current(self) -> frozenset[str]:
+        """Names already in the class dict at the current statement, minus any the body ever deletes."""
+        if self._kept_prefix is None:
+            deleted = {
+                name
+                for statement in self.statements
+                for child in iter_own_scope(statement)
+                if isinstance(child, ast.Delete)
+                for target in child.targets
+                for name in assignment_target_names(target)
+            }
+            prefix: list[frozenset[str]] = []
+            bound: set[str] = set()
+            for statement in self.statements:
+                prefix.append(frozenset(bound - deleted))
+                bound |= possibly_bound_names((statement,))[0]
+            prefix.append(frozenset(bound - deleted))
+            self._kept_prefix = prefix
+        return self._kept_prefix[min(self.index, len(self._kept_prefix) - 1)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1012,6 +1112,15 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         self._runtime_module_bindings = runtime_module_bindings
         self._source_stack: list[set[str]] = [set()]
         self._deferred_binding_stack: list[dict[str, BindingTargets]] = []
+        # The class body being visited and how far into it we are: a lazily
+        # evaluated annotation-scope expression immediately inside a class body
+        # sees the class dict at access time — every state from its own
+        # statement onward, LATER rebindings included — before it falls
+        # through to the globals.
+        self._class_body_stack: list[_ClassBodyCursor] = []
+        # Names of every active PEP 695 type parameter; they shadow enclosing
+        # names in the annotation scope and every scope nested inside it.
+        self._type_parameter_stack: list[frozenset[str]] = []
         self._comprehension_mutation_stack: list[set[str]] = []
         self._assert_direct_call_ids: set[int] = set()
         self.sites: list[MasqueradeSite] = []
@@ -1019,19 +1128,35 @@ class _MasqueradeVisitor(ast.NodeVisitor):
     # -- scope bookkeeping -------------------------------------------------
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        for expression in definition_header_expressions(node, annotations=False):
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        in_class_body = self._container_stack[-1] == "class"
+        if node.type_params:
+            # Bases and keywords of a generic class evaluate inside the type
+            # parameter scope (they can see ``T``); the body cannot see an
+            # enclosing class, but the annotation scope can.
+            self._push_annotation_scope(node.type_params)
+            self._visit_type_parameters(node.type_params, declared_name=node.name, in_class_body=in_class_body)
+        for expression in _class_header_arguments(node):
             self.visit(expression)
         self._qual_stack.append(node.name)
         self._container_stack.append("class")
         self._push_binding_scope("class")
         self._source_stack.append(set(self._source_names))
+        cursor = _ClassBodyCursor(
+            node.body, dict(self._bindings), _ExecutionContext(future_annotations=self._future_annotations, function_scope=False)
+        )
+        self._class_body_stack.append(cursor)
         try:
-            self._visit_statements(node.body)
+            self._visit_statements(node.body, cursor=cursor)
         finally:
+            self._class_body_stack.pop()
             self._source_stack.pop()
             self._pop_binding_scope()
             self._container_stack.pop()
             self._qual_stack.pop()
+            if node.type_params:
+                self._pop_annotation_scope()
         self._bind_unknown((node.name,))
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -1041,17 +1166,17 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         self._visit_function(node)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        captured_defaults = self._visit_function_header(node)
         parent_kind = self._container_stack[-1]
+        captured_defaults = self._visit_function_header(node)
         self._qual_stack.append(node.name)
         self._container_stack.append("function")
         nested_in_function = "function" in self._container_stack[:-1]
-        local_bindings = function_local_binding_names(node)
+        # Type parameters are closure cells of the body: never rebound there,
+        # never refreshed from the deferred enclosing state.
+        local_bindings = function_local_binding_names(node) | _type_parameter_names(node.type_params)
         self._push_binding_scope("function", local_bindings=local_bindings)
         deferred_bindings = self._deferred_binding_stack[-1] if nested_in_function else self._runtime_module_bindings
-        for name, targets in deferred_bindings.items():
-            if name not in local_bindings:
-                self._bindings[name] = self._bindings.get(name, frozenset()) | targets
+        self._merge_deferred_bindings(deferred_bindings, excluding=local_bindings)
         for name, targets in captured_defaults.items():
             if name in local_bindings:
                 self._bindings[name] = targets
@@ -1068,6 +1193,8 @@ class _MasqueradeVisitor(ast.NodeVisitor):
             self._pop_binding_scope()
             self._container_stack.pop()
             self._qual_stack.pop()
+            if node.type_params:
+                self._pop_annotation_scope()
         self._bind_unknown((node.name,))
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
@@ -1078,9 +1205,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         local_bindings = argument_names(node.args)
         self._push_binding_scope("function", local_bindings=local_bindings)
         deferred_bindings = self._deferred_binding_stack[-1] if nested_in_function else self._runtime_module_bindings
-        for name, targets in deferred_bindings.items():
-            if name not in local_bindings:
-                self._bindings[name] = self._bindings.get(name, frozenset()) | targets
+        self._merge_deferred_bindings(deferred_bindings, excluding=local_bindings)
         for name, targets in captured_defaults.items():
             if name in local_bindings:
                 self._bindings[name] = targets
@@ -1123,9 +1248,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         self._push_binding_scope("function", local_bindings=local_bindings)
         if isinstance(node, ast.GeneratorExp):
             deferred_bindings = self._deferred_binding_stack[-1] if self._deferred_binding_stack else self._runtime_module_bindings
-            for name, targets in deferred_bindings.items():
-                if name not in local_bindings:
-                    self._bindings[name] = self._bindings.get(name, frozenset()) | targets
+            self._merge_deferred_bindings(deferred_bindings, excluding=local_bindings)
         # Every iteration after the first enters through the back edge: a
         # walrus in a filter or the element rebinds names for the next pass,
         # so the head state is the fixpoint of replaying one iteration.
@@ -1184,10 +1307,13 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         return self._source_stack[-1]
 
     def _push_binding_scope(self, kind: str, *, local_bindings: Sequence[str] | set[str] = ()) -> None:
+        # A function-like scope sees the nearest enclosing function/module
+        # frame, never a class body and never the (class-visible) type
+        # parameter frame — but every active type parameter is a closure cell.
         for frame_kind, bindings in reversed(self._binding_stack):
-            if frame_kind != "class":
+            if frame_kind not in {"class", "annotation"}:
                 scoped = dict(bindings)
-                for name in local_bindings:
+                for name in (*local_bindings, *self._active_type_parameters):
                     scoped[name] = frozenset({_SHADOWED_BINDING})
                 self._binding_stack.append((kind, scoped))
                 return
@@ -1196,9 +1322,71 @@ class _MasqueradeVisitor(ast.NodeVisitor):
     def _pop_binding_scope(self) -> None:
         self._binding_stack.pop()
 
-    def _visit_statements(self, statements: Sequence[ast.stmt]) -> None:
+    @property
+    def _active_type_parameters(self) -> frozenset[str]:
+        return frozenset().union(*self._type_parameter_stack) if self._type_parameter_stack else frozenset()
+
+    def _push_annotation_scope(self, type_params: Sequence[ast.type_param]) -> None:
+        """Enter a PEP 695 annotation scope: the current frame — class body included — plus the type parameters."""
+        names = _type_parameter_names(type_params)
+        scoped = dict(self._bindings)
+        for name in names:
+            scoped[name] = frozenset({_SHADOWED_BINDING})
+        self._binding_stack.append(("annotation", scoped))
+        self._source_stack.append(set(self._source_names))
+        self._type_parameter_stack.append(names)
+
+    def _pop_annotation_scope(self) -> None:
+        self._type_parameter_stack.pop()
+        self._source_stack.pop()
+        self._binding_stack.pop()
+
+    def _merge_deferred_bindings(
+        self, deferred: dict[str, BindingTargets], *, excluding: Sequence[str] | set[str] | frozenset[str] = ()
+    ) -> None:
+        """Widen the current frame with the bindings a later-running body may see."""
+        shadowed = self._active_type_parameters
+        for name, targets in deferred.items():
+            if name not in excluding and name not in shadowed:
+                self._bindings[name] = self._bindings.get(name, frozenset()) | targets
+
+    def _visit_type_parameters(self, type_params: Sequence[ast.type_param], *, declared_name: str, in_class_body: bool) -> None:
+        for expression in _lazy_type_parameter_expressions(type_params):
+            self._visit_lazy_annotation_expression(expression, declared_name=declared_name, in_class_body=in_class_body)
+
+    def _visit_lazy_annotation_expression(self, expression: ast.expr, *, declared_name: str, in_class_body: bool) -> None:
+        """Inventory a bound, constraint, PEP 696 default, or ``type`` alias value.
+
+        These evaluate on first access, after the declaration has completed:
+        the declared name is bound by then, enclosing function locals and
+        module globals may have been rebound (the deferred bindings), and an
+        annotation scope immediately inside a class body sees that class's
+        namespace as it stands at access time — including rebindings later in
+        the body. Type parameters shadow all of that; boundary provenance
+        cannot cross the deferral.
+        """
+        state = self._snapshot_state()
+        outer_deferred = self._deferred_binding_stack[-1] if "function" in self._container_stack else self._runtime_module_bindings
+        if in_class_body:
+            # The class dict is consulted first, so a name the body bound
+            # BEFORE this statement (and never deletes) shadows the enclosing
+            # scope outright; everything the body can still do from here on
+            # is a reachable class-dict state.
+            cursor = self._class_body_stack[-1]
+            self._merge_deferred_bindings(outer_deferred, excluding=cursor.names_bound_before_current())
+            self._merge_deferred_bindings(cursor.states_from_current())
+        else:
+            self._merge_deferred_bindings(outer_deferred)
+        self._bind_unknown((declared_name,))
+        self._source_names.clear()
+        self.visit(expression)
+        self._restore_state(state)
+
+    def _visit_statements(self, statements: Sequence[ast.stmt], *, cursor: _ClassBodyCursor | None = None) -> None:
         reachable = True
-        for statement in statements:
+        for index, statement in enumerate(statements):
+            if cursor is not None:
+                cursor.index = index
             if reachable:
                 self.visit(statement)
                 reachable = _suite_can_fall_through((statement,))
@@ -1215,10 +1403,20 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         return _ExecutionContext(future_annotations=self._future_annotations, function_scope=self._container_stack[-1] == "function")
 
     def _visit_function_header(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, BindingTargets]:
-        """Visit the header in :func:`definition_header_expressions` order; return the captured defaults."""
+        """Visit the header in :func:`definition_header_expressions` order; return the captured defaults.
+
+        For a generic function the annotation scope is left pushed for the
+        body (type parameters are visible there) and popped by the caller.
+        Defaults are evaluated OUTSIDE it, in the enclosing scope, and are
+        passed in — a type parameter does not shadow them.
+        """
         for decorator in node.decorator_list:
             self.visit(decorator)
         captured_defaults = _default_parameter_bindings(node.args, self._bindings, evaluate=self.visit)
+        if node.type_params:
+            in_class_body = self._container_stack[-1] == "class"
+            self._push_annotation_scope(node.type_params)
+            self._visit_type_parameters(node.type_params, declared_name=node.name, in_class_body=in_class_body)
         for annotation in _annotation_expressions(node.args, node.returns):
             if self._context.header_annotations_execute:
                 self.visit(annotation)
@@ -1241,9 +1439,9 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         """
         state = self._snapshot_state()
         if deferred:
-            deferred_bindings = self._deferred_binding_stack[-1] if "function" in self._container_stack else self._runtime_module_bindings
-            for name, targets in deferred_bindings.items():
-                self._bindings[name] = self._bindings.get(name, frozenset()) | targets
+            self._merge_deferred_bindings(
+                self._deferred_binding_stack[-1] if "function" in self._container_stack else self._runtime_module_bindings
+            )
         self.visit(annotation)
         self._restore_state(state)
 
@@ -1334,7 +1532,15 @@ class _MasqueradeVisitor(ast.NodeVisitor):
                     self._bind_unknown((name,))
 
     def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
-        self.visit(node.value)
+        in_class_body = self._container_stack[-1] == "class"
+        declared_name = node.name.id if isinstance(node.name, ast.Name) else ""
+        if node.type_params:
+            self._push_annotation_scope(node.type_params)
+            self._visit_type_parameters(node.type_params, declared_name=declared_name, in_class_body=in_class_body)
+        # The alias value is lazy even without type parameters.
+        self._visit_lazy_annotation_expression(node.value, declared_name=declared_name, in_class_body=in_class_body)
+        if node.type_params:
+            self._pop_annotation_scope()
         self._bind_unknown(assignment_target_names(node.name))
 
     def _bind_assignment(self, target: ast.expr, value: ast.expr) -> None:

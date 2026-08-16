@@ -1504,6 +1504,198 @@ def test_definition_header_expression_order_matches_the_running_interpreter() ->
     assert modelled == log
 
 
+# -- elspeth-f1def53d38: PEP 695/696 annotation scopes ------------------------
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        pytest.param("def later[T: probe(obj, 'field')]():\n    pass\n", id="function-bound"),
+        pytest.param("async def later[T: probe(obj, 'field')]():\n    pass\n", id="async-function-bound"),
+        pytest.param("def later[T: (int, probe(obj, 'field'))]():\n    pass\n", id="function-constraint"),
+        pytest.param("class Later[T: probe(obj, 'field')]:\n    pass\n", id="class-bound"),
+        pytest.param("type Later[T: probe(obj, 'field')] = int\n", id="alias-bound"),
+        pytest.param("type Later = probe(obj, 'field')\n", id="alias-value"),
+        pytest.param("type Later[T] = probe(obj, 'field')\n", id="generic-alias-value"),
+        pytest.param(
+            "def later[T = probe(obj, 'field')]():\n    pass\n",
+            id="type-var-default",
+            marks=pytest.mark.skipif(sys.version_info < (3, 13), reason="PEP 696 defaults need Python 3.13"),
+        ),
+        pytest.param(
+            "def later[*Ts = probe(obj, 'field')]():\n    pass\n",
+            id="type-var-tuple-default",
+            marks=pytest.mark.skipif(sys.version_info < (3, 13), reason="PEP 696 defaults need Python 3.13"),
+        ),
+        pytest.param(
+            "class Later[**P = probe(obj, 'field')]:\n    pass\n",
+            id="param-spec-default",
+            marks=pytest.mark.skipif(sys.version_info < (3, 13), reason="PEP 696 defaults need Python 3.13"),
+        ),
+    ],
+)
+def test_lazy_type_parameter_expressions_resolve_against_later_bindings(declaration: str) -> None:
+    """Bounds, constraints, defaults, and alias values evaluate on first access, after the module has finished."""
+    source = f"from foreign import getattr as probe\n{declaration}from builtins import getattr as probe\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/lazy_type_params.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        pytest.param("def later[T](argument: probe(obj, 'field')):\n    pass\n", id="generic-parameter-annotation"),
+        pytest.param("def later[T]() -> probe(obj, 'field'):\n    pass\n", id="generic-return-annotation"),
+        pytest.param("class Later[T](probe(obj, 'field')):\n    pass\n", id="generic-class-base"),
+        pytest.param("class Later[T](Base, option=probe(obj, 'field')):\n    pass\n", id="generic-class-keyword"),
+        pytest.param("def later[T](argument=probe(obj, 'field')):\n    pass\n", id="generic-default"),
+    ],
+)
+def test_eager_generic_header_expressions_resolve_against_the_current_binding(declaration: str) -> None:
+    builtin_first = f"from builtins import getattr as probe\n{declaration}from foreign import getattr as probe\n"
+    foreign_first = f"from foreign import getattr as probe\n{declaration}from builtins import getattr as probe\n"
+
+    assert [site.kind for site in iter_masquerade_sites(ast.parse(builtin_first), "src/elspeth/eager_generic.py")] == ["getattr"]
+    assert iter_masquerade_sites(ast.parse(foreign_first), "src/elspeth/eager_generic_foreign.py") == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_kinds"),
+    [
+        pytest.param(
+            "class Owner:\n    getattr = adapter.get\n    def method[T: getattr(obj, 'field')](self):\n        pass\n",
+            [],
+            id="method-bound-sees-its-class",
+        ),
+        pytest.param(
+            "class Owner:\n    getattr = adapter.get\n    class Inner[T: getattr(obj, 'field')]:\n        pass\n",
+            [],
+            id="nested-generic-class-bound-sees-the-outer-class",
+        ),
+        pytest.param(
+            "class Owner:\n    getattr = adapter.get\n    class Inner:\n        def method[T: getattr(obj, 'field')](self):\n            pass\n",
+            ["getattr"],
+            id="inner-method-bound-does-not-see-the-outer-class",
+        ),
+        pytest.param(
+            "class Owner:\n    getattr = adapter.get\n    def method[T](self, argument: getattr(obj, 'field')):\n        pass\n",
+            [],
+            id="generic-annotation-sees-its-class",
+        ),
+        pytest.param(
+            "class Owner:\n    getattr = adapter.get\n    class Inner[T](getattr(obj, 'field')):\n        pass\n",
+            [],
+            id="nested-generic-class-base-sees-the-outer-class",
+        ),
+        pytest.param(
+            "class Owner:\n    getattr = adapter.get\n    class Inner[T]:\n        value = getattr(obj, 'field')\n",
+            ["getattr"],
+            id="nested-generic-class-body-does-not-see-the-outer-class",
+        ),
+        pytest.param(
+            "class Owner:\n    from foreign import getattr as probe\n    def method[T: probe(obj, 'field')](self):\n        pass\n    from builtins import getattr as probe\n",
+            ["getattr"],
+            id="lazy-bound-sees-a-later-class-rebinding",
+        ),
+        pytest.param(
+            "class Owner:\n    from foreign import getattr as probe\n    type Alias = probe(obj, 'field')\n    from builtins import getattr as probe\n",
+            ["getattr"],
+            id="lazy-alias-value-sees-a-later-class-rebinding",
+        ),
+        pytest.param(
+            "class Owner:\n    def method[T: getattr(obj, 'field')](self):\n        pass\n    getattr = adapter.get\n",
+            ["getattr"],
+            id="class-shadow-bound-after-the-definition-is-not-yet-in-the-class-dict",
+        ),
+        pytest.param(
+            "class Owner:\n    getattr = adapter.get\n    def method[T: getattr(obj, 'field')](self):\n        pass\n    del getattr\n",
+            ["getattr"],
+            id="deleted-class-shadow-falls-through-to-the-builtin",
+        ),
+    ],
+)
+def test_annotation_scopes_see_exactly_the_immediately_enclosing_class(source: str, expected_kinds: list[str]) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/class_annotation_scope.py")
+
+    assert [site.kind for site in sites] == expected_kinds
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_kinds"),
+    [
+        pytest.param("def later[getattr]():\n    return getattr(obj, 'field')\n", [], id="function-body"),
+        pytest.param("class Later[getattr]:\n    value = getattr(obj, 'field')\n", [], id="class-body"),
+        pytest.param(
+            "class Later[getattr]:\n    def method(self):\n        return getattr(obj, 'field')\n", [], id="method-in-generic-class"
+        ),
+        pytest.param("def later[getattr](argument: getattr(obj, 'field')):\n    pass\n", [], id="generic-annotation"),
+        pytest.param("class Later[getattr](getattr(obj, 'field')):\n    pass\n", [], id="generic-base"),
+        pytest.param(
+            "def later[getattr](argument=getattr(obj, 'field')):\n    pass\n", ["getattr"], id="default-is-outside-the-annotation-scope"
+        ),
+        pytest.param("def later[getattr]():\n    return (lambda: getattr(obj, 'field'))()\n", [], id="lambda-inside-generic-body"),
+        pytest.param(
+            "class Later[getattr]:\n    values = [getattr(obj, 'field') for _ in items]\n", [], id="comprehension-inside-generic-class-body"
+        ),
+    ],
+)
+def test_type_parameters_shadow_probe_names_in_their_annotation_scope(source: str, expected_kinds: list[str]) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/type_param_shadow.py")
+
+    assert [site.kind for site in sites] == expected_kinds
+
+
+def test_type_parameter_shadowing_ends_with_the_declaration() -> None:
+    source = "def later[getattr]():\n    pass\ngetattr(obj, 'field')\n"
+
+    assert [site.kind for site in iter_masquerade_sites(ast.parse(source), "src/elspeth/type_param_scope_end.py")] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_kinds"),
+    [
+        pytest.param("def getattr[T: getattr(obj, 'field')]():\n    pass\n", [], id="lazy-bound-sees-the-completed-definition"),
+        pytest.param("class getattr[T: getattr(obj, 'field')]:\n    pass\n", [], id="lazy-class-bound-sees-the-completed-definition"),
+        pytest.param("type getattr = getattr(obj, 'field')\n", [], id="lazy-alias-value-sees-the-completed-definition"),
+        pytest.param(
+            "def getattr[T](argument=getattr(obj, 'field')):\n    pass\n", ["getattr"], id="eager-default-precedes-the-definition"
+        ),
+        pytest.param(
+            "def getattr[T](argument: getattr(obj, 'field')):\n    pass\n", ["getattr"], id="eager-annotation-precedes-the-definition"
+        ),
+    ],
+)
+def test_declaration_self_name_is_bound_only_for_lazy_expressions(source: str, expected_kinds: list[str]) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/self_name.py")
+
+    assert [site.kind for site in sites] == expected_kinds
+
+
+def test_lazy_type_parameter_expression_cannot_inherit_boundary_source_amnesty() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response):\n"
+        "    def inner[T: getattr(response, 'field', None)]():\n"
+        "        pass\n"
+        "    return inner\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/lazy_source.py")
+
+    assert [(site.kind, site.amnesty) for site in sites] == [("getattr", False)]
+
+
+def test_generic_function_default_walrus_binds_in_the_enclosing_scope() -> None:
+    source = "from foreign import getattr as probe\ndef early():\n    return probe(obj, 'field', None)\ndef later[T](argument=(probe := getattr)):\n    pass\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/generic_default_walrus.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
 @pytest.mark.parametrize(
     "body",
     [
