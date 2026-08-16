@@ -148,6 +148,42 @@ class TestLLMSourcePluginConfigDispatch:
         with pytest.raises(ValueError, match="Unknown LLM provider 'fake'"):
             get_transform_config_model("llm", {"provider": "fake"})
 
+    @pytest.mark.parametrize("provider", [{"name": "openrouter"}, ["openrouter"], 7], ids=["mapping", "list", "int"])
+    def test_llm_plugin_non_string_provider_is_a_config_error_not_a_crash(self, provider: object) -> None:
+        """A non-string ``provider`` must raise the same ValueError family as an unknown one.
+
+        ``provider in _PROVIDERS`` on a mapping raised ``TypeError: unhashable
+        type: 'dict'`` — and the composer's Stage-1 semantic validator calls
+        this dispatcher for every llm node, so ``CompositionState.validate()``
+        crashed (a 500) on an authorable ``upsert_node`` option instead of
+        returning a verdict (elspeth-2ed41f0a4a census, 2026-08-17).
+        """
+        with pytest.raises(ValueError, match="LLM 'provider' must be a string"):
+            get_transform_config_model("llm", {"provider": provider})
+
+    @pytest.mark.parametrize("provider", ["fake", {"name": "openrouter"}], ids=["unknown-string", "mapping"])
+    def test_provider_dispatch_rejection_is_reported_as_a_config_error(self, provider: object) -> None:
+        """``validate_*_config`` must REPORT a dispatch rejection, and the manager must raise the standard prefixed error.
+
+        The dispatcher's bare ``ValueError`` escaped ``validate_transform_config``
+        untouched, so ``PluginManager.create_transform`` raised it unprefixed
+        and every composer probe — which tolerates only typed config errors
+        and the "Invalid configuration for transform" ValueError — let it
+        crash ``CompositionState.validate()`` (elspeth-2ed41f0a4a census).
+        """
+        from elspeth.plugins.infrastructure.validation import validate_source_config, validate_transform_config
+
+        transform_errors = validate_transform_config("llm", {"provider": provider})
+        assert [e.field for e in transform_errors] == ["provider"]
+        assert "provider" in transform_errors[0].message
+        source_errors = validate_source_config("llm", {"provider": provider})
+        assert [e.field for e in source_errors] == ["provider"]
+
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        with pytest.raises(ValueError, match=r"^Invalid configuration for transform 'llm'"):
+            get_shared_plugin_manager().create_transform("llm", {"provider": provider, "schema": {"mode": "observed"}})
+
     def test_llm_plugin_none_config_falls_back_to_base(self) -> None:
         """verify None config falls back to LLMConfig."""
         from elspeth.plugins.transforms.llm.base import LLMConfig

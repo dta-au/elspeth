@@ -1398,6 +1398,43 @@ class TestStage1Validation:
             result.errors
         )
 
+    @pytest.mark.parametrize("provider", ["fake", {"name": "openrouter"}], ids=["unknown-string", "mapping"])
+    def test_llm_node_with_bad_provider_returns_a_verdict_not_a_crash(self, provider: object) -> None:
+        """``validate()`` must never raise on authorable options.
+
+        An llm node whose ``provider`` was an unknown string, or a mapping,
+        made the semantic validator's consumer probe raise a bare
+        ``ValueError`` / ``TypeError`` out of ``validate()`` — a 500 for a
+        ``upsert_node`` payload (elspeth-2ed41f0a4a census, 2026-08-17). Plugin
+        OPTION validity is owned by the tool-layer prevalidation and Stage 2's
+        plugin_instantiation; Stage 1 abstains on an un-constructable draft,
+        so the verdict here is simply "no crash".
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="t_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="t1",
+                node_type="transform",
+                plugin="llm",
+                input="t_in",
+                on_success="main",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}, "provider": provider, "model": "m", "prompt": "p"},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()  # must not raise
+
+        assert isinstance(result.is_valid, bool)
+
     def test_transform_cycle_is_rejected(self) -> None:
         """Two transforms feeding each other must not validate green.
 

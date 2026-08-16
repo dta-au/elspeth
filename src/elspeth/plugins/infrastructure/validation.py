@@ -70,7 +70,14 @@ def validate_source_config(
         List of validation errors (empty if valid)
     """
     # Get config model for source type (config needed for provider dispatch).
-    config_model = get_source_config_model(source_type, config)
+    try:
+        config_model = get_source_config_model(source_type, config)
+    except UnknownPluginTypeError:
+        raise
+    except ValueError as exc:
+        # Same contract as validate_transform_config: dispatch rejection is a
+        # config error, reported rather than raised.
+        return [ValidationError(field="provider", message=str(exc), value=config.get("provider"))]
 
     # Handle special case: null_source has no config class
     if config_model is None:
@@ -129,7 +136,18 @@ def validate_transform_config(
         List of validation errors (empty if valid)
     """
     # Get config model for transform type (config needed for provider dispatch)
-    config_model = get_transform_config_model(transform_type, config)
+    try:
+        config_model = get_transform_config_model(transform_type, config)
+    except UnknownPluginTypeError:
+        raise
+    except ValueError as exc:
+        # Provider dispatch rejected the config (unknown or non-string
+        # ``provider``). That is a CONFIG error from authored input, not an
+        # engine fault: report it through the same channel as a Pydantic
+        # rejection so ``PluginManager`` raises the standard prefixed
+        # ValueError and every composer probe abstains instead of crashing
+        # ``CompositionState.validate()`` (elspeth-2ed41f0a4a census).
+        return [ValidationError(field="provider", message=str(exc), value=config.get("provider"))]
 
     if config_model is None:
         return []  # No validation needed

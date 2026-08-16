@@ -1190,6 +1190,12 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     def get_config_model(cls, config: dict[str, Any] | None = None) -> type[LLMConfig]:
         """Dispatch to provider-specific config class based on config["provider"]."""
         provider = config.get("provider") if config is not None else None
+        if provider is not None and not isinstance(provider, str):
+            # ``provider in _PROVIDERS`` on an unhashable value (a mapping from
+            # a free-form ``upsert_node`` options payload) raised TypeError and
+            # crashed the composer's Stage-1 validator; a wrong-typed provider
+            # is a config error like an unknown one (elspeth-2ed41f0a4a).
+            raise ValueError(f"LLM 'provider' must be a string naming one of: {sorted(_PROVIDERS)}")
         if provider is not None and provider in _PROVIDERS:
             config_cls, _ = _PROVIDERS[provider]
             return config_cls
