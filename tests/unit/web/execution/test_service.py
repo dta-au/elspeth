@@ -33,6 +33,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import CallType, NodeStateStatus, NodeType
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import CreationModality, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError
 from elspeth.contracts.hashing import stable_hash
@@ -55,7 +56,7 @@ from elspeth.core.config import (
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import run_attributions_table, runs_table
+from elspeth.core.landscape.schema import run_attributions_table, runs_table, tokens_table
 from elspeth.telemetry.manager import TelemetryManager
 from elspeth.web.blobs.protocol import (
     BlobFinalizationResult,
@@ -9941,3 +9942,274 @@ class TestSetOpenrouterCatalogSnapshotValidation:
     def test_setter_rejects_bad_source(self, service: ExecutionServiceImpl) -> None:
         with pytest.raises(RuntimeError, match="must be 'live' or 'bundled'"):
             service.set_openrouter_catalog_snapshot(sha256="0" * 64, source="oops")
+
+
+# ── elspeth-30416e67cc: Tier-3 per-row failure text must not egress ───
+
+_EGRESS_CANARY_ROW = "CANARY_ROW_SECRET_9f3a"
+_EGRESS_CANARY_PROVIDER = "CANARY_PROVIDER_ERROR_7b21"
+
+
+@pytest.mark.usefixtures("mock_pipeline_config_assembly")
+class TestFailureSampleClientEgress:
+    """The inline run-level summary is category + node + count, never row text.
+
+    ``transform_errors.error_details_json`` is written through
+    ``canonical_or_recorded_error_details_json``, which self-declares a
+    **Tier-3** boundary: the payload "may carry arbitrary row-derived data"
+    and nothing in it is validated at write time.  Before elspeth-30416e67cc
+    the run-level enrichment inlined that free text verbatim (truncated only)
+    into three surfaces that all live OUTSIDE the audit boundary:
+
+    1. the non-audit sessions DB ``runs.error`` column,
+    2. ``RunStatusResponse.error`` on ``GET /api/runs/{id}``, and
+    3. the SSE ``failed`` event's ``FailedData.detail``.
+
+    All three derive from one ``session_error`` string, so all three are
+    asserted here — the mechanism, not one symptom.  Per-row free text stays
+    available only behind the authenticated, ownership-verified
+    ``GET /api/runs/{id}/diagnostics``, which reads its own tables.
+    """
+
+    @staticmethod
+    def _seed_run_with_canary_failures(
+        db: LandscapeDB,
+        *,
+        transform_id: str = "fetch",
+        rows: int = 3,
+    ) -> str:
+        """Record ``rows`` per-row transform errors whose text carries canaries."""
+        factory = RecorderFactory(db)
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        dynamic_schema = SchemaConfig.from_dict({"mode": "observed"})
+        factory.data_flow.register_node(
+            run_id=run.run_id,
+            plugin_name="test_source",
+            node_type=NodeType.SOURCE,
+            plugin_version="1.0",
+            config={},
+            schema_config=dynamic_schema,
+            node_id="source_test",
+            sequence=0,
+        )
+        factory.data_flow.register_node(
+            run_id=run.run_id,
+            plugin_name="web_scrape",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0",
+            config={},
+            schema_config=dynamic_schema,
+            node_id=transform_id,
+            sequence=1,
+        )
+        for index in range(rows):
+            row = factory.data_flow.create_row(
+                run_id=run.run_id,
+                source_node_id="source_test",
+                row_index=index,
+                data={"url": f"row-{index}"},
+                source_row_index=index,
+                ingest_sequence=index,
+            )
+            token_id = f"canary_tok_{index}"
+            with db.write_connection() as conn:
+                conn.execute(
+                    tokens_table.insert().values(
+                        token_id=token_id,
+                        row_id=row.row_id,
+                        run_id=run.run_id,
+                        step_in_pipeline=0,
+                        created_at=datetime.now(UTC),
+                    )
+                )
+                conn.commit()
+            factory.data_flow.record_transform_error(
+                ref=TokenRef(token_id=token_id, run_id=run.run_id),
+                transform_id=transform_id,
+                row_data={"url": f"row-{index}"},
+                error_details={
+                    "reason": "decode_failed",
+                    # Distinct per row: the pre-fix aggregation keyed on the
+                    # message, so distinct texts also mean the top-N slice was
+                    # taken over messages rather than over categories.
+                    "error": f"gzip: incorrect header check for {_EGRESS_CANARY_ROW}-{index}",
+                    "error_type": f"BadGzipFile: {_EGRESS_CANARY_PROVIDER}",
+                },
+                destination="discard",
+            )
+        return run.run_id
+
+    @staticmethod
+    def _drive_terminal_run(
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        *,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        mock_landscape: MagicMock,
+        landscape_db: LandscapeDB,
+        result: RunResult,
+        session_status: str,
+    ) -> tuple[str, str, list[Any]]:
+        """Run ``_run_pipeline`` to the engine-decided terminal branch.
+
+        Returns ``(run_id, persisted_runs_error, failed_event_payloads)``.
+        """
+        _configure_runtime_success(
+            mock_load=mock_load,
+            mock_instantiate=mock_instantiate,
+            mock_graph_cls=mock_graph_cls,
+            mock_orch_cls=mock_orch_cls,
+            result=result,
+        )
+        mock_landscape.return_value = landscape_db
+        run_id = str(uuid4())
+        with patch(
+            "elspeth.web.execution.service.load_run_accounting_from_db",
+            return_value=_run_accounting_for_status(result.status),
+        ):
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event())
+
+        status_calls = [
+            call for call in mock_session_service.update_run_status.call_args_list if call.kwargs.get("status") == session_status
+        ]
+        assert status_calls, f"the terminal branch must record status={session_status!r}"
+        persisted_error = status_calls[-1].kwargs["error"]
+        assert persisted_error is not None, "the terminal branch must persist a run-level error summary"
+        failed_events = [
+            call.kwargs for call in mock_session_service.append_run_event.call_args_list if call.kwargs.get("event_type") == "failed"
+        ]
+        return run_id, persisted_error, failed_events
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_failed_run_egresses_category_and_node_but_never_row_text(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """FAILED: all three client surfaces carry the summary, none the canary."""
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        try:
+            landscape_run_id = self._seed_run_with_canary_failures(db)
+            run_id, persisted_error, failed_events = self._drive_terminal_run(
+                service,
+                mock_session_service,
+                mock_load=mock_load,
+                mock_instantiate=mock_instantiate,
+                mock_graph_cls=mock_graph_cls,
+                mock_orch_cls=mock_orch_cls,
+                mock_landscape=mock_landscape,
+                landscape_db=db,
+                result=_orchestrator_result_stub(
+                    run_id=landscape_run_id,
+                    status=RunStatus.FAILED,
+                    rows_processed=3,
+                    rows_succeeded=0,
+                    rows_failed=3,
+                ),
+                session_status="failed",
+            )
+        finally:
+            db.close()
+
+        # Surface 1 — the non-audit sessions DB ``runs.error`` column.
+        assert _EGRESS_CANARY_ROW not in persisted_error, persisted_error
+        assert _EGRESS_CANARY_PROVIDER not in persisted_error, persisted_error
+        assert "incorrect header check" not in persisted_error, persisted_error
+        # …and it still names the category, the node, and the count.
+        assert "decode_failed" in persisted_error, persisted_error
+        assert "fetch" in persisted_error, persisted_error
+        assert "3x" in persisted_error, persisted_error
+
+        # Surface 2 — the SSE ``failed`` event detail is the SAME string.
+        assert failed_events, "a FAILED terminal branch must broadcast a failed event"
+        sse_detail = failed_events[-1]["data"]["detail"]
+        assert sse_detail == persisted_error
+        assert _EGRESS_CANARY_ROW not in sse_detail
+        assert _EGRESS_CANARY_PROVIDER not in sse_detail
+
+        # Surface 3 — ``RunStatusResponse.error`` on GET /api/runs/{id}.
+        run_uuid = UUID(run_id)
+        record = _run_record_stub(
+            id=run_uuid,
+            status="failed",
+            error=persisted_error,
+            finished_at=datetime.now(tz=UTC),
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            status_response = loop.run_until_complete(service.get_status(run_uuid, run_record=record))
+        finally:
+            loop.close()
+        assert status_response.error == persisted_error
+        assert status_response.error is not None
+        assert _EGRESS_CANARY_ROW not in status_response.error
+        assert _EGRESS_CANARY_PROVIDER not in status_response.error
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_completed_with_failures_run_never_egresses_row_text(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """The partial-completion sibling leaks identically and is fixed with it.
+
+        This branch emits no ``failed`` SSE event, so it is two surfaces
+        (``runs.error`` and ``RunStatusResponse.error``) rather than three.
+        """
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        try:
+            landscape_run_id = self._seed_run_with_canary_failures(db, transform_id="summarise", rows=2)
+            _run_id, persisted_error, _failed_events = self._drive_terminal_run(
+                service,
+                mock_session_service,
+                mock_load=mock_load,
+                mock_instantiate=mock_instantiate,
+                mock_graph_cls=mock_graph_cls,
+                mock_orch_cls=mock_orch_cls,
+                mock_landscape=mock_landscape,
+                landscape_db=db,
+                result=_orchestrator_result_stub(
+                    run_id=landscape_run_id,
+                    status=RunStatus.COMPLETED_WITH_FAILURES,
+                    rows_processed=10,
+                    rows_succeeded=8,
+                    rows_failed=2,
+                ),
+                session_status="completed_with_failures",
+            )
+        finally:
+            db.close()
+
+        assert _EGRESS_CANARY_ROW not in persisted_error, persisted_error
+        assert _EGRESS_CANARY_PROVIDER not in persisted_error, persisted_error
+        assert "incorrect header check" not in persisted_error, persisted_error
+        assert "decode_failed" in persisted_error, persisted_error
+        assert "summarise" in persisted_error, persisted_error
+        assert "2x" in persisted_error, persisted_error

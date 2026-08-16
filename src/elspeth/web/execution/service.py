@@ -104,7 +104,7 @@ from elspeth.web.execution.errors import (
     SemanticContractViolationError,
     UnresolvedInterpretationPlaceholderError,
 )
-from elspeth.web.execution.failure_samples import format_failure_samples, load_top_failure_samples
+from elspeth.web.execution.failure_samples import format_failure_categories, load_top_failure_categories
 from elspeth.web.execution.fanout_guard import (
     ExecutionFanoutGuardRequired,
     annotate_pipeline_yaml_with_fanout_guard,
@@ -670,11 +670,15 @@ def _structural_failure_message(*, rows_processed: int, failure_samples: str = "
     OR an intentional gate-routed sink, i.e. when every row failed terminally
     or was diverted via on_error.
 
-    ``failure_samples`` is an optional pre-formatted bullet list of the most
-    common per-row error messages (see ``failure_samples.format_failure_samples``).
-    When supplied, it is appended so the runs view shows the dominant failure
+    ``failure_samples`` is an optional pre-formatted bullet list summarising
+    the dominant per-row failures as count + failing node + error category
+    (see ``failure_samples.format_failure_categories``).  It carries no
+    per-row error text: this string egresses to the non-audit sessions DB,
+    the HTTP run-status response, and the SSE stream, so the raw Tier-3
+    message is deliberately not available to it (elspeth-30416e67cc).  When
+    supplied, it is appended so the runs view names the dominant failure
     modes inline — the panel-expand affordance still has the full per-token
-    drill-down, but the headline already names the problem.
+    drill-down, including the free text.
     """
     base = (
         f"No row reached a success path (rows_processed={rows_processed}, "
@@ -2444,7 +2448,7 @@ class ExecutionServiceImpl:
                 # recorded via the slog warning (audit-system failure
                 # exemption per CLAUDE.md logging-telemetry-policy).
                 # Malformed audit JSON (json.JSONDecodeError, a ValueError
-                # subclass raised by load_top_failure_samples) is Tier-1
+                # subclass raised by load_top_failure_categories) is Tier-1
                 # audit-data corruption and is DELIBERATELY not caught — it
                 # must crash per the tier model, not be silently degraded.
                 samples_outcome = self._enrich_failure_samples(
@@ -2934,8 +2938,8 @@ class ExecutionServiceImpl:
         if landscape_db is None:
             return _FailureSampleEnrichmentOutcome(samples_text="")
         try:
-            samples = load_top_failure_samples(landscape_db, landscape_run_id)
-            return _FailureSampleEnrichmentOutcome(samples_text=format_failure_samples(samples))
+            summaries = load_top_failure_categories(landscape_db, landscape_run_id)
+            return _FailureSampleEnrichmentOutcome(samples_text=format_failure_categories(summaries))
         except (SQLAlchemyError, OSError):
             slog.warning(
                 "failure_sample_enrichment_failed",
@@ -2995,7 +2999,7 @@ class ExecutionServiceImpl:
         try:
             with landscape_db.read_only_connection() as conn:
                 # Row iteration over a LIMIT-1 select, mirroring
-                # ``load_top_failure_samples``: an empty result simply yields
+                # ``load_top_failure_categories``: an empty result simply yields
                 # nothing and falls through to the node-less return, so
                 # "no FAILED node" needs no separate branch.
                 for (node_id,) in conn.execute(stmt):
