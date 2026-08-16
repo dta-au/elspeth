@@ -108,6 +108,21 @@ ambiguous connection-loss reconciliation. SQLite evidence is catalog-N/A for
 PB-11; follower-only RC-05 and PB-08 cells are catalog-N/A outside the two
 SQLite follower profiles.
 
+### Follower-profile applicability is narrowed per leg, in the catalog
+
+Ruled 2026-08-17 (elspeth-efb47cb5fd, Decision 2). The two SQLite follower
+profiles are required for a leg only where a second claimant, follower seat,
+or follower-mediated handoff can change the leg's durable outcome. Where the
+contract is provably not on a follower's path, the catalog marks the follower
+profile cells `not_applicable` **per leg, with a written reason per
+(leg, profile)** naming why no follower can reach or alter that boundary.
+
+The instrument is the v3 catalog's `cell_applicability`, amended in a
+reviewed commit. A blanket N/A, an assessor's mapping note, a tracker comment,
+or a close reason is not that instrument. Any leg without such a reasoned
+catalog entry keeps both follower profiles required and is proved under a
+real leader-plus-follower composition with the profile probe bound per node.
+
 ## Evidence hierarchy
 
 Behavioral `pass`, `partial`, or `fail` claims require executed evidence:
@@ -137,6 +152,33 @@ connection-queried semantic 3.x version.
 Concurrency claims require independent connections and, where the contract is
 process-scoped, independent operating-system processes. In-process exception
 handling does not establish process-death recovery.
+
+### Provider-backed plugins on the SQLite profiles
+
+Ruled 2026-08-17 (elspeth-efb47cb5fd, Decision 1). A first-party plugin whose
+reviewed matrix entry (`tests/golden/state_engine/plugin_lifecycle_matrix.json`)
+carries `external_observation_required: true` and
+`local_fixture: provider-contract-fake` may promote its PB-09 lifecycle cells
+on the three SQLite execution profiles from a local run in which the
+provider's **client object** is replaced by a contract fake at the SDK-client
+seam. The seam is the object the plugin would otherwise obtain from the
+provider SDK or HTTP client factory (for example a boto3 client, an Azure SDK
+client, the Dataverse HTTP session, a Chroma client, or an LLM provider
+client). The plugin's own `on_start`, read/write/flush, `on_complete`, and
+`close` code runs unmodified; the fake records the ordered calls it receives
+and answers with the provider's documented contract shapes.
+
+What this admits: the plugin lifecycle contract of PB-09 (fresh, resume,
+partial-start, normal-teardown, exceptional-teardown ordering) on all ten
+dimensions for the SQLite profiles, where `success_effects`' external-effect
+image is the exact ordered call sequence the plugin emitted to the fake.
+
+What it does not admit: any cell on `postgresql-16-aws-single-leader-landscape`
+(the plugin's release lane remains the only evidence for that profile); any
+sink-effect publication cell (PB-06, PB-07) whose contract is the real external
+effect; and any test that replaces, subclasses, or patches the plugin's own
+methods. A fake standing in for the proof subject is a stand-in, not a
+contract fake, and is rejected on sight.
 
 ## Hard gates
 
