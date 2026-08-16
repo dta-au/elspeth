@@ -4057,14 +4057,18 @@ def _check_schema_contracts(
             return False
         return schema_config is not None and not schema_config.is_observed
 
-    def _edge_field_type_conflict(producer: ProducerEntry, node: NodeSpec) -> ValidationEntry | None:
+    def _edge_field_type_conflict(producer: ProducerEntry, consumer: NodeSpec | OutputSpec) -> ValidationEntry | None:
         """Mirror the runtime's Phase-2 edge TYPE check on declared field specs.
 
         Stage 1's edge-contract accounting compares field NAMES only, so a
         producer declaring ``age: int`` into a consumer declaring ``age: str``
         validated green while the DAG build raised ``EdgeContractError``
         (elspeth-f2eb8fef9f) — a divergence needing no coalesce, no row_union
-        and no special topology.
+        and no special topology. The consumer may be a node OR a sink: the
+        first cut covered nodes only, and ``csv(value: str) -> sink(value:
+        int)`` — the registry's own Shape-10-adjacent example — stayed green
+        (elspeth-2ed41f0a4a census, 2026-08-17). The runtime runs the same
+        ``validate_single_edge`` on both edge kinds.
 
         Compares the DECLARED ``field_type`` strings directly, the way the
         union-coalesce mirror a few hundred lines above does through
@@ -4104,12 +4108,18 @@ def _check_schema_contracts(
         producers resolve to a dynamic effective producer schema at runtime and
         are skipped there, so they are skipped here too.
         """
+        if isinstance(consumer, OutputSpec):
+            consumer_id = f"output:{consumer.name}"
+            consumer_component = consumer_id
+        else:
+            consumer_id = consumer.id
+            consumer_component = f"node:{consumer.id}"
         try:
             producer_schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
-            consumer_options = node.options
-            consumer_owner = f"node:{node.id}"
-            if node.node_type == "aggregation":
-                consumer_options, consumer_owner = get_aggregation_contract_options(node.options, owner=consumer_owner)
+            consumer_options = consumer.options
+            consumer_owner = consumer_component
+            if isinstance(consumer, NodeSpec) and consumer.node_type == "aggregation":
+                consumer_options, consumer_owner = get_aggregation_contract_options(consumer.options, owner=consumer_owner)
             consumer_schema_config = get_raw_schema_config(consumer_options, owner=consumer_owner)
         except ValueError:
             # Malformed declarations own their rejection through the
@@ -4138,8 +4148,8 @@ def _check_schema_contracts(
             return None
         detail = ", ".join(f"{name} (consumer expects {expected}, producer emits {actual})" for name, expected, actual in mismatches)
         return _err(
-            f"node:{node.id}",
-            f"Schema contract violation: '{producer.producer_id}' -> '{node.id}'. Incompatible field types: {detail}.",
+            consumer_component,
+            f"Schema contract violation: '{producer.producer_id}' -> '{consumer_id}'. Incompatible field types: {detail}.",
             "high",
             "edge_field_type_incompatible",
         )
@@ -4473,6 +4483,15 @@ def _check_schema_contracts(
                 continue
             assert producer_vote is not None  # No error => guarantees resolved.
             producer_participates, producer_guaranteed = producer_vote
+
+            # Field-TYPE conflict on the producer -> sink edge, gated exactly as
+            # the node-consumer call above: only a typed (fixed/flexible) SOURCE
+            # presents a static schema the runtime's Phase-2 check reads; a
+            # transform/gate/coalesce producer is dynamic and skipped there too.
+            if _producer_is_typed_source(actual_producer):
+                sink_type_error = _edge_field_type_conflict(actual_producer, output)
+                if sink_type_error is not None:
+                    errors.append(sink_type_error)
 
             # ADR-007 parity: mirror the runtime abstention clause in
             # validate_sink_required_fields (core/dag/schema_validation.py).

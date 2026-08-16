@@ -1866,11 +1866,25 @@ class TestComposerRuntimeAgreement:
         assert "observed" in message
         assert "explicit" in message
 
-    def test_composer_accepts_field_names_but_runtime_rejects_type_mismatch(
+    def test_both_reject_sink_field_type_mismatch(
         self,
         tmp_path: Path,
     ) -> None:
-        """Type compatibility remains runtime-only even when contract fields line up."""
+        """Shape 21 — a typed source into a sink declaring a conflicting field type is rejected by BOTH surfaces.
+
+        Until 2026-08-17 this test was named
+        ``test_composer_accepts_field_names_but_runtime_rejects_type_mismatch``
+        and PINNED the divergence ("type compatibility remains runtime-only"):
+        the node-consumer mirror (elspeth-f2eb8fef9f) had left the sink
+        consumer uncovered. Now ``_edge_field_type_conflict`` runs on the
+        producer -> sink edge under the same typed-source gate.
+
+        Bug verification protocol: revert the ``_producer_is_typed_source``-
+        gated call in the sink loop of ``_check_schema_contracts``
+        (``state.py``, "Field-TYPE conflict on the producer -> sink edge") and
+        this test fails at ``assert not composer_result.is_valid`` with
+        ``is_valid=True, errors=()`` — the exact pre-fix shape.
+        """
         csv_path = tmp_path / "input.csv"
         csv_path.write_text("value\nhello\n", encoding="utf-8")
         output_path = tmp_path / "out.csv"
@@ -1900,7 +1914,12 @@ class TestComposerRuntimeAgreement:
         )
 
         composer_result = state.validate()
-        assert composer_result.is_valid, composer_result.errors
+        assert not composer_result.is_valid
+        [type_error] = [e for e in composer_result.errors if e.error_code == "edge_field_type_incompatible"]
+        assert type_error.component == "output:main"
+        assert "value" in type_error.message
+        # Field NAMES still line up — the contract row is satisfied; only the
+        # TYPE direction is reported, and only once.
         sink_contract = next(contract for contract in composer_result.edge_contracts if contract.to_id == "output:main")
         assert sink_contract.satisfied is True
         assert sink_contract.producer_guarantees == ("value",)

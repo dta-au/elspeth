@@ -3565,6 +3565,93 @@ class TestSchemaContractValidation:
         assert result.is_valid, [(e.error_code, e.message) for e in result.errors]
         assert not any(error.error_code == "edge_field_type_incompatible" for error in result.errors)
 
+    def _make_typed_sink_edge_state(self, producer_type: str, sink_type: str) -> CompositionState:
+        """Build csv(fixed value:<producer_type>) -> sink(fixed value:<sink_type>) with NO node between.
+
+        The sink-consumer twin of :meth:`_make_typed_edge_state`. The two calls
+        differ ONLY in the sink's declared field type, so the mismatch test is
+        pinned against its own type-agreeing control (clean-probe rule).
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="main",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": [f"value: {producer_type}"]}},
+            )
+        )
+        return state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": "outputs/main.csv", "schema": {"mode": "fixed", "fields": [f"value: {sink_type}"]}},
+                on_write_failure="discard",
+            )
+        )
+
+    def test_sink_edge_field_type_mismatch_is_rejected(self) -> None:
+        """A typed source feeding a SINK that declares a conflicting field type must not validate green.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). The node-consumer mirror
+        (elspeth-f2eb8fef9f) left the sink consumer uncovered: ``csv(value: str)
+        -> sink(value: int)`` returned ``is_valid=True`` byte-identical to the
+        type-agreeing control while the runtime edge check raised
+        ``GraphValidationError`` "incompatible ... value" — a two-component
+        pipeline with a typo-level mistake, no special topology.
+        """
+        result = self._make_typed_sink_edge_state("str", "int").validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "edge_field_type_incompatible" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+        [entry] = [error for error in result.errors if error.error_code == "edge_field_type_incompatible"]
+        assert entry.component == "output:main"
+
+    def test_sink_edge_field_type_agreement_is_accepted(self) -> None:
+        """Positive control for :meth:`test_sink_edge_field_type_mismatch_is_rejected`."""
+        result = self._make_typed_sink_edge_state("str", "str").validate()
+
+        assert result.is_valid, [(e.error_code, e.message) for e in result.errors]
+
+    def test_sink_edge_field_type_check_abstains_on_dynamic_producer(self) -> None:
+        """A transform-fed sink is a DYNAMIC producer edge: the runtime skips it, so Stage 1 must too.
+
+        Runtime Phase-2 type validation fires only when the effective producer
+        schema is a typed model (``graph.py`` observed/dynamic bypass); a
+        transform producer resolves to a dynamic schema. Rejecting here would be
+        a false red the runtime does not share.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="t1_in",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": ["value: str"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1_in",
+                "main",
+                plugin="value_transform",
+                options={"schema": {"mode": "observed"}},
+            )
+        )
+        result = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": "outputs/main.csv", "schema": {"mode": "fixed", "fields": ["value: int"]}},
+                on_write_failure="discard",
+            )
+        ).validate()
+
+        assert not any(error.error_code == "edge_field_type_incompatible" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+
     def _make_unreferenced_source_schema_state(self, source_fields: list[str]) -> CompositionState:
         """Build csv(fixed, <source_fields>) -> sink, where the SINK DECLARES NO SCHEMA.
 
