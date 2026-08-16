@@ -15,12 +15,18 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Set
-from typing import Any, cast
+from typing import Any, Final, cast
 from urllib.parse import parse_qs, urlparse
 
 from elspeth.contracts.url import SENSITIVE_PARAMS
 
-_REDACTED = "<redacted-secret>"
+# Public so consumers that must NOT treat two scrubbed strings as the same
+# fact (failure-attribution correlation) can recognise the constant instead of
+# re-spelling it. Whole-string replacement means every secret-bearing message
+# collapses to this one value; equality of two scrubbed strings is therefore
+# not evidence they came from the same failure.
+REDACTED_SECRET_TEXT: Final[str] = "<redacted-secret>"
+_REDACTED = REDACTED_SECRET_TEXT
 
 # Heuristic patterns. Order matters — longer / more specific first.
 #

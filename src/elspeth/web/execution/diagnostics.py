@@ -15,6 +15,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.engine import Connection, make_url
 
 from elspeth.contracts.errors import TransformErrorCategory
+from elspeth.contracts.secret_scrub import REDACTED_SECRET_TEXT
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.export_mappers import artifact_producer_kind, validate_artifact_publication_projection
 from elspeth.core.landscape.schema import (
@@ -282,6 +283,12 @@ def _node_state_error_correlating_exception(error_json: str | None, operation_er
         context = payload.get("context")
         candidate = context.get("message") if isinstance(context, dict) else None
     if not isinstance(candidate, str) or not candidate.strip():
+        return None
+    if candidate == REDACTED_SECRET_TEXT:
+        # The scrubber replaces a whole secret-bearing message with one
+        # constant, so two unrelated exceptions can become byte-identical here.
+        # That equality carries no causal information — and it would otherwise
+        # take the exact-match rank, naming a bystander confidently.
         return None
     if candidate == operation_error_message:
         return candidate

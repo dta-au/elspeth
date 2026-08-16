@@ -1141,6 +1141,123 @@ def test_diagnostics_failure_detail_ignores_a_degenerate_substring_candidate(tmp
         db.close()
 
 
+def test_diagnostics_failure_detail_does_not_correlate_two_exceptions_collapsed_by_the_scrubber(tmp_path) -> None:
+    """Two unrelated secret-bearing exceptions scrub to one constant; that is not a match.
+
+    ``scrub_text_for_audit`` replaces a whole secret-bearing message with
+    ``<redacted-secret>``, so a bystander's exception and the failed
+    operation's message can become byte-identical while sharing no cause. An
+    exact match normally outranks every fragment, which is what makes this
+    collapse dangerous: the constant would name a bystander CONFIDENTLY. Both
+    sides here pass through the real scrubber — ``ExecutionError`` scrubs on
+    construction and the operation message is scrubbed the way
+    ``_render_exception`` does — and the operation must keep its scope-owning
+    node.
+    """
+    from elspeth.contracts.secret_scrub import REDACTED_SECRET_TEXT, scrub_text_for_audit
+
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "explode", NodeType.TRANSFORM, "json_explode")
+
+        fatal_message = scrub_text_for_audit("ConnectionError: https://svc:hunter2@db.internal:5432/items refused")
+        assert fatal_message == REDACTED_SECRET_TEXT  # the operation side really collapsed
+
+        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
+        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        bystander_state = factory.execution.begin_node_state(
+            token.token_id, "explode", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+        )
+        bystander_error = ExecutionError(exception="ValueError: api_key=sk-live-000 rejected by explode", exception_type="ValueError")
+        assert bystander_error.exception == REDACTED_SECRET_TEXT  # the state side really collapsed
+        factory.execution.complete_node_state(
+            bystander_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=bystander_error,
+        )
+
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "source"
+        assert diagnostics.failure_detail.error_message == REDACTED_SECRET_TEXT
+    finally:
+        db.close()
+
+
+def test_diagnostics_failure_detail_still_correlates_a_genuine_cause_beside_a_scrubbed_bystander(tmp_path) -> None:
+    """Control for the scrubber-collapse guard: refusing the constant must not refuse real matches."""
+    from elspeth.contracts.secret_scrub import REDACTED_SECRET_TEXT
+
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "hoist_items", NodeType.TRANSFORM, "value_transform")
+        _register_node(factory, web_run_id, "explode", NodeType.TRANSFORM, "json_explode")
+
+        fatal_message = "Transform 'value_transform' input validation failed: 2 validation errors"
+
+        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
+        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        raising_state = factory.execution.begin_node_state(
+            token.token_id, "hoist_items", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+        )
+        factory.execution.complete_node_state(
+            raising_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(exception=fatal_message, exception_type="PluginContractViolation"),
+        )
+        later_row = factory.data_flow.create_row(
+            web_run_id, "source", 1, {"value": 2}, row_id="row-1", source_row_index=1, ingest_sequence=1
+        )
+        later_token = factory.data_flow.create_token(later_row.row_id, token_id="token-1")
+        bystander_state = factory.execution.begin_node_state(
+            later_token.token_id, "explode", web_run_id, 1, {"value": 2}, state_id="state-token-1"
+        )
+        bystander_error = ExecutionError(exception="ValueError: api_key=sk-live-000 rejected by explode", exception_type="ValueError")
+        assert bystander_error.exception == REDACTED_SECRET_TEXT
+        factory.execution.complete_node_state(
+            bystander_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=bystander_error,
+        )
+
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "hoist_items"
+    finally:
+        db.close()
+
+
 def test_diagnostics_failure_detail_correlates_a_short_exception_matching_the_message_exactly(tmp_path) -> None:
     """A short exception still correlates when it IS the message, not a fragment of one.
 
