@@ -313,11 +313,69 @@ export async function expectResizeGeometry(
   await separator.focus();
   await separator.press("Home");
   await expect.poll(() => boxWidth(composer.authoringPane())).toBe(360);
+  await expectComposerInputGeometry(composer, "narrow");
   await separator.press("End");
   await expect.poll(() => boxWidth(composer.authoringPane())).toBe(expectedMaximum);
   await expect.poll(() => unoccludedArtifactWidth(composer)).toBeGreaterThanOrEqual(640);
+  await expectComposerInputGeometry(composer, "wide");
   await expect(separator).toHaveAttribute("aria-valuemin", "360");
   await expect(separator).toHaveAttribute("aria-valuemax", String(expectedMaximum));
+}
+
+/**
+ * The composer input's two arrangements, as rendered (operator request
+ * 2026-08-16, elspeth-1b7227936c before it). "wide" — the pane's chat-input
+ * container is 430px or more (the 640px maximum pane here): Upload/More/Send
+ * share the textarea's line and the keyboard hint sits INSIDE that line's
+ * height, right-aligned above the buttons, so the row ends flush with the
+ * textarea — no text row of region height under the box. "narrow" — the 360px
+ * pane: Upload/More wrap under the textarea and the hint is back in flow on
+ * that wrapped line, filling its gutter. Both are asserted here because the
+ * positioned placement and its in-flow reset are two halves of one rule: a
+ * hint left positioned at 360 would sit on the textarea's bottom-right corner,
+ * and one left in flow at 640 would put the extra row back.
+ */
+export async function expectComposerInputGeometry(
+  composer: ComposerPage,
+  arrangement: "wide" | "narrow",
+): Promise<void> {
+  const geometry = await composer.page.evaluate(() => {
+    const box = (selector: string) => {
+      const element = document.querySelector(selector);
+      if (element === null) return null;
+      const r = element.getBoundingClientRect();
+      return { top: r.top, bottom: r.bottom, left: r.left, right: r.right };
+    };
+    return {
+      row: box(".chat-input-row"),
+      textarea: box(".chat-input-textarea"),
+      send: box(".chat-input-send-btn"),
+      upload: box(".chat-input-upload-btn"),
+      hint: box(".chat-input-hint"),
+    };
+  });
+  for (const part of [geometry.row, geometry.textarea, geometry.send, geometry.hint]) {
+    expect(part).not.toBeNull();
+  }
+  const { row, textarea, send, hint } = geometry;
+  if (arrangement === "wide") {
+    // The row is the textarea's height — nothing beneath the box.
+    expect(Math.abs(row!.bottom - textarea!.bottom)).toBeLessThanOrEqual(1);
+    // Send shares the textarea's bottom edge; the hint sits above Send, inside
+    // the row, and shares its right edge.
+    expect(Math.abs(send!.bottom - textarea!.bottom)).toBeLessThanOrEqual(1);
+    expect(hint!.bottom).toBeLessThanOrEqual(send!.top);
+    expect(hint!.top).toBeGreaterThanOrEqual(row!.top - 1);
+    expect(Math.abs(hint!.right - send!.right)).toBeLessThanOrEqual(1);
+  } else {
+    // In flow again: the hint is BELOW the textarea, on the wrapped
+    // attachment line beside Upload (which wrapped under the textarea too).
+    expect(hint!.top).toBeGreaterThanOrEqual(textarea!.bottom - 1);
+    expect(geometry.upload).not.toBeNull();
+    expect(geometry.upload!.top).toBeGreaterThanOrEqual(textarea!.bottom - 1);
+    const centre = (b: { top: number; bottom: number }) => (b.top + b.bottom) / 2;
+    expect(Math.abs(centre(hint!) - centre(geometry.upload!))).toBeLessThanOrEqual(1);
+  }
 }
 
 export async function expectDialogGeometry(

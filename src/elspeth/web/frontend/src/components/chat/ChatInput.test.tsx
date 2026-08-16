@@ -1218,13 +1218,56 @@ describe("ChatInput keyboard hint in the composition row (elspeth-1b7227936c)", 
     expect(row!.lastElementChild).toBe(hint);
   });
 
-  it("wraps the hint to a full-width line of its own at ordinary pane widths", () => {
-    // Anchored to the line start: the base rule is unindented, while the
+  it("seats the hint above the buttons inside the textarea's height at ordinary pane widths", () => {
+    // Operator request 2026-08-16: the composer region ends flush with the
+    // textarea. The hint used to be a full-width flex line of its own BELOW
+    // the controls — one text row of region height under the box. Now it is
+    // positioned inside the row, right-aligned above the buttons, and the
+    // row is the textarea's height. The three parts have to agree: the row
+    // is the containing block, the hint is positioned against its bottom by
+    // one control height, and the row carries a floor so a user-shortened
+    // textarea cannot let the hint escape the row's top.
+    //
+    // Anchored to the line start: the base rules are unindented, while the
     // container-query `.chat-input-row .chat-input-hint` rule also ends in
     // this class name and must not be the one inspected here.
     const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const rowRule = css.match(/\n\.chat-input-row\s*\{([^}]*)\}/s)?.[1];
+    expect(rowRule).toMatch(/position:\s*relative/);
+    expect(rowRule).toMatch(/min-height:\s*calc\([^;]*var\(--size-control\)/s);
     const hintRule = css.match(/\n\.chat-input-hint\s*\{([^}]*)\}/s)?.[1];
+    expect(hintRule).toMatch(/position:\s*absolute/);
+    expect(hintRule).toMatch(/right:\s*0/);
+    expect(hintRule).toMatch(/bottom:\s*calc\(var\(--size-control\)/);
+    // Still carries its own-line basis for the regimes that put it back in
+    // flow (below); inert while positioned.
     expect(hintRule).toMatch(/flex-basis:\s*100%/);
+  });
+
+  it("puts the hint back in flow wherever the buttons already take a second line", () => {
+    // Two regimes: the narrow-pane container query (the hint fills the wrapped
+    // attachment row's gutter) and the ≤760px viewport regime (the buttons
+    // are on their own line and the positioned placement would land on the
+    // textarea's bottom-right corner). Each must reset BOTH halves — the
+    // hint's position and the row's floor — or the row would keep a 74px
+    // floor for a hint that no longer needs it.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const container = css.match(
+      /@container \(max-width: 429px\)\s*\{([\s\S]*?)\n\}/,
+    )?.[1];
+    expect(container).toMatch(
+      /\.chat-input-row \.chat-input-hint\s*\{[^}]*position:\s*static/s,
+    );
+    expect(container).toMatch(/\.chat-input-row\s*\{[^}]*min-height:\s*0/s);
+    const blocks = Array.from(
+      css.matchAll(/@media \(max-width: 760px\)\s*\{([\s\S]*?)\n\}/g),
+      (m) => m[1],
+    );
+    const composerBlock = blocks.find((b) => b.includes(".chat-input-textarea"));
+    expect(composerBlock).toMatch(
+      /\.chat-input-row \.chat-input-hint\s*\{[^}]*position:\s*static/s,
+    );
+    expect(composerBlock).toMatch(/\.chat-input-row\s*\{[^}]*min-height:\s*0/s);
   });
 
   it("sends the hint onto the wrapped attachment row's own flex line", () => {

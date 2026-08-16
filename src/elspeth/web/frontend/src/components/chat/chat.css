@@ -563,18 +563,29 @@
    alarming, so it must not borrow the error tone above. */
 
 .chat-input-row {
+  /* The keyboard hint's containing block: at ordinary pane widths the hint is
+     positioned inside this row (see .chat-input-hint), so the row — and with
+     it the composer region — is exactly the textarea's height. */
+  position: relative;
   display: flex;
-  /* Wrap is on at EVERY pane width (elspeth-1b7227936c): the keyboard hint is
-     the row's last flex item at flex-basis:100%, so it takes a full-width line
-     of its own below the controls — the same visual position it held as a
-     sibling element — while remaining available to join the wrapped
-     attachment row under the narrow-pane container query below. The control
-     items themselves never wrap without the forced break: their combined
-     min-content width (~402px) fits every pane at or above the 430px
-     threshold where the break is display:none. */
+  /* Wrap is on at EVERY pane width (elspeth-1b7227936c) so the keyboard hint
+     can join the wrapped attachment row under the narrow-pane container query
+     below (where it is a flex item again). The control items themselves never
+     wrap without the forced break: their combined min-content width (~402px)
+     fits every pane at or above the 430px threshold where the break is
+     display:none. */
   flex-wrap: wrap;
   gap: var(--space-sm);
   align-items: flex-end;
+  /* Floor = the buttons plus one hint line above them. `resize: vertical`
+     lets the user drag the textarea shorter than that, and the row must not
+     follow it below the height its own hint occupies, or the hint would
+     escape the row's top edge into the transcript above. Inert at the
+     shipped four-row textarea (107px against a 74px floor). */
+  min-height: calc(
+    var(--size-control) + var(--space-sm) + var(--space-xs) +
+      var(--font-size-xs) * var(--line-height-normal)
+  );
 }
 
 .chat-input-textarea {
@@ -660,6 +671,9 @@
        so the gap is paid once. (The ≤760px viewport rule later in this file
        restores its own gap by source order and resets these margins.) */
     row-gap: 0;
+    /* The base rule's floor exists for the positioned hint; with the hint
+       back in flow (below) the row is content-sized again. */
+    min-height: 0;
   }
 
   .chat-input-row-break {
@@ -676,13 +690,16 @@
     margin-top: var(--space-sm);
   }
 
-  /* The hint leaves its full-width line and fills the attachment row's
-     gutter (elspeth-1b7227936c): in guided mode Upload has no More sibling,
-     so without the hint the wrapped row was one 44px button and ~344px of
-     nothing. Specificity (0,2,0) on purpose — the base .chat-input-hint
+  /* The hint rejoins the flow and fills the attachment row's gutter
+     (elspeth-1b7227936c): in guided mode Upload has no More sibling, so
+     without the hint the wrapped row was one 44px button and ~344px of
+     nothing. position: static undoes the ordinary-width placement above the
+     buttons — here the attachment row IS a second line, and the hint has a
+     place on it. Specificity (0,2,0) on purpose — the base .chat-input-hint
      rule appears LATER in this file, so an unqualified (0,1,0) rule here
-     would lose its flex override to source order. */
+     would lose its overrides to source order. */
   .chat-input-row .chat-input-hint {
+    position: static;
     order: 2;
     flex: 1 1 auto;
     align-self: center;
@@ -821,19 +838,34 @@
 }
 
 .chat-input-hint {
-  font-size: var(--font-size-xs);
-  color: var(--color-text-muted);
-  /* The hint is the row's LAST flex item (elspeth-1b7227936c): at ordinary
-     pane widths flex-basis:100% wraps it onto a full-width line of its own
-     directly below the controls — the same visual position it held as a
-     sibling element — and the row's 8px gap supplies the separation that
-     elspeth-aa32533179 used to buy with padding-top (8px, not 2px: at 2px
-     the hint was the tightest gap in a region whose every other gap is 8 or
-     16px). Under the narrow-pane container query it gives up the full-width
-     basis and joins the wrapped Upload/More line instead, filling what was
-     ~344px of dead gutter beside a lone 44px button. */
+  /* At ordinary pane widths (container ≥ 430px) the hint sits INSIDE the
+     control line's height, right-aligned above Upload/More/Send in the space
+     the four-row textarea leaves over the 44px buttons, so the composer
+     region ends flush with the textarea's bottom edge (operator request,
+     2026-08-16). It used to be the row's last flex item at flex-basis:100%,
+     taking a full-width line of its own BELOW the controls (elspeth-
+     1b7227936c) — one text row of region height under the box, at every
+     pane width. Positioned rather than placed by grid or a wrapper: the
+     controls are conditional siblings (Upload/More absent read-only, Stop
+     present only while composing), so a per-column grid would pay gaps for
+     empty columns, and a right-column wrapper would break the narrow-pane
+     rule that Send stays beside the textarea while Upload/More wrap. bottom
+     = one control height plus --space-xs, and the padding-bottom below is
+     --space-xs, so the text clears the buttons by the row's --space-sm gap.
+     The row carries a min-height floor so a user-shortened textarea cannot
+     let this escape upward. Two regimes put it back in flow, each with a
+     line of its own to sit on: the narrow-pane container query (it fills the
+     wrapped attachment row's gutter — ~344px of nothing beside a lone 44px
+     Upload in guided mode) and the ≤760px viewport regime (the buttons are
+     already on a second line there); flex-basis:100% is what gives it its
+     own full-width line in the latter, and is inert while positioned. */
+  position: absolute;
+  right: 0;
+  bottom: calc(var(--size-control) + var(--space-xs));
   flex-basis: 100%;
   padding: 0 0 var(--space-xs);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
   text-align: right;
 }
 
@@ -846,6 +878,8 @@
     flex-wrap: wrap;
     align-items: stretch;
     gap: var(--space-xs);
+    /* Hint back in flow here (below), so no floor. */
+    min-height: 0;
   }
 
   .chat-input-textarea {
@@ -882,6 +916,10 @@
   }
 
   .chat-input-row .chat-input-hint {
+    /* Back in flow on its full-width line (flex-basis:100% in the base rule):
+       the buttons already occupy a second line here, and the positioned
+       placement would land on the textarea's bottom-right corner. */
+    position: static;
     margin-top: 0;
   }
 
