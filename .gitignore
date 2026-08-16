@@ -401,3 +401,4 @@ findings.jsonl
 .playwright-mcp/
 .playwright-cli/
 output/playwright/
+test-results/.last-run.json

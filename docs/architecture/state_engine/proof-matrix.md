@@ -50,12 +50,24 @@ adjudications, and limits.
 
 | Lane group | Cells | Owner | Exit condition |
 | --- | ---: | --- | --- |
-| PostgreSQL 16 AWS composition lane + 38 protected live provider lanes | 1,780 | `elspeth-82592e3aa1` | Operator restores AWS, activates `state-engine-live-provider.yml` on the default branch with its protected environment, and dispatches it once at the frozen SHA; `ingest-live-evidence` binds the artifacts |
+| PostgreSQL 16 AWS composition lane + 38 protected live provider lanes | 1,780 | `elspeth-29a7f5a21a` | Operator restores AWS, activates `state-engine-live-provider.yml` on the default branch with its protected environment, and dispatches it once at the frozen SHA; `ingest-live-evidence` binds the artifacts |
 | Local cells with no mapped assertion (incl. 38 provider-backed PB-09 cases lacking local internal-composition tests) | 4,741 | `elspeth-efb47cb5fd` | Author tests or extend the reviewed coverage mapping only where an assertion genuinely proves the cell |
 
-The campaign milestone remains `elspeth-4b3d734e3a`. Tracker assignment,
-status, priority, and dependencies remain live Filigree authority rather than
-evergreen prose.
+The campaign is owned by epic `elspeth-1040aa2143` ("State engine — completion to
+1.0"). It superseded milestone `elspeth-4b3d734e3a` on 2026-08-15, which was
+cancelled after all open work was re-parented flat under the epic; its phases
+`elspeth-7152ce00e4` and `elspeth-19149b1cb7` were skipped. Use
+`filigree list --parent elspeth-1040aa2143` — `filigree plan` is milestone-only
+and no longer applies.
+
+The 1,780-cell live lane above is owned by `elspeth-29a7f5a21a`, the slim
+successor to `elspeth-82592e3aa1`. The published 2026-08-15-0537 package still
+names the predecessor because that package is digest-frozen and is not edited
+retroactively; the successor pointer is tracker-side. Making that pointer
+machine-checkable is `elspeth-079c8fb9ab`.
+
+Tracker assignment, status, priority, and dependencies remain live Filigree
+authority rather than evergreen prose.
 
 ## Hard gates
 
