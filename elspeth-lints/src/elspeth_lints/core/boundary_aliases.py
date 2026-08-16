@@ -171,6 +171,46 @@ def function_local_binding_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -
     return names - declarations
 
 
+def possibly_bound_names(statements: Sequence[ast.stmt]) -> tuple[set[str], bool]:
+    """Return every name ``statements`` may bind in their own scope, plus a star-import flag.
+
+    Scope-respecting via :func:`iter_own_scope`: binders inside nested
+    functions, lambdas, and classes belong to those scopes and are not
+    reported. The flag is ``True`` when a ``from module import *`` makes the
+    bound set unknowable, so callers must treat every name as possibly
+    rebound. Used both for exception-edge alias invalidation here and for the
+    masquerade inventory's loop-head provenance drop.
+    """
+    names: set[str] = set()
+    clears_all = False
+    for statement in statements:
+        for child in iter_own_scope(statement):
+            if isinstance(child, (ast.Assign, ast.Delete)):
+                for target in child.targets:
+                    names.update(assignment_target_names(target))
+            elif isinstance(child, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For, ast.AsyncFor)):
+                names.update(assignment_target_names(child.target))
+            elif isinstance(child, (ast.With, ast.AsyncWith)):
+                for item in child.items:
+                    if item.optional_vars is not None:
+                        names.update(assignment_target_names(item.optional_vars))
+            elif isinstance(child, ast.ExceptHandler) and child.name is not None:
+                names.add(child.name)
+            elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                effect = import_alias_effect(child)
+                names.update(name for name, _target in effect.proven)
+                names.update(effect.invalidated)
+                clears_all = clears_all or effect.clears_all
+            elif isinstance(child, ast.Match):
+                for case in child.cases:
+                    names.update(match_pattern_binding_names(case.pattern))
+            elif isinstance(child, ast.TypeAlias):
+                names.update(assignment_target_names(child.name))
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(child.name)
+    return names, clears_all
+
+
 def identical_alias_join(paths: Sequence[Mapping[str, str]]) -> dict[str, str]:
     """Keep aliases carrying the same proven target on every possible path."""
     if not paths:
@@ -243,7 +283,7 @@ class _AliasEffectsEvaluator:
                 if path.transfer is not None:
                     next_paths.append(path)
                     continue
-                bound_names, clears_all = self._possibly_bound_names((statement,))
+                bound_names, clears_all = possibly_bound_names((statement,))
                 exception_aliases = {} if clears_all else {name: target for name, target in path.aliases.items() if name not in bound_names}
                 next_paths.append(AliasFlowPath(exception_aliases, "raise"))
                 next_paths.extend(self.statement(statement, path.aliases))
@@ -487,37 +527,6 @@ class _AliasEffectsEvaluator:
             aliases.clear()
         self._invalidate(aliases, effect.invalidated)
         aliases.update(effect.proven)
-
-    @staticmethod
-    def _possibly_bound_names(statements: Sequence[ast.stmt]) -> tuple[set[str], bool]:
-        names: set[str] = set()
-        clears_all = False
-        for statement in statements:
-            for child in iter_own_scope(statement):
-                if isinstance(child, (ast.Assign, ast.Delete)):
-                    for target in child.targets:
-                        names.update(assignment_target_names(target))
-                elif isinstance(child, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For, ast.AsyncFor)):
-                    names.update(assignment_target_names(child.target))
-                elif isinstance(child, (ast.With, ast.AsyncWith)):
-                    for item in child.items:
-                        if item.optional_vars is not None:
-                            names.update(assignment_target_names(item.optional_vars))
-                elif isinstance(child, ast.ExceptHandler) and child.name is not None:
-                    names.add(child.name)
-                elif isinstance(child, (ast.Import, ast.ImportFrom)):
-                    effect = import_alias_effect(child)
-                    names.update(name for name, _target in effect.proven)
-                    names.update(effect.invalidated)
-                    clears_all = clears_all or effect.clears_all
-                elif isinstance(child, ast.Match):
-                    for case in child.cases:
-                        names.update(match_pattern_binding_names(case.pattern))
-                elif isinstance(child, ast.TypeAlias):
-                    names.update(assignment_target_names(child.name))
-                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    names.add(child.name)
-        return names, clears_all
 
     @staticmethod
     def _deduplicate(paths: Sequence[AliasFlowPath]) -> tuple[AliasFlowPath, ...]:

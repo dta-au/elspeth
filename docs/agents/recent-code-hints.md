@@ -265,18 +265,62 @@ Three facts a future attempt will want, all measured 2026-08-16:
   are absent from a tree that currently passes the gate, so the oracle must be
   adversarial hand-written cases; the corpus run only answers "would today's
   findings change".
-- **The gate is fail-open today** (`elspeth-34ac84b4b6`): loop back-edges get
-  no fixpoint, so a probe used before its rebind inside a loop is invisible,
-  and `_resolve_binding_expression` discards evidence when resolution fails
-  (`p = wrap(getattr); p(o,'a')` reports nothing). Fixable in place.
+- **Two fail-open holes were closed in place on 2026-08-16**
+  (`elspeth-34ac84b4b6`, `elspeth-682e0c6581`), and the mechanisms are now
+  conventions you must not undo:
+  - *Loop heads are a fixpoint.* `_loop_head_bindings` /
+    `_comprehension_head_bindings` join the body's reachable states back into
+    the loop head until stable, so a probe used before its rebind inside a
+    `for`/`while`/comprehension is visible on iteration 2+, `continue`/`break`
+    carried states count, and boundary provenance is dropped for any name the
+    body can rebind. It terminates only because binding targets are finite:
+    `_MAX_TARGET_DEPTH` collapses any dotted target deeper than 8 segments to
+    `<shadowed>`. **Never build an unbounded target string** (`node =
+    node.next` in a loop hung the whole-tree scan before that cap existed).
+  - *Resolution keeps evidence.* `_resolve_binding_expression` no longer
+    returns an empty set for an unmodelled shape: every *uncalled* probe
+    reference inside it (`wrap(getattr)`, `partial(getattr, o)`, `[getattr]`,
+    `probes[0]`, `for p in probes`) flows out beside the `<shadowed>` marker,
+    so the eventual call is inventoried. A *called* probe contributes nothing
+    (its result is arbitrary; the call itself is the site). Consequence for
+    code you write: passing `getattr`/`hasattr`/`getattr_static` as a value is
+    inventoried where the carrier is called — do it only where you would
+    accept a baseline entry.
+  - *Definition headers replay in CPython order.* `definition_header_expressions`
+    is the single evaluation-order authority for both the live visitor and the
+    deferred projection: decorators, positional then keyword defaults, then —
+    outside `from __future__ import annotations` — signature annotations in
+    CPython's order (`args` BEFORE `posonlyargs`, vararg, kwonly, kwarg,
+    return); classes: decorators, bases, keywords. Variable annotations execute
+    after the value is stored, only outside function bodies, and never under
+    PEP 563 (`_ExecutionContext`); unexecuted annotations are still inventoried
+    (dead-code style, deferred bindings for stringized ones) but their walrus
+    effects never touch the live state. Default captures happen at each
+    default's own evaluation point. Modelled semantics are 3.12/3.13; 3.14
+    (PEP 649) defers annotations and rejects a walrus inside one.
+    `test_definition_header_expression_order_matches_the_running_interpreter`
+    pins the enumerator to the interpreter — note it must `compile(...,
+    dont_inherit=True)` because the test module itself imports
+    `annotations` from `__future__`, which `compile` otherwise inherits.
+  - Still open in this family: `elspeth-f1def53d38` (PEP 695/696 type-parameter
+    scopes) and `elspeth-2a72512454` (destructured literal RHS timing). Not
+    modelled and not claimed: `getattr.__call__(...)`, `a, b = wrap(getattr)`
+    (destructuring a laundered value), reflective laundering
+    (`getattr(builtins, "getattr")` — the outer call is itself a site).
 - **`probe_shape` is invariant under a resolver change** — it is computed from
   the AST node and kind, neither of which passes through resolution (verified:
   354 distinct / 474 total digests, zero differing files). That is what makes
   resolver work safe to attempt at all, since drift would reset the baseline's
   39 human adjudications; land the digest comparison as a test before changing
-  anything. Cost context: one whole-tree scan is ~63s and
-  `test_masquerade_gate.py` runs four of them (~6 min), ~12% of which is a
-  separate quadratic with a ~5-line fix (`elspeth-df09888129`).
+  anything (the 2026-08-16 change was measured this way: 488/488 sites, zero
+  digest/kind/amnesty drift, whole-tree 65.0s → 64.8s after a two-state fast
+  path in `_join_binding_states`). Cost context: one whole-tree scan is ~65s
+  and `test_masquerade_gate.py` runs four of them (~6 min), ~12% of which is
+  a separate quadratic with a ~5-line fix (`elspeth-df09888129`). The
+  per-statement state copy in the possible-bindings model is itself
+  quadratic in suite length (~3–4× per input doubling on flat 1600-statement
+  inputs, before and after); the stop rule is about not making that class
+  worse, and any loop-head work multiplies it by the fixpoint pass count.
 
 ### 3. Trust-tier lint corpus (standing)
 

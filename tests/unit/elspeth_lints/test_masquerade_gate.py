@@ -41,13 +41,14 @@ from __future__ import annotations
 
 import ast
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 from elspeth_lints.core.ast_walker import walk_python_files
 from elspeth_lints.rules.masquerade.baseline import BaselineEntry, MasqueradeBaseline, load_baseline, render_baseline_yaml
-from elspeth_lints.rules.masquerade.inventory import compute_qualname, iter_masquerade_sites
+from elspeth_lints.rules.masquerade.inventory import compute_qualname, definition_header_expressions, iter_masquerade_sites
 from elspeth_lints.rules.masquerade.metadata import SCAN_SUBDIRS
 from elspeth_lints.rules.masquerade.rule import RULE, SiteGroup, collect_sites, group_non_amnestied_sites, scan_root
 from elspeth_lints.rules.masquerade.seed_baseline import build_entries
@@ -1083,6 +1084,424 @@ def test_deleting_a_module_shadow_restores_builtin_lookup() -> None:
     sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/deleted_shadow.py")
 
     assert [site.kind for site in sites] == ["getattr"]
+
+
+# -- elspeth-34ac84b4b6: loop back edges and laundered probes ---------------
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "from foreign import getattr as probe\nfor item in items:\n    probe(obj, 'field', None)\n    probe = getattr\n",
+            id="module-for",
+        ),
+        pytest.param(
+            "from foreign import getattr as probe\nwhile pending():\n    probe(obj, 'field', None)\n    probe = getattr\n",
+            id="module-while",
+        ),
+        pytest.param(
+            "def scan(items):\n    from foreign import getattr as probe\n    for item in items:\n        probe(obj, 'field', None)\n        probe = getattr\n",
+            id="function-for",
+        ),
+        pytest.param(
+            (
+                "from foreign import getattr as probe\n"
+                "for item in items:\n"
+                "    probe(obj, 'field', None)\n"
+                "    if item:\n"
+                "        probe = getattr\n"
+                "        continue\n"
+                "    probe = foreign_probe\n"
+            ),
+            id="continue-carries-the-back-edge",
+        ),
+        pytest.param(
+            (
+                "from foreign import getattr as probe\n"
+                "from foreign import getattr as carrier\n"
+                "for item in items:\n"
+                "    probe(obj, 'field', None)\n"
+                "    probe = carrier\n"
+                "    carrier = getattr\n"
+            ),
+            id="chained-alias-needs-a-fixpoint",
+        ),
+        pytest.param(
+            "from foreign import getattr as probe\nwhile probe(obj, 'field', None):\n    probe = getattr\n",
+            id="while-test-runs-every-iteration",
+        ),
+        pytest.param(
+            (
+                "from foreign import getattr as probe\n"
+                "for item in items:\n"
+                "    probe = getattr\n"
+                "    if item:\n"
+                "        break\n"
+                "    probe = foreign_probe\n"
+                "probe(obj, 'field', None)\n"
+            ),
+            id="break-carries-a-mid-body-state-out",
+        ),
+        pytest.param(
+            (
+                "from foreign import getattr as probe\n"
+                "for item in items:\n"
+                "    def inspect_value():\n"
+                "        return alias(obj, 'field', None)\n"
+                "    alias = probe\n"
+                "    probe = getattr\n"
+            ),
+            id="deferred-body-inside-the-loop",
+        ),
+        pytest.param(
+            "from foreign import getattr as probe\nvalues = [(probe(obj, 'field', None), (probe := getattr)) for item in items]\n",
+            id="comprehension-walrus-back-edge",
+        ),
+    ],
+)
+def test_probe_rebound_later_in_a_loop_body_is_visible_on_the_back_edge(source: str) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/loop_back_edge.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "from foreign import getattr as probe\nfor item in items:\n    probe(obj, 'field', None)\n    probe = foreign_probe\n",
+            id="module-for",
+        ),
+        pytest.param(
+            "from foreign import getattr as probe\nvalues = [(probe(obj, 'field', None), (probe := foreign_probe)) for item in items]\n",
+            id="comprehension-walrus-back-edge",
+        ),
+    ],
+)
+def test_loop_back_edge_join_does_not_invent_a_builtin_probe(source: str) -> None:
+    assert iter_masquerade_sites(ast.parse(source), "src/elspeth/loop_back_edge_foreign.py") == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_kind"),
+    [
+        pytest.param(
+            "node = root\nfor item in items:\n    node = node.next\n    probe = getattr\nprobe(node, 'field', None)\n",
+            "getattr",
+            id="attribute-chain",
+        ),
+        pytest.param(
+            "import inspect\nprobe = inspect\nfor item in items:\n    probe = wrap(probe).getattr_static\nprobe(obj, 'field')\n",
+            "getattr_static",
+            id="laundered-attribute-chain",
+        ),
+    ],
+)
+def test_loop_head_fixpoint_terminates_on_a_growing_attribute_chain(source: str, expected_kind: str) -> None:
+    """``node = node.next`` must not grow the head state forever: target depth is bounded."""
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/attribute_chain.py")
+
+    assert [site.kind for site in sites] == [expected_kind]
+
+
+def test_boundary_source_rebound_in_a_loop_body_loses_amnesty_on_the_back_edge() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response, owned, items):\n"
+        "    for item in items:\n"
+        "        value = getattr(response, 'field', None)\n"
+        "        response = owned\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/loop_source_rebound.py")
+
+    assert [site.amnesty for site in sites] == [False]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("probe = wrap(getattr)\nprobe(obj, 'field', None)\n", id="call-result"),
+        pytest.param("probes = [getattr]\nprobes[0](obj, 'field', None)\n", id="subscript-over-a-name"),
+        pytest.param("import functools\nprobe = functools.partial(getattr, obj)\nprobe('field', None)\n", id="partial"),
+        pytest.param("wrap(getattr)(obj, 'field', None)\n", id="inline-call-result"),
+        pytest.param("import functools\nfunctools.partial(getattr, obj)('field', None)\n", id="inline-partial"),
+        pytest.param("probes = (getattr,)\nfor probe in probes:\n    probe(obj, 'field', None)\n", id="iterating-a-named-container"),
+        pytest.param("probe = {'p': getattr, 'q': other}[key]\nprobe(obj, 'field', None)\n", id="literal-mapping-with-a-dynamic-key"),
+        pytest.param("probe = (getattr, other)[index]\nprobe(obj, 'field', None)\n", id="literal-sequence-with-a-dynamic-index"),
+        pytest.param("def inspect_value():\n    return probe(obj, 'field', None)\nprobe = wrap(getattr)\n", id="deferred-body"),
+        pytest.param("import inspect\nwrap(inspect).getattr_static(obj, 'field')\n", id="attribute-of-a-laundered-module"),
+        pytest.param("probe = lambda: getattr\nprobe()\n", id="lambda-returning-the-probe"),
+    ],
+)
+def test_probe_evidence_survives_an_unmodelled_transformation(source: str) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/laundered.py")
+
+    assert len(sites) == 1
+    assert sites[0].kind in {"getattr", "getattr_static"}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("from foreign import getattr as probe\nalias = wrap(probe)\nalias(obj, 'field', None)\n", id="foreign-call-result"),
+        pytest.param("from foreign import getattr as probe\nprobes = [probe]\nprobes[0](obj, 'field', None)\n", id="foreign-subscript"),
+        pytest.param("method = getattr(obj, 'name')\nmethod()\n", id="probe-result-is-not-the-probe"),
+        pytest.param("wrap(getattr(obj, 'name'))(value)\n", id="inline-probe-result-is-not-the-probe"),
+        pytest.param("handler = build(getattr(obj, 'name'), other)\nhandler(value)\n", id="probe-result-inside-a-call"),
+        pytest.param("probe = lambda target: getattr(target, 'field', None)\nprobe(obj)\n", id="lambda-body-site-is-recorded-once"),
+    ],
+)
+def test_laundering_evidence_only_flows_from_an_uncalled_probe_reference(source: str) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/laundered_control.py")
+
+    assert [site.kind for site in sites] == (["getattr"] if "getattr(" in source else [])
+
+
+def test_laundered_attribute_error_cannot_earn_module_getattr_amnesty() -> None:
+    source = (
+        "AttributeError = wrap(AttributeError)\n"
+        "def __getattr__(name):\n"
+        "    if name == 'legacy':\n"
+        "        return 1\n"
+        "    raise AttributeError(name)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/laundered_error.py")
+
+    assert [(site.kind, site.amnesty) for site in sites] == [("dunder_getattr", False)]
+
+
+def test_star_import_shadowing_survives_attribute_error_aliasing() -> None:
+    source = (
+        "from foreign import *\n"
+        "Missing = AttributeError\n"
+        "def __getattr__(name):\n"
+        "    if name == 'legacy':\n"
+        "        return 1\n"
+        "    raise Missing(name)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/star_error.py")
+
+    assert [(site.kind, site.amnesty) for site in sites] == [("dunder_getattr", False)]
+
+
+# -- elspeth-682e0c6581: definition headers and evaluated annotations --------
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        pytest.param("@(probe := getattr)\ndef later():\n    pass\n", id="decorator"),
+        pytest.param("@register(probe := getattr)\ndef later():\n    pass\n", id="decorator-argument"),
+        pytest.param("def later(argument=(probe := getattr)):\n    pass\n", id="positional-default"),
+        pytest.param("def later(*, argument=(probe := getattr)):\n    pass\n", id="keyword-default"),
+        pytest.param("async def later(argument=(probe := getattr)):\n    pass\n", id="async-default"),
+        pytest.param("def later(argument: (probe := getattr)):\n    pass\n", id="parameter-annotation"),
+        pytest.param("def later() -> (probe := getattr):\n    pass\n", id="return-annotation"),
+        pytest.param("later = lambda argument=(probe := getattr): argument\n", id="lambda-default"),
+        pytest.param("@(probe := getattr)\nclass Later:\n    pass\n", id="class-decorator"),
+        pytest.param("class Later(Base, (probe := getattr)):\n    pass\n", id="class-base"),
+        pytest.param("class Later(Base, option=(probe := getattr)):\n    pass\n", id="class-keyword"),
+        pytest.param("value: (probe := getattr) = 1\n", id="module-annotation"),
+        pytest.param("value: (probe := getattr)\n", id="module-annotation-without-value"),
+        pytest.param("class Later:\n    value: (probe := getattr) = 1\n", id="class-body-annotation-does-not-leak"),
+    ],
+)
+def test_definition_header_walrus_is_visible_to_an_earlier_deferred_body(header: str) -> None:
+    source = f"from foreign import getattr as probe\ndef early():\n    return probe(obj, 'field', None)\n{header}"
+    expected = [] if header.startswith("class Later:\n") else ["getattr"]
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/header_walrus.py")
+
+    assert [site.kind for site in sites] == expected
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        pytest.param("def later(argument: (probe := getattr)):\n    pass\n", id="parameter-annotation"),
+        pytest.param("def later() -> (probe := getattr):\n    pass\n", id="return-annotation"),
+        pytest.param("value: (probe := getattr) = 1\n", id="module-annotation"),
+    ],
+)
+def test_future_annotations_never_execute_a_header_walrus(header: str) -> None:
+    source = (
+        "from __future__ import annotations\n"
+        "from foreign import getattr as probe\n"
+        "def early():\n"
+        "    return probe(obj, 'field', None)\n"
+        f"{header}"
+    )
+
+    assert iter_masquerade_sites(ast.parse(source), "src/elspeth/future_header_walrus.py") == []
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("def later(argument: (probe := foreign_probe)):\n    pass\n", id="parameter-annotation"),
+        pytest.param("value: (probe := foreign_probe) = 1\n", id="module-annotation"),
+    ],
+)
+def test_future_annotation_walrus_cannot_shadow_a_live_builtin_probe(statement: str) -> None:
+    source = f"from __future__ import annotations\nfrom builtins import getattr as probe\n{statement}probe(obj, 'field', None)\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/future_live_shadow.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("value: (probe := foreign_probe) = 1", id="simple-name"),
+        pytest.param("table[0]: (probe := foreign_probe) = 1", id="subscript-target"),
+        pytest.param("holder.value: (probe := foreign_probe)", id="attribute-target-without-value"),
+    ],
+)
+def test_function_local_variable_annotations_never_execute(statement: str) -> None:
+    source = f"def scan():\n    from builtins import getattr as probe\n    {statement}\n    return probe(obj, 'field', None)\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/local_annotation.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_class_body_variable_annotations_execute() -> None:
+    source = (
+        "class Later:\n    from builtins import getattr as probe\n    value: (probe := foreign_probe) = 1\n    probe(obj, 'field', None)\n"
+    )
+
+    assert iter_masquerade_sites(ast.parse(source), "src/elspeth/class_annotation.py") == []
+
+
+def test_annotated_assignment_evaluates_the_value_before_the_annotation() -> None:
+    source = "from builtins import getattr as probe\nvalue: (probe := foreign_probe) = probe(obj, 'field', None)\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/annotation_order.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    ("header", "expected_kinds"),
+    [
+        pytest.param(
+            "@(probe := foreign_probe)\ndef later(argument=probe(obj, 'field', None)):\n    pass\n", [], id="decorators-before-defaults"
+        ),
+        pytest.param(
+            "def later(argument: probe(obj, 'field', None) = (probe := foreign_probe)):\n    pass\n", [], id="defaults-before-annotations"
+        ),
+        pytest.param(
+            "def later(positional: (probe := foreign_probe), /, argument: probe(obj, 'field', None)):\n    pass\n",
+            ["getattr"],
+            id="args-annotations-before-positional-only",
+        ),
+        pytest.param(
+            "def later(*rest: (probe := foreign_probe), keyword: probe(obj, 'field', None)):\n    pass\n",
+            [],
+            id="vararg-annotation-before-keyword-only",
+        ),
+        pytest.param(
+            "def later(keyword: (probe := foreign_probe), **options: probe(obj, 'field', None)):\n    pass\n",
+            [],
+            id="keyword-only-before-kwarg",
+        ),
+        pytest.param(
+            "class Later(probe(obj, 'field', None), option=(probe := foreign_probe)):\n    pass\n", ["getattr"], id="bases-before-keywords"
+        ),
+    ],
+)
+def test_definition_headers_evaluate_in_cpython_order(header: str, expected_kinds: list[str]) -> None:
+    source = f"from builtins import getattr as probe\n{header}"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/header_order.py")
+
+    assert [site.kind for site in sites] == expected_kinds
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        pytest.param("@(probe := getattr)\ndef later(argument=probe):", id="decorator-walrus-precedes-default-capture"),
+        pytest.param("def later(argument=(probe := getattr), other=probe):", id="earlier-default-precedes-later-capture"),
+        pytest.param("def later(argument=probe, other: (probe := foreign_probe) = 1):", id="annotation-walrus-follows-default-capture"),
+    ],
+)
+def test_default_parameter_capture_happens_at_each_default_evaluation_point(header: str) -> None:
+    initial = (
+        "from builtins import getattr as probe"
+        if "annotation-walrus" in header or "other: (probe" in header
+        else "from foreign import getattr as probe"
+    )
+    body_target = "other" if header.startswith("def later(argument=(probe := getattr)") else "argument"
+    source = f"{initial}\n{header}\n    return {body_target}(obj, 'field', None)\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/default_capture_order.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 14), reason="PEP 649 defers annotation evaluation; the inventory models 3.12/3.13")
+def test_definition_header_expression_order_matches_the_running_interpreter() -> None:
+    """The shared header enumerator IS the model; pin it to CPython's actual definition-time order."""
+    source = (
+        "@m('dec1')\n"
+        "@m('dec2')\n"
+        "def f(p0: m('ann_p0') = m('def_p0'), /, a: m('ann_a') = m('def_a'), *va: m('ann_va'), "
+        "k: m('ann_k') = m('def_k'), **kw: m('ann_kw')) -> m('ann_ret'):\n"
+        "    pass\n"
+        "@m('cdec')\n"
+        "class C(m('base1'), m('base2'), metaclass=Meta, option=m('kw_option')):\n"
+        "    pass\n"
+        "g = lambda a=m('lambda_a'), *, k=m('lambda_k'): None\n"
+    )
+    log: list[str] = []
+
+    class _Marker:
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+
+        def __call__(self, *args: object, **kwargs: object) -> object:
+            return args[0] if args else None
+
+        def __mro_entries__(self, bases: tuple[object, ...]) -> tuple[object, ...]:
+            return ()
+
+    class Meta(type):
+        def __new__(mcls, name: str, bases: tuple[type, ...], namespace: dict[str, object], **kwargs: object) -> Meta:
+            return super().__new__(mcls, name, bases, namespace)
+
+        def __init__(cls, name: str, bases: tuple[type, ...], namespace: dict[str, object], **kwargs: object) -> None:
+            super().__init__(name, bases, namespace)
+
+    def m(tag: str) -> _Marker:
+        log.append(tag)
+        return _Marker(tag)
+
+    # ``dont_inherit``: this test module itself imports ``annotations`` from
+    # ``__future__``, and ``compile`` would otherwise stringize the oracle's.
+    exec(compile(source, "<header-order-oracle>", "exec", dont_inherit=True), {"m": m, "Meta": Meta})
+
+    tree = ast.parse(source)
+    modelled: list[str] = []
+    for statement in tree.body:
+        if isinstance(statement, ast.FunctionDef | ast.ClassDef):
+            expressions = definition_header_expressions(statement, annotations=True)
+        else:
+            assert isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Lambda)
+            expressions = definition_header_expressions(statement.value, annotations=True)
+        for expression in expressions:
+            marker = expression.func if isinstance(expression, ast.Call) else None
+            if isinstance(marker, ast.Name) and marker.id == "m":
+                assert isinstance(expression, ast.Call)
+                modelled.append(str(ast.literal_eval(expression.args[0])))
+
+    assert modelled == log
 
 
 @pytest.mark.parametrize(

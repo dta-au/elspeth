@@ -46,6 +46,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from elspeth_lints.core.ast_walker import iter_own_scope
 from elspeth_lints.core.boundary_aliases import (
     argument_names,
     assignment_target_names,
@@ -53,6 +54,7 @@ from elspeth_lints.core.boundary_aliases import (
     function_local_binding_names,
     import_alias_effect,
     match_pattern_binding_names,
+    possibly_bound_names,
 )
 from elspeth_lints.rules.trust_boundary.shared import extract_keywords, iter_boundary_decorators
 
@@ -63,6 +65,12 @@ ALL_KINDS: tuple[SiteKind, ...] = ("getattr", "hasattr", "getattr_static", "dund
 MODULE_QUALNAME = "<module>"
 _LAMBDA_FRAME = "<lambda>"
 _SHADOWED_BINDING = "<shadowed>"
+#: A binding target deeper than this many dotted segments can never be a probe
+#: identity (``builtins.getattr``, ``inspect.getattr_static``) or the exact
+#: ``builtins.AttributeError``; it collapses to the shadowed marker. This is
+#: what keeps every fixpoint here finite: ``node = node.next`` in a loop would
+#: otherwise grow ``X.next.next...`` for ever.
+_MAX_TARGET_DEPTH = 8
 type BindingTargets = frozenset[str]
 _DEFAULT_PROBE_BINDINGS = {
     "getattr": frozenset({"builtins.getattr"}),
@@ -74,6 +82,100 @@ _PROBE_TARGETS: dict[str, SiteKind] = {
     "builtins.hasattr": "hasattr",
     "inspect.getattr_static": "getattr_static",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionContext:
+    """Which annotation expressions execute for the statements of one scope.
+
+    The inventory models CPython 3.12/3.13 definition-time semantics: signature
+    annotations and module/class variable annotations execute eagerly, a
+    function-local variable annotation never executes, and
+    ``from __future__ import annotations`` (PEP 563) stringizes every
+    annotation so none executes. Python 3.14 (PEP 649) defers annotations
+    entirely and rejects a walrus inside one, so the eager model is exactly
+    the case where an annotation can rebind a probe alias.
+    """
+
+    future_annotations: bool
+    function_scope: bool
+
+    @property
+    def header_annotations_execute(self) -> bool:
+        return not self.future_annotations
+
+    @property
+    def variable_annotations_execute(self) -> bool:
+        return not self.future_annotations and not self.function_scope
+
+
+def _uses_future_annotations(tree: ast.Module) -> bool:
+    return any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "__future__"
+        and any(alias.name == "annotations" for alias in statement.names)
+        for statement in tree.body
+    )
+
+
+def _parameter_defaults(arguments: ast.arguments) -> list[tuple[ast.arg, ast.expr]]:
+    """Return ``(parameter, default)`` pairs in CPython evaluation order.
+
+    Positional defaults (``posonlyargs`` then ``args``, right-aligned) evaluate
+    before keyword-only defaults, each group left to right.
+    """
+    positional = [*arguments.posonlyargs, *arguments.args]
+    positional_with_defaults = positional[-len(arguments.defaults) :] if arguments.defaults else []
+    pairs = list(zip(positional_with_defaults, arguments.defaults, strict=True))
+    pairs.extend(
+        (parameter, keyword_default)
+        for parameter, keyword_default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True)
+        if keyword_default is not None
+    )
+    return pairs
+
+
+def _annotation_expressions(arguments: ast.arguments, returns: ast.expr | None) -> list[ast.expr]:
+    """Return signature annotations in CPython 3.12/3.13 evaluation order.
+
+    ``compiler_visit_annotations`` walks ``args`` BEFORE ``posonlyargs`` — the
+    source order is not the evaluation order — then vararg, keyword-only
+    parameters, kwarg, and finally the return annotation.
+    """
+    parameters: list[ast.arg] = [*arguments.args, *arguments.posonlyargs]
+    if arguments.vararg is not None:
+        parameters.append(arguments.vararg)
+    parameters.extend(arguments.kwonlyargs)
+    if arguments.kwarg is not None:
+        parameters.append(arguments.kwarg)
+    expressions = [parameter.annotation for parameter in parameters if parameter.annotation is not None]
+    if returns is not None:
+        expressions.append(returns)
+    return expressions
+
+
+def definition_header_expressions(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef,
+    *,
+    annotations: bool,
+) -> list[ast.expr]:
+    """Return every expression a definition header evaluates, in evaluation order.
+
+    This is the single order both the live visitor and the deferred runtime
+    projection replay (elspeth-682e0c6581): a class evaluates decorators, then
+    bases (starred included), then keyword values; a function or lambda
+    evaluates decorators, then defaults, then — when ``annotations`` is set,
+    i.e. outside ``from __future__ import annotations`` — its signature
+    annotations. PEP 695 type parameters are a separate annotation scope and
+    are deliberately not enumerated here (elspeth-f1def53d38).
+    """
+    if isinstance(node, ast.ClassDef):
+        return [*node.decorator_list, *node.bases, *(keyword.value for keyword in node.keywords)]
+    decorators = node.decorator_list if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else []
+    expressions: list[ast.expr] = [*decorators, *(default for _parameter, default in _parameter_defaults(node.args))]
+    if annotations and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        expressions.extend(_annotation_expressions(node.args, node.returns))
+    return expressions
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,12 +222,16 @@ def iter_masquerade_sites(tree: ast.Module, display_path: str) -> list[Masquerad
     boundary_source_params = _boundary_source_params(tree)
     module_tables = _module_level_literal_containers(tree)
     in_tests = display_path == "tests" or display_path.startswith("tests/")
+    future_annotations = _uses_future_annotations(tree)
     visitor = _MasqueradeVisitor(
         display_path=display_path,
         boundary_source_params=boundary_source_params,
         module_tables=module_tables,
-        runtime_module_bindings=_module_runtime_bindings(tree),
+        runtime_module_bindings=_module_runtime_bindings(
+            tree, _ExecutionContext(future_annotations=future_annotations, function_scope=False)
+        ),
         in_tests=in_tests,
+        future_annotations=future_annotations,
     )
     visitor.visit(tree)
     return visitor.sites
@@ -228,23 +334,61 @@ def _is_literal_str_container(node: ast.expr) -> bool:
 
 
 def _resolve_binding_expression(expression: ast.expr, bindings: dict[str, BindingTargets]) -> BindingTargets:
+    """Return every binding target ``expression`` may evaluate to.
+
+    Modelled shapes — names and dotted names, a walrus, a conditional
+    expression, a literal container subscript — resolve exactly. Every other
+    shape keeps its evidence instead of discarding it (elspeth-34ac84b4b6):
+    an *uncalled* reference inside the expression may be the value that flows
+    out (``wrap(getattr)``, ``partial(getattr, obj)``, ``[getattr]``), so
+    those targets are retained beside the ``<shadowed>`` marker recording
+    that the value is otherwise unknown. A probe that is *called* inside the
+    expression contributes nothing: its result is arbitrary, and the call is
+    inventoried where it appears. The marker is what keeps the amnesty layer
+    honest — a laundered ``AttributeError`` never resolves to the exact
+    builtin identity a PEP 562 hook needs.
+    """
     if isinstance(expression, ast.NamedExpr):
         return _resolve_binding_expression(expression.value, bindings)
     if isinstance(expression, ast.IfExp):
         return _resolve_binding_expression(expression.body, bindings) | _resolve_binding_expression(expression.orelse, bindings)
-    if isinstance(expression, ast.Subscript) and isinstance(expression.value, (ast.Tuple, ast.List)):
+    if isinstance(expression, ast.Subscript):
+        return _resolve_subscript(expression, bindings)
+    parts = _dotted_name(expression)
+    if parts is not None:
+        return frozenset(_extend_target(root, parts[1:]) for root in bindings.get(parts[0], frozenset()))
+    if isinstance(expression, ast.Attribute):
+        # ``wrap(inspect).getattr_static``: an attribute of whatever a
+        # laundered value may be, keyed exactly like a dotted alias.
+        return frozenset(_extend_target(root, (expression.attr,)) for root in _resolve_binding_expression(expression.value, bindings))
+    return _laundered_evidence(expression, bindings) | {_SHADOWED_BINDING}
+
+
+def _extend_target(root: str, attributes: Sequence[str]) -> str:
+    """Append attribute segments to a binding target, bounded by :data:`_MAX_TARGET_DEPTH`."""
+    if root == _SHADOWED_BINDING or root.count(".") + len(attributes) >= _MAX_TARGET_DEPTH:
+        return _SHADOWED_BINDING
+    return ".".join((root, *attributes))
+
+
+def _resolve_subscript(expression: ast.Subscript, bindings: dict[str, BindingTargets]) -> BindingTargets:
+    container = expression.value
+    if isinstance(container, (ast.Tuple, ast.List)):
         index = expression.slice
         if isinstance(index, ast.Constant) and isinstance(index.value, int):
             try:
-                return _resolve_binding_expression(expression.value.elts[index.value], bindings)
+                return _resolve_binding_expression(container.elts[index.value], bindings)
             except IndexError:
                 return frozenset()
-    if isinstance(expression, ast.Subscript) and isinstance(expression.value, ast.Dict):
+        # A dynamic index selects some element; a slice keeps a subsequence
+        # of them. Either way only the elements themselves can flow out.
+        return frozenset(target for element in container.elts for target in _resolve_binding_expression(element, bindings))
+    if isinstance(container, ast.Dict):
         try:
             requested_key = ast.literal_eval(expression.slice)
         except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-            return frozenset()
-        for key, value in zip(expression.value.keys, expression.value.values, strict=True):
+            return frozenset(target for value in container.values for target in _resolve_binding_expression(value, bindings))
+        for key, value in zip(container.keys, container.values, strict=True):
             if key is None:
                 continue
             try:
@@ -253,10 +397,68 @@ def _resolve_binding_expression(expression: ast.expr, bindings: dict[str, Bindin
                 continue
             if candidate_key == requested_key:
                 return _resolve_binding_expression(value, bindings)
-    parts = _dotted_name(expression)
-    if parts is None:
-        return frozenset()
-    return frozenset(".".join((root, *parts[1:])) for root in bindings.get(parts[0], frozenset()) if root != _SHADOWED_BINDING)
+        # No literal key matched: only a ``**spread`` entry could still supply it.
+        return frozenset(
+            target
+            for key, value in zip(container.keys, container.values, strict=True)
+            if key is None
+            for target in _resolve_binding_expression(value, bindings)
+        )
+    # ``probes[0]`` over a name-bound or computed container: whatever evidence
+    # the container carries is what an element may be.
+    return _resolve_binding_expression(container, bindings)
+
+
+def _laundered_evidence(expression: ast.AST, bindings: dict[str, BindingTargets]) -> BindingTargets:
+    """Union the targets of every uncalled reference inside an unmodelled expression.
+
+    A callee is consumed by its call — a probe reference in call position is
+    inventoried as a site where it stands, and the call's *result* is
+    arbitrary — so ``func`` sub-expressions are skipped while arguments are
+    walked. Names bound inside the expression itself (lambda parameters,
+    comprehension targets) shadow the enclosing bindings.
+    """
+    evidence: set[str] = set()
+
+    def walk(node: ast.AST, shadowed: frozenset[str]) -> None:
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            parts = _dotted_name(node)
+            if parts is not None:
+                if parts[0] not in shadowed:
+                    evidence.update(_resolve_binding_expression(node, bindings))
+                return
+        if isinstance(node, ast.Call):
+            for argument in node.args:
+                walk(argument, shadowed)
+            for keyword in node.keywords:
+                walk(keyword.value, shadowed)
+            return
+        if isinstance(node, ast.Lambda):
+            for _parameter, default in _parameter_defaults(node.args):
+                walk(default, shadowed)
+            walk(node.body, shadowed | argument_names(node.args))
+            return
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            first, *remaining = node.generators
+            walk(first.iter, shadowed)
+            inner = shadowed | {name for generator in node.generators for name in assignment_target_names(generator.target)}
+            for condition in first.ifs:
+                walk(condition, inner)
+            for generator in remaining:
+                walk(generator.iter, inner)
+                for condition in generator.ifs:
+                    walk(condition, inner)
+            if isinstance(node, ast.DictComp):
+                walk(node.key, inner)
+                walk(node.value, inner)
+            else:
+                walk(node.elt, inner)
+            return
+        for child in ast.iter_child_nodes(node):
+            walk(child, shadowed)
+
+    walk(expression, frozenset())
+    return frozenset(evidence)
 
 
 def _bind_runtime_value(target: ast.expr, value: ast.expr, bindings: dict[str, BindingTargets]) -> None:
@@ -270,6 +472,22 @@ def _bind_runtime_value(target: ast.expr, value: ast.expr, bindings: dict[str, B
 
 
 def _join_binding_states(states: Sequence[dict[str, BindingTargets]]) -> dict[str, BindingTargets]:
+    """Return the per-name union of ``states``.
+
+    This is the hot path of the possible-bindings model (one merge per
+    statement), so the two-state case copies the first state at C speed and
+    only rebuilds the target sets that actually differ.
+    """
+    if len(states) == 2:
+        first, second = states
+        joined = dict(first)
+        for name, targets in second.items():
+            existing = joined.get(name)
+            if existing is None:
+                joined[name] = targets
+            elif not targets <= existing:
+                joined[name] = existing | targets
+        return joined
     names = {name for state in states for name in state}
     return {name: frozenset(target for state in states for target in state.get(name, ())) for name in names}
 
@@ -279,16 +497,23 @@ def _target_bindings_from_iterable(
     iterable: ast.expr,
     bindings: dict[str, BindingTargets],
 ) -> dict[str, BindingTargets]:
+    fallback: BindingTargets = frozenset()
     if isinstance(iterable, (ast.Tuple, ast.List, ast.Set)):
         values = iterable.elts
     elif isinstance(iterable, ast.Dict):
         values = [key for key in iterable.keys if key is not None]
     else:
+        # ``for probe in probes``: an element of a name-bound or computed
+        # container may be any evidence the container itself carries.
         values = []
+        fallback = _resolve_binding_expression(iterable, bindings)
 
     def collect(candidate: ast.expr, possible_values: Sequence[ast.expr]) -> dict[str, BindingTargets]:
         if isinstance(candidate, ast.Name):
-            targets = frozenset(target_name for value in possible_values for target_name in _resolve_binding_expression(value, bindings))
+            targets = (
+                frozenset(target_name for value in possible_values for target_name in _resolve_binding_expression(value, bindings))
+                | fallback
+            )
             return {candidate.id: targets} if targets else {}
         if isinstance(candidate, (ast.Tuple, ast.List)):
             result: dict[str, BindingTargets] = {}
@@ -340,18 +565,19 @@ def _pattern_capture_bindings(
 def _default_parameter_bindings(
     arguments: ast.arguments,
     bindings: dict[str, BindingTargets],
+    *,
+    evaluate: Callable[[ast.expr], None],
 ) -> dict[str, BindingTargets]:
+    """Capture what each default binds at its own evaluation point.
+
+    Defaults evaluate in :func:`_parameter_defaults` order and each is captured
+    BEFORE ``evaluate`` replays it against ``bindings``, so a walrus in one
+    default is visible to the defaults after it and never to the ones before.
+    """
     captured: dict[str, BindingTargets] = {}
-    positional = [*arguments.posonlyargs, *arguments.args]
-    positional_with_defaults = positional[-len(arguments.defaults) :] if arguments.defaults else []
-    for parameter, default in zip(positional_with_defaults, arguments.defaults, strict=True):
+    for parameter, default in _parameter_defaults(arguments):
         targets = _resolve_binding_expression(default, bindings)
-        if targets:
-            captured[parameter.arg] = targets
-    for parameter, keyword_default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
-        if keyword_default is None:
-            continue
-        targets = _resolve_binding_expression(keyword_default, bindings)
+        evaluate(default)
         if targets:
             captured[parameter.arg] = targets
     return captured
@@ -359,6 +585,10 @@ def _default_parameter_bindings(
 
 def _apply_runtime_expression(expression: ast.AST, bindings: dict[str, BindingTargets]) -> None:
     if isinstance(expression, ast.Lambda):
+        # Defaults evaluate in the enclosing scope when the lambda is created;
+        # the body is a deferred scope and binds nothing here.
+        for _parameter, default in _parameter_defaults(expression.args):
+            _apply_runtime_expression(default, bindings)
         return
     if isinstance(expression, ast.NamedExpr):
         _apply_runtime_expression(expression.value, bindings)
@@ -472,7 +702,19 @@ def _apply_runtime_control_target(
     )
 
 
-def _runtime_bindings_after(nodes: Sequence[ast.stmt], incoming: dict[str, BindingTargets]) -> dict[str, BindingTargets]:
+def _runtime_bindings_after(
+    nodes: Sequence[ast.stmt],
+    incoming: dict[str, BindingTargets],
+    context: _ExecutionContext,
+) -> dict[str, BindingTargets]:
+    """Project the bindings reachable after ``nodes`` execute from ``incoming``.
+
+    This is the deferred-body authority: a function, lambda, or generator body
+    runs later, so it resolves names against every binding the enclosing
+    scope can reach, not the binding at its definition point. It must agree
+    with the live visitor on which expressions execute and in what order —
+    definition headers, evaluated annotations, and loop back edges included.
+    """
     bindings = dict(incoming)
     for node in nodes:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -497,6 +739,10 @@ def _runtime_bindings_after(nodes: Sequence[ast.stmt], incoming: dict[str, Bindi
             else:
                 _apply_runtime_expression(node.value, bindings)
                 _apply_runtime_assignment_target(node.target, node.value, bindings, dict(bindings))
+            # CPython 3.12/3.13 evaluates the annotation AFTER the value is
+            # stored, only for module/class variables, never under PEP 563.
+            if context.variable_annotations_execute:
+                _apply_runtime_expression(node.annotation, bindings)
         elif isinstance(node, ast.Delete):
             for deletion_target in node.targets:
                 for name in assignment_target_names(deletion_target):
@@ -506,11 +752,15 @@ def _runtime_bindings_after(nodes: Sequence[ast.stmt], incoming: dict[str, Bindi
             for name in assignment_target_names(bound_target):
                 bindings[name] = frozenset({_SHADOWED_BINDING})
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # Definition headers execute in the enclosing scope, in order,
+            # before the name is bound; the body is its own (deferred) scope.
+            for expression in definition_header_expressions(node, annotations=context.header_annotations_execute):
+                _apply_runtime_expression(expression, bindings)
             bindings[node.name] = frozenset({_SHADOWED_BINDING})
         elif isinstance(node, ast.If):
             _apply_runtime_expression(node.test, bindings)
-            body = _runtime_bindings_after(node.body, bindings)
-            orelse = _runtime_bindings_after(node.orelse, bindings) if node.orelse else dict(bindings)
+            body = _runtime_bindings_after(node.body, bindings, context)
+            orelse = _runtime_bindings_after(node.orelse, bindings, context) if node.orelse else dict(bindings)
             bindings = _join_binding_states((body, orelse))
         elif isinstance(node, ast.Match):
             _apply_runtime_expression(node.subject, bindings)
@@ -520,39 +770,50 @@ def _runtime_bindings_after(nodes: Sequence[ast.stmt], incoming: dict[str, Bindi
                 for name in match_pattern_binding_names(case.pattern):
                     case_bindings[name] = frozenset({_SHADOWED_BINDING})
                 case_bindings.update(_pattern_capture_bindings(case.pattern, node.subject, bindings))
-                states.append(_runtime_bindings_after(case.body, case_bindings))
+                states.append(_runtime_bindings_after(case.body, case_bindings, context))
             bindings = _join_binding_states(states)
         elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
-            _apply_runtime_expression(node.iter if isinstance(node, (ast.For, ast.AsyncFor)) else node.test, bindings)
-            body_entry = dict(bindings)
-            if isinstance(node, (ast.For, ast.AsyncFor)):
-                target_bindings = _target_bindings_from_iterable(node.target, node.iter, bindings)
-                _apply_runtime_control_target(node.target, target_bindings, body_entry)
-            body = _runtime_bindings_after(node.body, body_entry)
-            joined = _join_binding_states((bindings, body))
-            orelse = _runtime_bindings_after(node.orelse, joined) if node.orelse else body
-            bindings = _join_binding_states((bindings, body, orelse))
+            target_bindings = _loop_target_bindings(node, bindings)
+            bindings = _loop_states(node, bindings, target_bindings, context).exit
         elif isinstance(node, (ast.Try, ast.TryStar)):
-            states = [_runtime_bindings_after(node.body, bindings)]
-            states.extend(_runtime_bindings_after(handler.body, bindings) for handler in node.handlers)
+            states = [_runtime_bindings_after(node.body, bindings, context)]
+            states.extend(_runtime_bindings_after(handler.body, bindings, context) for handler in node.handlers)
             if node.orelse:
-                states.append(_runtime_bindings_after(node.orelse, states[0]))
+                states.append(_runtime_bindings_after(node.orelse, states[0], context))
             bindings = _join_binding_states(states)
             if node.finalbody:
-                bindings = _runtime_bindings_after(node.finalbody, bindings)
+                bindings = _runtime_bindings_after(node.finalbody, bindings, context)
         elif isinstance(node, (ast.With, ast.AsyncWith)):
             for item in node.items:
                 _apply_runtime_expression(item.context_expr, bindings)
                 if item.optional_vars is not None:
                     _apply_runtime_control_target(item.optional_vars, {}, bindings)
-            bindings = _runtime_bindings_after(node.body, bindings)
+            bindings = _runtime_bindings_after(node.body, bindings, context)
         else:
             _apply_runtime_expression(node, bindings)
     return bindings
 
 
-def _possible_runtime_bindings(nodes: Sequence[ast.stmt], incoming: dict[str, BindingTargets]) -> dict[str, BindingTargets]:
+def _possible_runtime_bindings(
+    nodes: Sequence[ast.stmt],
+    incoming: dict[str, BindingTargets],
+    context: _ExecutionContext,
+) -> dict[str, BindingTargets]:
     """Return every binding target reachable at any point in ``nodes``."""
+    return _possible_and_final_runtime_bindings(nodes, incoming, context)[0]
+
+
+def _possible_and_final_runtime_bindings(
+    nodes: Sequence[ast.stmt],
+    incoming: dict[str, BindingTargets],
+    context: _ExecutionContext,
+) -> tuple[dict[str, BindingTargets], dict[str, BindingTargets]]:
+    """Return ``(possible, final)``: every reachable state, and the state after ``nodes``.
+
+    ``final`` is exactly :func:`_runtime_bindings_after` — the walk computes it
+    on the way — and is returned so a loop fixpoint need not walk the body
+    again for its exit state.
+    """
     possible = dict(incoming)
     current = dict(incoming)
 
@@ -562,28 +823,169 @@ def _possible_runtime_bindings(nodes: Sequence[ast.stmt], incoming: dict[str, Bi
 
     for node in nodes:
         if isinstance(node, ast.If):
-            merge(_possible_runtime_bindings(node.body, current))
-            merge(_possible_runtime_bindings(node.orelse, current))
+            merge(_possible_runtime_bindings(node.body, current, context))
+            merge(_possible_runtime_bindings(node.orelse, current, context))
         elif isinstance(node, ast.Match):
             for case in node.cases:
-                merge(_possible_runtime_bindings(case.body, current))
+                merge(_possible_runtime_bindings(case.body, current, context))
         elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
-            merge(_possible_runtime_bindings(node.body, current))
-            merge(_possible_runtime_bindings(node.orelse, current))
+            working = dict(current)
+            target_bindings = _loop_target_bindings(node, working)
+            states = _loop_states(node, working, target_bindings, context)
+            merge(states.body_possible)
+            if node.orelse:
+                merge(_possible_runtime_bindings(node.orelse, states.normal_exit, context))
+            current = states.exit
+            merge(current)
+            continue
         elif isinstance(node, (ast.Try, ast.TryStar)):
-            merge(_possible_runtime_bindings(node.body, current))
+            merge(_possible_runtime_bindings(node.body, current, context))
             for handler in node.handlers:
-                merge(_possible_runtime_bindings(handler.body, current))
-            merge(_possible_runtime_bindings(node.orelse, current))
-            merge(_possible_runtime_bindings(node.finalbody, current))
-        current = _runtime_bindings_after((node,), current)
+                merge(_possible_runtime_bindings(handler.body, current, context))
+            merge(_possible_runtime_bindings(node.orelse, current, context))
+            merge(_possible_runtime_bindings(node.finalbody, current, context))
+        current = _runtime_bindings_after((node,), current, context)
         merge(current)
-    return possible
+    return possible, current
 
 
-def _module_runtime_bindings(tree: ast.Module) -> dict[str, BindingTargets]:
+@dataclass(frozen=True, slots=True)
+class _LoopStates:
+    """The binding states of one loop, all over-approximations.
+
+    ``head`` is the state at the loop head on ANY iteration — the incoming
+    state joined with everything the body can carry around the back edge
+    (``continue`` paths included). ``entry`` is ``head`` after the per
+    iteration ``for`` target store or ``while`` test. ``body_possible`` is
+    every state reachable inside the body from ``entry``. ``normal_exit`` is
+    the state after zero or more iterations, including a mid-body ``break``;
+    ``exit`` additionally runs the ``else`` suite.
+    """
+
+    head: dict[str, BindingTargets]
+    entry: dict[str, BindingTargets]
+    body_possible: dict[str, BindingTargets]
+    normal_exit: dict[str, BindingTargets]
+    exit: dict[str, BindingTargets]
+
+
+def _loop_target_bindings(node: ast.For | ast.AsyncFor | ast.While, bindings: dict[str, BindingTargets]) -> dict[str, BindingTargets]:
+    """Apply the once-evaluated ``for`` iterable and return the target's element bindings."""
+    if isinstance(node, ast.While):
+        return {}
+    _apply_runtime_expression(node.iter, bindings)
+    return _target_bindings_from_iterable(node.target, node.iter, bindings)
+
+
+def _loop_iteration_bindings(
+    node: ast.For | ast.AsyncFor | ast.While,
+    head: dict[str, BindingTargets],
+    target_bindings: dict[str, BindingTargets],
+) -> dict[str, BindingTargets]:
+    entry = dict(head)
+    if isinstance(node, ast.While):
+        _apply_runtime_expression(node.test, entry)
+    else:
+        _apply_runtime_control_target(node.target, target_bindings, entry)
+    return entry
+
+
+def _loop_head_bindings(
+    node: ast.For | ast.AsyncFor | ast.While,
+    incoming: dict[str, BindingTargets],
+    target_bindings: dict[str, BindingTargets],
+    context: _ExecutionContext,
+) -> tuple[dict[str, BindingTargets], dict[str, BindingTargets], dict[str, BindingTargets], dict[str, BindingTargets]]:
+    """Return ``(head, entry, body_possible, body_end)`` at the loop head's fixpoint.
+
+    A loop body is visited once, so without this a probe used before its
+    rebind inside the body is invisible on every iteration after the first
+    (elspeth-34ac84b4b6). The head is the least fixpoint of joining the
+    body's reachable states back into the incoming state; targets form a
+    finite set and the join only grows, so it terminates — normally in two
+    passes, more only for alias chains that need several iterations to
+    reach the probe. This is a local over-approximation on the existing
+    possible-bindings model, not a CFG.
+    """
+    head = dict(incoming)
+    while True:
+        entry = _loop_iteration_bindings(node, head, target_bindings)
+        body_possible, body_end = _possible_and_final_runtime_bindings(node.body, entry, context)
+        candidate = _join_binding_states((head, body_possible))
+        if candidate == head:
+            return head, entry, body_possible, body_end
+        head = candidate
+
+
+def _loop_states(
+    node: ast.For | ast.AsyncFor | ast.While,
+    incoming: dict[str, BindingTargets],
+    target_bindings: dict[str, BindingTargets],
+    context: _ExecutionContext,
+) -> _LoopStates:
+    head, entry, body_possible, body_end = _loop_head_bindings(node, incoming, target_bindings, context)
+    # An exhausted ``for`` leaves the target as it was; a ``while`` exits
+    # through one more (falsy) test evaluation. ``head`` already carries every
+    # mid-body state a ``break`` can leave with.
+    zero_or_more = entry if isinstance(node, ast.While) else head
+    normal_exit = _join_binding_states((zero_or_more, body_end))
+    exit_state = (
+        _join_binding_states((normal_exit, _runtime_bindings_after(node.orelse, normal_exit, context))) if node.orelse else normal_exit
+    )
+    return _LoopStates(head=head, entry=entry, body_possible=body_possible, normal_exit=normal_exit, exit=exit_state)
+
+
+def _comprehension_elements(node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp) -> tuple[ast.expr, ...]:
+    return (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)
+
+
+def _comprehension_head_bindings(
+    node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp,
+    incoming: dict[str, BindingTargets],
+    first_target_bindings: dict[str, BindingTargets],
+) -> dict[str, BindingTargets]:
+    """Return the comprehension-scope bindings at the head of ANY iteration.
+
+    The counterpart of :func:`_loop_head_bindings` for the implicit loop of a
+    comprehension: one iteration binds each generator target, then evaluates
+    filters, inner iterables, and the element, and any walrus among them is
+    live on the next pass.
+    """
+    head = dict(incoming)
+    while True:
+        iteration = dict(head)
+        first, *remaining = node.generators
+        _apply_runtime_control_target(first.target, first_target_bindings, iteration)
+        for condition in first.ifs:
+            _apply_runtime_expression(condition, iteration)
+        for generator in remaining:
+            _apply_runtime_expression(generator.iter, iteration)
+            generator_bindings = _target_bindings_from_iterable(generator.target, generator.iter, iteration)
+            _apply_runtime_control_target(generator.target, generator_bindings, iteration)
+            for condition in generator.ifs:
+                _apply_runtime_expression(condition, iteration)
+        for element in _comprehension_elements(node):
+            _apply_runtime_expression(element, iteration)
+        candidate = _join_binding_states((head, iteration))
+        if candidate == head:
+            return head
+        head = candidate
+
+
+def _named_expression_targets(expressions: Sequence[ast.expr]) -> set[str]:
+    """Return names a walrus in ``expressions`` binds in the enclosing scope."""
+    return {
+        name
+        for expression in expressions
+        for child in iter_own_scope(expression)
+        if isinstance(child, ast.NamedExpr)
+        for name in assignment_target_names(child.target)
+    }
+
+
+def _module_runtime_bindings(tree: ast.Module, context: _ExecutionContext) -> dict[str, BindingTargets]:
     """Return bindings possible whenever deferred module members may run."""
-    return _possible_runtime_bindings(tree.body, dict(_DEFAULT_PROBE_BINDINGS))
+    return _possible_runtime_bindings(tree.body, dict(_DEFAULT_PROBE_BINDINGS), context)
 
 
 class _MasqueradeVisitor(ast.NodeVisitor):
@@ -597,11 +999,13 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         module_tables: frozenset[str],
         runtime_module_bindings: dict[str, BindingTargets],
         in_tests: bool,
+        future_annotations: bool,
     ) -> None:
         self._display_path = display_path
         self._boundary_source_params = boundary_source_params
         self._module_tables = module_tables
         self._in_tests = in_tests
+        self._future_annotations = future_annotations
         self._qual_stack: list[str] = []
         self._container_stack: list[str] = ["module"]
         self._binding_stack: list[tuple[str, dict[str, BindingTargets]]] = [("module", dict(_DEFAULT_PROBE_BINDINGS))]
@@ -615,10 +1019,8 @@ class _MasqueradeVisitor(ast.NodeVisitor):
     # -- scope bookkeeping -------------------------------------------------
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        for expression in (*node.decorator_list, *node.bases):
+        for expression in definition_header_expressions(node, annotations=False):
             self.visit(expression)
-        for keyword in node.keywords:
-            self.visit(keyword.value)
         self._qual_stack.append(node.name)
         self._container_stack.append("class")
         self._push_binding_scope("class")
@@ -639,8 +1041,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         self._visit_function(node)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        captured_defaults = _default_parameter_bindings(node.args, self._bindings)
-        self._visit_function_header(node)
+        captured_defaults = self._visit_function_header(node)
         parent_kind = self._container_stack[-1]
         self._qual_stack.append(node.name)
         self._container_stack.append("function")
@@ -656,7 +1057,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
                 self._bindings[name] = targets
         source_param = None if nested_in_function else self._boundary_source_params.get(id(node))
         self._source_stack.append({source_param} if source_param is not None else set())
-        self._deferred_binding_stack.append(_possible_runtime_bindings(node.body, dict(self._bindings)))
+        self._deferred_binding_stack.append(_possible_runtime_bindings(node.body, dict(self._bindings), self._context))
         try:
             if node.name == "__getattr__":
                 self._record_dunder_getattr(node, parent_kind)
@@ -670,10 +1071,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         self._bind_unknown((node.name,))
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
-        captured_defaults = _default_parameter_bindings(node.args, self._bindings)
-        for default in (*node.args.defaults, *node.args.kw_defaults):
-            if default is not None:
-                self.visit(default)
+        captured_defaults = _default_parameter_bindings(node.args, self._bindings, evaluate=self.visit)
         self._qual_stack.append(_LAMBDA_FRAME)
         self._container_stack.append("function")
         nested_in_function = "function" in self._container_stack[:-1]
@@ -728,10 +1126,17 @@ class _MasqueradeVisitor(ast.NodeVisitor):
             for name, targets in deferred_bindings.items():
                 if name not in local_bindings:
                     self._bindings[name] = self._bindings.get(name, frozenset()) | targets
+        # Every iteration after the first enters through the back edge: a
+        # walrus in a filter or the element rebinds names for the next pass,
+        # so the head state is the fixpoint of replaying one iteration.
+        self._bindings.update(_comprehension_head_bindings(node, self._bindings, first_bindings))
+        rebound = _named_expression_targets(
+            (*first.ifs, *(part for generator in remaining for part in (generator.iter, *generator.ifs)), *_comprehension_elements(node))
+        )
         # Generator bodies execute later and close over cells whose values may
         # be rebound before iteration.  Eager list/set/dict comprehensions can
         # retain current boundary provenance; a generator cannot.
-        inherited_sources = set() if isinstance(node, ast.GeneratorExp) else self._source_names - local_bindings
+        inherited_sources = set() if isinstance(node, ast.GeneratorExp) else self._source_names - local_bindings - rebound
         self._source_stack.append(inherited_sources)
         outer_mutations: set[str] = set()
         self._comprehension_mutation_stack.append(outer_mutations)
@@ -805,21 +1210,42 @@ class _MasqueradeVisitor(ast.NodeVisitor):
             self.visit(statement)
             self._restore_state(state)
 
-    def _visit_function_header(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+    @property
+    def _context(self) -> _ExecutionContext:
+        return _ExecutionContext(future_annotations=self._future_annotations, function_scope=self._container_stack[-1] == "function")
+
+    def _visit_function_header(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, BindingTargets]:
+        """Visit the header in :func:`definition_header_expressions` order; return the captured defaults."""
         for decorator in node.decorator_list:
             self.visit(decorator)
-        for default in (*node.args.defaults, *node.args.kw_defaults):
-            if default is not None:
-                self.visit(default)
-        for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
-            if argument.annotation is not None:
-                self.visit(argument.annotation)
-        if node.args.vararg is not None and node.args.vararg.annotation is not None:
-            self.visit(node.args.vararg.annotation)
-        if node.args.kwarg is not None and node.args.kwarg.annotation is not None:
-            self.visit(node.args.kwarg.annotation)
-        if node.returns is not None:
-            self.visit(node.returns)
+        captured_defaults = _default_parameter_bindings(node.args, self._bindings, evaluate=self.visit)
+        for annotation in _annotation_expressions(node.args, node.returns):
+            if self._context.header_annotations_execute:
+                self.visit(annotation)
+            else:
+                self._visit_unexecuted_annotation(annotation, deferred=True)
+        return captured_defaults
+
+    def _visit_unexecuted_annotation(self, annotation: ast.expr, *, deferred: bool) -> None:
+        """Inventory an annotation that never executes at definition time, without replaying its effects.
+
+        Under ``from __future__ import annotations`` — and for every
+        function-local variable annotation — the expression does not run when
+        the statement does, so a walrus inside it must not touch the live
+        state. The probe sites in it are still lexically present: a
+        stringized module/class/signature annotation can be evaluated later
+        by ``typing.get_type_hints`` (``deferred``), so it is inventoried
+        against the deferred bindings like any other late-running body; a
+        local variable annotation is evaluated by nothing and is inventoried
+        under the current state like other dead code.
+        """
+        state = self._snapshot_state()
+        if deferred:
+            deferred_bindings = self._deferred_binding_stack[-1] if "function" in self._container_stack else self._runtime_module_bindings
+            for name, targets in deferred_bindings.items():
+                self._bindings[name] = self._bindings.get(name, frozenset()) | targets
+        self.visit(annotation)
+        self._restore_state(state)
 
     def _snapshot_state(self) -> tuple[dict[str, BindingTargets], set[str]]:
         return dict(self._bindings), set(self._source_names)
@@ -872,12 +1298,18 @@ class _MasqueradeVisitor(ast.NodeVisitor):
             self._visit_assignment_target(target, node.value, value_bindings, value_sources)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        self.visit(node.annotation)
         if node.value is None:
             self._visit_store_target_expressions(node.target)
         else:
             self.visit(node.value)
             self._visit_assignment_target(node.target, node.value, dict(self._bindings), set(self._source_names))
+        # CPython 3.12/3.13 evaluates a variable annotation after the value is
+        # stored, only outside function bodies, and never under PEP 563.
+        context = self._context
+        if context.variable_annotations_execute:
+            self.visit(node.annotation)
+        else:
+            self._visit_unexecuted_annotation(node.annotation, deferred=not context.function_scope)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.target)
@@ -974,13 +1406,22 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         self._join_states(normal_states or (start,))
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor | ast.While) -> None:
-        target = node.target if isinstance(node, (ast.For, ast.AsyncFor)) else None
-        header = node.iter if isinstance(node, (ast.For, ast.AsyncFor)) else node.test
-        self.visit(header)
+        target_bindings: dict[str, BindingTargets] = {}
+        rebound = _named_expression_targets((node.test,)) if isinstance(node, ast.While) else set(assignment_target_names(node.target))
+        if not isinstance(node, ast.While):
+            self.visit(node.iter)
+            target_bindings = _target_bindings_from_iterable(node.target, node.iter, self._bindings)
+        # Every iteration after the first enters through the back edge, so the
+        # body (and a ``while`` test) is visited under the loop-head fixpoint,
+        # and boundary provenance is dropped for any name the loop can rebind.
+        head, _entry, _body_possible, _body_end = _loop_head_bindings(node, self._bindings, target_bindings, self._context)
+        body_rebound, clears_all = possibly_bound_names(node.body)
+        self._restore_state((head, set() if clears_all else self._source_names - rebound - body_rebound))
+        if isinstance(node, ast.While):
+            self.visit(node.test)
         start = self._snapshot_state()
-        if target is not None:
-            target_bindings = _target_bindings_from_iterable(target, header, self._bindings)
-            self._visit_control_target(target, target_bindings)
+        if not isinstance(node, ast.While):
+            self._visit_control_target(node.target, target_bindings)
         self._visit_statements(node.body)
         body_state = self._snapshot_state()
         body_transfers = _suite_transfer_kinds(node.body)
