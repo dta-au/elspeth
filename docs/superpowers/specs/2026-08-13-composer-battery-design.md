@@ -1,9 +1,8 @@
 # Composer Path-Quality Battery — Design
 
-**Date:** 2026-08-13 (rev 1) · rev 2 2026-08-16 · **rev 3 2026-08-16**
-**Status:** Rev 3 — after two panel reviews
-(`2026-08-16-composer-battery-design-review.md`); pending user approval,
-pre-implementation
+**Date:** 2026-08-13 (rev 1) · rev 2/3 2026-08-16 · **rev 4 2026-08-16**
+**Status:** Rev 4 — **approved** (two panel reviews + the Decision 7 panel,
+`2026-08-16-composer-battery-design-review.md`); pre-implementation
 **Home:** `evals/composer-battery/` (new), reusing `evals/lib/` and the
 `evals/composer-parity/` fixture format
 **Owner:** the ELSPETH maintainer; the corpus is curated by whoever edits
@@ -36,10 +35,17 @@ rate. The report prints this caveat in its header.
 
 **Success criteria for the instrument.** Keep it while (a) every deviation it
 reports carries evidence a reader can act on without opening a raw
-transcript, and (b) the calibration firing and the first measurement firing
-agree within the stated MDE on the pooled rates. If several firings surface
-no kit defect at all, question whether the corpus still probes real
-ambiguity — a judgement call, not a calendar rule.
+transcript; (b) the calibration firing and the first measurement firing
+agree within the stated MDE on the pooled rates; and (c) **it discriminates**:
+across those two firings the ledger attributes deviations to *both* classes
+— at least one kit defect and at least one hard problem, each with an
+evidence bundle. All-"hard problem" means the corpus does not probe real
+ambiguity; all-"kit" means the floors are probably mis-derived; either way
+the instrument is re-cut, not re-tuned. Kit edits argued from an evidence
+bundle (never from the rate) should be followed by a measured drop in that
+case's deviation rate of at least the MDE. If the tripwire never fires across
+the first several firings, question it at the v2 review — a judgement call,
+not a calendar rule.
 
 ## Relationship to existing harnesses
 
@@ -96,26 +102,46 @@ Agreed 2026-08-13:
 
 Added 2026-08-16:
 
-7. **Surface: compose loop only.** `service.py` routes a freeform request on
-   an empty session to the **planner** when
+7. **Surface: E — the standing corpus measures the compose loop; a
+   one-shot paired probe and a standing tripwire cover the planner.**
+   `service.py:3227-3275` routes a freeform request on an empty session to
+   the **planner** (`_plan_and_stage_empty_pipeline`) when
    `classify_pipeline_mutation_intent` returns EXPLICIT_MUTATION, else to
-   `_compose_loop`. The two are different architectures (planner: own
-   75-call budget, discovery not persisted as tool rows). Corpus v1 measures
-   the compose loop — the surface the affordance kit governs. Every corpus
-   prompt is run through the classifier at authoring time and must NOT be
-   EXPLICIT_MUTATION; the decision is recorded per case and re-checked at
-   freeze; the observed surface is asserted per run from artifacts (§5). A
-   planner stratum is v2 with its own floor rules.
-   **Known tension, stated:** the classifier fires on *completely specified*
-   build requests, so the gate selects toward less-fully-specified phrasing,
-   while §1 also requires prompts tight enough that one shape is the
-   reasonable reading. Operator voice can satisfy both ("I want to read a
-   CSV of … then split it into two routes …" classifies AMBIGUOUS and is
-   tight), but the calibration firing reports the `decline/passivity` rate as
-   a **corpus-QA signal**, and the report header states that the corpus
-   measures the register the compose loop receives, not "Build a pipeline
-   that…" requests. *(Decision 7 remains the one most worth the user's
-   explicit confirmation.)*
+   `_compose_loop`. **Both surfaces run the same affordance kit** — the
+   byte-identical rendered skill (`self._composer_skill_text`,
+   `service.py:4287`), the same tool registry (the planner filters it to a
+   discovery subset) and the same authoring aids — so a kit defect can hit
+   either. The reason the standing corpus measures the loop is
+   **observability and taxonomy**, not kit: only the loop writes `role=tool`
+   rows, which every deviation class in §3 reads. Facts that fix the shape
+   of E (Decision 7 panel, verified): natural operator voice essentially
+   never reaches the planner (acceptance intents 1/24, harness scenarios
+   0/27, personas 0/4 classify EXPLICIT_MUTATION; only "Build a pipeline
+   that…" does, 10/10 parity fixtures); a semantically-null prefix (`"Hi. "`)
+   or a trailing `?` flips every such request back to the loop; the planner
+   persists a `planner_attempt_audit` row per model response with closed
+   vocabularies and is fully recoverable via `include_llm_audit=true`. **No
+   traffic-share figure is cited anywhere in this spec** — the only journal
+   sample was the telemetry's own acceptance run.
+   - **Standing corpus (§1):** operator voice; every prompt is run through
+     the classifier at authoring, at freeze, and **in CI** (a unit test
+     over `corpus.md`) and must not be EXPLICIT_MUTATION; the observed
+     surface is asserted per run from artifacts (§5).
+   - **Paired probe (§7, once, at calibration):** the 10
+     `evals/composer-parity` fixtures × 2 arms — as authored (→ planner) and
+     `"Hi. "`-prefixed (→ loop) — same `canonical_arguments` oracle, scored
+     on a shared information-class floor. It answers one question: *for a
+     fully-specified build request, does the surface change the outcome?*
+     Pre-registered reading: a null result closes the v2 planner-stratum
+     *scope* question, not the behavioural one; a material difference is
+     the measured case for building the stratum.
+   - **Tripwire (§7, standing):** 2–3 parity fixtures fired as authored
+     every round; binary pass/fail (a `PIPELINE_STAGED_*` message and a
+     staged payload topologically ≡ the fixture) plus health counts; **no
+     floor, no deviation taxonomy, never pooled with the loop rates**. A
+     regression check on the shared kit's planner path, not a measurement.
+   - Report header caveat: "the standing rates measure the compose loop on
+     operator-voice prompts; the planner is covered by the tripwire only."
 8. **Currency = tool-bearing provider calls** with `status == success`,
    counted from `llm_call_audit` rows (one per outbound model call).
    Three buckets per row: **tool-bearing** (`tools_spec_hash` non-null —
@@ -163,6 +189,8 @@ Added 2026-08-16:
 - **identity block** — the stamped substrate/kit/model facts a round is
   comparable under (§4); split into *binding* and *recorded* fields.
 - **kit defect** — the canonical term for an affordance-kit-caused deviation.
+- **probe / tripwire** — the one-shot paired planner experiment and the
+  standing binary planner regression check (§7); neither enters a rate.
 
 ## 1. Corpus
 
@@ -228,9 +256,11 @@ Numbering is kept so the strata table stays comparable when they return.
   derived floor legitimate. Where a stratum is defined by an option value
   (threshold, k), the prompt states it and the scenario carries an
   `option_assertions` entry for it.
-- **Surface gate (offline, at authoring time and again at freeze):**
+- **Surface gate (offline, at authoring time, at freeze, and in CI):**
   `classify_pipeline_mutation_intent(prompt)` must not return
-  `EXPLICIT_MUTATION` (Decision 7). The decision is recorded per case in
+  `EXPLICIT_MUTATION` (Decision 7); a unit test re-runs it over every
+  corpus prompt so a classifier-grammar edit fails the build instead of
+  silently re-routing a frozen case. The decision is recorded per case in
   `scenario.json` (`surface.classifier_decision`). Prompts that trip it are
   rephrased in operator voice — "Build a pipeline that reads…" is the
   phrasing to avoid. If the classifier changes after freeze and a frozen
@@ -436,8 +466,9 @@ nothing is not, and would need a capture change plus a new identity field.
 Flags: `--base` (default `https://elspeth.foundryside.dev`),
 `--round <name>` (e.g. `2026-08-20-baseline`), `--repeats` (default 5),
 `--cases a,b,c` (comma-separated case names; omit for all), `--resume`,
-`--cleanup`. Firing order is fixed: canary pre-flight (N=10), then
-round-robin by repeat index over the corpus (repeat 1 of every case, then
+`--cleanup`, `--probe` (runs the §7 paired probe; calibration only).
+Firing order is fixed: canary pre-flight (N=10), then the §7 tripwire
+(2–3 fixtures, once), then round-robin by repeat index over the corpus (repeat 1 of every case, then
 repeat 2, …) so mid-firing drift is not confounded with case index. Repeat
 index is recorded per run and the report bins by it, because provider
 prompt-cache state differs between repeat 1 and later repeats
@@ -600,6 +631,8 @@ over audit rows — recomputable from the bytes, never the driver clock.
   "round": "…", "corpus_version": 1, "identity": { "binding": {}, "recorded": {} },
   "caveats": ["compose-loop surface only", "operator-voice register only", "…"],
   "canary": { "n": 10, "non_optimal": 0, "flag": false },
+  "tripwire": [ { "fixture": "fork_coalesce", "pass": true, "staged_variant": "PIPELINE_STAGED_AUTO_COMMIT",
+                  "planner_calls": 4, "planner_codes": {} } ],
   "pooled": { "n": 95, "excluded": 3, "clean": 71, "optimal": 60, "hard": 12,
               "formula": "sum(successes)/sum(n)", "mde_pp": 10 },
   "by_repeat": [ { "repeat": 1, "n": 19, "clean": 14, "cached_prompt_tokens_median": 0 } ],
@@ -664,11 +697,16 @@ mutation-test-the-guard:
   advisor call path passes `tools=None`; that `composer_advisor_model` ≠
   `composer_model` (config validator); that PATCH-title precedes POST in the
   driver.
+- **Probe/tripwire honesty:** each arm's surface is asserted from
+  artifacts; both arms of a fixture must dry-run to their intended surface
+  offline before firing (classifier fingerprint); tripwire results render
+  in their own table and never enter a pooled rate; `undetermined` is a
+  flag, never a pass.
 - **Report honesty:** `--compare` refuses on binding mismatch and prints
   recorded deltas; `n`, exclusions and the formula render beside every rate;
   the per-case streak and 15 % exclusion flags render.
-- **Calibration firing before freeze:** canary at N=10, then one N=1 pass
-  across the 18 cases. Calibration runs are corpus QA, never measurement —
+- **Calibration firing before freeze:** canary at N=10, the tripwire, the
+  §7 paired probe (10 × 2, once), then one N=1 pass across the 18 cases. Calibration runs are corpus QA, never measurement —
   they enter no rate. Checks: surface observed = compose loop for every
   case; advisor rows are on the advisor model with null `tools_spec_hash`;
   first-call `messages_hash` stable across two runs of one case; floors
@@ -709,10 +747,57 @@ mutation-test-the-guard:
   candidate second source; confirm it is exposed on a read API before
   depending on it.
 
+## 7. Planner probe and tripwire
+
+Both use the parity fixtures verbatim (`evals/composer-parity/fixtures/*.json`
+`intent`, tracked) — the only tracked register that routes to the planner —
+and their `canonical_arguments` as the oracle, so no new authoring.
+
+**Paired probe (once, at calibration; enters no rate).** For each of the 10
+fixtures: arm P = `intent` verbatim (classifier: EXPLICIT_MUTATION → planner);
+arm L = `"Hi. " + intent` (→ compose loop). Both arms are asserted per run
+from artifacts (`planner_call_ordinal != null` ⇔ planner). Scored on a
+**shared information-class floor**: the set of `ComposerPlannerInformationClass`
+values the case's topology requires (e.g. `plugin.schema` per selected
+plugin, `catalog.selection`) must appear in the union of `new_information`
+(planner arm) or be implied by the discovery tool calls (`get_plugin_schema`
+⇒ `plugin.schema`; loop arm) before the accepting mutation; plus one
+accepted terminal (`outcome=accepted, led_to=done` / a `set_pipeline` with
+`is_valid`). Deviations on the planner arm map from the closed
+`ComposerPlannerCode` vocabulary (`DISCOVERY_NO_GAIN`/`DISCOVERY_CYCLE` ⇒
+kit-misled discovery; `REPAIR_BLIND_REPEAT`/`repeated_fingerprint` ⇒ error
+message not actionable; `*_EXHAUSTED` ⇒ budget; `MALFORMED_RESPONSE`/prose
+⇒ model). Output: a 10×2 table of clean/floor/deviations plus the
+`PIPELINE_STAGED_*` outcome, and a written reading against the
+pre-registered rule above. The probe is bound to a classifier fingerprint
+(the offline dry-run of both arms is a precondition; if the grammar changes,
+the pair silently unpairs).
+
+**Tripwire (standing, every round, before the corpus).** 2–3 fixtures
+(`fork_coalesce`, `error_routing`, one linear) fired as authored. Pass ⇔ a
+`PIPELINE_STAGED_*` assistant message appears **and** the staged candidate's
+topology ≡ the fixture's `expected_topology` under the §2 isomorphism rule.
+Recorded, not scored: `planner_call_ordinal` count, `planner_code`
+distribution, the `PIPELINE_STAGED_*` variant. `undetermined` surface is a
+flag, never a pass. Reported in its own table; never pooled with loop rates.
+
+**Prerequisites (both):** capture `GET …/proposals` and `/proposal-events`
+per run — under `explicit_approve` or a preflight-not-green outcome the
+staged candidate lands in a proposal row, not `state.json` — and pin the
+`battery_local` auto-commit preference so runs are comparable; paginate the
+messages fetch (§4 already does). **Deferred to v2 with the planner
+stratum:** the per-invocation discovery rows (`_kind:"audit"`) and the
+`planner_failure_disposition` row are filtered from every API view; the
+failure-disposition one is a one-line server predicate widening
+(`sessions/routes/_helpers.py:_is_composer_llm_audit_tool_message`) and is
+needed only for planner *failure* triage, which the tripwire reports as a
+count, not a class.
+
 ## Out of scope (v1)
 
 - Executing composed pipelines (compose+validate only).
-- The planner surface (v2 stratum with its own floor rules).
+- A scored planner *stratum* (v2, gated on the paired probe's result); v1
+  covers the planner by probe + tripwire only (§7).
 - Cases 13/14 until `set_pipeline` binds multiple blob-backed sources.
 - LLM-judge triage verdicts; auto-filing tracker issues.
 - Firing at the gov-domain production host.
@@ -745,3 +830,10 @@ outcome vocabulary; canary as N=10 pre-flight; per-repeat bins; pooling
 formula; tokens/cost null rule; `wall_ms` provenance; PATCH-before-POST
 contract; `--order` flag, `driver_version`, quarterly clause dropped;
 `report.json` schema; ownership; file-path corrections.
+
+**Rev 4 (2026-08-16)**, after the Decision 7 panel (7 seats): Decision 7 →
+E (loop corpus + one-shot paired probe + standing tripwire); rationale
+rewritten on observables — the planner runs the same kit; the contaminated
+traffic datum struck; classifier gate added to CI; §7 added with the
+shared information-class floor, prerequisites and v2 deferrals; success
+criteria gain the discrimination test.
