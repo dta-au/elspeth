@@ -1,0 +1,2977 @@
+# runtime-rejection parity baseline (elspeth-2ed41f0a4a)
+#
+# READ THIS BEFORE TRUSTING A GREEN GATE.
+#
+# One entry per constructed-exception raise site under the runtime
+# preflight roots (src/elspeth/core/dag/, src/elspeth/core/config.py).
+# Each entry adjudicates whether the composer's Stage-1 authoring
+# validator mirrors that runtime rejection. Identity is
+# (path, qualname, exception, message, ordinal) - no line numbers.
+#
+#   mirrored        Stage 1 rejects the same predicate; `counterpart` names
+#                   the Stage-1 error_code(s), verified to exist.
+#   abstains        Stage 1 checks a narrower predicate and deliberately
+#                   abstains on some topology; renders is_valid:true.
+#   structural      no composer-authored state can violate it.
+#   not_authorable  the composer cannot produce the rejected shape at all.
+#   unmirrored      authorable, Stage 1 silent - a KNOWN validate-green /
+#                   runtime-red gap. `note` names the ticket. Ratcheted.
+#   unadjudicated   seeded, never reviewed. THE GATE FAILS ON ANY.
+#
+# A passing gate means "every runtime rejection site has a reviewed
+# disposition and no unmirrored site was added" - NOT "Stage 1 mirrors
+# everything". Refresh with:
+#   .venv/bin/python scripts/cicd/runtime_rejection_parity.py --write
+# Never hand-edit a `key`.
+
+sites:
+- key: 3d4dabaae9897318
+  path: src/elspeth/core/config.py
+  qualname: AggregationSettings.validate_input
+  exception: ValueError
+  message: Aggregation input connection must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: 1cff053348ca1a04
+  path: src/elspeth/core/config.py
+  qualname: AggregationSettings.validate_name
+  exception: ValueError
+  message: 'Aggregation name ''{}'' is reserved. Reserved: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+  note: _composer_node_id_validation_message (state.py:168) returns the same reserved-label rejection;
+    probed "fork" as an aggregation id — Stage 1 red with node_id_invalid. Counterpart is WORKING-TREE-ONLY,
+    absent from HEAD — see header.
+- key: 0c34c21bc057bd87
+  path: src/elspeth/core/config.py
+  qualname: AggregationSettings.validate_name
+  exception: ValueError
+  message: Aggregation name '{}' starts with '__', which is reserved for system edges
+  ordinal: 0
+  disposition: structural
+  note: 'Unreachable defensive branch: _validate_node_name_chars (config.py:681, regex ^[a-zA-Z][a-zA-Z0-9_-]*$)
+    rejects every ''__''-prefixed name before line 685 is reached. Probed AggregationSettings(name="__a")
+    — the message is "contains invalid characters".'
+- key: 1d020a64cab0d8c9
+  path: src/elspeth/core/config.py
+  qualname: AggregationSettings.validate_name
+  exception: ValueError
+  message: Aggregation name must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+  note: state.py:157 emits "Aggregation name must not be empty" for an empty node id; probed. Counterpart
+    is WORKING-TREE-ONLY, absent from HEAD — see header.
+- key: e25b99c40322cf26
+  path: src/elspeth/core/config.py
+  qualname: AggregationSettings.validate_on_success
+  exception: ValueError
+  message: on_success must be a connection name, sink name, or omitted entirely
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: fd6d948566d50337
+  path: src/elspeth/core/config.py
+  qualname: AuditExportContentStoreSettings
+  exception: FieldConstraint
+  message: 'policy_version: max_length, min_length'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 6b0195153e650bd9
+  path: src/elspeth/core/config.py
+  qualname: AuditExportContentStoreSettings
+  exception: FieldConstraint
+  message: 'retention_days: gt, le'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: a5e831a2750c561c
+  path: src/elspeth/core/config.py
+  qualname: AuditExportContentStoreSettings.validate_root
+  exception: TypeError
+  message: content store root must be a filesystem path
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.export.content_store. _generate_pipeline_dict never emits a landscape section (yaml_generator.py:352-353);
+    the composer has no tool that can author it.
+- key: 20042b376b58e967
+  path: src/elspeth/core/config.py
+  qualname: AuditExportContentStoreSettings.validate_root
+  exception: ValueError
+  message: content store root must be a directory
+  ordinal: 0
+  disposition: not_authorable
+  note: Same landscape.export.content_store section the generator never emits (yaml_generator.py:352-353);
+    config.py:1431 is operator-settings territory.
+- key: 5330fdb8e0e7d5c7
+  path: src/elspeth/core/config.py
+  qualname: AuditExportContentStoreSettings.validate_root
+  exception: ValueError
+  message: content store root must be inside the code-owned .elspeth/audit-export-content-store root
+  ordinal: 0
+  disposition: not_authorable
+  note: Same landscape.export.content_store section the generator never emits (yaml_generator.py:352-353);
+    config.py:1428.
+- key: 517ce3391022c759
+  path: src/elspeth/core/config.py
+  qualname: AuditExportContentStoreSettings.validate_root
+  exception: ValueError
+  message: content store root must be private (no group/world permissions)
+  ordinal: 0
+  disposition: not_authorable
+  note: Same landscape.export.content_store section the generator never emits (yaml_generator.py:352-353);
+    config.py:1433 reads filesystem mode bits.
+- key: e87b4e142abcdd62
+  path: src/elspeth/core/config.py
+  qualname: CheckpointSettings
+  exception: FieldConstraint
+  message: 'checkpoint_interval: gt'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 0afaee0e7926919c
+  path: src/elspeth/core/config.py
+  qualname: CheckpointSettings.validate_interval
+  exception: ValueError
+  message: checkpoint_interval required when frequency='every_n'
+  ordinal: 0
+  disposition: not_authorable
+  note: '`checkpoint` is not one of the eight keys _generate_pipeline_dict emits (yaml_generator.py:197-354),
+    so frequency/checkpoint_interval always take model defaults.'
+- key: 7982e83920119504
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings
+  exception: FieldConstraint
+  message: 'branches: min_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_branches_invalid
+- key: dbae945780539dd1
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings
+  exception: FieldConstraint
+  message: 'quorum_count: gt'
+  ordinal: 0
+  disposition: not_authorable
+  note: NodeSpec carries no quorum_count; Stage 1 rejects policy=quorum outright (coalesce_policy_quorum_unsupported),
+    so the gt=0 bound is unreachable from the composer.
+- key: 877760fc7c2601e2
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings
+  exception: FieldConstraint
+  message: 'timeout_seconds: gt'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_timeout_invalid
+- key: 1d2e077de66d87ff
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.normalize_branches
+  exception: ValueError
+  message: 'Duplicate branch names in list: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: 5b6789c90e8ed003
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_branch_names
+  exception: ValueError
+  message: Coalesce branch '{}' input connection must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: a9c21968ab557b07
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_branch_names
+  exception: ValueError
+  message: 'Coalesce branch names collide after trimming whitespace: ''{}'' is declared twice'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: 6061dabdefde6a53
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_branch_names
+  exception: ValueError
+  message: Coalesce branch names must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: 694dd719dd2ab858
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_merge_requirements
+  exception: ValueError
+  message: 'Coalesce ''{}'': select merge strategy requires select_branch'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_merge_select_unsupported
+- key: 36fbeb1de8b70731
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_merge_requirements
+  exception: ValueError
+  message: 'Coalesce ''{}'': select_branch ''{}'' must be one of the expected branches: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: NodeSpec has no select_branch field (state.py:240-257) and _generate_pipeline_dict never emits
+    one (yaml_generator.py:324-338), so select_branch is always None and the membership guard at config.py:1103
+    cannot be entered from composer state.
+- key: d3cf4159ca0d7212
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_name
+  exception: ValueError
+  message: 'Coalesce name ''{}'' is reserved. Reserved: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+  note: 'Probed a coalesce id of "fork": Stage 1 red with node_id_invalid, same wording (state.py:168).
+    Counterpart is WORKING-TREE-ONLY, absent from HEAD — see header.'
+- key: 0e35dfbf4706dc4a
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_name
+  exception: ValueError
+  message: Coalesce name '{}' starts with '__', which is reserved for system edges
+  ordinal: 0
+  disposition: structural
+  note: 'Unreachable defensive branch: _validate_node_name_chars (config.py:1044) rejects ''__''-prefixed
+    names before config.py:1048. Probed CoalesceSettings(name="__c") — the message is "contains invalid
+    characters".'
+- key: 3a29cf7440fd734a
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_name
+  exception: ValueError
+  message: Coalesce name must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+  note: state.py:157 emits "Coalesce name must not be empty" for an empty coalesce node id. Counterpart
+    is WORKING-TREE-ONLY, absent from HEAD — see header.
+- key: 5e7f445954c3c703
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_on_success
+  exception: ValueError
+  message: on_success must be a sink name or omitted entirely
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_on_success_unknown_sink
+  note: 'Probed on_success="  ": Stage 1 red with coalesce_on_success_unknown_sink (state.py:1678); a
+    blank string can never be a declared sink name.'
+- key: cd9767b3385d2a86
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_policy_requirements
+  exception: ValueError
+  message: 'Coalesce ''{}'': best_effort policy requires timeout_seconds'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_best_effort_requires_timeout
+- key: c700d40d2910bfc4
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_policy_requirements
+  exception: ValueError
+  message: 'Coalesce ''{}'': quorum policy requires quorum_count'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_policy_quorum_unsupported
+- key: 8ad5391abc1aca47
+  path: src/elspeth/core/config.py
+  qualname: CoalesceSettings.validate_policy_requirements
+  exception: ValueError
+  message: 'Coalesce ''{}'': quorum_count ({}) cannot exceed number of branches ({})'
+  ordinal: 0
+  disposition: not_authorable
+  note: NodeSpec has no quorum_count field (state.py:240-257) and the generator never emits one (yaml_generator.py:324-338),
+    so quorum_count is always None and config.py:1079 is unreachable from composer state.
+- key: fab723472f44c429
+  path: src/elspeth/core/config.py
+  qualname: ConcurrencySettings
+  exception: FieldConstraint
+  message: 'max_workers: gt'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 0adc1e4c2ddee6a5
+  path: src/elspeth/core/config.py
+  qualname: DatabaseSettings
+  exception: FieldConstraint
+  message: 'pool_size: gt'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 2d35787e832832ec
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'aggregations: max_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_collection_cap_exceeded
+- key: c01fbcdf36a8b583
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'coalesce: max_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_collection_cap_exceeded
+- key: 3f91189acb041469
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'collection_probes: max_length'
+  ordinal: 0
+  disposition: not_authorable
+  note: Pipeline section the composer never emits (depends_on / commencement_gates / collection_probes);
+    Field constraint enumerated 2026-08-17.
+- key: 33d690fa7a6486f2
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'commencement_gates: max_length'
+  ordinal: 0
+  disposition: not_authorable
+  note: Pipeline section the composer never emits (depends_on / commencement_gates / collection_probes);
+    Field constraint enumerated 2026-08-17.
+- key: 5e3996c8ae46ae21
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'depends_on: max_length'
+  ordinal: 0
+  disposition: not_authorable
+  note: Pipeline section the composer never emits (depends_on / commencement_gates / collection_probes);
+    Field constraint enumerated 2026-08-17.
+- key: e10b3ab47bbdd009
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'gates: max_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_collection_cap_exceeded
+- key: b569d1a62f7a5963
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'queues: max_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_collection_cap_exceeded
+- key: f7d6cdc3ac9c4ba2
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'row_unions: max_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_collection_cap_exceeded
+- key: 9b424bb0895a6737
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'sinks: max_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_collection_cap_exceeded
+- key: dfac098820a74536
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'sources: max_length, min_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_collection_cap_exceeded
+  - no_source_configured
+- key: 8a69e4d0995d267a
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'transforms: max_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_collection_cap_exceeded
+- key: b1139d7fbc9c885b
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings._validate_default_llm_profile_alias
+  exception: ValueError
+  message: default_llm_profile must name a configured llm profile
+  ordinal: 0
+  disposition: not_authorable
+  note: '`default_llm_profile` and `llm_profiles` are absent from the eight keys _generate_pipeline_dict
+    emits (yaml_generator.py:197-354); the web surface resolves profiles through WebSettings, not through
+    authored YAML.'
+- key: 776463e24d99af80
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.reject_legacy_source_field
+  exception: ValueError
+  message: 'Configuration uses the deleted singular ''source:'' field. Per ADR-025 the source surface
+    is plural; rewrite as ''sources:\n <name>: { ... }'' (e.g. ''sources: { pri'
+  ordinal: 0
+  disposition: not_authorable
+  note: The generator emits the plural `sources` mapping unconditionally (yaml_generator.py:204-206) and
+    has no code path that writes a singular `source:` key, so config.py:2034 cannot fire.
+- key: 479c002a2fa26a75
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_export_sink_exists
+  exception: ValueError
+  message: 'landscape.export.sink ''{}'' not found in sinks. Available sinks: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: Guarded by landscape.export.enabled, and `landscape` is never emitted (yaml_generator.py:352-353)
+    so export.enabled always takes its False default (config.py:1442).
+- key: ca92d961ad9b28d9
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_export_sink_exists
+  exception: ValueError
+  message: landscape.export.sink is required when export is enabled
+  ordinal: 0
+  disposition: not_authorable
+  note: Same landscape.export.enabled guard (config.py:2045) that composer YAML can never turn on (yaml_generator.py:352-353).
+- key: 0f959991339a963c
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_globally_unique_node_names
+  exception: ValueError
+  message: Node name '{}' is used by both {} and {}. All node names must be unique across transforms,
+    gates, aggregations, coalesce nodes, row_union nodes, sources, queues
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_collides_with_source_or_sink
+  - queue_name_collision
+  - duplicate_node_id
+- key: e7d99b1fec819603
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_queue_names
+  exception: ValueError
+  message: 'Queue name ''{}'' is reserved. Reserved queue/edge labels: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+  note: 'Probed a queue node id of "fork": Stage 1 red with node_id_invalid (state.py:168 via 5142). Counterpart
+    is WORKING-TREE-ONLY, absent from HEAD — see header.'
+- key: 01cdf02033dfc059
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_queue_names
+  exception: ValueError
+  message: Queue name '{}' starts with '__', which is reserved for system edges
+  ordinal: 0
+  disposition: structural
+  note: 'Unreachable defensive branch: _validate_node_name_chars (config.py:2131) rejects ''__''-prefixed
+    queue names before config.py:2135, exactly as for the other node kinds.'
+- key: 444c3e4f463d9725
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_queue_names
+  exception: ValueError
+  message: 'Queue names must be lowercase. Found: {}. Suggested fixes: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+  note: 'Probed queue id "Qname": Stage 1 red with node_id_invalid — queue is in _LOWERCASE_ONLY_NODE_TYPES,
+    so state.py:159 emits the same lowercase rejection. Counterpart is WORKING-TREE-ONLY, absent from
+    HEAD — see header.'
+- key: 572e67af29227b56
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_replay_from
+  exception: ValueError
+  message: replay_from is required when run_mode is '{}'
+  ordinal: 0
+  disposition: not_authorable
+  note: '`run_mode` and `replay_from` are not emitted by _generate_pipeline_dict (yaml_generator.py:197-354),
+    so run_mode always takes the RunMode.LIVE default (config.py:1905) and config.py:2098 cannot be entered.'
+- key: f1ff2858eb09ec27
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_sinks_not_empty
+  exception: ValueError
+  message: At least one sink is required
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - no_sinks_configured
+  note: Stage 1 rejects a composition with no outputs at state.py:5045; the generator also omits the `sinks`
+    key entirely when outputs are empty (yaml_generator.py:341), so the runtime never sees an explicit
+    empty mapping.
+- key: 660340faa03eb1f5
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_sources_not_empty_and_named
+  exception: ValueError
+  message: At least one source is required
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - no_source_configured
+  note: Stage 1 rejects an empty sources mapping at state.py:5036.
+- key: de4b955c339bef84
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_sources_not_empty_and_named
+  exception: ValueError
+  message: 'Source name ''{}'' is reserved. Reserved source/edge labels: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fn:validate_composer_source_name
+  - source_name_invalid
+  note: 'Doubly mirrored: with_named_source (state.py:4841) hard-raises through validate_composer_source_name
+    (state.py:109/118) so the name never enters state at all, and validate() re-reports it as source_name_invalid
+    (state.py:5041).'
+- key: a3bf462e1078547d
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_sources_not_empty_and_named
+  exception: ValueError
+  message: Source name '{}' starts with '__', which is reserved for system edges
+  ordinal: 0
+  disposition: structural
+  note: 'Unreachable defensive branch: _validate_node_name_chars (config.py:2114) rejects ''__''-prefixed
+    source names before config.py:2118. Probed ElspethSettings with source "__s" — the message is "contains
+    invalid characters".'
+- key: c9eb4f6945a96ed9
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_sources_not_empty_and_named
+  exception: ValueError
+  message: 'Source names must be lowercase. Found: {}. Suggested fixes: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fn:validate_composer_source_name
+  - source_name_invalid
+  note: validate_composer_source_name raises on a non-lowercase name at state.py:114 before the source
+    can be stored, and validate() reports the same message as source_name_invalid.
+- key: 3001af948be2f7fd
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_unique_collection_probes
+  exception: ValueError
+  message: 'duplicate collection_probes for collection(s): {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: '`collection_probes` is not among the keys _generate_pipeline_dict emits (yaml_generator.py:197-354);
+    it always takes its empty default (config.py:1943).'
+- key: f4d7ce369e768fa2
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.validate_unique_dependencies
+  exception: ValueError
+  message: 'duplicate depends_on dependency name(s): {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: '`depends_on` is not among the keys _generate_pipeline_dict emits (yaml_generator.py:197-354);
+    it always takes its empty default (config.py:1929).'
+- key: dc28e4fcc7cbb6c1
+  path: src/elspeth/core/config.py
+  qualname: ExporterSettings.validate_name_not_empty
+  exception: ValueError
+  message: exporter name cannot be empty
+  ordinal: 0
+  disposition: not_authorable
+  note: telemetry.exporters is never emitted by _generate_pipeline_dict (yaml_generator.py:197-354), so
+    no ExporterSettings is ever constructed from composer YAML.
+- key: ca4138950a9ab100
+  path: src/elspeth/core/config.py
+  qualname: GateSettings
+  exception: FieldConstraint
+  message: 'fork_to: max_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_collection_cap_exceeded
+- key: ebc5f889ca37d8d6
+  path: src/elspeth/core/config.py
+  qualname: GateSettings
+  exception: FieldConstraint
+  message: 'routes: max_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_collection_cap_exceeded
+- key: e7e2835d6b561a51
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_boolean_routes
+  exception: ValueError
+  message: <call:join>
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_route_labels_mismatch
+  note: _validate_gate_route_parity (state.py:1997-2009) is a deliberate line-for-line copy of config.py:892-905,
+    reported as gate_route_labels_mismatch (state.py:5212). Probed.
+- key: 96b87d0fa58836c2
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_boolean_routes
+  exception: ValueError
+  message: Gate '{}' condition ({}) statically returns a numeric value, which can never be a route label.
+    Gate conditions must evaluate to a boolean (routes "true"/"false"
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_route_labels_mismatch
+  note: Same helper's elif branch (state.py:2010-2015) mirrors config.py:906-914 with the same boolean/non-routable
+    precedence; probed condition "1 + 1" — Stage 1 red.
+- key: c63884966dd39929
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_condition_expression
+  exception: ValueError
+  message: 'Forbidden construct in condition: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_condition_invalid
+  note: _validate_gate_expression (state.py:1726-1731) builds the same ExpressionParser and catches ExpressionSecurityError;
+    probed "__import__('os')" — Stage 1 red.
+- key: 3659a7243f286576
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_condition_expression
+  exception: ValueError
+  message: 'Invalid condition syntax: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_condition_invalid
+  note: Same helper's ExpressionSyntaxError arm (state.py:1728); probed condition "row[" — Stage 1 red
+    with the identical parser diagnostic.
+- key: d8e6e1bd7a570a7a
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_fork_consistency
+  exception: ValueError
+  message: fork_to is only valid when a route destination is 'fork'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_fork_to_without_fork_route
+  note: state.py:5245 mirrors config.py:871-872 exactly.
+- key: 2bb7cf07a79bf012
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_fork_consistency
+  exception: ValueError
+  message: fork_to is required when any route destination is 'fork'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_fork_route_without_fork_to
+  note: state.py:5235 mirrors config.py:869-870 exactly.
+- key: 7d0cbcc82a40e6d5
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_fork_to_labels
+  exception: ValueError
+  message: Fork branch names must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: e72be2c7d4c28204
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_fork_to_labels
+  exception: ValueError
+  message: fork_to must not be an empty list; omit it (or use null) for no fork
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_fork_to_empty
+- key: 3c91e75abe7cb36d
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_input
+  exception: ValueError
+  message: Gate input connection must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: 295234cb4e9e5bd2
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_name
+  exception: ValueError
+  message: 'Gate name ''{}'' is reserved. Reserved: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+  note: _composer_node_id_validation_message (state.py:168) applies the same _RESERVED_EDGE_LABELS set
+    to every composer node type, gates included. Counterpart is WORKING-TREE-ONLY, absent from HEAD —
+    see header.
+- key: f1374ceee3d633ed
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_name
+  exception: ValueError
+  message: Gate name '{}' starts with '__', which is reserved for system edges
+  ordinal: 0
+  disposition: structural
+  note: 'Unreachable defensive branch: _validate_node_name_chars (config.py:762) rejects ''__''-prefixed
+    names before config.py:766. Probed GateSettings(name="__g") — the message is "contains invalid characters".'
+- key: 094c1d8f68c442da
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_name
+  exception: ValueError
+  message: Gate name must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+  note: state.py:157 emits "Gate name must not be empty" for an empty gate node id. Counterpart is WORKING-TREE-ONLY,
+    absent from HEAD — see header.
+- key: 7e5386771717fe80
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_on_error
+  exception: ValueError
+  message: on_error must be a sink name, 'discard', or omitted
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_on_error_unknown_sink
+  note: 'Probed on_error="  ": Stage 1 red with gate_on_error_unknown_sink (state.py:1593). The tool layer
+    additionally pins min_length=1 on the argument (transforms.py:82).'
+- key: 10328c324c64bd13
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_routes
+  exception: ValueError
+  message: Route destination 'continue' has been removed. Use an explicit connection name or sink name.
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_route_target_unknown
+  note: 'Probed routes {"true": "continue"}: Stage 1 red at state.py:1608 — "continue" is neither a sink
+    nor a consumed connection, and _FORK/_DISCARD are the only reserved targets it skips.'
+- key: 731b206149ee3a62
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_routes
+  exception: ValueError
+  message: Route labels must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: daf86657112a1757
+  path: src/elspeth/core/config.py
+  qualname: GateSettings.validate_routes
+  exception: ValueError
+  message: routes must have at least one entry
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_routes_empty
+  note: state.py:5222 explicitly mirrors config.py:810-811; probed routes {} — Stage 1 red.
+- key: 49db5a3ac2aa7a92
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings
+  exception: FieldConstraint
+  message: 'chunk_limit: gt, le'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 1840f70e22814747
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings
+  exception: FieldConstraint
+  message: 'chunking_algorithm_version: max_length, min_length'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: e239a11a9100383f
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings
+  exception: FieldConstraint
+  message: 'exporter_version: max_length, min_length'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: fb75d2375641e5b9
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings
+  exception: FieldConstraint
+  message: 'per_chunk_byte_limit: gt, le'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 30dec47167b1fb3a
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings
+  exception: FieldConstraint
+  message: 'per_chunk_record_limit: gt, le'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 17b07fe907f320f0
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings
+  exception: FieldConstraint
+  message: 'serialization_version: max_length, min_length'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: ae0a7a000212b150
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings
+  exception: FieldConstraint
+  message: 'total_byte_limit: gt, le'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 21b42eed993dce0a
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings
+  exception: FieldConstraint
+  message: 'total_record_limit: gt, le'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 932875a117751f9f
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.assert_signer_rotation_allowed
+  exception: ValueError
+  message: single_export rotation policy refuses a different signer_key_id
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.export signer rotation; `landscape` is never emitted by the generator (yaml_generator.py:352-353)
+    and this method is called by the export runner, not by composer preflight.
+- key: 0b7cbecb0b1758cb
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.public_snapshot_config
+  exception: ValueError
+  message: audit export chunk limits are not configured
+  ordinal: 0
+  disposition: not_authorable
+  note: Reached only from the audit-export snapshot path over a landscape.export section the composer
+    never emits (yaml_generator.py:352-353).
+- key: 4d555848b9c24105
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_signing_secret_ref
+  exception: ValueError
+  message: signing_secret_ref must be an exact environment secret reference name
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.export.signing_secret_ref; not among the eight emitted keys (yaml_generator.py:197-354),
+    so it always takes its None default (config.py:1447).
+- key: 07de050605a4f315
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: 'enabled audit export requires explicit fields: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: Guarded by landscape.export.enabled, which composer YAML can never set (yaml_generator.py:352-353);
+    config.py:1514-1517.
+- key: 207f94c6dab3a2ee
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: hmac_sha256 signer_key_id cannot use the reserved UNSIGNED identity
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.export.signing_mode is never emitted (yaml_generator.py:352-353) so it holds its "unsigned"
+    default and config.py:1501 is unreachable.
+- key: 66da2917e8f4b95e
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: hmac_sha256 signing requires a signing secret reference
+  ordinal: 0
+  disposition: not_authorable
+  note: Same unauthorable landscape.export.signing_mode branch (config.py:1503).
+- key: 3d1c38ceb57e0a12
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: per_chunk_byte_limit cannot exceed total_byte_limit
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.export chunk limits are never emitted (yaml_generator.py:352-353); all five stay None
+    so the all-configured branch at config.py:1518 is never entered.
+- key: fab3e314ed7b1e13
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: per_chunk_record_limit cannot exceed total_record_limit
+  ordinal: 0
+  disposition: not_authorable
+  note: Same unauthorable landscape.export chunk-limit block (config.py:1525).
+- key: ed7bd2467de526d2
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: total_byte_limit exceeds configured chunk byte capacity
+  ordinal: 0
+  disposition: not_authorable
+  note: Same unauthorable landscape.export chunk-limit block (config.py:1530).
+- key: c7de11c92ebe0f73
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: total_byte_limit must allow at least one byte per accepted record
+  ordinal: 0
+  disposition: not_authorable
+  note: Same unauthorable landscape.export chunk-limit block (config.py:1533).
+- key: d9e65a0d551baca0
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: total_record_limit exceeds configured chunk record capacity
+  ordinal: 0
+  disposition: not_authorable
+  note: Same unauthorable landscape.export chunk-limit block (config.py:1529).
+- key: d4f541a4e24a58b5
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: unsigned signing forbids signing secret resolution
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.export.signing_secret_ref is never emitted (yaml_generator.py:352-353) so it stays None
+    and config.py:1498 cannot fire.
+- key: b97cfd26db0efcfa
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: unsigned signing requires the typed UNSIGNED signer identity
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.export.signer_key_id is never emitted (yaml_generator.py:352-353) so it holds its "UNSIGNED"
+    default and config.py:1496 cannot fire.
+- key: 388adb21f4b4d55e
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_spool_root
+  exception: TypeError
+  message: spool_root must be a filesystem path
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.export.spool_root; never emitted (yaml_generator.py:352-353), always None, and config.py:1478
+    returns early on None.
+- key: 8ce61b4bbdf2f153
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_spool_root
+  exception: ValueError
+  message: spool_root must be a directory
+  ordinal: 0
+  disposition: not_authorable
+  note: Same unauthorable landscape.export.spool_root field (config.py:1487).
+- key: 2f004302dcd51d36
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_spool_root
+  exception: ValueError
+  message: spool_root must be inside the code-owned private .elspeth/audit-export-spool root
+  ordinal: 0
+  disposition: not_authorable
+  note: Same unauthorable landscape.export.spool_root field (config.py:1484).
+- key: 2d954902103a9b7e
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_spool_root
+  exception: ValueError
+  message: spool_root must be private (no group/world permissions)
+  ordinal: 0
+  disposition: not_authorable
+  note: Same unauthorable landscape.export.spool_root field (config.py:1489).
+- key: e1b25ab0a3e7ee63
+  path: src/elspeth/core/config.py
+  qualname: LandscapeSettings._reject_disabled
+  exception: ValueError
+  message: landscape.enabled=false is not supported — the audit trail is mandatory. Disabling Landscape
+    recording would violate the auditability standard.
+  ordinal: 0
+  disposition: not_authorable
+  note: '`landscape` is deliberately omitted from generated YAML (yaml_generator.py:352-353), so landscape.enabled
+    always takes its True default and config.py:1573 cannot fire.'
+- key: ad6f8c28d5e4a6bc
+  path: src/elspeth/core/config.py
+  qualname: LandscapeSettings.validate_backend_url_consistency
+  exception: ValueError
+  message: backend={} requires URL scheme {}, got {} from url={}
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.backend/url are operator-owned and never emitted by the generator (yaml_generator.py:352-353);
+    the web runtime supplies the URL at execution time.
+- key: a970a9cb8a3b11c7
+  path: src/elspeth/core/config.py
+  qualname: PayloadStoreSettings
+  exception: FieldConstraint
+  message: 'retention_days: gt'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 4831a8e6ac294be8
+  path: src/elspeth/core/config.py
+  qualname: RateLimitSettings
+  exception: FieldConstraint
+  message: 'default_requests_per_minute: gt'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 6eaf529021777bd4
+  path: src/elspeth/core/config.py
+  qualname: RetrySettings
+  exception: FieldConstraint
+  message: 'exponential_base: gt'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 83188afd176b9132
+  path: src/elspeth/core/config.py
+  qualname: RetrySettings
+  exception: FieldConstraint
+  message: 'initial_delay_seconds: ge'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 38082cd7b36be3e1
+  path: src/elspeth/core/config.py
+  qualname: RetrySettings
+  exception: FieldConstraint
+  message: 'max_attempts: gt'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 02b3ceed7ddbc5b2
+  path: src/elspeth/core/config.py
+  qualname: RetrySettings
+  exception: FieldConstraint
+  message: 'max_delay_seconds: ge'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: cf54c12ab63bc4eb
+  path: src/elspeth/core/config.py
+  qualname: RowUnionSettings
+  exception: FieldConstraint
+  message: 'branches: min_length'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_branches_invalid
+- key: abf4ab16dbee030d
+  path: src/elspeth/core/config.py
+  qualname: RowUnionSettings
+  exception: FieldConstraint
+  message: 'timeout_seconds: gt'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_timeout_invalid
+- key: 3da999689b1fc301
+  path: src/elspeth/core/config.py
+  qualname: RowUnionSettings.normalize_branches
+  exception: ValueError
+  message: 'Duplicate branch names in list: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_branches_invalid
+- key: 814bf0a5084ef1b3
+  path: src/elspeth/core/config.py
+  qualname: RowUnionSettings.validate_branch_names
+  exception: ValueError
+  message: row_union branch '{}' input connection must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_branch_invalid
+- key: 5705ea0354b833cd
+  path: src/elspeth/core/config.py
+  qualname: RowUnionSettings.validate_branch_names
+  exception: ValueError
+  message: 'row_union branch names collide after trimming whitespace: ''{}'' is declared twice'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_branch_invalid
+  note: 'Same code, adjacent predicate, but total coverage: a whitespace-trim collision (config.py:1264)
+    requires a branch key with surrounding whitespace, and Stage 1 applies _validate_connection_or_sink_name
+    to the UNTRIMMED key (state.py ~5410), whose regex forbids whitespace. Probed branches {"x": "cx",
+    " x ": "cy"} -> Stage 1 red with row_union_branch_invalid ("branch name '' x '' contains invalid characters");
+    no input can reach config.py:1264 with Stage 1 green.'
+- key: 1b3f9eb54de781f1
+  path: src/elspeth/core/config.py
+  qualname: RowUnionSettings.validate_branch_names
+  exception: ValueError
+  message: row_union branch names must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_branch_invalid
+- key: 81e46f437b43b01f
+  path: src/elspeth/core/config.py
+  qualname: RowUnionSettings.validate_name
+  exception: ValueError
+  message: 'row_union name ''{}'' is reserved. Reserved: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_name_invalid
+- key: d3a3f2be92fc89a8
+  path: src/elspeth/core/config.py
+  qualname: RowUnionSettings.validate_name
+  exception: ValueError
+  message: row_union name '{}' starts with '__', which is reserved for system edges
+  ordinal: 0
+  disposition: structural
+  note: 'Dead raise. RowUnionSettings.validate_name calls _validate_node_name_chars (config.py:1239) BEFORE
+    this `__` check (config.py:1242); _VALID_NODE_NAME_RE (config.py:188) requires a leading letter, so
+    any `__`-prefixed name is already rejected by the char rule and can never reach line 1243. Probed:
+    row_union id "__ru" yields "contains invalid characters", not the `__` message, at both stages (Stage
+    1 code row_union_name_invalid, state.py:5380).'
+- key: 54881416e326cfcc
+  path: src/elspeth/core/config.py
+  qualname: RowUnionSettings.validate_name
+  exception: ValueError
+  message: row_union name must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_name_invalid
+- key: 5da66f26d521b985
+  path: src/elspeth/core/config.py
+  qualname: RowUnionSettings.validate_on_success
+  exception: ValueError
+  message: row_union on_success must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_on_success_invalid
+- key: b3ed458a9973fd76
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_keyvault_requirements
+  exception: ValueError
+  message: mapping is required when source is 'keyvault' (cannot be empty)
+  ordinal: 0
+  disposition: not_authorable
+  note: '`secrets:` is not in the composer emit-set (yaml_generator.py:197-354) and not a recognised import
+    section (yaml_importer.py:44-47); SecretsConfig (config.py:303) is only constructed from ElspethSettings.secrets,
+    so the keyvault mapping requirement (config.py:449) is unreachable from composer state.'
+- key: 69befa4ab9101d24
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_keyvault_requirements
+  exception: ValueError
+  message: vault_url is required when source is 'keyvault'
+  ordinal: 0
+  disposition: not_authorable
+  note: 'Same reason as the sibling SecretsConfig sites: no `secrets:` section is emitted or importable
+    (yaml_generator.py:197-354, yaml_importer.py:44-47), so the vault_url requirement at config.py:447
+    cannot be reached from the composer.'
+- key: 1f71c713042cb511
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_mapping_env_var_names
+  exception: ValueError
+  message: secrets mapping key {} is not a valid environment variable name (must match [A-Za-z_][A-Za-z0-9_]*)
+  ordinal: 0
+  disposition: not_authorable
+  note: secrets.mapping (config.py:424-440) has no composer-authored carrier; the emit-set has no `secrets:`
+    key (yaml_generator.py:197-354).
+- key: 1c144342ea73619d
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: 'Invalid URL: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: vault_url validation (config.py:347) applies to SecretsConfig.vault_url only; ordinal 0 is the
+    urlparse-raised branch at config.py:384. No `secrets:` section is authorable (yaml_generator.py:197-354).
+- key: f05b2eafa8c49a61
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: 'Invalid URL: {}'
+  ordinal: 1
+  disposition: not_authorable
+  note: 'Ordinal 1 of the same message skeleton — the missing-scheme/netloc branch at config.py:387 (distinct
+    from ordinal 0 at config.py:384). Same reason: no `secrets:` section in the composer emit-set (yaml_generator.py:197-354).'
+- key: c7e7de1437ae5c13
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: vault_url cannot contain ${VAR} references. Use a literal URL like 'https://my-vault.vault.azure.net'.
+    Environment variables are resolved AFTER secrets are load
+  ordinal: 0
+  disposition: not_authorable
+  note: config.py:374 rejects ${VAR} inside secrets.vault_url; the composer emits no `secrets:` section
+    (yaml_generator.py:197-354).
+- key: 8a6d0bcea1445ce5
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: 'vault_url has an invalid port: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: config.py:403 (parsed.port raising ValueError) is on the SecretsConfig.vault_url path only, which
+    the composer never emits (yaml_generator.py:197-354).
+- key: 11de5cd93b4b70f7
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: vault_url host {} is not an approved Azure Key Vault endpoint (must end with one of {}).
+  ordinal: 0
+  disposition: not_authorable
+  note: The approved-Key-Vault-suffix floor (config.py:413-417, elspeth-7572facbc6) guards secrets.vault_url;
+    no `secrets:` section is composer-authorable (yaml_generator.py:197-354).
+- key: 04917561e8374ce3
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: 'vault_url must not contain a fragment, got: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: config.py:411 (fragment) is a SecretsConfig.vault_url component check; the composer emits no `secrets:`
+    section (yaml_generator.py:197-354).
+- key: 47437a2b00ae3408
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: 'vault_url must not contain a path, got: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: config.py:407 (path) is a SecretsConfig.vault_url component check; the composer emits no `secrets:`
+    section (yaml_generator.py:197-354).
+- key: a9afdecc567dba9a
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: 'vault_url must not contain a query string, got: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: config.py:409 (query string) is a SecretsConfig.vault_url component check; the composer emits
+    no `secrets:` section (yaml_generator.py:197-354).
+- key: f1566d1b462bb116
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: vault_url must not contain control characters
+  ordinal: 0
+  disposition: not_authorable
+  note: config.py:370 (control characters) guards SecretsConfig.vault_url only; the composer emits no
+    `secrets:` section (yaml_generator.py:197-354).
+- key: 63a13b8be12bfc17
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: 'vault_url must not contain userinfo (user:pass@), got: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: config.py:399 (userinfo) is a SecretsConfig.vault_url SSRF check; the composer emits no `secrets:`
+    section (yaml_generator.py:197-354).
+- key: d8a606f909bde5b5
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: vault_url must not specify a non-standard port, got port {}
+  ordinal: 0
+  disposition: not_authorable
+  note: config.py:405 (non-standard port) is a SecretsConfig.vault_url check; the composer emits no `secrets:`
+    section (yaml_generator.py:197-354).
+- key: 9771de992ef6b3fe
+  path: src/elspeth/core/config.py
+  qualname: SecretsConfig.validate_vault_url_format
+  exception: ValueError
+  message: 'vault_url must use HTTPS protocol, got: {}://'
+  ordinal: 0
+  disposition: not_authorable
+  note: config.py:391 (HTTPS required) guards SecretsConfig.vault_url; the composer emits no `secrets:`
+    section (yaml_generator.py:197-354).
+- key: 19130bc267504464
+  path: src/elspeth/core/config.py
+  qualname: ServiceRateLimit
+  exception: FieldConstraint
+  message: 'requests_per_minute: gt'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 325f8a5168c8bd42
+  path: src/elspeth/core/config.py
+  qualname: SinkSettings.validate_on_write_failure
+  exception: ValueError
+  message: on_write_failure must be a sink name or 'discard'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: 0dd9eca0c0c25e4f
+  path: src/elspeth/core/config.py
+  qualname: SourceSettings.validate_on_success
+  exception: ValueError
+  message: Source on_success must be a connection name or sink name
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: 833d16202507b9fd
+  path: src/elspeth/core/config.py
+  qualname: TelemetrySettings
+  exception: FieldConstraint
+  message: 'max_consecutive_failures: gt'
+  ordinal: 0
+  disposition: not_authorable
+  note: Operational settings section (landscape/export/retry/rate-limit/telemetry/db/checkpoint/payload-store)
+    the composer never emits; Field constraint enumerated 2026-08-17.
+- key: 60b4588ad375c9e4
+  path: src/elspeth/core/config.py
+  qualname: TransformSettings.validate_input
+  exception: ValueError
+  message: Transform input connection must not be empty
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+- key: 46ecc72f7edf1194
+  path: src/elspeth/core/config.py
+  qualname: TransformSettings.validate_on_error
+  exception: ValueError
+  message: on_error must be a sink name or 'discard'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - transform_missing_on_error
+- key: 6b8d315a32f5b471
+  path: src/elspeth/core/config.py
+  qualname: TransformSettings.validate_on_success
+  exception: ValueError
+  message: on_success must be a connection name or sink name
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - transform_missing_on_success
+- key: bc17cb87d7f0246a
+  path: src/elspeth/core/config.py
+  qualname: TriggerConfig
+  exception: FieldConstraint
+  message: 'count: gt'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_trigger_invalid
+- key: 9eddf838a82bae70
+  path: src/elspeth/core/config.py
+  qualname: TriggerConfig
+  exception: FieldConstraint
+  message: 'timeout_seconds: gt'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_trigger_invalid
+- key: 48e42f54cde157bb
+  path: src/elspeth/core/config.py
+  qualname: TriggerConfig.validate_condition_expression
+  exception: ValueError
+  message: 'Forbidden construct in condition: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_trigger_invalid
+- key: c5ab21f28f23be7a
+  path: src/elspeth/core/config.py
+  qualname: TriggerConfig.validate_condition_expression
+  exception: ValueError
+  message: 'Invalid condition syntax: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_trigger_invalid
+- key: 564a7d7ac0bb000f
+  path: src/elspeth/core/config.py
+  qualname: TriggerConfig.validate_condition_expression
+  exception: ValueError
+  message: 'Trigger condition must be a boolean expression that returns True/False. Got: {} which returns
+    a non-boolean value. Use comparisons (>=, ==, etc.) or boolean ope'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_trigger_invalid
+- key: 928db69c1a1b8e4c
+  path: src/elspeth/core/config.py
+  qualname: TriggerConfig.validate_condition_expression
+  exception: ValueError
+  message: 'Trigger condition references unsupported row keys: {}. Allowed keys: row[''batch_count''],
+    row[''batch_age_seconds''].'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_trigger_invalid
+- key: e062e001eb56cabf
+  path: src/elspeth/core/config.py
+  qualname: TriggerConfig.validate_condition_expression
+  exception: ValueError
+  message: 'Trigger condition row keys must be string literals. Allowed keys: row[''batch_count''], row[''batch_age_seconds''].'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_trigger_invalid
+- key: 28eda14355b6f21f
+  path: src/elspeth/core/config.py
+  qualname: TriggerConfig.validate_condition_expression
+  exception: ValueError
+  message: 'Trigger condition row.get() keys must be string literals. Allowed keys: row[''batch_count''],
+    row[''batch_age_seconds''].'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_trigger_invalid
+- key: 24cc364d4c88276f
+  path: src/elspeth/core/config.py
+  qualname: TriggerConfig.validate_condition_expression
+  exception: ValueError
+  message: 'end_of_source is not a trigger.condition expression. End-of-source flush is implicit; omit
+    trigger or use trigger: {} for end-of-source-only aggregation.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_trigger_invalid
+- key: f960bf9a77d1ddde
+  path: src/elspeth/core/config.py
+  qualname: _BoundedInMemoryYamlLoader.compose_node
+  exception: ComposerError
+  message: <Constant>
+  ordinal: 0
+  disposition: structural
+  note: 'Alias/anchor rejection (config.py:138). The YAML this loader sees on the composer path is produced
+    by yaml.dump over the freshly built per-entry dicts of _generate_pipeline_dict (yaml_generator.py:197-354,
+    dumped at :616); an anchor requires the same object to appear twice, which JSON-parsed tool arguments
+    cannot produce. Probed every shape in this census including deeply nested and 200KB options: ''&id''
+    never appears in the dump. The independent import path has its own alias rejection before construction
+    (yaml_importer.py:54 _reject_yaml_aliases) and never reaches this loader.'
+- key: fed5dfd4df9aa9ad
+  path: src/elspeth/core/config.py
+  qualname: _BoundedInMemoryYamlLoader.compose_node
+  exception: ComposerError
+  message: <Constant>
+  ordinal: 1
+  disposition: unmirrored
+  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). MAX_IN_MEMORY_PIPELINE_YAML_NODES=10_000
+    (config.py:122, raise at :147). Reachable from composer state through a large plugin-options collection:
+    a value_transform with 4000 `operations` entries dumps to ~204KB and >10k YAML nodes. Probed: Stage
+    1 is_valid=True, load_settings_from_yaml_string raises "YAML parse failed: ComposerError". Stage 1
+    bounds no options-collection size. elspeth-2ed41f0a4a census 2026-08-17.'
+- key: 6d42f345f9e1db14
+  path: src/elspeth/core/config.py
+  qualname: _BoundedInMemoryYamlLoader.compose_node
+  exception: ComposerError
+  message: <Constant>
+  ordinal: 2
+  disposition: unmirrored
+  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). MAX_IN_MEMORY_PIPELINE_YAML_DEPTH=64
+    (config.py:123, raise at :157). Reachable: an 80-deep nested mapping inside a transform''s options.
+    Probed: Stage 1 is_valid=True, Stage 2 (validate_pipeline_for_trained_operator) raises ValueError
+    "YAML parse failed: ComposerError". Stage 1 bounds no options nesting depth. elspeth-2ed41f0a4a census
+    2026-08-17.'
+- key: 3df12e6a684506f7
+  path: src/elspeth/core/config.py
+  qualname: _expand_env_vars._expand_string.replacer
+  exception: ValueError
+  message: Required environment variable '{}' is not set. Either set the variable or use ${{var_name}:-default}
+    syntax for optional values.
+  ordinal: 0
+  disposition: structural
+  note: 'The raise (config.py:2231) lives inside _expand_env_vars, which runs only under `if expand_env_vars:`
+    (config.py:2977-2978). Fact (B): the web preflight passes expand_env_vars=False at both load sites
+    (web/execution/service.py:2195, :2197), so this pass never executes on a composer-authored pipeline
+    and no authored value can reach the raise.'
+- key: 3d550488bb691295
+  path: src/elspeth/core/config.py
+  qualname: _fingerprint_secrets._process_value
+  exception: SecretFingerprintError
+  message: Secret field '{}' found but ELSPETH_FINGERPRINT_KEY is not set. Either set the environment
+    variable or use ELSPETH_ALLOW_RAW_SECRETS=true for development (not r
+  ordinal: 0
+  disposition: structural
+  note: 'The raise (config.py:2502) sits inside the `elif fail_if_no_key:` branch (config.py:2501), so
+    it is conditioned on the SERVER environment, not on authored shape — it fires only when ELSPETH_FINGERPRINT_KEY
+    is unset and ELSPETH_ALLOW_RAW_SECRETS is not "true" (config.py:2484-2488, 2749). Probed: in a keyless
+    env an authored `api_key` option does reach it (Stage 1 green, resolve_config raises); with the key
+    set the same state is clean. No authoring-side check can observe the server''s env, so this is a deployment
+    invariant rather than a validate-green/runtime-red authoring gap. The nested collision raise in the
+    same function (f313f94b65fcc84b) is filed unmirrored precisely because it is OUTSIDE this guard.'
+- key: f313f94b65fcc84b
+  path: src/elspeth/core/config.py
+  qualname: _fingerprint_secrets._recurse
+  exception: SecretFingerprintError
+  message: Config contains both '{}' and '{}'. The '{}' field is auto-generated from '{}' during fingerprinting
+    — remove '{}' from your configuration.
+  ordinal: 0
+  disposition: unmirrored
+  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). The X / X_fingerprint collision raise
+    (config.py:2522). extra="forbid" stops the TOP-LEVEL carrier (probed: options.api_key + options.api_key_fingerprint
+    on a value_transform fails at "Extra inputs are not permitted"), but _fingerprint_secrets recurses
+    into nested dicts (config.py:2492-2493) and the llm transform declares a free-form `lookup: dict[str,
+    Any]` (plugins/transforms/llm/base.py:93 — the "arbitrary plugin payloads" the yaml_generator docstring
+    names). Probed: LLMConfig ACCEPTS lookup={"api_key": ..., "api_key_fingerprint": ...}, and _fingerprint_secrets
+    on that shape raises the collision even with ELSPETH_FINGERPRINT_KEY SET, so unlike its sibling 3d550488bb691295
+    this raise is not env-conditioned. Stage 1 does not inspect nested option payloads for secret-field
+    shape. elspeth-2ed41f0a4a census 2026-08-17.'
+- key: a5738f59b5792ee8
+  path: src/elspeth/core/config.py
+  qualname: _lower_llm_profile_nodes
+  exception: ValueError
+  message: default_llm_profile {} does not name a configured llm_profiles entry
+  ordinal: 0
+  disposition: not_authorable
+  note: 'Reads raw_config["default_llm_profile"] (config.py:2337-2339). Fact (A): that top-level key is
+    not in the composer emit-set (yaml_generator.py:197-354) and is not a recognised import section (yaml_importer.py:44-47).'
+- key: 4f606960c6bbaec5
+  path: src/elspeth/core/config.py
+  qualname: _lower_llm_profile_nodes
+  exception: ValueError
+  message: llm_profiles[{}] must be a mapping
+  ordinal: 0
+  disposition: not_authorable
+  note: 'Reads raw_config["llm_profiles"] (config.py:2331-2334). Fact (A): the composer never emits an
+    `llm_profiles:` section (yaml_generator.py:197-354).'
+- key: 5a44d3a8444df94f
+  path: src/elspeth/core/config.py
+  qualname: _lower_llm_profile_nodes.lower_component
+  exception: ValueError
+  message: '{} llm component ''profile'' option must be a string alias'
+  ordinal: 0
+  disposition: unmirrored
+  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). config.py:2355 — a non-string `profile`
+    option on an llm component. `profile` survives composer authoring into the loader whenever the plugin-policy
+    stage finds no profile context (web/plugin_policy/validation.py:744-745 returns None when profile_registry
+    is None or the plugin has no usable aliases), and _strip_web_metadata does not remove it. Probed:
+    llm transform with options.profile=123 -> Stage 1 is_valid=True; load_settings_from_config_dict on
+    the generated pipeline dict raises exactly this message. elspeth-2ed41f0a4a census 2026-08-17.'
+- key: e990d83362891828
+  path: src/elspeth/core/config.py
+  qualname: _lower_llm_profile_nodes.lower_component
+  exception: ValueError
+  message: '{} llm component references profile {} with credential_scope {}; batch/CLI runs have no per-user
+    secret store and can only use credential_scope ''server'' (or sco'
+  ordinal: 0
+  disposition: structural
+  note: 'The credential_scope rejection (config.py:2366) is unreachable from composer state: it runs only
+    after `profile_settings = profiles[alias]` succeeds (config.py:2362), and `profiles` is built solely
+    from raw_config["llm_profiles"] (config.py:2329-2335), which fact (A) shows the composer never emits
+    — so `profiles` is always empty and the KeyError branch at config.py:2364 fires first.'
+- key: 0b64446599720206
+  path: src/elspeth/core/config.py
+  qualname: _lower_llm_profile_nodes.lower_component
+  exception: ValueError
+  message: '{} llm component references unknown llm profile {}'
+  ordinal: 0
+  disposition: unmirrored
+  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). config.py:2364 — any surviving string
+    `profile` on an llm source or transform hits this, because `profiles` is always empty on a composer-authored
+    config (see e990d83362891828). Probed both carriers: transform and source llm nodes with options.profile="no_such_alias"
+    -> Stage 1 is_valid=True, settings load raises "transforms[0] / sources[''source''] llm component
+    references unknown llm profile ''no_such_alias''". elspeth-2ed41f0a4a census 2026-08-17.'
+- key: 3376dcea7706f4dd
+  path: src/elspeth/core/config.py
+  qualname: _lower_llm_profile_nodes.lower_component
+  exception: ValueError
+  message: '{} llm component specifies both ''profile'' and ''provider'' — choose exactly one: an operator
+    profile alias, or explicit provider config'
+  ordinal: 0
+  disposition: unmirrored
+  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). config.py:2357 — `profile` and `provider`
+    both present on an llm component. Probed: llm transform with both keys -> Stage 1 is_valid=True; settings
+    load raises exactly this message. Stage 1 has no profile/provider exclusivity rule. elspeth-2ed41f0a4a
+    census 2026-08-17.'
+- key: 545f5085d49071c7
+  path: src/elspeth/core/config.py
+  qualname: _reject_sensitive_plugin_env_placeholders_before_expansion
+  exception: ValueError
+  message: '{}[{}] {} option {} must not contain environment-variable placeholders before env expansion;
+    {} emits this option in user-visible report output'
+  ordinal: 0
+  disposition: unmirrored
+  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). config.py:2451. This pass is unconditional
+    on the web path (config.py:2969 — it runs regardless of expand_env_vars) and walks `transforms` and
+    `aggregations`, both emitted by the composer. _ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS covers
+    report_assemble''s join_with/title (config.py:2203-2205), and report_assemble is a composer-usable
+    plugin (web/plugin_policy/compiler.py:36). Probed: report_assemble aggregation with title="${SECRET_TITLE}"
+    -> Stage 1 is_valid=True, Stage 2 red with exactly this message; the control (title="Report") is green
+    at both stages. Stage 1 has no ${VAR} check on plugin options. elspeth-2ed41f0a4a census 2026-08-17.'
+- key: 00f2bf94a9e053a4
+  path: src/elspeth/core/config.py
+  qualname: _sanitize_dsn
+  exception: SecretFingerprintError
+  message: Database URL contains a password but ELSPETH_FINGERPRINT_KEY is not set. Either set the environment
+    variable or use ELSPETH_ALLOW_RAW_SECRETS=true for developme
+  ordinal: 0
+  disposition: structural
+  note: 'The parsed-URL password branch is gated on `fail_if_no_key` — it fires only when ELSPETH_FINGERPRINT_KEY
+    is unset and ELSPETH_ALLOW_RAW_SECRETS is not "true" (config.py:2749 supplies the flag). Probed a
+    database sink with url="postgresql://u:pw@h/db" in a keyless env: Stage 1 does not return is_valid=false,
+    it RAISES SecretFingerprintError out of validate() — so there is no Stage-1-green/Stage-2-red shape
+    here, only a deployment invariant that no authoring-side check can observe. Contrast the sibling e1794d62d3353207,
+    which is NOT env-gated.'
+- key: e1794d62d3353207
+  path: src/elspeth/core/config.py
+  qualname: _sanitize_dsn
+  exception: SecretFingerprintError
+  message: Unparsable database URL appears to contain credentials (detected '://<user>:<password>@<host>'
+    pattern). Fix the URL so SQLAlchemy can parse it, or remove the e
+  ordinal: 0
+  disposition: unmirrored
+  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). config.py:2577 — the "unparsable URL
+    that still looks credentialed" branch, reached when sqlalchemy make_url() raises ArgumentError (config.py:2568).
+    It is OUTSIDE the fail_if_no_key guard: probed _sanitize_dsn("://u:pw@h/db") with ELSPETH_FINGERPRINT_KEY
+    SET and it raises exactly this message. (A mistyped scheme like "postgreql://" is ACCEPTED by make_url,
+    and "…@[::bad/db" raises ValueError, which config.py:2568 does not catch — only a genuinely ArgumentError-unparsable
+    authority reaches the raise.) Probed a database sink with url="://u:pw@h/db": Stage 1 is_valid=True
+    — Stage 1 has no database-URL syntax rule. On a default deployment Stage 2 stops one gate earlier
+    (SinkEffectCapabilityError, database sinks need an operator-declared target-side-effect ledger); where
+    an operator has declared one, this raise is what fires. elspeth-2ed41f0a4a census 2026-08-17.'
+- key: 076e98a9b4386c16
+  path: src/elspeth/core/config.py
+  qualname: _validate_connection_name_chars
+  exception: ValueError
+  message: '{} ''{}'' contains invalid characters. Names must start with a letter or digit and contain
+    only letters, digits, underscores, and hyphens.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+  - output_name_invalid
+- key: 173848a728295759
+  path: src/elspeth/core/config.py
+  qualname: _validate_connection_or_sink_name
+  exception: ValueError
+  message: '{} ''{}'' is reserved. Reserved: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+  - output_name_invalid
+- key: c3dbb9bd26f241f2
+  path: src/elspeth/core/config.py
+  qualname: _validate_connection_or_sink_name
+  exception: ValueError
+  message: '{} ''{}'' starts with ''__'', which is reserved for system edges'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_label_invalid
+  - output_name_invalid
+- key: be5a5ebc731d84c3
+  path: src/elspeth/core/config.py
+  qualname: _validate_max_length
+  exception: ValueError
+  message: '{} exceeds max length {} (got {})'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+  - connection_label_invalid
+  - output_name_invalid
+- key: 387bd8bdbf41c710
+  path: src/elspeth/core/config.py
+  qualname: _validate_node_name_chars
+  exception: ValueError
+  message: '{} ''{}'' contains invalid characters. Node names must start with a letter and contain only
+    letters, digits, underscores, and hyphens.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+  - row_union_name_invalid
+  note: '_validate_node_name_chars (config.py:214) has exactly three callers, all mirrored: validate_runtime_node_name
+    (config.py:226 — every Transform/Gate/ Aggregation/Coalesce name) and RowUnionSettings.validate_name
+    (config.py:1239) are covered by _composer_node_id_validation_message (state.py:163-167) reported as
+    node_id_invalid (state.py:5142) and row_union_name_invalid (state.py:5380); validate_composer_source_name
+    (state.py:116) is the mutation-boundary source check. Probed node ids "t1!bad", "__sys", "1t" -> Stage
+    1 red with node_id_invalid in every case. Unlike the connection-name helper (076e98a9b4386c16) this
+    one is never reached by a routing label.'
+- key: 0af6678b68265866
+  path: src/elspeth/core/config.py
+  qualname: load_bounded_pipeline_yaml
+  exception: ValueError
+  message: YAML content exceeds the {} byte YAML limit
+  ordinal: 0
+  disposition: unmirrored
+  note: elspeth-96e2dd023f (parity residue ticket, 2026-08-17). Authorable and Stage-1 silent. bounded_json
+    caps ONE tool call at 1 MiB of text (JSON_MAX_TOTAL_TEXT_CHARS, bounded_json.py:14) and yaml_importer
+    caps an IMPORTED document at 256 KiB (yaml_importer.py:33/487), but nothing bounds the aggregate size
+    of accumulated composer state, so ~3 maximally-sized upsert_node option payloads generate YAML over
+    the 2 MiB limit at config.py:170-171 with no Stage-1 rule to catch it. elspeth-2ed41f0a4a census 2026-08-17.
+- key: 04d73f291757d487
+  path: src/elspeth/core/config.py
+  qualname: load_bounded_pipeline_yaml
+  exception: ValueError
+  message: 'YAML parse failed: {}'
+  ordinal: 0
+  disposition: structural
+  note: The composer's Stage-2 input is yaml.dump output from generate_yaml (yaml_generator.py:612-616),
+    which is by construction alias-free, shallow, and parseable by _BoundedInMemoryYamlLoader; config.py:176-177
+    is a defensive re-check.
+- key: 17629cf20941285f
+  path: src/elspeth/core/config.py
+  qualname: load_settings
+  exception: FileNotFoundError
+  message: 'Config file not found: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: load_settings is the Dynaconf/file CLI loader. Composer Stage 2 uses load_settings_from_yaml_string
+    (validation.py:222) and never touches a config path.
+- key: bb98734e37080a10
+  path: src/elspeth/core/config.py
+  qualname: load_settings
+  exception: ValueError
+  message: 'Configuration file {} must be a YAML mapping (key: value), not {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: Same CLI-only file loader (config.py:2908); the composer path never reads a settings file (validation.py:221-223).
+- key: dadef486162311d0
+  path: src/elspeth/core/config.py
+  qualname: load_settings
+  exception: ValueError
+  message: 'Unknown configuration keys in {}: {}. Check for typos. Valid top-level keys: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: Same CLI-only file loader (config.py:2912); the unknown-key check reads the YAML file from disk,
+    which the composer path never provides (validation.py:221-223).
+- key: f978377dd540cafa
+  path: src/elspeth/core/config.py
+  qualname: load_settings_from_config_dict
+  exception: ValueError
+  message: 'Unknown configuration keys: {}. Valid top-level keys: {}'
+  ordinal: 0
+  disposition: structural
+  note: The dict is built by _generate_pipeline_dict from a literal key set (yaml_generator.py:197-354)
+    that is a strict subset of ElspethSettings.model_fields, so config.py:2964-2965 is a defensive re-check
+    on the composer path.
+- key: 89e7625f72ec2db4
+  path: src/elspeth/core/config.py
+  qualname: load_settings_from_yaml_string
+  exception: ValueError
+  message: 'Configuration must be a YAML mapping (key: value), not {}'
+  ordinal: 0
+  disposition: structural
+  note: generate_yaml always dumps a dict (yaml_generator.py:612-616), which round-trips to a dict; config.py:3007-3008
+    cannot fire for composer-generated YAML.
+- key: 31fb18aa23e4a028
+  path: src/elspeth/core/config.py
+  qualname: sanitize_node_config_for_audit
+  exception: TypeError
+  message: 'Node config must thaw to dict[str, object], got {}: {}'
+  ordinal: 0
+  disposition: structural
+  note: config.py:2747 — a TypeError on deep_thaw() returning a non-dict for a config the caller already
+    holds as a Mapping (config.py:2745). This is an internal consistency assertion over an owned value,
+    not a check on authored input.
+- key: e2b7968706fb22be
+  path: src/elspeth/core/config.py
+  qualname: validate_runtime_node_name
+  exception: ValueError
+  message: '{} ''{}'' is reserved. Reserved: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+- key: 8440ae6986518a1f
+  path: src/elspeth/core/config.py
+  qualname: validate_runtime_node_name
+  exception: ValueError
+  message: '{} ''{}'' starts with ''__'', which is reserved for system edges'
+  ordinal: 0
+  disposition: structural
+  note: 'Dead raise, exactly as in RowUnionSettings.validate_name (d3a3f2be92fc89a8): _validate_node_name_chars
+    runs first (config.py:226) and _VALID_NODE_NAME_RE (config.py:188) requires a leading letter, so a
+    `__`-prefixed node name is rejected at line 214 and can never reach line 230. Probed: node id "__sys"
+    yields the invalid-characters message at both stages.'
+- key: efaaa85abf2450a6
+  path: src/elspeth/core/config.py
+  qualname: validate_runtime_node_name
+  exception: ValueError
+  message: '{} must not be empty'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_id_invalid
+- key: 95d5dd92c598ca5a
+  path: src/elspeth/core/config.py
+  qualname: validate_sink_name
+  exception: ValueError
+  message: '{} ''{}'' is reserved. Reserved: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - output_name_invalid
+- key: e348560d2544c30a
+  path: src/elspeth/core/config.py
+  qualname: validate_sink_name
+  exception: ValueError
+  message: '{} ''{}'' must be lowercase. Suggested fix: ''{}''.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - output_name_invalid
+- key: 546d8586d07fa89a
+  path: src/elspeth/core/config.py
+  qualname: validate_sink_name
+  exception: ValueError
+  message: '{} ''{}'' starts with ''__'', which is reserved for system edges'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - output_name_invalid
+- key: 6557fc89e6b5c8de
+  path: src/elspeth/core/dag/builder.py
+  qualname: _parse_contract_schema_config
+  exception: GraphValidationError
+  message: 'Invalid schema config: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - contract_config_invalid
+  note: Stage 1's eager schema-syntax sweep (state.py:4788-4805) calls the same get_raw_schema_config
+    over EVERY source, node and output, which covers all four runtime call sites of this helper (builder.py:293
+    source, 318 sink, 382 transform, 442 aggregation).
+- key: 562c0a28d56a6581
+  path: src/elspeth/core/dag/builder.py
+  qualname: _validate_output_schema_contract
+  exception: FrameworkBugError
+  message: Transform {} declares output fields {} but provides no _output_schema_config for DAG contract
+    validation. Call self._output_schema_config = self._build_output_s
+  ordinal: 0
+  disposition: structural
+  note: FrameworkBugError at builder.py:127 — a plugin-implementation invariant (a transform that sets
+    declared_output_fields must also set _output_schema_config in __init__). No composer-authored state
+    can violate it; only transform source code can.
+- key: 947e4923597332bd
+  path: src/elspeth/core/dag/builder.py
+  qualname: _validate_output_schema_contract
+  exception: FrameworkBugError
+  message: Transform {} declares output fields {} not present in effective guaranteed fields {}. declared_output_fields
+    must be a subset of guaranteed_fields.
+  ordinal: 0
+  disposition: structural
+  note: FrameworkBugError at builder.py:144 — declared_output_fields must be a subset of the plugin's
+    own effective guaranteed_fields. Both sides come from the transform class, not from NodeSpec.options,
+    so authored state cannot reach it.
+- key: 185547a3819dee51
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Aggregation '{}' is downstream of row_union '{}' but declares a count/timeout/condition trigger.
+    Such triggers can fire between variants of one source row, spli
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_downstream_group_invalid
+  note: state.py:5754-5773 walks nodes downstream of the row_union's on_success and rejects an aggregation
+    whose TriggerConfig has_count/has_timeout/has_condition — the same predicate as builder.py:1395.
+- key: f40d1b3f21901ff8
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Aggregation ''{}'' is inside a fork branch that feeds row_union ''{}'' and uses output_mode
+    ''transform'' (the default). A transform-mode flush emits its rows from a '
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_branch_aggregation_invalid
+  note: state.py:5710-5727 walks each branch lineage and rejects an aggregation with output_mode in (None,
+    'transform'), matching builder.py:1504 (OutputMode.TRANSFORM default).
+- key: ad2b76e2461e9fbc
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Aggregation '{}' on_success '{}' is neither a sink nor a known connection.{}
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - aggregation_on_success_dangling
+  note: state.py:1640 — same guard shape (on_success not None, not a sink, not a consumer connection)
+    as builder.py:1045-1057.
+- key: 96d86078b2cf7b6f
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Branch '{}' is already mapped to coalesce '{}', but row_union '{}' also declares it. Each fork
+    branch can only join at one barrier.
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fork_branch_multiple_barriers
+  note: state.py:5588-5608 collects barrier_claimants across BOTH coalesce and row_union nodes and errors
+    on any alias with >=2 claimants — the coalesce-then-row_union case of builder.py:630.
+- key: 223ab02bf7ff8961
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Coalesce ''{}'' declares branch ''{}'', but no gate produces this branch. Branches must be
+    listed in a gate''s fork_to list to be valid. Branches produced by gates: '
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_branch_alias_unreachable
+- key: 34359a5fda0b51c5
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Coalesce '{}' has on_success='{}'. Coalesce on_success must point to a sink when configured.
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_on_success_must_be_sink
+  note: state.py:1666 — on_success in consumer_connections, identical to builder.py:1063.
+- key: 5791d9905742f4c7
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Coalesce ''{}'' on_success references unknown sink ''{}''. Available sinks: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_on_success_unknown_sink
+  note: state.py:1676 — on_success neither a consumer connection nor a declared sink, the same arm as
+    builder.py:1071.
+- key: 0d2c6bac5cd96e68
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Coalesce node '{}' has no incoming branches; cannot determine schema for audit.
+  ordinal: 0
+  disposition: structural
+  note: Defensive re-check. CoalesceSettings.branches carries Pydantic min_length=2 (config.py branch
+    validator comment at 1065-1068) and builder.py:744-757 has already proved every declared branch is
+    produced by a gate, which wires either a COPY edge (identity branch, builder.py:701) or a MOVE edge
+    via the producer/consumer match (builder.py:1003). No coalesce can reach line 1251 with zero incoming
+    edges.
+- key: c25b40ad6a2ea42c
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Duplicate branch name ''{}'' found in coalesce settings. Branch ''{}'' is already mapped to
+    coalesce ''{}'', but coalesce ''{}'' also declares it. Each fork branch can '
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fork_branch_multiple_barriers
+  note: state.py:5588-5608 counts claimants per alias across all coalesce nodes, covering the coalesce-vs-coalesce
+    duplicate of builder.py:559.
+- key: 25b20562e321e60d
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Duplicate branch name '{}' found in row_union settings. Branch '{}' is already mapped to row_union
+    '{}', but row_union '{}' also declares it.
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fork_branch_multiple_barriers
+  note: Same claimant map at state.py:5588-5608 covers the row_union-vs-row_union duplicate of builder.py:639.
+- key: 56083ff5ac4f8a4a
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: ExecutionGraph requires at least one sink
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - no_sinks_configured
+  note: state.py:5107 — 'if not self.outputs'.
+- key: e57497439ab2bae6
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: ExecutionGraph requires at least one source
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - no_source_configured
+  note: state.py:5098 — 'if not self.sources'.
+- key: 8c269f4deebda8cb
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Fork branch ''{}'' is declared by multiple gates: ''{}'' and ''{}''. Fork branch names must
+    be globally unique across all gates.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fork_branch_declared_by_multiple_gates
+  - duplicate_connection_producer
+- key: 3f1c08a2b4cf5536
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Fork gate(s) {} are nested inside a branch that feeds row_union '{}'. A nested fork replaces
+    the enclosing branch identity and terminalizes its parent before th
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_nested_fork_invalid
+  note: state.py:5712-5739 flags any gate with fork_to inside a branch lineage feeding the union, matching
+    builder.py:1520.
+- key: 97b28c3991b71d07
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Gate ''{}'' has duplicate fork branches: {}. Each fork branch name must be unique.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_duplicate_fork_branch
+  note: state.py:5556-5568 uses the same Counter-over-fork_to shape as builder.py:673-680.
+- key: c5ab074fc7c97dc8
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Gate ''{}'' has fork branch ''{}'' with no destination. Fork branches must either: 1. Be listed
+    in a coalesce ''branches'' dict/list, or 2. Be listed in a row_union '''
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fork_branch_no_destination
+  note: state.py:5572-5587 requires each fork_to name to be a coalesce/row_union branch key or a sink
+    name — the same three-way destination rule as builder.py:728.
+- key: 0ec43a980d71a7e4
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Gate ''{}'' input ''{}'' has no producer.{} Available connections: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_input_not_reachable
+  note: Gates fall through to the generic input-reachability check at state.py:5777 (only coalesce/row_union
+    'continue' out of that loop), mirroring builder.py:962-969.
+- key: 5093898aeba54f59
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Gate ''{}'' on_error ''{}'' references unknown sink.{} Available sinks: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_on_error_unknown_sink
+  note: state.py:1591 — on_error not 'discard' and not a declared sink, identical to builder.py:1171.
+- key: 2e3f8f12c6deb208
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Gate route target '{}' is neither a sink nor a known connection name.{}
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_route_target_unknown
+  note: state.py:1603-1615 skips the reserved discard/fork targets and requires every other route destination
+    to be a sink or a consumer connection, as at builder.py:1019.
+- key: ce2b478102df686c
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Queue '{}' has no upstream producers.
+  ordinal: 0
+  disposition: structural
+  note: 'Unreachable defensive branch. queue_input_edges is a defaultdict(list) whose only access is ''queue_input_edges[connection_name].append(...)''
+    at builder.py:783, so a key exists only once it holds at least one edge; ''if not upstream_edges''
+    at builder.py:938 can never be true. (Stage 1 does cover the real predicate anyway: a queue''s input
+    is its own id, so a producerless queue trips node_input_not_reachable — see state.py:5788-5790.)'
+- key: 6e3e011c4d6699d3
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Sink ''{}'' on_write_failure references ''{}'' which is not in sink_ids. Available: {}.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - failsink_unknown_output
+  note: state.py:6006 rejects an on_write_failure naming an undeclared sink, the same predicate as builder.py:1193.
+- key: 70a0ccd39f135697
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Source '{}' on_success '{}' is neither a sink nor a known connection.{}
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - source_on_success_dangling
+  note: state.py:1544-1560 requires source.on_success to be a sink or a consumer connection; a queue's
+    NodeSpec.input equals its id, so queue targets are in consumer_connections (_runtime_consumer_connections,
+    state.py:1197) exactly as builder.py:1095-1110 allows them.
+- key: 04af99e53b08d2bb
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Source '{}' on_success '{}' references queue '{}' with no downstream consumer.
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - queue_no_consumer
+  note: state.py:5803-5814 rejects any queue with no runtime downstream consumer — strictly broader than
+    builder.py:1096, which only reaches the raise when a source points at the queue.
+- key: 266a36d3daef14df
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Source plugin names and source settings names must match. plugins={}, settings={}
+  ordinal: 0
+  disposition: structural
+  note: A caller-contract invariant on build_execution_graph's two keyword arguments (builder.py:199).
+    runtime_factory derives both `sources` and `source_settings_map` from the same settings block, so
+    the key sets cannot diverge for any authored pipeline.
+- key: a22ba097117b6958
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Transform ''{}'' on_error ''{}'' references unknown sink.{} Available sinks: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - transform_on_error_unknown_sink
+  note: state.py:1628 — on_error not 'discard' and not a declared sink, matching builder.py:1148.
+- key: b35430ac6ab4f9e2
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Transform '{}' on_success '{}' is neither a sink nor a known connection.{}
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - transform_on_success_dangling
+  note: state.py:1619 — neither a sink nor a consumer connection, matching builder.py:1034.
+- key: 50a85d8e4c51c61b
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: row_union '{}' branch '{}' maps input connection '{}', but no chain arriving at the union descends
+    from fork branch '{}' of gate '{}'. Rows arriving on '{}' nev
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_branch_not_downstream
+  note: state.py:5684-5704 runs _runtime_connection_lineage(branch_alias, branch_connection) per branch
+    and rejects a mapped input that is not downstream of that alias's fork edge — the authoring twin of
+    the _trace_branch_endpoints check at builder.py:1543-1560.
+- key: eb83d83954d95dfd
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'row_union ''{}'' declares branch ''{}'', but no gate produces this branch. Branches must be
+    listed in a gate''s fork_to list to be valid. Branches produced by gates:'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_branch_alias_unreachable
+  note: state.py:5633-5642 rejects any row_union branch ALIAS absent from every gate's fork_to, the same
+    predicate as builder.py:762 ('branch_name not in row_union_branch_gates').
+- key: 55fedc6679041321
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'row_union ''{}'' declares branches produced by ancestor/descendant fork gates {}. A require-all
+    union cannot span fork generations: the nested fork path replaces '
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_branch_origin_invalid
+  note: An ancestor/descendant pair means the union's aliases span two distinct fork gates, so no single
+    gate's fork_to is a superset and state.py:5666 fires (common_gate_ids empty). The remaining case —
+    one gate holding all the aliases — needs that gate to be its own fork ancestor, i.e. a graph cycle,
+    which is the separately-tracked Stage-1 cycle-detection gap, not this predicate. For every acyclic
+    topology the two predicates coincide.
+- key: 4ae3d2a996962e70
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'row_union ''{}'' declares branches produced by unrelated fork gates {}. Rows forked by different
+    gates never share a correlation identity, so a require-all union '
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_branch_origin_invalid
+  note: 'Unrelated fork gates is the same Stage-1 predicate at state.py:5661-5680: aliases must all come
+    from one common gate fork_to so they share a correlation origin (builder.py:1477).'
+- key: 8c334befe70f521f
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: row_union '{}' on_success '{}' names a sink. A released group must continue on a processing
+    connection; terminal row_union -> sink release is not supported in v
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_on_success_must_be_connection
+  note: state.py:1688 — on_success in output_names, identical to builder.py:602.
+- key: 2707b4e07eac3b31
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: '{} ''{}'' is downstream of row_union ''{}'' with no intervening sink. row_union releases N
+    tokens that share one row_id, and a correlated barrier cannot consume an '
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_downstream_group_invalid
+  note: state.py:5740-5753 rejects a coalesce/row_union downstream of a row_union's on_success with no
+    intervening sink, the barrier arm of builder.py:1378-1391.
+- key: 3113abc75ea18b67
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph._best_schema_config
+  exception: FrameworkBugError
+  message: Node '{}' has no output_schema_config. All producer nodes must have output_schema_config populated
+    at construction time.
+  ordinal: 0
+  disposition: structural
+  note: FrameworkBugError at builder.py:258 — every producer node is given an output_schema_config at
+    add_node time (sources/transforms/aggregations from config, gates and coalesce via _assign_schema).
+    A None here is a builder defect, not authored input.
+- key: 142f133d74e795e8
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph.node_id
+  exception: GraphValidationError
+  message: 'Generated node_id exceeds {} characters: ''{}'' (length={}). Use shorter transform/gate/aggregation/source/sink
+    names.'
+  ordinal: 0
+  disposition: structural
+  note: 'Unreachable once settings load. config.py caps EVERY node name at _MAX_NODE_NAME_LENGTH=38 (transform
+    1336, aggregation 680, gate 761, coalesce 1043, row_union 1238, source 2113, queue 2130, sink 2188/2197),
+    and the generated id is ''{prefix}_{name}_{hash12}'' with no sequence suffix at any call site — worst
+    case len(''aggregation'') + 38 + 14 = 63 <= NODE_ID_MAX_LENGTH 64 (contracts/types.py:10). PROBED
+    with a 60-char node id: Stage 1 rejects first with node_id_invalid (state.py:5142, ''Transform name
+    exceeds max length 38'') and Stage 2 dies at settings load, never in node_id(). NB this is a different
+    constant and unit from the config.py:75 name-cap raise site, which is adjudicated separately.'
+- key: 00660ca0ee6fba2b
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph.register_producer
+  exception: GraphValidationError
+  message: 'Duplicate producer for connection ''{}'': {} ({}) and {} ({}).'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - duplicate_connection_producer
+  note: state.py:2589-2605 surfaces the resolver's duplicate_connections with the same 'Duplicate producer
+    for connection ...' shape as builder.py:787.
+- key: 947356b8099c8ed8
+  path: src/elspeth/core/dag/coalesce_merge.py
+  qualname: merge_coalesce_schema
+  exception: GraphValidationError
+  message: <call:_coalesce_error_prefix> has unsupported merge strategy {}.
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_merge_invalid
+- key: 7d5980f9538e28a4
+  path: src/elspeth/core/dag/coalesce_merge.py
+  qualname: merge_coalesce_schema
+  exception: GraphValidationError
+  message: '<call:_coalesce_error_prefix> select_branch ''{}'' has no schema mapping. Available branches:
+    {}. This indicates a graph construction bug.'
+  ordinal: 0
+  disposition: not_authorable
+  note: NodeSpec carries no select_branch field (state.py:240-257) and the coalesce lowering emits only
+    name/branches/policy/merge/on_success/timeout_seconds (yaml_generator.py:327-338), so the composer
+    can never populate the config key this membership check reads (coalesce_merge.py:96).
+- key: a3e16b088039466b
+  path: src/elspeth/core/dag/coalesce_merge.py
+  qualname: merge_coalesce_schema
+  exception: GraphValidationError
+  message: <call:_coalesce_error_prefix> uses select merge without select_branch.
+  ordinal: 0
+  disposition: structural
+  note: 'Shadowed before the builder: probed a composer coalesce with merge=''select'' — Stage 1 green,
+    Stage 2 red at ElspethSettings load ("Coalesce ''c'': select merge strategy requires select_branch"),
+    with zero GraphValidationError constructed. merge_coalesce_schema is only called at builder.py:1304,
+    downstream of that settings validator, so no composer-authored state reaches coalesce_merge.py:91.
+    The Stage-1/Stage-2 gap for merge=''select'' is real but lives at the core/config.py CoalesceSettings
+    validator, not here.'
+- key: c9ab9addf75280c7
+  path: src/elspeth/core/dag/coalesce_merge.py
+  qualname: merge_union_fields
+  exception: GraphValidationError
+  message: 'Coalesce node {} receives incompatible types for field ''{}'' in union merge: branch ''{}''
+    has {}, branch ''{}'' has {}. Union merge requires compatible types on sha'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_union_type_incompatible
+- key: 24b4c22a4d35a868
+  path: src/elspeth/core/dag/coalesce_merge.py
+  qualname: merge_union_fields
+  exception: GraphValidationError
+  message: Coalesce {} has mixed observed/explicit schemas - this is not allowed because observed branches
+    may produce rows missing fields expected by downstream consumers
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - coalesce_schema_mode_mixed
+- key: 0e1eb14fb4bb094e
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph._assert_build_metadata_mutable
+  exception: GraphValidationError
+  message: ExecutionGraph build metadata is frozen after construction; rebuild the graph instead of mutating
+    it.
+  ordinal: 0
+  disposition: structural
+  note: _build_metadata_frozen is set only by _freeze_build_metadata() at the end of the builder (graph.py:852-860);
+    every setter guarded by this assert is called during construction, before the freeze. No pipeline
+    input can flip the flag.
+- key: 23471f499ecc0acb
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph._trace_branch_endpoints
+  exception: GraphValidationError
+  message: Cannot trace first transform for branch '{}' leading to {} node '{}'. This indicates a graph
+    construction bug — transform branches must have MOVE edge chains fr
+  ordinal: 0
+  disposition: structural
+  note: The branch chains this walk traces are created by the builder from already-validated branch plans
+    (graph.py:1074-1129); the trace is reached only through _branch_info / _row_union_branch_gates entries
+    the same builder registered. Its own message calls it a graph construction bug.
+- key: 77e375777f67a4a6
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph._validate_connection_namespaces
+  exception: GraphValidationError
+  message: 'Connection names overlap with sink names: {}. Connection names and sink names must be disjoint.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - connection_sink_name_overlap
+- key: 79937df2e84fe7de
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph._validate_connection_namespaces
+  exception: GraphValidationError
+  message: 'Dangling output connections with no consumer: {}. Every produced connection must be consumed
+    or routed to a sink.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - source_on_success_dangling
+  - transform_on_success_dangling
+  - aggregation_on_success_dangling
+  - row_union_on_success_dangling
+  - queue_no_consumer
+- key: fbb62de6bbc0bfc1
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph._validate_connection_namespaces
+  exception: GraphValidationError
+  message: 'Duplicate consumers for {} connection(s): <call:join>. Use a gate for fan-out.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - duplicate_connection_consumer
+- key: 27e557e9d54affb9
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph._validate_connection_namespaces
+  exception: GraphValidationError
+  message: 'No producer for connection ''{}''.{} Available connections: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - node_input_not_reachable
+- key: c6e3f5cdd5f5f163
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph._validate_route_resolution_map_complete
+  exception: GraphValidationError
+  message: Gate '{}' route label '{}' has no destination in route resolution map. All declared route labels
+    must resolve during graph construction.
+  ordinal: 0
+  disposition: structural
+  note: The builder registers a _route_resolution_map entry for every route label it lowers, and a label
+    whose destination is unknown is rejected earlier (builder.py route-target checks, mirrored by Stage-1
+    gate_route_target_unknown). This pass (graph.py:488-509) re-reads the builder's own two structures
+    against each other.
+- key: c384de7797508a12
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.add_node
+  exception: GraphValidationError
+  message: 'Invalid schema config: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - contract_config_invalid
+- key: a45d05ec3cc9e67c
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.get_next_node
+  exception: GraphValidationError
+  message: 'Node ''{}'' has multiple continue MOVE edges to processing nodes: {}'
+  ordinal: 0
+  disposition: structural
+  note: 'Two ''continue'' MOVE edges out of one node require two consumers of that node''s single on_success
+    connection, which _validate_connection_namespaces already refuses at graph.py:540 during the build
+    (probed: raise-site graph.py:540). get_next_node (graph.py:576-599) additionally runs only in the
+    orchestrator, after that build succeeded.'
+- key: 175af4c308a61851
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.get_node_info
+  exception: KeyError
+  message: 'Node not found: {}'
+  ordinal: 0
+  disposition: structural
+  note: 'Internal lookup guard (graph.py:484): every caller passes a node id read out of the same graph.
+    Not driven by pipeline input.'
+- key: 8e8b098459da239b
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.topological_order
+  exception: GraphValidationError
+  message: 'Cannot sort graph: {}'
+  ordinal: 0
+  disposition: structural
+  note: 'Shadowed: topological_processing_order raises on the same nx.NetworkXUnfeasible at builder.py:1216,
+    which runs before any topological_order() caller (orchestrator graph_registration/landscape_registration,
+    and get_pipeline_node_sequence). Probed cycle raise-site was graph.py:454, never graph.py:443.'
+- key: 4df579eb5bda8594
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.topological_processing_order
+  exception: GraphValidationError
+  message: Pipeline contains a cycle
+  ordinal: 0
+  disposition: structural
+  note: 'Unreachable fallback arm: nx.topological_sort raised NetworkXUnfeasible, so nx.find_cycle on
+    the same graph cannot raise NetworkXNoCycle (graph.py:450-456). The reachable sibling is the ''Pipeline
+    contains a cycle: {}'' site.'
+- key: b729f4e4c1de9bed
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.topological_processing_order
+  exception: GraphValidationError
+  message: 'Pipeline contains a cycle: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - pipeline_cycle
+- key: e6e7db992ca657d5
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.validate
+  exception: GraphValidationError
+  message: Gate '{}' has a direct edge to sink node '{}' (sink name '{}') but no registered route label.
+    This indicates a graph construction bug — every gate→sink edge mus
+  ordinal: 0
+  disposition: structural
+  note: The builder creates a gate->sink MOVE edge and its _route_label_map entry together; this pass
+    (graph.py:421-429) re-reads the builder's two structures against each other and names itself a graph
+    construction bug.
+- key: 7af62c1dfed475c7
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.validate
+  exception: GraphValidationError
+  message: Graph contains a cycle
+  ordinal: 0
+  disposition: structural
+  note: 'Unreachable fallback arm: is_acyclic() is already False, so nx.find_cycle cannot raise NetworkXNoCycle
+    (graph.py:302-309). Doubly shadowed — builder.py:1216 rejects the cycle before graph.validate() runs
+    at web/execution/preflight.py:663.'
+- key: 911c989e8b9c7b64
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.validate
+  exception: GraphValidationError
+  message: 'Graph contains a cycle: {}'
+  ordinal: 0
+  disposition: structural
+  note: 'Shadowed: graph.validate() runs only after from_plugin_instances returns (web/execution/preflight.py:663,
+    _validation_runtime.py:369), and the builder already rejects any cycle at builder.py:1216. Probed
+    cycle raise-site was graph.py:454, not graph.py:307.'
+- key: 87e2bde49961f9e2
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.validate
+  exception: GraphValidationError
+  message: Graph must have at least one sink
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - no_sinks_configured
+- key: e4ea79b6864ff478
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.validate
+  exception: GraphValidationError
+  message: Graph must have at least one source
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - no_source_configured
+- key: 2b517506d794b32e
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.validate
+  exception: GraphValidationError
+  message: 'Graph validation failed: {} unreachable node(s) detected: {} All nodes must be reachable from
+    at least one source node.'
+  ordinal: 0
+  disposition: structural
+  note: 'Shadowed by the namespace pass: a source-unreachable component must contain a node whose input
+    connection has no producer, which _validate_connection_namespaces rejects at graph.py:552 during the
+    build. Probed a disconnected acyclic island — Stage 1 red (node_input_not_reachable + transform_on_success_dangling),
+    Stage 2 raise-site graph.py:552, never graph.py:334.'
+- key: bbf3aefe1df6a901
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.validate
+  exception: GraphValidationError
+  message: Node '{}' has duplicate outgoing edge label '{}'. Edge labels must be unique per source node
+    to ensure correct routing event recording.
+  ordinal: 0
+  disposition: structural
+  note: Outgoing edge labels come from route-map keys (a Mapping, unique by construction), the literal
+    'continue'/'on_success' labels, and fork_to branch names; a repeated fork branch is rejected by Stage-1
+    gate_duplicate_fork_branch (state.py:5543). add_edge keys by label (graph.py:277), so a genuine repeat
+    to the same target overwrites rather than duplicating.
+- key: 2d6730232f799eda
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.validate
+  exception: GraphValidationError
+  message: Node '{}' has fan-in from multiple producers without a queue. Route multiple producers through
+    an explicit queue node before ordinary processing.
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - duplicate_connection_producer
+- key: 674d26755e286609
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph.validate
+  exception: GraphValidationError
+  message: Sink node '{}' exists in the graph but is not registered in the sink ID map. This indicates
+    a graph construction bug.
+  ordinal: 0
+  disposition: structural
+  note: _sink_id_map and the SINK nodes are populated from the same sinks mapping in one builder pass;
+    this check (graph.py:414-420) re-reads the builder's own two structures and names itself a graph construction
+    bug.
+- key: 0293462605a1dec5
+  path: src/elspeth/core/dag/guarantees.py
+  qualname: get_required_fields
+  exception: GraphValidationError
+  message: 'Invalid contract config: {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - contract_config_invalid
+  note: Stage 1's _parse_node_required_fields (state.py:3966-3979) calls the same get_raw_node_required_fields
+    parser over node.options and converts the ValueError into a blocking entry; _parse_sink_required_fields
+    (state.py:3989-3998) covers the sink side.
+- key: ae851bfbf0135d7f
+  path: src/elspeth/core/dag/guarantees.py
+  qualname: walk_effective_guarantee_vote
+  exception: FrameworkBugError
+  message: Pass-through transform {} has no predecessors. Builder must wire transforms with at least one
+    upstream edge.
+  ordinal: 0
+  disposition: structural
+  note: FrameworkBugError at guarantees.py:265 — 'Builder must wire transforms with at least one upstream
+    edge'. build_execution_graph always wires a transform from its input connection's producer (builder.py:983-1003),
+    and a transform whose input has no producer is already rejected upstream. Only hand-built test graphs
+    can reach it.
+- key: 5732d298460fe9f1
+  path: src/elspeth/core/dag/models.py
+  qualname: BranchInfo.__post_init__
+  exception: ValueError
+  message: BranchInfo.coalesce_name must not be empty
+  ordinal: 0
+  disposition: structural
+  note: BranchInfo is constructed only from builder branch plans (builder.py:77-91, graph.py:817), whose
+    coalesce_name comes from a validated CoalesceSettings.name — never empty.
+- key: d39bb75d6782905d
+  path: src/elspeth/core/dag/models.py
+  qualname: BranchInfo.__post_init__
+  exception: ValueError
+  message: BranchInfo.gate_node_id must not be empty
+  ordinal: 0
+  disposition: structural
+  note: BranchInfo.gate_node_id is the builder's own generated gate node id (builder.py:83/91); node_id()
+    always emits prefix_name_hash (builder.py:232-236), never empty.
+- key: 14f3e3bf3d9a2084
+  path: src/elspeth/core/dag/models.py
+  qualname: GraphValidationWarning.__post_init__
+  exception: ValueError
+  message: GraphValidationWarning.code must not be empty
+  ordinal: 0
+  disposition: structural
+  note: Every GraphValidationWarning is constructed with a literal code at coalesce_warnings.py:199/280
+    and row_union_warnings.py:125 — no pipeline input reaches this field.
+- key: 4b673974ef6efe67
+  path: src/elspeth/core/dag/models.py
+  qualname: GraphValidationWarning.__post_init__
+  exception: ValueError
+  message: GraphValidationWarning.message must not be empty
+  ordinal: 0
+  disposition: structural
+  note: Same three construction sites as the code guard (coalesce_warnings.py:199/280, row_union_warnings.py:125);
+    message is always a built f-string.
+- key: b97d665109399f00
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: <dynamic:msg>
+  ordinal: 0
+  disposition: structural
+  note: 'This is the node_id length guard (models.py:297-299, NODE_ID_MAX_LENGTH=64 from contracts/types.py:10).
+    Shadowed twice: builder.node_id() raises on the same constant at builder.py:238 before NodeInfo is
+    constructed, and composer names are capped at 38 by core/config.py:75 _MAX_NODE_NAME_LENGTH. Probed
+    a 60-char node id: Stage 1 red (node_id_invalid, state.py:5142), Stage 2 red at ElspethSettings, no
+    GraphValidationError at all.'
+- key: 93e547da47bf8cce
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.declared_input_fields is only meaningful for TRANSFORM nodes; node {} has type {}
+    with declared_input_fields={}.
+  ordinal: 0
+  disposition: structural
+  note: declared_input_fields is written at exactly one non-test site, builder.py:404, reading TransformProtocol.declared_input_fields
+    on a node the builder is adding as a TRANSFORM; add_node defaults it to frozenset() otherwise (graph.py:139).
+    No composer option feeds it.
+- key: 92c1f53a91970629
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.declared_output_fields is only meaningful for TRANSFORM nodes; node {} has type {}
+    with declared_output_fields={}.
+  ordinal: 0
+  disposition: structural
+  note: declared_output_fields is written only at builder.py:403 (transform path) and defaults to frozenset()
+    in add_node (graph.py:138); the node type is fixed by the same builder branch.
+- key: 0c238cf34e2c8f4e
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.declared_required_fields is only meaningful for SINK nodes; node {} has type {} with
+    declared_required_fields={}.
+  ordinal: 0
+  disposition: structural
+  note: declared_required_fields is written only at builder.py:331 (sink path), or derived inside add_node
+    under an explicit `node_type == NodeType.SINK` guard (graph.py:224-225). The non-SINK case is unconstructible
+    from pipeline input.
+- key: 45df09e60fd82cca
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.declared_string_input_fields is only meaningful for TRANSFORM nodes; node {} has type
+    {} with declared_string_input_fields={}.
+  ordinal: 0
+  disposition: structural
+  note: declared_string_input_fields is written only at builder.py:405 (transform path); add_node defaults
+    it to frozenset() (graph.py:140).
+- key: 1cd37988a4cab3a7
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.forwards_input_fields/removed_input_fields are only meaningful for TRANSFORM or AGGREGATION
+    nodes; node {} has type {}.
+  ordinal: 0
+  disposition: structural
+  note: forwards_input_fields / removed_input_fields are written only at builder.py:407-408 (transform)
+    and 458-459 (aggregation) — both node types the guard admits; add_node defaults them off (graph.py:142-143).
+- key: 4d7b97c8230791d6
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.node_id must not be empty
+  ordinal: 0
+  disposition: structural
+  note: Every node_id reaching NodeInfo comes from builder.node_id(), which emits prefix_name_hash (builder.py:232-236)
+    — never empty.
+- key: 14a57e9bdacd33c5
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.passes_through_input is only meaningful for TRANSFORM or AGGREGATION nodes; node {}
+    has type {}.
+  ordinal: 0
+  disposition: structural
+  note: passes_through_input is written only at builder.py:406 (transform) and 457 (aggregation) — both
+    admitted types; add_node defaults it False (graph.py:141).
+- key: 597f6abb9f4eba13
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.plugin_name must not be empty for node {}
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - transform_missing_plugin
+  - aggregation_missing_plugin
+- key: 57c9f229abe3f2b8
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.removed_input_fields on node {} requires forwards_input_fields=True; got removed_input_fields={}
+    with the flag unset.
+  ordinal: 0
+  disposition: structural
+  note: Both fields are read off one TransformProtocol instance at builder.py:407-408 / 458-459, so the
+    pairing invariant is the plugin's own declaration, not pipeline input; the composer cannot set either
+    field.
+- key: 92eca96a9e43431a
+  path: src/elspeth/core/dag/models.py
+  qualname: _GateEntry.__post_init__
+  exception: ValueError
+  message: _GateEntry.fork_to must not be empty tuple (use None for no fork)
+  ordinal: 0
+  disposition: structural
+  note: GateSettings.validate_fork_to_labels rejects an empty list at settings load (2026-08-17), so an
+    empty tuple can no longer reach _GateEntry from any settings-loaded pipeline; the composer mirrors
+    that rule as gate_fork_to_empty.
+- key: 62d1b3ad51d35bd5
+  path: src/elspeth/core/dag/models.py
+  qualname: _GateEntry.__post_init__
+  exception: ValueError
+  message: _GateEntry.name must not be empty
+  ordinal: 0
+  disposition: structural
+  note: _GateEntry is constructed at exactly one site, builder.py:508, from GateSettings.name, which core/config.py:761
+    validates for length and non-emptiness before the builder runs.
+- key: 7dfe52d555f1a25f
+  path: src/elspeth/core/dag/models.py
+  qualname: _GateEntry.__post_init__
+  exception: ValueError
+  message: _GateEntry.node_id must not be empty
+  ordinal: 0
+  disposition: structural
+  note: _GateEntry.node_id at builder.py:509 is the builder's own generated gate id from node_id() (builder.py:232-236)
+    — never empty.
+- key: ed789bb5f27edd17
+  path: src/elspeth/core/dag/models.py
+  qualname: _GateEntry.__post_init__
+  exception: ValueError
+  message: _GateEntry.routes must have at least one entry
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - gate_routes_empty
+- key: dd506cf1a3f7a87b
+  path: src/elspeth/core/dag/schema_factory.py
+  qualname: build_coalesce_schema
+  exception: GraphValidationError
+  message: Coalesce union schema has no fields (mode={}). Observed schemas should be filtered before calling
+    build_coalesce_schema.
+  ordinal: 0
+  disposition: structural
+  note: 'schema_factory.py:44-50 — its own docstring names this a builder bug: observed schemas are filtered
+    out before build_coalesce_schema is called, so a fieldless SchemaConfig here is an internal inconsistency,
+    not an authored shape.'
+- key: 63d0cee3448bbaa0
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: _validate_locked_consumer_guaranteed_extras
+  exception: EdgeContractError
+  message: <dynamic:message>
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - locked_input_extras
+  - sink_locked_extras
+- key: d178de06b5b0a33c
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: get_effective_producer_schema
+  exception: GraphValidationError
+  message: Coalesce node '{}' has merge strategy 'select' but no 'select_branch' in config. This indicates
+    a graph construction bug.
+  ordinal: 0
+  disposition: structural
+  note: 'Same config-layer shadow as the coalesce_merge.py select site: a composer coalesce with merge=''select''
+    is rejected by the ElspethSettings CoalesceSettings validator (probed, zero GraphValidationError),
+    so no composer-authored graph reaches schema_validation.py:681. select_branch is also not a NodeSpec
+    field (state.py:240-257).'
+- key: 475652d075a1144b
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: get_effective_producer_schema
+  exception: GraphValidationError
+  message: '{} ''{}'' has mixed observed/explicit schemas - this is not allowed because observed branches
+    may produce rows missing fields expected by downstream consumers. Ob'
+  ordinal: 0
+  disposition: structural
+  note: This arm is inside the `node_info.node_type == NodeType.GATE` branch (schema_validation.py:712-749)
+    and needs len(all_schemas) > 1, i.e. a gate with two incoming edges. That requires two producers of
+    the gate's single input connection, which builder.py:787 register_producer rejects first (probed raise-site)
+    and Stage 1 mirrors as duplicate_connection_producer; DIVERT edges only ever land on sinks (builder.py:1126/1146/1169/1189)
+    and COPY fork edges never target a gate.
+- key: 80f3c59b95454b43
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: get_effective_producer_schema
+  exception: GraphValidationError
+  message: '{} ''{}'' receives incompatible schemas from multiple inputs - this is a graph construction
+    bug. First input: {}, other input: {}. {}'
+  ordinal: 0
+  disposition: structural
+  note: 'Same multi-input gate precondition as its mixed-mode sibling a few lines above (schema_validation.py:752-766):
+    unreachable because a second producer of the gate''s input connection is rejected at builder.py:787
+    / graph.py:540, mirrored by Stage-1 duplicate_connection_producer.'
+- key: 791f8d394e5b7029
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: get_effective_producer_schema
+  exception: GraphValidationError
+  message: '{} node ''{}'' has no incoming edges - this indicates a bug in graph construction'
+  ordinal: 0
+  disposition: structural
+  note: 'Inside the GATE branch (schema_validation.py:715-721): a gate with no incoming edges means its
+    input connection has no producer, which _validate_connection_namespaces rejects at graph.py:552 during
+    the build (probed) and Stage 1 mirrors as node_input_not_reachable.'
+- key: 1446ebd3a69c4745
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_coalesce_compatibility
+  exception: GraphValidationError
+  message: Coalesce '{}' has mixed observed/explicit schemas - this is not allowed because observed branches
+    may produce rows missing fields expected by downstream consume
+  ordinal: 0
+  disposition: structural
+  note: 'Shadowed by coalesce_merge.py:238: probed a union coalesce with one observed and one explicit
+    branch — Stage 1 red (coalesce_schema_mode_mixed) and the Stage-2 raise-site was coalesce_merge.py:238
+    in merge_union_fields (builder.py:1304), which runs before validate_edge_compatibility (builder.py:1324)
+    ever calls this validator.'
+- key: f8e3cf3154823557
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_coalesce_compatibility
+  exception: GraphValidationError
+  message: Coalesce '{}' has no incoming edges — this is a graph construction bug
+  ordinal: 0
+  disposition: structural
+  note: 'Shadowed: the builder rejects a branchless coalesce at builder.py:1229 ("Coalesce node ''...''
+    has no incoming branches; cannot determine schema for audit"), which runs before validate_edge_compatibility
+    at builder.py:1324. The message names itself a graph construction bug.'
+- key: d928645800603878
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_coalesce_compatibility
+  exception: GraphValidationError
+  message: 'Coalesce ''{}'' receives incompatible schemas from multiple branches: first branch has {},
+    branch from ''{}'' has {}. {}'
+  ordinal: 0
+  disposition: structural
+  note: 'Shadowed by the union merge that runs first. validate_coalesce_compatibility returns early for
+    nested/select (schema_validation.py:884), so line 919 is reachable only for a union coalesce whose
+    branches are all-explicit AND agree on every shared field type AND are still mutually structurally
+    incompatible — but merge_union_fields at builder.py:1304 has already rejected the mixed-mode case
+    (coalesce_merge.py:238) and every shared-field type conflict (coalesce_merge.py:274), both probed
+    as the actual raise sites, and builder.py:1304 runs before validate_edge_compatibility at builder.py:1324.
+    Two reachability attempts on the residue failed: fixed-mode disjoint branches trip the branch-chain
+    edge check first, flexible-mode disjoint branches are green at both stages. Same shadow basis as the
+    mixed-mode sibling at schema_validation.py:900.'
+- key: 31d79a84fe7082c9
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_forgiven_field_ancestor_types
+  exception: EdgeContractError
+  message: 'Schema contract violation: edge ''{}'' → ''{}'' Consumer ({}) declares ''{}'' as {} (required),
+    but rows arrive typed {}: the graph guarantees ''{}'' is present — the p'
+  ordinal: 0
+  disposition: unmirrored
+  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). Reasoned from source, not probed: Stage
+    1''s only type-axis edge rule is _edge_field_type_conflict (state.py:4104-4155), which by design compares
+    the DECLARED field_type strings on both sides and abstains wherever either declares ''any''. The forgiven
+    population this validator exists for is exactly the fields the producer NEVER declares (schema_validation.py:457-461),
+    so Stage 1 has nothing to compare; there is no ancestor-type resolution anywhere in state.py (no resolve_guaranteed_field_type
+    equivalent). elspeth-2ed41f0a4a census 2026-08-17'
+- key: 4bc008dabf653b33
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_row_union_compatibility
+  exception: GraphValidationError
+  message: 'row_union ''{}'' receives incompatible schemas from multiple branches: branch from ''{}''
+    has {}, branch from ''{}'' has {}.{} {}'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - row_union_schema_incompatible
+- key: 6965b8a70018896e
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_single_edge
+  exception: EdgeContractError
+  message: 'Edge from ''{}'' to ''{}'' invalid: producer schema ''{}'' incompatible with consumer schema
+    ''{}'': {}'
+  ordinal: 0
+  disposition: abstains
+  counterpart:
+  - edge_field_type_incompatible
+  note: 'Mirrored for ordinary producers — probed BOTH consumer kinds: source(value: str) -> transform(fixed
+    value: int) and source(value: str) -> sink(fixed value: int) are Stage-1 red with edge_field_type_incompatible
+    (_edge_field_type_conflict, called for node consumers at state.py ~4281 and for sink consumers at
+    ~4536), and the same conflict behind a boolean gate is still caught via producer walk-back; all three
+    controls green. Stage 1 ABSTAINS on fork-branch producers, emitting a warning instead (_walk_producer_entry_to_real_producer,
+    state.py ~2703-2793) — probed: a fixed-schema transform on a fork branch is Stage-1 is_valid=True
+    and Stage-2 red at schema_validation.py:282.'
+- key: 909faa5921a845ea
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_single_edge
+  exception: EdgeContractError
+  message: 'Schema contract violation: edge ''{}'' → ''{}'' Consumer ({}) requires fields: {} Producer
+    ({}) guarantees: {} Missing fields: {} Fix: Either: 1. Add missing fields'
+  ordinal: 0
+  disposition: abstains
+  counterpart:
+  - schema_contract_violation
+  note: 'Mirrored on the ordinary path and ABSTAINING on fork branches — probed BOTH with controls. Direct:
+    a consumer declaring required_input_fields [''absent_col''] on a csv source is Stage-1 red (schema_contract_violation,
+    emitted by the contract loop in CompositionState.validate, state.py ~4281) with Stage-2 raise-site
+    schema_validation.py:199. Move that same consumer onto a fork branch and Stage 1 goes is_valid=True
+    with only a WARNING ("Contract check skipped because fork gate ''g'' produces connection ''x''", _walk_producer_entry_to_real_producer,
+    state.py ~2703-2793) while Stage 2 still raises at schema_validation.py:199; both controls green.
+    Probed separately from its Phase-2 sibling because the two Stage-1 mirrors have different gates —
+    only the type mirror is gated on _producer_is_typed_source. elspeth-2ed41f0a4a census 2026-08-17'
+- key: 2cc6ea6e441c400b
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_single_edge
+  exception: GraphValidationError
+  message: 'Gate ''{}'' must preserve schema: input_schema={}, output_schema={}'
+  ordinal: 0
+  disposition: structural
+  note: 'Gates are true pass-throughs: the builder assigns a gate''s schema from its resolved upstream
+    producer (builder.py:963-1010 config-gate schema resolution) and there is no composer or YAML surface
+    that sets a gate''s input_schema separately from its output_schema. The guard at schema_validation.py:155-167
+    compares two values the builder derives from one source.'
+- key: 9ffa677af01761b5
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_sink_required_fields
+  exception: GraphValidationError
+  message: <call:_sink_required_violation_message>
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - sink_contract_violation
+- key: b4c68d796da04254
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_transform_declared_input_fields
+  exception: GraphValidationError
+  message: Transform '{}' (node '{}') requires input fields {} that its upstream '{}' does not guarantee
+    on the rows reaching it. The transform declares these from its own
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - schema_contract_violation
+- key: c49fdd8d392b5847
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_transform_output_field_collisions
+  exception: GraphValidationError
+  message: 'Transform ''{}'' (node ''{}'') declares output fields {} that its upstream ''{}'' already
+    guarantees on every row reaching it. The transform would overwrite existing '
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - transform_contract_violation
+- key: 864bb0595539ade6
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_transform_string_typed_input_fields
+  exception: GraphValidationError
+  message: 'Transform ''{}'' (node ''{}'') scans input fields that must be text, but its upstream ''{}''
+    declares them non-string: {}. The transform fails closed on any non-strin'
+  ordinal: 0
+  disposition: abstains
+  counterpart:
+  - transform_string_input_field_type_incompatible
+  note: Mirrored for typed-SOURCE producers via _string_input_field_type_conflict; transform/gate/coalesce
+    producers abstain (their runtime output schema may be computed, not the raw schema block) - the same
+    gate as _edge_field_type_conflict. Census 2026-08-17.
+- key: 1cef4a504ba4febf
+  path: src/elspeth/core/dag/wiring.py
+  qualname: WiredTransform.__post_init__
+  exception: GraphValidationError
+  message: 'WiredTransform mismatch: settings.plugin=''{}'' but plugin instance name=''{}''.'
+  ordinal: 0
+  disposition: structural
+  note: wiring.py:24 — WiredTransform pairs a plugin instance with its TransformSettings, and runtime_factory
+    instantiates the plugin FROM settings.plugin, so the two names cannot diverge for any authored pipeline.
+    A pure construction-site invariant.

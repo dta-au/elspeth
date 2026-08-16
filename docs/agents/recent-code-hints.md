@@ -8,6 +8,33 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-17 — a NEW runtime rejection needs a Stage-1 disposition (whole-tree
+  gate)**: `tests/unit/scripts/cicd/test_runtime_rejection_parity_gate.py`
+  AST-enumerates every `raise <Exception>(...)` under `src/elspeth/core/dag/`
+  and `src/elspeth/core/config.py` PLUS every declarative pydantic
+  `Field(min_length=/max_length=/gt=/...)` constraint on those settings
+  models, and requires each site to carry a reviewed disposition in
+  `config/cicd/runtime_rejection_parity.yaml` (`mirrored` with a real Stage-1
+  `error_code` or `fn:<validator>` counterpart, `abstains`, `structural`,
+  `not_authorable`, or `unmirrored` under a ratchet ceiling — 10 today,
+  elspeth-96e2dd023f). Adding a rule to the DAG builder or a settings
+  validator therefore fails the gate until you run
+  `.venv/bin/python scripts/cicd/runtime_rejection_parity.py --write` and
+  adjudicate the seeded entry — that is the point (elspeth-2ed41f0a4a: Shape
+  17 landed a runtime rule with nothing requiring its authoring counterpart).
+  Rewording a message re-keys the site (`--write` drops the stale entry and
+  seeds the new one; carry the adjudication across). Never hand-edit a `key`.
+  Sibling conventions landed with it: Stage 1 mirrors the runtime NAME/LABEL
+  rules by calling the runtime's own validators (`_composer_node_id_validation_message`,
+  `_routing_label_errors` -> `_validate_connection_or_sink_name` /
+  `validate_composer_output_name`), so fixture node ids/labels must be
+  runtime-valid (leading letter, <=38 chars, not `fork`/`continue`/`on_success`,
+  sinks lowercase) — a UUID or a gate named `fork` now fails Stage 1 exactly as
+  it fails `settings_load`; fix the FIXTURE, never relax the mirror. Coalesce
+  `merge: select` and `policy: quorum` are rejected as unauthorable (no
+  `select_branch`/`quorum_count` on NodeSpec); `best_effort` needs
+  `timeout_seconds`. Cycle detection (`_node_topology_cycle`) is whole-graph.
+
 - **2026-08-15 — commencement gate conditions have separate execution and
   audit forms**: only the raw configured expression enters `ExpressionParser`.
   Every `CommencementGateFailedError`, successful `CommencementGateResult`, and
