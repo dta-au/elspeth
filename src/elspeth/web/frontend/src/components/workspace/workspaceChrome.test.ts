@@ -85,12 +85,12 @@ describe("workspace inspector drawer (elspeth-4e54200207)", () => {
       "min(var(--workspace-inspector-width), 100%)",
     );
 
-    // The drawer spans the workspace's full height, and the artifact column
-    // has TWO occupants since the bar row became its own grid row
-    // (elspeth-9c94a58500): the artifact pane and the bar's artifact cell.
-    // Both must reserve, from ONE rule, or the bar's controls would be sliced
-    // by the drawer while the toolbar above them was not — the original
-    // defect, half-fixed.
+    // Exactly one occupant reserves: the artifact pane. The drawer occupies
+    // the pane row only (below), so the bottom bar's artifact cell runs its
+    // full width beneath the drawer and must NOT reserve — while it did
+    // (elspeth-b4e88f0f8c) the bar wrapped to three or four lines under an
+    // open drawer at every width up to 1600, and the whole bar row paid for
+    // that wrap in height.
     const reserve = rules.filter((rule) =>
       rule.selector.includes(".workspace-inspector:not([hidden])"),
     );
@@ -99,19 +99,42 @@ describe("workspace inspector drawer (elspeth-4e54200207)", () => {
       const compounds = selector.trim().split(/\s+/);
       return compounds[compounds.length - 1];
     });
-    expect(reserveTargets).toEqual([
-      ".workspace-artifact-pane",
-      ".workspace-action-bar-main",
-    ]);
+    expect(reserveTargets).toEqual([".workspace-artifact-pane"]);
     expect(reserve[0].declarations).toContain(
       "padding-right: var(--workspace-inspector-width);",
     );
 
     // Narrow mode moves the slot to the full width and the drawer becomes the
-    // view, so the reserve must not apply there — to either occupant.
-    for (const selector of reserve[0].selector.split(",")) {
-      expect(selector).toContain(':not([data-layout-mode="narrow"])');
-    }
+    // view, so the reserve must not apply there.
+    expect(reserve[0].selector).toContain(':not([data-layout-mode="narrow"])');
+  });
+
+  it("confines the drawer to the pane row and leaves the bottom bar beneath it (elspeth-b4e88f0f8c)", () => {
+    // The slot is a grid item in the artifact cell of the PANE row, not an
+    // absolutely-positioned box spanning the workspace — that is what keeps
+    // the drawer off the bar row. position: relative is load-bearing: the
+    // drawer inside is inset: 0 0 0 auto, and without a positioned slot that
+    // would resolve against the workspace root and span both rows again.
+    const slot = ".workspace-inspector-slot";
+    expect(declaration(slot, "position")).toBe("relative");
+    expect(declaration(slot, "grid-row")).toBe("1");
+    expect(declaration(slot, "grid-column")).toBe("2");
+    expect(ruleFor(slot)).not.toMatch(/(?:^|;)\s*(?:inset|top|bottom|left|right):/);
+    expect(declaration(".workspace-inspector", "inset")).toBe("0 0 0 auto");
+
+    // The collapsed state needs no override: column 1 is 0px wide then, so
+    // the artifact cell already starts at x=0. Narrow mode spans every row
+    // because there the drawer IS the view.
+    expect(
+      rules.some(
+        (rule) =>
+          rule.selector.includes('[data-authoring-collapsed="true"]') &&
+          rule.selector.includes(slot),
+      ),
+    ).toBe(false);
+    const narrowSlot = `.composer-workspace[data-layout-mode="narrow"] ${slot}`;
+    expect(declaration(narrowSlot, "grid-row")).toBe("1 / -1");
+    expect(declaration(narrowSlot, "grid-column")).toBe("1");
   });
 
   it("compresses both drawer bands with the shared workspace band token", () => {
@@ -218,30 +241,63 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
 });
 
 describe("workspace completion group (recut 2026-08-15, supersedes elspeth-c6fd722d2f)", () => {
+  const group = ".workspace-action-bar .completion-bar";
+
   it("isolates Run at the right edge from content-sized members", () => {
     // The equal-width co-equal contract retired 2026-08-15 (operator
     // decision): Run pipeline sits alone at the bar's right edge, registered
     // with the toolbar's Focus graph button through the shared
     // --artifact-gutter inline inset, while Save/Import cluster left. The
-    // group is the bar's filler and the auto margin on the Run button is
-    // what spends the free space as the isolating void. Members size to
-    // content (no grow), so the 2560 slab overshoot the old cap existed for
-    // cannot recur — which is also why the cap itself is gone.
-    const group = ".workspace-action-bar .completion-bar";
-    expect(declaration(group, "flex")).toBe("1 1 auto");
-    expect(declaration(`${group} > *`, "flex")).toBe("0 0 auto");
-    expect(
-      declaration(`${group} .side-rail-execute-btn`, "margin-inline-start"),
-    ).toBe("auto");
+    // group is the bar's filler and its flexible third column is the void
+    // that isolates Run — with the reason line in it when Run is gated,
+    // empty when it is not — so Run is pinned to the FOURTH column rather
+    // than auto-placed, or the ungated state would seat it beside Import.
+    // Members are auto tracks at their content width (justify-items: start),
+    // so the 2560 slab overshoot the old cap existed for cannot recur — which
+    // is also why the cap itself is gone.
+    expect(declaration(group, "display")).toBe("grid");
+    expect(declaration(group, "grid-template-columns")).toBe("auto auto 1fr auto");
+    expect(declaration(group, "justify-items")).toBe("start");
+    expect(declaration(`${group} .side-rail-execute-btn`, "grid-column")).toBe("4");
+    expect(declaration(`${group} .side-rail-execute-reason`, "grid-column")).toBe("3");
+    expect(declaration(`${group} > *`, "width")).toBe("auto");
     expect(ruleFor(group)).not.toContain("max-width");
+    // No auto margins survive from the flex row: the column is the void.
+    for (const rule of rules.filter((candidate) => candidate.selector.startsWith(group))) {
+      expect(rule.declarations).not.toMatch(/margin[a-z-]*:\s*auto/);
+    }
+  });
+
+  it("keeps the reason beside Run and lets it absorb the squeeze (elspeth-b4e88f0f8c)", () => {
+    // A wrapping flex row broke lines by each item's MAX-content, so the whole
+    // group moved under the chips before the reason line had yielded a pixel
+    // and no measure cap could change that. In a one-row grid the reason and
+    // Run cannot part, the reason's 1fr column is the only thing that shrinks,
+    // and the group's minimum size — buttons plus the reason's 16ch floor —
+    // is what the OUTER bar reads when it decides whether the group fits
+    // beside the chips, because flex-basis 0 presents the automatic minimum
+    // rather than the max-content. Basis auto (the previous value) wrapped the
+    // group at 1280 unconditionally.
+    expect(declaration(group, "flex")).toBe("1 1 0");
+    expect(ruleFor(group)).not.toMatch(/(?:^|;)\s*min-width:/);
+    const reason = `${group} .side-rail-execute-reason`;
+    expect(declaration(reason, "min-width")).toBe("16ch");
+    expect(declaration(reason, "max-width")).toBe("44ch");
+    expect(declaration(reason, "justify-self")).toBe("end");
+    expect(declaration(reason, "text-align")).toBe("end");
+    // The reason-to-Run gap is one grid gap plus one, keyed on the adjacency
+    // ExecuteButton's DOM order guarantees (the <p> precedes the button).
+    expect(
+      declaration(`${reason} + .side-rail-execute-btn`, "margin-inline-start"),
+    ).toBe("var(--workspace-bar-gap)");
   });
 
   it("keeps the bar's composition stable when the middle group is absent", () => {
     // space-between would change the arrangement depending on whether guided
     // mode rendered a completion bar. flex-start keeps status and the
     // Save/Import cluster as one left-anchored run; the completion group's
-    // own grow + Run's auto margin (above) are what hold the right edge, and
-    // they do it identically whether or not the status cluster renders.
+    // own grow and its flexible column (above) are what hold the right edge,
+    // and they do it identically whether or not the status cluster renders.
     expect(declaration(".workspace-action-bar", "justify-content")).toBe(
       "flex-start",
     );
@@ -273,10 +329,15 @@ describe("workspace completion group (recut 2026-08-15, supersedes elspeth-c6fd7
   it("centers the members instead of stretching them to the bar's height", () => {
     // elspeth-929fc5d4a7: .completion-bar carries align-items: stretch for its
     // vertical rail layout, which in this row context stretched each button to
-    // the bar's full height — a 98px slab whenever the bar wrapped.
-    expect(
-      declaration(".workspace-action-bar .completion-bar", "align-items"),
-    ).toBe("center");
+    // the bar's full height — a 98px slab whenever the bar wrapped. And since
+    // the reason line can make the group taller than a control row, the bar
+    // must centre its groups too (elspeth-b4e88f0f8c): the buttons sit at
+    // (H - 44) / 2 inside the group, and only a centred status group lands
+    // at the same offset. flex-start was right while the group's buttons sat
+    // at ITS top (elspeth-15e8cff7a5); it would now misregister the chips by
+    // the same half-difference from the other side.
+    expect(declaration(group, "align-items")).toBe("center");
+    expect(declaration(".workspace-action-bar", "align-items")).toBe("center");
   });
 });
 
@@ -366,15 +427,17 @@ describe("workspace bottom edge (elspeth-215c989bed, elspeth-9c94a58500)", () =>
     ).toBe("3");
   });
 
-  it("seats the collapse control in the row's authoring cell, registered with the bar's first line", () => {
+  it("seats the collapse control in the row's authoring cell, centred like the bar's controls", () => {
     // The « control is a child of the bar row now (it had to be: in narrow
     // Compose view the action bar is hidden and the control alone gives the
-    // row its height). Column 1 is the authoring cell; align-self: start is
-    // what puts it on the bar's first line when the bar is taller than one
-    // control row, which the bar itself achieves with align-items: flex-start.
+    // row its height). Column 1 is the authoring cell. Its block alignment
+    // must be the SAME as the bar's cross-axis alignment: the bar centres its
+    // groups against a reason-tall completion group (elspeth-b4e88f0f8c), so
+    // a start-aligned control would sit above the buttons by half the
+    // difference — the seam misregistration again, one cell over.
     expect(declaration(".workspace-collapse-control", "grid-column")).toBe("1");
-    expect(declaration(".workspace-collapse-control", "align-self")).toBe("start");
-    expect(declaration(".workspace-action-bar", "align-items")).toBe("flex-start");
+    expect(declaration(".workspace-collapse-control", "align-self")).toBe("center");
+    expect(declaration(".workspace-action-bar", "align-items")).toBe("center");
     expect(declaration(".workspace-action-bar-main", "grid-column")).toBe("2");
   });
 
@@ -383,13 +446,16 @@ describe("workspace bottom edge (elspeth-215c989bed, elspeth-9c94a58500)", () =>
     // density regime's --workspace-bar-inset override would tighten it twice.
     // The bar's padding and the control's margin are the only two carriers
     // (both pinned to the token in the rhythm describe above); neither the
-    // wrapper nor the artifact cell has any. (The cell's inspector-open
-    // padding-right lives in the reserve rule pinned above — an inline
-    // reservation, not a block-axis standoff.)
+    // wrapper nor the artifact cell has any — the cell no longer reserves for
+    // the inspector drawer either (elspeth-b4e88f0f8c), so no rule anywhere
+    // pads it.
     expect(ruleFor(slot)).not.toMatch(/(?:^|;)\s*padding[a-z-]*:/);
-    expect(ruleFor(".workspace-action-bar-main")).not.toMatch(
-      /(?:^|;)\s*padding[a-z-]*:/,
-    );
+    expect(
+      rules
+        .filter((rule) => rule.selector.split(",").some((s) => s.trim().endsWith(".workspace-action-bar-main")))
+        .map((rule) => rule.declarations)
+        .join(""),
+    ).not.toMatch(/(?:^|;)\s*padding[a-z-]*:/);
   });
 });
 

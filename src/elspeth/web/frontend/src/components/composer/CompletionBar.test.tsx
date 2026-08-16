@@ -73,18 +73,21 @@ describe("CompletionBar", () => {
       "utf8",
     );
 
+    // In the workspace action bar the group is a one-row GRID (Save | Import |
+    // reason | Run — elspeth-b4e88f0f8c) that overrides the rail's vertical
+    // flex column; the rail's own rule must stay a column, so the override is
+    // scoped to the bar. workspaceChrome.test.ts pins the full contract; this
+    // pin only keeps the override scoped.
     expect(css).toMatch(
-      /\.workspace-action-bar\s+\.completion-bar\s*\{[^}]*flex-direction:\s*row;[^}]*flex-wrap:\s*wrap;[^}]*padding:\s*0;/s,
+      /\.workspace-action-bar\s+\.completion-bar\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*auto auto 1fr auto;[^}]*padding:\s*0;/s,
     );
-    // Recut 2026-08-15: members are content-sized (no grow) and Run is
-    // pushed to the bar's right edge by its auto inline-start margin —
-    // workspaceChrome.test.ts pins the full contract; this pin only keeps
-    // the override scoped to the workspace action bar.
+    // Recut 2026-08-15: members are content-sized — sidebar.css's width: 100%
+    // is undone here, inside the bar only.
     expect(css).toMatch(
-      /\.workspace-action-bar\s+\.completion-bar\s*>\s*\*\s*\{[^}]*flex:\s*0 0 auto;[^}]*width:\s*auto;/s,
+      /\.workspace-action-bar\s+\.completion-bar\s*>\s*\*\s*\{[^}]*width:\s*auto;/s,
     );
     expect(css).not.toMatch(
-      /(?:^|\n)\.completion-bar\s*\{[^}]*flex-direction:\s*row;/s,
+      /(?:^|\n)\.completion-bar\s*\{[^}]*(?:flex-direction:\s*row|display:\s*grid);/s,
     );
   });
 

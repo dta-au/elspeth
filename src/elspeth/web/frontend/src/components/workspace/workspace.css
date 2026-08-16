@@ -8,7 +8,10 @@
      vanished and the primary action was cut mid-word at the drawer's left
      border (elspeth-4e54200207). Deliberately not a grid column — at 1280 a
      360px authoring pane plus a 512px column leaves 408px, under the 640px
-     ARTIFACT_MIN the pane bounds are built on. */
+     ARTIFACT_MIN the pane bounds are built on. It IS confined to the pane
+     row (elspeth-b4e88f0f8c): the drawer's slot is a grid item on row 1, so
+     the bottom bar keeps its full width beneath the drawer and only the
+     artifact pane reserves this measure. */
   --workspace-inspector-width: 512px;
 
   /* Action-bar rhythm. ONE pair of values feeds every gap and standoff in the
@@ -293,18 +296,20 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--workspace-bar-gap);
-  /* flex-start, NOT center (elspeth-15e8cff7a5). The bar's two groups are not
-     the same height: .completion-bar carries ExecuteButton's block-reason line
-     as a fourth, full-width flex item (see .side-rail-execute-reason below), so
-     it measures 70px against .workspace-status-controls' 44px whenever Run is
-     gated — which is the DEFAULT state of any unvalidated pipeline, blank ones
-     included. Centering two unequal groups pushed the status chips down by half
-     the difference, (70 - 44) / 2 = 13px, and the row read as two bars that
-     failed to align. Top-alignment registers the chips with the buttons on the
-     bar's first line and leaves the reason line hanging below them, which is
-     where it belongs. In the ungated state both groups are --size-control tall
-     and flex-start and center resolve identically, so this is not a trade. */
-  align-items: flex-start;
+  /* center — and it was flex-start, deliberately, for a reason that no longer
+     holds (elspeth-15e8cff7a5). Then, .completion-bar was a wrapping flex row
+     that carried ExecuteButton's block-reason line as a fourth item on a
+     second flex line BELOW the buttons, so the group was 70px with its buttons
+     at the TOP; centring the 44px status group against it pushed the chips
+     down (70 - 44) / 2 = 13px and the row read as two bars that failed to
+     align. Now the group is a one-row grid whose members are centred within
+     it (below), so whenever the reason makes the group taller than a control
+     row its buttons sit at (H - 44) / 2 — and centring the chips against the
+     group puts them at exactly that offset. flex-start would leave the chips
+     at the top while the buttons sat lower: the same misregistration, from
+     the other side. In the ungated state both groups are --size-control tall
+     and the two values resolve identically. */
+  align-items: center;
   /* justify-content: space-between used to sit here and was INERT — the
      uncapped completion group absorbed every pixel of free space, so there was
      never any to distribute. Capping that group (elspeth-c6fd722d2f) makes the
@@ -325,75 +330,80 @@
 
 /* Completion actions in the horizontal bar (recut 2026-08-15, operator
    decision): Run pipeline is ISOLATED at the bar's right edge while Save and
-   Import stay clustered on the left beside the status chips. The group is
-   the bar's filler (flex: 1 1 auto) and the auto inline-start margin on the
-   Run button spends that space as a void between the neutral verbs and the
-   consequential one. Because the bar and the artifact toolbar share the same
-   --artifact-gutter inline inset (elspeth-87195dda2c), Run's right edge
-   registers with the toolbar's Focus graph button above it. This supersedes
-   the equal-width co-equal contract (elspeth-c6fd722d2f): members now size
-   to content (flex: 0 0 auto), so the 2560 slab overshoot that contract's
-   cap existed to stop cannot recur — no member grows at all. DOM order is
-   Save → Import → Run (CompletionBar.tsx) so the visual order stays the tab
-   order with no CSS `order` on interactive controls.
+   Import stay clustered on the left beside the status chips. Because the bar
+   and the artifact toolbar share the same --artifact-gutter inline inset
+   (elspeth-87195dda2c), Run's right edge registers with the toolbar's Focus
+   graph button above it. This supersedes the equal-width co-equal contract
+   (elspeth-c6fd722d2f): members size to content, so the 2560 slab overshoot
+   that contract's cap existed to stop cannot recur. DOM order is Save →
+   Import → Run (CompletionBar.tsx) so the visual order stays the tab order
+   with no CSS `order` on interactive controls.
 
-   align-items: center is load-bearing: .completion-bar carries
+   The group is a ONE-ROW GRID, not a wrapping flex row (elspeth-b4e88f0f8c):
+   Save | Import | the reason line | Run, with the reason's column the only
+   flexible one. Two things follow that a flex row could not deliver. First,
+   the reason and Run are always on the same line — the pair the 2026-08-16
+   operator decision asks for — because a grid row cannot wrap; a flex row
+   broke lines by each item's max-content size, so it moved the WHOLE group
+   under the chips (or Run alone onto a second line) before the reason had
+   yielded a single pixel, and no measure cap on the reason could change that
+   order of events. Second, the reason absorbs the squeeze: its 1fr column
+   shrinks as the bar narrows and the text wraps within it, and two or three
+   wrapped lines are shorter than or close to the 44px buttons, so the bar
+   stays one control row where it used to double (measured at the default
+   360px pane, gated: 1280 wide 113 → 61px, 1366 113 → 61, 1440 with the
+   validation-errors reason 113 → 61). Its floor is 16ch (below): narrower
+   than that a reason is a ransom note, so the group's minimum size includes
+   the floor and the OUTER bar wraps the group under the chips instead — with
+   the reason still beside Run on that line — which is what happens at 1280
+   with the pane widened to 420, at 1024, and for a reason carrying an
+   unbreakable token wider than the floor.
+
+   flex: 1 1 0 on the group is what makes the outer bar keep it beside the
+   chips: a flex item's hypothetical size is its flex-basis clamped by its
+   automatic minimum, so with basis 0 the bar sees the group's MIN-content
+   (buttons + the reason's floor), not its max-content, when it decides
+   whether the group fits on the chips' line. Basis auto (the previous value)
+   presented the max-content and wrapped the group at 1280 unconditionally.
+   The auto margins that used to isolate Run and anchor Save/Import are gone
+   with the flex row: the 1fr column IS the void between the left cluster and
+   Run, whether or not a reason is in it, and Save/Import are placed by their
+   auto tracks.
+
+   align-items: center is load-bearing on two counts. .completion-bar carries
    align-items: stretch for its vertical rail layout, which in this row
-   context stretched each button to the bar's full height — a 98px slab
-   whenever the bar wrapped (elspeth-929fc5d4a7). */
+   context stretched each button to the group's full height — a 98px slab
+   (elspeth-929fc5d4a7); and it is what centres the buttons against a
+   multi-line reason so that .workspace-action-bar's own centring (above)
+   registers the chips with them. justify-items: start keeps auto-track
+   members at their content width rather than stretched to the track. */
 .workspace-action-bar .completion-bar {
-  flex: 1 1 auto;
-  flex-direction: row;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: auto auto 1fr auto;
   gap: var(--workspace-bar-gap);
-  /* flex-end is the WRAPPED-LINE rule, and it is inert on any line an auto
-     margin already governs — auto margins eat free space before
-     justify-content sees it, so on the unwrapped line Save/Import still sit
-     left. It exists for the lines that have no auto margin: once the reason
-     line moved beside Run (2026-08-16) the adjacency rule below hands Run a
-     plain gap instead of its auto margin, which is right while the two share a
-     line and wrong the moment they wrap apart — Run landed at the LEFT edge of
-     the next line, losing the right-edge isolation the 2026-08-15 recut exists
-     to give it (caught by the inspector-open-1280x720 visual baseline, which is
-     the one baseline that renders a gated Run). flex-end restores the right
-     edge on every line, wrapped or not, without a wrapper element — and
-     .completion-bar cannot gain one, since the no-wrapper shape is what
-     elspeth-929fc5d4a7 fixed. */
-  justify-content: flex-end;
   align-items: center;
+  justify-items: start;
+  flex: 1 1 0;
   padding: 0;
 }
 
+/* sidebar.css sizes the rail's members to width: 100% for the vertical
+   layout; in the grid every member is content-sized. */
 .workspace-action-bar .completion-bar > * {
-  flex: 0 0 auto;
   width: auto;
 }
 
+/* Explicit column, not auto-placement: with no reason line in the group Run
+   would otherwise auto-place into the flexible third column and sit beside
+   Import. Pinning it to the fourth keeps the void between the clusters in
+   both the gated and the ungated state. */
 .workspace-action-bar .completion-bar .side-rail-execute-btn {
-  margin-inline-start: auto;
-}
-
-/* The left cluster ends here, and saying so with an auto margin is what keeps
-   Save/Import anchored LEFT on whatever line they end up on. Without it,
-   justify-content: flex-end above right-aligns them the moment the group wraps
-   and they no longer share a line with an auto margin — which is a real state
-   (1280 with the inspector open) and contradicts the recut's "Save/Import stay
-   in the left cluster". Auto margins resolve per FLEX LINE, which is exactly
-   why this works where justify-content alone cannot: this one governs the line
-   the left cluster is on, flex-end governs the lines it is not on.
-
-   On the unwrapped line it also does the isolating job on its own — it eats all
-   the free space, so the reason and Run are carried to the right edge together
-   and Run's own auto margin has nothing left to spend. In the ungated state
-   (no reason line) this margin and Run's auto margin split a gap that is
-   contiguous anyway, so Run still lands on the right edge exactly as before. */
-.workspace-action-bar .completion-bar .side-rail-import-yaml-btn {
-  margin-inline-end: auto;
+  grid-column: 4;
 }
 
 /* The run-gate reason line is part of ExecuteButton's fragment and, now that
    CompletionBar renders the three verbs as DIRECT children (no wrapper divs),
-   it is a flex item of this row. Riding INSIDE the Run column was what made
+   it is a member of this group. Riding INSIDE the Run column was what made
    that column ~98px and dragged its siblings with it (elspeth-929fc5d4a7).
    The fix for that gave it its own full-width line BELOW the buttons, which
    worked but made the bar's height variable, and two consumers had assumed it
@@ -401,29 +411,35 @@
 
    Operator decision 2026-08-16: the line sits to Run's LEFT, on the same line,
    vertically centred against it. ExecuteButton emits the <p> BEFORE the button
-   so this is DOM order, not a CSS `order` lift. Three things make it hold:
+   so this is DOM order, not a CSS `order` lift; the grid places it in the
+   flexible third column, right-aligned against Run (justify-self: end,
+   text-align: end), so it hugs the button it explains at every width.
 
-   `flex: 0 1 auto` lets it shrink rather than shove the buttons, which never
-   shrink (`> *` is flex: 0 0 auto above). `max-width: 44ch` is the load-bearing
-   one: the `readiness` reason is an ARBITRARY-LENGTH backend string
-   (readiness.blockers[0].detail, ExecuteButton.tsx), so without a measure cap a
-   long blocker detail eats the row and pushes Save/Import onto their own line.
-   Capped, it wraps within its own column instead, and because two wrapped lines
-   (36px) are still shorter than the 44px buttons the bar does not grow at all —
-   it only grows past three lines, which is the honest cost of a very long
-   backend message. Measured at 1920/1600/1440: 61px bar for the built-in
-   reasons, 71px for a 150-character one, buttons never displaced.
-
-   The reason carries no auto margin of its own: Import's margin-inline-end
-   (above) is what spends the free space, so the reason and Run ride to the
-   right edge together as a pair, and the adjacency rule below gives Run a plain
-   gap so the space is not split between two competing auto margins. */
+   The two measures bound the column, and both are load-bearing. `max-width:
+   44ch`: the `readiness` reason is an ARBITRARY-LENGTH backend string
+   (readiness.blockers[0].detail, ExecuteButton.tsx), so without a cap a long
+   blocker detail would take the whole void and read as a paragraph; capped, it
+   wraps within its own column, and two wrapped lines (36px) are still shorter
+   than the 44px buttons so the bar does not grow at all — it grows past three
+   lines, the honest cost of a very long message. `min-width: 16ch` is the
+   floor the group's own comment describes: it is what the group's minimum
+   size includes, so a bar too narrow to give the reason 16ch wraps the group
+   under the chips rather than squeezing the text into a ransom note. Between
+   the two the column takes whatever the row leaves it. text-wrap: balance
+   evens the wrapped lines (progressive; no effect on a one-line reason and
+   none on the column's size), so a two-line reason does not orphan its last
+   word at exactly the width where it first wraps. */
 .workspace-action-bar .completion-bar .side-rail-execute-reason {
-  flex: 0 1 auto;
+  grid-column: 3;
+  justify-self: end;
+  min-width: 16ch;
   max-width: 44ch;
   text-align: end;
+  text-wrap: balance;
 }
 
+/* Reason-to-Run spacing is one grid gap plus one more: the reason is text
+   with no box of its own, so a single gap read as the button crowding it. */
 .workspace-action-bar
   .completion-bar
   .side-rail-execute-reason
@@ -542,15 +558,20 @@
 }
 
 /* The « control is the bar row's authoring-column cell (see
-   .workspace-action-bar-slot): right-aligned against the seam, top-aligned
-   with the action bar's controls in the cell beside it. justify-self: end
-   keeps it where the pane's flex-end used to put it; align-self: start is what
-   registers it with the bar's first line when the bar is taller than one
-   control row (the bar itself is align-items: flex-start for the same reason),
-   which the old bottom-anchored placement could not do. */
+   .workspace-action-bar-slot): right-aligned against the seam, centred on
+   the row like every control in the cell beside it. justify-self: end keeps
+   it where the pane's flex-end used to put it. align-self: center is the
+   registration: the bar centres its groups and the completion group centres
+   its members (elspeth-b4e88f0f8c), so when a multi-line reason makes the bar
+   taller than one control row every control sits at (H - 44) / 2 — and so
+   does this one, with the same margin above and below. It was align-self:
+   start when the bar was flex-start, registered with the first line and
+   leaving the rest of the row empty beneath it; the two moved together. In
+   the one state where the bar still holds two lines (the completion group
+   wrapped under the chips) the control centres between them. */
 .workspace-collapse-control {
   grid-column: 1;
-  align-self: start;
+  align-self: center;
   justify-self: end;
 
   /* Vertical registration with the action bar across the divider: both take
@@ -803,11 +824,28 @@
    elspeth-9c94a58500 (it is an in-flow box now — see .workspace-action-bar),
    which also retired the one-step-raised token the collapsed affordance
    needed to out-paint it. Everything stays below --z-catalog (40) and
-   --z-overlay (100), as before (elspeth-cf4b08e271). */
+   --z-overlay (100), as before (elspeth-cf4b08e271).
+
+   The slot is a GRID ITEM on the pane row — the artifact cell, over the
+   artifact slot — not an absolutely-positioned box over the whole workspace
+   (elspeth-b4e88f0f8c). Spanning the full height meant the drawer covered
+   the bottom bar's artifact cell too, so that cell reserved the drawer's
+   512px strip alongside the pane and the bar wrapped to three or four lines
+   under an open drawer at every width up to 1600 — a wrap the whole row then
+   paid for in height. On the pane row the drawer stops at the bar's rule,
+   the bar keeps its full width beneath it, and only the pane reserves. The
+   cell is the same region the old inset described (from the pane's edge to
+   the right, and from x=0 with the pane collapsed, because column 1 is 0px
+   then), so nothing horizontal changes; position: relative is what makes
+   the slot the drawer's containing block, or its inset: 0 0 0 auto would
+   resolve against the workspace root and span both rows again. Narrow mode
+   spans every row (tabs, view, bar), as the full-height inset did there,
+   because in narrow mode the drawer IS the view. */
 .workspace-inspector-slot {
-  position: absolute;
+  position: relative;
   z-index: var(--z-panel-controls);
-  inset: 0 0 0 var(--authoring-pane-width);
+  grid-row: 1;
+  grid-column: 2;
   min-width: 0;
   min-height: 0;
   pointer-events: none;
@@ -817,28 +855,22 @@
   pointer-events: auto;
 }
 
-.composer-workspace[data-authoring-collapsed="true"]
-  .workspace-inspector-slot,
 .composer-workspace[data-layout-mode="narrow"] .workspace-inspector-slot {
-  left: 0;
+  grid-row: 1 / -1;
+  grid-column: 1;
 }
 
 /* Reserve the drawer's strip in the artifact column while it is open, so the
-   toolbar and the action bar lay out inside the UNOCCLUDED region instead of
-   being sliced by an overlay with no scrim. The drawer spans the workspace's
-   full height, so the column has TWO occupants that reserve — the artifact
-   pane in the pane row and the bar's artifact cell in the bar row — and they
-   reserve from the one measure the drawer is drawn at, in one rule. Excluded
-   in narrow mode, where the slot spans the full width and the drawer is the
-   view (elspeth-4e54200207). */
+   toolbar lays out inside the UNOCCLUDED region instead of being sliced by an
+   overlay with no scrim, from the one measure the drawer is drawn at. The
+   pane is the drawer's only neighbour: the drawer occupies the pane row and
+   the bottom bar runs full width beneath it (elspeth-b4e88f0f8c), so the bar
+   reserves nothing. Excluded in narrow mode, where the slot spans the full
+   width and the drawer is the view (elspeth-4e54200207). */
 .composer-workspace:not([data-layout-mode="narrow"]):has(
     .workspace-inspector:not([hidden])
   )
-  .workspace-artifact-pane,
-.composer-workspace:not([data-layout-mode="narrow"]):has(
-    .workspace-inspector:not([hidden])
-  )
-  .workspace-action-bar-main {
+  .workspace-artifact-pane {
   padding-right: var(--workspace-inspector-width);
 }
 
