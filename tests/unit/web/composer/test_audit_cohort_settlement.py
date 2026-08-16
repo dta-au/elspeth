@@ -184,7 +184,7 @@ class _InsertInjector:
             self.calls += 1
             if self.fail_at is not None and index == self.fail_at:
                 self.fired = True
-                raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))
+                raise OperationalError("injected chat-message insert failure", {}, Exception("db unavailable"))
             return self._original(conn, **kwargs)
 
         monkeypatch.setattr(self.sessions_service, "_insert_chat_message", _flaky_insert)
@@ -500,7 +500,7 @@ class _GatedInsert:
                     raise TimeoutError("test worker was never released")
             if self.fail_after_release_at is not None and index == self.fail_after_release_at:
                 self.fired = True
-                raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))
+                raise OperationalError("injected chat-message insert failure", {}, Exception("db unavailable"))
             return self._original(conn, **kwargs)
 
         monkeypatch.setattr(self.sessions_service, "_insert_chat_message", _gated_insert)
