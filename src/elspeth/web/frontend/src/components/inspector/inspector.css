@@ -57,7 +57,11 @@
   top: 100%;
   left: 0;
   margin-top: var(--space-xs);
-  min-width: 260px;
+  /* 360, not 260 (operator request 2026-08-16): a row reads
+     "v16 (current) · 3 nodes · no visible change · 22h ago", ~330px at the
+     xs font, so at 260 the count wrapped to two lines and the operation
+     label ellipsized to "no visible c…" on every current row. */
+  min-width: 360px;
   max-height: 240px;
   overflow-y: auto;
   background-color: var(--color-surface-elevated);
@@ -98,7 +102,9 @@
 }
 
 .version-selector-item-label {
+  flex: 0 0 auto;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .version-selector-item-tag {
@@ -107,17 +113,26 @@
   margin-left: var(--space-xs);
 }
 
+/* Every cell of a row stays on one line. The node count and the timestamp are
+   short fixed phrases and never give way; the operation label below is the
+   ONE cell that absorbs a tight row, by ellipsis — so a long tool name
+   shortens itself instead of pushing "3 nodes" onto a second line. */
 .version-selector-item-meta {
+  flex: 0 0 auto;
   color: var(--color-text-muted);
+  white-space: nowrap;
 }
 
 /* Operation label ("Applied: upsert_edge", "Reverted to v2", …) — kept to
-   one line so long tool names cannot wrap the 260px dropdown rows. */
+   one line so long tool names cannot wrap the dropdown rows; it is the row's
+   only shrinking cell (min-width: 0 lets a flex item shrink below its
+   nowrap content, which is what makes the ellipsis reachable). */
 .version-selector-item-op {
+  flex: 0 1 auto;
+  min-width: 0;
   max-width: 150px;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* Bookkeeping snapshots (content identical to the previous version): de-
