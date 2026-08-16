@@ -134,9 +134,32 @@ def _shape_token(plugin: str | None) -> str | None:
 
 
 def _extract_source(yaml_doc: dict[str, Any]) -> dict[str, Any]:
-    """Pull source kind + path + observed schema fields."""
-    src = yaml_doc.get("source") or {}
+    """Pull the default source's kind + path + observed schema fields.
+
+    ELSPETH settings declare ``sources:`` as a name → spec map (ADR-025);
+    the legacy singular ``source:`` is still accepted as a fallback. The
+    first declared source is the default one for chain/column criteria;
+    ``source_count`` records how many were declared so a caller can tell a
+    multi-source example apart.
+
+    A settings document with no source plugin is an error, not an empty
+    dict: a structural target with a ``None`` source silently weakens every
+    criterion derived from it (verified 2026-08-16 — every example returned
+    ``None`` while this function read only the singular key).
+    """
+    source_name: str | None = None
+    sources = yaml_doc.get("sources")
+    if isinstance(sources, dict) and sources:
+        source_name, first = next(iter(sources.items()))
+        src = first if isinstance(first, dict) else {}
+        source_count = len(sources)
+    else:
+        legacy = yaml_doc.get("source")
+        src = legacy if isinstance(legacy, dict) else {}
+        source_count = 1 if src else 0
     plugin = src.get("plugin")
+    if not isinstance(plugin, str) or not plugin:
+        raise ValueError("settings declare no source plugin (expected `sources: {<name>: {plugin: ...}}`)")
     options = src.get("options") or {}
     schema = options.get("schema") or {}
     fields_raw = schema.get("fields") or []
@@ -151,6 +174,8 @@ def _extract_source(yaml_doc: dict[str, Any]) -> dict[str, Any]:
                 columns.append(name)
 
     return {
+        "name": source_name,
+        "source_count": source_count,
         "plugin": plugin,
         "shape_token": _shape_token(plugin),
         "path": options.get("path"),

@@ -683,9 +683,12 @@ mutation-test-the-guard:
 
 ### Implementation obligations (verified 2026-08-16)
 
-- Fix `scenario_from_example._extract_source` for the plural `sources:` dict
-  and make an absent source a hard error (all 20 examples currently return
-  `None`, silently); normalise `fork`→`gate` in the cross-check.
+- ~~Fix `scenario_from_example._extract_source` for the plural `sources:` dict
+  and make an absent source a hard error~~ — **landed 2026-08-16** (reads the
+  first declared source, records `name`/`source_count`, raises on a null
+  plugin; a truth-test pins every plain example). ~~`fork`→`gate`~~ — landed as
+  a `fork`→`gate` alias in `composer_rgr_score._SHAPE_TOKEN_ALIASES`, so the
+  cross-check needs no extra normalisation.
 - Give the RGR tool-row helpers public names before importing them.
 - Author `battery_score.topology_from_arguments`, the isomorphism
   comparator, and the `sources["source"]` mapping (no comparator exists for
@@ -696,6 +699,15 @@ mutation-test-the-guard:
 - Confirm `status: APPROVAL_REQUIRED` survives redaction (latent class).
 - Verify at calibration: advisor discriminator; `create_blob` vs
   `inline_blob` behaviour; `messages_hash` stability.
+- Do not cross-check the scorer's repair count against
+  `composer_meta.repair_turns_used` — it is hard-capped 0..2
+  (`composer/protocol.py`), corroboration at best.
+- Every audit-grade `GET /messages` page writes an `audit_access_log` row —
+  harmless, but pagination multiplies it; expected, not a defect.
+- If `composer_skill_hash` is null (no review in the session), the blob
+  record's `creating_composer_skill_hash` (`contracts/blobs.py`) is a
+  candidate second source; confirm it is exposed on a read API before
+  depending on it.
 
 ## Out of scope (v1)
 

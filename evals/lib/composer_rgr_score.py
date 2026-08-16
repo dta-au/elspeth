@@ -128,6 +128,11 @@ def _normalise_plugin_token(value: Any) -> str:
 _SHAPE_TOKEN_ALIASES: dict[str, frozenset[str]] = {
     "batch": frozenset({"stats"}),
     "content_safety": frozenset({"moderation"}),
+    # A fork is a ``gate`` node with ``fork_to`` — there is no "fork" node_type
+    # (web/composer/pipeline_planner.py). Scenario generation emits ``fork`` as
+    # the shape token for such gates; without this alias no real state could
+    # ever satisfy a fork chain/kind criterion (verified 2026-08-16).
+    "fork": frozenset({"gate"}),
     "json": frozenset({"jsonl"}),
     "rag": frozenset({"chroma"}),
 }

@@ -1081,3 +1081,50 @@ class TestPersistedToolCallCountStat:
         messages = [_msg("user", "hi"), _msg("assistant", "what do you want?")]
         result = score(scenario=_scenario(), messages=messages, state=_state_valid())
         assert result["stats"]["persisted_tool_call_count"] == 0
+
+
+# --------------------------------------------------------------------------
+# fork shape token — a fork is a gate node with fork_to; there is no fork node_type
+# --------------------------------------------------------------------------
+
+
+class TestForkTokenAlias:
+    def _fork_state(self) -> dict[str, Any]:
+        return _state_valid(
+            nodes=[
+                {"id": "fork_gate", "node_type": "gate", "plugin": None, "routes": {"true": "fork"}, "fork_to": ["path_a", "path_b"]},
+                {"id": "merge_results", "node_type": "coalesce", "plugin": None},
+            ],
+        )
+
+    def test_fork_chain_token_matches_a_real_gate_node(self) -> None:
+        """Scenario generation emits ``fork`` for fork gates; the composer authors a ``gate`` node."""
+        result = score(
+            scenario=_scenario(green={"must_have_node_chain_in_order": ["csv", "fork", "coalesce"]}),
+            messages=[_msg("assistant", "ok")],
+            state=self._fork_state(),
+        )
+        assert result["verdict"] == "GREEN", result["amber_reasons"]
+
+    def test_fork_kind_token_matches_a_real_gate_node(self) -> None:
+        result = score(
+            scenario=_scenario(green={"must_have_node_kinds_substring_any_of": [["fork", "coalesce"]]}),
+            messages=[_msg("assistant", "ok")],
+            state=self._fork_state(),
+        )
+        assert result["verdict"] == "GREEN", result["amber_reasons"]
+
+    def test_fork_chain_still_fails_without_a_gate(self) -> None:
+        """Control: the alias must not make ``fork`` match arbitrary nodes."""
+        result = score(
+            scenario=_scenario(green={"must_have_node_chain_in_order": ["csv", "fork", "coalesce"]}),
+            messages=[_msg("assistant", "ok")],
+            state=_state_valid(
+                nodes=[
+                    {"id": "n0", "node_type": "transform", "plugin": "passthrough"},
+                    {"id": "n1", "node_type": "coalesce", "plugin": None},
+                ]
+            ),
+        )
+        assert result["verdict"] == "AMBER"
+        assert any("'fork'" in r for r in result["amber_reasons"])
