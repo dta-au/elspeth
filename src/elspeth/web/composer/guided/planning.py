@@ -606,6 +606,60 @@ def _resolve_edge_routing_authority(
     )
 
 
+#: Edge types that mirror a scalar routing slot when they target a declared
+#: sink. ``sink_edge_route_mismatch`` checks exactly these; the two failure
+#: routes (``on_validation_failure``/``on_write_failure``) leave the graph and
+#: have no mirror axis at all.
+_SINK_MIRROR_EDGE_TYPES = frozenset({"on_success", "on_error", "route_true", "route_false", "fork"})
+_GATE_ROUTE_MIRROR_EDGE_TYPES: Mapping[str, str] = {"true": "route_true", "false": "route_false"}
+
+
+def _sink_mirror_edge_type(routing: GuidedEdgeRoutingAuthority) -> str | None:
+    """Return the edge type mirroring one routing scalar, or None when it has none."""
+
+    if routing.field in ("on_success", "on_error"):
+        return routing.field
+    if routing.field == "routes":
+        if routing.route_key is None or routing.route_key not in _GATE_ROUTE_MIRROR_EDGE_TYPES:
+            return None
+        return _GATE_ROUTE_MIRROR_EDGE_TYPES[routing.route_key]
+    if routing.field == "fork_to":
+        return "fork"
+    return None
+
+
+def _draft_output_names(pipeline: _MutablePipelineDraft) -> frozenset[str]:
+    return frozenset(output["name"] for output in pipeline.outputs if "name" in output and type(output["name"]) is str)
+
+
+def _mask_slot_sink_mirror_edges(
+    draft: _MutablePipelineDraft,
+    *,
+    owner_key: str,
+    edge_type: str,
+    fork_destination: object,
+) -> None:
+    """Drop one routing slot's sink-mirror edges from a preservation hash draft.
+
+    A fork slot owns only the branch it names, so only that branch's edge is
+    masked; every other fork branch stays under the preservation contract.
+    """
+
+    output_names = _draft_output_names(draft)
+    retained = [
+        edge
+        for edge in draft.edges
+        if not (
+            edge["from_node"] == owner_key
+            and edge["edge_type"] == edge_type
+            and edge["to_node"] in output_names
+            and (edge_type != "fork" or edge["to_node"] == fork_destination)
+        )
+    ]
+    draft.edges = retained
+    draft.document["edges"] = retained
+
+
 def _edge_preserved_state_fingerprint(
     state: CompositionState,
     *,
@@ -613,23 +667,45 @@ def _edge_preserved_state_fingerprint(
     owner_key: str,
     routing: GuidedEdgeRoutingAuthority,
 ) -> str:
-    """Hash all private state except the one selected routing scalar."""
+    """Hash all private state except the one selected routing scalar and its mirror.
+
+    A scalar routing slot and the SINK-targeting edge that mirrors it are one
+    authority, not two: retargeting the slot obliges the materializer to move
+    the mirror with it or Stage 1 fails closed on ``edge_route_mismatch``
+    (elspeth-a0a830fc95). The slot's mirror edges are therefore REMOVED rather
+    than marker-substituted — a slot that leaves the sinks entirely has no
+    successor edge to substitute into, and removal makes retarget-to-sink,
+    retarget-to-node, and no-op hash alike. Every other edge stays in the hash,
+    so an edit outside the selected slot is still caught.
+    """
 
     draft = _MutablePipelineDraft.from_state(state)
     owner = draft.owner(owner_kind=owner_kind, owner_key=owner_key)
     marker = "__ELSPETH_SELECTED_EDGE_AUTHORITY__"
+    slot_destination: object
     if routing.field == "routes":
         routes = owner["routes"] if "routes" in owner else None
         if type(routes) is not dict or routing.route_key is None or routing.route_key not in routes:
             raise AuditIntegrityError("guided edge preservation routes are malformed")
+        slot_destination = routes[routing.route_key]
         routes[routing.route_key] = marker
     elif routing.field == "fork_to":
         branches = owner["fork_to"] if "fork_to" in owner else None
         if type(branches) is not list or routing.fork_index is None or routing.fork_index >= len(branches):
             raise AuditIntegrityError("guided edge preservation fork branches are malformed")
+        slot_destination = branches[routing.fork_index]
         branches[routing.fork_index] = marker
     else:
+        slot_destination = owner[routing.field] if routing.field in owner else None
         owner[routing.field] = marker
+    mirror_edge_type = _sink_mirror_edge_type(routing)
+    if mirror_edge_type is not None:
+        _mask_slot_sink_mirror_edges(
+            draft,
+            owner_key=owner_key,
+            edge_type=mirror_edge_type,
+            fork_destination=slot_destination if mirror_edge_type == "fork" else None,
+        )
     return stable_hash(draft.document)
 
 
@@ -1562,6 +1638,93 @@ def _incident_edges(
     return edges
 
 
+def _reconcile_draft_sink_mirror_edges(
+    pipeline: _MutablePipelineDraft,
+    *,
+    origin_key: str,
+    edge_types: frozenset[str],
+) -> None:
+    """Converge one origin's sink-mirror edges onto its authoritative scalars.
+
+    Scalar routing fields are the runtime authority and SINK-targeting edges
+    are their mirror (elspeth-67b44040ee) — the guided public projection
+    derives every reviewable connection from those scalars and never reads
+    ``edges``. An admitted correction writes the scalar, so the mirror must
+    follow inside the same materialization: otherwise Stage 1 fails closed with
+    ``edge_route_mismatch`` against a delta that exposes no surface the provider
+    could use to repair it, burning the whole repair budget plus the escape
+    hatch on a disagreement only the server can see (elspeth-a0a830fc95).
+
+    Each named slot's sink edge is retargeted to the scalar's current sink or
+    dropped when the slot no longer names one. An edge already drawing the
+    authoritative route keeps the slot, so a stale mirror can never displace
+    the edge an admitted delta authored. Missing edges are never invented — the
+    graph view infers an undrawn route from the scalar, so absence cannot lie
+    the way a stale edge does. This is the one deliberate exception to
+    :func:`_merge_incident_edge_patches`' preserve-every-omitted-byte rule: a
+    sink mirror is a projection of the scalar, not independent state.
+    """
+
+    output_names = _draft_output_names(pipeline)
+    if origin_key in pipeline.sources:
+        origin: Mapping[str, Any] = pipeline.sources[origin_key]
+        is_source = True
+    else:
+        matches = [node for node in pipeline.nodes if node["id"] == origin_key]
+        if len(matches) != 1:
+            return
+        origin = matches[0]
+        is_source = False
+
+    def slot_sink(value: object) -> str | None:
+        return value if type(value) is str and value in output_names else None
+
+    slot_sinks: dict[str, str | None] = {"on_success": slot_sink(origin["on_success"] if "on_success" in origin else None)}
+    fork_sinks: frozenset[str] = frozenset()
+    if not is_source:
+        routes = origin["routes"] if "routes" in origin and type(origin["routes"]) is dict else {}
+        fork_to = origin["fork_to"] if "fork_to" in origin and type(origin["fork_to"]) is list else []
+        slot_sinks["on_error"] = slot_sink(origin["on_error"] if "on_error" in origin else None)
+        slot_sinks["route_true"] = slot_sink(routes["true"] if "true" in routes else None)
+        slot_sinks["route_false"] = slot_sink(routes["false"] if "false" in routes else None)
+        fork_sinks = frozenset(target for target in fork_to if type(target) is str and target in output_names)
+
+    def mirrors(edge: Mapping[str, Any]) -> bool:
+        return edge["from_node"] == origin_key and edge["edge_type"] in edge_types and edge["to_node"] in output_names
+
+    def desired_sink(edge_type: str) -> str | None:
+        return slot_sinks[edge_type] if edge_type in slot_sinks else None
+
+    claimed: set[str] = set()
+    settled: set[int] = set()
+    for index, edge in enumerate(pipeline.edges):
+        edge_type = edge["edge_type"]
+        if not mirrors(edge) or edge_type == "fork" or edge_type in claimed:
+            continue
+        if edge["to_node"] == desired_sink(edge_type):
+            claimed.add(edge_type)
+            settled.add(index)
+
+    retained: list[dict[str, Any]] = []
+    for index, edge in enumerate(pipeline.edges):
+        edge_type = edge["edge_type"]
+        if not mirrors(edge) or index in settled:
+            retained.append(edge)
+            continue
+        if edge_type == "fork":
+            if edge["to_node"] in fork_sinks:
+                retained.append(edge)
+            continue
+        desired = desired_sink(edge_type)
+        if desired is None or edge_type in claimed:
+            continue
+        claimed.add(edge_type)
+        edge["to_node"] = desired
+        retained.append(edge)
+    pipeline.edges = retained
+    pipeline.document["edges"] = retained
+
+
 def _replace_incident_edges(
     pipeline: _MutablePipelineDraft,
     *,
@@ -1742,6 +1905,17 @@ def materialize_guided_authorized_candidate(
             authority=authority,
             destination=destination,
         )
+        if authority.edge_routing is not None:
+            # The selected scalar slot and its sink mirror are ONE authority:
+            # reconcile exactly that slot, so the preserved-state fingerprint
+            # (which masks the same pair) still proves nothing else moved.
+            mirror_edge_type = _sink_mirror_edge_type(authority.edge_routing)
+            if mirror_edge_type is not None:
+                _reconcile_draft_sink_mirror_edges(
+                    predecessor,
+                    origin_key=authority.owner_key,
+                    edge_types=frozenset({mirror_edge_type}),
+                )
     elif authority.owner_kind == "source":
         admitted = _exact_delta_members(delta, allowed={"source_routes", "nodes", "edges"})
         if set(admitted) != {"source_routes", "nodes", "edges"}:
@@ -1800,6 +1974,12 @@ def materialize_guided_authorized_candidate(
         owners = frozenset({authority.owner_key, *(node.node_id for node in additions)})
         edges = _incident_edges(admitted["edges"], owners=owners)
         _replace_incident_edges(predecessor, owners=owners, replacements=edges)
+        for reconciled_owner in sorted(owners):
+            _reconcile_draft_sink_mirror_edges(
+                predecessor,
+                origin_key=reconciled_owner,
+                edge_types=_SINK_MIRROR_EDGE_TYPES,
+            )
     elif authority.owner_kind == "node":
         admitted = _exact_delta_members(delta, allowed={"node_patch", "edges"})
         if set(admitted) != {"node_patch", "edges"}:
@@ -1834,6 +2014,11 @@ def materialize_guided_authorized_candidate(
         owners = frozenset({authority.owner_key})
         edges = _incident_edges(admitted["edges"], owners=owners)
         _merge_incident_edge_patches(predecessor, owners=owners, patches=edges)
+        _reconcile_draft_sink_mirror_edges(
+            predecessor,
+            origin_key=authority.owner_key,
+            edge_types=_SINK_MIRROR_EDGE_TYPES,
+        )
     else:
         admitted = _exact_delta_members(delta, allowed={"output_targets", "edges"})
         if set(admitted) != {"output_targets", "edges"}:
@@ -1851,6 +2036,7 @@ def materialize_guided_authorized_candidate(
         edges = _incident_edges(admitted["edges"], owners=frozenset({authority.owner_key}))
         raw_sources = predecessor.sources
         raw_nodes = predecessor.nodes
+        reconnected_slots: dict[str, set[str]] = {}
         for edge in edges:
             if edge.to_node != authority.owner_key:
                 raise _guided_delta_rejection("guided_delta_nonincident_route", facts={"edge_id": edge.edge_id})
@@ -1858,6 +2044,7 @@ def materialize_guided_authorized_candidate(
             edge_type = edge.edge_type
             if origin in raw_sources and edge_type == "on_success":
                 raw_sources[origin]["on_success"] = authority.owner_key
+                reconnected_slots.setdefault(origin, set()).add(edge_type)
                 continue
             positions = [index for index, item in enumerate(raw_nodes) if item["id"] == origin]
             if len(positions) != 1 or edge_type not in {"on_success", "on_error"}:
@@ -1866,7 +2053,18 @@ def materialize_guided_authorized_candidate(
                     facts={"from_node": origin, "edge_type": edge_type},
                 )
             raw_nodes[positions[0]][edge_type] = authority.owner_key
+            reconnected_slots.setdefault(origin, set()).add(edge_type)
         _replace_incident_edges(predecessor, owners=frozenset({authority.owner_key}), replacements=edges)
+        # Reconnecting a producer to THIS sink leaves its mirror to the sink it
+        # left behind untouched — that edge is not incident to the correction
+        # owner, so the replacement above retains it. Reconcile exactly the
+        # slots this delta rewrote (elspeth-a0a830fc95).
+        for reconnected_origin in sorted(reconnected_slots):
+            _reconcile_draft_sink_mirror_edges(
+                predecessor,
+                origin_key=reconnected_origin,
+                edge_types=frozenset(reconnected_slots[reconnected_origin]),
+            )
     # Source-route and output-reconnection candidates above were constructed
     # from the private predecessor by this materializer, not reconstructed by
     # the provider.  The ordinary binder restores reviewed source/sink

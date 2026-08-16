@@ -253,3 +253,83 @@ def test_edge_acceptance_rejects_a_selected_reroute_that_also_changes_a_sibling_
 
     with pytest.raises(AuditIntegrityError, match="outside selected edge authority"):
         require_guided_correction_target_changed(successor_wire, target, successor)
+
+
+NODE_A_SUCCESS = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+
+def _mirror_predecessor() -> CompositionState:
+    """``node_a`` routes on_success to a SINK and the graph draws that mirror."""
+    predecessor = _predecessor()
+    return replace(
+        predecessor,
+        edges=(*predecessor.edges, EdgeSpec("node_a_to_result_a", "node_a", "result_a", "on_success", None)),
+    )
+
+
+def _mirror_wire() -> dict[str, object]:
+    wire = _wire()
+    wire["connections"].append(  # type: ignore[union-attr]
+        {
+            "stable_id": NODE_A_SUCCESS,
+            "from_endpoint": _endpoint("node", NODE_A),
+            "to_endpoint": _endpoint("output", OUTPUT_A),
+            "flow": {"role": "on_success", "route": None},
+            "schema_contract": {"satisfied": True, "missing_fields": []},
+        }
+    )
+    return wire
+
+
+def test_edge_acceptance_admits_the_selected_slots_sink_mirror_edge() -> None:
+    """A scalar route and its sink-mirror edge are ONE authority.
+
+    Retargeting a sink-destined route obliges the materializer to move the
+    mirror edge with it (elspeth-a0a830fc95) or the candidate dies at Stage 1
+    with an unrepairable ``edge_route_mismatch``. The preserved-state
+    fingerprint must therefore mask the selected slot's mirror edge alongside
+    the scalar, not treat the mirror as unrelated state.
+    """
+    predecessor = _mirror_predecessor()
+    wire = _mirror_wire()
+    target = resolve_guided_correction_target(
+        requested=ComponentTarget(kind="edge", stable_id=NODE_A_SUCCESS),
+        wire_payload=wire,
+        predecessor=predecessor,
+    )
+    assert target.edge_routing is not None
+    assert target.edge_routing.field == "on_success"
+    assert target.edge_routing.before_destination == "result_a"
+
+    successor = replace(
+        predecessor,
+        nodes=(replace(predecessor.nodes[0], on_success="result_b"), predecessor.nodes[1]),
+        edges=tuple(replace(edge, to_node="result_b") if edge.id == "node_a_to_result_a" else edge for edge in predecessor.edges),
+    )
+    successor_wire = deepcopy(wire)
+    _connection(successor_wire, NODE_A_SUCCESS)["to_endpoint"] = _endpoint("output", OUTPUT_B)
+
+    require_guided_correction_target_changed(successor_wire, target, successor)
+
+
+def test_edge_acceptance_still_rejects_a_change_to_an_unselected_edge() -> None:
+    predecessor = _mirror_predecessor()
+    wire = _mirror_wire()
+    target = resolve_guided_correction_target(
+        requested=ComponentTarget(kind="edge", stable_id=NODE_A_SUCCESS),
+        wire_payload=wire,
+        predecessor=predecessor,
+    )
+    successor = replace(
+        predecessor,
+        nodes=(replace(predecessor.nodes[0], on_success="result_b"), predecessor.nodes[1]),
+        edges=tuple(
+            replace(edge, to_node="result_b") if edge.id == "node_a_to_result_a" else replace(edge, id=f"{edge.id}_rewritten")
+            for edge in predecessor.edges
+        ),
+    )
+    successor_wire = deepcopy(wire)
+    _connection(successor_wire, NODE_A_SUCCESS)["to_endpoint"] = _endpoint("output", OUTPUT_B)
+
+    with pytest.raises(AuditIntegrityError, match="outside selected edge authority"):
+        require_guided_correction_target_changed(successor_wire, target, successor)

@@ -11,6 +11,7 @@ validation with "unknown node" and the repair loop burns to REPAIR_EXHAUSTED
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import replace
 
@@ -34,7 +35,7 @@ from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
 from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession
 from elspeth.web.composer.pipeline_planner import _CANDIDATE_SHAPE_INTEGRITY_PREFIX
-from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -3114,3 +3115,236 @@ def test_output_upstream_reconnection_delta_matches_equivalent_full_candidate_st
         current_state=predecessor,
         authority=_output_correction_target(),
     )
+
+
+# --- Sink-mirror edge reconciliation after a guided correction (elspeth-a0a830fc95)
+#
+# Scalar routing fields are the runtime authority and SINK-targeting edges are
+# their mirror (elspeth-67b44040ee). Every correction fixture above uses
+# ``edges=()``, which is exactly why the suite could not see that an admitted
+# correction moves a scalar route and leaves its mirror edge drawing the old
+# sink — a deterministic ``edge_route_mismatch`` with no delta surface the
+# provider could use to repair it.
+
+
+def _mirror_edge_correction_guided() -> GuidedSession:
+    return _boundary_valid_guided(multiple_outputs=True)
+
+
+def _mirror_edge_correction_predecessor(*, edges: tuple[EdgeSpec, ...]) -> CompositionState:
+    base = _boundary_valid_correction_predecessor()
+    quarantine = OutputSpec(
+        name="quarantine",
+        plugin="json",
+        options={"path": "outputs/quarantine.jsonl", "schema": {"mode": "observed"}},
+        on_write_failure="discard",
+    )
+    return replace(base, edges=edges, outputs=(*base.outputs, quarantine))
+
+
+def _edge_correction_target(
+    *,
+    owner_key: str,
+    routing: GuidedEdgeRoutingAuthority,
+    stable_id: str = "77777777-7777-4777-8777-777777777777",
+) -> GuidedCorrectionTarget:
+    return GuidedCorrectionTarget(
+        requested=ComponentTarget(kind="edge", stable_id=stable_id),
+        owner_kind="node",
+        owner_key=owner_key,
+        authority_key=None,
+        public_target={
+            "stable_id": stable_id,
+            "from_endpoint": {"kind": "node", "stable_id": "44444444-4444-4444-8444-444444444444"},
+            "to_endpoint": {"kind": "output", "stable_id": OUTPUT_ID},
+            "flow": {"kind": "node_success", "route": None, "branch": None},
+        },
+        before_fingerprint="3" * 64,
+        edge_routing=routing,
+    )
+
+
+def _assert_materialized_candidate_is_acceptable(materialized: Mapping[str, object], predecessor: CompositionState) -> None:
+    candidate = build_set_pipeline_candidate(materialized, predecessor, _candidate_context())
+    assert candidate.acceptable, [(entry.error_code, entry.message) for entry in candidate.result.validation.errors]
+
+
+def test_edge_correction_retargets_the_selected_slots_sink_mirror_edge() -> None:
+    predecessor = _mirror_edge_correction_predecessor(
+        edges=(EdgeSpec("format_to_output", "format_high_value", "output", "on_success", None),)
+    )
+    target = _edge_correction_target(
+        owner_key="format_high_value",
+        routing=GuidedEdgeRoutingAuthority(
+            field="on_success",
+            route_key=None,
+            fork_index=None,
+            before_destination="output",
+        ),
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {"edge_patch": {"stable_id": target.requested.stable_id, "to_node": "quarantine"}},
+        authority=target,
+        guided=_mirror_edge_correction_guided(),
+        current_state=predecessor,
+    )
+
+    assert bound["nodes"][2]["on_success"] == "quarantine"
+    assert bound["edges"] == [
+        {"id": "format_to_output", "from_node": "format_high_value", "to_node": "quarantine", "edge_type": "on_success", "label": None}
+    ]
+    _assert_materialized_candidate_is_acceptable(bound, predecessor)
+
+
+def test_edge_correction_drops_a_gate_route_mirror_edge_that_leaves_the_sink() -> None:
+    base = _mirror_edge_correction_predecessor(edges=())
+    gate = replace(base.nodes[0], routes={"true": "output", "false": "high_value"})
+    predecessor = replace(
+        base,
+        nodes=(gate, *base.nodes[1:]),
+        edges=(EdgeSpec("gate_true_to_output", "amount_gate", "output", "route_true", None),),
+    )
+    target = _edge_correction_target(
+        owner_key="amount_gate",
+        routing=GuidedEdgeRoutingAuthority(
+            field="routes",
+            route_key="true",
+            fork_index=None,
+            before_destination="output",
+        ),
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {"edge_patch": {"stable_id": target.requested.stable_id, "to_node": "high_value"}},
+        authority=target,
+        guided=_mirror_edge_correction_guided(),
+        current_state=predecessor,
+    )
+
+    assert bound["nodes"][0]["routes"] == {"true": "high_value", "false": "high_value"}
+    # Missing edges are never invented and a route that no longer names a sink
+    # has no mirror to draw: absence cannot lie the way a stale edge does.
+    assert bound["edges"] == []
+    _assert_materialized_candidate_is_acceptable(bound, predecessor)
+
+
+def test_node_correction_retargets_the_owners_stale_sink_mirror_edge() -> None:
+    predecessor = _mirror_edge_correction_predecessor(
+        edges=(EdgeSpec("format_to_output", "format_high_value", "output", "on_success", None),)
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {
+            "node_patch": {
+                "stable_id": _format_node_correction_target().requested.stable_id,
+                "on_success": "quarantine",
+            },
+            "edges": [],
+        },
+        authority=_format_node_correction_target(),
+        guided=_mirror_edge_correction_guided(),
+        current_state=predecessor,
+    )
+
+    assert bound["nodes"][2]["on_success"] == "quarantine"
+    assert [edge["to_node"] for edge in bound["edges"]] == ["quarantine"]
+    _assert_materialized_candidate_is_acceptable(bound, predecessor)
+
+
+def test_output_correction_retargets_a_moved_producers_stale_sink_edge() -> None:
+    base = _mirror_edge_correction_predecessor(edges=())
+    formatter = replace(base.nodes[2], on_success="quarantine")
+    predecessor = replace(
+        base,
+        nodes=(*base.nodes[:2], formatter),
+        edges=(EdgeSpec("format_to_quarantine", "format_high_value", "quarantine", "on_success", None),),
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {
+            "output_targets": [{"stable_id": OUTPUT_ID}],
+            "edges": [
+                {
+                    "id": "format_to_output",
+                    "from_node": "format_high_value",
+                    "to_node": "output",
+                    "edge_type": "on_success",
+                }
+            ],
+        },
+        authority=_output_correction_target(),
+        guided=_mirror_edge_correction_guided(),
+        current_state=predecessor,
+    )
+
+    assert bound["nodes"][2]["on_success"] == "output"
+    # The edge the delta authored keeps the slot; the stale mirror to the old
+    # sink is dropped rather than left to claim the same on_success route.
+    assert [(edge["id"], edge["to_node"]) for edge in bound["edges"]] == [("format_to_output", "output")]
+    _assert_materialized_candidate_is_acceptable(bound, predecessor)
+
+
+def test_output_correction_keeps_a_dropped_producers_scalar_route() -> None:
+    """A producer omitted from the incident set keeps its runtime route.
+
+    Clearing the scalar is not available here: Stage 1 requires a transform to
+    carry a routable ``on_success``, so ``None``/``discard`` would turn a
+    benign undrawn route into ``transform_missing_on_success`` /
+    ``transform_on_success_dangling`` that the output-correction delta (which
+    exposes no scalar surface) could never repair. Absence of a mirror edge
+    cannot lie — the graph view infers an undrawn route from the scalar.
+    """
+    base = _mirror_edge_correction_predecessor(edges=())
+    gate = replace(base.nodes[0], routes={"true": "high_value", "false": "second_input"})
+    second = replace(base.nodes[1], id="second_writer", input="second_input", on_success="output")
+    predecessor = replace(
+        base,
+        nodes=(gate, *base.nodes[1:], second),
+        edges=(
+            EdgeSpec("format_to_output", "format_high_value", "output", "on_success", None),
+            EdgeSpec("second_to_output", "second_writer", "output", "on_success", None),
+        ),
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {
+            "output_targets": [{"stable_id": OUTPUT_ID}],
+            "edges": [
+                {
+                    "id": "format_to_output",
+                    "from_node": "format_high_value",
+                    "to_node": "output",
+                    "edge_type": "on_success",
+                }
+            ],
+        },
+        authority=_output_correction_target(),
+        guided=_mirror_edge_correction_guided(),
+        current_state=predecessor,
+    )
+
+    assert bound["nodes"][3]["id"] == "second_writer"
+    assert bound["nodes"][3]["on_success"] == "output"
+    assert [edge["id"] for edge in bound["edges"]] == ["format_to_output"]
+    _assert_materialized_candidate_is_acceptable(bound, predecessor)
+
+
+def test_correction_on_an_edgeless_predecessor_still_draws_no_edges() -> None:
+    predecessor = _boundary_valid_correction_predecessor()
+
+    bound = materialize_guided_authorized_candidate(
+        {
+            "node_patch": {
+                "stable_id": _format_node_correction_target().requested.stable_id,
+                "on_success": "output",
+            },
+            "edges": [],
+        },
+        authority=_format_node_correction_target(),
+        guided=_boundary_valid_correction_guided(),
+        current_state=predecessor,
+    )
+
+    assert bound["edges"] == []
+    assert bound["nodes"][2]["on_success"] == "output"

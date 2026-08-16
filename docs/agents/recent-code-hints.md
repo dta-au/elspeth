@@ -35,6 +35,39 @@ is a working document under the normal delivery posture.
   `select_branch`/`quorum_count` on NodeSpec); `best_effort` needs
   `timeout_seconds`. Cycle detection (`_node_topology_cycle`) is whole-graph.
 
+- **2026-08-17 — a guided correction that writes a routing scalar must move its
+  SINK MIRROR EDGE in the same materialization** (elspeth-a0a830fc95): scalar
+  routes are the runtime authority and sink-targeting edges are their mirror
+  (elspeth-67b44040ee); the guided public `connections` projection derives every
+  reviewable connection from the scalars and never reads `edges`. Every
+  correction path in `guided/planning.py`
+  (`materialize_guided_authorized_candidate`) therefore ends by calling
+  `_reconcile_draft_sink_mirror_edges` — edges follow scalars, retargeted onto
+  the slot's current sink or dropped when the slot no longer names one, and
+  never invented (an undrawn route is inferred from the scalar, so absence
+  cannot lie the way a stale edge does). Add a new correction path and you must
+  call it, or Stage 1 fails closed on `edge_route_mismatch` against a delta
+  with no repair surface — deterministic REPAIR_EXHAUSTED. Two traps: (a) the
+  edge-correction arm is scoped to the SELECTED slot only, because
+  `_edge_preserved_state_fingerprint` hashes the whole document and proves
+  nothing else moved — the slot and its mirror are ONE authority, so that
+  function REMOVES (never marker-substitutes) the slot's mirror edges on both
+  sides; a wider sweep there is an undetected out-of-authority edit; (b) do NOT
+  "fix" the inverse half by clearing a dropped producer's scalar. Measured
+  2026-08-17, every producer kind: transform `on_success=None` ->
+  `transform_missing_on_success`, `"discard"` -> `transform_on_success_dangling`;
+  deleting a gate route key -> `gate_route_labels_mismatch` (emptying `routes`
+  -> `gate_missing_routes`); source `"discard"` -> `source_on_success_dangling`.
+  There is no valid cleared value, so clearing converts a benign undrawn route
+  into a rejection the delta cannot repair. The node arm sweeps ALL of the
+  owner's slots (as `upsert_node` does), which means a provider-authored edge
+  patch retargeting a GATE route to a different sink is snapped back rather than
+  honoured — correct, because `routes` is deliberately absent from the
+  node-patch schema and gate routing is the edge-correction surface's job.
+  Every pre-existing correction fixture used `edges=()`, which is why the suite
+  could not see any of this; new fixtures live beside
+  `_mirror_edge_correction_predecessor`.
+
 - **2026-08-15 — commencement gate conditions have separate execution and
   audit forms**: only the raw configured expression enters `ExpressionParser`.
   Every `CommencementGateFailedError`, successful `CommencementGateResult`, and
