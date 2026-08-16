@@ -591,6 +591,9 @@ Current 0.7.2 behaviour:
   web coordination remains deferred; production Compose, AWS ECS, Azure VM, and
   Kubernetes BYO deployments use external PostgreSQL where the deployment
   contract requires it.
+- Each web process serves all blocking work from one shared 16-thread worker
+  pool with bounded, fail-fast admission; the pool is not yet partitioned by
+  purpose (see [Web Worker Pool Capacity](#web-worker-pool-capacity)).
 
 Planned direction (design intentions, not release commitments):
 
@@ -904,6 +907,37 @@ remains the single writer of ingest, barrier, and finalization state; followers
 only claim and process work items. See
 [ADR-030](docs/architecture/adr/030-multi-worker-deployment-shape.md) for the
 deployment shape and operator requirements.
+
+### Web Worker Pool Capacity
+
+The web process runs every blocking operation — runtime preflight, composer
+tool dispatch and persistence, blob custody, secret listing, session writes,
+planner sync phases — on **one shared bounded worker pool**
+(`src/elspeth/web/async_workers.py`). Its limits are module constants, not
+operator settings:
+
+| Limit | Value | Behaviour at the limit |
+|---|---|---|
+| Worker threads | 16 | Further submissions queue |
+| Outstanding submissions (running + queued) | 32 | Callers wait up to 1.0 s for admission, then fail fast with `AsyncWorkerAdmissionTimeoutError` (a `TimeoutError`; composer surfaces report it as their TIMEOUT outcome) |
+| Admission release | when the sync work actually finishes | A caller that times out or is cancelled does not free the slot its work still occupies; work still queued when its caller gives up is dropped and never runs |
+
+A runtime preflight that times out stays admitted until it really finishes,
+and a retry for the same session state joins the running preflight instead of
+starting another, so a retry storm cannot accumulate hung workers.
+
+**Known capacity limit (open, not a release blocker):** the pool is not
+partitioned by purpose. If 16 *distinct* runtime preflights hang at once,
+every worker thread is occupied by preflight and unrelated calls (listing
+secrets, uploading a blob, settling custody) can only queue behind them and
+then fail fast. Preflight hangs are rare — plugin instantiation runs in a
+side-effect-free preflight mode with sockets forbidden — but a preflight
+pathology currently degrades the whole web process rather than only preflight.
+The planned fix is a preflight bulkhead (a cap on concurrent distinct
+preflights below the pool size); it is tracked as `elspeth-8c60e9b126`. Until
+then, treat `AsyncWorkerAdmissionTimeoutError` in the journal as the
+saturation signal, and size expected concurrent authoring sessions against a
+single 16-thread pool per web process.
 
 ### Rate Limiting
 
