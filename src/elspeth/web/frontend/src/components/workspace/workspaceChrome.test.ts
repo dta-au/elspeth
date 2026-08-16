@@ -85,19 +85,33 @@ describe("workspace inspector drawer (elspeth-4e54200207)", () => {
       "min(var(--workspace-inspector-width), 100%)",
     );
 
-    const reserve = rules.filter(
-      (rule) =>
-        rule.selector.includes(".workspace-inspector:not([hidden])") &&
-        rule.selector.endsWith(".workspace-artifact-pane"),
+    // The drawer spans the workspace's full height, and the artifact column
+    // has TWO occupants since the bar row became its own grid row
+    // (elspeth-9c94a58500): the artifact pane and the bar's artifact cell.
+    // Both must reserve, from ONE rule, or the bar's controls would be sliced
+    // by the drawer while the toolbar above them was not — the original
+    // defect, half-fixed.
+    const reserve = rules.filter((rule) =>
+      rule.selector.includes(".workspace-inspector:not([hidden])"),
     );
     expect(reserve).toHaveLength(1);
+    const reserveTargets = reserve[0].selector.split(",").map((selector) => {
+      const compounds = selector.trim().split(/\s+/);
+      return compounds[compounds.length - 1];
+    });
+    expect(reserveTargets).toEqual([
+      ".workspace-artifact-pane",
+      ".workspace-action-bar-main",
+    ]);
     expect(reserve[0].declarations).toContain(
       "padding-right: var(--workspace-inspector-width);",
     );
 
     // Narrow mode moves the slot to the full width and the drawer becomes the
-    // view, so the reserve must not apply there.
-    expect(reserve[0].selector).toContain(':not([data-layout-mode="narrow"])');
+    // view, so the reserve must not apply there — to either occupant.
+    for (const selector of reserve[0].selector.split(",")) {
+      expect(selector).toContain(':not([data-layout-mode="narrow"])');
+    }
   });
 
   it("compresses both drawer bands with the shared workspace band token", () => {
@@ -291,36 +305,90 @@ describe("workspace stacking order (elspeth-cf4b08e271)", () => {
   });
 });
 
-describe("workspace bottom edge (elspeth-215c989bed)", () => {
-  it("builds the authoring-side band from the same values as the action bar", () => {
-    // The action bar's rule and fill are a child of the artifact grid column,
-    // so the bottom of the app was a half-drawn line. The mirrored band must
-    // be exactly as tall as the action bar: inset + tallest control + inset.
-    const band = ".workspace-authoring-pane::before";
-    /* The band's height is no longer a constant that can be checked against the
-       bar's constant, because the bar is no longer constant: it grows a line
-       whenever .completion-bar carries ExecuteButton's block-reason text, and
-       the band then missed it by 27px (elspeth-97db9c22e5). What a source-string
-       test can still pin is the SHAPE of the agreement — the measured height
-       published by ComposerWorkspace wins, and the token formula survives as the
-       fallback for the paint before the observer fires, so it must still be the
-       bar's ungated height rather than some other value. The equality itself is
-       a rendered fact now and is asserted as one, in
-       composer-workspace-geometry.spec.ts. */
-    expect(declaration(band, "height")).toBe(
-      "var(--workspace-action-bar-height, calc(2 * var(--workspace-bar-inset) + var(--size-control)))",
+describe("workspace bottom edge (elspeth-215c989bed, elspeth-9c94a58500)", () => {
+  // The bottom rule of the application was drawn by two elements in two grid
+  // columns — the action bar in the artifact column and a mirrored band on the
+  // authoring pane — and every way of making them the same height failed in
+  // turn: a token formula (elspeth-215c989bed) that encoded "the bar is one
+  // control row" and broke when the block-reason line made it 87px
+  // (elspeth-97db9c22e5), then a measured height that a ResizeObserver kept
+  // publishing. The restructure retires the seam itself: ONE grid item spans
+  // both columns and paints the rule and the fill once, and its height is its
+  // content because it is a content-sized grid row. These pins are the shape
+  // of that guarantee as it reads in the stylesheet; the rendered facts — the
+  // rule spanning the full width, the collapse control registered with the
+  // bar's controls through a wrap — are asserted in
+  // composer-workspace-geometry.spec.ts.
+  const slot = ".workspace-action-bar-slot";
+
+  it("paints the rule and the fill once, on one item spanning both columns", () => {
+    expect(declaration(slot, "grid-column")).toBe("1 / -1");
+    expect(declaration(slot, "grid-template-columns")).toBe("subgrid");
+    expect(declaration(slot, "border-top")).toBe(
+      "1px solid var(--color-border, currentcolor)",
     );
-    expect(declaration(band, "border-top")).toBe(
-      declaration(".workspace-action-bar", "border-top"),
+    expect(declaration(slot, "background")).toBe("var(--color-surface, Canvas)");
+
+    // The bar itself must NOT draw them too, or the bottom edge is back to
+    // having two owners — the exact shape being retired.
+    expect(ruleFor(".workspace-action-bar")).not.toMatch(
+      /(?:^|;)\s*border[a-z-]*:/,
     );
-    expect(declaration(band, "background")).toBe(
-      declaration(".workspace-action-bar", "background"),
+    expect(ruleFor(".workspace-action-bar")).not.toMatch(
+      /(?:^|;)\s*background[a-z-]*:/,
     );
 
-    // The control has to paint above the band it sits on; tree order only
-    // decides that while the control is itself positioned.
-    expect(declaration(".workspace-collapse-control", "position")).toBe(
-      "relative",
+    // And nothing may draw a second band on the authoring side again.
+    expect(rules.some((rule) => rule.selector.includes(".workspace-authoring-pane::"))).toBe(
+      false,
+    );
+  });
+
+  it("gives the bar row no height of its own — it is content-sized, in every layout", () => {
+    // No height, no min-height, no measured custom property: the row is the
+    // grid's `auto` track and is exactly as tall as the taller of its two
+    // cells. A height on the wrapper, however derived, is the seam coming
+    // back.
+    expect(ruleFor(slot)).not.toMatch(/(?:^|;)\s*(?:min-|max-)?height:/);
+    expect(cssWithoutComments).not.toContain("--workspace-action-bar-height");
+
+    // Desktop: panes row, then the bar row. Narrow: tabs, view, then the bar
+    // row — placed on the third track explicitly.
+    expect(declaration(".composer-workspace", "grid-template-rows")).toBe(
+      "minmax(0, 1fr) auto",
+    );
+    expect(declaration(slot, "grid-row")).toBe("2");
+    expect(
+      declaration('.composer-workspace[data-layout-mode="narrow"]', "grid-template-rows"),
+    ).toBe("auto minmax(0, 1fr) auto");
+    expect(
+      declaration(`.composer-workspace[data-layout-mode="narrow"] ${slot}`, "grid-row"),
+    ).toBe("3");
+  });
+
+  it("seats the collapse control in the row's authoring cell, registered with the bar's first line", () => {
+    // The « control is a child of the bar row now (it had to be: in narrow
+    // Compose view the action bar is hidden and the control alone gives the
+    // row its height). Column 1 is the authoring cell; align-self: start is
+    // what puts it on the bar's first line when the bar is taller than one
+    // control row, which the bar itself achieves with align-items: flex-start.
+    expect(declaration(".workspace-collapse-control", "grid-column")).toBe("1");
+    expect(declaration(".workspace-collapse-control", "align-self")).toBe("start");
+    expect(declaration(".workspace-action-bar", "align-items")).toBe("flex-start");
+    expect(declaration(".workspace-action-bar-main", "grid-column")).toBe("2");
+  });
+
+  it("applies the standoff exactly once on each side of the seam", () => {
+    // The ticket's own warning: if the wrapper ALSO carried the inset, the
+    // density regime's --workspace-bar-inset override would tighten it twice.
+    // The bar's padding and the control's margin are the only two carriers
+    // (both pinned to the token in the rhythm describe above); neither the
+    // wrapper nor the artifact cell has any. (The cell's inspector-open
+    // padding-right lives in the reserve rule pinned above — an inline
+    // reservation, not a block-axis standoff.)
+    expect(ruleFor(slot)).not.toMatch(/(?:^|;)\s*padding[a-z-]*:/);
+    expect(ruleFor(".workspace-action-bar-main")).not.toMatch(
+      /(?:^|;)\s*padding[a-z-]*:/,
     );
   });
 });

@@ -164,34 +164,84 @@ async function assertScenario(
 }
 
 /**
- * The two halves of the workspace's bottom rule. The artifact column draws it
- * as .workspace-action-bar's border-top; the authoring column has no wrapper
- * that could carry a mirrored bar, so its pane paints a ::before pinned to its
- * own bottom edge. A pseudo-element has no box to measure, so its top edge is
- * derived: the pane's bottom minus its rendered height (elspeth-97db9c22e5).
+ * The workspace's bottom bar row (elspeth-9c94a58500): ONE grid item spanning
+ * both columns that paints the bottom rule and fill once, hosting the collapse
+ * control in the authoring column and the action bar in the artifact column.
+ * It replaced a mirrored band the authoring pane painted as a ::before to meet
+ * the bar across the seam — first token-sized, then observer-sized
+ * (elspeth-215c989bed, elspeth-97db9c22e5). Returned as boxes so a test can
+ * state the row's contract directly: full width, exactly the bar's height,
+ * and no second band anywhere.
  */
-async function workspaceBottomEdges(page: ComposerPage["page"]): Promise<{
-  bandTop: number;
-  barTop: number;
-  barHeight: number;
-  bandHeight: number;
+async function workspaceBottomRow(page: ComposerPage["page"]): Promise<{
+  workspace: { left: number; right: number; bottom: number };
+  row: { top: number; bottom: number; left: number; right: number; borderTop: number };
+  bar: { top: number; bottom: number; height: number };
+  collapse: { top: number; bottom: number } | null;
+  authoringBandContent: string;
 } | null> {
   return page.evaluate(() => {
-    const pane = document.querySelector(".workspace-authoring-pane");
+    const workspace = document.querySelector('[data-testid="composer-workspace"]');
+    const row = document.querySelector('[data-workspace-part="action-bar"]');
     const bar = document.querySelector(".workspace-action-bar");
-    if (pane === null || bar === null) return null;
-    const bandHeight = Number.parseFloat(
-      getComputedStyle(pane, "::before").height,
+    const pane = document.querySelector(".workspace-authoring-pane");
+    const collapse = document.querySelector(
+      'button[aria-label="Collapse authoring pane"]',
     );
-    if (!Number.isFinite(bandHeight)) return null;
+    if (workspace === null || row === null || bar === null || pane === null) {
+      return null;
+    }
+    const workspaceBox = workspace.getBoundingClientRect();
+    const rowBox = row.getBoundingClientRect();
     const barBox = bar.getBoundingClientRect();
+    const collapseBox = collapse?.getBoundingClientRect() ?? null;
     return {
-      bandTop: pane.getBoundingClientRect().bottom - bandHeight,
-      barTop: barBox.top,
-      barHeight: barBox.height,
-      bandHeight,
+      workspace: {
+        left: workspaceBox.left,
+        right: workspaceBox.right,
+        bottom: workspaceBox.bottom,
+      },
+      row: {
+        top: rowBox.top,
+        bottom: rowBox.bottom,
+        left: rowBox.left,
+        right: rowBox.right,
+        borderTop: Number.parseFloat(getComputedStyle(row).borderTopWidth),
+      },
+      bar: { top: barBox.top, bottom: barBox.bottom, height: barBox.height },
+      collapse:
+        collapseBox === null || collapseBox.height === 0
+          ? null
+          : { top: collapseBox.top, bottom: collapseBox.bottom },
+      authoringBandContent: getComputedStyle(pane, "::before").content,
     };
   });
+}
+
+/**
+ * The bottom-row contract, stated once and asserted at every step of a
+ * geometry change: the row spans the workspace's full width and sits on its
+ * bottom edge; the action bar starts directly under the row's rule and ends on
+ * the row's bottom (the row IS the bar's height — nothing above it, nothing
+ * below it, so no rule that could have derived that height exists); the
+ * collapse control shares the bar's first line, top-registered with the chips
+ * across the seam; and the authoring pane paints no band of its own.
+ */
+function expectBottomRowContract(
+  edges: NonNullable<Awaited<ReturnType<typeof workspaceBottomRow>>>,
+  chipTop: number,
+): void {
+  expect(Math.abs(edges.row.left - edges.workspace.left)).toBeLessThanOrEqual(1);
+  expect(Math.abs(edges.row.right - edges.workspace.right)).toBeLessThanOrEqual(1);
+  expect(Math.abs(edges.row.bottom - edges.workspace.bottom)).toBeLessThanOrEqual(1);
+  expect(edges.row.borderTop).toBeGreaterThanOrEqual(1);
+  expect(
+    Math.abs(edges.row.top + edges.row.borderTop - edges.bar.top),
+  ).toBeLessThanOrEqual(1);
+  expect(Math.abs(edges.row.bottom - edges.bar.bottom)).toBeLessThanOrEqual(1);
+  expect(edges.collapse).not.toBeNull();
+  expect(Math.abs(edges.collapse!.top - chipTop)).toBeLessThanOrEqual(1);
+  expect(edges.authoringBandContent).toBe("none");
 }
 
 test.describe("Composer deterministic workspace geometry", () => {
@@ -683,15 +733,15 @@ test.describe("Composer deterministic workspace geometry", () => {
      so they are aligned by construction and the assertion cannot fail. The
      elements that actually move are the status chips in the OTHER group.
 
-     So this test exercises the gated state and pins the two cross-group facts:
-     the chips share the buttons' top edge, and the two halves of the
-     application's bottom rule — the artifact column's action bar and the
-     authoring column's mirrored band — start on one line. The second is
-     asserted as a RENDERED fact: the band is a fixed-height pseudo-element in a
-     different grid column, so a source-string test of its height cannot observe
-     that the bar it must meet has grown past the formula (elspeth-27dc483116).
-     Nor can a visual snapshot serve here — --update-snapshots rewrites only
-     failing files, and a sub-threshold offset passes silently. */
+     So this test exercises the gated state and pins the cross-group facts: the
+     chips share the buttons' top edge, and the application's bottom rule is ONE
+     row spanning both columns with the collapse control registered on its
+     first line beside the chips (elspeth-9c94a58500 — before it, the two
+     halves of that rule were separate elements whose agreement was asserted
+     here as a rendered fact, because a source-string test could not observe
+     that the bar had grown past the band's formula, elspeth-27dc483116). Still
+     asserted as RENDERED geometry, not by snapshot — --update-snapshots
+     rewrites only failing files, and a sub-threshold offset passes silently. */
   test("a gated Run keeps the status chips and the bottom rule registered with the completion buttons", async ({
     page,
   }) => {
@@ -747,33 +797,30 @@ test.describe("Composer deterministic workspace geometry", () => {
       expect(barBox).not.toBeNull();
       expect(barBox!.height).toBeLessThanOrEqual(64);
 
-      // Both halves of the bottom rule start on one line.
-      const bottomEdges = await workspaceBottomEdges(page);
-      expect(bottomEdges).not.toBeNull();
-      expect(
-        Math.abs(bottomEdges!.bandTop - bottomEdges!.barTop),
-      ).toBeLessThanOrEqual(1);
+      // One bottom row, full width, the bar's exact height, the collapse
+      // control on its first line with the chips.
+      const bottomRow = await workspaceBottomRow(page);
+      expect(bottomRow).not.toBeNull();
+      expectBottomRowContract(bottomRow!, chip!.y);
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }
   });
 
-  /* The band is published by a ResizeObserver, so a steady-state check only
-     proves the value was right ONCE. Two things it cannot prove are pinned
-     here, and both are the reason the observer exists rather than a second
-     constant (elspeth-97db9c22e5):
-
-     WRAP — at 1280 the bar wraps its two groups onto separate flex lines and
-     roughly doubles in height. A band repaired by adding one more constant to
-     the token formula would be correct at 1600 and wrong here.
-
-     TRANSITION — the observer has to FIRE when the bar changes, not merely
-     report a height at mount. If it missed a change the band would stick at the
-     stale value: the same misregistration, in whichever direction the bar last
-     moved. The trigger used here is a viewport resize rather than DOM surgery,
-     because a resize is a real thing users do and it exercises the observer
-     through the same path the browser uses in production. */
-  test("the mirrored bottom band tracks the action bar through a wrap and back", async ({
+  /* A steady-state check proves the row's contract held ONCE. The bar's height
+     is not constant — at 1280 it wraps its two groups onto separate flex lines
+     and roughly doubles — and the reason this row exists is that every earlier
+     construction held at 1600 and broke somewhere else: a token formula was
+     right in the ungated state and wrong by 27px in the gated one; an observer
+     was right whenever it fired. So the contract is asserted through a WRAP
+     and back — a viewport resize, because that is a real thing users do and it
+     drives the browser's own relayout — and it must hold at all three points
+     without anything having to fire: the row is a content-sized grid track,
+     so the bar's new height IS the row's new height in the same layout pass.
+     Polling is still used after each resize, but only for the bar itself to
+     have wrapped (a resize is asynchronous to the test), never for a second
+     element to catch up. */
+  test("the bottom row is exactly the action bar's height through a wrap and back, with the collapse control on its first line", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1600, height: 900 });
@@ -785,44 +832,34 @@ test.describe("Composer deterministic workspace geometry", () => {
       const reason = page.locator(".side-rail-execute-reason");
       await expect(reason).toBeVisible();
 
-      const wide = await workspaceBottomEdges(page);
+      const chipTop = async (): Promise<number> =>
+        (await composer.validationStatus().boundingBox())!.y;
+      const wide = await workspaceBottomRow(page);
       expect(wide).not.toBeNull();
-      expect(Math.abs(wide!.bandTop - wide!.barTop)).toBeLessThanOrEqual(1);
+      expectBottomRowContract(wide!, await chipTop());
 
       // 1280 wraps the bar's two groups onto separate flex lines, so its height
       // genuinely changes. Height stays 900 so the short-screen density regime
       // (min-width: 961px and max-height: 800px) is NOT also toggled — one
       // variable at a time, or a pass would not say which mechanism worked.
-      //
-      // Poll on the BAND, not on the bar. The bar relayouts synchronously with
-      // the resize, so polling it returns the instant the resize lands, before
-      // the observer callback and its re-render have published the new height —
-      // a race that failed this test at 40px on first write. Waiting for the
-      // band to move is waiting for the exact mechanism under test, and it
-      // still fails (by timeout) if the observer never fires at all.
       await page.setViewportSize({ width: 1280, height: 900 });
       await expect
-        .poll(async () => (await workspaceBottomEdges(page))?.bandHeight ?? 0)
-        .toBeGreaterThan(wide!.bandHeight);
+        .poll(async () => (await workspaceBottomRow(page))?.bar.height ?? 0)
+        .toBeGreaterThan(wide!.bar.height);
 
-      const wrapped = await workspaceBottomEdges(page);
+      const wrapped = await workspaceBottomRow(page);
       expect(wrapped).not.toBeNull();
-      expect(wrapped!.barHeight).toBeGreaterThan(wide!.barHeight);
-      expect(Math.abs(wrapped!.bandTop - wrapped!.barTop)).toBeLessThanOrEqual(
-        1,
-      );
+      expectBottomRowContract(wrapped!, await chipTop());
 
-      // ...and back, so a stale value cannot pass by being large enough.
+      // ...and back, so a row that merely stayed large could not pass.
       await page.setViewportSize({ width: 1600, height: 900 });
       await expect
-        .poll(async () => (await workspaceBottomEdges(page))?.bandHeight ?? 0)
-        .toBeLessThan(wrapped!.bandHeight);
+        .poll(async () => (await workspaceBottomRow(page))?.bar.height ?? 0)
+        .toBeLessThan(wrapped!.bar.height);
 
-      const restored = await workspaceBottomEdges(page);
+      const restored = await workspaceBottomRow(page);
       expect(restored).not.toBeNull();
-      expect(
-        Math.abs(restored!.bandTop - restored!.barTop),
-      ).toBeLessThanOrEqual(1);
+      expectBottomRowContract(restored!, await chipTop());
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }

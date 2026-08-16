@@ -100,11 +100,16 @@ test.describe("Composer workspace browser accessibility", () => {
         .evaluateAll((elements) =>
           elements.map((element) => element.getAttribute("data-workspace-part")),
         );
+      // The bottom bar row is its own part since elspeth-9c94a58500: it
+      // follows both panes in DOM order because it sits BELOW both of them,
+      // spanning the two columns — so the sequence still reads as the visual
+      // order, left to right across the panes and then down to the bar.
       expect(parts).toEqual([
         "view-tabs",
         "authoring",
         "separator",
         "artifact",
+        "action-bar",
         "inspector",
       ]);
 
@@ -115,12 +120,22 @@ test.describe("Composer workspace browser accessibility", () => {
         .locator(':scope > [data-workspace-part="separator"]')
         .boundingBox();
       const artifact = await composer.artifactRegion().boundingBox();
+      const bottomBar = await composer.workspace()
+        .locator(':scope > [data-workspace-part="action-bar"]')
+        .boundingBox();
       expect(authoring).not.toBeNull();
       expect(separator).not.toBeNull();
       expect(artifact).not.toBeNull();
+      expect(bottomBar).not.toBeNull();
       expect(authoring!.x + authoring!.width).toBeLessThanOrEqual(separator!.x);
       expect(separator!.x + separator!.width).toBeLessThanOrEqual(artifact!.x);
       expect(artifact!.x).toBeGreaterThan(authoring!.x);
+      expect(bottomBar!.y).toBeGreaterThanOrEqual(authoring!.y + authoring!.height - 1);
+      expect(bottomBar!.y).toBeGreaterThanOrEqual(artifact!.y + artifact!.height - 1);
+      expect(bottomBar!.x).toBeLessThanOrEqual(authoring!.x);
+      expect(bottomBar!.x + bottomBar!.width).toBeGreaterThanOrEqual(
+        artifact!.x + artifact!.width,
+      );
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }

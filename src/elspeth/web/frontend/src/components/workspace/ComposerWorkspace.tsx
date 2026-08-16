@@ -98,18 +98,12 @@ export function ComposerWorkspace({
   const [workspaceWidth, setWorkspaceWidth] = useState(0);
   const [narrowView, setNarrowView] = useState<NarrowView>("compose");
   const [authoringFocusRequest, setAuthoringFocusRequest] = useState(0);
-  /* null = "no measurement", which is NOT the same as 0 and must not be
-     rendered as 0px: the authoring band falls back to its token formula on
-     null, and a 0px band would erase the bottom rule outright. See the
-     observer below (elspeth-97db9c22e5). */
-  const [actionBarHeight, setActionBarHeight] = useState<number | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const composeTabRef = useRef<HTMLButtonElement | null>(null);
   const pipelineTabRef = useRef<HTMLButtonElement | null>(null);
   const authoringSlotRef = useRef<HTMLDivElement | null>(null);
   const separatorSlotRef = useRef<HTMLDivElement | null>(null);
   const artifactSlotRef = useRef<HTMLDivElement | null>(null);
-  const actionBarSlotRef = useRef<HTMLDivElement | null>(null);
   const authoringPaneRef = useRef<HTMLElement | null>(null);
   const artifactPaneRef = useRef<HTMLElement | null>(null);
   const collapseControlRef = useRef<HTMLButtonElement | null>(null);
@@ -145,34 +139,6 @@ export function ComposerWorkspace({
       }
     });
     observer.observe(root);
-    return () => observer.disconnect();
-  }, []);
-
-  /* Publish the action bar's RENDERED height so the authoring pane's mirrored
-     bottom band can be exactly as tall (elspeth-97db9c22e5). The band is a
-     ::before in the other grid column, and CSS gives a pseudo-element no way to
-     read a sibling column's height — but the two must agree or the bottom rule
-     of the application is drawn at two heights. The bar is not a fixed row: it
-     grows by a whole line whenever .completion-bar takes one for ExecuteButton's
-     block-reason text, and by more than one when that text wraps, so the
-     token formula the band used to hard-code cannot be repaired by adding a
-     second constant to it. Observing beats recomputing: the slot reports what
-     the browser actually laid out, wrap included.
-
-     The slot is observed rather than the bar itself because the slot is this
-     component's own element and outlives every state in which `actionBar` is
-     null; observing a conditionally-rendered child would need the observer torn
-     down and rebuilt on each mount. An empty slot measures 0, which we report as
-     null so the band keeps its token fallback instead of collapsing. */
-  useLayoutEffect(() => {
-    const slot = actionBarSlotRef.current;
-    if (slot === null) return;
-    const observer = new ResizeObserver((entries) => {
-      const height = entries[0]?.contentRect.height;
-      if (height === undefined || !Number.isFinite(height)) return;
-      setActionBarHeight(height > 0 ? height : null);
-    });
-    observer.observe(slot);
     return () => observer.disconnect();
   }, []);
 
@@ -307,12 +273,6 @@ export function ComposerWorkspace({
 
   const rootStyle = {
     "--authoring-pane-width": `${paneState.effectiveAuthoringWidth}px`,
-    /* Omitted, not zeroed, when unmeasured: an absent custom property lets the
-       band's var() fall through to its token formula, whereas "0px" would win
-       and erase the rule. */
-    ...(actionBarHeight === null
-      ? {}
-      : { "--workspace-action-bar-height": `${actionBarHeight}px` }),
   } as CSSProperties;
 
   return (
@@ -394,28 +354,6 @@ export function ComposerWorkspace({
               <ErrorBoundary label="Authoring pane">{authoring}</ErrorBoundary>
             </div>
             <div className="workspace-authoring-status">{authoringStatus}</div>
-            {/* Icon-form pane toggles (2026-08-15 UX review): the earlier
-                full-text secondary-chrome button shared height, border,
-                background, and spacing rhythm with the action-bar buttons one
-                gutter away, so Gestalt grouping read it as a sixth workflow
-                action. Both toggles now follow the pane's own icon+tooltip
-                convention (ChatInput's Upload/More buttons): icon-only, full
-                name kept as aria-label + title, chevrons pointing the way the
-                pane moves. aria-expanded/aria-controls make the disclosure
-                state machine-readable; the pair is two buttons (one per
-                state), each reporting the state it acts from. */}
-            <Button
-              ref={collapseControlRef}
-              variant="bare"
-              className="workspace-pane-toggle workspace-collapse-control"
-              title="Collapse authoring pane"
-              aria-label="Collapse authoring pane"
-              aria-expanded={!paneState.authoringCollapsed}
-              aria-controls="workspace-authoring-pane"
-              onClick={collapseAuthoring}
-            >
-              <Icon name="chevrons-left" className="workspace-pane-toggle-icon" />
-            </Button>
           </section>
           {paneState.authoringCollapsed && (
             <div
@@ -489,10 +427,64 @@ export function ComposerWorkspace({
             >
               {artifact}
             </div>
-            <div ref={actionBarSlotRef} className="workspace-action-bar-slot">
-              {actionBar}
-            </div>
           </section>
+        </div>
+
+        {/* The application's bottom bar: ONE grid item spanning both columns
+            (elspeth-9c94a58500), carrying the rule and the fill once. Its two
+            cells are the parent grid's own columns (subgrid), so the collapse
+            control sits in the authoring column and the action bar in the
+            artifact column at every pane width, including the collapsed 0px
+            one — and the row is exactly as tall as its content, whichever
+            child is showing. Before this the bar was the artifact pane's last
+            flex child and the authoring pane painted a MIRRORED band to meet
+            it across the seam: first from a token formula, then from a
+            measured height a ResizeObserver published (elspeth-215c989bed,
+            elspeth-97db9c22e5). Two elements agreeing about one height is the
+            seam that produced both bugs; a single element has no height to
+            keep in sync.
+
+            The collapse control moved here from the authoring pane's tail
+            for the same reason: in narrow Compose view the action bar is
+            hidden, so the row's height has to come from the control alone,
+            and it can only do that as the row's own child. Its aria-controls
+            still names the pane; the disclosure button now sits OUTSIDE the
+            region it discloses, which is the same relationship the restore
+            button already has. Each child hides on the same fact that used
+            to hide its former parent — the control with the authoring pane,
+            the bar with the artifact view — so what is visible in each
+            state is unchanged, and the row itself hides when neither is. */}
+        <div
+          className="workspace-action-bar-slot"
+          data-workspace-part="action-bar"
+          hidden={authoringHidden && artifactViewHidden}
+        >
+          {/* Icon-form pane toggles (2026-08-15 UX review): the earlier
+              full-text secondary-chrome button shared height, border,
+              background, and spacing rhythm with the action-bar buttons one
+              gutter away, so Gestalt grouping read it as a sixth workflow
+              action. Both toggles now follow the pane's own icon+tooltip
+              convention (ChatInput's Upload/More buttons): icon-only, full
+              name kept as aria-label + title, chevrons pointing the way the
+              pane moves. aria-expanded/aria-controls make the disclosure
+              state machine-readable; the pair is two buttons (one per
+              state), each reporting the state it acts from. */}
+          <Button
+            ref={collapseControlRef}
+            variant="bare"
+            className="workspace-pane-toggle workspace-collapse-control"
+            title="Collapse authoring pane"
+            aria-label="Collapse authoring pane"
+            aria-expanded={!paneState.authoringCollapsed}
+            aria-controls="workspace-authoring-pane"
+            hidden={authoringHidden}
+            onClick={collapseAuthoring}
+          >
+            <Icon name="chevrons-left" className="workspace-pane-toggle-icon" />
+          </Button>
+          <div className="workspace-action-bar-main" hidden={artifactViewHidden}>
+            {actionBar}
+          </div>
         </div>
 
         <div

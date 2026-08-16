@@ -35,7 +35,16 @@
 
   position: relative;
   display: grid;
-  grid-template-rows: minmax(420px, 1fr);
+  /* Two rows: the panes, then the application's bottom bar
+     (.workspace-action-bar-slot, one item spanning both columns). Row 1 is
+     minmax(0, 1fr), not minmax(420px, 1fr): the 420px canvas floor is this
+     container's min-height below, and the bar row is carved out of that floor
+     exactly as the bar used to be carved out of the artifact pane's height —
+     so at the floor the panes and the artifact panel measure what they did
+     before, and above it the fr row fills. Pinning 420 on the row as well
+     would make the grid taller than its floor by one bar and clip the bar
+     itself under overflow: hidden. */
+  grid-template-rows: minmax(0, 1fr) auto;
   grid-template-columns: var(--authoring-pane-width) minmax(0, 1fr);
   width: 100%;
   height: 100%;
@@ -70,46 +79,6 @@
   overflow: hidden;
 }
 
-/* The action bar's rule and fill are a child of the ARTIFACT grid column, so
-   the bottom of the application used to be a half-drawn line: left of the pane
-   seam there was no rule and no fill, and "Collapse authoring pane" floated on
-   bare page ground while identical-looking controls 8px to its right sat on a
-   bordered, filled bar — an app with a closed top edge and a half-open bottom
-   one (elspeth-215c989bed). The authoring pane has no wrapper element that
-   could carry a mirrored bar, so the pane paints the band itself: a ::before
-   pinned to its bottom edge, exactly as tall as the collapse control's margin
-   box (standoff + --size-control + standoff), which is how the action bar's
-   own height is built — so the two bands start and end on the same two lines
-   in the density regime as well. The pseudo-element is the pane's FIRST child
-   and .workspace-collapse-control is positioned, so tree order paints the
-   control above the band without needing a negative z-index.
-
-   That token formula was the band's height outright until elspeth-97db9c22e5.
-   It encodes "the action bar is exactly one --size-control row", which stops
-   being true the moment .completion-bar takes a second line for ExecuteButton's
-   block-reason text: the bar measured 87px against this band's 60px and the
-   bottom of the application was a half-drawn line again — the very defect the
-   band exists to close. CSS cannot read a sibling column's rendered height, so
-   ComposerWorkspace measures the action-bar slot and publishes
-   --workspace-action-bar-height on the workspace root, the same channel that
-   already carries --authoring-pane-width. The formula stays as the fallback
-   because it is the bar's height in the ungated state, so a first paint before
-   the observer fires lands on the right value rather than on zero. */
-.workspace-authoring-pane {
-  position: relative;
-}
-
-.workspace-authoring-pane::before {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: var(--workspace-action-bar-height, calc(2 * var(--workspace-bar-inset) + var(--size-control)));
-  border-top: 1px solid var(--color-border, currentcolor);
-  background: var(--color-surface, Canvas);
-  content: "";
-}
-
 .workspace-authoring-body,
 .workspace-artifact-body {
   flex: 1 1 auto;
@@ -118,9 +87,46 @@
   overflow: hidden;
 }
 
-.workspace-authoring-status,
-.workspace-action-bar-slot {
+.workspace-authoring-status {
   flex: 0 0 auto;
+}
+
+/* The application's bottom bar: the rule and the fill are painted ONCE, by
+   this one grid item spanning both columns (elspeth-9c94a58500). Its cells are
+   the parent grid's own columns via subgrid, so the collapse control lands in
+   the authoring column and the action bar in the artifact column at whatever
+   width the pane has — the resized one, the collapsed 0px one, narrow mode's
+   single column — with no second copy of the column formula. The row is auto:
+   exactly as tall as the taller of its two children, so it grows with the bar
+   when .completion-bar wraps or carries ExecuteButton's block-reason line, and
+   it is the collapse control's margin box tall in narrow Compose view where
+   the bar is hidden. Nothing derives that height and nothing measures it.
+
+   History, because this row has absorbed seven fixes and the seam is what
+   kept regenerating them: the bar used to be a child of the ARTIFACT column,
+   so the bottom of the application was a half-drawn line — no rule and no
+   fill left of the pane seam, "Collapse authoring pane" floating on bare page
+   ground beside a bordered, filled bar (elspeth-215c989bed). The fix taken was
+   a MIRRORED band on the authoring pane, first sized by the token formula
+   (2 * inset + --size-control), which encoded "the bar is exactly one control
+   row" and broke the day the block-reason line made the bar 87px
+   (elspeth-97db9c22e5); then sized by a ResizeObserver publishing the bar's
+   rendered height, which was correct and still two elements agreeing about
+   one number. This wrapper was the other remediation elspeth-215c989bed
+   offered. It has no height to keep in sync. */
+.workspace-action-bar-slot {
+  display: grid;
+  grid-row: 2;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  min-width: 0;
+  border-top: 1px solid var(--color-border, currentcolor);
+  background: var(--color-surface, Canvas);
+}
+
+.workspace-action-bar-main {
+  grid-column: 2;
+  min-width: 0;
 }
 
 .artifact-workspace {
@@ -271,10 +277,19 @@
   max-width: 74ch;
 }
 
+/* The bar carries no border-top and no background of its own: the rule and
+   the fill belong to .workspace-action-bar-slot above, which spans both
+   columns, and drawing them here as well would put two elements back in
+   charge of the bottom edge (elspeth-9c94a58500). Nor is it positioned or on
+   a z rung any more — it was position: sticky on --z-panel-controls, which
+   was dead as sticky (nothing here scrolls) but live as a compositor layer:
+   with the opaque background gone, that layer stopped being opaque and Chrome
+   dropped the bar's text from subpixel to grayscale antialiasing (measured:
+   ~4000 differing pixels in every visual baseline's bar controls, none once
+   the bar was in flow). Nothing needs to paint over it: the desktop collapsed
+   restore control is positioned on --z-panel-controls and an in-flow bar is
+   below any positioned box. */
 .workspace-action-bar {
-  position: sticky;
-  z-index: var(--z-panel-controls);
-  bottom: 0;
   display: flex;
   flex-wrap: wrap;
   gap: var(--workspace-bar-gap);
@@ -306,8 +321,6 @@
      registration contract, elspeth-fca731fb28); the INLINE inset is the
      artifact column's shared gutter (elspeth-87195dda2c). */
   padding: var(--workspace-bar-inset) var(--artifact-gutter);
-  border-top: 1px solid var(--color-border, currentcolor);
-  background: var(--color-surface, Canvas);
 }
 
 /* Completion actions in the horizontal bar (recut 2026-08-15, operator
@@ -528,19 +541,27 @@
   pointer-events: none;
 }
 
+/* The « control is the bar row's authoring-column cell (see
+   .workspace-action-bar-slot): right-aligned against the seam, top-aligned
+   with the action bar's controls in the cell beside it. justify-self: end
+   keeps it where the pane's flex-end used to put it; align-self: start is what
+   registers it with the bar's first line when the bar is taller than one
+   control row (the bar itself is align-items: flex-start for the same reason),
+   which the old bottom-anchored placement could not do. */
 .workspace-collapse-control {
-  position: relative;
-  align-self: flex-end;
-  flex: 0 0 auto;
+  grid-column: 1;
+  align-self: start;
+  justify-self: end;
 
-  /* Vertical registration with the action bar across the divider: both rows
-     take the same --workspace-bar-inset standoff and the full --size-control
+  /* Vertical registration with the action bar across the divider: both take
+     the same --workspace-bar-inset standoff and the full --size-control
      height (the shared .workspace-pane-toggle chrome above carries the
-     min-height), so they share one bottom edge and one optical center.
+     min-height), so they share one top edge and one optical center.
      Expressed in tokens on both sides of the seam, so the contract no longer
-     depends on the browser root staying at 16px (elspeth-fca731fb28).
-     position: relative keeps this control painted above the band that
-     .workspace-authoring-pane::before draws behind it. */
+     depends on the browser root staying at 16px (elspeth-fca731fb28). This
+     margin and the bar's padding are the ONLY two places the standoff is
+     applied in the row — the wrapper carries none — so the density regime's
+     inset override tightens both, once each. */
   margin: var(--workspace-bar-inset) var(--space-sm);
   min-height: var(--size-control);
 }
@@ -608,23 +629,26 @@
 
 /* The restore control joins the action bar's own line (operator decision,
    2026-08-15): no reserved row, no banner box, no visible text — just the »
-   icon at the bottom-left, where the expanded pane's « control sits (the
-   elspeth-215c989bed bottom-edge band), so the toggle pair occupies one
-   spot in both states. It stays the DOM child of .workspace-authoring-slot
-   it always was — the narrow-mode DOM-order test depends on that — only its
-   desktop position changes, from the narrow badge's top-left anchor to a
-   bottom anchor on the bar's inset token. Column 1 is 0-width when
-   collapsed, so column 2's opaque .workspace-action-bar paints at the same
-   pixels; both share --z-panel-controls with tree order putting the bar
-   LATER (the five-way group documented at .workspace-inspector-slot below),
-   which was inert while the two never overlapped. This one pairing is
-   therefore bumped one step so the button stays clickable — the group's
-   other four legs are untouched. */
+   icon at the bottom-left, where the expanded state's « control sits in the
+   bar row's authoring cell, so the toggle pair occupies one spot in both
+   states. It stays the DOM child of .workspace-authoring-slot it always was —
+   the narrow-mode DOM-order test depends on that — only its desktop position
+   changes, from the narrow badge's top-left anchor to a bottom anchor on the
+   bar's inset token (its containing block is the positioned workspace root,
+   so that anchor is the bar row's bottom edge regardless of which grid row
+   the slot occupies). Column 1 is 0-width when collapsed, so the artifact
+   cell's .workspace-action-bar lays out at the same pixels — and the button
+   wins those pixels because it is positioned on --z-panel-controls (the base
+   rule above) while the bar row and the bar are in-flow, unpositioned boxes.
+   The bar used to sit on that same rung itself (position: sticky) with tree
+   order in its favour, and this rule carried a one-step-raised token so the
+   button stayed clickable; the bar left the rung with elspeth-9c94a58500 and
+   the raised token went with it. The clickability is pinned as a rendered
+   fact (elementFromPoint) in composer-workspace-geometry.spec.ts. */
 .composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
   .workspace-collapsed-affordance {
   top: auto;
   bottom: var(--workspace-bar-inset);
-  z-index: var(--z-panel-controls-raised);
   padding: 0;
   border: none;
   background: transparent;
@@ -632,9 +656,9 @@
 }
 
 /* Reserve the restore control's slot at the bar's left edge: the » is an
-   absolutely-positioned sibling from the authoring slot painting one rung
-   above the bar, so without this the bar's first chip renders UNDERNEATH
-   it (still hit-testable through the raised button, but visually collided).
+   absolutely-positioned sibling from the authoring slot painting above the
+   in-flow bar, so without this the bar's first chip renders UNDERNEATH it
+   (still hit-testable through the button, but visually collided).
    Reservation = the button's left offset (--space-sm) + its --size-control
    width + one more --space-sm of breathing room before the first chip. */
 .composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
@@ -660,6 +684,11 @@
   border: 0;
 }
 
+/* The pane row only, NOT both rows. The seam never visibly ran through the
+   bar: the old sticky bar's opaque background painted over it there, and the
+   grip mark centres on the slot's height. Stopping at the bar row's rule keeps
+   both facts as they were, and keeps the separator's 24px pointer target out
+   of the « control's cell in the row below. */
 .workspace-separator-slot {
   position: relative;
   z-index: var(--z-panel-controls);
@@ -766,17 +795,15 @@
    tuned from tokens.css — and the literal 4 put this slot BELOW
    .graph-a11y-list's var(--z-panel-controls), which is a live ordering bug:
    neither .composer-workspace nor .artifact-workspace-panel opens a stacking
-   context, so the a11y list painted straight through the open drawer. All
-   five now sit on --z-panel-controls and their relative order is carried by
-   tree order, which reproduces the previous ordering exactly (separator <
-   action bar, action bar < inspector, menu above its own bar) while lifting
-   the drawer over the a11y list. ONE documented exception: the desktop
-   COLLAPSED affordance is +1 above the group — tree order puts the action
-   bar later, and since the restore icon now sits ON the bar's line
-   (operator decision 2026-08-15, rule near the top of this file), tree
-   order would paint the bar's opaque background over the button. Every
-   one of them stays below --z-catalog (40) and --z-overlay (100), as before
-   (elspeth-cf4b08e271). */
+   context, so the a11y list painted straight through the open drawer. What
+   is left on the rung all sits on --z-panel-controls with relative order
+   carried by tree order (separator < collapsed affordance < inspector), which
+   lifts the drawer over the a11y list. Two former members have left it: the
+   More-actions menu retired 2026-08-15, and the action bar left with
+   elspeth-9c94a58500 (it is an in-flow box now — see .workspace-action-bar),
+   which also retired the one-step-raised token the collapsed affordance
+   needed to out-paint it. Everything stays below --z-catalog (40) and
+   --z-overlay (100), as before (elspeth-cf4b08e271). */
 .workspace-inspector-slot {
   position: absolute;
   z-index: var(--z-panel-controls);
@@ -796,15 +823,22 @@
   left: 0;
 }
 
-/* Reserve the drawer's strip in the artifact pane while it is open, so the
-   toolbar and the sticky action bar lay out inside the UNOCCLUDED region
-   instead of being sliced by an overlay with no scrim. Excluded in narrow
-   mode, where the slot spans the full width and the drawer is the view
-   (elspeth-4e54200207). */
+/* Reserve the drawer's strip in the artifact column while it is open, so the
+   toolbar and the action bar lay out inside the UNOCCLUDED region instead of
+   being sliced by an overlay with no scrim. The drawer spans the workspace's
+   full height, so the column has TWO occupants that reserve — the artifact
+   pane in the pane row and the bar's artifact cell in the bar row — and they
+   reserve from the one measure the drawer is drawn at, in one rule. Excluded
+   in narrow mode, where the slot spans the full width and the drawer is the
+   view (elspeth-4e54200207). */
 .composer-workspace:not([data-layout-mode="narrow"]):has(
     .workspace-inspector:not([hidden])
   )
-  .workspace-artifact-pane {
+  .workspace-artifact-pane,
+.composer-workspace:not([data-layout-mode="narrow"]):has(
+    .workspace-inspector:not([hidden])
+  )
+  .workspace-action-bar-main {
   padding-right: var(--workspace-inspector-width);
 }
 
@@ -883,7 +917,8 @@
 }
 
 .composer-workspace[data-layout-mode="narrow"] {
-  grid-template-rows: auto minmax(0, 1fr);
+  /* Tabs, the selected view, the bar row. */
+  grid-template-rows: auto minmax(0, 1fr) auto;
   grid-template-columns: minmax(0, 1fr);
   /* Keep the shared workspace's usable-canvas floor at reflow widths. On a
      very short viewport the App-owned .app-main becomes the outer vertical
@@ -912,6 +947,22 @@
   grid-column: 1;
 }
 
+/* One column, so the bar row's two cells share it. Only one is ever visible
+   in narrow mode — the « control with the Compose view, the action bar with
+   the Pipeline view (each hides on the same fact that hides its view) — so
+   the row holds one item at a time and is exactly that item tall. Placed
+   explicitly rather than left to auto-placement: an item placed in column 2
+   of a one-column subgrid would otherwise depend on the subgrid clamping
+   rule, and "clamped into the last track" is a fact worth not relying on. */
+.composer-workspace[data-layout-mode="narrow"] .workspace-action-bar-slot {
+  grid-row: 3;
+}
+
+.composer-workspace[data-layout-mode="narrow"] .workspace-collapse-control,
+.composer-workspace[data-layout-mode="narrow"] .workspace-action-bar-main {
+  grid-column: 1;
+}
+
 .composer-workspace[data-layout-mode="narrow"] .workspace-separator-slot {
   display: none;
 }
@@ -932,6 +983,9 @@
 .composer-workspace .workspace-separator-slot[hidden],
 .composer-workspace .workspace-authoring-pane[hidden],
 .composer-workspace .workspace-artifact-pane[hidden],
+.composer-workspace .workspace-action-bar-slot[hidden],
+.composer-workspace .workspace-collapse-control[hidden],
+.composer-workspace .workspace-action-bar-main[hidden],
 .composer-workspace .workspace-inspector[hidden],
 .composer-workspace .workspace-inspector-body > [role="tabpanel"][hidden] {
   display: none;

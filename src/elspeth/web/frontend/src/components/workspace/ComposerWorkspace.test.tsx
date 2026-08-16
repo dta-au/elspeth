@@ -127,24 +127,103 @@ describe("ComposerWorkspace", () => {
     renderWorkspace();
     const root = screen.getByTestId("composer-workspace");
 
+    // The bar row is its own grid item spanning both columns
+    // (elspeth-9c94a58500), placed after both panes so the tab sequence
+    // reads chat → separator → artifact → bottom bar → inspector, and
+    // before the inspector so tree order keeps the drawer painted above it.
     expect([...root.children].map((child) => child.getAttribute("data-workspace-part")))
-      .toEqual(["view-tabs", "authoring", "separator", "artifact", "inspector"]);
+      .toEqual([
+        "view-tabs",
+        "authoring",
+        "separator",
+        "artifact",
+        "action-bar",
+        "inspector",
+      ]);
     expect(
       screen.getAllByRole("region", { name: "Authoring pane", hidden: true }),
     ).toHaveLength(1);
     expect(
       screen.getAllByRole("region", { name: "Pipeline artifact", hidden: true }),
     ).toHaveLength(1);
+    const authoringRegion = screen.getByRole("region", {
+      name: "Authoring pane",
+      hidden: true,
+    });
     const artifactRegion = screen.getByRole("region", {
       name: "Pipeline artifact",
       hidden: true,
     });
     const artifactContent = within(artifactRegion).getByText("Artifact control");
-    const action = within(artifactRegion).getByText("Primary action");
+    const action = screen.getByText("Primary action");
+    const collapse = screen.getByRole("button", {
+      name: "Collapse authoring pane",
+    });
+    // Neither bottom-bar occupant lives inside a pane region any more: the
+    // action bar follows the artifact content, and the collapse control —
+    // a disclosure button — sits outside the region it discloses, exactly
+    // as the restore button always has. Both are the bar row's children,
+    // collapse first (it is the row's authoring-column cell).
+    expect(artifactRegion).not.toContainElement(action);
+    expect(authoringRegion).not.toContainElement(collapse);
+    const barSlot = root.querySelector('[data-workspace-part="action-bar"]');
+    expect(barSlot).not.toBeNull();
+    expect(barSlot).toContainElement(action);
+    expect(barSlot).toContainElement(collapse);
     expect(
-      artifactContent.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING,
+      artifactContent.compareDocumentPosition(collapse) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+    expect(
+      collapse.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
   });
+
+  it.each([
+    // width, collapse?, narrow view, expected: collapse shown, bar shown
+    [1280, false, "compose", true, true],
+    [1280, true, "compose", false, true],
+    [959, false, "compose", true, false],
+    [959, false, "pipeline", false, true],
+    [959, true, "compose", false, false],
+    [959, true, "pipeline", false, true],
+  ] as const)(
+    "shows the bar row's occupants by state: %ipx collapsed=%s view=%s",
+    async (width, collapsed, view, collapseShown, barShown) => {
+      // The bar row hosts two things that used to hide with their former
+      // parents — the « control with the authoring pane, the action bar with
+      // the artifact view (elspeth-9c94a58500). Each still hides on that same
+      // fact, so what is visible in every state is what it was before the
+      // row existed; and the row itself hides when neither occupant shows,
+      // so narrow collapsed Compose does not draw a stray rule across the
+      // bottom of an empty view.
+      const user = userEvent.setup();
+      renderWorkspace();
+      const root = emitWidth(width);
+      if (collapsed) {
+        await user.click(
+          screen.getByRole("button", { name: "Collapse authoring pane" }),
+        );
+      }
+      if (view === "pipeline") {
+        await user.click(screen.getByRole("tab", { name: "Pipeline" }));
+      }
+
+      // By attribute, not by role: the accessible-name algorithm returns ""
+      // for a node that is itself `hidden`, so a role query cannot find the
+      // control in the states where it is hidden — which are the states
+      // under test.
+      const collapse = root.querySelector(
+        'button[aria-label="Collapse authoring pane"]',
+      );
+      expect(collapse).not.toBeNull();
+      const action = screen.getByText("Primary action");
+      const barSlot = root.querySelector('[data-workspace-part="action-bar"]');
+      expect(collapse!.closest("[hidden]") === null).toBe(collapseShown);
+      expect(action.closest("[hidden]") === null).toBe(barShown);
+      expect(barSlot).not.toBeNull();
+      expect(barSlot!.hasAttribute("hidden")).toBe(!collapseShown && !barShown);
+    },
+  );
 
   it("retains the workspace height floor in narrow mode for short-viewport scrolling", () => {
     const css = readFileSync(
@@ -765,12 +844,22 @@ describe("ComposerWorkspace", () => {
     expect(css).toMatch(
       /data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s+\.workspace-collapsed-affordance\s*\{[^}]*bottom:\s*var\(--workspace-bar-inset\)/s,
     );
-    // …and sits one step above the shared --z-panel-controls rung: tree
-    // order paints the action bar later, so without the raised token its
-    // opaque background covers the button once they share pixels.
+    // …paints over the bar it shares pixels with because it is positioned
+    // on --z-panel-controls (the base rule) while the bar row and the bar
+    // are in-flow, unpositioned boxes (elspeth-9c94a58500) — the bar used to
+    // sit on that rung itself with tree order in its favour, and this rule
+    // then needed a raised token to out-paint it. That token is gone, so the
+    // collapsed rule must NOT reintroduce a z-index and the bar must not
+    // regain one; the clickability itself is a rendered fact pinned by
+    // elementFromPoint in composer-workspace-geometry.spec.ts.
     expect(css).toMatch(
-      /data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s+\.workspace-collapsed-affordance\s*\{[^}]*z-index:\s*var\(--z-panel-controls-raised\)/s,
+      /^\.workspace-collapsed-affordance\s*\{[^}]*z-index:\s*var\(--z-panel-controls\)/ms,
     );
+    expect(css).not.toMatch(
+      /data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s+\.workspace-collapsed-affordance\s*\{[^}]*z-index/s,
+    );
+    expect(css).not.toMatch(/^\.workspace-action-bar\s*\{[^}]*(?:z-index|position):/ms);
+    expect(css).not.toContain("--z-panel-controls-raised");
     // …while the bar reserves the button's slot so the first status chip
     // starts clear of it instead of rendering underneath.
     expect(css).toMatch(
