@@ -330,3 +330,34 @@ Same seven lenses, mandate: closure audit + attack rev 2's new claims + over-eng
 
 ## Still open for the user
 Decision 7 (compose loop only; the planner is where "Build a pipeline that…" requests go) — now with its selection tension stated in the spec.
+
+---
+
+# Decision 7 panel — which authoring surface(s) does the battery measure? (2026-08-16)
+
+Seven seats (solution architect, red-team, systems, product, UX-theorist, measurement-validity, observability), one shared brief with options A (loop only, rev 3), B (both surfaces as gated strata), C (planner only), D (measure as routed, no gate). Read-only; every load-bearing claim below was re-verified by the lead.
+
+## Facts the panel established (unanimous or lead-verified)
+
+1. **Rev 3's rationale for Decision 7 is false.** The planner consumes the *same* affordance kit: `rendered_skill = self._composer_skill_text` (`service.py:4287`, the byte-identical rendered `pipeline_composer.md`, same `composer_skill_hash`), the same tool registry (`planner_tool_definitions` filters `get_tool_definitions()` to the `PLANNER_DISCOVERY_TOOL_NAMES` subset — `get_plugin_schema`, `list_models`, `get_plugin_assistance`, …), and the same `build_planner_authoring_aids`. A misleading skill paragraph or tool description misleads both surfaces. The honest reason the loop is easier to score is the *observables* (it writes `role=tool` rows), not the kit.
+2. **The "77 % loop / 23 % planner" traffic datum is contaminated and is retracted.** The `composer_authoring_surface_selected` log landed 2026-08-05; all 10 planner events fall on Aug 06 (15 events in 2½ minutes, five sessions receiving *both* surfaces seconds apart — someone probing the classifier); the following nine days show 17 loop / 0 planner. The journal holds no usable estimate of human first-turn distribution. Nothing in the spec may cite a traffic share.
+3. **Natural operator voice essentially never reaches the planner.** Offline classifier dry-runs: acceptance intents 1/24 EXPLICIT_MUTATION, harness scenarios 0/27, the four personas 0/4; only the parity fixtures' "Build a pipeline that…" register fires it (10/10). The UI's own copy ("Describe your pipeline…", "Describe the outcome you need in ordinary language") steers to the loop; the string "Build a pipeline that" appears in no user-facing UI.
+4. **The classifier is brittle in a useful way.** A `"Hi. "` prefix, a context sentence, a trailing `?`, or one quoted term flips every parity fixture to the loop (the grammar `fullmatch`es from the start; suffixes survive). There is no request/session/config flag to pin the surface. So the same content with the same oracle can be routed to either surface by a semantically-null edit — the only way to separate the *surface* effect from the *register* effect.
+5. **The planner is well observable today.** Every model response persists a `planner_attempt_audit` row (`phase`/`outcome`/`planner_code`/`led_to`/`selected_tools`/`requested_information`/`new_information`, closed vocabularies: 21 codes, 14 outcomes, 6 phases, 24 information classes), reachable losslessly via `include_llm_audit=true`; `planner_call_ordinal != null` marks planner calls; audit is fail-durable on every exit path incl. `CancelledError`; there is **no** planner→loop fallback. Gaps: per-invocation discovery rows are `_kind:"audit"` and filtered from every API view; the `planner_failure_disposition` row is filtered by the same predicate (one-line server fix); the staged candidate may land in `state.json` *or* a proposal row depending on auto-commit prefs (`GET /proposals`, `/proposal-events` must be captured or the preference pinned). A planner floor is definable now in *information-class* currency (≥1 discovery attempt with non-empty `new_information` + 1 accepted candidate); the deviation taxonomy is a table lookup over the existing enum.
+6. Stale memory corrected: `reference_planner_disposition_forensics_journalctl` ("planner codes ONLY in journal") predates `_PlannerAttemptTrail`; attempts are persisted per response now.
+
+## Seat verdicts
+
+| Seat | Rec | Core argument |
+|---|---|---|
+| Architect | D | Kit is shared → excluding the planner has no kit rationale; one instrument if the seam is at scoring only; **kill-condition:** dry-run the corpus — if <3 planner cases, A |
+| Red-team | **E₁** = A + one-shot *paired probe* | Under D surface is perfectly collinear with register (fact 4); only pairing (fixture as-authored → planner; `"Hi. "`+fixture → loop) attributes a difference to the surface; 20 runs, decides v2 scope |
+| Systems | D | Under A a kit edit tuned against the loop has a silent side channel into the planner (Goodhart on the wrong denominator) |
+| Product | **E₂** = A + standing *tripwire* | The question is about the kit; the taxonomy is loop-native; add 2–3 parity fixtures as binary regression checks (staged ≡ fixture, health counts, no floor); falsifiable success criterion supplied |
+| UX | D (or B if goal = planner coverage) | Personas/UI never produce the planner register; authoring "for" a surface manufactures the phenomenon; names the real fork: representativeness vs planner-defect coverage |
+| Measurement validity | B | A is circular (corpus admitted by the same classifier that routes); D reproduces A by accident (natural voice → ~0 % planner); never pool surfaces |
+| Observability | D | Planner stratum may be *cheaper* to score than the loop's; three prerequisites (paginate, capture proposals, widen predicate) |
+
+## Lead synthesis
+
+Facts 2–3 remove B's and D's premise (a material planner traffic share) and, per the architect's own kill-condition, D collapses into A in practice. Fact 1 removes A's *stated* reason but supplies a better one for wanting *some* planner signal: the kit is shared, so a kit defect can hit both. Fact 4 makes the red-team's paired probe the one design that can measure the surface effect at fixed content; fact 5 makes it cheap. **Recommendation: E = A + a one-shot paired probe at calibration (10 parity fixtures × 2 arms) + a standing 2–3-case planner tripwire (binary, no floor).** Rewrite Decision 7's rationale on observables; strike the traffic datum; run the corpus through the classifier in CI as the surface guard; keep the planner stratum as v2, gated on the probe's result. Decision remains the user's.
