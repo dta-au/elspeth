@@ -330,10 +330,25 @@ class Battery:
                 terminal = {"budget_exhausted": detail.get("budget_exhausted"), "reason": detail.get("reason"), "source": "422_detail"}
             if r.status_code in (401, 403):
                 instrument["auth_failed"] = True
-            if r.status_code >= 500:
-                # the composer's structured terminal (turn/wall budget) is a 422, so a 5xx here is a SERVER
-                # fault, never a product outcome: exclude the run as an instrument error and let it feed the
-                # abort rule rather than scoring a dead substrate as 95 product findings.
+            # A PLANNER terminal arrives as a 5xx, not only as a 422: `_handle_planner_failure` answers
+            # MALFORMED_RESPONSE and its siblings with 502 carrying a structured `composer_planner_failure`
+            # envelope. The planner reached a verdict and said why, so that is a PRODUCT outcome — the run is
+            # observed and belongs in the denominator. Reading the status alone filed one completed planner
+            # terminal alongside three edge-truncated runs as a planner regression (elspeth-ad5628ecda).
+            planner_code = detail.get("planner_code") if isinstance(detail, dict) else None
+            # Gated on 5xx so this cannot shadow the 422 branch above: `policy_blocked` is a 422 that ALSO
+            # carries a planner envelope, and its `422_detail` terminal is the more specific classification.
+            if (
+                r.status_code >= 500
+                and isinstance(detail, dict)
+                and detail.get("error_type") == "composer_planner_failure"
+                and planner_code
+            ):
+                terminal = {"budget_exhausted": None, "reason": str(planner_code), "source": "planner_5xx"}
+            elif r.status_code >= 500:
+                # Any OTHER 5xx has no verdict attached: the substrate faulted before it could produce one.
+                # Exclude as an instrument error and let it feed the abort rule rather than scoring a dead
+                # substrate as 95 product findings.
                 instrument["http_unrecovered"] = instrument["http_unrecovered"] or f"post_message {r.status_code}"
             self._settle(sid, step)
         # 4. reviews

@@ -235,6 +235,53 @@ def test_a_5xx_compose_before_any_provider_call_aborts_the_round(tmp_path: Path)
     assert inst["http_unrecovered"] == "post_message 500"
 
 
+def test_a_5xx_carrying_a_planner_terminal_is_a_product_outcome_not_an_instrument_fault(tmp_path: Path) -> None:
+    """The blanket "any 5xx is a server fault" rule is false: ELSPETH answers a planner terminal with a 5xx.
+
+    ``MALFORMED_RESPONSE`` — the planner reached its own verdict and said why — returns 502 carrying a
+    structured ``composer_planner_failure`` envelope. Excluding that as an instrument fault discards a real
+    product observation, which is how three edge-truncated runs and one COMPLETED planner terminal were filed
+    together as a planner regression (elspeth-ad5628ecda). The discriminator is the envelope, not the status.
+    """
+    body = {"error_type": "composer_planner_failure", "failure_code": "invalid_provider_response", "planner_code": "MALFORMED_RESPONSE"}
+    r = happy_responders([tg.user_row(1)], state=None)
+    r["POST /api/sessions/"] = lambda c: (
+        ok({"detail": body}, 502) if c.path.endswith("/messages") else ok({"is_valid": False, "errors": []})
+    )
+    b = _battery(tmp_path, FakeClient(r), repeats=1)
+    cases = {"fork_coalesce": CorpusCase("fork_coalesce", "f")}
+    b.fire(cases, tripwire=None, only=set(cases))
+    meta = json.loads((tmp_path / "runs/r1/fork_coalesce/1/meta.json").read_text())
+    assert meta["instrument"]["http_unrecovered"] is None, meta["instrument"]
+    assert meta["server_terminal"] == {"budget_exhausted": None, "reason": "MALFORMED_RESPONSE", "source": "planner_5xx"}
+
+    # A 422 carrying a planner envelope (`policy_blocked` does) keeps its MORE SPECIFIC 422_detail terminal:
+    # the 5xx branch must not shadow it just because the body shape matches.
+    policy = {
+        "error_type": "composer_planner_failure",
+        "failure_code": "policy_blocked",
+        "planner_code": "VALIDATION_FAILED",
+        "reason": "p",
+    }
+    r3 = happy_responders([tg.user_row(1)], state=None)
+    r3["POST /api/sessions/"] = lambda c: (
+        ok({"detail": policy}, 422) if c.path.endswith("/messages") else ok({"is_valid": False, "errors": []})
+    )
+    b3 = _battery(tmp_path / "b3", FakeClient(r3), repeats=1)
+    b3.fire(cases, tripwire=None, only=set(cases))
+    assert json.loads((tmp_path / "b3" / "runs/r1/fork_coalesce/1/meta.json").read_text())["server_terminal"]["source"] == "422_detail"
+
+    # A 5xx WITHOUT a planner envelope is still a substrate fault — the rule narrows, it does not vanish.
+    r2 = happy_responders([tg.user_row(1)], state=None)
+    r2["POST /api/sessions/"] = lambda c: (
+        ok({"detail": "service_setup_failed"}, 500) if c.path.endswith("/messages") else ok({"is_valid": False, "errors": []})
+    )
+    b2 = _battery(tmp_path / "b2", FakeClient(r2), repeats=1)
+    b2.fire(cases, tripwire=None, only=set(cases))
+    meta2 = json.loads((tmp_path / "b2" / "runs/r1/fork_coalesce/1/meta.json").read_text())
+    assert meta2["instrument"]["http_unrecovered"] == "post_message 500"
+
+
 def test_composer_progress_reasons_map_to_every_budget_and_a_missing_snapshot_is_source_none(tmp_path: Path) -> None:
     """M1: the scorer's terminal_missing keys on ``source``, so a progress read that produced no reason must
     not claim one; and the composition/discovery budgets must map as well as the wall clock."""

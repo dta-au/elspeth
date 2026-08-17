@@ -73,6 +73,7 @@ from ._helpers import (
     client_cancelled_progress_event,
     contextlib,
     convergence_progress_event,
+    freeform_planner_progress_reason,
     get_current_user,
     get_rate_limiter,
     maybe_auto_title_session,
@@ -589,7 +590,10 @@ def register_message_routes(router: APIRouter) -> None:
                             headline="The composer could not build a pipeline for this request.",
                             evidence=("The composer model did not return a usable pipeline plan.",),
                             likely_next="Retry the request; if it keeps failing, simplify it or check the composer provider.",
-                            reason="provider_unavailable",
+                            # Attribute the failure to its actual actor rather than blaming the
+                            # provider for every planner code — the guided mirror already does
+                            # (guided_plan.py), and the closed vocabulary carries the codes.
+                            reason=freeform_planner_progress_reason(exc.code),
                         ),
                     )
                     status_code, planner_response_body = await _handle_planner_failure(

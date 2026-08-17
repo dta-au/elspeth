@@ -38,7 +38,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerChatTurnStatus,
     ComposerLLMCall,
 )
-from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
+from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
@@ -2387,6 +2387,35 @@ def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
     return any(code in PLANNER_POLICY_DETAIL_CODES for code in exc.detail_codes)
 
 
+# ``PipelinePlannerError.code -> ComposerProgressReason`` for the freeform failed-progress
+# event. Only codes whose ACTOR is the planner appear here; everything else falls through to
+# ``provider_unavailable``, which is honest for a genuine upstream fault.
+#
+# This exists because the freeform raise site hardcoded ``provider_unavailable`` for every
+# planner code, so a discovery-budget exhaustion, a tool-call cap and a real provider outage
+# were one indistinguishable reason (elspeth-ad5628ecda). The vocabulary already anticipated
+# the split — ``planner_repair_exhausted`` is documented in ``contracts/composer_progress.py``
+# as existing "so the failed progress event stops blaming the provider" — and the GUIDED path
+# already maps onto it (``routes/composer/guided_plan.py``). This is the freeform mirror.
+#
+# ``PROVIDER_CALLS_EXHAUSTED`` is deliberately ABSENT: it is planner-owned (our budget on
+# physical provider attempts) but the closed vocabulary has no member for it, and widening
+# that vocabulary is a frontend/contract change rather than an attribution fix. It therefore
+# still reads ``provider_unavailable`` — a known residual, not an oversight.
+_FREEFORM_PLANNER_PROGRESS_REASONS: Final[dict[str, ComposerProgressReason]] = {
+    "REPAIR_EXHAUSTED": "planner_repair_exhausted",
+    "COMPOSITION_EXHAUSTED": "convergence_composition_budget",
+    "DISCOVERY_EXHAUSTED": "convergence_discovery_budget",
+    "TOOL_CALLS_EXHAUSTED": "tool_call_cap_exceeded",
+    "TIMEOUT": "convergence_wall_clock_timeout",
+}
+
+
+def freeform_planner_progress_reason(planner_code: str) -> ComposerProgressReason:
+    """Attribute a freeform planner failure to its actual actor for the progress snapshot."""
+    return _FREEFORM_PLANNER_PROGRESS_REASONS.get(planner_code, "provider_unavailable")
+
+
 def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
     """Map a ``PipelinePlannerError.code`` to a closed freeform failure code.
 
@@ -2464,6 +2493,14 @@ async def _handle_planner_failure(
     return status_code, {
         "error_type": "composer_planner_failure",
         "failure_code": failure_code,
+        # The closed planner code reaches the CLIENT, not only the durable audit row above.
+        # `failure_code` buckets eleven codes into `invalid_provider_response`, so without this
+        # a caller cannot tell a product terminal (the planner reached a verdict and said why)
+        # from a substrate fault (the process died) — both are a bare 502. That ambiguity read
+        # three edge-truncated battery runs as a planner regression (elspeth-ad5628ecda). Safe
+        # to expose for the same reason the audit row carries it: it is a closed vocabulary
+        # with no provider content, usage, or model metadata.
+        "planner_code": exc.code,
         "detail": detail,
     }
 

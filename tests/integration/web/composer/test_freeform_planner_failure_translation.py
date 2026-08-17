@@ -499,6 +499,11 @@ def test_send_message_freeform_planner_failure_is_translated(
     body = response.json()
     assert body["detail"]["error_type"] == "composer_planner_failure"
     assert body["detail"]["failure_code"] == expected_failure_code
+    # The raw planner code reaches the CLIENT, not just the durable audit row below.
+    # `failure_code` buckets eleven codes into `invalid_provider_response`, so without
+    # this a caller cannot tell a product terminal (the planner reached a verdict) from
+    # a substrate fault (the process died) — they are the same 502 (elspeth-ad5628ecda).
+    assert body["detail"]["planner_code"] == expected_planner_code
 
     # (b) a "failed" progress event is emitted.
     progress = client.get(f"/api/sessions/{session_id}/composer-progress").json()
@@ -580,6 +585,42 @@ _ALL_PLANNER_CODES = (
     "TOOL_CALLS_EXHAUSTED",
     "VALIDATION_FAILED",
 )
+
+
+def test_freeform_progress_reason_stops_blaming_the_provider_for_planner_faults() -> None:
+    """The freeform failed-progress event hardcoded ``provider_unavailable`` for EVERY planner code.
+
+    ``ComposerProgressReason`` already carries the codes this needs — ``planner_repair_exhausted``
+    exists verbatim "so the failed progress event stops blaming the provider" — and the GUIDED path
+    maps onto them (``guided_plan.py``). Freeform did not, so a discovery-budget exhaustion, a tool-call
+    cap, and a genuine provider outage were one indistinguishable reason on this surface. That is what
+    ``/composer-progress`` reports, which is the terminal a client reads when its request is cut
+    (elspeth-ad5628ecda).
+    """
+    from elspeth.web.sessions.routes._helpers import freeform_planner_progress_reason
+
+    planner_owned = {
+        "REPAIR_EXHAUSTED": "planner_repair_exhausted",
+        "COMPOSITION_EXHAUSTED": "convergence_composition_budget",
+        "DISCOVERY_EXHAUSTED": "convergence_discovery_budget",
+        "TOOL_CALLS_EXHAUSTED": "tool_call_cap_exceeded",
+        "TIMEOUT": "convergence_wall_clock_timeout",
+    }
+    for code, expected in planner_owned.items():
+        assert freeform_planner_progress_reason(code) == expected, code
+
+    # A genuine upstream fault still names the provider — the fix is attribution, not avoidance.
+    assert freeform_planner_progress_reason("PROVIDER_ERROR") == "provider_unavailable"
+    assert freeform_planner_progress_reason("MALFORMED_RESPONSE") == "provider_unavailable"
+
+    # Total over the live corpus: every code resolves to a member of the closed vocabulary.
+    from typing import get_args
+
+    from elspeth.contracts.composer_progress import ComposerProgressReason
+
+    allowed = set(get_args(ComposerProgressReason.__value__))
+    for code in _ALL_PLANNER_CODES:
+        assert freeform_planner_progress_reason(code) in allowed, code
 
 
 # The detail-code shapes a rejection can carry. ``policy_blocked`` is keyed on
