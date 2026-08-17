@@ -47,8 +47,17 @@ ROW_OUTCOME_VALUES = frozenset(
     }
 )
 
-SQL_TEXT_RE = re.compile(
-    r"\b(select|from|where|join|insert|update|delete|create|alter|pragma)\b|count\s*\(",
+# A SQL clause keyword must GOVERN the table name, not merely share a string
+# with it. ``from``/``where``/``update``/``create`` are ordinary English words,
+# so bare co-presence made every prose docstring or data blob that also
+# mentioned ``token_outcomes`` a finding. Requiring adjacency (optionally
+# through a schema qualifier or quoting) keeps every hand-written statement
+# shape — FROM/JOIN/INSERT INTO/UPDATE/DELETE FROM/CREATE TABLE/ALTER TABLE —
+# while English prose no longer matches anything.
+TOKEN_OUTCOMES_STATEMENT_RE = re.compile(
+    r"\b(?:from|join|into|update|table)\s+"
+    r"""(?:["'`\[]?[A-Za-z_][A-Za-z0-9_$]*["'`\]]?\s*\.\s*)?"""
+    r"""["'`\[]?token_outcomes\b""",
     re.IGNORECASE,
 )
 TOKEN_OUTCOME_COLUMN_RE = re.compile(r"\boutcome\b", re.IGNORECASE)
@@ -392,8 +401,13 @@ def _token_outcomes_column(node: ast.AST) -> str | None:
 
 
 def _is_raw_token_outcomes_sql(value: str) -> bool:
-    lower_value = value.lower()
-    if SQL_TEXT_RE.search(value) is None or "token_outcomes" not in lower_value:
+    """Return whether a string constant hand-writes SQL against ``token_outcomes``.
+
+    The string must contain a SQL statement whose clause keyword governs the
+    table itself; the ADR-019 two-axis check (outcome without path) then
+    decides whether that statement is the stale outcome-only shape.
+    """
+    if TOKEN_OUTCOMES_STATEMENT_RE.search(value) is None:
         return False
     if TOKEN_OUTCOME_IS_TERMINAL_RE.search(value) is not None:
         return True

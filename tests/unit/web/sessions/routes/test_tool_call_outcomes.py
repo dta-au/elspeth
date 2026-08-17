@@ -26,6 +26,7 @@ from uuid import uuid4
 from elspeth.web.sessions.protocol import ChatMessageRecord
 from elspeth.web.sessions.routes._helpers import (
     _tool_call_outcomes_by_call_id,
+    _ToolCallOutcomeKind,
 )
 
 _NOW = datetime(2026, 8, 6, 12, 0, 0, tzinfo=UTC)
@@ -76,7 +77,7 @@ class TestPrimaryWriterRows:
             [_tool_row(tool_call_id="call-1", composition_state_id=state_id)],
             state_versions_by_id={str(state_id): 3},
         )
-        assert outcomes["call-1"].outcome == "applied"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.APPLIED
         assert outcomes["call-1"].applied_state_version == 3
 
     def test_applied_without_version_map_entry_still_applied(self) -> None:
@@ -84,7 +85,7 @@ class TestPrimaryWriterRows:
             [_tool_row(tool_call_id="call-1", composition_state_id=uuid4())],
             state_versions_by_id={},
         )
-        assert outcomes["call-1"].outcome == "applied"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.APPLIED
         assert outcomes["call-1"].applied_state_version is None
 
     def test_successful_lookup_is_completed(self) -> None:
@@ -92,7 +93,7 @@ class TestPrimaryWriterRows:
             [_tool_row(tool_call_id="call-1", content=json.dumps({"success": True, "data": {}}))],
             state_versions_by_id={},
         )
-        assert outcomes["call-1"].outcome == "completed"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.COMPLETED
         assert outcomes["call-1"].applied_state_version is None
 
     def test_semantic_rejection_is_rejected(self) -> None:
@@ -103,7 +104,7 @@ class TestPrimaryWriterRows:
             [_tool_row(tool_call_id="call-1", content=json.dumps({"success": False, "validation": {}}))],
             state_versions_by_id={},
         )
-        assert outcomes["call-1"].outcome == "rejected"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.REJECTED
 
     def test_failure_projection_is_failed(self) -> None:
         content = json.dumps({"_redaction_status": "plugin_crash", "error_class": "ValueError"})
@@ -111,7 +112,7 @@ class TestPrimaryWriterRows:
             [_tool_row(tool_call_id="call-1", content=content)],
             state_versions_by_id={},
         )
-        assert outcomes["call-1"].outcome == "failed"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.FAILED
 
     def test_cancelled_projection_is_cancelled(self) -> None:
         content = json.dumps({"_redaction_status": "cancelled", "error_class": "CancelledError", "error_message": "cancelled"})
@@ -119,7 +120,7 @@ class TestPrimaryWriterRows:
             [_tool_row(tool_call_id="call-1", content=content)],
             state_versions_by_id={},
         )
-        assert outcomes["call-1"].outcome == "cancelled"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.CANCELLED
 
 
 class TestFallbackWriterRows:
@@ -147,7 +148,7 @@ class TestFallbackWriterRows:
             composition_state_id=uuid4(),
         )
         outcomes = _tool_call_outcomes_by_call_id([row], state_versions_by_id={})
-        assert outcomes["call-1"].outcome == "applied"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.APPLIED
         assert outcomes["call-1"].applied_state_version == 2
 
     def test_shared_state_id_without_version_advance_is_not_applied(self) -> None:
@@ -158,7 +159,7 @@ class TestFallbackWriterRows:
             composition_state_id=uuid4(),
         )
         outcomes = _tool_call_outcomes_by_call_id([row], state_versions_by_id={})
-        assert outcomes["call-1"].outcome == "completed"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.COMPLETED
 
     def test_crash_status_is_failed(self) -> None:
         row = _tool_row(
@@ -167,7 +168,7 @@ class TestFallbackWriterRows:
             tool_calls=[self._envelope(status="plugin_crash", version_after=None, error_class="RuntimeError")],
         )
         outcomes = _tool_call_outcomes_by_call_id([row], state_versions_by_id={})
-        assert outcomes["call-1"].outcome == "failed"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.FAILED
 
     def test_cancelled_status_is_cancelled(self) -> None:
         row = _tool_row(
@@ -176,7 +177,7 @@ class TestFallbackWriterRows:
             tool_calls=[self._envelope(status="cancelled", version_after=None, error_class="CancelledError")],
         )
         outcomes = _tool_call_outcomes_by_call_id([row], state_versions_by_id={})
-        assert outcomes["call-1"].outcome == "cancelled"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.CANCELLED
 
     def test_rejected_mutation_via_content_success_false(self) -> None:
         row = _tool_row(
@@ -185,7 +186,7 @@ class TestFallbackWriterRows:
             tool_calls=[self._envelope(result_canonical=json.dumps({"success": False}))],
         )
         outcomes = _tool_call_outcomes_by_call_id([row], state_versions_by_id={})
-        assert outcomes["call-1"].outcome == "rejected"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.REJECTED
 
 
 class TestNonToolRows:
@@ -209,4 +210,4 @@ class TestNonToolRows:
             [_tool_row(tool_call_id="call-1", content="not json")],
             state_versions_by_id={},
         )
-        assert outcomes["call-1"].outcome == "completed"
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.COMPLETED

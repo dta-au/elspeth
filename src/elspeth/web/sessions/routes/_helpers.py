@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, Final, Literal, cast
 from uuid import UUID, uuid4
 from weakref import WeakValueDictionary
@@ -397,25 +398,42 @@ async def _pending_proposal_responses(
     return [_composition_proposal_response(proposal) for proposal in proposals]
 
 
+class _ToolCallOutcomeKind(StrEnum):
+    """Closed vocabulary of server-derived per-call outcomes for the SPA.
+
+    Mirrors the frontend union in ``frontend/src/types/index.ts``
+    (``ToolCallEnvelope.outcome``); the two must be extended together. A
+    ``StrEnum`` member serialises as its bare value, so the wire shape is
+    exactly the string the SPA already decodes.
+    """
+
+    APPLIED = "applied"
+    """The call durably created a composition-state version."""
+
+    REJECTED = "rejected"
+    """Dispatch completed but the tool reported ``success=False`` — validation
+    refused the mutation and nothing persisted."""
+
+    FAILED = "failed"
+    """Arg-error or plugin crash."""
+
+    CANCELLED = "cancelled"
+    """The coordinator cancelled the dispatch (Stop)."""
+
+    COMPLETED = "completed"
+    """Everything else (lookups, advisor hints)."""
+
+
 @dataclass(frozen=True, slots=True)
 class _ToolCallOutcome:
     """Server-derived outcome of one tool call, projected for the SPA.
-
-    ``outcome`` is a closed vocabulary:
-
-    * ``applied``   — the call durably created a composition-state version;
-    * ``rejected``  — the dispatch completed but the tool reported
-      ``success=False`` (validation refused the mutation; nothing persisted);
-    * ``failed``    — arg-error or plugin crash;
-    * ``cancelled`` — the coordinator cancelled the dispatch (Stop);
-    * ``completed`` — everything else (lookups, advisor hints).
 
     ``applied_state_version`` accompanies ``applied`` when the version
     number is derivable (state-id map for primary-writer rows, envelope
     ``version_after`` for fallback-writer rows), else ``None``.
     """
 
-    outcome: str
+    outcome: _ToolCallOutcomeKind
     applied_state_version: int | None
 
 
@@ -447,7 +465,7 @@ def _tool_call_outcomes_by_call_id(
         envelope = row.tool_calls[0] if row.tool_calls else None
         if envelope is None and row.composition_state_id is not None:
             outcomes[row.tool_call_id] = _ToolCallOutcome(
-                outcome="applied",
+                outcome=_ToolCallOutcomeKind.APPLIED,
                 applied_state_version=state_versions_by_id.get(str(row.composition_state_id)),
             )
             continue
@@ -456,16 +474,16 @@ def _tool_call_outcomes_by_call_id(
             version_after = envelope.get("version_after")
             if isinstance(version_before, int) and isinstance(version_after, int) and version_after > version_before:
                 outcomes[row.tool_call_id] = _ToolCallOutcome(
-                    outcome="applied",
+                    outcome=_ToolCallOutcomeKind.APPLIED,
                     applied_state_version=version_after,
                 )
                 continue
             status = envelope.get("status")
             if status == ComposerToolStatus.CANCELLED.value:
-                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome="cancelled", applied_state_version=None)
+                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.CANCELLED, applied_state_version=None)
                 continue
             if status in (ComposerToolStatus.ARG_ERROR.value, ComposerToolStatus.PLUGIN_CRASH.value):
-                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome="failed", applied_state_version=None)
+                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.FAILED, applied_state_version=None)
                 continue
         try:
             content = json.loads(row.content)
@@ -475,14 +493,14 @@ def _tool_call_outcomes_by_call_id(
             if content.get("error_class"):
                 cancelled = content.get("_redaction_status") == ComposerToolStatus.CANCELLED.value
                 outcomes[row.tool_call_id] = _ToolCallOutcome(
-                    outcome="cancelled" if cancelled else "failed",
+                    outcome=_ToolCallOutcomeKind.CANCELLED if cancelled else _ToolCallOutcomeKind.FAILED,
                     applied_state_version=None,
                 )
                 continue
             if content.get("success") is False:
-                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome="rejected", applied_state_version=None)
+                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.REJECTED, applied_state_version=None)
                 continue
-        outcomes[row.tool_call_id] = _ToolCallOutcome(outcome="completed", applied_state_version=None)
+        outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.COMPLETED, applied_state_version=None)
     return outcomes
 
 
@@ -516,7 +534,9 @@ def _message_response(
             if projected is not None:
                 entry = {
                     **entry,
-                    "outcome": projected.outcome,
+                    # Emit the bare value: the wire shape is the string the SPA
+                    # union decodes, never an enum repr from a serializer.
+                    "outcome": projected.outcome.value,
                     "applied_state_version": projected.applied_state_version,
                 }
             stamped.append(entry)
