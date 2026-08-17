@@ -201,8 +201,14 @@ def test_normalized_result_container_fields_are_deeply_frozen() -> None:
     mappings, mutable through any retained reference. This pins the
     ``__post_init__`` freeze that closes that gap, and is the contract the
     thawed content assertions above deliberately no longer check.
+
+    Built from the FACET pages, not the default ones: under ``_normalize()``
+    five of the six facets are empty tuples, so the per-entry carrier
+    assertion below would never execute for them and the test would be
+    vacuous exactly where the thawed assertions gave up coverage.
     """
-    result = _normalize()
+    result = _normalize(_facet_first_page(), _second_page())
+    assert all(getattr(result, name) for name in ("pages", "tables", "forms", "queries", "signatures", "layout"))
 
     for facet_name in ("pages", "tables", "forms", "queries", "signatures", "layout"):
         facet = getattr(result, facet_name)
