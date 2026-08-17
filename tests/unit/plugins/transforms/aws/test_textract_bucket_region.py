@@ -17,6 +17,7 @@ from elspeth.plugins.transforms.aws.textract_bucket_region import (
     BucketRegionProof,
     BucketRegionUnverifiedError,
     HeadBucketClient,
+    _success_proof,
     build_s3_head_bucket_sdk_client,
 )
 
@@ -189,6 +190,14 @@ def test_success_response_rejects_missing_disagreeing_or_malformed_region() -> N
     )
 
     for response in responses:
+        # Boundary claim: the decorated ``_success_proof`` rejects the raw
+        # response through its declared ``raw_response`` parameter. This is the
+        # ``@trust_boundary`` honesty proof and must call the boundary directly.
+        with pytest.raises(BucketRegionUnverifiedError, match="unverified"):
+            _success_proof(response)
+
+        # Integration claim: the same rejection reaches the caller through the
+        # client, so the boundary is genuinely on the live HeadBucket path.
         client, _execution, _events, _sdk = _client(response)
         with pytest.raises(BucketRegionUnverifiedError, match="unverified"):
             client.verify_bucket_region("documents")

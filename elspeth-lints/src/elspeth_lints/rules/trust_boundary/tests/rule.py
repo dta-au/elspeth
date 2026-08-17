@@ -715,12 +715,30 @@ def _exception_names_from_expr(expr: ast.expr) -> set[str]:
     return set()
 
 
+def _is_classmethod(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return True if the boundary is declared as a ``@classmethod``."""
+    return any(isinstance(decorator, ast.Name) and decorator.id == "classmethod" for decorator in func_node.decorator_list)
+
+
 def _source_param_index(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     source_param: str,
 ) -> int | None:
-    """Return the positional parameter index for ``source_param`` if it has one."""
+    """Return the positional parameter index for ``source_param`` if it has one.
+
+    A ``@classmethod`` binds ``cls`` implicitly at *every* call form —
+    ``Cls.method(payload)``, ``instance.method(payload)``, and a module-level
+    alias alike — so ``cls`` never appears in the caller's argument list and
+    must not be counted here. The ``_is_unbound_method_call`` adjustment in
+    :func:`_call_uses_source_param` cannot cover this case: it keys off the
+    receiver *name*, and a classmethod's canonical receiver IS the class, which
+    that helper reads as an unbound ``Cls.method(self, payload)`` call.
+    Declaring the index without ``cls`` up front leaves that helper's
+    instance-method handling untouched.
+    """
     positional = [*func_node.args.posonlyargs, *func_node.args.args]
+    if positional and _is_classmethod(func_node):
+        positional = positional[1:]
     for index, arg in enumerate(positional):
         if arg.arg == source_param:
             return index

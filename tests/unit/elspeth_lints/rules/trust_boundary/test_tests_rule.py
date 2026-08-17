@@ -755,6 +755,91 @@ def test_unbound_method_call_does_not_count_receiver_as_source_param(tmp_path: P
     assert [finding.rule_id for finding in findings] == ["R_TB_TESTS_IRRELEVANT_INPUT"]
 
 
+def test_classmethod_boundary_call_binds_cls_implicitly(tmp_path: Path) -> None:
+    """``Cls.restore(envelope)`` supplies ``envelope``; ``cls`` is bound implicitly.
+
+    Regression: ``_is_unbound_method_call`` keys off the receiver *name*, so a
+    classmethod's canonical ``Cls.method(payload)`` receiver was read as an
+    unbound ``Cls.method(self, payload)`` call. The declared ``source_param``
+    index was then off by one and this honest test was reported as
+    R_TB_TESTS_IRRELEVANT_INPUT.
+    """
+    test_ref = "tests/test_classmethod.py::test_rejects_bad_input"
+    _write_test_file(
+        tmp_path,
+        "tests/test_classmethod.py",
+        """
+        import pytest
+
+        class Binding:
+            pass
+
+        def test_rejects_bad_input():
+            with pytest.raises(ValueError):
+                Binding.restore({"bad": object()})
+        """,
+    )
+    fingerprint = _test_fingerprint(tmp_path, test_ref)
+    findings = _analyze_at(
+        f"""
+        class Binding:
+            @classmethod
+            @trust_boundary(
+                tier=3,
+                source="x",
+                source_param="envelope",
+                suppresses=("R1",),
+                invariant="raises ValueError on malformed envelope",
+                test_ref="{test_ref}",
+                test_fingerprint="{fingerprint}",
+            )
+            def restore(cls, envelope):
+                return envelope["x"]
+        """,
+        repo_root=tmp_path,
+    )
+    assert findings == []
+
+
+def test_classmethod_boundary_called_without_source_param_still_fires(tmp_path: Path) -> None:
+    """The classmethod adjustment must not blanket-accept: no argument, no proof."""
+    test_ref = "tests/test_classmethod_bare.py::test_rejects_bad_input"
+    _write_test_file(
+        tmp_path,
+        "tests/test_classmethod_bare.py",
+        """
+        import pytest
+
+        class Binding:
+            pass
+
+        def test_rejects_bad_input():
+            with pytest.raises(ValueError):
+                Binding.restore()
+        """,
+    )
+    fingerprint = _test_fingerprint(tmp_path, test_ref)
+    findings = _analyze_at(
+        f"""
+        class Binding:
+            @classmethod
+            @trust_boundary(
+                tier=3,
+                source="x",
+                source_param="envelope",
+                suppresses=("R1",),
+                invariant="raises ValueError on malformed envelope",
+                test_ref="{test_ref}",
+                test_fingerprint="{fingerprint}",
+            )
+            def restore(cls, envelope):
+                return envelope["x"]
+        """,
+        repo_root=tmp_path,
+    )
+    assert [finding.rule_id for finding in findings] == ["R_TB_TESTS_IRRELEVANT_INPUT"]
+
+
 def test_repurposed_test_that_calls_different_subject_fires_irrelevant_input(tmp_path: Path) -> None:
     test_ref = "tests/test_repurposed.py::test_rejects_bad_input"
     _write_test_file(

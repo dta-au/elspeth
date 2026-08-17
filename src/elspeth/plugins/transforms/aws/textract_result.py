@@ -495,7 +495,7 @@ def _project_layout(blocks: Sequence[Mapping[str, Any]], index: Mapping[str, Map
     suppresses=("R1", "R5"),
     invariant="raises MalformedTextractResponse unless all response pages have JobStatus SUCCEEDED, DocumentMetadata with Pages, AnalyzeDocumentModelVersion, and valid Blocks; never silently defaults or skips a malformed response page",
     test_ref="tests/unit/plugins/transforms/aws/test_textract_result.py::test_missing_required_result_key_fails_closed",
-    test_fingerprint="fdaf02d9a0623a4de3d1854e1b1191580a48c7e5e0ad169b60338fb42975bb84",
+    test_fingerprint="ab8a34060d1de580cbb94733d5c11c3e7f4b305e461e883646acfa2abda07d61",
 )
 def normalize_textract_result(
     *,
@@ -590,7 +590,7 @@ def normalize_textract_result(
     suppresses=("R1", "R5"),
     invariant="raises MalformedTextractResponse unless response has DocumentMetadata with Pages, AnalyzeDocumentModelVersion, and valid Blocks; materializes missing Page on single-page responses; rejects HumanLoopActivationOutput; never silently defaults",
     test_ref="tests/unit/plugins/transforms/aws/test_textract_result.py::test_analyze_document_missing_required_member_fails_closed",
-    test_fingerprint="cae23556b7529080ce399988c8a58f16d3acd040e610fcc50ee1d4fb0228caa8",
+    test_fingerprint="b83f3697fa0b5f37cb86d7b3f18c28b92b7ec6ed2215726e2bd39c183778c10b",
 )
 def normalize_analyze_document_result(
     *,

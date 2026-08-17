@@ -248,8 +248,19 @@ def test_missing_required_result_key_fails_closed(missing: str) -> None:
     first = _first_page()
     del first[missing]
 
+    # The boundary is invoked directly, not through ``_normalize``: this is the
+    # ``@trust_boundary`` honesty proof for ``normalize_textract_result``'s
+    # ``result_pages`` parameter, so the raising assertion must exercise that
+    # parameter on the decorated function itself rather than through a wrapper.
     with pytest.raises(MalformedTextractResponse, match=missing):
-        _normalize(first, _second_page())
+        normalize_textract_result(
+            job_id="job-1",
+            result_pages=[first, _second_page()],
+            feature_types=("FORMS", "TABLES"),
+            s3_version="version-1",
+            max_blocks=200_000,
+            max_result_bytes=50_000_000,
+        )
 
 
 def test_non_list_blocks_fail_closed() -> None:
@@ -724,8 +735,16 @@ def test_analyze_document_missing_required_member_fails_closed(missing: str) -> 
     response = _sync_response()
     del response[missing]
 
+    # Direct invocation rather than ``_normalize_sync``: this is the
+    # ``@trust_boundary`` honesty proof for
+    # ``normalize_analyze_document_result``'s ``response`` parameter.
     with pytest.raises(MalformedTextractResponse):
-        _normalize_sync(response)
+        normalize_analyze_document_result(
+            response=response,
+            feature_types=("FORMS", "TABLES"),
+            max_blocks=200_000,
+            max_result_bytes=50_000_000,
+        )
 
 
 def test_analyze_document_unknown_top_level_members_are_omitted() -> None:

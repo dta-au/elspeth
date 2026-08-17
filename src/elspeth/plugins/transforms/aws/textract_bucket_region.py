@@ -129,7 +129,7 @@ def _metadata(value: object) -> tuple[int | None, Mapping[str, Any], int]:
     suppresses=("R1",),
     invariant="raises BucketRegionUnverifiedError unless response is mapping with status 200, ResponseMetadata, and valid region from 'BucketRegion' field or 'x-amz-bucket-region' header; never silently defaults",
     test_ref="tests/unit/plugins/transforms/aws/test_textract_bucket_region.py::test_success_response_rejects_missing_disagreeing_or_malformed_region",
-    test_fingerprint="3e3e2591154513eea657efa33439ed6e08970aaf803851ecaa97a12ef6b4dd30",
+    test_fingerprint="9d8d3401193fd635da8538592dfb1766fc52e7c5d420ef8a63b3e40797dd4775",
 )
 def _success_proof(raw_response: object) -> tuple[BucketRegionProof, int]:
     response = _strict_mapping(raw_response)
