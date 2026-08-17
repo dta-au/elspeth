@@ -101,7 +101,15 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             resp = composer_test_client.post("/api/sessions", json={"title": "x"})
             assert resp.status_code == 201
     """
-    backend = getattr(request, "param", "sqlite")
+    # pytest sets ``request.param`` only for indirectly parametrized requests
+    # (``@pytest.mark.parametrize(..., indirect=True)``); a plain request of
+    # this fixture has no such attribute at all, and the absence IS the
+    # sqlite default.  The backend value itself is then contract-checked
+    # below, so an unexpected parameter fails loudly rather than silently.
+    try:
+        backend = request.param
+    except AttributeError:
+        backend = "sqlite"
     postgres: PostgresContainer | None = None
     if backend == "sqlite":
         # Use independent SQLite connections so route-race tests exercise the

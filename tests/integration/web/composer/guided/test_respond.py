@@ -3750,7 +3750,7 @@ class TestStep2IntraStep:
                 return
             compiled = context.compiled
             statement = compiled.statement if compiled is not None else None
-            table_name = getattr(getattr(statement, "table", None), "name", None)
+            table_name = statement.table.name if isinstance(statement, Insert | Update) else None
             value_keys = set(compiled.params) if compiled is not None else set()
             operation: str | None = None
             if isinstance(statement, Insert):

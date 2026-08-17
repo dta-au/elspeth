@@ -505,14 +505,15 @@ class ParityEnv:
                 f"(got {len(proposals)}) — it may have fallen through to the compose loop"
             )
         proposal = proposals[0]
-        surface_value = getattr(proposal.pipeline_metadata, "surface", None) if proposal.pipeline_metadata is not None else None
-        surface_value = getattr(surface_value, "value", surface_value)
-        if surface_value != "freeform":
-            raise AssertionError(f"freeform proposal recorded surface {surface_value!r}, not 'freeform'")
+        metadata = proposal.pipeline_metadata
+        if metadata is None:
+            raise AssertionError(f"freeform proposal for {fixture['class']} carries no pipeline metadata")
+        if metadata.surface != "freeform":
+            raise AssertionError(f"freeform proposal recorded surface {metadata.surface!r}, not 'freeform'")
         async with self._client() as client:
             response = await client.post(
                 f"/api/sessions/{session.id}/proposals/{proposal.id}/accept",
-                json={"draft_hash": proposal.pipeline_metadata.draft_hash},
+                json={"draft_hash": metadata.draft_hash},
             )
         if response.status_code != 200:
             raise AssertionError(f"freeform accept failed ({response.status_code}): {response.text}")

@@ -11,6 +11,9 @@ from uuid import UUID
 import pytest
 from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import event, func, select, text
+from sqlalchemy.engine.interfaces import ExecutionContext
+from sqlalchemy.sql.dml import Delete, Insert, Update
+from sqlalchemy.sql.expression import FromClause
 
 from elspeth.contracts.blobs import BlobIntegrityError, BlobStateError
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
@@ -50,6 +53,20 @@ from elspeth.web.sessions.routes.guided_operations import (
 )
 from elspeth.web.sessions.schemas import CompositionProposalResponse
 from elspeth.web.sessions.service import _composition_state_data_content_hash
+
+
+def _dml_target_table(context: ExecutionContext) -> FromClause | None:
+    """Return the table a compiled DML statement writes to, else ``None``.
+
+    ``before_cursor_execute`` also fires for SELECT, DDL, and raw-text
+    execution, none of which carry a DML target; those cases are the honest
+    ``None``, not a missing attribute.
+    """
+    compiled = context.compiled
+    statement = compiled.statement if compiled is not None else None
+    if isinstance(statement, Insert | Update | Delete):
+        return statement.table
+    return None
 
 
 def _record_failed_llm_call(recorder, *, status: ComposerLLMCallStatus, secret: str) -> None:
@@ -1333,8 +1350,7 @@ def test_guided_full_inline_custody_fault_rolls_back_blob_and_cohort_together(co
         nonlocal armed
         if not armed:
             return
-        compiled = getattr(context, "compiled", None)
-        target_table = getattr(getattr(compiled, "statement", None), "table", None)
+        target_table = _dml_target_table(context)
         if target_table is blobs_table:
             armed = False
             raise RuntimeError("injected blob fault")
@@ -1434,8 +1450,7 @@ def test_guided_full_atomic_stage_fault_rolls_back_the_entire_cohort(
         if not armed:
             return
         normalized = " ".join(statement.lower().split())
-        compiled = getattr(context, "compiled", None)
-        target_table = getattr(getattr(compiled, "statement", None), "table", None)
+        target_table = _dml_target_table(context)
         label: str | None = None
         if target_table is composition_states_table:
             label = "checkpoint"

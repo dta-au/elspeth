@@ -17,6 +17,7 @@ import pytest
 import structlog
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, text
+from starlette.routing import Route
 
 from elspeth.contracts.blobs import BlobNotFoundError, BlobStateError
 from elspeth.contracts.errors import AuditIntegrityError
@@ -1697,7 +1698,10 @@ def test_only_one_schema8_respond_route_is_registered(composer_test_client: Test
     routes = [
         route
         for route in composer_test_client.app.routes
-        if getattr(route, "path", None) == "/api/sessions/{session_id}/guided/respond" and "POST" in getattr(route, "methods", set())
+        # ``Route`` (not ``APIRoute``) so a duplicate registered through the
+        # bare Starlette API would still be counted; ``Mount`` is not a
+        # ``Route`` and carries no methods, exactly as before.
+        if isinstance(route, Route) and route.path == "/api/sessions/{session_id}/guided/respond" and "POST" in (route.methods or set())
     ]
     assert len(routes) == 1
     session_id = _create_session(composer_test_client)

@@ -221,9 +221,7 @@ def test_plural_sources_outputs_survive_hydration_and_stage_ordered_proposal(
     old_app = client.app
     old_service = client.app.state.session_service
     old_engine = client.app.state.session_engine
-    restart_test_client = getattr(client.app.state, "restart_test_client", None)
-    assert callable(restart_test_client), "guided integration fixture must support a literal app/service restart"
-    client = restart_test_client()
+    client = client.app.state.restart_test_client()
     assert client.app is not old_app
     assert client.app.state.session_service is not old_service
     assert client.app.state.session_engine is not old_engine

@@ -11,6 +11,9 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import event, func, select
+from sqlalchemy.engine.interfaces import ExecutionContext
+from sqlalchemy.sql.dml import Delete, Insert, Update
+from sqlalchemy.sql.expression import FromClause
 
 from elspeth.contracts.blobs import BlobQuotaExceededError
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
@@ -73,6 +76,20 @@ from tests.integration.web.composer.guided.test_respond import (
 from tests.integration.web.composer.guided.test_respond_schema8_atomic import _respond_operation_count
 from tests.integration.web.composer.guided.test_step_chat import TestStepChatCrossStep, _create_session
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+
+
+def _dml_target_table(context: ExecutionContext) -> FromClause | None:
+    """Return the table a compiled DML statement writes to, else ``None``.
+
+    ``before_cursor_execute`` also fires for SELECT, DDL, and raw-text
+    execution, none of which carry a DML target; those cases are the honest
+    ``None``, not a missing attribute.
+    """
+    compiled = context.compiled
+    statement = compiled.statement if compiled is not None else None
+    if isinstance(statement, Insert | Update | Delete):
+        return statement.table
+    return None
 
 
 def _session_message_rows(connection, session_id: str) -> list[dict[str, object]]:
@@ -1378,7 +1395,7 @@ def test_schema8_management_proposal_invalidation_fault_rolls_back_intent_propos
 
     def inject_fault(_conn, _cursor, statement, _parameters, context, _executemany):
         nonlocal reached
-        target_table = getattr(getattr(getattr(context, "compiled", None), "statement", None), "table", None)
+        target_table = _dml_target_table(context)
         normalized = " ".join(statement.lower().split())
         matched = (fault_point == "proposal_event" and target_table is proposal_events_table) or (
             fault_point == "proposal_update" and normalized.startswith("update composition_proposals")
@@ -2615,13 +2632,12 @@ def test_fault_at_each_settlement_boundary_rolls_back_business_state_but_persist
     writes: list[str] = []
     chat_insert_count = 0
 
-    def inject_fault(_conn, _cursor, statement, _parameters, _context, _executemany):
+    def inject_fault(_conn, _cursor, statement, _parameters, context, _executemany):
         nonlocal armed, chat_insert_count
         if not armed:
             return
         normalized = " ".join(statement.lower().split())
-        compiled = getattr(_context, "compiled", None)
-        target_table = getattr(getattr(compiled, "statement", None), "table", None)
+        target_table = _dml_target_table(context)
         label: str | None = None
         if target_table is composition_states_table:
             label = "state_insert"
