@@ -18,11 +18,7 @@ from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 BuiltinPluginClass = type[BaseSource] | type[BaseTransform] | type[BaseSink]
 
-_REFERENCE_TEXT_FIELDS = (
-    "usage_when_to_use",
-    "usage_when_not_to_use",
-    "example_use",
-)
+
 _GENERIC_REFERENCE_TEXT = frozenset(
     {
         "see documentation",
@@ -62,11 +58,24 @@ def _normalize_reference_text(value: str) -> str:
     return normalized.rstrip(".!")
 
 
+def _reference_text_fields(plugin_cls: BuiltinPluginClass) -> tuple[tuple[str, object], ...]:
+    """Return the reference-prose contract as an explicit (name, value) table.
+
+    ``BaseSource``/``BaseTransform``/``BaseSink`` each declare all three fields,
+    so every entry is a direct attribute read: a base class that dropped one
+    fails here with ``AttributeError`` instead of silently reading a default.
+    """
+    return (
+        ("usage_when_to_use", plugin_cls.usage_when_to_use),
+        ("usage_when_not_to_use", plugin_cls.usage_when_not_to_use),
+        ("example_use", plugin_cls.example_use),
+    )
+
+
 def assert_reference_text(plugin_cls: BuiltinPluginClass) -> None:
     """Assert that all reference prose is present, specific, and distinct."""
     normalized_values: list[str] = []
-    for field_name in _REFERENCE_TEXT_FIELDS:
-        value = getattr(plugin_cls, field_name)
+    for field_name, value in _reference_text_fields(plugin_cls):
         assert isinstance(value, str), f"{plugin_cls.name}.{field_name} must be a nonblank string"
         assert value.strip(), f"{plugin_cls.name}.{field_name} must be nonblank"
         normalized = _normalize_reference_text(value)
@@ -131,7 +140,13 @@ def _expected_section(reference: BuiltinReference) -> str:
         return "sources"
     if reference.kind == "sink":
         return "sinks"
-    if bool(getattr(reference.plugin_cls, "is_batch_aware", False)):
+    plugin_cls = reference.plugin_cls
+    # kind == "transform" here, so the class is nominally a BaseTransform —
+    # the only base that declares ``is_batch_aware``. Assert the owned type
+    # rather than probing for the flag: a source/sink misfiled as a transform
+    # must fail loudly, not silently fall through to the row-transform section.
+    assert issubclass(plugin_cls, BaseTransform), f"{plugin_cls.name} is registered as a transform but is not a BaseTransform"
+    if plugin_cls.is_batch_aware:
         return "aggregations"
     return "transform"
 

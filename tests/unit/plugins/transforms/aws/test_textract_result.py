@@ -208,18 +208,24 @@ def test_normalized_result_container_fields_are_deeply_frozen() -> None:
     vacuous exactly where the thawed assertions gave up coverage.
     """
     result = _normalize(_facet_first_page(), _second_page())
-    assert all(getattr(result, name) for name in ("pages", "tables", "forms", "queries", "signatures", "layout"))
+    facets = (
+        ("pages", result.pages),
+        ("tables", result.tables),
+        ("forms", result.forms),
+        ("queries", result.queries),
+        ("signatures", result.signatures),
+        ("layout", result.layout),
+    )
+    assert all(facet for _, facet in facets)
 
-    for facet_name in ("pages", "tables", "forms", "queries", "signatures", "layout"):
-        facet = getattr(result, facet_name)
+    for facet_name, facet in facets:
         assert type(facet) is tuple, facet_name
         for entry in facet:
             assert type(entry) is MappingProxyType, facet_name
             with pytest.raises(TypeError):
                 entry["injected"] = "mutated"  # type: ignore[index]
 
-    for mapping_name in ("metadata", "native_result"):
-        mapping = getattr(result, mapping_name)
+    for mapping_name, mapping in (("metadata", result.metadata), ("native_result", result.native_result)):
         assert type(mapping) is MappingProxyType, mapping_name
         with pytest.raises(TypeError):
             mapping["injected"] = "mutated"  # type: ignore[index]

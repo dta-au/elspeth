@@ -41,6 +41,7 @@ from elspeth.core.landscape.execution.sink_effect_reservation import SinkEffectR
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
+    RunSourceLifecycleState,
     artifacts_table,
     batch_members_table,
     batches_table,
@@ -3554,8 +3555,11 @@ def _expansion_child_enqueue_recovery_case(
         **kwargs: Any,
     ) -> None:
         record_run_source(repository, **kwargs)
+        # ``lifecycle_state`` is declared ``str | RunSourceLifecycleState``.
+        # The enum is a ``StrEnum``, so this one comparison covers both arms
+        # of the union and binds the owned enum instead of a magic string.
         lifecycle = kwargs["lifecycle_state"]
-        if getattr(lifecycle, "value", lifecycle) == "exhausted" and not observed_faults:
+        if lifecycle == RunSourceLifecycleState.EXHAUSTED and not observed_faults:
             observed_faults.append("after_source_exhausted_before_sink_flush")
             raise RuntimeError("injected DAG corpus expansion crash before sink flush")
 
@@ -4012,8 +4016,11 @@ def _pending_sink_redrive_recovery_case(
 
     def stop_after_source_exhausted(repository: RunLifecycleRepository, **kwargs: Any) -> None:
         record_run_source(repository, **kwargs)
+        # See ``fail_after_source_exhausted``: ``RunSourceLifecycleState`` is a
+        # ``StrEnum``, so one comparison covers both arms of the declared
+        # ``str | RunSourceLifecycleState`` union.
         lifecycle = kwargs["lifecycle_state"]
-        if getattr(lifecycle, "value", lifecycle) == "exhausted" and not setup_faults:
+        if lifecycle == RunSourceLifecycleState.EXHAUSTED and not setup_faults:
             setup_faults.append("after_source_exhausted_before_sink_flush")
             raise RuntimeError("injected DAG corpus pending-sink setup crash")
 

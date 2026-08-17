@@ -481,6 +481,7 @@ def _freeze_runtime_val_registries_before_begin_run(monkeypatch: pytest.MonkeyPa
 
         from elspeth.contracts import (
             ResolvedSinkEffectMode,
+            SinkEffectContract,
             SinkEffectExecutionPurpose,
             SinkEffectInputKind,
         )
@@ -501,10 +502,15 @@ def _freeze_runtime_val_registries_before_begin_run(monkeypatch: pytest.MonkeyPa
         modes: dict[str, str] = dict(config.sink_effect_modes)
         if not modes:
             for sink_name, sink in config.sinks.items():
-                resolver = getattr(type(sink), "_resolve_sink_effect_mode", None)
-                if resolver is None:
+                # Nominal, not structural: production admission
+                # (``preflight._resolved_modes_for_sinks``) gates on this exact
+                # marker class before calling the adapter-owned resolver, and
+                # ``BaseSink`` declares it, so every sink that owns a mode
+                # resolver is a ``SinkEffectContract``. A legacy sink that
+                # declares nothing simply has no mode to contribute.
+                if not isinstance(sink, SinkEffectContract):
                     continue
-                resolved = resolver(dict(sink.config), purpose=SinkEffectExecutionPurpose.FRESH)
+                resolved = type(sink)._resolve_sink_effect_mode(dict(sink.config), purpose=SinkEffectExecutionPurpose.FRESH)
                 if resolved is None:
                     continue
                 if not isinstance(resolved, ResolvedSinkEffectMode):
