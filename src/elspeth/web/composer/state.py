@@ -81,6 +81,32 @@ _COALESCE_RUNTIME_POLICY_DEFAULT: Final[str] = CoalesceSettings.model_fields["po
 _COALESCE_RUNTIME_MERGE_DEFAULT: Final[str] = CoalesceSettings.model_fields["merge"].default
 
 
+def _row_union_normalized_branches(node_type: str, branches: CoalesceBranches | None) -> CoalesceBranches | None:
+    """Return ``row_union`` list branches as the runtime's identity mapping.
+
+    ``branches`` is returned unchanged for every other node type, for ``None``,
+    and for branches already authored as a ``Mapping`` — so this is safe to
+    apply unconditionally at a construction boundary.
+
+    A list whose entries are NOT unique is returned as the tuple it was, not
+    as a mapping: a dict comprehension would silently erase the duplicate and
+    with it the authoring error, so the invalid shape is preserved long enough
+    for ``validate()`` to reject it. Unique lists normalize to the runtime's
+    ordered identity mapping.
+
+    This lives at module level, and takes ``node_type``/``branches`` as
+    parameters rather than reading ``self``, so ``NodeSpec.__post_init__`` and
+    ``NodeSpec.from_dict`` share ONE normalisation. The two were byte-identical
+    copies before.
+    """
+    if node_type != "row_union" or branches is None or isinstance(branches, Mapping):
+        return branches
+    branch_tuple = tuple(branches)
+    if len(branch_tuple) != len(set(branch_tuple)):
+        return branch_tuple
+    return {branch: branch for branch in branch_tuple}
+
+
 class _ProducerEmitProfile(NamedTuple):
     """What a producer puts on its outgoing edge, for the EXTRAS direction.
 
@@ -586,12 +612,9 @@ class NodeSpec:
         # ``on_error=d["on_error"]`` unnormalised, so a session persisted with
         # ``on_error: null`` deserialises to None — contained, because Stage 1
         # rejects it.
-        if self.node_type == "row_union" and self.branches is not None and not isinstance(self.branches, Mapping):
-            branch_tuple = tuple(self.branches)
-            normalized_branches: CoalesceBranches = (
-                branch_tuple if len(branch_tuple) != len(set(branch_tuple)) else {branch: branch for branch in branch_tuple}
-            )
-            object.__setattr__(self, "branches", normalized_branches)
+        # Unconditional: the helper is a no-op for every shape that needs no
+        # normalisation, and returns the value it was given.
+        object.__setattr__(self, "branches", _row_union_normalized_branches(self.node_type, self.branches))
         # Mapping fields must be deep-frozen. Scalar, enum, and tuple fields
         # are already immutable and need no guard.
         freeze_fields(self, "options")
@@ -615,16 +638,16 @@ class NodeSpec:
         """
         fork_to = d["fork_to"] if "fork_to" in d else None
         branches = d["branches"] if "branches" in d else None
-        if d["node_type"] == "row_union" and branches is not None and not isinstance(branches, Mapping):
-            branch_tuple = tuple(branches)
-            # Preserve an invalid duplicate list long enough for validate() to
-            # reject it; a dict comprehension would silently erase the authoring
-            # error. Valid lists normalize to the runtime's identity mapping.
-            normalized_branches: CoalesceBranches | None = (
-                branch_tuple if len(branch_tuple) != len(set(branch_tuple)) else {branch: branch for branch in branch_tuple}
-            )
+        # Mapping branches are defensively copied; list branches are coerced to
+        # a tuple and then routed through the SHARED row_union normalisation
+        # that ``__post_init__`` also applies, so the two can never drift.
+        normalized_branches: CoalesceBranches | None
+        if isinstance(branches, Mapping):
+            normalized_branches = dict(branches)
+        elif branches is None:
+            normalized_branches = None
         else:
-            normalized_branches = dict(branches) if isinstance(branches, Mapping) else tuple(branches) if branches is not None else None
+            normalized_branches = _row_union_normalized_branches(d["node_type"], tuple(branches))
         return cls(
             id=d["id"],
             node_type=d["node_type"],

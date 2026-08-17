@@ -17,6 +17,7 @@ import yaml
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.blobs_inline import BlobInlineValidationViolation
 from elspeth.contracts.errors import PipelineLoweringError
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.core.blobs_inline import (
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
     BLOB_INLINE_PER_REF_BYTE_CAP,
@@ -65,6 +66,17 @@ class _LLMPolicyComponent:
     label: str
     plugin: str | None
     options: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        # ``options`` arrives from ``CompositionState``, which already
+        # deep-freezes source/node options in its own ``__post_init__``, so in
+        # practice this is a cheap re-freeze of an already-immutable mapping.
+        # It is stated here anyway because the component may be constructed
+        # from any Mapping and both readers — ``web_llm_base_url_policy_error``
+        # and ``web_llm_tracing_policy_error`` — are policy gates whose input
+        # must not be mutable behind their back. No consumer compares this
+        # field by identity.
+        freeze_fields(self, "options")
 
 
 def _source_policy_component_id(source_name: object) -> str:

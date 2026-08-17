@@ -304,9 +304,21 @@ def _replace_llm_tool_call_arguments(
     raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _SetPipelineFinalization:
-    """Pure candidate-finalization outcome before custody or publication."""
+    """Pure candidate-finalization outcome before custody or publication.
+
+    Deliberately NOT ``frozen=True``. ``arguments`` is a plain mutable
+    ``dict`` — the caller's own tool arguments on the no-op paths, or the
+    canonicalized rewrite — which the dispatch loop rebinds as
+    ``dict[str, Any]`` and then hands to custody preparation, redaction, and
+    the JSON re-serialization of the LLM tool call. ``frozen=True`` would
+    claim a deep immutability this field cannot honour, and deep-freezing it
+    to earn the claim would put a ``MappingProxyType`` on a ``json.dumps``
+    path. The struct is constructed and immediately destructured at its two
+    call sites; nothing hashes it, ``replace``s it, or uses it as a key, so
+    the frozen marker was never load-bearing.
+    """
 
     arguments: Mapping[str, Any]
     context: ToolContext

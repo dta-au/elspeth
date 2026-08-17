@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.sessions.protocol import ChatMessageRole, CompositionStateData
 
 
@@ -117,6 +118,15 @@ class AuditMessageDraft:
     tool_call_id: str | None = None
     parent_assistant_id: str | None = None
     composition_state_id: str | None = None
+
+    def __post_init__(self) -> None:
+        # ``tool_calls`` carries audit envelopes that must not change between
+        # cohort construction and the atomic insert. Both readers already
+        # expect frozen shapes: ``add_messages_atomic`` ``deep_thaw``s before
+        # the DB write, and ``record_settled_composer_audit_message`` admits
+        # ``MappingProxyType`` alongside ``dict``. ``None`` passes through
+        # ``deep_freeze`` unchanged.
+        freeze_fields(self, "tool_calls")
 
 
 @dataclass(frozen=True, slots=True)

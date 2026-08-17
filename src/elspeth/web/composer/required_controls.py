@@ -40,6 +40,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Final, Literal, cast
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, ControlRole, PluginCapability
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
@@ -115,6 +116,16 @@ class _CandidateSource:
     container: Literal["source", "sources"]
     name: str
     block: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        # ``block`` is a live sub-mapping of the caller's authored candidate.
+        # Deep-freezing it rebinds THIS field only — the caller's candidate is
+        # never mutated — so the no-op identity contract of
+        # ``wire_required_controls`` (every no-op path returns the INPUT
+        # OBJECT) is unaffected. Both readers are read-only: ``_parse_source``
+        # projects a ``SourceSpec`` and the rewrite path copies via
+        # ``dict(location.block)``.
+        freeze_fields(self, "block")
 
     @property
     def component_id(self) -> str:

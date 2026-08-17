@@ -12,6 +12,7 @@ from sqlalchemy import and_, case, func, or_, select
 
 from elspeth.contracts.audit import _TERMINAL_PAIR_FIELD_CONSTRAINTS, DISCARD_SINK_NAME
 from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, _NON_TERMINAL_PATHS, TerminalOutcome, TerminalPath
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
     rows_table,
@@ -54,6 +55,13 @@ class RunAccountingBatch:
 
     accounting: Mapping[str, RunAccounting] = field(default_factory=dict)
     corrupt: Mapping[str, RunAccountingCorruption] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Both mappings are built fresh per batch read and consumed read-only
+        # by the response projections (``in``/``[]``/``.get``). The values are
+        # pydantic models, which ``deep_freeze`` returns unchanged, so this
+        # freezes the batch's own two dicts and nothing else.
+        freeze_fields(self, "accounting", "corrupt")
 
 
 def load_run_accounting_for_settings(
