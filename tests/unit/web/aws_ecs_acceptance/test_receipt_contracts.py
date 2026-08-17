@@ -17,8 +17,9 @@ from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 
 def test_moved_public_receipt_contracts_are_facade_reexports_by_identity() -> None:
-    for name in ("encode_exec_receipt", "extract_exec_receipt", "resolve_exec_receipt_env"):
-        assert getattr(acceptance, name) is getattr(receipt_contracts, name)
+    assert acceptance.encode_exec_receipt is receipt_contracts.encode_exec_receipt
+    assert acceptance.extract_exec_receipt is receipt_contracts.extract_exec_receipt
+    assert acceptance.resolve_exec_receipt_env is receipt_contracts.resolve_exec_receipt_env
 
 
 def _s3_receipt_details() -> dict[str, object]:

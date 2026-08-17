@@ -19,18 +19,14 @@ from elspeth.web._aws_ecs_acceptance import http_client
 
 
 def test_moved_public_transport_and_capture_are_facade_reexports_by_identity() -> None:
-    owners = {
-        "AcceptanceHttpClient": http_client,
-        "build_canonical_tutorial_pipeline_yaml": capture_module,
-        "build_fixed_pipeline_yaml": capture_module,
-        "capture": capture_module,
-        "provision_storage": capture_module,
-        "verify_api": capture_module,
-        "verify_local_auth": capture_module,
-        "verify_payloads": capture_module,
-    }
-    for name, owner in owners.items():
-        assert getattr(acceptance, name) is getattr(owner, name)
+    assert acceptance.AcceptanceHttpClient is http_client.AcceptanceHttpClient
+    assert acceptance.build_canonical_tutorial_pipeline_yaml is capture_module.build_canonical_tutorial_pipeline_yaml
+    assert acceptance.build_fixed_pipeline_yaml is capture_module.build_fixed_pipeline_yaml
+    assert acceptance.capture is capture_module.capture
+    assert acceptance.provision_storage is capture_module.provision_storage
+    assert acceptance.verify_api is capture_module.verify_api
+    assert acceptance.verify_local_auth is capture_module.verify_local_auth
+    assert acceptance.verify_payloads is capture_module.verify_payloads
 
 
 def _auth_env(**updates: str) -> Mapping[str, str]:

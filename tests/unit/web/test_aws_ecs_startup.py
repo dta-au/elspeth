@@ -411,15 +411,21 @@ def test_group_or_world_writable_data_or_blob_directory_is_rejected(
     _assert_redacted(exc_info.value)
 
 
-@pytest.mark.parametrize("operation", ["lstat", "resolve"])
+@pytest.mark.parametrize(
+    ("operation", "original"),
+    [
+        pytest.param("lstat", Path.lstat, id="lstat"),
+        pytest.param("resolve", Path.resolve, id="resolve"),
+    ],
+)
 def test_secret_bearing_path_failures_are_static(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
+    original: Callable[..., object],
 ) -> None:
     settings = _settings(tmp_path)
     assert settings.payload_store_path is not None
-    original = getattr(Path, operation)
 
     def fail(target: Path, *args: object, **kwargs: object) -> object:
         if target == settings.payload_store_path:

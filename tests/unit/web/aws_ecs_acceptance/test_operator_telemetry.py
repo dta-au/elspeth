@@ -16,25 +16,6 @@ from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._aws_ecs_acceptance import operator_telemetry
 from tests.unit.web.aws_ecs_acceptance.test_manifest_schema_inventory import _init_control_manifest
 
-PUBLIC_OPERATOR_TELEMETRY_EXPORTS = {
-    "AWSOperatorMetricEmitter",
-    "AWSOperatorTelemetryQueries",
-    "AcceptancePolicy",
-    "AuditSentinel",
-    "ExistingLandscapeLifecycleAudit",
-    "OperatorTelemetryEvidence",
-    "OperatorTelemetryOutageEvidence",
-    "PublicApiLifecycleAudit",
-    "TelemetryQueries",
-    "TelemetrySentinelEmitter",
-    "operator_metric_dimensions",
-    "verify_connection_budget_live",
-    "verify_operator_telemetry",
-    "verify_operator_telemetry_live",
-    "verify_operator_telemetry_outage",
-    "xray_trace_id",
-}
-
 _CONNECTION_BUDGET_RUN_ID = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
 _CONNECTION_BUDGET_ENV = {
     "AWS_REGION": "ap-southeast-2",
@@ -172,9 +153,25 @@ def test_positive_operator_receipt_creates_and_binds_exact_retained_checkpoint(t
 
 
 def test_operator_telemetry_symbols_are_owned_by_private_module_and_reexported_by_identity() -> None:
-    for name in PUBLIC_OPERATOR_TELEMETRY_EXPORTS:
-        owned = getattr(operator_telemetry, name)
-        assert getattr(acceptance, name) is owned
+    for reexported, owned in (
+        (acceptance.AWSOperatorMetricEmitter, operator_telemetry.AWSOperatorMetricEmitter),
+        (acceptance.AWSOperatorTelemetryQueries, operator_telemetry.AWSOperatorTelemetryQueries),
+        (acceptance.AcceptancePolicy, operator_telemetry.AcceptancePolicy),
+        (acceptance.AuditSentinel, operator_telemetry.AuditSentinel),
+        (acceptance.ExistingLandscapeLifecycleAudit, operator_telemetry.ExistingLandscapeLifecycleAudit),
+        (acceptance.OperatorTelemetryEvidence, operator_telemetry.OperatorTelemetryEvidence),
+        (acceptance.OperatorTelemetryOutageEvidence, operator_telemetry.OperatorTelemetryOutageEvidence),
+        (acceptance.PublicApiLifecycleAudit, operator_telemetry.PublicApiLifecycleAudit),
+        (acceptance.TelemetryQueries, operator_telemetry.TelemetryQueries),
+        (acceptance.TelemetrySentinelEmitter, operator_telemetry.TelemetrySentinelEmitter),
+        (acceptance.operator_metric_dimensions, operator_telemetry.operator_metric_dimensions),
+        (acceptance.verify_connection_budget_live, operator_telemetry.verify_connection_budget_live),
+        (acceptance.verify_operator_telemetry, operator_telemetry.verify_operator_telemetry),
+        (acceptance.verify_operator_telemetry_live, operator_telemetry.verify_operator_telemetry_live),
+        (acceptance.verify_operator_telemetry_outage, operator_telemetry.verify_operator_telemetry_outage),
+        (acceptance.xray_trace_id, operator_telemetry.xray_trace_id),
+    ):
+        assert reexported is owned
         assert owned.__module__ == operator_telemetry.__name__
 
 

@@ -294,42 +294,36 @@ def test_task_definition_family_parser_is_pure_while_wrapper_preserves_live_erro
 
 
 def test_moved_public_foundations_are_facade_reexports_by_identity() -> None:
-    for name in (
-        "CONNECT_TIMEOUT_SECONDS",
-        "EVIDENCE_KINDS",
-        "FORBIDDEN_AWS_OVERRIDE_ENV",
-        "MAX_BLOB_RESPONSE_BYTES",
-        "MAX_CONTROL_DOCUMENT_BYTES",
-        "MAX_EXEC_RECEIPT_CHARS",
-        "MAX_EXEC_STREAM_BYTES",
-        "MAX_JSON_RESPONSE_BYTES",
-        "MAX_STATE_FILE_BYTES",
-        "PLUGIN_POLICY_ASSIGNMENT_NAMES",
-        "POOL_TIMEOUT_SECONDS",
-        "READ_TIMEOUT_SECONDS",
-        "RUN_POLL_DEADLINE_SECONDS",
-        "RUN_POLL_INTERVAL_SECONDS",
-        "SCENARIO_ASSIGNMENT_NAMES",
-        "WRITE_TIMEOUT_SECONDS",
-    ):
-        assert getattr(acceptance, name) is getattr(contracts, name)
+    assert acceptance.CONNECT_TIMEOUT_SECONDS is contracts.CONNECT_TIMEOUT_SECONDS
+    assert acceptance.EVIDENCE_KINDS is contracts.EVIDENCE_KINDS
+    assert acceptance.FORBIDDEN_AWS_OVERRIDE_ENV is contracts.FORBIDDEN_AWS_OVERRIDE_ENV
+    assert acceptance.MAX_BLOB_RESPONSE_BYTES is contracts.MAX_BLOB_RESPONSE_BYTES
+    assert acceptance.MAX_CONTROL_DOCUMENT_BYTES is contracts.MAX_CONTROL_DOCUMENT_BYTES
+    assert acceptance.MAX_EXEC_RECEIPT_CHARS is contracts.MAX_EXEC_RECEIPT_CHARS
+    assert acceptance.MAX_EXEC_STREAM_BYTES is contracts.MAX_EXEC_STREAM_BYTES
+    assert acceptance.MAX_JSON_RESPONSE_BYTES is contracts.MAX_JSON_RESPONSE_BYTES
+    assert acceptance.MAX_STATE_FILE_BYTES is contracts.MAX_STATE_FILE_BYTES
+    assert acceptance.PLUGIN_POLICY_ASSIGNMENT_NAMES is contracts.PLUGIN_POLICY_ASSIGNMENT_NAMES
+    assert acceptance.POOL_TIMEOUT_SECONDS is contracts.POOL_TIMEOUT_SECONDS
+    assert acceptance.READ_TIMEOUT_SECONDS is contracts.READ_TIMEOUT_SECONDS
+    assert acceptance.RUN_POLL_DEADLINE_SECONDS is contracts.RUN_POLL_DEADLINE_SECONDS
+    assert acceptance.RUN_POLL_INTERVAL_SECONDS is contracts.RUN_POLL_INTERVAL_SECONDS
+    assert acceptance.SCENARIO_ASSIGNMENT_NAMES is contracts.SCENARIO_ASSIGNMENT_NAMES
+    assert acceptance.WRITE_TIMEOUT_SECONDS is contracts.WRITE_TIMEOUT_SECONDS
 
-    for name, owner in {
-        "AcceptanceCheckError": contracts,
-        "AcceptanceCredentials": state_module,
-        "AcceptanceHttpError": contracts,
-        "AcceptanceInputError": contracts,
-        "AcceptanceState": state_module,
-        "AcceptanceStateError": contracts,
-        "OperatorTelemetryAcceptanceError": contracts,
-        "SanitizedResourceIdentity": contracts,
-        "normalize_acceptance_origin": contracts,
-        "plugin_policy_binding_sha256": contracts,
-        "read_acceptance_state": state_module,
-        "scenario_resource_namespace": contracts,
-        "write_acceptance_state": state_module,
-    }.items():
-        assert getattr(acceptance, name) is getattr(owner, name)
+    assert acceptance.AcceptanceCheckError is contracts.AcceptanceCheckError
+    assert acceptance.AcceptanceCredentials is state_module.AcceptanceCredentials
+    assert acceptance.AcceptanceHttpError is contracts.AcceptanceHttpError
+    assert acceptance.AcceptanceInputError is contracts.AcceptanceInputError
+    assert acceptance.AcceptanceState is state_module.AcceptanceState
+    assert acceptance.AcceptanceStateError is contracts.AcceptanceStateError
+    assert acceptance.OperatorTelemetryAcceptanceError is contracts.OperatorTelemetryAcceptanceError
+    assert acceptance.SanitizedResourceIdentity is contracts.SanitizedResourceIdentity
+    assert acceptance.normalize_acceptance_origin is contracts.normalize_acceptance_origin
+    assert acceptance.plugin_policy_binding_sha256 is contracts.plugin_policy_binding_sha256
+    assert acceptance.read_acceptance_state is state_module.read_acceptance_state
+    assert acceptance.scenario_resource_namespace is contracts.scenario_resource_namespace
+    assert acceptance.write_acceptance_state is state_module.write_acceptance_state
 
 
 def _mutate_protected_document_in_process(

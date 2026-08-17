@@ -27,14 +27,11 @@ from tests.unit.web.aws_ecs_acceptance.test_manifest_schema_inventory import _in
 
 def test_facade_reexports_cleanup_and_control_service_owners_by_identity() -> None:
     assert acceptance.cleanup_evidence_finalize is cleanup.cleanup_evidence_finalize
-    for name in (
-        "control_manifest_validate",
-        "control_manifest_update",
-        "control_manifest_load_cleanup",
-        "scenario_load",
-        "validate_compatibility_record",
-    ):
-        assert getattr(acceptance, name) is getattr(control_service, name)
+    assert acceptance.control_manifest_validate is control_service.control_manifest_validate
+    assert acceptance.control_manifest_update is control_service.control_manifest_update
+    assert acceptance.control_manifest_load_cleanup is control_service.control_manifest_load_cleanup
+    assert acceptance.scenario_load is control_service.scenario_load
+    assert acceptance.validate_compatibility_record is control_service.validate_compatibility_record
 
 
 def test_control_manifest_validate_fails_loudly_for_corrupt_final_evidence(

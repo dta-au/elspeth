@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -142,21 +142,126 @@ class _FakeOrphanClient:
         self.close_calls = 0
         self.close_error: Exception | None = None
 
-    def __getattr__(self, name: str) -> Callable[..., object]:
-        def call(**kwargs: object) -> object:
-            self.calls.append((name, kwargs))
-            response = self.responses[name]
-            if callable(response):
-                return response(**kwargs)
-            if isinstance(response, list):
-                if not response:
-                    raise AssertionError(f"unexpected extra {name} call")
-                return response.pop(0)
-            if isinstance(response, BaseException):
-                raise response
-            return response
+    def _invoke(self, name: str, kwargs: dict[str, object]) -> object:
+        self.calls.append((name, kwargs))
+        response = self.responses[name]
+        if callable(response):
+            return response(**kwargs)
+        if isinstance(response, list):
+            if not response:
+                raise AssertionError(f"unexpected extra {name} call")
+            return response.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
-        return call
+    # The AWS operations this double supports are written out explicitly: the set is
+    # exactly the operations `orphan_sweep` reaches on its client bundle. An operation
+    # outside this closed surface raises AttributeError rather than being synthesised.
+    def batch_delete_image(self, **kwargs: object) -> object:
+        return self._invoke("batch_delete_image", kwargs)
+
+    def batch_get_traces(self, **kwargs: object) -> object:
+        return self._invoke("batch_get_traces", kwargs)
+
+    def delete_task_definitions(self, **kwargs: object) -> object:
+        return self._invoke("delete_task_definitions", kwargs)
+
+    def deregister_task_definition(self, **kwargs: object) -> object:
+        return self._invoke("deregister_task_definition", kwargs)
+
+    def describe_access_points(self, **kwargs: object) -> object:
+        return self._invoke("describe_access_points", kwargs)
+
+    def describe_alarms(self, **kwargs: object) -> object:
+        return self._invoke("describe_alarms", kwargs)
+
+    def describe_db_clusters(self, **kwargs: object) -> object:
+        return self._invoke("describe_db_clusters", kwargs)
+
+    def describe_db_instances(self, **kwargs: object) -> object:
+        return self._invoke("describe_db_instances", kwargs)
+
+    def describe_file_systems(self, **kwargs: object) -> object:
+        return self._invoke("describe_file_systems", kwargs)
+
+    def describe_images(self, **kwargs: object) -> object:
+        return self._invoke("describe_images", kwargs)
+
+    def describe_listeners(self, **kwargs: object) -> object:
+        return self._invoke("describe_listeners", kwargs)
+
+    def describe_load_balancers(self, **kwargs: object) -> object:
+        return self._invoke("describe_load_balancers", kwargs)
+
+    def describe_log_groups(self, **kwargs: object) -> object:
+        return self._invoke("describe_log_groups", kwargs)
+
+    def describe_mount_targets(self, **kwargs: object) -> object:
+        return self._invoke("describe_mount_targets", kwargs)
+
+    def describe_resource_policies(self, **kwargs: object) -> object:
+        return self._invoke("describe_resource_policies", kwargs)
+
+    def describe_rule(self, **kwargs: object) -> object:
+        return self._invoke("describe_rule", kwargs)
+
+    def describe_rules(self, **kwargs: object) -> object:
+        return self._invoke("describe_rules", kwargs)
+
+    def describe_secret(self, **kwargs: object) -> object:
+        return self._invoke("describe_secret", kwargs)
+
+    def describe_services(self, **kwargs: object) -> object:
+        return self._invoke("describe_services", kwargs)
+
+    def describe_target_groups(self, **kwargs: object) -> object:
+        return self._invoke("describe_target_groups", kwargs)
+
+    def describe_task_definition(self, **kwargs: object) -> object:
+        return self._invoke("describe_task_definition", kwargs)
+
+    def describe_user_pool(self, **kwargs: object) -> object:
+        return self._invoke("describe_user_pool", kwargs)
+
+    def get_groups(self, **kwargs: object) -> object:
+        return self._invoke("get_groups", kwargs)
+
+    def get_indexing_rules(self, **kwargs: object) -> object:
+        return self._invoke("get_indexing_rules", kwargs)
+
+    def get_resources(self, **kwargs: object) -> object:
+        return self._invoke("get_resources", kwargs)
+
+    def get_role(self, **kwargs: object) -> object:
+        return self._invoke("get_role", kwargs)
+
+    def get_sampling_rules(self, **kwargs: object) -> object:
+        return self._invoke("get_sampling_rules", kwargs)
+
+    def get_trace_segment_destination(self, **kwargs: object) -> object:
+        return self._invoke("get_trace_segment_destination", kwargs)
+
+    def list_dashboards(self, **kwargs: object) -> object:
+        return self._invoke("list_dashboards", kwargs)
+
+    def list_guardrails(self, **kwargs: object) -> object:
+        return self._invoke("list_guardrails", kwargs)
+
+    def list_metrics(self, **kwargs: object) -> object:
+        return self._invoke("list_metrics", kwargs)
+
+    def list_targets_by_rule(self, **kwargs: object) -> object:
+        return self._invoke("list_targets_by_rule", kwargs)
+
+    def list_task_definitions(self, **kwargs: object) -> object:
+        return self._invoke("list_task_definitions", kwargs)
+
+    def list_tasks(self, **kwargs: object) -> object:
+        return self._invoke("list_tasks", kwargs)
+
+    def list_users(self, **kwargs: object) -> object:
+        return self._invoke("list_users", kwargs)
 
     def close(self) -> None:
         self.closed = True

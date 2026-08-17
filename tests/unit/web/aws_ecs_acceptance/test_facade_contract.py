@@ -632,13 +632,17 @@ def test_all_private_owned_exports_are_facade_reexports_by_identity() -> None:
     assert private_owned.isdisjoint(facade_owned)
     assert private_owned | facade_owned == EXPECTED_PUBLIC_EXPORTS
 
-    for name in facade_owned:
-        assert getattr(acceptance, name).__module__ == acceptance.__name__
+    assert acceptance.build_parser.__module__ == acceptance.__name__
+    assert acceptance.main.__module__ == acceptance.__name__
 
+    # Namespace-dict lookup, not attribute resolution: this asserts each name is a
+    # real entry in both module `__dict__`s, so a name synthesised by a module-level
+    # PEP 562 `__getattr__` fails here where attribute access would have accepted it.
+    facade_namespace = vars(acceptance)
     for module_name, names in PRIVATE_OWNER_EXPORTS.items():
-        owner = import_module(f"elspeth.web._aws_ecs_acceptance.{module_name}")
+        owner_namespace = vars(import_module(f"elspeth.web._aws_ecs_acceptance.{module_name}"))
         for name in names:
-            assert getattr(acceptance, name) is getattr(owner, name), f"{name} is not owned by {module_name}"
+            assert facade_namespace[name] is owner_namespace[name], f"{name} is not owned by {module_name}"
 
 
 def test_public_export_literal_matches_selected_base_module_definitions() -> None:

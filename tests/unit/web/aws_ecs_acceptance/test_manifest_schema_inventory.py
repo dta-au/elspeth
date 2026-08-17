@@ -77,28 +77,23 @@ def test_bound_scenario_loader_fails_loudly_for_invalid_manifest_contract() -> N
 
 
 def test_manifest_and_inventory_owners_are_facade_reexports_by_identity() -> None:
-    for name in (
-        "_load_retained_evidence",
-        "_read_control_manifest",
-        "_require_mutable_control_manifest",
-        "_validate_control_manifest",
-        "_validate_retained_evidence_receipt",
-    ):
-        assert getattr(acceptance, name) is getattr(manifest_schema, name)
+    assert acceptance._load_retained_evidence is manifest_schema._load_retained_evidence
+    assert acceptance._read_control_manifest is manifest_schema._read_control_manifest
+    assert acceptance._require_mutable_control_manifest is manifest_schema._require_mutable_control_manifest
+    assert acceptance._validate_control_manifest is manifest_schema._validate_control_manifest
+    assert acceptance._validate_retained_evidence_receipt is manifest_schema._validate_retained_evidence_receipt
 
-    for name in (
-        "_load_bound_scenario_inventory",
-        "_load_preapply_scenario_inventory",
-        "_scenario_inventory_hash",
-        "_validate_scenario_inventory",
-        "_validate_scenario_inventory_isolation",
-        "_validate_tf_binding_receipt",
-    ):
-        assert getattr(acceptance, name) is getattr(scenario_inventory, name)
+    assert acceptance._load_bound_scenario_inventory is scenario_inventory._load_bound_scenario_inventory
+    assert acceptance._load_preapply_scenario_inventory is scenario_inventory._load_preapply_scenario_inventory
+    assert acceptance._scenario_inventory_hash is scenario_inventory._scenario_inventory_hash
+    assert acceptance._validate_scenario_inventory is scenario_inventory._validate_scenario_inventory
+    assert acceptance._validate_scenario_inventory_isolation is scenario_inventory._validate_scenario_inventory_isolation
+    assert acceptance._validate_tf_binding_receipt is scenario_inventory._validate_tf_binding_receipt
 
-    for name in ("PLUGIN_POLICY_ASSIGNMENT_NAMES", "SCENARIO_ASSIGNMENT_NAMES"):
-        assert getattr(acceptance, name) is getattr(scenario_inventory, name)
-        assert getattr(scenario_inventory, name) is getattr(contracts, name)
+    assert acceptance.PLUGIN_POLICY_ASSIGNMENT_NAMES is scenario_inventory.PLUGIN_POLICY_ASSIGNMENT_NAMES
+    assert scenario_inventory.PLUGIN_POLICY_ASSIGNMENT_NAMES is contracts.PLUGIN_POLICY_ASSIGNMENT_NAMES
+    assert acceptance.SCENARIO_ASSIGNMENT_NAMES is scenario_inventory.SCENARIO_ASSIGNMENT_NAMES
+    assert scenario_inventory.SCENARIO_ASSIGNMENT_NAMES is contracts.SCENARIO_ASSIGNMENT_NAMES
 
 
 def _terraform_receipt(*, kind: str = "terraform-plan", deletes: int = 0, plan_sha256: str = "a" * 64) -> dict[str, object]:

@@ -69,14 +69,11 @@ def test_cloudwatch_sidecar_fails_loudly_for_incomplete_bound_inventory_contract
 def test_manifest_and_task_definition_owners_are_facade_reexports_by_identity() -> None:
     from elspeth.web._aws_ecs_acceptance import manifest
 
-    for name in (
-        "control_manifest_bind_retained_evidence",
-        "control_manifest_bind_scenario",
-        "control_manifest_checkpoint_operator_evidence",
-        "control_manifest_get",
-        "control_manifest_init",
-    ):
-        assert getattr(acceptance, name) is getattr(manifest, name)
+    assert acceptance.control_manifest_bind_retained_evidence is manifest.control_manifest_bind_retained_evidence
+    assert acceptance.control_manifest_bind_scenario is manifest.control_manifest_bind_scenario
+    assert acceptance.control_manifest_checkpoint_operator_evidence is manifest.control_manifest_checkpoint_operator_evidence
+    assert acceptance.control_manifest_get is manifest.control_manifest_get
+    assert acceptance.control_manifest_init is manifest.control_manifest_init
     assert acceptance.validate_task_definition_policy_binding is task_definition.validate_task_definition_policy_binding
 
 
