@@ -74,3 +74,44 @@ months or more long-term and anything shorter short-term, while a good score on 
 other loan type is simply approved; below 700, an amount of 50000 or more is high
 risk and everything else goes to manual review. Each outcome gets its own CSV file.
 ```
+
+## error_routing
+
+```
+Make up a dozen sales deals — an id, the customer, the amount, a category and a
+free-text notes field. Any deal whose notes trip a check for passwords, secrets or
+confidential material must not be dropped; those go to their own quarantine file.
+The rest get their notes shortened to fifty characters, and then deals of ten
+thousand or more are split by category — enterprise ones to their own file and the
+other large ones to a commercial file — while everything under ten thousand goes to
+a standard file.
+```
+
+## schema_contracts_demo
+
+```
+I need a customer transaction feed handled with the column types stated up front:
+customer_id is text, amount_usd is a number, transaction_date_time is text,
+product_name is text, status_active_inactive is text and notes_comments is text.
+Make the rows up. Every row travels through unchanged, and then anything with an
+amount_usd of 500 or more goes to a high-value CSV file while the rest goes to the
+ordinary output file.
+```
+
+## json_explode
+
+```
+Make up a few orders in JSON, each with an order id and a list of the items on it.
+I want one row out per item rather than one per order, with the item kept under its
+own field and its position in the list recorded next to it. Write the result out as
+JSON.
+```
+
+## batch_aggregation
+
+```
+Make up twenty-odd expense records with an id, a date, a category, an amount and a
+region. I don't want the individual rows out — take them five at a time and, for
+each group of five, give me the count, the total and the average amount broken down
+by category. Write those summaries out as CSV.
+```

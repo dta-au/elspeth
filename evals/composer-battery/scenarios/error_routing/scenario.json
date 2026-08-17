@@ -1,0 +1,257 @@
+{
+  "case": "error_routing",
+  "example": "examples/error_routing",
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "AMBIGUOUS"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "csv",
+      "on_success": "raw",
+      "options": {
+        "path": "deals.csv",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "content_filter",
+        "node_type": "transform",
+        "plugin": "keyword_filter",
+        "input": "raw",
+        "on_success": "clean",
+        "on_error": "quarantine",
+        "options": {
+          "fields": [
+            "notes"
+          ],
+          "blocked_patterns": [
+            "(?i)\\bpassword\\b",
+            "(?i)\\bconfidential\\b",
+            "(?i)\\bsecret\\b"
+          ],
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      },
+      {
+        "id": "truncate_notes",
+        "node_type": "transform",
+        "plugin": "truncate",
+        "input": "clean",
+        "on_success": "trimmed",
+        "on_error": "discard",
+        "options": {
+          "fields": {
+            "notes": 50
+          },
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      },
+      {
+        "id": "amount_gate",
+        "node_type": "gate",
+        "input": "trimmed",
+        "condition": "row['amount'] >= 10000",
+        "routes": {
+          "true": "high_value",
+          "false": "standard"
+        }
+      },
+      {
+        "id": "category_gate",
+        "node_type": "gate",
+        "input": "high_value",
+        "condition": "row['category'] == 'enterprise'",
+        "routes": {
+          "true": "enterprise",
+          "false": "commercial"
+        }
+      }
+    ],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "enterprise",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/enterprise_deals.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "commercial",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/commercial_deals.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "standard",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/standard_deals.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "quarantine",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/quarantine.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "keyword_filter",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "truncate",
+        "extras": {}
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
+        "on_success"
+      ],
+      [
+        1,
+        8,
+        "on_error"
+      ],
+      [
+        2,
+        3,
+        "on_success"
+      ],
+      [
+        3,
+        4,
+        "route"
+      ],
+      [
+        3,
+        7,
+        "route"
+      ],
+      [
+        4,
+        5,
+        "route"
+      ],
+      [
+        4,
+        6,
+        "route"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: schemas for csv source, keyword_filter, truncate, gate, csv sink \u2014 one batched call",
+      "data: invented rows travel as source.inline_blob inside the mutation \u2014 0 extra",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors the whole graph"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": true,
+    "is_valid": true
+  }
+}
