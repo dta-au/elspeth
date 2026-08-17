@@ -14,11 +14,26 @@ an account.
 
 - `source .venv/bin/activate` in the main checkout.
 - `~/.elspeth-battery/credentials.json` (mode 600):
-  `{"username": "battery_local", "password": "…"}` — the account must
-  already exist on the substrate (`elspeth-web` local auth); the driver
-  logs in and **never registers**. The sibling harnesses' env names
-  `ELSPETH_EVAL_USER` / `ELSPETH_EVAL_PASS` / `ELSPETH_EVAL_BASE_URL`
-  work for one-off runs.
+  `{"username": "<account>", "password": "…"}` — whichever composer account
+  the operator has provisioned on the substrate (`elspeth-web` local auth);
+  the driver logs in and **never registers**, so the account must already
+  exist. Any other mode than 600 is a config refusal (exit 64). The sibling
+  harnesses' env names `ELSPETH_EVAL_USER` / `ELSPETH_EVAL_PASS` /
+  `ELSPETH_EVAL_BASE_URL` work for one-off runs; with no file and no
+  `ELSPETH_EVAL_PASS`, the driver prompts, which means it cannot run
+  unattended.
+- **Redeploy first if `src/elspeth` has moved since the service last
+  started.** The battery measures the *deployed* composer, and
+  `/api/system/status` is read at boot, so a long-lived process reports a
+  stale `frontend_build` into the binding identity. Check
+  `systemctl show -p ActiveEnterTimestamp --value elspeth-web.service`
+  against `git log -1 -- src/elspeth`; if it is behind:
+  `(cd src/elspeth/web/frontend && npm run build)` then
+  `sudo systemctl restart elspeth-web.service`, poll `/api/ready` until 200,
+  and confirm no `Scheduled restart job` lines in
+  `journalctl -u elspeth-web.service` (a restart can reveal a stale
+  Landscape schema epoch, and `systemctl is-active` lies under a
+  crash-loop).
 - `deploy/elspeth-web.env` present (advisor model and the two turn budgets
   are read from it into the binding identity).
 - The substrate is healthy: `curl -s https://elspeth.foundryside.dev/api/system/status | jq .composer_available` → `true`.
