@@ -1,0 +1,212 @@
+{
+  "case": "fork_coalesce",
+  "example": "examples/fork_coalesce",
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "AMBIGUOUS"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "csv",
+      "on_success": "raw",
+      "options": {
+        "path": "rows.csv",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "preprocess",
+        "node_type": "transform",
+        "plugin": "truncate",
+        "input": "raw",
+        "on_success": "preprocessed",
+        "on_error": "discard",
+        "options": {
+          "fields": {
+            "description": 40
+          },
+          "suffix": "...",
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      },
+      {
+        "id": "fork_gate",
+        "node_type": "gate",
+        "input": "preprocessed",
+        "condition": "True",
+        "routes": {
+          "true": "fork",
+          "false": "merged"
+        },
+        "fork_to": [
+          "path_a",
+          "path_b"
+        ]
+      },
+      {
+        "id": "merge_results",
+        "node_type": "coalesce",
+        "input": "path_a",
+        "branches": {
+          "path_a": "path_a",
+          "path_b": "path_b"
+        },
+        "policy": "require_all",
+        "merge": "nested"
+      },
+      {
+        "id": "route_output",
+        "node_type": "gate",
+        "input": "merge_results",
+        "condition": "True",
+        "routes": {
+          "true": "merged",
+          "false": "merged"
+        }
+      }
+    ],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "merged",
+        "plugin": "json",
+        "options": {
+          "path": "outputs/merged.json",
+          "format": "json",
+          "schema": {
+            "mode": "observed"
+          },
+          "mode": "write",
+          "collision_policy": "auto_increment"
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "truncate",
+        "extras": {}
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "fork_count": "2",
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "coalesce",
+        "plugin": null,
+        "extras": {
+          "branch_count": "2",
+          "merge": "nested",
+          "policy": "require_all"
+        }
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "output",
+        "plugin": "json",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
+        "on_success"
+      ],
+      [
+        2,
+        3,
+        "fork"
+      ],
+      [
+        2,
+        3,
+        "fork"
+      ],
+      [
+        2,
+        5,
+        "route"
+      ],
+      [
+        3,
+        4,
+        "on_success"
+      ],
+      [
+        4,
+        5,
+        "route"
+      ],
+      [
+        4,
+        5,
+        "route"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: schemas for csv, truncate, gate, coalesce, json \u2014 one batched call",
+      "data: invented rows travel as source.inline_blob inside the mutation \u2014 0 extra",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors the whole graph"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": true,
+    "is_valid": true
+  }
+}
