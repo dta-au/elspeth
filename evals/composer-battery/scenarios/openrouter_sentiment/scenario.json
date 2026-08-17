@@ -1,0 +1,149 @@
+{
+  "case": "openrouter_sentiment",
+  "example": "examples/openrouter_sentiment",
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "AMBIGUOUS"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "csv",
+      "on_success": "source_out",
+      "options": {
+        "path": "reviews.csv",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "score_sentiment",
+        "node_type": "transform",
+        "plugin": "llm",
+        "input": "source_out",
+        "on_success": "output",
+        "on_error": "quarantine",
+        "options": {
+          "provider": "openrouter",
+          "model": "openai/gpt-4.1-mini",
+          "api_key": {
+            "secret_ref": "OPENROUTER_API_KEY"
+          },
+          "prompt_template": "Analyze the sentiment of the following review and respond with ONLY a JSON object.\n\nReview: {{ row.text }}\n\nRespond with exactly this format: {\"sentiment\": \"positive\" or \"negative\" or \"neutral\", \"confidence\": 0.0-1.0, \"summary\": \"brief explanation\"}",
+          "temperature": 0.0,
+          "response_field": "sentiment_analysis",
+          "required_input_fields": [
+            "text"
+          ],
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      }
+    ],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "output",
+        "plugin": "json",
+        "options": {
+          "path": "outputs/results.json",
+          "schema": {
+            "mode": "observed"
+          },
+          "format": "jsonl"
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "quarantine",
+        "plugin": "json",
+        "options": {
+          "path": "outputs/quarantine.json",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "llm",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "json",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "json",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
+        "on_success"
+      ],
+      [
+        1,
+        3,
+        "on_error"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: schemas for csv source, llm transform, json sink \u2014 one batched call",
+      "data: invented rows travel as source.inline_blob inside the mutation \u2014 0 extra",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors the whole graph"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": true,
+    "is_valid": true
+  }
+}

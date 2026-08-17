@@ -1,0 +1,127 @@
+{
+  "case": "llm_source",
+  "example": "examples/llm_source",
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "CONVERSATIONAL"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "llm",
+      "on_success": "result",
+      "options": {
+        "provider": "openrouter",
+        "model": "openai/gpt-4.1-mini",
+        "api_key": {
+          "secret_ref": "OPENROUTER_API_KEY"
+        },
+        "timeout_seconds": 20,
+        "prompt_template": "Invent five plausible customer support tickets, one per row.",
+        "temperature": 0.0,
+        "max_tokens": 400,
+        "response_field": "ticket",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "keep_tickets",
+        "node_type": "transform",
+        "plugin": "passthrough",
+        "input": "result",
+        "on_success": "tickets",
+        "on_error": "discard",
+        "options": {
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      }
+    ],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "tickets",
+        "plugin": "json",
+        "options": {
+          "path": "outputs/tickets.jsonl",
+          "format": "jsonl",
+          "schema": {
+            "mode": "observed"
+          },
+          "collision_policy": "auto_increment"
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "llm",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "passthrough",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "json",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
+        "on_success"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: schemas for llm source, passthrough, json sink \u2014 one batched call",
+      "data: the model is the data source \u2014 no rows travel with the mutation \u2014 0 extra",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors the whole graph"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": true,
+    "is_valid": true
+  }
+}

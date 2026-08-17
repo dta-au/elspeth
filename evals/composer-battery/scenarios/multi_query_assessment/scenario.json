@@ -1,0 +1,249 @@
+{
+  "case": "multi_query_assessment",
+  "example": "examples/multi_query_assessment",
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "AMBIGUOUS"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "csv",
+      "on_success": "source_out",
+      "options": {
+        "path": "case_studies.csv",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "assess_cases",
+        "node_type": "transform",
+        "plugin": "llm",
+        "input": "source_out",
+        "on_success": "results",
+        "on_error": "quarantine",
+        "options": {
+          "provider": "openrouter",
+          "model": "openai/gpt-4.1-mini",
+          "api_key": {
+            "secret_ref": "OPENROUTER_API_KEY"
+          },
+          "system_prompt": "You are a clinical assessment assistant. For each case study and criterion, give a score from 0 to 100 and a short rationale.",
+          "prompt_template": "Assess: {{ row.background }}",
+          "required_input_fields": [
+            "background",
+            "symptoms",
+            "history"
+          ],
+          "queries": {
+            "diagnosis": {
+              "input_fields": {
+                "input_1": "background",
+                "input_2": "symptoms",
+                "input_3": "history"
+              },
+              "template": "## Case study\n**Background:** {{ row.input_1 }}\n**Symptoms:** {{ row.input_2 }}\n**History:** {{ row.input_3 }}\n\n## Evaluation criterion: diagnosis\nAssess the accuracy and completeness of the diagnosis.",
+              "response_format": "structured",
+              "output_fields": [
+                {
+                  "suffix": "score",
+                  "type": "integer"
+                },
+                {
+                  "suffix": "rationale",
+                  "type": "string"
+                }
+              ]
+            },
+            "treatment": {
+              "input_fields": {
+                "input_1": "background",
+                "input_2": "symptoms",
+                "input_3": "history"
+              },
+              "template": "## Case study\n**Background:** {{ row.input_1 }}\n**Symptoms:** {{ row.input_2 }}\n**History:** {{ row.input_3 }}\n\n## Evaluation criterion: treatment\nAssess the appropriateness of the treatment plan.",
+              "response_format": "structured",
+              "output_fields": [
+                {
+                  "suffix": "score",
+                  "type": "integer"
+                },
+                {
+                  "suffix": "rationale",
+                  "type": "string"
+                }
+              ]
+            },
+            "prognosis": {
+              "input_fields": {
+                "input_1": "background",
+                "input_2": "symptoms",
+                "input_3": "history"
+              },
+              "template": "## Case study\n**Background:** {{ row.input_1 }}\n**Symptoms:** {{ row.input_2 }}\n**History:** {{ row.input_3 }}\n\n## Evaluation criterion: prognosis\nAssess the accuracy of the prognostic assessment.",
+              "response_format": "structured",
+              "output_fields": [
+                {
+                  "suffix": "score",
+                  "type": "integer"
+                },
+                {
+                  "suffix": "rationale",
+                  "type": "string"
+                }
+              ]
+            },
+            "risk": {
+              "input_fields": {
+                "input_1": "background",
+                "input_2": "symptoms",
+                "input_3": "history"
+              },
+              "template": "## Case study\n**Background:** {{ row.input_1 }}\n**Symptoms:** {{ row.input_2 }}\n**History:** {{ row.input_3 }}\n\n## Evaluation criterion: risk\nAssess the identification of risks and complications.",
+              "response_format": "structured",
+              "output_fields": [
+                {
+                  "suffix": "score",
+                  "type": "integer"
+                },
+                {
+                  "suffix": "rationale",
+                  "type": "string"
+                }
+              ]
+            },
+            "followup": {
+              "input_fields": {
+                "input_1": "background",
+                "input_2": "symptoms",
+                "input_3": "history"
+              },
+              "template": "## Case study\n**Background:** {{ row.input_1 }}\n**Symptoms:** {{ row.input_2 }}\n**History:** {{ row.input_3 }}\n\n## Evaluation criterion: followup\nAssess the follow-up and monitoring plan.",
+              "response_format": "structured",
+              "output_fields": [
+                {
+                  "suffix": "score",
+                  "type": "integer"
+                },
+                {
+                  "suffix": "rationale",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "pool_size": 10,
+          "temperature": 0.0,
+          "max_tokens": 500,
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      }
+    ],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "results",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/results.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "quarantine",
+        "plugin": "json",
+        "options": {
+          "path": "outputs/quarantine.json",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "llm",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "json",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
+        "on_success"
+      ],
+      [
+        1,
+        3,
+        "on_error"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: schemas for csv source, llm transform, csv sink, json sink \u2014 one batched call",
+      "data: invented rows travel as source.inline_blob inside the mutation \u2014 0 extra",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors the whole graph"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": true,
+    "is_valid": true
+  }
+}

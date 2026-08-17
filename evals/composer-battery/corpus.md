@@ -154,3 +154,43 @@ into one stream together, two rows per ticket rather than one merged row. Once t
 whole stream is through, compare the arms against the control and write the
 comparison out as JSON lines.
 ```
+
+## template_lookups
+
+```
+Make up a dozen support tickets — a ticket id, a category id, a priority id, a
+subject and a body. Have a model classify each one against these categories:
+billing (payments, refunds, subscriptions, invoices), technical (bugs, crashes,
+performance) and general (feature requests, feedback, account questions), taking
+the priority into account for the tone it recommends. Its answer goes on the row as
+a classification field. Anything the model cannot classify goes to a quarantine
+file instead of the results file; both come out as JSON.
+```
+
+## multi_query_assessment
+
+```
+Make up half a dozen clinical case studies, each with a user id and a background, a
+symptoms and a history column. Have a model assess every case against five criteria
+— diagnosis, treatment, prognosis, risk and follow-up — returning a score out of 100
+and a short rationale for each criterion, all kept on the row. The assessed rows
+come out as CSV; anything the model fails on goes to a quarantine file as JSON.
+```
+
+## openrouter_sentiment
+
+```
+Make up a dozen customer reviews, each with an id and the review text. I want the
+sentiment of each one — positive, negative or neutral, with a confidence and a
+one-line summary — worked out by a model and kept on the row. Reviews the model
+fails on go to a quarantine file rather than being lost. Write the results out as
+JSON lines.
+```
+
+## llm_source
+
+```
+I have no data for this one. The rows should come from a model instead: ask it for
+five plausible support tickets, one per row, and keep whatever it returns as it
+comes. Write them straight out as JSON lines.
+```
