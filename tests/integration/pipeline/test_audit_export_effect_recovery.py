@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import cast
+from typing import Any, BinaryIO, cast
 from unittest.mock import patch
 
 import pytest
@@ -346,11 +346,35 @@ def test_spool_close_failure_does_not_fail_a_registered_export(
     store = _MemoryContentStore()
 
     class _ExplodingCloseSpool:
-        def __init__(self, inner: object) -> None:
+        """Explicit ``BinaryIO``-shaped spool whose ``close()`` fails.
+
+        Every member the derivation and read-back paths use is written out and
+        delegates to the real temporary file. There is deliberately no
+        catch-all ``__getattr__``: a spool path that starts using a new file
+        member raises ``AttributeError`` here instead of being forwarded
+        silently, which would let this test drift away from the real shape.
+        """
+
+        def __init__(self, inner: BinaryIO) -> None:
             self._inner = inner
 
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._inner, name)
+        def tell(self) -> int:
+            return self._inner.tell()
+
+        def write(self, data: Any) -> int:
+            return self._inner.write(data)
+
+        def seek(self, offset: int, whence: int = 0) -> int:
+            return self._inner.seek(offset, whence)
+
+        def read(self, size: int = -1) -> bytes:
+            return self._inner.read(size)
+
+        def flush(self) -> None:
+            self._inner.flush()
+
+        def fileno(self) -> int:
+            return self._inner.fileno()
 
         def close(self) -> None:
             raise OSError("spool close failure")
@@ -358,7 +382,7 @@ def test_spool_close_failure_does_not_fail_a_registered_export(
     real_temporary_file = audit_export_effects.TemporaryFile
 
     def exploding_temporary_file(*args: object, **kwargs: object) -> _ExplodingCloseSpool:
-        return _ExplodingCloseSpool(real_temporary_file(*args, **kwargs))
+        return _ExplodingCloseSpool(cast(BinaryIO, real_temporary_file(*args, **kwargs)))
 
     monkeypatch.setattr(audit_export_effects, "TemporaryFile", exploding_temporary_file)
     try:

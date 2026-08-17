@@ -11,6 +11,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import inspect
 from collections import defaultdict as collections_defaultdict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -1024,22 +1025,158 @@ class TestExportRunSigned:
 
 
 class _SpyReadModel:
-    """Delegating read-model proxy that records every query-family call."""
+    """Explicit delegating read-model proxy that records every query-family call.
 
-    def __init__(self, inner: Any) -> None:
+    Every public method of :class:`_ExportReadModelRecorder` is written out
+    here rather than resolved by a catch-all ``__getattr__``. Because
+    ``test_first_record_yields_before_later_query_families`` asserts
+    ``touched <= allowed``, an unrecorded family would make that assertion pass
+    vacuously — so construction pins the recorded surface against the wrapped
+    recorder's public surface, and a newly added query family fails loudly
+    here until it is written out below.
+    """
+
+    _RECORDED: ClassVar[frozenset[str]] = frozenset(
+        {
+            "get_run",
+            "get_run_attribution",
+            "get_web_plugin_policy_evidence",
+            "get_secret_resolutions_for_run",
+            "get_nodes",
+            "get_edges",
+            "get_validation_errors_for_run",
+            "get_transform_errors_for_run",
+            "get_operations_for_run",
+            "get_all_operation_calls_for_run",
+            "get_batches",
+            "get_all_batch_members_for_run",
+            "get_artifacts",
+            "get_sink_effect_streams_for_run",
+            "get_sink_effects_for_run",
+            "get_sink_effect_members_for_run",
+            "get_sink_effect_attempts_for_run",
+            "iter_rows_for_run",
+            "get_tokens_for_rows",
+            "get_token_parents_for_tokens",
+            "get_token_outcomes_for_tokens",
+            "get_scheduler_events_for_tokens",
+            "get_node_states_for_tokens",
+            "get_routing_events_for_states",
+            "get_calls_for_states",
+        }
+    )
+
+    def __init__(self, inner: _ExportReadModelRecorder) -> None:
         self._inner = inner
         self.calls: list[str] = []
+        surface = {name for name, _func in inspect.getmembers(_ExportReadModelRecorder, inspect.isfunction) if not name.startswith("_")}
+        assert surface == self._RECORDED, (
+            f"_SpyReadModel records {sorted(self._RECORDED - surface)} that no longer exist and misses "
+            f"{sorted(surface - self._RECORDED)} — an unrecorded query family makes the streaming assertion vacuous"
+        )
 
-    def __getattr__(self, name: str) -> Any:
-        original = getattr(self._inner, name)
-        if not callable(original):
-            return original
+    def _record(self, name: str) -> None:
+        self.calls.append(name)
 
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            self.calls.append(name)
-            return original(*args, **kwargs)
+    def get_run(self, run_id: str) -> Run | None:
+        self._record("get_run")
+        return self._inner.get_run(run_id)
 
-        return wrapper
+    def get_run_attribution(self, run_id: str) -> tuple[str, str] | None:
+        self._record("get_run_attribution")
+        return self._inner.get_run_attribution(run_id)
+
+    def get_web_plugin_policy_evidence(self, run_id: str) -> WebPluginPolicyEvidence | None:
+        self._record("get_web_plugin_policy_evidence")
+        return self._inner.get_web_plugin_policy_evidence(run_id)
+
+    def get_secret_resolutions_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_secret_resolutions_for_run")
+        return self._inner.get_secret_resolutions_for_run(run_id)
+
+    def get_nodes(self, run_id: str) -> list[Any]:
+        self._record("get_nodes")
+        return self._inner.get_nodes(run_id)
+
+    def get_edges(self, run_id: str) -> list[Any]:
+        self._record("get_edges")
+        return self._inner.get_edges(run_id)
+
+    def get_validation_errors_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_validation_errors_for_run")
+        return self._inner.get_validation_errors_for_run(run_id)
+
+    def get_transform_errors_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_transform_errors_for_run")
+        return self._inner.get_transform_errors_for_run(run_id)
+
+    def get_operations_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_operations_for_run")
+        return self._inner.get_operations_for_run(run_id)
+
+    def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_all_operation_calls_for_run")
+        return self._inner.get_all_operation_calls_for_run(run_id)
+
+    def get_batches(self, run_id: str) -> list[Any]:
+        self._record("get_batches")
+        return self._inner.get_batches(run_id)
+
+    def get_all_batch_members_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_all_batch_members_for_run")
+        return self._inner.get_all_batch_members_for_run(run_id)
+
+    def get_artifacts(self, run_id: str) -> list[Any]:
+        self._record("get_artifacts")
+        return self._inner.get_artifacts(run_id)
+
+    def get_sink_effect_streams_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_sink_effect_streams_for_run")
+        return self._inner.get_sink_effect_streams_for_run(run_id)
+
+    def get_sink_effects_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_sink_effects_for_run")
+        return self._inner.get_sink_effects_for_run(run_id)
+
+    def get_sink_effect_members_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_sink_effect_members_for_run")
+        return self._inner.get_sink_effect_members_for_run(run_id)
+
+    def get_sink_effect_attempts_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_sink_effect_attempts_for_run")
+        return self._inner.get_sink_effect_attempts_for_run(run_id)
+
+    def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]:
+        self._record("iter_rows_for_run")
+        return self._inner.iter_rows_for_run(run_id, batch_size=batch_size)
+
+    def get_tokens_for_rows(self, run_id: str, row_ids: Sequence[str]) -> list[Any]:
+        self._record("get_tokens_for_rows")
+        return self._inner.get_tokens_for_rows(run_id, row_ids)
+
+    def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
+        self._record("get_token_parents_for_tokens")
+        return self._inner.get_token_parents_for_tokens(token_ids)
+
+    def get_token_outcomes_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> list[Any]:
+        self._record("get_token_outcomes_for_tokens")
+        return self._inner.get_token_outcomes_for_tokens(run_id, token_ids)
+
+    def get_scheduler_events_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> list[Any]:
+        self._record("get_scheduler_events_for_tokens")
+        return self._inner.get_scheduler_events_for_tokens(run_id, token_ids)
+
+    def get_node_states_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> list[Any]:
+        self._record("get_node_states_for_tokens")
+        return self._inner.get_node_states_for_tokens(run_id, token_ids)
+
+    def get_routing_events_for_states(self, state_ids: Sequence[str]) -> list[Any]:
+        self._record("get_routing_events_for_states")
+        return self._inner.get_routing_events_for_states(state_ids)
+
+    def get_calls_for_states(self, state_ids: Sequence[str]) -> list[Any]:
+        self._record("get_calls_for_states")
+        return self._inner.get_calls_for_states(state_ids)
 
 
 def _make_row(index: int) -> Row:

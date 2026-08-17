@@ -85,11 +85,18 @@ _PAYLOAD = TokenSchedulerRepository.serialize_row_payload(PipelineRow({"id": 1},
 
 
 class _RecordingScheduler:
-    """Delegating wrapper over the real scheduler repository.
+    """Explicit delegating wrapper over the real scheduler repository.
 
     Records ``(verb, kwargs)`` for the drain-relevant verbs in invocation
     order, then delegates to the real repository — the durable behavior is
-    exactly the real repository's. Everything else passes straight through.
+    exactly the real repository's.
+
+    Every delegated member is written out. There is deliberately no catch-all
+    ``__getattr__``: a scheduler member this wrapper does not name raises
+    ``AttributeError`` at the call site, so a drain path that starts using a
+    new verb shows up here instead of slipping past unrecorded. Only keyword
+    arguments are recorded, which is what every ``calls_for(...)`` assertion in
+    this module reads.
     """
 
     _RECORDED = frozenset(
@@ -112,21 +119,91 @@ class _RecordingScheduler:
         self._inner = inner
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    def __getattr__(self, name: str) -> Any:
-        attr = getattr(self._inner, name)
-        if name in self._RECORDED:
+    def _record(self, verb: str, kwargs: dict[str, Any]) -> None:
+        assert verb in self._RECORDED, f"{verb!r} is recorded but missing from _RECORDED"
+        self.calls.append((verb, dict(kwargs)))
 
-            def recorded(*args: Any, _attr: Any = attr, _name: str = name, **kwargs: Any) -> Any:
-                self.calls.append((_name, dict(kwargs)))
-                return _attr(*args, **kwargs)
+    # -- recorded drain verbs -------------------------------------------
 
-            return recorded
-        return attr
+    def recover_expired_leases(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("recover_expired_leases", kwargs)
+        return self._inner.recover_expired_leases(*args, **kwargs)
+
+    def terminalize_pending_sinks_with_terminal_outcomes(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("terminalize_pending_sinks_with_terminal_outcomes", kwargs)
+        return self._inner.terminalize_pending_sinks_with_terminal_outcomes(*args, **kwargs)
+
+    def claim_pending_sink(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("claim_pending_sink", kwargs)
+        return self._inner.claim_pending_sink(*args, **kwargs)
+
+    def claim_ready(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("claim_ready", kwargs)
+        return self._inner.claim_ready(*args, **kwargs)
+
+    def mark_pending_sink(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("mark_pending_sink", kwargs)
+        return self._inner.mark_pending_sink(*args, **kwargs)
+
+    def mark_failed(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("mark_failed", kwargs)
+        return self._inner.mark_failed(*args, **kwargs)
+
+    def mark_terminal(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("mark_terminal", kwargs)
+        return self._inner.mark_terminal(*args, **kwargs)
+
+    def mark_blocked(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("mark_blocked", kwargs)
+        return self._inner.mark_blocked(*args, **kwargs)
+
+    def heartbeat_lease(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("heartbeat_lease", kwargs)
+        return self._inner.heartbeat_lease(*args, **kwargs)
+
+    def enqueue_ready_claimed(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("enqueue_ready_claimed", kwargs)
+        return self._inner.enqueue_ready_claimed(*args, **kwargs)
+
+    def enqueue_ready_claimed_legacy_unfenced(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("enqueue_ready_claimed_legacy_unfenced", kwargs)
+        return self._inner.enqueue_ready_claimed_legacy_unfenced(*args, **kwargs)
+
+    # -- unrecorded members the drain paths still reach ------------------
+
+    def enqueue_ready(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.enqueue_ready(*args, **kwargs)
+
+    # The atomic disposition-plus-child-enqueue verbs are deliberately NOT in
+    # ``_RECORDED``: several tests assert ``calls_for("mark_terminal") == []``
+    # precisely to prove the drain took the atomic variant instead of the plain
+    # one, so recording them here would not change any assertion but would blur
+    # that distinction. This mirrors the previous wrapper's behaviour exactly.
+    def mark_terminal_with_ready_children(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.mark_terminal_with_ready_children(*args, **kwargs)
+
+    def mark_failed_with_ready_children(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.mark_failed_with_ready_children(*args, **kwargs)
+
+    def mark_pending_sink_with_ready_children(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.mark_pending_sink_with_ready_children(*args, **kwargs)
+
+    def peer_active_leases(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.peer_active_leases(*args, **kwargs)
+
+    @staticmethod
+    def serialize_row_payload(row: Any) -> str:
+        return TokenSchedulerRepository.serialize_row_payload(row)
+
+    @staticmethod
+    def deserialize_row_payload(row_payload_json: str) -> Any:
+        return TokenSchedulerRepository.deserialize_row_payload(row_payload_json)
 
     def verbs(self) -> list[str]:
         return [name for name, _ in self.calls]
 
     def calls_for(self, verb: str) -> list[dict[str, Any]]:
+        assert verb in self._RECORDED, f"{verb!r} is not a recorded verb — calls_for would be vacuously empty"
         return [kwargs for name, kwargs in self.calls if name == verb]
 
 
