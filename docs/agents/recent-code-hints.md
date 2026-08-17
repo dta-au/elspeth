@@ -8,6 +8,27 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-17 — a directory-scoped test `conftest.py` that mutates `sys.path`
+  is PROCESS-GLOBAL, not directory-scoped**: `tests/unit/evals/composer_battery/
+  conftest.py` (Task 7 of the composer-battery build, elspeth-composer-battery)
+  is the first such shim under `tests/unit/evals/` — it `sys.path.insert(0, …)`s
+  `evals/composer-battery/` so tests can `import drive_battery` (a module that
+  lives in a hyphenated, non-package directory). pytest loads a directory's
+  `conftest.py` once per worker process, but the path mutation persists for
+  the REST of that worker's session — every later test module collected on
+  the same xdist worker resolves a bare top-level import against
+  `evals/composer-battery/` FIRST, ahead of site-packages and the repo root.
+  That directory holds generically-named modules (`report.py`, and Task 8's
+  `planner_probe.py`) that could shadow an unrelated `import report` elsewhere
+  in the suite. Verified 2026-08-17: no test currently does a bare
+  `import report`/`from report import`, so this is latent, not live — but the
+  next agent adding a `tests/unit/**/conftest.py` with a similar `sys.path`
+  insertion must grep for a same-name collision first
+  (`grep -rn "^\s*import <name>\b\|^\s*from <name> import" tests/ src/ evals/`),
+  and prefer `sys.path.append(...)` over `insert(0, ...)` unless import
+  priority is actually required, so a same-named third-party or repo module
+  keeps precedence.
+
 - **2026-08-17 — a NEW runtime rejection needs a Stage-1 disposition (whole-tree
   gate)**: `tests/unit/scripts/cicd/test_runtime_rejection_parity_gate.py`
   AST-enumerates every `raise <Exception>(...)` under `src/elspeth/core/dag/`
