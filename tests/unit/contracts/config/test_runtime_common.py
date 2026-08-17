@@ -31,6 +31,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import re
+from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,20 @@ import pytest
 
 from elspeth.contracts.config import INTERNAL_DEFAULTS
 from elspeth.contracts.config import runtime as _runtime_module
+from elspeth.contracts.config.protocols import (
+    RuntimeCheckpointProtocol,
+    RuntimeConcurrencyProtocol,
+    RuntimeRateLimitProtocol,
+    RuntimeRetryProtocol,
+    RuntimeTelemetryProtocol,
+)
+from elspeth.core.config import (
+    CheckpointSettings,
+    ConcurrencySettings,
+    RateLimitSettings,
+    RetrySettings,
+    TelemetrySettings,
+)
 
 if TYPE_CHECKING:
     pass
@@ -82,56 +97,104 @@ def _runtime_config_tuple(config_cls: type) -> tuple[str, str, str, str | None]:
     return (config_name, protocol_name, settings_name, internal_key)
 
 
-def _discover_runtime_configs() -> list[tuple[str, str, str, str | None]]:
-    """Return RUNTIME_CONFIGS tuples for every ``Runtime*Config`` in the runtime module."""
+def _discover_runtime_config_classes() -> list[type]:
+    """Return every ``Runtime*Config`` class in the runtime module, name-sorted."""
     configs = [obj for _name, obj in inspect.getmembers(_runtime_module) if _is_runtime_config_class(obj)]
     # Sort by class name for deterministic test order.
     configs.sort(key=lambda cls: cls.__name__)
-    return [_runtime_config_tuple(cls) for cls in configs]
+    return configs
 
+
+# Discovery keeps the class OBJECTS, so nothing downstream has to re-resolve a
+# config class from its name.
+_DISCOVERED_CONFIG_CLASSES: Mapping[str, type] = MappingProxyType({cls.__name__: cls for cls in _discover_runtime_config_classes()})
 
 # Each tuple: (config_class_name, protocol_class_name, settings_class_name, internal_defaults_key)
-RUNTIME_CONFIGS: list[tuple[str, str, str, str | None]] = _discover_runtime_configs()
+RUNTIME_CONFIGS: list[tuple[str, str, str, str | None]] = [_runtime_config_tuple(cls) for cls in _DISCOVERED_CONFIG_CLASSES.values()]
+
+
+# The convention's two cross-module pairings, written out as named classes
+# rather than resolved off a module by a derived name (ADR-032). Discovery above
+# still enumerates ``Runtime*Config`` from the live module, so a config added in
+# production without an entry here raises the same hard AttributeError it always
+# did: the convention stays a gate, it just is not a dynamic attribute lookup.
+_PROTOCOL_CLASSES: Mapping[str, type] = MappingProxyType(
+    {
+        "RuntimeCheckpointProtocol": RuntimeCheckpointProtocol,
+        "RuntimeConcurrencyProtocol": RuntimeConcurrencyProtocol,
+        "RuntimeRateLimitProtocol": RuntimeRateLimitProtocol,
+        "RuntimeRetryProtocol": RuntimeRetryProtocol,
+        "RuntimeTelemetryProtocol": RuntimeTelemetryProtocol,
+    }
+)
+
+_SETTINGS_CLASSES: Mapping[str, type] = MappingProxyType(
+    {
+        "CheckpointSettings": CheckpointSettings,
+        "ConcurrencySettings": ConcurrencySettings,
+        "RateLimitSettings": RateLimitSettings,
+        "RetrySettings": RetrySettings,
+        "TelemetrySettings": TelemetrySettings,
+    }
+)
 
 
 def get_config_class(name: str) -> Any:
-    """Import and return a RuntimeConfig class by name."""
-    from elspeth.contracts.config import runtime
+    """Return the discovered ``Runtime*Config`` class of this name.
 
-    return getattr(runtime, name)
+    Discovery already holds the class object; this looks it up in that same
+    discovered set instead of re-resolving the name against the module.
+    """
+    config_cls = _DISCOVERED_CONFIG_CLASSES.get(name)
+    if config_cls is None:
+        raise AttributeError(f"No Runtime config class named {name!r} was discovered in elspeth.contracts.config.runtime.")
+    return config_cls
 
 
 def get_protocol_class(name: str) -> Any:
-    """Import and return a Protocol class by name."""
-    from elspeth.contracts import config
-
-    protocol_cls = getattr(config, name, None)
+    """Return the Protocol class of this name."""
+    protocol_cls = _PROTOCOL_CLASSES.get(name)
     if protocol_cls is None:
         raise AttributeError(
             f"No Protocol class named {name!r} found. Per the "
             "Runtime<Name>Config → Runtime<Name>Protocol naming convention, "
             "every runtime config must have a paired protocol. Add the "
-            "protocol or rename the config."
+            "protocol (and its entry in _PROTOCOL_CLASSES) or rename the config."
         )
     return protocol_cls
 
 
 def get_settings_class(name: str) -> Any:
-    """Import and return a Settings class by name.
+    """Return the Settings class of this name.
 
     Settings classes are in core.config, NOT contracts.config (leaf boundary fix).
     """
-    from elspeth.core import config
-
-    settings_cls = getattr(config, name, None)
+    settings_cls = _SETTINGS_CLASSES.get(name)
     if settings_cls is None:
         raise AttributeError(
             f"No Settings class named {name!r} found in elspeth.core.config. "
             "Per the Runtime<Name>Config → <Name>Settings naming convention, "
             "every runtime config must map back to a Pydantic settings class. "
-            "Add the Settings class or rename the config."
+            "Add the Settings class (and its entry in _SETTINGS_CLASSES) or "
+            "rename the config."
         )
     return settings_cls
+
+
+def test_convention_tables_cover_every_discovered_runtime_config() -> None:
+    """Every discovered config must be paired — the tables cannot go stale.
+
+    This is what the old name-resolution bought for free: a new
+    ``Runtime*Config`` was picked up and its protocol/settings resolved (or the
+    lookup failed loudly). With the pairings written out, the coverage claim has
+    to be asserted, or the file quietly degrades into a hand-maintained list
+    that stops covering whatever is added after it was typed.
+    """
+    assert RUNTIME_CONFIGS, "No Runtime*Config discovered — every parametrised test below would be vacuous."
+    for config_name, protocol_name, settings_name, _internal_key in RUNTIME_CONFIGS:
+        assert get_config_class(config_name).__name__ == config_name
+        assert get_protocol_class(protocol_name).__name__ == protocol_name
+        assert get_settings_class(settings_name).__name__ == settings_name
 
 
 # =============================================================================

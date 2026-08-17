@@ -48,8 +48,9 @@ behind it, which for a coverage gate is the same blindness it exists to catch.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import cast
 
+from elspeth.contracts import TransformErrorReason, TransformResult
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.testing import make_pipeline_row
@@ -87,7 +88,7 @@ def _registered_transform_classes() -> tuple[type[BaseTransform], ...]:
 
 
 def _plugin_name(plugin_cls: type[BaseTransform]) -> str:
-    return getattr(plugin_cls, "name", plugin_cls.__name__)
+    return plugin_cls.name
 
 
 def _forward_scope() -> tuple[type[BaseTransform], ...]:
@@ -138,20 +139,19 @@ def _probe_execution_failure(plugin_cls: type[BaseTransform], *, direction: str)
     return f"status={result.status!r} reason={_probe_failure_reason(result)!r}"
 
 
-def _probe_failure_reason(result: Any) -> Any:
+def _probe_failure_reason(result: TransformResult) -> TransformErrorReason | str:
     """The transform's own explanation for a non-success probe, for the report.
 
-    ``TransformResult`` carries the structured failure record on ``reason`` —
-    e.g. ``{'reason': 'validation_failed', 'error': ..., 'error_type': ...}``.
-    Read defensively so a shape change turns into a degraded message rather than
-    an AttributeError inside the gate, and say so explicitly when nothing is
-    there: a bare ``None`` in the failure text would read as "no reason given"
-    when it actually means this helper is looking at the wrong attribute.
+    ``TransformResult.reason`` is a real field carrying the structured failure
+    record — e.g. ``{'reason': 'validation_failed', 'error': ..., 'error_type':
+    ...}`` — so it is read directly (ADR-032: owned type, no sentinel probe).
+    ``None`` is a legitimate value, not an absent attribute, and it is spelled
+    out rather than printed bare: a lone ``None`` in the failure text would read
+    as "no reason given" when it means the transform declined to give one.
     """
-    reason = getattr(result, "reason", None)
-    if reason is None:
-        return "<no 'reason' on TransformResult — inspect the result shape directly>"
-    return reason
+    if result.reason is None:
+        return "<TransformResult.reason is None — the transform reported no failure reason>"
+    return result.reason
 
 
 def test_probe_rosters_partition_the_registry() -> None:

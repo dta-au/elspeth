@@ -67,11 +67,15 @@ def _probe_instance(plugin_cls: type) -> Any | None:
     see ``_semantics_instance``. Most sources and sinks have no ``probe_config``
     and declare no semantics, so they legitimately contribute to neither roster.
     """
-    probe_config = getattr(plugin_cls, "probe_config", None)
-    if probe_config is None:
+    # ``probe_config`` is supplied by ``BaseTransform``/``BaseSink`` (raising
+    # NotImplementedError by default) and by the individual sources that opt in
+    # — ``LLMSource`` is one today. Ask the class chain whether it is defined at
+    # all, the same class-dict question ``_declares_own`` asks below, rather
+    # than probing the attribute off the class with a sentinel default.
+    if not any("probe_config" in klass.__dict__ for klass in plugin_cls.__mro__):
         return None
     try:
-        return plugin_cls(probe_config())
+        return plugin_cls(plugin_cls.probe_config())
     except (NotImplementedError, TypeError):
         return None
 

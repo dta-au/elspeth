@@ -18,14 +18,39 @@ elspeth-425047a599.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+
 import pytest
 
 import elspeth.engine.executors.declaration_contract_bootstrap  # noqa: F401
 from elspeth.contracts.declaration_contracts import (
+    DeclarationContract,
     DeclarationContractViolation,
+    DispatchSite,
     positive_example_does_not_apply_bundles,
     registered_declaration_contracts,
 )
+
+
+def _dispatch_method(contract: DeclarationContract, site: DispatchSite) -> Callable[..., None]:
+    """The bound dispatch method a bundle's site names, by explicit table.
+
+    ADR-032: ``DeclarationContract`` is an owned type with exactly four
+    dispatch sites, so a bundle's site selects a real bound method instead of
+    resolving an attribute name dynamically. An unknown site raises KeyError
+    rather than silently producing a probe default. Kept byte-identical in
+    ``tests/invariants/test_contract_negative_examples_fire.py``,
+    ``tests/invariants/test_contract_non_fire.py``,
+    ``tests/invariants/test_framework_accepts_second_contract.py`` and
+    ``tests/unit/contracts/test_declaration_contracts.py``.
+    """
+    methods: Mapping[DispatchSite, Callable[..., None]] = {
+        DispatchSite.PRE_EMISSION: contract.pre_emission_check,
+        DispatchSite.POST_EMISSION: contract.post_emission_check,
+        DispatchSite.BATCH_FLUSH: contract.batch_flush_check,
+        DispatchSite.BOUNDARY: contract.boundary_check,
+    }
+    return methods[site]
 
 
 @pytest.mark.parametrize(
@@ -68,7 +93,7 @@ def test_runtime_check_does_not_fire_on_non_apply_scenario(contract) -> None:
     harness that "this scenario should never cause me to fire."
     """
     for bundle in positive_example_does_not_apply_bundles(contract):
-        method = getattr(contract, bundle.site.value)
+        method = _dispatch_method(contract, bundle.site)
         try:
             method(*bundle.args)
         except DeclarationContractViolation as exc:

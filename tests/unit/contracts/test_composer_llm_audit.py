@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 from datetime import UTC, datetime
 
 import pytest
@@ -177,9 +178,11 @@ def test_l0_module_has_no_upward_imports() -> None:
 
     forbidden_prefixes = ("elspeth.core", "elspeth.engine", "elspeth.plugins", "elspeth.web", "elspeth.cli")
     for ref in audit.__dict__.values():
-        ref_module = getattr(ref, "__module__", None)
-        if ref_module is None:
-            continue
+        # Classes and functions carry their own ``__module__``; for any other
+        # value the name resolves through its type, which is what the old
+        # sentinel ``getattr`` was already reading. Narrow to the two cases and
+        # read the owned attribute directly.
+        ref_module = ref.__module__ if isinstance(ref, type) or inspect.isroutine(ref) else type(ref).__module__
         for prefix in forbidden_prefixes:
             assert not ref_module.startswith(prefix), f"composer_llm_audit imports {ref!r} from forbidden module {ref_module}"
 

@@ -692,7 +692,14 @@ def test_call_judge_wraps_openrouter_status_errors(error_cls: str, status: int) 
         surrounding_code="...",
     )
     response = httpx.Response(status, request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"))
-    exc = getattr(openai, error_cls)(f"status {status}", response=response, body={"error": "test"})
+    # Explicit table instead of resolving the class name off the SDK module:
+    # the two status errors under test are named, so a rename fails loudly here
+    # rather than at the parametrise string (ADR-032).
+    error_classes: dict[str, type[openai.APIStatusError]] = {
+        "AuthenticationError": openai.AuthenticationError,
+        "RateLimitError": openai.RateLimitError,
+    }
+    exc = error_classes[error_cls](f"status {status}", response=response, body={"error": "test"})
     fake_client = _OpenAIClientDouble(side_effect=exc)
 
     with (

@@ -17,12 +17,15 @@ Dedicated contract behaviour and round-trip coverage lives in
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import pytest
 
 from elspeth.contracts.audit_evidence import AuditEvidenceBase
 from elspeth.contracts.declaration_contracts import (
+    DeclarationContract,
+    DispatchSite,
     PostEmissionInputs,
     PostEmissionOutputs,
     _attach_contract_name_from_dispatcher,
@@ -37,6 +40,27 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.engine.executors.declaration_dispatch import run_post_emission_checks
 from elspeth.engine.executors.declared_output_fields import DeclaredOutputFieldsContract
 from elspeth.engine.executors.pass_through import PassThroughDeclarationContract
+
+
+def _dispatch_method(contract: DeclarationContract, site: DispatchSite) -> Callable[..., None]:
+    """The bound dispatch method a bundle's site names, by explicit table.
+
+    ADR-032: ``DeclarationContract`` is an owned type with exactly four
+    dispatch sites, so a bundle's site selects a real bound method instead of
+    resolving an attribute name dynamically. An unknown site raises KeyError
+    rather than silently producing a probe default. Kept byte-identical in
+    ``tests/invariants/test_contract_negative_examples_fire.py``,
+    ``tests/invariants/test_contract_non_fire.py``,
+    ``tests/invariants/test_framework_accepts_second_contract.py`` and
+    ``tests/unit/contracts/test_declaration_contracts.py``.
+    """
+    methods: Mapping[DispatchSite, Callable[..., None]] = {
+        DispatchSite.PRE_EMISSION: contract.pre_emission_check,
+        DispatchSite.POST_EMISSION: contract.post_emission_check,
+        DispatchSite.BATCH_FLUSH: contract.batch_flush_check,
+        DispatchSite.BOUNDARY: contract.boundary_check,
+    }
+    return methods[site]
 
 
 def _contract(fields: tuple[str, ...]) -> SchemaContract:
@@ -140,6 +164,6 @@ def test_declared_output_fields_violation_is_audit_evidence() -> None:
 def test_negative_example_for_real_production_adopter_fires() -> None:
     contract = DeclaredOutputFieldsContract()
     bundle = contract.negative_example()
-    method = getattr(contract, bundle.site.value)
+    method = _dispatch_method(contract, bundle.site)
     with pytest.raises(DeclaredOutputFieldsViolation):
         method(*bundle.args)

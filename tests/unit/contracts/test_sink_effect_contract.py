@@ -295,11 +295,13 @@ def test_sink_effect_protocol_has_independent_kind_capability_and_exact_methods(
     assert "effect_call_type" in annotations
     assert "supported_effect_modes" in annotations
     assert "supported_effect_input_kinds" in annotations
-    assert {
-        name
-        for name in ("inspect_effect", "prepare_effect", "commit_effect", "reconcile_effect")
-        if callable(getattr(SinkEffectProtocol, name, None))
-    } == {
+    protocol_methods = {
+        "inspect_effect": SinkEffectProtocol.inspect_effect,
+        "prepare_effect": SinkEffectProtocol.prepare_effect,
+        "commit_effect": SinkEffectProtocol.commit_effect,
+        "reconcile_effect": SinkEffectProtocol.reconcile_effect,
+    }
+    assert {name for name, member in protocol_methods.items() if callable(member)} == {
         "inspect_effect",
         "prepare_effect",
         "commit_effect",
@@ -840,10 +842,16 @@ def test_export_input_is_dense_bounded_exact_and_has_no_pipeline_fields() -> Non
     export_input = _export_input()
     assert export_input.input_kind is SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT
     assert isinstance(export_input.chunks, tuple)
-    missing = object()
-    assert inspect.getattr_static(export_input, "members", missing) is missing
-    assert inspect.getattr_static(export_input, "target_snapshot_members", missing) is missing
-    assert inspect.getattr_static(export_input, "token_id", missing) is missing
+    # The export input must not carry the pipeline-members carriers at all.
+    # Direct access is a strictly stronger statement than a static probe: it
+    # proves the name does not resolve by ANY route — no field, no descriptor,
+    # no forwarding ``__getattr__`` (ADR-032).
+    with pytest.raises(AttributeError):
+        export_input.members  # noqa: B018
+    with pytest.raises(AttributeError):
+        export_input.target_snapshot_members  # noqa: B018
+    with pytest.raises(AttributeError):
+        export_input.token_id  # noqa: B018
     assert list(export_input.reader.iter_verified_chunks()) == [b'{"record":1}\n']
 
     chunk = export_input.chunks[0]
@@ -932,8 +940,25 @@ def test_restricted_reader_keeps_manifest_separate_and_exposes_no_arbitrary_read
     assert not manifest_bytes.endswith(b"\n")
     assert b'"record":1' not in manifest_bytes
     assert inspect.signature(reader.read_verified_signed_manifest).parameters == {}
-    for forbidden in ("read", "read_ref", "resolve", "query", "landscape", "credentials", "signer", "secret"):
-        assert inspect.getattr_static(reader, forbidden, None) is None
+    # Same reasoning as the export-input carriers above: each arbitrary-read
+    # name must fail to resolve outright, which direct access proves and a
+    # static probe with a None default does not.
+    with pytest.raises(AttributeError):
+        reader.read  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.read_ref  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.resolve  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.query  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.landscape  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.credentials  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.signer  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.secret  # noqa: B018
     with pytest.raises(TypeError):
         reader.read_verified_signed_manifest("sha256:" + "0" * 64)  # type: ignore[call-arg]
 

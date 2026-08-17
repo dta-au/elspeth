@@ -5,9 +5,11 @@ import inspect
 import json
 import subprocess
 import sys
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from pathlib import Path
 from string import Template
+from types import MappingProxyType
 from typing import Any, cast, get_args
 from urllib.parse import unquote, urlsplit
 
@@ -2283,7 +2285,16 @@ def test_b3_error_projections_require_canonical_json(model: type[BaseModel], fie
             "destination": "discard",
         }
     parsed = model.model_validate(values)
-    assert getattr(parsed, field).startswith("{")
+    # Narrow to the concrete projection rather than resolving the field name
+    # off the instance: both models are contract-owned, so the canonical-JSON
+    # carrier is a real attribute on each (ADR-032).
+    if isinstance(parsed, corpus_schema.StableValidationErrorProjection):
+        canonical_json = parsed.row_data
+    elif isinstance(parsed, corpus_schema.StableTransformErrorProjection):
+        canonical_json = parsed.error_details
+    else:
+        raise AssertionError(f"unparametrised error projection model: {type(parsed).__name__}")
+    assert canonical_json.startswith("{")
     values[field] = '{"z":1, "a":2}'
     with pytest.raises(ValidationError, match=f"{field} must use canonical JSON"):
         model.model_validate(values)
@@ -3494,6 +3505,31 @@ def test_empty_stateful_families_preserve_pre_b3_semantic_shape_and_hash() -> No
     }
 
 
+# Explicit reader tables instead of resolving a family name off the projection.
+# Both projections are contract-owned pydantic models with these exact fields,
+# so each family gets a named accessor (ADR-032); ``family`` itself stays a
+# string because ``model_copy(update=...)`` is a keyed data-container API.
+_STATEFUL_FAMILY_READERS: Mapping[str, Callable[[Any], object]] = MappingProxyType(
+    {
+        "intermediate_outcomes": lambda projection: projection.intermediate_outcomes,
+        "batches": lambda projection: projection.batches,
+        "expansions": lambda projection: projection.expansions,
+        "validation_errors": lambda projection: projection.validation_errors,
+        "transform_errors": lambda projection: projection.transform_errors,
+    }
+)
+
+_STATEFUL_COUNT_READERS: Mapping[str, Callable[[corpus_harness.SemanticProjectionCounts], int]] = MappingProxyType(
+    {
+        "intermediate_outcomes": lambda counts: counts.intermediate_outcomes,
+        "batches": lambda counts: counts.batches,
+        "expansions": lambda counts: counts.expansions,
+        "validation_errors": lambda counts: counts.validation_errors,
+        "transform_errors": lambda counts: counts.transform_errors,
+    }
+)
+
+
 @pytest.mark.parametrize(
     ("scenario_id", "case_id", "family", "count_field"),
     (
@@ -3516,8 +3552,10 @@ def test_nonempty_stateful_family_changes_semantic_projection_and_hash(
     raw = case.expected.projection
     semantic = semantic_runtime_projection(raw)
 
-    assert getattr(semantic, family) == getattr(raw, family)
-    assert getattr(corpus_harness.semantic_runtime_projection_counts(semantic), count_field) > 0
+    read_family = _STATEFUL_FAMILY_READERS[family]
+    read_count = _STATEFUL_COUNT_READERS[count_field]
+    assert read_family(semantic) == read_family(raw)
+    assert read_count(corpus_harness.semantic_runtime_projection_counts(semantic)) > 0
     if family == "batches":
         first_batch, *remaining = semantic.batches
         mutated_value = (

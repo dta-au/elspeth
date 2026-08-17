@@ -68,10 +68,33 @@ CONTRACT_CARRIERS = (
 )
 
 
+# The package-level re-export of each carrier, paired with the carrier itself.
+# Naming both objects is the point of the test, so they are written out rather
+# than the package attribute being resolved from ``carrier.__name__`` (ADR-032):
+# a carrier that loses its ``elspeth.contracts`` export now fails at import.
+CONTRACT_CARRIER_EXPORTS: tuple[tuple[type, object], ...] = (
+    (AuditExportSnapshotCandidate, contracts.AuditExportSnapshotCandidate),
+    (AuditExportSnapshotReadLimits, contracts.AuditExportSnapshotReadLimits),
+    (AuditExportSnapshotRegistryKey, contracts.AuditExportSnapshotRegistryKey),
+    (AuditExportSnapshotWinner, contracts.AuditExportSnapshotWinner),
+    (AuditExportTerminalWitness, contracts.AuditExportTerminalWitness),
+    (SinkEffectAttemptRequest, contracts.SinkEffectAttemptRequest),
+    (SinkEffectAttemptResult, contracts.SinkEffectAttemptResult),
+    (SinkEffectFinalizationMember, contracts.SinkEffectFinalizationMember),
+    (SinkEffectFinalizationResult, contracts.SinkEffectFinalizationResult),
+    (SinkEffectFinalizeRequest, contracts.SinkEffectFinalizeRequest),
+    (SinkEffectLease, contracts.SinkEffectLease),
+    (SinkEffectReservationRequest, contracts.SinkEffectReservationRequest),
+)
+
+
 def test_sink_effect_carriers_are_contract_owned_and_public() -> None:
-    for carrier in CONTRACT_CARRIERS:
+    assert tuple(carrier for carrier, _exported in CONTRACT_CARRIER_EXPORTS) == CONTRACT_CARRIERS, (
+        "CONTRACT_CARRIER_EXPORTS has drifted from CONTRACT_CARRIERS; every carrier must be checked."
+    )
+    for carrier, exported in CONTRACT_CARRIER_EXPORTS:
         assert carrier.__module__.startswith("elspeth.contracts.")
-        assert getattr(contracts, carrier.__name__) is carrier
+        assert exported is carrier
         assert carrier.__name__ in contracts.__all__
 
 

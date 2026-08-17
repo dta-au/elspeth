@@ -105,7 +105,7 @@ def _registered_transform_classes() -> tuple[type[BaseTransform], ...]:
 
 def _declares_an_arriving_column(cls: type[BaseTransform]) -> bool:
     """Whether this plugin's config folds a config option into its input contract."""
-    config_model = getattr(cls, "config_model", None)
+    config_model = cls.config_model
     if config_model is None or not issubclass(config_model, TransformDataConfig):
         return False
     return config_model.declared_input_fields is not TransformDataConfig.declared_input_fields
@@ -121,13 +121,18 @@ def _input_naming_options(cls: type[BaseTransform], probe: BaseTransform) -> dic
     validated = probe._validated_config
     assert validated is not None, f"{cls.name}: probe captured no validated config; options cannot be discovered"
 
+    # ``dict(model)`` is pydantic's own field-value view: it yields the raw
+    # (unserialised) value for every declared field by name, so the option
+    # values are read from the model's data surface rather than probed off it.
+    field_values = dict(validated)
+
     options: dict[str, str | None] = {}
     for name in type(validated).model_fields:
         if name in _GENERIC_DECLARATION_OPTIONS or name in cls.output_naming_config_keys:
             continue
         if not is_column_naming_config_option(name):
             continue
-        value = getattr(validated, name, None)
+        value = field_values[name]
         if value is None or isinstance(value, str):
             options[name] = value
     return options

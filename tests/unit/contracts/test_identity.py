@@ -1,6 +1,8 @@
 """Tests for identity contracts."""
 
+from collections.abc import Callable, Mapping
 from dataclasses import FrozenInstanceError
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -142,6 +144,20 @@ class TestTokenInfo:
         assert updated.resume_checkpoint_id == "ck-abc"
 
 
+# The four lineage fields, each paired with a named reader. The field NAME is
+# still needed as a keyword-argument key (a data-container use), but reading the
+# value back off the constructed TokenInfo is a real attribute on an owned
+# dataclass and is accessed directly (ADR-032).
+_LINEAGE_FIELD_READERS: Mapping[str, Callable[[TokenInfo], str | None]] = MappingProxyType(
+    {
+        "branch_name": lambda token: token.branch_name,
+        "fork_group_id": lambda token: token.fork_group_id,
+        "join_group_id": lambda token: token.join_group_id,
+        "expand_group_id": lambda token: token.expand_group_id,
+    }
+)
+
+
 class TestTokenInfoLineageFieldGuards:
     """Empty-string lineage fields corrupt coalesce keys — must be rejected."""
 
@@ -167,7 +183,7 @@ class TestTokenInfoLineageFieldGuards:
         }
         kwargs[field] = None
         t = TokenInfo(**kwargs)
-        assert getattr(t, field) is None
+        assert _LINEAGE_FIELD_READERS[field](t) is None
 
     @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id"])
     def test_accepts_non_empty_lineage_field(self, field: str) -> None:
@@ -179,7 +195,7 @@ class TestTokenInfoLineageFieldGuards:
         }
         kwargs[field] = "valid_value"
         t = TokenInfo(**kwargs)
-        assert getattr(t, field) == "valid_value"
+        assert _LINEAGE_FIELD_READERS[field](t) == "valid_value"
 
 
 class TestTokenInfoResumeOffsetInvariant:

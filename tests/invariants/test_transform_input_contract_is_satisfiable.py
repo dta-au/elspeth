@@ -143,11 +143,10 @@ def _probe_instance(plugin_cls: type[BaseTransform]) -> BaseTransform:
     while still shipping — the silent-coverage-loss failure mode that
     ``test_semantic_requirements_are_satisfiable`` closes the same way.
     """
-    probe_config = getattr(plugin_cls, "probe_config", None)
-    assert probe_config is not None, (
+    assert any("probe_config" in klass.__dict__ for klass in plugin_cls.__mro__), (
         f"{plugin_cls.__name__} has no probe_config(), so its input contract is invisible to this gate. Add probe_config(); do not let a transform be skipped."
     )
-    return plugin_cls(probe_config())
+    return plugin_cls(plugin_cls.probe_config())
 
 
 def _declared_required_fields(transform: BaseTransform) -> frozenset[str]:
@@ -221,7 +220,7 @@ class TestTransformInputContractIsSatisfiable:
 
         for plugin_cls in _registered_transform_classes():
             transform = _probe_instance(plugin_cls)
-            plugin_name = getattr(plugin_cls, "name", plugin_cls.__name__)
+            plugin_name = plugin_cls.name
 
             # A field the transform READS may legitimately stay required, whatever
             # else it does with it — demotion is defined on created MINUS consumed.
@@ -265,7 +264,7 @@ class TestTransformInputContractIsSatisfiable:
         unsatisfiable: dict[str, dict[str, Any]] = {}
 
         for plugin_cls in _registered_transform_classes():
-            plugin_name = getattr(plugin_cls, "name", plugin_cls.__name__)
+            plugin_name = plugin_cls.name
             base = plugin_cls.probe_config()
             created = _probe_instance(plugin_cls).self_created_input_fields
             if not created:
@@ -305,7 +304,7 @@ class TestTransformInputContractIsSatisfiable:
         # for a reason none of them records — an exception swallowed upstream, a
         # roster that quietly shrank — and the anchors would still pass because
         # they only check the names they name.
-        registered = {getattr(cls, "name", cls.__name__) for cls in _registered_transform_classes()}
+        registered = {cls.name for cls in _registered_transform_classes()}
         accounted = set(armed) | set(rejected) | set(no_created_fields)
         assert accounted == registered, (
             f"transforms unaccounted for by the armed sweep: {sorted(registered - accounted)}. "

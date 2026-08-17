@@ -39,7 +39,9 @@ def _write_signed_allowlist(
     allowlist_dir.mkdir(parents=True, exist_ok=True)
     key = _canonical_key(finding)
     file_fingerprint = hashlib.sha256(source_file.read_bytes()).hexdigest()
-    ast_path = getattr(finding, "ast_path", f"decorator:{finding.line}:{finding.column}")
+    # ``Finding.ast_path`` is a real field with a "" default, so the old
+    # sentinel default was dead code: read the owned attribute (ADR-032).
+    ast_path = finding.ast_path
     judge_rationale = "Synthetic judge accepted this exact honesty-gate false positive for test coverage."
     signature = compute_judge_metadata_signature(
         key=key,

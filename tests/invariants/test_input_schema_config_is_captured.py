@@ -142,11 +142,12 @@ class TestInputSchemaConfigIsCaptured:
         diverged: dict[str, dict[str, Any]] = {}
 
         for cls in _registered_transform_classes():
-            plugin_name = getattr(cls, "name", cls.__name__)
-            probe_config = getattr(cls, "probe_config", None)
-            assert probe_config is not None, f"{plugin_name} has no probe_config(); the roster cannot be swept"
+            plugin_name = cls.name
+            assert any("probe_config" in klass.__dict__ for klass in cls.__mro__), (
+                f"{plugin_name} has no probe_config(); the roster cannot be swept"
+            )
 
-            base = probe_config()
+            base = cls.probe_config()
             probed = cls(base)
 
             # Demotion can only touch fields the transform creates AND the
@@ -200,11 +201,12 @@ class TestInputSchemaConfigIsCaptured:
         checked = 0
 
         for cls in _registered_transform_classes():
-            plugin_name = getattr(cls, "name", cls.__name__)
-            probe_config = getattr(cls, "probe_config", None)
-            assert probe_config is not None, f"{plugin_name} has no probe_config(); the roster cannot be swept"
+            plugin_name = cls.name
+            assert any("probe_config" in klass.__dict__ for klass in cls.__mro__), (
+                f"{plugin_name} has no probe_config(); the roster cannot be swept"
+            )
 
-            instance = cls(probe_config())
+            instance = cls(cls.probe_config())
             checked += 1
             if instance._schema_config is None:
                 uncaptured.append(plugin_name)
