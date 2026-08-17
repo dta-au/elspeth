@@ -1,0 +1,1 @@
+{"state_id": "state-2", "version": 2, "sources": {"source": {"plugin": "csv", "on_success": "in", "options": {"path": "rows.csv"}}}, "nodes": [{"id": "p", "node_type": "transform", "plugin": "passthrough", "input": "in", "on_success": "out", "on_error": "discard", "options": {}}], "edges": [], "outputs": [{"name": "out", "plugin": "json", "options": {}}]}
