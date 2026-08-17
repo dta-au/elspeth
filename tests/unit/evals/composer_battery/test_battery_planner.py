@@ -172,6 +172,27 @@ def test_a_planner_arm_that_stages_an_invalid_pipeline_is_not_clean(tmp_path: Pa
     assert r2.accepted_terminal and r2.clean
 
 
+def test_a_planner_run_with_no_response_and_no_terminal_is_terminal_missing(tmp_path: Path) -> None:
+    """The sibling shape of the http case. A client timeout on `post_message` deliberately does NOT set
+    `http_unrecovered` (the driver only flags transport errors there) — the loop ladder catches it at its
+    `terminal_missing` rungs instead, which the planner branch also lacked. A decided run still survives."""
+    meta = tg.meta(case="fork_coalesce")
+    meta["http"] = [{"step": "post_message", "status": None, "elapsed_ms": 620000, "detail": "client timeout"}]
+    _write(tmp_path / "P", _truncated_planner_thread(), state=None, is_valid=None, meta=meta)
+    r = pp.score_arm(tmp_path / "P", "fork_coalesce", "P")
+    assert r.excluded == "terminal_missing" and not r.clean
+    assert r.reason == "excluded: terminal_missing (post_message status None and no server terminal reason)", r.reason
+    # a run that reached its own terminal is observed, not missing one, even with no response delivered
+    _write(tmp_path / "P2", _terminated_planner_thread(), state=None, is_valid=None, meta=meta)
+    assert pp.score_arm(tmp_path / "P2", "fork_coalesce", "P").excluded is None
+    # and a captured 422 terminal is a product outcome, never an exclusion
+    meta422 = tg.meta(
+        case="fork_coalesce", post_status=422, terminal={"budget_exhausted": "discovery", "reason": "x", "source": "422_detail"}
+    )
+    _write(tmp_path / "P3", _truncated_planner_thread(), state=None, is_valid=None, meta=meta422)
+    assert pp.score_arm(tmp_path / "P3", "fork_coalesce", "P").excluded is None
+
+
 def test_tripwire_reports_an_instrument_exclusion_instead_of_a_topology_failure(tmp_path: Path) -> None:
     """elspeth-c18073bd8f: all three calib4 arms died at the edge (524/524/502), and the tripwire reported
     "topology: no committed state and no pending proposal" — a dead substrate read as a planner defect."""
@@ -284,6 +305,31 @@ def test_probe_dir_scores_ten_by_two_and_binds_fingerprint(tmp_path: Path) -> No
     assert doc["classifier_fingerprint"] == pp.classifier_fingerprint() and len(doc["arms"]) == 20
     assert all(a["surface_ok"] for a in doc["arms"])
     assert (rd / "_probe" / "probe.md").exists() and "| fixture | arm |" in (rd / "_probe" / "probe.md").read_text()
+
+
+def test_probe_marks_a_fixture_whose_pair_was_never_read_as_not_comparable(tmp_path: Path) -> None:
+    """The probe's claim is the PAIRED planner-vs-loop comparison. An instrument-excluded arm was not read, so
+    its fixture has no pair — tabulating it as a comparison is how a dead substrate reads as a surface verdict."""
+    rd = tmp_path / "runs" / "r1"
+    meta = tg.meta(case="fork_coalesce", post_status=524, instrument={**tg.Instrument().to_dict(), "http_unrecovered": "post_message 524"})
+    for name in pp.PROBE_FIXTURES:
+        args = pp.load_fixture(name)["canonical_arguments"]
+        _write(rd / "_probe" / name / "P", _planner_thread(), state={"id": "s", "version": 2, **copy.deepcopy(args)})
+        _write(rd / "_probe" / name / "L", tg.ideal_thread(args), state=copy.deepcopy(args))
+    dead = pp.PROBE_FIXTURES[0]
+    _write(rd / "_probe" / dead / "P", _truncated_planner_thread(), state=None, is_valid=None, meta=meta)
+    doc = pp.score_probe_dir(rd)
+    assert doc["unpaired"] == [dead], doc["unpaired"]
+    md = (rd / "_probe" / "probe.md").read_text()
+    assert "NOT COMPARABLE" in md and dead in md
+    # and with every arm read, the probe says so rather than staying silent
+    _write(
+        rd / "_probe" / dead / "P",
+        _planner_thread(),
+        state={"id": "s", "version": 2, **copy.deepcopy(pp.load_fixture(dead)["canonical_arguments"])},
+    )
+    doc2 = pp.score_probe_dir(rd)
+    assert doc2["unpaired"] == [] and "All fixtures paired." in (rd / "_probe" / "probe.md").read_text()
 
 
 def test_vocabularies_are_live_enum_members() -> None:

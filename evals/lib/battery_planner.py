@@ -36,7 +36,7 @@ from evals.lib.battery_capture import (
     planner_attempts,
     tool_outcomes,
 )
-from evals.lib.battery_score import captured_is_valid, instrument_exclusion, score_path, surface_of
+from evals.lib.battery_score import INSTRUMENT_KINDS, captured_is_valid, instrument_exclusion, score_path, surface_of
 from evals.lib.battery_topology import topologies_match, topology_from_pipeline
 
 REPO = Path(__file__).resolve().parents[2]
@@ -186,6 +186,7 @@ def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
         else (f"surface {surface} != expected {expected_surface}" if surface != "undetermined" else "surface undetermined")
     )
     post = next((h for h in (cap.meta.get("http") or []) if h.get("step") == "post_message"), {})
+    terminal = cap.meta.get("server_terminal") or {}
     excluded, evidence = instrument_exclusion(parse_instrument(cap.meta), post.get("status"))
     need = required_information(args)
     calls = llm_calls(cap)
@@ -208,12 +209,20 @@ def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
         # always leaves a committed state, so a missing verdict really is a missing capture).
         accepted = accepted_idx is not None and captured_is_valid(cap) is not False
         deviations = sorted(codes)
-        if excluded == "http" and any(a.led_to != "continue" for a in attempts):
-            # A captured planner DECISION (`done`/`terminal`) outranks a delivery failure — the same rule the loop
-            # ladder applies to `transport`. The planner reached its verdict before the 5xx landed, so the run is
-            # observed, and excluding would bury a real defect (fork_coalesce: prose x3 -> MALFORMED_RESPONSE, then
-            # 502). Only a run still mid-loop (every attempt `continue`) has an outcome we genuinely cannot know.
+        # Did the planner reach a verdict of its own? That is this surface's equivalent of the loop ladder's
+        # "a server terminal reason outranks transport" — every attempt still `continue` means the run was cut
+        # mid-loop and its outcome is unknowable; anything else means we observed it, whatever happened after.
+        decided = any(a.led_to != "continue" for a in attempts)
+        if excluded == "http" and decided:
+            # The planner reached its verdict before the 5xx landed, so the run is observed and excluding would
+            # bury a real defect (fork_coalesce: prose x3 -> MALFORMED_RESPONSE terminal, THEN a 502).
             excluded, evidence = None, None
+        elif excluded is None and post.get("status") != 200 and not decided and str(terminal.get("source", "none")) == "none":
+            # No response, no planner verdict, no server terminal. A client timeout deliberately does NOT set
+            # `http_unrecovered` (the driver flags only transport errors there), so without this rung the run
+            # falls through to the topology reason and reads as a planner finding — the same defect as `http`
+            # in the shape the flag does not cover. Mirrors score_path's terminal_missing rungs.
+            excluded, evidence = "terminal_missing", f"post_message status {post.get('status')} and no server terminal reason"
         return ArmResult(
             fixture,
             arm,
@@ -367,9 +376,15 @@ def score_probe_dir(round_dir: Path) -> dict[str, Any]:
                         "capture",
                     ).to_dict()
                 )
+    # The probe's whole claim is the PAIRED comparison. An arm excluded by the instrument was not read, so its
+    # fixture has no pair to compare — say so, rather than tabulating half a comparison as if it were one.
+    unpaired = sorted(
+        {a["fixture"] for a in arms if a["excluded"] in INSTRUMENT_KINDS or sum(1 for b in arms if b["fixture"] == a["fixture"]) < 2}
+    )
     doc = {
         "classifier_fingerprint": classifier_fingerprint(),
         "rule": "floor = required information classes seen before the accepting mutation + one accepted terminal; surface asserted per arm from artifacts",
+        "unpaired": unpaired,
         "arms": arms,
     }
     pd.mkdir(parents=True, exist_ok=True)
@@ -379,11 +394,20 @@ def score_probe_dir(round_dir: Path) -> dict[str, Any]:
         "",
         f"classifier fingerprint `{doc['classifier_fingerprint']}`",
         "",
-        "| fixture | arm | surface_ok | clean | floor_missing | accepted | tool_bearing | planner_calls | triage | staged | topology_ok | reason |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        (
+            f"**NOT COMPARABLE — {len(unpaired)} fixture(s) have no usable pair: {', '.join(unpaired)}.** "
+            "An instrument-excluded or missing arm was never read; do not read a paired conclusion off those rows."
+            if unpaired
+            else "All fixtures paired."
+        ),
+        "",
+        "| fixture | arm | excluded | surface_ok | clean | floor_missing | accepted | tool_bearing | planner_calls | triage | staged | topology_ok | reason |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     lines += [
-        f"| {a['fixture']} | {a['arm']} | {a['surface_ok']} | {a['clean']} | {','.join(a['floor_missing']) or '-'} | {a['accepted_terminal']} | {a['tool_bearing_calls']} | {a['planner_calls']} | {json.dumps(a['triage'])} | {a['staged_variant']} | {a['staged_topology_ok']} | {a['reason'] or ''} |"
+        f"| {a['fixture']} | {a['arm']} | {a['excluded'] or '-'} | {a['surface_ok']} | {a['clean']} | {','.join(a['floor_missing']) or '-'} "
+        f"| {a['accepted_terminal']} | {a['tool_bearing_calls']} | {a['planner_calls']} | {json.dumps(a['triage'])} "
+        f"| {a['staged_variant']} | {a['staged_topology_ok']} | {a['reason'] or ''} |"
         for a in arms
     ]
     (pd / "probe.md").write_text("\n".join(lines) + "\n")
