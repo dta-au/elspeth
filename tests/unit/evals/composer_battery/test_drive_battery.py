@@ -9,6 +9,7 @@ import pytest
 from evals.lib import battery_planner as db_planner
 from evals.lib.battery_corpus import CorpusCase
 from evals.lib.battery_scenario import load_scenario
+from evals.lib.battery_score import path_from_disk
 
 from tests.unit.evals.composer_battery import threadgen as tg
 from tests.unit.evals.composer_battery.fake_http import FakeClient, happy_responders, ok
@@ -194,6 +195,27 @@ def test_capture_step_server_failures_are_instrument_exclusions_not_product_find
     b3 = _battery(tmp_path, FakeClient(r3), repeats=1)
     b3.run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/x/3", case="x", repeat=3)
     assert json.loads((tmp_path / "runs/r1/x/3/meta.json").read_text())["instrument"]["http_unrecovered"] is None
+
+
+def test_a_state_read_that_times_out_is_an_instrument_fault_too(tmp_path: Path) -> None:
+    """`step` flags a transport error but NOT a client timeout, so `sr is None` bypassed a `sr is not None`
+    guard entirely — and a timed-out state read also skips validate (state_id stays None), so the
+    validate-side flag cannot rescue it. The run would score `state_empty`/`not is_valid`: a product finding
+    for a server outage, which is exactly what C2 exists to prevent."""
+
+    def times_out(c):
+        raise db.HttpTimeout("30s")
+
+    r = happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS))
+    r["GET /api/sessions/s1/state"] = times_out
+    client = FakeClient(r)
+    run_dir = tmp_path / "runs/r1/x/1"
+    verdict = _battery(tmp_path, client, repeats=1).run_prompt(label="l", prompt="p", run_dir=run_dir, case="x", repeat=1)
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert meta["instrument"]["http_unrecovered"].startswith("get_state timeout")
+    assert not (run_dir / "state.json").exists() and not (run_dir / "validate.json").exists()
+    assert "POST /api/sessions/s1/validate" not in client.steps()  # the validate seam never ran at all
+    assert verdict in db.INSTRUMENT_KINDS and path_from_disk(run_dir).excluded_by_instrument
 
 
 def test_a_5xx_compose_before_any_provider_call_aborts_the_round(tmp_path: Path) -> None:

@@ -363,11 +363,13 @@ class Battery:
         # 5. state + validate (pinned to state_id)
         state_id: str | None = None
         sr = step("get_state", "GET", f"/api/sessions/{sid}/state", timeout=30)
-        if sr is not None and sr.status_code != 200:
-            # "no state yet" is 200 + a null body (composer/state.py get_current_state); only a non-200 is a
-            # fault, and without this the missing state.json would score as an empty final state — a PRODUCT
-            # finding for a server outage.
-            instrument["http_unrecovered"] = instrument["http_unrecovered"] or f"get_state {sr.status_code}"
+        if sr is None or sr.status_code != 200:
+            # "no state yet" is 200 + a null body (composer/state.py get_current_state); only a non-200 — or a
+            # client timeout, which ``step`` returns as None WITHOUT flagging (it only flags a transport
+            # error) — is a fault. Without this the missing state.json would score as an empty final state, a
+            # PRODUCT finding for a server outage; and a timeout also skips the validate call entirely
+            # (state_id stays None), so the validate-side flag below cannot rescue it.
+            instrument["http_unrecovered"] = instrument["http_unrecovered"] or f"get_state {sr.status_code if sr else 'timeout'}"
         if sr is not None and sr.status_code == 200 and isinstance(sr.body, dict):
             (run_dir / "state.json").write_text(json.dumps(sr.body, indent=2))
             state_id = str(sr.body.get("id"))

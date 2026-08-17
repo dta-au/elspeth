@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from drive_battery import HttpResponse  # resolved via conftest.py sys.path insertion (below)
+from drive_battery import HttpResponse  # evals/composer-battery is appended to sys.path by conftest.py
 
 from tests.unit.evals.composer_battery import threadgen as tg
 
