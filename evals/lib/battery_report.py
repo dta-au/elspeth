@@ -141,7 +141,7 @@ def _rates(scores: list[Score]) -> dict[str, Any]:
         "optimal_rate": (optimal / n) if n else None,
         "hard_rate": (hard / n) if n else None,
         "formula": FORMULA,
-        "mde_pp": ci_half_width_pp(n),
+        "ci_half_width_pp": ci_half_width_pp(n),
     }
 
 
@@ -383,7 +383,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     out += [
         "## Headline",
         "",
-        f"- clean {_pct(p['clean_rate'])} (n={p['n']}, excluded={p['excluded']}, formula {p['formula']}, MDE ±{p['mde_pp']} pp)",
+        f"- clean {_pct(p['clean_rate'])} (n={p['n']}, excluded={p['excluded']}, formula {p['formula']}, 95% CI ±{p['ci_half_width_pp']} pp)",
         f"- optimal {_pct(p['optimal_rate'])} (n={p['n']}, excluded={p['excluded']}, formula {p['formula']})",
         f"- hard {_pct(p['hard_rate'])} (n={p['n']}, excluded={p['excluded']}, formula {p['formula']})",
         f"- clean excluding provider retries: {p['clean_ex_transport']}/{p['n']} (runs with a retried provider error: {p['runs_with_retried_provider_error']})",

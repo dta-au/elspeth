@@ -130,7 +130,7 @@ def test_pooled_uses_sum_over_sum_and_excludes_beside_n(tmp_path: Path) -> None:
         "optimal_rate": 0.75,
         "hard_rate": 0.25,
         "formula": "sum(successes)/sum(n)",
-        "mde_pp": ci_half_width_pp(4),
+        "ci_half_width_pp": ci_half_width_pp(4),
     }
     assert rep["canary"] == {"n": 10, "non_optimal": 0, "flag": False}
     assert rep["exclusions"] == [] and rep["measurement_exclusions"] == [
@@ -266,6 +266,42 @@ def test_compare_refuses_on_binding_mismatch_and_prints_recorded_deltas(tmp_path
     # corpus_version mismatch → refused (late-binding guard fires first when meta disagrees with the version being scored)
     with pytest.raises((CompareRefused, LateBinding), match="corpus_version"):
         build_report(_round(tmp_path, "r2"), scenarios=SCENARIOS, corpus_version=1, compare_to=prev)
+
+
+def test_compare_delta_sign_is_current_minus_previous(tmp_path: Path) -> None:
+    """pooled_delta/by_case_delta must be current minus previous. Two identical `_round` calls (as in
+    test_compare_refuses_on_binding_mismatch_and_prints_recorded_deltas) tie at delta 0.0 either way a
+    swapped ``pp(old, cur)`` would pass that test silently — so this pins a round pair with a real difference:
+    prior round all-clean (5/5 ideal threads), current round with one hard deviation (the standard `_round`
+    fixture, clean 3/4)."""
+    prev = tmp_path / "runs" / "r0"
+    fc = SC.canonical_arguments
+    ca = CANARY.canonical_arguments
+    for rep in range(1, 6):
+        m, s, meta = _ideal("fork_coalesce", rep, fc)
+        _write_run(prev / "fork_coalesce" / str(rep), m, state=s, meta=meta)
+    for rep in range(1, 11):
+        m, s, meta = _ideal("canary", rep, ca)
+        _write_run(prev / "canary" / str(rep), m, state=s, meta=meta)
+    (prev / "_tripwire").mkdir()
+    (prev / "_tripwire" / "tripwire.json").write_text("[]")
+    (prev / "firing.json").write_text(
+        json.dumps(
+            {"round": "r0", "base": "x", "started_at": "t", "completed": [], "aborted": False, "abort_reason": None, "case_flags": {}}
+        )
+    )
+    write_report(prev, build_report(prev, scenarios=SCENARIOS, corpus_version=0))
+
+    cur = _round(tmp_path, "r1")  # 3 ideal + 1 hard (repair) + 1 measurement-excluded ⇒ clean 3/4 = 0.75
+    rep = build_report(cur, scenarios=SCENARIOS, corpus_version=0, compare_to=prev)
+
+    # prev clean_rate = 5/5 = 1.0; cur clean_rate = 3/4 = 0.75 => delta = (0.75 - 1.0) * 100 = -25.0 -- NEGATIVE.
+    # A swapped `pp(old, cur)` would report +25.0 here instead.
+    assert rep["compare"]["pooled_delta"]["clean_pp"] == -25.0
+    case_delta = next(d for d in rep["compare"]["by_case_delta"] if d["case"] == "fork_coalesce")
+    assert case_delta["clean_pp"] == -25.0
+    md = render_markdown(rep)
+    assert "clean -25.0 pp" in md
 
 
 def test_late_binding_guard_refuses_moved_corpus_or_prompt(tmp_path: Path) -> None:
