@@ -1,0 +1,331 @@
+"""§7 planner probe (paired, calibration only) and tripwire (standing, every round) — the OFFLINE half.
+
+Both reuse the parity fixtures verbatim; scoring is over captured run directories only. Nothing here
+enters a pooled rate. The live wrapper (``evals/composer-battery/planner_probe.py``) is ~25 lines.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+from collections import Counter
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from elspeth.contracts.composer_planner_audit import ComposerPlannerCode as PC
+from elspeth.contracts.composer_planner_audit import ComposerPlannerInformationClass as IC
+from elspeth.web.composer import no_tool_policy
+from elspeth.web.composer.no_tool_policy import PipelineMutationIntentDecision, classify_pipeline_mutation_intent
+from elspeth.web.composer.protocol import (
+    PIPELINE_STAGED_AUTO_COMMIT_MESSAGE,
+    PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE,
+    PIPELINE_STAGED_REVIEW_MESSAGE,
+    PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE,
+    PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE,
+)
+from elspeth.web.composer.tools.discovery import is_mutation_tool
+from evals.lib.battery_capture import assistant_turns, llm_calls, load_capture, planner_attempts, tool_outcomes
+from evals.lib.battery_score import score_path, surface_of
+from evals.lib.battery_topology import topologies_match, topology_from_pipeline
+
+REPO = Path(__file__).resolve().parents[2]
+PARITY_DIR = REPO / "evals" / "composer-parity" / "fixtures"
+TRIPWIRE_FIXTURES: tuple[str, ...] = ("fork_coalesce", "error_routing", "linear_transform")
+PROBE_FIXTURES: tuple[str, ...] = tuple(sorted(p.stem for p in PARITY_DIR.glob("*.json")))
+STAGED_VARIANTS: dict[str, str] = {
+    PIPELINE_STAGED_AUTO_COMMIT_MESSAGE: "PIPELINE_STAGED_AUTO_COMMIT_MESSAGE",
+    PIPELINE_STAGED_REVIEW_MESSAGE: "PIPELINE_STAGED_REVIEW_MESSAGE",
+    PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE: "PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE",
+    PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE: "PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE",
+    PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE: "PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE",
+}
+# Loop-side discovery tool → the information class it yields (values are LIVE enum members, never literals).
+LOOP_TOOL_TO_INFO: dict[str, str] = {
+    "get_plugin_schema": IC.PLUGIN_SCHEMA.value,
+    "list_models": IC.MODEL_CATALOG.value,
+    "get_plugin_assistance": IC.PLUGIN_ASSISTANCE.value,
+    "get_expression_grammar": IC.EXPRESSION_GRAMMAR.value,
+    "list_sources": IC.CATALOG_SELECTION.value,
+    "list_transforms": IC.CATALOG_SELECTION.value,
+    "list_sinks": IC.CATALOG_SELECTION.value,
+    "get_pipeline_state": IC.PIPELINE_CURRENT.value,
+    "list_recipes": IC.RECIPE_INDEX.value,
+    "get_audit_info": IC.AUDIT_INFO.value,
+}
+# Planner-code triage (spec §7), keyed by live ComposerPlannerCode values; ``repeated_fingerprint`` is an attempt flag, not a code.
+TRIAGE_BY_CODE: dict[str, str] = {
+    PC.DISCOVERY_NO_GAIN.value: "kit_misled_discovery",
+    PC.DISCOVERY_CYCLE.value: "kit_misled_discovery",
+    PC.REPAIR_BLIND_REPEAT.value: "error_message_not_actionable",
+    PC.COMPOSITION_EXHAUSTED.value: "budget",
+    PC.DISCOVERY_EXHAUSTED.value: "budget",
+    PC.PROVIDER_CALLS_EXHAUSTED.value: "budget",
+    PC.REPAIR_EXHAUSTED.value: "budget",
+    PC.REQUEST_BYTES_EXHAUSTED.value: "budget",
+    PC.TOOL_CALLS_EXHAUSTED.value: "budget",
+    PC.MALFORMED_RESPONSE.value: "model",
+    PC.PROSE_REPLY.value: "model",
+    PC.RESPONSE_TRUNCATED.value: "model",
+}
+LOOP_PREFIX = "Hi. "
+
+
+class ProbeUnpaired(RuntimeError):
+    pass
+
+
+def load_fixture(name: str) -> dict[str, Any]:
+    doc = json.loads((PARITY_DIR / f"{name}.json").read_text())
+    return {"intent": doc["intent"], "canonical_arguments": doc["canonical_arguments"]}
+
+
+def classifier_fingerprint() -> str:
+    return hashlib.sha256(Path(inspect.getsourcefile(no_tool_policy) or "").read_bytes()).hexdigest()
+
+
+def assert_pair_routes(intent: str) -> None:
+    p = classify_pipeline_mutation_intent(intent)
+    l_ = classify_pipeline_mutation_intent(LOOP_PREFIX + intent)
+    if p is not PipelineMutationIntentDecision.EXPLICIT_MUTATION or l_ is PipelineMutationIntentDecision.EXPLICIT_MUTATION:
+        raise ProbeUnpaired(f"pair does not route P→planner / L→loop: P={p.name} L={l_.name} for {intent[:60]!r}")
+
+
+def required_information(args: dict[str, Any]) -> frozenset[str]:
+    plugins = [str((args.get("source") or {}).get("plugin") or "")] + [str(n.get("plugin") or "") for n in args.get("nodes") or []]
+    for src in (args.get("sources") or {}).values() if isinstance(args.get("sources"), dict) else []:
+        plugins.append(str(src.get("plugin") or ""))
+    need = {IC.PLUGIN_SCHEMA.value}
+    if any(p.startswith("llm") or "_llm" in p for p in plugins):
+        need.add(IC.MODEL_CATALOG.value)
+    return frozenset(need)
+
+
+def triage_code(code: str) -> str:
+    if code == "repeated_fingerprint":
+        return "error_message_not_actionable"
+    return TRIAGE_BY_CODE.get(code, "other")
+
+
+@dataclass
+class ArmResult:
+    fixture: str
+    arm: str
+    surface: str
+    surface_ok: bool
+    information_seen: list[str]
+    floor_missing: list[str]
+    accepted_terminal: bool
+    planner_calls: int
+    planner_codes: dict[str, int]
+    triage: dict[str, int]
+    deviations: list[str]
+    staged_variant: str | None
+    staged_topology_ok: bool | None
+    clean: bool
+    tool_bearing_calls: int
+    reason: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def staged_topology(run_dir: Path, args: dict[str, Any]) -> tuple[bool | None, str | None]:
+    expected = topology_from_pipeline(args)
+    state_p = run_dir / "state.json"
+    if state_p.exists():
+        state = json.loads(state_p.read_text())
+        if isinstance(state, dict) and (state.get("sources") or state.get("source") or state.get("nodes")):
+            m = topologies_match(expected, topology_from_pipeline(state))
+            return m.ok, m.reason
+    prop_p = run_dir / "proposals.json"
+    if prop_p.exists():
+        doc = json.loads(prop_p.read_text())
+        for prop in (doc.get("proposals") or []) if isinstance(doc, dict) else []:
+            if isinstance(prop, dict) and prop.get("status") == "pending" and isinstance(prop.get("arguments_redacted_json"), dict):
+                m = topologies_match(expected, topology_from_pipeline(prop["arguments_redacted_json"]))
+                return m.ok, m.reason
+    return None, "no committed state and no pending proposal"
+
+
+def _staged_variant(capture: Any) -> str | None:
+    for turn in reversed(assistant_turns(capture)):
+        for text, name in STAGED_VARIANTS.items():
+            if text in (turn.content or ""):
+                return name
+    return None
+
+
+def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
+    args = load_fixture(fixture)["canonical_arguments"]
+    cap = load_capture(Path(run_dir))
+    surface = surface_of(cap)
+    expected_surface = "planner" if arm == "P" else "compose_loop"
+    surface_ok = surface == expected_surface
+    reason: str | None = (
+        None
+        if surface_ok
+        else (f"surface {surface} != expected {expected_surface}" if surface != "undetermined" else "surface undetermined")
+    )
+    need = required_information(args)
+    calls = llm_calls(cap)
+    tool_bearing = sum(1 for c in calls if c.status == "success" and c.tools_spec_hash)
+    variant = _staged_variant(cap)
+    topo_ok, topo_reason = staged_topology(Path(run_dir), args)
+
+    if surface == "planner":
+        attempts = planner_attempts(cap)
+        accepted_idx = next((i for i, a in enumerate(attempts) if a.outcome == "accepted" and a.led_to == "done"), None)
+        before = attempts if accepted_idx is None else attempts[: accepted_idx + 1]
+        seen = sorted({info for a in before for info in a.new_information})
+        codes = Counter(a.planner_code for a in attempts if a.planner_code)
+        if any(a.repeated_fingerprint for a in attempts):
+            codes["repeated_fingerprint"] += 1
+        triage = Counter(triage_code(c) for c in codes.elements())
+        accepted = accepted_idx is not None
+        deviations = sorted(codes)
+        return ArmResult(
+            fixture,
+            arm,
+            surface,
+            surface_ok,
+            seen,
+            sorted(need - set(seen)),
+            accepted,
+            sum(1 for c in calls if c.planner_call_ordinal is not None),
+            dict(codes),
+            dict(triage),
+            deviations,
+            variant,
+            topo_ok,
+            surface_ok and not (need - set(seen)) and accepted and not deviations and topo_ok is True,
+            tool_bearing,
+            reason or (None if topo_ok else f"topology: {topo_reason}"),
+        )
+
+    # compose loop (or undetermined): the scenario-free path score — no fabricated floor, no synthetic Scenario
+    path = score_path(cap)
+    outcomes = tool_outcomes(cap)
+    seen_set: set[str] = set()
+    accepted = False
+    for turn in assistant_turns(cap):
+        for c in turn.tool_calls:
+            if is_mutation_tool(c.name) and outcomes.get(c.id) == "applied":
+                accepted = True
+                break
+            if c.name in LOOP_TOOL_TO_INFO:
+                seen_set.add(LOOP_TOOL_TO_INFO[c.name])
+        if accepted:
+            break
+    accepted = accepted and bool(path.is_valid)
+    seen = sorted(seen_set)
+    deviations = [d.cls for d in path.deviations]
+    return ArmResult(
+        fixture,
+        arm,
+        surface,
+        surface_ok,
+        seen,
+        sorted(need - seen_set),
+        accepted,
+        0,
+        {},
+        {},
+        deviations,
+        variant,
+        topo_ok,
+        surface_ok and not (need - seen_set) and accepted and not deviations and topo_ok is True and path.excluded is None,
+        tool_bearing,
+        reason or (path.excluded and f"excluded: {path.excluded}") or (None if topo_ok else f"topology: {topo_reason}"),
+    )
+
+
+def score_tripwire_dir(round_dir: Path) -> list[dict[str, Any]]:
+    tw = Path(round_dir) / "_tripwire"
+    table: list[dict[str, Any]] = []
+    for fixture in TRIPWIRE_FIXTURES:
+        run_dir = tw / fixture / "1"
+        if not run_dir.exists():
+            table.append(
+                {
+                    "fixture": fixture,
+                    "pass": False,
+                    "staged_variant": None,
+                    "planner_calls": 0,
+                    "planner_codes": {},
+                    "surface": "undetermined",
+                    "reason": "not fired",
+                }
+            )
+            continue
+        r = score_arm(run_dir, fixture, "P")
+        passed = r.surface == "planner" and r.staged_variant is not None and r.staged_topology_ok is True
+        reason = None if passed else (r.reason or ("no PIPELINE_STAGED_* message" if r.staged_variant is None else "topology mismatch"))
+        table.append(
+            {
+                "fixture": fixture,
+                "pass": passed,
+                "staged_variant": r.staged_variant,
+                "planner_calls": r.planner_calls,
+                "planner_codes": r.planner_codes,
+                "surface": r.surface,
+                "reason": reason,
+            }
+        )
+    tw.mkdir(parents=True, exist_ok=True)
+    (tw / "tripwire.json").write_text(json.dumps(table, indent=2))
+    return table
+
+
+def score_probe_dir(round_dir: Path) -> dict[str, Any]:
+    pd = Path(round_dir) / "_probe"
+    arms: list[dict[str, Any]] = []
+    for fixture in PROBE_FIXTURES:
+        for arm in ("P", "L"):
+            run_dir = pd / fixture / arm
+            if run_dir.exists():
+                arms.append(score_arm(run_dir, fixture, arm).to_dict())
+    doc = {
+        "classifier_fingerprint": classifier_fingerprint(),
+        "rule": "floor = required information classes seen before the accepting mutation + one accepted terminal; surface asserted per arm from artifacts",
+        "arms": arms,
+    }
+    pd.mkdir(parents=True, exist_ok=True)
+    (pd / "probe.json").write_text(json.dumps(doc, indent=2))
+    lines = [
+        "# Planner probe (calibration; enters no rate)",
+        "",
+        f"classifier fingerprint `{doc['classifier_fingerprint']}`",
+        "",
+        "| fixture | arm | surface_ok | clean | floor_missing | accepted | tool_bearing | planner_calls | triage | staged | topology_ok | reason |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    lines += [
+        f"| {a['fixture']} | {a['arm']} | {a['surface_ok']} | {a['clean']} | {','.join(a['floor_missing']) or '-'} | {a['accepted_terminal']} | {a['tool_bearing_calls']} | {a['planner_calls']} | {json.dumps(a['triage'])} | {a['staged_variant']} | {a['staged_topology_ok']} | {a['reason'] or ''} |"
+        for a in arms
+    ]
+    (pd / "probe.md").write_text("\n".join(lines) + "\n")
+    return doc
+
+
+__all__ = [
+    "LOOP_PREFIX",
+    "LOOP_TOOL_TO_INFO",
+    "PARITY_DIR",
+    "PROBE_FIXTURES",
+    "STAGED_VARIANTS",
+    "TRIAGE_BY_CODE",
+    "TRIPWIRE_FIXTURES",
+    "ArmResult",
+    "ProbeUnpaired",
+    "assert_pair_routes",
+    "classifier_fingerprint",
+    "load_fixture",
+    "required_information",
+    "score_arm",
+    "score_probe_dir",
+    "score_tripwire_dir",
+    "staged_topology",
+    "triage_code",
+]
