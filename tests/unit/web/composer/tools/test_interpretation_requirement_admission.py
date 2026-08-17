@@ -228,7 +228,7 @@ def test_source_guard_uses_the_same_exhaustive_admission_contract() -> None:
 def test_canonical_invariant_rejects_shape_domain_and_identity_failures_without_leaking(
     requirements: list[dict[str, Any]],
 ) -> None:
-    invariant = getattr(common_tools, "_canonical_interpretation_requirement_error", None)
+    invariant = common_tools._canonical_interpretation_requirement_error
 
     assert callable(invariant), "central canonical invariant B is missing"
     error = invariant(
@@ -242,7 +242,7 @@ def test_canonical_invariant_rejects_shape_domain_and_identity_failures_without_
 
 
 def test_canonical_invariant_accepts_exact_coherent_pending_rows() -> None:
-    invariant = getattr(common_tools, "_canonical_interpretation_requirement_error", None)
+    invariant = common_tools._canonical_interpretation_requirement_error
 
     assert callable(invariant), "central canonical invariant B is missing"
     assert (
@@ -295,7 +295,7 @@ def test_canonical_invariant_requires_kind_appropriate_resolved_evidence(
     required_hash_field: str,
     wrong_hash_field: str,
 ) -> None:
-    invariant = getattr(common_tools, "_canonical_interpretation_requirement_error", None)
+    invariant = common_tools._canonical_interpretation_requirement_error
     assert callable(invariant), "central canonical invariant B is missing"
     resolved = _canonical_pending_requirement(
         requirement_id=f"resolved:{kind}",
@@ -1160,13 +1160,13 @@ def test_public_composition_mutations_reject_preexisting_output_review_metadata(
 
 
 def test_composition_gate_registry_covers_every_public_state_mutation() -> None:
-    from elspeth.web.composer.tools import _dispatch
+    from elspeth.web.composer.tools._dispatch import _COMPOSITION_STATE_MUTATION_TOOL_NAMES
     from elspeth.web.composer.tools._registry import (
         _MUTATION_TOOL_NAMES,
         _SECRET_MUTATION_TOOL_NAMES,
     )
 
-    covered = getattr(_dispatch, "_COMPOSITION_STATE_MUTATION_TOOL_NAMES", None)
+    covered = _COMPOSITION_STATE_MUTATION_TOOL_NAMES
 
     assert covered == (
         _MUTATION_TOOL_NAMES

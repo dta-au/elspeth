@@ -2,29 +2,83 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
+    from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
+    from elspeth.plugins.infrastructure.manager import PluginManager
 
 
+@dataclass
 class TrackedPlugin:
-    """Transparent plugin proxy that records every close call."""
+    """Close-count record for one plugin instance created during validation.
 
-    def __init__(self, delegate: Any) -> None:
+    A record, deliberately not a proxy. The instance handed back to the code
+    under test IS the real plugin; only its ``close`` is rebound, per instance,
+    to count the call and then run the class's own ``close``. A forwarding
+    wrapper would have to impersonate whichever of ``BaseTransform`` /
+    ``BaseSink`` / ``BaseSource`` it happened to hold — roughly seventy
+    members between them — and any ``isinstance`` check in the validation path
+    would see the wrapper rather than the plugin.
+    """
+
+    _delegate: BaseSink | BaseSource | BaseTransform
+    close_count: int = 0
+
+
+class _PluginManagerDelegate:
+    """Explicit, exhaustive delegation of the ``PluginManager`` public surface.
+
+    Every method a caller may reach is written out. There is no catch-all
+    forwarding: a plugin-manager method that grows a new caller in the web
+    layer fails here loudly, which is the point — a silent forward would let a
+    double answer for a registry it was never checked against.
+    """
+
+    def __init__(self, delegate: PluginManager) -> None:
         self._delegate = delegate
-        self.close_count = 0
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._delegate, name)
+    def register_builtin_plugins(self) -> None:
+        self._delegate.register_builtin_plugins()
 
-    def close(self) -> None:
-        self.close_count += 1
-        self._delegate.close()
+    def register(self, plugin: Any) -> None:
+        self._delegate.register(plugin)
+
+    def get_sources(self) -> list[type[SourceProtocol]]:
+        return self._delegate.get_sources()
+
+    def get_transforms(self) -> list[type[TransformProtocol]]:
+        return self._delegate.get_transforms()
+
+    def get_sinks(self) -> list[type[SinkProtocol]]:
+        return self._delegate.get_sinks()
+
+    def get_source_by_name(self, name: str) -> type[SourceProtocol]:
+        return self._delegate.get_source_by_name(name)
+
+    def get_transform_by_name(self, name: str) -> type[TransformProtocol]:
+        return self._delegate.get_transform_by_name(name)
+
+    def get_sink_by_name(self, name: str) -> type[SinkProtocol]:
+        return self._delegate.get_sink_by_name(name)
+
+    def create_source(self, source_type: str, config: dict[str, Any]) -> SourceProtocol:
+        return self._delegate.create_source(source_type, config)
+
+    def create_transform(self, transform_type: str, config: dict[str, Any]) -> TransformProtocol:
+        return self._delegate.create_transform(transform_type, config)
+
+    def create_sink(self, sink_type: str, config: dict[str, Any]) -> SinkProtocol:
+        return self._delegate.create_sink(sink_type, config)
 
 
-class TrackingPluginManager:
-    """Delegate plugin-manager operations while wrapping every created plugin.
+class TrackingPluginManager(_PluginManagerDelegate):
+    """Delegate plugin-manager operations while tracking every created plugin.
 
-    All three factories are wrapped, not just ``create_transform``. Composer
+    All three factories are tracked, not just ``create_transform``. Composer
     validation probes transforms, sinks (``_semantic_validator``'s output loop)
     and sources, and every probe instance is owned by the caller and must be
     closed. Tracking only one factory would leave a leaked sink or source probe
@@ -32,30 +86,35 @@ class TrackingPluginManager:
     exist to catch.
     """
 
-    def __init__(self, delegate: Any) -> None:
-        self._delegate = delegate
+    def __init__(self, delegate: PluginManager) -> None:
+        super().__init__(delegate)
         self.instances: list[TrackedPlugin] = []
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._delegate, name)
-
-    def _track(self, plugin: Any) -> TrackedPlugin:
+    def _track(self, plugin: Any) -> Any:
+        """Record ``plugin`` and count its closes, returning the plugin itself."""
         tracked = TrackedPlugin(plugin)
         self.instances.append(tracked)
-        return tracked
+        plugin_close = plugin.close
 
-    def create_transform(self, plugin_name: str, options: dict[str, Any]) -> TrackedPlugin:
-        return self._track(self._delegate.create_transform(plugin_name, options))
+        def counting_close() -> None:
+            tracked.close_count += 1
+            plugin_close()
 
-    def create_sink(self, plugin_name: str, options: dict[str, Any]) -> TrackedPlugin:
-        return self._track(self._delegate.create_sink(plugin_name, options))
+        plugin.close = counting_close
+        return plugin
 
-    def create_source(self, plugin_name: str, options: dict[str, Any]) -> TrackedPlugin:
-        return self._track(self._delegate.create_source(plugin_name, options))
+    def create_source(self, source_type: str, config: dict[str, Any]) -> SourceProtocol:
+        return self._track(self._delegate.create_source(source_type, config))
+
+    def create_transform(self, transform_type: str, config: dict[str, Any]) -> TransformProtocol:
+        return self._track(self._delegate.create_transform(transform_type, config))
+
+    def create_sink(self, sink_type: str, config: dict[str, Any]) -> SinkProtocol:
+        return self._track(self._delegate.create_sink(sink_type, config))
 
 
 @lru_cache(maxsize=1)
-def real_plugin_manager() -> Any:
+def real_plugin_manager() -> PluginManager:
     """A real, fully-registered PluginManager, built once per test session.
 
     Deliberately NOT ``get_shared_plugin_manager()``: the tests that use this
@@ -69,7 +128,7 @@ def real_plugin_manager() -> Any:
     return manager
 
 
-class DelegatingPluginManagerDouble:
+class DelegatingPluginManagerDouble(_PluginManagerDelegate):
     """Plugin-manager double that breaks only what its subclass overrides.
 
     Composer validation reaches the shared manager for transforms, sinks and
@@ -80,5 +139,5 @@ class DelegatingPluginManagerDouble:
     so each double breaks exactly the surface it names.
     """
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(real_plugin_manager(), name)
+    def __init__(self, delegate: PluginManager | None = None) -> None:
+        super().__init__(real_plugin_manager() if delegate is None else delegate)

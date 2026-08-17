@@ -133,12 +133,14 @@ def test_tools_all_entries_resolve() -> None:
 
     from elspeth.web.composer import tools
 
-    missing = []
-    for name in tools.__all__:
-        try:
-            getattr(tools, name)
-        except AttributeError:
-            missing.append(name)
+    # Module-dict inspection rather than attribute resolution. The facade
+    # defines no PEP 562 module ``__getattr__``, so its ``vars()`` IS its
+    # attribute surface and the set difference states the invariant directly.
+    # The precondition is asserted so a future lazy-export facade fails here
+    # loudly instead of turning every entry into a phantom "missing".
+    assert "__getattr__" not in vars(tools), "facade grew a lazy module __getattr__; this test must be reworked to match"
+
+    missing = sorted(set(tools.__all__) - set(vars(tools)))
 
     assert not missing, f"__all__ declares names that are not attributes of the module: {missing}"
 

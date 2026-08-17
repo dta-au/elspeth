@@ -5832,7 +5832,10 @@ async def test_settlement_failure_does_not_replace_primary_provider_failure(
 
     assert caught.value.code == "PROVIDER_ERROR"
     assert raw_provider_canary not in str(caught.value)
-    assert any("SettlementFailure" in note for note in getattr(caught.value, "__notes__", ()))
+    # Direct access, not a probe: a settlement failure MUST have attached a
+    # note via ``add_note``, so a missing ``__notes__`` is a defect to raise
+    # on rather than an absence to tolerate.
+    assert any("SettlementFailure" in note for note in caught.value.__notes__)
 
 
 @pytest.mark.asyncio

@@ -16,7 +16,7 @@ def test_provider_telemetry_projector_surface_exists() -> None:
     assert importlib.util.find_spec(module_name) is not None
     module = importlib.import_module(module_name)
 
-    assert callable(getattr(module, "record_settled_composer_provider_calls", None))
+    assert callable(module.record_settled_composer_provider_calls)
 
 
 @dataclass

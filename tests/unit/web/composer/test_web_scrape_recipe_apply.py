@@ -181,7 +181,7 @@ def test_apply_web_scrape_recipe_json_preserves_shield_advisory(_seeded_url_blob
         session_engine=engine,
         session_id=session_id,
     )
-    assert result.success, getattr(result, "data", result)
+    assert result.success, result.data
     state = result.updated_state
     assert state.sources["source"].plugin == "json"
     # Re-polarized shield: no hard node, advisory survives.
@@ -210,7 +210,7 @@ def test_apply_web_scrape_recipe_csv_preserves_shield_advisory(_seeded_url_blob_
         session_engine=engine,
         session_id=session_id,
     )
-    assert result.success, getattr(result, "data", result)
+    assert result.success, result.data
     state = result.updated_state
     # The resolved source_plugin slot preserves the csv source materialisation.
     assert state.sources["source"].plugin == "csv"

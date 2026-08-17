@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
@@ -248,31 +249,73 @@ def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_un
 
 
 @pytest.mark.parametrize(
-    ("module", "variant_name", "required_fields"),
+    ("variant", "required_fields"),
     [
-        (chat_solver, "GuidedChatProseOutcome", {"assistant_message"}),
-        (chat_solver, "GuidedChatDeferredIntentOutcome", {"action"}),
-        (chat_solver, "GuidedChatDeferredIntentWithheldResolutionOutcome", {"action", "resolution_error_class"}),
-        (chat_solver, "GuidedChatDeferredManagementOutcome", {"action"}),
-        (chat_solver, "Step1SourcePluginReselectedOutcome", {"plugin", "assistant_message"}),
-        (chat_solver, "Step1SourceResolvedOutcome", {"resolution", "deferred_action"}),
-        (chat_solver, "Step2SinkResolvedOutcome", {"sink", "assistant_message", "deferred_action"}),
-        (guided_step_chat_module, "GuidedStepChatOnlyResult", {"chat"}),
-        (guided_step_chat_module, "GuidedStepDeferredClarificationResult", {"chat"}),
-        (guided_step_chat_module, "GuidedStepDeferredIntentResult", {"chat", "action"}),
-        (guided_step_chat_module, "GuidedStepDeferredIntentWithheldResolutionResult", {"chat", "action"}),
-        (guided_step_chat_module, "GuidedStepDeferredManagementResult", {"chat", "action"}),
-        (guided_step_chat_module, "Step1SourcePluginReselectedResult", {"chat", "plugin"}),
-        (guided_step_chat_module, "Step1SourceResolvedResult", {"chat", "resolution", "deferred_action"}),
-        (guided_step_chat_module, "Step2SinkResolvedResult", {"chat", "sink", "deferred_action"}),
+        pytest.param(chat_solver.GuidedChatProseOutcome, {"assistant_message"}, id="GuidedChatProseOutcome"),
+        pytest.param(chat_solver.GuidedChatDeferredIntentOutcome, {"action"}, id="GuidedChatDeferredIntentOutcome"),
+        pytest.param(
+            chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome,
+            {"action", "resolution_error_class"},
+            id="GuidedChatDeferredIntentWithheldResolutionOutcome",
+        ),
+        pytest.param(chat_solver.GuidedChatDeferredManagementOutcome, {"action"}, id="GuidedChatDeferredManagementOutcome"),
+        pytest.param(
+            chat_solver.Step1SourcePluginReselectedOutcome,
+            {"plugin", "assistant_message"},
+            id="Step1SourcePluginReselectedOutcome",
+        ),
+        pytest.param(
+            chat_solver.Step1SourceResolvedOutcome,
+            {"resolution", "deferred_action"},
+            id="Step1SourceResolvedOutcome",
+        ),
+        pytest.param(
+            chat_solver.Step2SinkResolvedOutcome,
+            {"sink", "assistant_message", "deferred_action"},
+            id="Step2SinkResolvedOutcome",
+        ),
+        pytest.param(guided_step_chat_module.GuidedStepChatOnlyResult, {"chat"}, id="GuidedStepChatOnlyResult"),
+        pytest.param(
+            guided_step_chat_module.GuidedStepDeferredClarificationResult,
+            {"chat"},
+            id="GuidedStepDeferredClarificationResult",
+        ),
+        pytest.param(
+            guided_step_chat_module.GuidedStepDeferredIntentResult,
+            {"chat", "action"},
+            id="GuidedStepDeferredIntentResult",
+        ),
+        pytest.param(
+            guided_step_chat_module.GuidedStepDeferredIntentWithheldResolutionResult,
+            {"chat", "action"},
+            id="GuidedStepDeferredIntentWithheldResolutionResult",
+        ),
+        pytest.param(
+            guided_step_chat_module.GuidedStepDeferredManagementResult,
+            {"chat", "action"},
+            id="GuidedStepDeferredManagementResult",
+        ),
+        pytest.param(
+            guided_step_chat_module.Step1SourcePluginReselectedResult,
+            {"chat", "plugin"},
+            id="Step1SourcePluginReselectedResult",
+        ),
+        pytest.param(
+            guided_step_chat_module.Step1SourceResolvedResult,
+            {"chat", "resolution", "deferred_action"},
+            id="Step1SourceResolvedResult",
+        ),
+        pytest.param(
+            guided_step_chat_module.Step2SinkResolvedResult,
+            {"chat", "sink", "deferred_action"},
+            id="Step2SinkResolvedResult",
+        ),
     ],
 )
 def test_closed_chat_variants_have_only_required_keyword_fields(
-    module: object,
-    variant_name: str,
+    variant: type,
     required_fields: set[str],
 ) -> None:
-    variant = getattr(module, variant_name)
     signature = inspect.signature(variant)
 
     assert set(signature.parameters) == required_fields
@@ -1944,7 +1987,13 @@ async def test_step_1_provider_reuses_combined_context_alias_registry_in_dynamic
     assert '"alias": "field_3", "uploaded_label": "field_1"' in user_content
 
 
-@pytest.mark.parametrize("helper_name", ["_source_field_aliases", "_sink_field_aliases"])
+_FIELD_ALIAS_HELPERS = [
+    pytest.param(chat_solver._source_field_aliases, "source", id="_source_field_aliases"),
+    pytest.param(chat_solver._sink_field_aliases, "sink", id="_sink_field_aliases"),
+]
+
+
+@pytest.mark.parametrize(("helper", "subject_kind"), _FIELD_ALIAS_HELPERS)
 @pytest.mark.parametrize(
     ("registry", "match"),
     [
@@ -1954,7 +2003,8 @@ async def test_step_1_provider_reuses_combined_context_alias_registry_in_dynamic
     ],
 )
 def test_supplied_field_alias_registry_fails_closed(
-    helper_name: str,
+    helper: Callable[..., Mapping[str, str]],
+    subject_kind: str,
     registry: dict[str, str],
     match: str,
 ) -> None:
@@ -1978,15 +2028,17 @@ def test_supplied_field_alias_registry_fails_closed(
             ),
         ),
     )
-    helper = getattr(chat_solver, helper_name)
-    subject = source if helper_name == "_source_field_aliases" else sink
+    subject = source if subject_kind == "source" else sink
 
     with pytest.raises(InvariantError, match=match):
         helper(subject, field_aliases=registry)
 
 
-@pytest.mark.parametrize("helper_name", ["_source_field_aliases", "_sink_field_aliases"])
-def test_complete_valid_field_alias_registry_is_reused_unchanged(helper_name: str) -> None:
+@pytest.mark.parametrize(("helper", "subject_kind"), _FIELD_ALIAS_HELPERS)
+def test_complete_valid_field_alias_registry_is_reused_unchanged(
+    helper: Callable[..., Mapping[str, str]],
+    subject_kind: str,
+) -> None:
     source = SourceResolved(
         name="source",
         plugin="csv",
@@ -2008,8 +2060,7 @@ def test_complete_valid_field_alias_registry_is_reused_unchanged(helper_name: st
         ),
     )
     registry = {"customer": "field_2", "field_1": "field_3"}
-    helper = getattr(chat_solver, helper_name)
-    subject = source if helper_name == "_source_field_aliases" else sink
+    subject = source if subject_kind == "source" else sink
 
     assert helper(subject, field_aliases=registry) is registry
 

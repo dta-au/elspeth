@@ -1194,7 +1194,10 @@ class TestRecipeIntegrationWithSetPipeline:
         # or a ToolResult on failure — type-discriminate.
         from elspeth.web.composer.tools import _ResolvedSourceBlob
 
-        assert isinstance(resolved, _ResolvedSourceBlob), getattr(resolved, "data", resolved)
+        if not isinstance(resolved, _ResolvedSourceBlob):
+            # The union's other arm is a ToolResult failure envelope, whose
+            # ``data`` payload names why the seeded blob was rejected.
+            pytest.fail(f"_resolve_source_blob returned a failure envelope: {resolved.data}")
         # Canonical key set by _resolve_source_blob.
         assert resolved.options["blob_ref"] == blob_id
         # Storage path should resolve to the seeded file.
@@ -1387,7 +1390,7 @@ class TestApplyRecipeEndToEnd:
             session_id=session_id,
         )
         # 1. set_pipeline prevalidation passed — this is the bug surface.
-        assert result.success, getattr(result, "data", result)
+        assert result.success, result.data
 
         # 2. Source is now blob-bound.
         new_state = result.updated_state
@@ -1455,7 +1458,7 @@ class TestApplyRecipeEndToEnd:
             session_engine=engine,
             session_id=session_id,
         )
-        assert result.success, getattr(result, "data", result)
+        assert result.success, result.data
 
         new_state = result.updated_state
         assert new_state.sources["source"].options["blob_ref"] == blob_id
@@ -1521,7 +1524,7 @@ class TestApplyRecipeEndToEnd:
             session_engine=engine,
             session_id=session_id,
         )
-        assert result.success, getattr(result, "data", result)
+        assert result.success, result.data
         assert result.updated_state.validate().is_valid is True
 
         runtime = validate_pipeline_for_trained_operator(
@@ -1628,7 +1631,7 @@ class TestApplyRecipeEndToEnd:
             session_id=session_id,
         )
 
-        assert result.success, getattr(result, "data", result)
+        assert result.success, result.data
         # The destructive replacement is now audible: data carries a
         # ``replaced_pipeline_note`` describing the prior counts. ToolResult
         # post-init deep-freezes the data field, so the type at this point
@@ -1697,7 +1700,7 @@ class TestApplyRecipeEndToEnd:
         # 1. set_pipeline prevalidation passed — this is the bug surface.
         #    A wiring error in gate.fork_to / path.input / coalesce.branches
         #    naming would surface here as an unresolved-connection error.
-        assert result.success, getattr(result, "data", result)
+        assert result.success, result.data
 
         # 2. Source is now blob-bound.
         new_state = result.updated_state
@@ -1757,7 +1760,7 @@ class TestApplyRecipeEndToEnd:
             session_engine=engine,
             session_id=session_id,
         )
-        assert result.success, getattr(result, "data", result)
+        assert result.success, result.data
         # No replacement note when there was nothing to replace.
         if result.data is not None:
             assert "replaced_pipeline_note" not in result.data

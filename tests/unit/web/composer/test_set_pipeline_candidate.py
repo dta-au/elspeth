@@ -55,6 +55,7 @@ from elspeth.web.plugin_policy.validation import (
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 
 
 def _empty_state() -> CompositionState:
@@ -1960,21 +1961,17 @@ def test_structured_llm_probe_failure_abstains_and_blocks_downstream_field_mappe
     original_manager = get_shared_plugin_manager()
     secret_canary = "RAW-PROBE-ERROR-SECRET-CANARY"
 
-    class _FailingLlmProbeManager:
-        def __getattr__(self, name: str):
-            return getattr(original_manager, name)
+    class _FailingLlmProbeManager(DelegatingPluginManagerDouble):
+        """Breaks exactly the ``llm`` transform probe; every other call is real."""
 
-        def get_transforms(self):
-            return original_manager.get_transforms()
-
-        def create_transform(self, plugin_name: str, options: dict[str, Any]):
-            if plugin_name == "llm":
+        def create_transform(self, transform_type: str, config: dict[str, Any]) -> Any:
+            if transform_type == "llm":
                 raise TemplateError(secret_canary)
-            return original_manager.create_transform(plugin_name, options)
+            return super().create_transform(transform_type, config)
 
     monkeypatch.setattr(
         "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
-        lambda: _FailingLlmProbeManager(),
+        lambda: _FailingLlmProbeManager(original_manager),
     )
 
     result = _execute_set_pipeline(args, _empty_state(), context)

@@ -178,26 +178,14 @@ def test_non_first_row_union_reorder_changes_set_pipeline_dispatch_binding_witho
     assert abc_audit.arguments_hash == stable_hash(abc)
     assert acb_audit.arguments_hash == stable_hash(acb)
     assert abc_audit.arguments_hash == acb_audit.arguments_hash
-    assert getattr(abc_audit, "authority_arguments_hash", None) != getattr(acb_audit, "authority_arguments_hash", None)
-    assert getattr(abc_audit, "authority_arguments_canonical", None) != getattr(
-        acb_audit,
-        "authority_arguments_canonical",
-        None,
-    )
-    assert getattr(rebound_abc, "authority_arguments_hash", None) != getattr(
-        rebound_acb,
-        "authority_arguments_hash",
-        None,
-    )
-    assert getattr(rebound_abc, "authority_arguments_canonical", None) != getattr(
-        rebound_acb,
-        "authority_arguments_canonical",
-        None,
-    )
-    assert getattr(abc_audit, "binding_arguments_hash", None) == composer_authority_hash(abc)
-    assert getattr(acb_audit, "binding_arguments_hash", None) == composer_authority_hash(acb)
-    assert getattr(rebound_abc, "binding_arguments_hash", None) == composer_authority_hash(abc)
-    assert getattr(rebound_acb, "binding_arguments_hash", None) == composer_authority_hash(acb)
+    assert abc_audit.authority_arguments_hash != acb_audit.authority_arguments_hash
+    assert abc_audit.authority_arguments_canonical != acb_audit.authority_arguments_canonical
+    assert rebound_abc.authority_arguments_hash != rebound_acb.authority_arguments_hash
+    assert rebound_abc.authority_arguments_canonical != rebound_acb.authority_arguments_canonical
+    assert abc_audit.binding_arguments_hash == composer_authority_hash(abc)
+    assert acb_audit.binding_arguments_hash == composer_authority_hash(acb)
+    assert rebound_abc.binding_arguments_hash == composer_authority_hash(abc)
+    assert rebound_acb.binding_arguments_hash == composer_authority_hash(acb)
 
     invocation = finish_success(abc_audit, result_payload=_dispatch_result(), version_after=2)
     invocation_payload = invocation.to_dict()

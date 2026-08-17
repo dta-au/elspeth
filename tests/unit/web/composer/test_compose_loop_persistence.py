@@ -401,7 +401,7 @@ async def test_tool_batch_rejects_duplicate_ids_before_real_handlers_or_blob_sta
 
     assert handler_calls == []
     assert batch_progress_calls == 0
-    assert getattr(composer_service_with_real_sessions, "_phase3_last_tool_outcomes", ()) == ()
+    assert composer_service_with_real_sessions._phase3_last_tool_outcomes == ()  # type: ignore[attr-defined]
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         assert (

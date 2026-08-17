@@ -74,6 +74,20 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
+
+def _attached_notes(exc: BaseException) -> tuple[str, ...]:
+    """Notes ``BaseException.add_note`` attached to ``exc``; empty when none were.
+
+    ``add_note`` stores ``__notes__`` in the exception's instance dictionary and
+    CPython creates it lazily, so "no note was attached" is genuinely an absent
+    key rather than an empty value. Reading the instance dict states that
+    directly — this is dict inspection, not an attribute probe, and it is used
+    only where the assertion is that NO note exists. Where a note is REQUIRED,
+    read ``exc.__notes__`` directly so a missing one raises.
+    """
+    return tuple(vars(exc).get("__notes__", ()))
+
+
 # Stub SHA-256 hex digest for test fixtures.  Must satisfy the
 # ``ck_blobs_ready_hash`` invariant — exactly 64 lowercase hex
 # characters — even when the surrounding test does not actually verify
@@ -3065,13 +3079,17 @@ class TestRemoveEdge:
         assert len(r2.updated_state.edges) == 0
 
     @pytest.mark.parametrize(
-        ("edge_type", "field_name"),
+        ("edge_type", "route_of"),
         [
-            ("on_success", "on_success"),
-            ("on_error", "on_error"),
+            pytest.param("on_success", lambda node: node.on_success, id="on_success"),
+            pytest.param("on_error", lambda node: node.on_error, id="on_error"),
         ],
     )
-    def test_remove_sink_edge_clears_node_runtime_route(self, edge_type: str, field_name: str) -> None:
+    def test_remove_sink_edge_clears_node_runtime_route(
+        self,
+        edge_type: str,
+        route_of: Callable[[NodeSpec], str | None],
+    ) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
         with_node = execute_tool(
@@ -3106,13 +3124,13 @@ class TestRemoveEdge:
             catalog,
         )
         assert routed.success is True
-        assert getattr(next(n for n in routed.updated_state.nodes if n.id == "t1"), field_name) == "main"
+        assert route_of(next(n for n in routed.updated_state.nodes if n.id == "t1")) == "main"
 
         result = execute_tool("remove_edge", {"id": "e1"}, routed.updated_state, catalog)
 
         assert result.success is True
         assert len(result.updated_state.edges) == 0
-        assert getattr(next(n for n in result.updated_state.nodes if n.id == "t1"), field_name) is None
+        assert route_of(next(n for n in result.updated_state.nodes if n.id == "t1")) is None
 
     def test_remove_sink_edge_clears_source_runtime_route(self) -> None:
         state = _empty_state()
@@ -5932,30 +5950,29 @@ class TestDeleteBlobActiveRunGuard:
 
     def test_delete_restores_file_when_db_delete_fails_after_filesystem_mutation(self) -> None:
         """DB failure after the filesystem step must not leave a stale row/missing-file split."""
-        from contextlib import contextmanager
-
-        from sqlalchemy import select
+        from sqlalchemy import event, select
 
         from elspeth.web.sessions.models import blobs_table
 
-        real_begin = self.engine.begin
+        # The blob-row DELETE fails at the driver seam, not behind a forwarding
+        # connection proxy. The code under test therefore keeps the REAL
+        # SQLAlchemy Connection — which matters, because the custody lock
+        # registers commit/rollback event listeners on that exact object — and
+        # the fault lands inside the real transaction where a database failure
+        # would. Only ``blobs`` is targeted: the tombstone journal writes to
+        # ``blob_deletion_cleanups``, which this prefix does not match.
+        def _fail_blob_row_delete(
+            _conn: Any,
+            _cursor: Any,
+            statement: str,
+            _parameters: Any,
+            _context: Any,
+            _executemany: bool,
+        ) -> None:
+            if statement.lstrip().upper().startswith("DELETE FROM BLOBS"):
+                raise RuntimeError("simulated delete failure")
 
-        @contextmanager
-        def failing_begin():
-            with real_begin() as real_conn:
-
-                class Proxy:
-                    def __getattr__(self, name: str) -> Any:
-                        return getattr(real_conn, name)
-
-                    def execute(self, stmt, *args, **kwargs):
-                        if str(stmt).lstrip().upper().startswith("DELETE FROM BLOBS"):
-                            raise RuntimeError("simulated delete failure")
-                        return real_conn.execute(stmt, *args, **kwargs)
-
-                yield Proxy()
-
-        self.engine.begin = failing_begin  # type: ignore[method-assign]
+        event.listen(self.engine, "before_cursor_execute", _fail_blob_row_delete)
         try:
             with pytest.raises(RuntimeError, match="simulated delete failure"):
                 execute_tool(
@@ -5967,7 +5984,7 @@ class TestDeleteBlobActiveRunGuard:
                     session_id=self.session_id,
                 )
         finally:
-            self.engine.begin = real_begin  # type: ignore[method-assign]
+            event.remove(self.engine, "before_cursor_execute", _fail_blob_row_delete)
 
         assert self.storage_path.exists(), "Rollback must restore the backing file"
         with self.engine.connect() as conn:
@@ -6447,7 +6464,7 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
             f"got {write_bytes_calls_to_storage[0]} writes to {target_path_str}"
         )
         # No add_note diagnostic — no divergence to record.
-        notes = getattr(exc_info.value, "__notes__", [])
+        notes = _attached_notes(exc_info.value)
         assert not any("Rollback failed" in n for n in notes), f"Spurious rollback note on pre-replace failure: {notes!r}"
         # File contents intact.
         assert self.storage_path.read_bytes() == self.original_content
@@ -6490,7 +6507,7 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
             )
 
         assert self.storage_path.read_bytes() == self.original_content
-        notes = getattr(exc_info.value, "__notes__", [])
+        notes = _attached_notes(exc_info.value)
         assert not any("Rollback failed" in n for n in notes), f"Spurious rollback note attached on clean DB failure: {notes!r}"
         leftovers = [p for p in self.storage_path.parent.iterdir() if p != self.storage_path]
         assert leftovers == [], f"Tempfile leaked: {leftovers}"
@@ -6528,7 +6545,7 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
             )
 
         assert type(exc_info.value) is RuntimeError
-        notes = getattr(exc_info.value, "__notes__", ())
+        notes = exc_info.value.__notes__
         assert any("Temporary blob cleanup failed" in note and cleanup_message in note for note in notes), notes
 
     def test_tempfile_cleanup_failure_surfaces_after_quota_rejection(self) -> None:
@@ -16574,18 +16591,19 @@ class TestUpsertNodeQueue:
         assert queue.on_success is None
         assert queue.on_error is None
         assert dict(queue.options) == {"description": "Orders and refunds interleave here"}
-        for field_name in (
-            "condition",
-            "routes",
-            "fork_to",
-            "branches",
-            "policy",
-            "merge",
-            "trigger",
-            "output_mode",
-            "expected_output_count",
-        ):
-            assert getattr(queue, field_name) is None
+        # Every routing/shape field a canonical queue must leave unset, written
+        # out one per line: the explicit list is the contract, and an added
+        # NodeSpec field shows up here as a missing assertion rather than
+        # silently passing a name-driven loop.
+        assert queue.condition is None
+        assert queue.routes is None
+        assert queue.fork_to is None
+        assert queue.branches is None
+        assert queue.policy is None
+        assert queue.merge is None
+        assert queue.trigger is None
+        assert queue.output_mode is None
+        assert queue.expected_output_count is None
 
     def test_orphan_queue_persists_even_though_validation_reports_incomplete(self) -> None:
         """Incremental authoring: an orphan canonical queue is a mutation SUCCESS.
