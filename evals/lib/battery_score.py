@@ -38,6 +38,7 @@ from elspeth.web.composer.tools.discovery import is_discovery_tool, is_mutation_
 from evals.lib.battery_capture import (
     Capture,
     CaptureError,
+    Instrument,
     ToolCall,
     assistant_turns,
     llm_calls,
@@ -65,6 +66,29 @@ EXCLUSION_KINDS: tuple[str, ...] = (
     "capture",
 )
 assert set(EXCLUSION_KINDS) == set(INSTRUMENT_KINDS) | set(MEASUREMENT_KINDS)
+
+
+def instrument_exclusion(instrument: Instrument, post_status: int | None) -> tuple[str | None, str | None]:
+    """The surface-agnostic half of the exclusion ladder: did the harness get a clean read of this run at all?
+
+    Deliberately NOT inlined into ``score_path``, which is compose-loop-only by design (a planner run excludes
+    there as the measurement kind ``surface``). The planner scorer must therefore decline ``score_path`` — and
+    without this seam it would silently decline these instrument kinds with it, scoring a substrate that died
+    mid-run as a planner verdict (elspeth-c18073bd8f: three arms killed at the edge read as topology failures).
+    Every kind returned is an INSTRUMENT kind and feeds the abort rule, never the product findings.
+    """
+    if instrument.truncated:
+        return "truncated", "last messages page was full"
+    if instrument.read_integrity:
+        return "read_integrity", instrument.read_integrity
+    if instrument.auth_failed or post_status in {401, 403}:
+        return "auth", f"post_message status {post_status}"
+    if instrument.http_unrecovered:
+        return "http", instrument.http_unrecovered
+    if instrument.review_rounds_exhausted:
+        return "http", "interpretation review rounds exhausted (5)"
+    return None, None
+
 
 SEVERITY: dict[str, str] = {
     "excess_discovery": "soft",
@@ -462,18 +486,9 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
     deviations.sort(key=lambda d: (d.sequence_no, d.cls))
 
     # ── exclusions (precedence order; instrument kinds first, then measurement kinds) ──
-    excluded: str | None = None
-    evidence: str | None = None
-    if instrument.truncated:
-        excluded, evidence = "truncated", "last messages page was full"
-    elif instrument.read_integrity:
-        excluded, evidence = "read_integrity", instrument.read_integrity
-    elif instrument.auth_failed or post_status in {401, 403}:
-        excluded, evidence = "auth", f"post_message status {post_status}"
-    elif instrument.http_unrecovered:
-        excluded, evidence = "http", instrument.http_unrecovered
-    elif instrument.review_rounds_exhausted:
-        excluded, evidence = "http", "interpretation review rounds exhausted (5)"
+    excluded, evidence = instrument_exclusion(instrument, post_status)
+    if excluded is not None:
+        pass  # an instrument fault outranks every measurement kind below; the ladder is shared with the planner scorer
     elif surface == "undetermined" and post_status != 200:
         # Zero audit rows AND a non-200 compose response: the substrate never ran the loop at all (a crash
         # loop / service_setup_failed / a client timeout with nothing written). That is an INSTRUMENT fault —
@@ -680,6 +695,7 @@ __all__ = [
     "Deviation",
     "PathScore",
     "Score",
+    "instrument_exclusion",
     "judge",
     "path_from_disk",
     "score_from_disk",

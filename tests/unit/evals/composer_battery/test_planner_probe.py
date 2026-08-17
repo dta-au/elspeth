@@ -133,6 +133,7 @@ def test_a_crashing_arm_never_stops_the_remaining_fixtures(tmp_path: Path) -> No
         "planner_codes": {},
         "surface": "undetermined",
         "reason": "not fired",
+        "excluded": "capture",
     }
     assert table[bp.TRIPWIRE_FIXTURES[1]]["pass"] is True
 

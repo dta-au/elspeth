@@ -109,6 +109,66 @@ def test_planner_arm_missing_floor_and_wrong_surface(tmp_path: Path) -> None:
     assert r2.surface == "planner" and not r2.surface_ok and not r2.clean and r2.reason == "surface planner != expected compose_loop"
 
 
+def _truncated_planner_thread() -> list[dict]:
+    """A planner run killed mid-flight: discovery ran, then the last provider call was cancelled with the
+    request. No attempt carries ``led_to="terminal"``, so the outcome is unknown, not negative."""
+    return [
+        tg.user_row(1),
+        tg.audit_row(2, planner_ordinal=1),
+        tg.planner_attempt_row(3, ordinal=1, outcome="discovery_executed", led_to="continue", new_information=("catalog.selection",)),
+        tg.audit_row(4, status="cancelled", tools=False, planner_ordinal=2),
+    ]
+
+
+def _terminated_planner_thread() -> list[dict]:
+    """The fork_coalesce shape: the planner reached its OWN terminal (prose → MALFORMED_RESPONSE) and the
+    5xx arrived after. The outcome is durably captured, so the run stays a product finding."""
+    return [
+        tg.user_row(1),
+        tg.audit_row(2, planner_ordinal=1),
+        tg.planner_attempt_row(3, ordinal=1, outcome="discovery_executed", led_to="continue", new_information=("catalog.selection",)),
+        tg.audit_row(4, status="malformed_response", tools=False, planner_ordinal=2),
+        tg.planner_attempt_row(
+            4 + 1, ordinal=2, phase="prose", outcome="prose_reply", planner_code="MALFORMED_RESPONSE", led_to="terminal"
+        ),
+    ]
+
+
+def test_planner_arm_excludes_an_unrecovered_http_run_rather_than_scoring_its_topology(tmp_path: Path) -> None:
+    """A 5xx on post_message kills the run mid-flight, so "no committed state and no pending proposal" is a
+    truncated read, not a planner verdict. The instrument half of the exclusion ladder is surface-agnostic;
+    the planner branch declines ``score_path`` (loop-only by design) and must not lose it with the rest."""
+    meta = tg.meta(case="fork_coalesce", post_status=524, instrument={**tg.Instrument().to_dict(), "http_unrecovered": "post_message 524"})
+    _write(tmp_path / "P", _truncated_planner_thread(), state=None, is_valid=None, meta=meta)
+    r = pp.score_arm(tmp_path / "P", "fork_coalesce", "P")
+    assert r.excluded == "http" and not r.clean
+    assert r.reason == "excluded: http (post_message 524)", r.reason
+
+
+def test_a_captured_planner_terminal_outranks_an_http_exclusion(tmp_path: Path) -> None:
+    """Mirrors the ladder's existing "a server terminal reason outranks transport" rule. The planner said why
+    it stopped before delivery failed, so excluding here would bury a real defect to fix a false one."""
+    meta = tg.meta(case="fork_coalesce", post_status=502, instrument={**tg.Instrument().to_dict(), "http_unrecovered": "post_message 502"})
+    _write(tmp_path / "P", _terminated_planner_thread(), state=None, is_valid=None, meta=meta)
+    r = pp.score_arm(tmp_path / "P", "fork_coalesce", "P")
+    assert r.excluded is None and not r.clean
+    assert r.planner_codes == {"MALFORMED_RESPONSE": 1} and r.triage == {"model": 1}
+
+
+def test_tripwire_reports_an_instrument_exclusion_instead_of_a_topology_failure(tmp_path: Path) -> None:
+    """elspeth-c18073bd8f: all three calib4 arms died at the edge (524/524/502), and the tripwire reported
+    "topology: no committed state and no pending proposal" — a dead substrate read as a planner defect."""
+    rd = tmp_path / "runs" / "r1"
+    meta = tg.meta(case="fork_coalesce", post_status=524, instrument={**tg.Instrument().to_dict(), "http_unrecovered": "post_message 524"})
+    for fixture in pp.TRIPWIRE_FIXTURES:
+        _write(rd / "_tripwire" / fixture / "1", _truncated_planner_thread(), state=None, is_valid=None, meta=meta)
+    table = {t["fixture"]: t for t in pp.score_tripwire_dir(rd)}
+    for fixture in pp.TRIPWIRE_FIXTURES:
+        assert table[fixture]["pass"] is False
+        assert table[fixture]["excluded"] == "http"
+        assert table[fixture]["reason"] == "excluded: http (post_message 524)", table[fixture]["reason"]
+
+
 def test_loop_arm_uses_the_scenario_free_path_score(tmp_path: Path) -> None:
     _write(tmp_path / "L", tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS))
     r = pp.score_arm(tmp_path / "L", "fork_coalesce", "L")

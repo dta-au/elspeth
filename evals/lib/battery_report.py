@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from evals.lib.battery_scenario import Scenario
-from evals.lib.battery_score import EXCLUSION_KINDS, MEASUREMENT_KINDS, SEVERITY, Score, score_from_disk, write_score
+from evals.lib.battery_score import EXCLUSION_KINDS, INSTRUMENT_KINDS, MEASUREMENT_KINDS, SEVERITY, Score, score_from_disk, write_score
 
 RESERVED_DIRS = frozenset({"_tripwire", "_probe"})
 CAVEATS = [
@@ -211,6 +211,12 @@ def build_report(
         degraded_reasons.append(f"driver aborted: {firing.get('abort_reason')}")
     if firing.get("tripwire_error"):
         degraded_reasons.append(f"tripwire raised: {firing.get('tripwire_error')}")
+    # An instrument-excluded tripwire arm means the round never READ the planner — degrade, don't report the
+    # arm as a planner finding. Without this the exclusion is computed and then rendered into a table nobody
+    # gates on, which is how elspeth-c18073bd8f left a dead-substrate round looking like a planner regression.
+    tripwire_excluded = sorted({t["excluded"] for t in tripwire if t.get("excluded") in INSTRUMENT_KINDS})
+    if tripwire_excluded:
+        degraded_reasons.append(f"tripwire arms excluded by instrument: {', '.join(tripwire_excluded)}")
 
     by_repeat: list[dict[str, Any]] = []
     for rep in sorted({s.repeat for s in corpus}):
@@ -409,13 +415,14 @@ def render_markdown(report: dict[str, Any]) -> str:
     out += [
         "## Tripwire",
         "",
-        "| fixture | pass | staged_variant | surface | planner_calls | planner_codes | reason |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| fixture | pass | excluded | staged_variant | surface | planner_calls | planner_codes | reason |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     out += [
-        f"| {t['fixture']} | {t['pass']} | {t.get('staged_variant')} | {t.get('surface')} | {t.get('planner_calls')} | {json.dumps(t.get('planner_codes') or {})} | {t.get('reason')} |"
+        f"| {t['fixture']} | {t['pass']} | {t.get('excluded') or '-'} | {t.get('staged_variant')} | {t.get('surface')} "
+        f"| {t.get('planner_calls')} | {json.dumps(t.get('planner_codes') or {})} | {t.get('reason')} |"
         for t in report["tripwire"]
-    ] or ["| (none) | | | | | | |"]
+    ] or ["| (none) | | | | | | | |"]
     out += [
         "",
         "## Per-repeat",

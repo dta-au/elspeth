@@ -27,8 +27,16 @@ from elspeth.web.composer.protocol import (
     PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE,
 )
 from elspeth.web.composer.tools.discovery import is_mutation_tool
-from evals.lib.battery_capture import CaptureError, assistant_turns, llm_calls, load_capture, planner_attempts, tool_outcomes
-from evals.lib.battery_score import score_path, surface_of
+from evals.lib.battery_capture import (
+    CaptureError,
+    assistant_turns,
+    llm_calls,
+    load_capture,
+    parse_instrument,
+    planner_attempts,
+    tool_outcomes,
+)
+from evals.lib.battery_score import instrument_exclusion, score_path, surface_of
 from evals.lib.battery_topology import topologies_match, topology_from_pipeline
 
 REPO = Path(__file__).resolve().parents[2]
@@ -127,6 +135,7 @@ class ArmResult:
     clean: bool
     tool_bearing_calls: int
     reason: str | None
+    excluded: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -158,6 +167,13 @@ def _staged_variant(capture: Any) -> str | None:
     return None
 
 
+def _exclusion_reason(kind: str | None, evidence: str | None) -> str | None:
+    """Render an exclusion so the operator reads the actionable half (``post_message 524``), not just the kind."""
+    if kind is None:
+        return None
+    return f"excluded: {kind}" + (f" ({evidence})" if evidence else "")
+
+
 def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
     args = load_fixture(fixture)["canonical_arguments"]
     cap = load_capture(Path(run_dir))
@@ -169,6 +185,8 @@ def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
         if surface_ok
         else (f"surface {surface} != expected {expected_surface}" if surface != "undetermined" else "surface undetermined")
     )
+    post = next((h for h in (cap.meta.get("http") or []) if h.get("step") == "post_message"), {})
+    excluded, evidence = instrument_exclusion(parse_instrument(cap.meta), post.get("status"))
     need = required_information(args)
     calls = llm_calls(cap)
     tool_bearing = sum(1 for c in calls if c.status == "success" and c.tools_spec_hash)
@@ -186,6 +204,12 @@ def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
         triage = Counter(triage_code(c) for c in codes.elements())
         accepted = accepted_idx is not None
         deviations = sorted(codes)
+        if excluded == "http" and any(a.led_to != "continue" for a in attempts):
+            # A captured planner DECISION (`done`/`terminal`) outranks a delivery failure — the same rule the loop
+            # ladder applies to `transport`. The planner reached its verdict before the 5xx landed, so the run is
+            # observed, and excluding would bury a real defect (fork_coalesce: prose x3 -> MALFORMED_RESPONSE, then
+            # 502). Only a run still mid-loop (every attempt `continue`) has an outcome we genuinely cannot know.
+            excluded, evidence = None, None
         return ArmResult(
             fixture,
             arm,
@@ -200,9 +224,10 @@ def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
             deviations,
             variant,
             topo_ok,
-            surface_ok and not (need - set(seen)) and accepted and not deviations and topo_ok is True,
+            excluded is None and surface_ok and not (need - set(seen)) and accepted and not deviations and topo_ok is True,
             tool_bearing,
-            reason or (None if topo_ok else f"topology: {topo_reason}"),
+            _exclusion_reason(excluded, evidence) or reason or (None if topo_ok else f"topology: {topo_reason}"),
+            excluded,
         )
 
     # compose loop (or undetermined): the scenario-free path score — no fabricated floor, no synthetic Scenario
@@ -222,6 +247,9 @@ def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
     accepted = accepted and bool(path.is_valid)
     seen = sorted(seen_set)
     deviations = [d.cls for d in path.deviations]
+    # An INSTRUMENT exclusion leads: "surface undetermined" for a substrate that died mid-run names the symptom
+    # and hides the fault. A MEASUREMENT kind stays behind `reason`, which already describes it more precisely.
+    excl_reason = _exclusion_reason(path.excluded, path.exclusion_evidence)
     return ArmResult(
         fixture,
         arm,
@@ -238,7 +266,11 @@ def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
         topo_ok,
         surface_ok and not (need - seen_set) and accepted and not deviations and topo_ok is True and path.excluded is None,
         tool_bearing,
-        reason or (path.excluded and f"excluded: {path.excluded}") or (None if topo_ok else f"topology: {topo_reason}"),
+        (excl_reason if path.excluded_by_instrument else None)
+        or reason
+        or excl_reason
+        or (None if topo_ok else f"topology: {topo_reason}"),
+        path.excluded,
     )
 
 
@@ -257,6 +289,7 @@ def score_tripwire_dir(round_dir: Path) -> list[dict[str, Any]]:
                     "planner_codes": {},
                     "surface": "undetermined",
                     "reason": "not fired",
+                    "excluded": "capture",
                 }
             )
             continue
@@ -273,10 +306,12 @@ def score_tripwire_dir(round_dir: Path) -> list[dict[str, Any]]:
                     "planner_codes": {},
                     "surface": "undetermined",
                     "reason": f"capture: {exc}",
+                    "excluded": "capture",
                 }
             )
             continue
-        passed = r.surface == "planner" and r.staged_variant is not None and r.staged_topology_ok is True
+        # An excluded arm never passes: the harness did not read the run, so it demonstrates nothing either way.
+        passed = r.excluded is None and r.surface == "planner" and r.staged_variant is not None and r.staged_topology_ok is True
         reason = None if passed else (r.reason or ("no PIPELINE_STAGED_* message" if r.staged_variant is None else "topology mismatch"))
         table.append(
             {
@@ -287,6 +322,7 @@ def score_tripwire_dir(round_dir: Path) -> list[dict[str, Any]]:
                 "planner_codes": r.planner_codes,
                 "surface": r.surface,
                 "reason": reason,
+                "excluded": r.excluded,
             }
         )
     tw.mkdir(parents=True, exist_ok=True)
@@ -308,7 +344,23 @@ def score_probe_dir(round_dir: Path) -> dict[str, Any]:
                 # one unreadable arm never costs the scoring of the arms that did fire
                 arms.append(
                     ArmResult(
-                        fixture, arm, "undetermined", False, [], [], False, 0, {}, {}, [], None, None, False, 0, f"capture: {exc}"
+                        fixture,
+                        arm,
+                        "undetermined",
+                        False,
+                        [],
+                        [],
+                        False,
+                        0,
+                        {},
+                        {},
+                        [],
+                        None,
+                        None,
+                        False,
+                        0,
+                        f"capture: {exc}",
+                        "capture",
                     ).to_dict()
                 )
     doc = {

@@ -359,6 +359,23 @@ def test_a_tripwire_crash_recorded_by_the_driver_degrades_the_firing(tmp_path: P
     assert rep["degraded"]["flag"] is True and any("tripwire raised" in r for r in rep["degraded"]["reasons"])
 
 
+def test_an_instrument_excluded_tripwire_arm_degrades_the_round(tmp_path: Path) -> None:
+    """elspeth-c18073bd8f: the round never READ the planner (all three arms died at the edge), yet the tripwire
+    table rendered as a planner finding and nothing gated on it. An instrument exclusion must degrade instead."""
+    rd = _round(tmp_path)
+    tw = json.loads((rd / "_tripwire" / "tripwire.json").read_text())
+    tw[0] = {**tw[0], "pass": False, "excluded": "http", "reason": "excluded: http (post_message 524)"}
+    (rd / "_tripwire" / "tripwire.json").write_text(json.dumps(tw))
+    rep = build_report(rd, scenarios=SCENARIOS, corpus_version=0)
+    assert rep["degraded"]["flag"] is True
+    assert any("tripwire arms excluded by instrument: http" in r for r in rep["degraded"]["reasons"]), rep["degraded"]["reasons"]
+    # a MEASUREMENT kind is a product finding, not a dead instrument: it must NOT degrade the round
+    tw[0] = {**tw[0], "excluded": "surface"}
+    (rd / "_tripwire" / "tripwire.json").write_text(json.dumps(tw))
+    rep2 = build_report(rd, scenarios=SCENARIOS, corpus_version=0)
+    assert not any("tripwire arms excluded" in r for r in rep2["degraded"]["reasons"]), rep2["degraded"]["reasons"]
+
+
 def test_an_expected_topology_edit_trips_the_compare_refusal(tmp_path: Path) -> None:
     """M5: floors_sha256 bound only the floor and the option assertions, so an oracle edit moved `wrong_shape`
     silently between rounds — exactly what a floor edit is refused for."""
