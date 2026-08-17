@@ -100,4 +100,30 @@ measured by outcome rather than ritual: `schema_fumble`, `repair` and
 `excess_discovery` fire on the consequences in either direction. Recorded in
 spec errata (f); the per-case switch remains, so any case can re-enable it.
 
+## Block 4 — canary + tripwire under the ruled instrument rule (`2026-08-17-calib4`)
+
+Canary prompt tightened (JSON stated on both ends), both rulings applied.
+
+**Canary PASSES the instrument rule**: 0 exclusions, `compose_loop` 10/10,
+`other_text_calls` 0, 4 runs at floor. Optimality also improved to **4/10**
+(from 2/10 in block 3) and `wrong_shape` never fired — pinning the input
+format removed the csv/json source variance. Every non-clean run's only
+deviation was `unattributed_excess`; no detours, repairs or backtracks in
+this block. Post-calibration canary floor: **2, confirmed reachable.**
+
+**Tripwire FAILS 3/3 — a product finding, not an instrument one.** Routing is
+correct (`surface: planner` 3/3, so the pair-routing precondition holds), but
+no arm stages a candidate: `error_routing` runs ten consecutive
+`discovery_executed` attempts to the discovery-budget ceiling and is
+cancelled; `fork_coalesce` and `linear_transform` degenerate into prose and
+`malformed_response`. Filed as **elspeth-c18073bd8f** (P1) with the capture
+paths. Secondary instrument gap recorded in the same ticket: `server_terminal`
+is null/`source: none` even where the discovery budget was demonstrably
+exhausted, so the driver's terminal capture does not describe a
+planner-surface termination.
+
+The tripwire is therefore RED for reasons outside the battery. It should stay
+red — that is what it is for — and the corpus firing may proceed, because the
+tripwire measures the planner surface and the corpus measures the loop.
+
 Probe reading (§7): (not yet fired — `--probe`).
