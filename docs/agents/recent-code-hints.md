@@ -8,6 +8,25 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-17 — a full-suite run in the SHARED checkout is not evidence unless
+  HEAD is unchanged across it, and a worktree A/B UNDER-COLLECTS**: two ways a
+  whole-tree measurement lies. (a) `pytest tests/` takes ~18 minutes; four sibling
+  commits landed inside one such window on 2026-08-17 and the run reported **456
+  failures** across engine/pipeline/e2e that did not exist before or after (a
+  representative slice re-run immediately after: 22 passed). Record
+  `git rev-parse HEAD` BEFORE and AFTER a long run; if they differ, a red result
+  is uninterpretable — re-run rather than diagnose. (b) The obvious fix — run the
+  A/B side in a `git worktree` — silently changes what is collected: `evals/*` is
+  git-ignored except for tracked re-includes, so a fresh worktree has no
+  `evals/composer-rgr`, `composer-harness`, … and every suite that GLOBS those
+  assets collects fewer tests there (measured: `test_convergence_scenarios.py`
+  11 vs 32, `test_paths.py` 22 vs 40, `test_execution_repository.py` 148 vs 161).
+  A worktree test-count delta is therefore NOT attributable to your change. To
+  attribute a count honestly, diff per-file collected counts
+  (`pytest --collect-only -q | sed 's/::.*//' | uniq -c`) between the two trees and
+  read the per-file rows, not the total. Worktree e2e recovery tests also fail on
+  capture-root binding, so a worktree pass/fail is its own instrument.
+
 - **2026-08-17 — a directory-scoped test `conftest.py` that mutates `sys.path`
   is PROCESS-GLOBAL, not directory-scoped**: `tests/unit/evals/composer_battery/
   conftest.py` (Task 7 of the composer-battery build, elspeth-composer-battery)
