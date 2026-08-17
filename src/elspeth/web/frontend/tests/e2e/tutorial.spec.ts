@@ -790,12 +790,20 @@ test.describe("first-run tutorial (staged guided flow)", () => {
     await page.getByRole("button", { name: "Send message", exact: true }).click();
     // ── Step 4 wire stage: topology + edge-contract overlay (M1 from/to) ─────
     await expect(page.getByRole("heading", { name: "Review wiring" })).toBeVisible();
+    // The parenthetical is the PLUGIN-derived step label, not the author's
+    // label: buildEntityNames renders `${node.label} (${stepLabelForPlugin(
+    // node.plugin)})`. `web_scrape` hits the curated override map ("Fetch");
+    // `llm_rate` has no override and falls through to the shared acronym-aware
+    // title-caser (elspeth-d2de348437), whose closed ACRONYMS set contains
+    // "llm" — so it renders "LLM Rate", never "Llm Rate". Only the
+    // parenthetical is re-cased; the author's own "Llm Rate step" label is
+    // deliberately passed through untouched.
     await expect(
       page.getByRole("listitem", { name: /Source to Fetch step \(Fetch\)/ }),
     ).toBeVisible();
     await expect(
       page.getByRole("listitem", {
-        name: /Fetch step \(Fetch\) to Llm Rate step \(Llm Rate\)/,
+        name: /Fetch step \(Fetch\) to Llm Rate step \(LLM Rate\)/,
       }),
     ).toBeVisible();
     await expect(
@@ -803,7 +811,7 @@ test.describe("first-run tutorial (staged guided flow)", () => {
     ).toBeVisible();
     await expect(
       page.getByRole("listitem", {
-        name: /Fetch step \(Fetch\) to Llm Rate step \(Llm Rate\).*connected/,
+        name: /Fetch step \(Fetch\) to Llm Rate step \(LLM Rate\).*connected/,
       }),
     ).toBeVisible();
     // M1 guard: post-M1 naming, never from_id/to_id.

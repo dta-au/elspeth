@@ -955,8 +955,17 @@
   /* Keep the shared workspace's usable-canvas floor at reflow widths. On a
      very short viewport the App-owned .app-main becomes the outer vertical
      scroller; cancelling the floor here instead compressed the conversation
-     log below a readable height and stranded the docked composer controls. */
-  min-height: 420px;
+     log below a readable height and stranded the docked composer controls.
+
+     The floor is 480, not the desktop 420, because at 320px wide the docked
+     .chat-input's controls wrap to ~181px — measured at 320x256, the shared
+     420 floor left the conversation log 81px against WCAG-reflow's 120px
+     readable minimum (elspeth-7aa9787996). The floor exists precisely to
+     stop that compression, so it has to clear the NARROWEST supported width,
+     not the desktop one. Costs scroll distance only: .app-main already owns
+     the outer scroll path, and on any viewport tall enough for the flow
+     layout the floor never binds. */
+  min-height: 480px;
 }
 
 .composer-workspace[data-layout-mode="narrow"] .workspace-view-tabs {
