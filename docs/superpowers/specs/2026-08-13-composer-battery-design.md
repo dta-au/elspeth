@@ -14,8 +14,13 @@ the affordance kit, in the same change.
 (one-sample half-width; a two-round delta needs more)", not as a minimum
 detectable effect.
 (b) §2's "Graphs are ≤ 12 nodes" does not hold for the shipped corpus:
-`deep_routing` is 16 nodes. Isomorphism is still cheap at that size
-(worst-case rejection measured ~1.4 s).
+`deep_routing` is 16 nodes. Isomorphism is still cheap at that size —
+measured 2026-08-17 on the maintainer's machine, 5-repetition
+`time.perf_counter()` median via `topologies_match()` on `deep_routing`'s
+scenario: match ≈0.00005 s, worst-case rejection (node kind/plugin
+multiset held equal to `expected`, edge structure forced non-isomorphic by
+collapsing one gate's two routes onto the same output) ≈1.21 s —
+re-measure at calibration.
 (c) A new named v1 blind spot beside §1's multi-source one: the compose
 surface cannot author repo-relative asset files, so `template_lookups`'
 template and lookup files are inlined as a `prompt_template`, and its

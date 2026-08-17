@@ -155,7 +155,9 @@ says so (`…-calib`).
   calibration — if the composer reliably omits it, the floor derivation
   needs review, not the composer.
 - **Likely second-discovery-call cases**: `deep_routing` (16 nodes — still
-  cheap to score; worst-case rejection isomorphism measured ~1.4 s) and
+  cheap to score; measured 2026-08-17, 5-repetition `perf_counter` median:
+  match ≈0.00005 s, worst-case rejection ≈1.21 s — method and full figures
+  in the spec's errata (b); re-measure at calibration) and
   `multi_query_assessment` are the cases most likely to need a second
   discovery call before composing; watch these first at calibration.
 
