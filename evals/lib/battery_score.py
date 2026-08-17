@@ -21,6 +21,18 @@ run from every rate and are reported beside it; they are partitioned into
 INSTRUMENT_KINDS (the harness failed — abort/flag material) and
 MEASUREMENT_KINDS (the product did something the loop-only instrument cannot
 score — reported, never an abort).
+
+**If you are writing a scorer for a NEW surface, read this.** ``score_path``
+is compose-loop-only: any other surface excludes there as the measurement kind
+``surface``, so your scorer must decline it — and the surface-agnostic facts it
+also computes would silently go with it. Those are factored out for you and you
+must call them: ``instrument_exclusion(instrument, post_status)`` (did the
+harness read this run at all?) and ``captured_is_valid(capture)`` (did the final
+state validate?). Then add your surface's own equivalent of the ``terminal_missing``
+rungs — "no response AND no terminal of my own" — or a run the substrate killed
+will score as a verdict about your surface. That is exactly what happened to the
+planner scorer (elspeth-c18073bd8f: three runs cut at the edge reported as
+topology failures, and an invalid staged pipeline scored clean).
 """
 
 from __future__ import annotations
