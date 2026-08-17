@@ -12,10 +12,12 @@ from typing import Any
 import pytest
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import (
+    HistogramDataPoint,
     InMemoryMetricReader,
     MetricExporter,
     MetricExportResult,
     MetricsData,
+    NumberDataPoint,
 )
 
 from elspeth.contracts.enums import CallStatus, CallType, RunStatus, TelemetryGranularity
@@ -110,9 +112,18 @@ def _metrics_by_name(reader: InMemoryMetricReader) -> dict[str, Any]:
 
 
 def _single_point_value(metric: Any) -> int | float:
+    """Read the one recorded value from a counter (Sum) or histogram metric.
+
+    The two OTel point types carry the reading under different names, so the
+    reader branches on the concrete point class rather than probing for a
+    ``value`` attribute — an unrecognised point type must fail loudly instead
+    of falling through to ``point.sum``.
+    """
     [point] = metric.data.data_points
-    value = getattr(point, "value", None)
-    return point.sum if value is None else value
+    if isinstance(point, NumberDataPoint):
+        return point.value
+    assert isinstance(point, HistogramDataPoint), f"unsupported metric point type {type(point).__name__}"
+    return point.sum
 
 
 def _run_finished() -> RunFinished:
@@ -147,9 +158,8 @@ def _external_call(
 
 
 def test_aws_operator_projects_audited_run_call_and_token_metrics_without_dimensions() -> None:
-    record_event = getattr(operator_telemetry, "record_operator_pipeline_event", None)
-    metric_names = getattr(operator_telemetry, "AWS_OPERATOR_PIPELINE_METRIC_NAMES", frozenset())
-    assert callable(record_event), "AWS operator pipeline event projection is not implemented"
+    record_event = operator_telemetry.record_operator_pipeline_event
+    metric_names = operator_telemetry.AWS_OPERATOR_PIPELINE_METRIC_NAMES
     assert metric_names == {
         "run.failure",
         "run.duration",
@@ -224,8 +234,7 @@ def test_pipeline_metric_observer_runs_before_lifecycle_granularity_filter() -> 
 
 
 def test_llm_token_projection_retains_partial_provider_usage_without_fabrication() -> None:
-    record_event = getattr(operator_telemetry, "record_operator_pipeline_event", None)
-    assert callable(record_event), "AWS operator pipeline event projection is not implemented"
+    record_event = operator_telemetry.record_operator_pipeline_event
 
     reader = InMemoryMetricReader()
     runtime = operator_telemetry.bootstrap_operator_telemetry(
@@ -263,8 +272,7 @@ def test_aws_web_execution_wires_the_post_audit_metric_observer() -> None:
 
 
 def test_operator_metric_projection_failure_cannot_replace_the_audited_outcome() -> None:
-    record_event = getattr(operator_telemetry, "record_operator_pipeline_event", None)
-    assert callable(record_event), "AWS operator pipeline event projection is not implemented"
+    record_event = operator_telemetry.record_operator_pipeline_event
 
     class _FailingRecorder:
         def record(self, _event: object) -> None:

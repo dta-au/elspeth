@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -276,20 +277,20 @@ async def test_guided_cancellation_projects_nothing_when_worker_rolls_back(engin
 
 
 @pytest.mark.parametrize(
-    "method_name",
+    "method",
     (
-        "fail_guided_operation_with_audit",
-        "save_state_for_guided_operation",
-        "settle_guided_state_operation",
-        "stage_guided_full_pipeline_proposal",
-        "decline_guided_full_pipeline_proposal",
-        "stage_guided_pipeline_proposal",
-        "back_edit_guided_pipeline_proposal",
-        "accept_guided_pipeline_proposal",
+        pytest.param(SessionServiceImpl.fail_guided_operation_with_audit, id="fail_guided_operation_with_audit"),
+        pytest.param(SessionServiceImpl.save_state_for_guided_operation, id="save_state_for_guided_operation"),
+        pytest.param(SessionServiceImpl.settle_guided_state_operation, id="settle_guided_state_operation"),
+        pytest.param(SessionServiceImpl.stage_guided_full_pipeline_proposal, id="stage_guided_full_pipeline_proposal"),
+        pytest.param(SessionServiceImpl.decline_guided_full_pipeline_proposal, id="decline_guided_full_pipeline_proposal"),
+        pytest.param(SessionServiceImpl.stage_guided_pipeline_proposal, id="stage_guided_pipeline_proposal"),
+        pytest.param(SessionServiceImpl.back_edit_guided_pipeline_proposal, id="back_edit_guided_pipeline_proposal"),
+        pytest.param(SessionServiceImpl.accept_guided_pipeline_proposal, id="accept_guided_pipeline_proposal"),
     ),
 )
-def test_every_unconditional_guided_audit_settlement_uses_post_commit_projection(method_name: str) -> None:
-    source = inspect.getsource(getattr(SessionServiceImpl, method_name))
+def test_every_unconditional_guided_audit_settlement_uses_post_commit_projection(method: Callable[..., object]) -> None:
+    source = inspect.getsource(method)
 
     assert "_run_guided_sync_with_provider_projection" in source
 

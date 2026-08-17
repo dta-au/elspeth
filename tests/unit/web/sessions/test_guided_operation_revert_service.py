@@ -1322,16 +1322,18 @@ async def test_revert_fault_rolls_back_every_settlement_surface(service, engine,
     def inject(_conn, _cursor, _statement, _parameters, context, _executemany):
         compiled = context.compiled
         statement = compiled.statement if compiled is not None else None
-        table_name = getattr(getattr(statement, "table", None), "name", None)
         value_keys = set(compiled.params) if compiled is not None else set()
         operation: str | None = None
+        # ``Insert``/``Update`` both declare ``.table``; every other compiled
+        # statement shape (SELECT, DDL, raw text) carries no fault point.
         if isinstance(statement, Insert):
             operation = {
                 "proposal_events": "proposal_event",
                 "composition_states": "state_insert",
                 "chat_messages": "message_insert",
-            }.get(table_name)
+            }.get(statement.table.name)
         elif isinstance(statement, Update):
+            table_name = statement.table.name
             if table_name == "composition_proposals":
                 operation = "proposal_update"
             elif table_name == "guided_operations" and "status" in value_keys:

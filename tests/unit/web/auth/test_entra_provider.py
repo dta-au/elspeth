@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from unittest.mock import patch
 
@@ -11,7 +12,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from elspeth.web.auth.entra import EntraAuthProvider
-from elspeth.web.auth.models import AuthenticationError
+from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
 from tests.unit.web.auth.conftest import build_rsa_jwk, make_rs256_token
 
 TENANT_ID = "00000000-aaaa-bbbb-cccc-111111111111"
@@ -213,8 +214,18 @@ class TestEntraSigningKeyRotation:
     """Every Entra token-decode path refreshes a rotated signing key."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("operation", ["authenticate", "get_user_info"])
-    async def test_unknown_kid_refreshes_shared_validator_cache(self, rsa_keypair, operation: str) -> None:
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            pytest.param(EntraAuthProvider.authenticate, id="authenticate"),
+            pytest.param(EntraAuthProvider.get_user_info, id="get_user_info"),
+        ],
+    )
+    async def test_unknown_kid_refreshes_shared_validator_cache(
+        self,
+        rsa_keypair,
+        operation: Callable[[EntraAuthProvider, str], Awaitable[UserIdentity | UserProfile]],
+    ) -> None:
         old_private_key, old_public_key = rsa_keypair
         new_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         old_jwks = _jwks_with_kid(old_public_key, "old-key")
@@ -230,7 +241,7 @@ class TestEntraSigningKeyRotation:
             client.jwks_fetches = 0
             client.jwks_response = rotated_jwks
 
-            result = await getattr(provider, operation)(rotated_token)
+            result = await operation(provider, rotated_token)
 
         assert result.user_id == "entra-user-456"
         assert client.discovery_fetches == 1

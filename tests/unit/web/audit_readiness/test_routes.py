@@ -7,6 +7,7 @@ from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 
 from elspeth.web.audit_readiness.routes import create_audit_readiness_router
 from elspeth.web.auth.middleware import get_current_user
@@ -27,7 +28,7 @@ from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 # audit-trail gap the policy forbids. Decoupled from the production
 # app so test discovery doesn't pay full-app-import cost.
 _router_for_probe = create_audit_readiness_router()
-if not any(getattr(r, "path", "").endswith("/audit-readiness") for r in _router_for_probe.routes):
+if not any(isinstance(route, APIRoute) and route.path.endswith("/audit-readiness") for route in _router_for_probe.routes):
     raise RuntimeError(
         "Phase 2C audit-readiness endpoint not mounted on "
         "create_audit_readiness_router(). The four Sub-task 7f "

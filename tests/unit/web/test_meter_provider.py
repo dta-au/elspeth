@@ -174,9 +174,10 @@ def test_metrics_endpoint_returns_prometheus_format(tmp_path: Path) -> None:
     # AnyIO portal and, when used as a context manager, run lifespan startup;
     # neither is part of this route-level meter -> exposition contract.
     metrics_route = next(
-        route for route in app.routes if getattr(route, "path", None) == "/metrics" and "GET" in getattr(route, "methods", set())
+        route
+        for route in app.routes
+        if isinstance(route, Route) and route.path == "/metrics" and route.methods is not None and "GET" in route.methods
     )
-    assert isinstance(metrics_route, Route)
     request = Request(
         {
             "type": "http",

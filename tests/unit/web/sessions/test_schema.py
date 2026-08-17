@@ -49,11 +49,11 @@ def _create_all_on_mock_engine(engine) -> None:
         # SQLAlchemy's mock PostgreSQL create_all path marks cycle-breaking
         # foreign keys with a transient _create_rule. If left on the shared
         # metadata object, later SQLite create_all calls omit those inline FKs.
-        _MISSING = object()
+        # ``Constraint.__init__`` always binds ``_create_rule`` (default None),
+        # so clearing it unconditionally is the whole reset.
         for table in metadata.tables.values():
             for constraint in table.constraints:
-                if getattr(constraint, "_create_rule", _MISSING) is not _MISSING:
-                    constraint._create_rule = None
+                constraint._create_rule = None
 
 
 @pytest.fixture

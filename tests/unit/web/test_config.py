@@ -7,6 +7,7 @@ import re
 import sys
 import types
 import typing
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -439,6 +440,14 @@ class TestDeploymentSettings:
         assert typing.get_args(web_config.DeploymentStateMode) == ("auto", "sqlite-single", "external-postgresql")
 
 
+def _read_service_name(settings: WebSettings) -> str:
+    return settings.operator_telemetry_service_name
+
+
+def _read_environment(settings: WebSettings) -> str:
+    return settings.operator_telemetry_environment
+
+
 class TestOperatorTelemetrySettings:
     def test_local_defaults_remain_prometheus_only(self) -> None:
         settings = WebSettings(
@@ -519,17 +528,17 @@ class TestOperatorTelemetrySettings:
         assert raw_value not in str(caught.value)
 
     @pytest.mark.parametrize(
-        ("field", "value"),
+        ("field", "read", "value"),
         [
-            ("operator_telemetry_service_name", "elspeth-web"),
-            ("operator_telemetry_service_name", "orders.api_v2"),
-            pytest.param("operator_telemetry_service_name", "s" * 128, id="service-128-char-boundary"),
-            ("operator_telemetry_environment", "production"),
-            ("operator_telemetry_environment", "prod-blue"),
-            pytest.param("operator_telemetry_environment", "e" * 128, id="environment-128-char-boundary"),
+            pytest.param("operator_telemetry_service_name", _read_service_name, "elspeth-web", id="service-plain"),
+            pytest.param("operator_telemetry_service_name", _read_service_name, "orders.api_v2", id="service-dotted"),
+            pytest.param("operator_telemetry_service_name", _read_service_name, "s" * 128, id="service-128-char-boundary"),
+            pytest.param("operator_telemetry_environment", _read_environment, "production", id="environment-plain"),
+            pytest.param("operator_telemetry_environment", _read_environment, "prod-blue", id="environment-hyphenated"),
+            pytest.param("operator_telemetry_environment", _read_environment, "e" * 128, id="environment-128-char-boundary"),
         ],
     )
-    def test_aws_mode_accepts_safe_resource_labels(self, field: str, value: str) -> None:
+    def test_aws_mode_accepts_safe_resource_labels(self, field: str, read: Callable[[WebSettings], str], value: str) -> None:
         overrides = {
             "operator_telemetry": "aws-otlp",
             "operator_telemetry_environment": "production",
@@ -544,7 +553,7 @@ class TestOperatorTelemetrySettings:
             **overrides,  # type: ignore[arg-type]
         )
 
-        assert getattr(settings, field) == value
+        assert read(settings) == value
 
     def test_local_mode_preserves_generic_operator_resource_labels(self) -> None:
         settings = WebSettings(

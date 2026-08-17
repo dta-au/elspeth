@@ -9,7 +9,6 @@ from uuid import uuid4
 
 import pytest
 import structlog
-from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import insert
 from sqlalchemy.exc import SQLAlchemyError
@@ -18,14 +17,22 @@ from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.protocol import AuditAccessLogWriteError
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
+from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.conftest import _make_session
 
 
-async def _get(test_client: TestClient, url: str) -> Response:
+async def _get(test_client: TestClient, url: str, *, raise_app_exceptions: bool = True) -> Response:
+    """Issue a GET through the fixture client's app on the caller's event loop.
+
+    ``raise_app_exceptions`` is an explicit argument rather than a flag read off
+    the client: :class:`SyncASGITestClient` fixes its own
+    ``raise_server_exceptions`` at construction, so a per-call override belongs
+    on the call, where the test that needs a 500 response body asks for it.
+    """
     async with AsyncClient(
         transport=ASGITransport(
             app=test_client.app,
-            raise_app_exceptions=getattr(test_client, "raise_server_exceptions", True),
+            raise_app_exceptions=raise_app_exceptions,
         ),
         base_url="http://test",
         cookies=test_client.cookies,
@@ -293,9 +300,12 @@ async def test_endpoint_fails_closed_when_audit_access_log_write_fails(
     seeded = _seed_user_assistant_tool_rows(test_client)
     sessions_service = test_client.app.state.session_service
     inject_audit_access_log_write_failure(sessions_service)
-    test_client.raise_server_exceptions = False
 
-    response = await _get(test_client, f"/api/sessions/{seeded['session_id']}/messages?include_tool_rows=true")
+    response = await _get(
+        test_client,
+        f"/api/sessions/{seeded['session_id']}/messages?include_tool_rows=true",
+        raise_app_exceptions=False,
+    )
 
     assert response.status_code == 500
     body = response.json()
@@ -316,9 +326,12 @@ async def test_endpoint_fails_closed_when_audit_access_log_write_fails_for_non_t
     seeded = _seed_user_assistant_tool_rows(test_client, assistant_raw_content="provider final prose")
     sessions_service = test_client.app.state.session_service
     inject_audit_access_log_write_failure(sessions_service)
-    test_client.raise_server_exceptions = False
 
-    response = await _get(test_client, f"/api/sessions/{seeded['session_id']}/messages?{audit_query}")
+    response = await _get(
+        test_client,
+        f"/api/sessions/{seeded['session_id']}/messages?{audit_query}",
+        raise_app_exceptions=False,
+    )
 
     assert response.status_code == 500
     body = response.json()

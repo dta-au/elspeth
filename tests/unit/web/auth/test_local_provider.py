@@ -24,13 +24,27 @@ from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfi
 
 
 class _CommitFailingConnection:
-    """Delegating sqlite3 connection proxy whose commit always fails."""
+    """A ``sqlite3.Connection`` stand-in whose commit always fails.
+
+    The delegated surface is written out explicitly rather than forwarded:
+    ``LocalAuthProvider`` reaches for exactly ``execute``/``rollback``/
+    ``close``/``commit`` on the connection it opens, so a double that
+    declares those four models the real contract. A forwarding
+    ``__getattr__`` would instead let a provider change reach an
+    undeclared method and silently keep passing.
+    """
 
     def __init__(self, real: sqlite3.Connection) -> None:
         self._real = real
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._real, name)
+    def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+        return self._real.execute(sql, parameters)
+
+    def rollback(self) -> None:
+        self._real.rollback()
+
+    def close(self) -> None:
+        self._real.close()
 
     def commit(self) -> None:
         raise sqlite3.OperationalError("simulated disk I/O error at commit")

@@ -12,7 +12,7 @@ import weakref
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, get_origin
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -26,6 +26,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import CompileError, OperationalError
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
+from starlette.routing import Mount, Route, WebSocketRoute
 from structlog.testing import capture_logs
 
 import elspeth.web.app as app_module
@@ -1174,7 +1175,7 @@ class TestExecutionWiring:
 
     def test_execution_routes_registered(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))
-        route_paths = [path for route in app.routes if isinstance(path := getattr(route, "path", None), str)]
+        route_paths = [route.path for route in app.routes if isinstance(route, (Route, WebSocketRoute, Mount))]
         assert "/api/sessions/{session_id}/validate" in route_paths
         assert "/api/sessions/{session_id}/execute" in route_paths
         assert "/api/runs/{run_id}" in route_paths
@@ -2012,9 +2013,7 @@ class TestJsonCollectionFieldsSync:
 
     def test_all_tuple_fields_in_allowlist(self) -> None:
         """Every tuple-typed field on WebSettings must appear in _JSON_COLLECTION_FIELDS."""
-        tuple_fields = {
-            name for name, field_info in WebSettings.model_fields.items() if getattr(field_info.annotation, "__origin__", None) is tuple
-        }
+        tuple_fields = {name for name, field_info in WebSettings.model_fields.items() if get_origin(field_info.annotation) is tuple}
         missing = tuple_fields - _JSON_COLLECTION_FIELDS
         assert not missing, (
             f"Tuple-typed WebSettings fields missing from _JSON_COLLECTION_FIELDS: {missing}. "
@@ -2023,9 +2022,7 @@ class TestJsonCollectionFieldsSync:
 
     def test_no_non_tuple_fields_in_allowlist(self) -> None:
         """_JSON_COLLECTION_FIELDS must not contain non-tuple fields."""
-        tuple_fields = {
-            name for name, field_info in WebSettings.model_fields.items() if getattr(field_info.annotation, "__origin__", None) is tuple
-        }
+        tuple_fields = {name for name, field_info in WebSettings.model_fields.items() if get_origin(field_info.annotation) is tuple}
         extra = _JSON_COLLECTION_FIELDS - tuple_fields
         assert not extra, f"Non-tuple fields in _JSON_COLLECTION_FIELDS: {extra}. Scalar fields should not be JSON-decoded."
 

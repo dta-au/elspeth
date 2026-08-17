@@ -167,24 +167,38 @@ class LockDisciplineNegativeTest:
 # ---------------------------------------------------------------------------
 
 
-def _attach_parents(tree: ast.AST) -> None:
-    """Annotate every node with a ``parent`` attribute for upward walks.
+ParentMap = dict[ast.AST, ast.AST]
+"""Child-node to parent-node lookup for one parsed module.
 
-    ``ast`` doesn't track parents; the lock-discipline checker needs to
-    walk from a Call up to its enclosing FunctionDef and any enclosing
-    ``with`` block. Building the parent map once is cheaper than
-    re-traversing.
+``ast`` doesn't track parents and the checkers below need upward walks (from a
+Call to its enclosing FunctionDef, ``with`` block, or statement list). The map
+is built once per file by :func:`_parent_map` and threaded explicitly. It
+replaces the older "attach a ``.parent`` attribute to every node" trick: an
+attached attribute is invisible to the type checker, forces a sentinel
+``getattr`` at every read, and silently returns ``None`` for a node from a
+*different* tree instead of raising.
+"""
+
+
+def _parent_map(tree: ast.AST) -> ParentMap:
+    """Build the child to parent lookup for ``tree`` in one walk.
+
+    The root itself is absent from the map, so ``parents.get(node)`` returning
+    ``None`` means exactly "``node`` is the module root", not "``node`` might
+    be from somewhere else".
     """
 
+    parents: ParentMap = {}
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
-            child.parent = node  # type: ignore[attr-defined]
+            parents[child] = node
+    return parents
 
 
-def _qualified_symbol(node: ast.AST) -> str:
+def _qualified_symbol(node: ast.AST, parents: ParentMap) -> str:
     """Return the dotted enclosing-symbol path for ``node``.
 
-    Walks parent links. The result joins ``ClassDef`` and
+    Walks ``parents``. The result joins ``ClassDef`` and
     ``FunctionDef``/``AsyncFunctionDef`` names from outermost to
     innermost. Module-level nodes return ``"<module>"``.
     """
@@ -194,28 +208,28 @@ def _qualified_symbol(node: ast.AST) -> str:
     while cursor is not None:
         if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             parts.append(cursor.name)
-        cursor = getattr(cursor, "parent", None)
+        cursor = parents.get(cursor)
     if not parts:
         return "<module>"
     return ".".join(reversed(parts))
 
 
-def _enclosing_call(node: ast.AST) -> ast.Call | None:
+def _enclosing_call(node: ast.AST, parents: ParentMap) -> ast.Call | None:
     """Walk parents from ``node`` up to the nearest enclosing :class:`ast.Call`.
 
     Returns ``None`` if the node is not inside a call. Skips
     Module/FunctionDef/ClassDef boundaries by continuing past them.
     """
 
-    cursor: ast.AST | None = getattr(node, "parent", None)
+    cursor: ast.AST | None = parents.get(node)
     while cursor is not None:
         if isinstance(cursor, ast.Call):
             return cursor
-        cursor = getattr(cursor, "parent", None)
+        cursor = parents.get(cursor)
     return None
 
 
-def _enclosing_with_blocks(node: ast.AST) -> Iterator[ast.With | ast.AsyncWith]:
+def _enclosing_with_blocks(node: ast.AST, parents: ParentMap) -> Iterator[ast.With | ast.AsyncWith]:
     """Yield enclosing ``with`` / ``async with`` blocks from inner to outer.
 
     Used by the lock-discipline checker to verify a helper call is
@@ -224,22 +238,11 @@ def _enclosing_with_blocks(node: ast.AST) -> Iterator[ast.With | ast.AsyncWith]:
     in the same module don't satisfy the check.
     """
 
-    cursor: ast.AST | None = getattr(node, "parent", None)
+    cursor: ast.AST | None = parents.get(node)
     while cursor is not None and not isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
         if isinstance(cursor, (ast.With, ast.AsyncWith)):
             yield cursor
-        cursor = getattr(cursor, "parent", None)
-
-
-def _enclosing_function(node: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-    """Return the nearest function whose lock precondition governs ``node``."""
-
-    cursor: ast.AST | None = getattr(node, "parent", None)
-    while cursor is not None:
-        if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            return cursor
-        cursor = getattr(cursor, "parent", None)
-    return None
+        cursor = parents.get(cursor)
 
 
 def _call_callable_name(call: ast.Call) -> str:
@@ -276,10 +279,11 @@ def _line_snippet(source_lines: Sequence[str], line: int, max_len: int = 200) ->
 class _WriterCollector(ast.NodeVisitor):
     """Collect direct-writer matches for one source file."""
 
-    def __init__(self, rel_path: str, source: str, tree: ast.AST) -> None:
+    def __init__(self, rel_path: str, source: str, tree: ast.AST, parents: ParentMap) -> None:
         self.rel_path = rel_path
         self.source_lines = source.splitlines()
         self.tree = tree
+        self.parents = parents
         self.matches: list[WriterMatch] = []
 
     def collect(self) -> list[WriterMatch]:
@@ -327,7 +331,7 @@ class _WriterCollector(ast.NodeVisitor):
         if match is None:
             return
         table = match.group(1).lower()
-        enclosing = _enclosing_call(node)
+        enclosing = _enclosing_call(node, self.parents)
         operation = f"raw_string_in_{_call_callable_name(enclosing)}" if enclosing is not None else "raw_string_module"
         self._emit(node, table=table, operation=operation)
 
@@ -335,13 +339,13 @@ class _WriterCollector(ast.NodeVisitor):
     # Internal
     # ------------------------------------------------------------------
 
-    def _emit(self, node: ast.AST, *, table: str, operation: str) -> None:
-        line = getattr(node, "lineno", 0)
+    def _emit(self, node: ast.expr, *, table: str, operation: str) -> None:
+        line = node.lineno
         self.matches.append(
             WriterMatch(
                 path=self.rel_path,
                 line=line,
-                enclosing_symbol=_qualified_symbol(node),
+                enclosing_symbol=_qualified_symbol(node, self.parents),
                 table=table,
                 operation=operation,
                 snippet=_line_snippet(self.source_lines, line),
@@ -390,7 +394,7 @@ def scan_writers(
             # A test fixture may write deliberately invalid Python to
             # exercise unrelated parsers; skip rather than crash.
             continue
-        _attach_parents(tree)
+        parents = _parent_map(tree)
 
         anchor = path_anchor or root
         try:
@@ -398,7 +402,7 @@ def scan_writers(
         except ValueError:
             rel = py_file.resolve().as_posix()
 
-        matches.extend(_WriterCollector(rel, source, tree).collect())
+        matches.extend(_WriterCollector(rel, source, tree, parents).collect())
     return matches
 
 
@@ -501,15 +505,36 @@ def _is_matching_lock_assertion(statement: ast.stmt, writer: ast.Call) -> bool:
     )
 
 
-def _call_has_dominating_matching_lock_assertion(call: ast.Call) -> bool:
+def _dominating_statement_blocks(node: ast.AST) -> tuple[list[ast.stmt], ...]:
+    """Return the statement lists of ``node`` that can hold a dominated child.
+
+    Written out per node type rather than reflected over field names: the set
+    of blocks whose earlier statements DOMINATE a later one is a deliberate
+    choice, not whatever fields happen to be named ``body``/``orelse``/
+    ``finalbody``. ``Try.handlers`` is excluded on purpose — a handler is not
+    dominated by the ``try`` body, so a child reached through one keeps
+    walking upward instead of matching there.
+    """
+
+    if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.With, ast.AsyncWith)):
+        return (node.body,)
+    if isinstance(node, (ast.ExceptHandler, ast.match_case)):
+        return (node.body,)
+    if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+        return (node.body, node.orelse)
+    if isinstance(node, (ast.Try, ast.TryStar)):
+        return (node.body, node.orelse, node.finalbody)
+    return ()
+
+
+def _call_has_dominating_matching_lock_assertion(call: ast.Call, parents: ParentMap) -> bool:
     """Accept only a prior, guaranteed assertion over this call's conn/session."""
 
     child: ast.AST = call
-    parent = getattr(child, "parent", None)
+    parent = parents.get(child)
     while parent is not None:
-        for field in ("body", "orelse", "finalbody"):
-            statements = getattr(parent, field, None)
-            if not isinstance(statements, list) or child not in statements:
+        for statements in _dominating_statement_blocks(parent):
+            if child not in statements:
                 continue
             index = statements.index(child)
             if any(_is_matching_lock_assertion(statement, call) for statement in statements[:index]):
@@ -517,7 +542,7 @@ def _call_has_dominating_matching_lock_assertion(call: ast.Call) -> bool:
         if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             return False
         child = parent
-        parent = getattr(parent, "parent", None)
+        parent = parents.get(parent)
     return False
 
 
@@ -555,7 +580,7 @@ def check_lock_discipline(
             tree = ast.parse(source, filename=str(py_file))
         except SyntaxError:
             continue
-        _attach_parents(tree)
+        parents = _parent_map(tree)
         anchor = path_anchor or root
         try:
             rel = py_file.resolve().relative_to(anchor.resolve()).as_posix()
@@ -569,15 +594,15 @@ def check_lock_discipline(
             helper_name = _called_helper_name(node)
             if helper_name is None:
                 continue
-            inside_lock = any(_with_block_establishes_session_write_lock(w, node) for w in _enclosing_with_blocks(node))
+            inside_lock = any(_with_block_establishes_session_write_lock(w, node) for w in _enclosing_with_blocks(node, parents))
             if not inside_lock:
-                inside_lock = _call_has_dominating_matching_lock_assertion(node)
+                inside_lock = _call_has_dominating_matching_lock_assertion(node, parents)
             if inside_lock:
                 continue
-            enclosing_symbol = _qualified_symbol(node)
+            enclosing_symbol = _qualified_symbol(node, parents)
             if (rel, enclosing_symbol, helper_name) in allowed_keys:
                 continue
-            line = getattr(node, "lineno", 0)
+            line = node.lineno
             findings.append(
                 LockDisciplineViolation(
                     path=rel,
@@ -627,7 +652,7 @@ def check_helper_lock_assertions(
             tree = ast.parse(source, filename=str(py_file))
         except SyntaxError:
             continue
-        _attach_parents(tree)
+        parents = _parent_map(tree)
         anchor = path_anchor or root
         try:
             rel = py_file.resolve().relative_to(anchor.resolve()).as_posix()
@@ -656,7 +681,7 @@ def check_helper_lock_assertions(
                 LockDisciplineViolation(
                     path=rel,
                     line=line,
-                    enclosing_symbol=_qualified_symbol(node),
+                    enclosing_symbol=_qualified_symbol(node, parents),
                     helper_name=node.name,
                     snippet=_line_snippet(source_lines, line),
                 )
@@ -679,7 +704,7 @@ _INLINE_VERSION_TABLE_SQL = re.compile(r"\bFROM\s+composition_states\b", re.IGNO
 _INLINE_ALLOCATION_SCOPE = frozenset({"save_composition_state", "set_active_state"})
 
 
-def _is_docstring_constant(node: ast.Constant) -> bool:
+def _is_docstring_constant(node: ast.Constant, parents: ParentMap) -> bool:
     """Return True iff ``node`` is the docstring literal of its enclosing scope.
 
     A docstring quoting the allocation SQL (as ``save_composition_state``'s
@@ -687,10 +712,10 @@ def _is_docstring_constant(node: ast.Constant) -> bool:
     allocation site.
     """
 
-    parent = getattr(node, "parent", None)
+    parent = parents.get(node)
     if not isinstance(parent, ast.Expr):
         return False
-    grandparent = getattr(parent, "parent", None)
+    grandparent = parents.get(parent)
     if not isinstance(grandparent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
         return False
     return bool(grandparent.body) and grandparent.body[0] is parent
@@ -790,7 +815,7 @@ def check_inline_state_version_allocation(
             tree = ast.parse(source, filename=str(py_file))
         except SyntaxError:
             continue
-        _attach_parents(tree)
+        parents = _parent_map(tree)
         anchor = path_anchor or root
         try:
             rel = py_file.resolve().relative_to(anchor.resolve()).as_posix()
@@ -800,7 +825,7 @@ def check_inline_state_version_allocation(
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant):
-                if not isinstance(node.value, str) or _is_docstring_constant(node):
+                if not isinstance(node.value, str) or _is_docstring_constant(node, parents):
                     continue
                 if not _is_raw_state_version_max_sql(node.value):
                     continue
@@ -809,13 +834,13 @@ def check_inline_state_version_allocation(
                     continue
             else:
                 continue
-            symbol = _qualified_symbol(node)
+            symbol = _qualified_symbol(node, parents)
             if not _INLINE_ALLOCATION_SCOPE & set(symbol.split(".")):
                 continue
-            inside_lock = any(_with_block_invokes_session_write_lock(w) for w in _enclosing_with_blocks(node))
+            inside_lock = any(_with_block_invokes_session_write_lock(w) for w in _enclosing_with_blocks(node, parents))
             if inside_lock:
                 continue
-            line = getattr(node, "lineno", 0)
+            line = node.lineno
             findings.append(
                 InlineAllocViolation(
                     path=rel,

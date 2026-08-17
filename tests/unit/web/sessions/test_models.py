@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import get_args
 
 import pytest
-from sqlalchemy import insert, inspect, select, text
+from sqlalchemy import CheckConstraint, insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.web.sessions.engine import create_session_engine
@@ -263,7 +263,9 @@ class TestCheckConstraints:
         mirrors the CHECK declaration order for diff clarity.
         """
         constraint = next(
-            item for item in guided_operations_table.constraints if getattr(item, "name", None) == "ck_guided_operations_failure_code"
+            item
+            for item in guided_operations_table.constraints
+            if isinstance(item, CheckConstraint) and item.name == "ck_guided_operations_failure_code"
         )
         declared = re.findall(r"'([a-z_]+)'", str(constraint.sqltext))
 

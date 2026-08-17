@@ -179,4 +179,4 @@ def test_postgres_unlock_failure_surfaces_after_unrelated_caught_exception() -> 
             pass
 
     assert outer is not None
-    assert getattr(outer, "__notes__", ()) == ()
+    assert vars(outer).get("__notes__", ()) == ()

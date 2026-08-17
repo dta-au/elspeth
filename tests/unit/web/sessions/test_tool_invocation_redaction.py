@@ -14,6 +14,7 @@ import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
@@ -53,13 +54,21 @@ class _CapturingSessionService:
         # In-memory double: the cohort is trivially atomic, so record one
         # captured message per draft with the same kwargs shape the old
         # per-row add_message calls carried.
+        #
+        # ``deep_thaw`` mirrors the real writer. ``AuditMessageDraft`` freezes
+        # ``tool_calls`` in its ``__post_init__``, so a draft's envelopes reach
+        # any writer as ``MappingProxyType``/tuple; both real writers
+        # (``add_message`` and ``add_messages_atomic``) thaw them back to
+        # JSON-serialisable shapes before the insert. A double that captured
+        # the frozen values verbatim would hand tests a shape production never
+        # persists.
         for draft in drafts:
             await self.add_message(
                 session_id,
                 draft.role,
                 draft.content,
                 writer_principal=writer_principal,
-                tool_calls=draft.tool_calls,
+                tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
                 composition_state_id=composition_state_id,
                 tool_call_id=draft.tool_call_id,
                 parent_assistant_id=draft.parent_assistant_id,

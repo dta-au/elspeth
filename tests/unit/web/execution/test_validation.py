@@ -10,6 +10,7 @@ W18 fix: Only typed exceptions are caught — no bare except Exception.
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -6296,25 +6297,25 @@ class TestValidatePipelineStateShapeMaterialization:
         )
 
     @pytest.mark.parametrize(
-        "poison_name",
+        "poison",
         [
-            "_poison_gate_condition",
-            "_poison_gate_routes",
-            "_poison_coalesce_branches",
-            "_poison_row_union_branches",
-            "_poison_transform_on_error",
-            "_poison_aggregation_on_error",
-            "_poison_unknown_node_type",
-            "_poison_queue_input",
+            pytest.param(_poison_gate_condition, id="gate_condition"),
+            pytest.param(_poison_gate_routes, id="gate_routes"),
+            pytest.param(_poison_coalesce_branches, id="coalesce_branches"),
+            pytest.param(_poison_row_union_branches, id="row_union_branches"),
+            pytest.param(_poison_transform_on_error, id="transform_on_error"),
+            pytest.param(_poison_aggregation_on_error, id="aggregation_on_error"),
+            pytest.param(_poison_unknown_node_type, id="unknown_node_type"),
+            pytest.param(_poison_queue_input, id="queue_input"),
         ],
     )
     def test_rehydrated_state_shape_defect_is_red_verdict_not_crash(
         self,
-        poison_name: str,
+        poison: Callable[[dict[str, Any]], None],
         state_dict_and_settings: tuple[dict[str, Any], WebSettings],
     ) -> None:
         state_dict, settings = state_dict_and_settings
-        getattr(self, poison_name)(state_dict)
+        poison(state_dict)
 
         result = validate_pipeline_for_web_principal(CompositionState.from_dict(state_dict), settings, yaml_generator_module)
 

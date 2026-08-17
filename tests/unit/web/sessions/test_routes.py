@@ -19,6 +19,7 @@ import structlog
 import yaml
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import CheckConstraint
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
@@ -50,6 +51,7 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.resolved import SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession, GuidedStep, TerminalKind, TerminalReason, TerminalState
+from elspeth.web.composer.pipeline_proposal import PlannerSurface
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult, ComposerService, PipelineCommitIntent
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
@@ -1938,10 +1940,16 @@ async def test_canonical_pipeline_http_readback_rejects_malformed_bound_content_
     assert await service.get_current_state(session_id) is None
 
 
-@pytest.mark.parametrize("surface_name", ["GUIDED_STAGED", "TUTORIAL_PROFILE"])
-def test_generic_accept_rejects_guided_pipeline_surfaces_before_dispatch(tmp_path, monkeypatch, surface_name) -> None:
+@pytest.mark.parametrize(
+    "surface",
+    [
+        pytest.param(PlannerSurface.GUIDED_STAGED, id="GUIDED_STAGED"),
+        pytest.param(PlannerSurface.TUTORIAL_PROFILE, id="TUTORIAL_PROFILE"),
+    ],
+)
+def test_generic_accept_rejects_guided_pipeline_surfaces_before_dispatch(tmp_path, monkeypatch, surface: PlannerSurface) -> None:
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
@@ -1951,7 +1959,7 @@ def test_generic_accept_rejects_guided_pipeline_surfaces_before_dispatch(tmp_pat
         pipeline=pipeline,
         base=AbsentBase(),
         reviewed_facts={"checkpoint": "server-owned"},
-        surface=getattr(PlannerSurface, surface_name),
+        surface=surface,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
         covered_deferred_intent_ids=(),
@@ -1959,7 +1967,7 @@ def test_generic_accept_rejects_guided_pipeline_surfaces_before_dispatch(tmp_pat
     )
     plan = PipelinePlanResult(
         proposal=proposal_envelope,
-        tool_call_id=f"{surface_name.lower()}-call",
+        tool_call_id=f"{surface.name.lower()}-call",
         custody_result="not_required",
         model_identifier="planner-model",
         model_version="planner-model-v1",
@@ -9325,13 +9333,17 @@ class TestRunAlreadyActiveError:
             request,
             exc: RunAlreadyActiveError,
         ) -> JSONResponse:
-            # Mirrors ``create_app``'s handler, including ``request_id``.
+            # Mirrors ``create_app``'s handler, including ``request_id`` --
+            # which production reads off the ASGI scope's ``state`` dict
+            # (``web/app.py::_correlation_id``), never by attribute probe.
+            scope_state = request.scope.get("state")
+            request_id = scope_state.get("request_id") if isinstance(scope_state, dict) else None
             return JSONResponse(
                 status_code=409,
                 content={
                     "detail": str(exc),
                     "error_type": "run_already_active",
-                    "request_id": getattr(getattr(request, "state", None), "request_id", None),
+                    "request_id": request_id,
                 },
             )
 
@@ -12946,8 +12958,10 @@ def test_composition_state_provenance_python_and_sql_enums_agree() -> None:
     from elspeth.web.sessions.models import composition_states_table
     from elspeth.web.sessions.protocol import COMPOSITION_STATE_PROVENANCE_VALUES
 
-    check = next(c for c in composition_states_table.constraints if getattr(c, "name", None) == "ck_composition_states_provenance")
-    sql_text = str(check.sqltext)  # type: ignore[attr-defined]
+    check = next(
+        c for c in composition_states_table.constraints if isinstance(c, CheckConstraint) and c.name == "ck_composition_states_provenance"
+    )
+    sql_text = str(check.sqltext)
     sql_values = frozenset(re.findall(r"'([a-z_]+)'", sql_text))
     assert sql_values == COMPOSITION_STATE_PROVENANCE_VALUES, (
         f"CHECK enum {sorted(sql_values)} drifted from CompositionStateProvenance Literal {sorted(COMPOSITION_STATE_PROVENANCE_VALUES)}"
@@ -12975,22 +12989,31 @@ class TestSendMessageTranscriptSnapshot:
         ``AuditIntegrityError``; post-fix the route never consults it.
         """
         mock_composer = _make_composer_mock(response_text="Got it!")
-        app, service = _make_app(tmp_path)
+        app, _service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
 
-        class _StaleGetMessagesService:
-            def __init__(self, inner: SessionServiceImpl) -> None:
-                self._inner = inner
-                self.get_messages_calls = 0
+        class _StaleGetMessagesService(SessionServiceImpl):
+            """The real service, with ``get_messages`` pinned to the pre-insert snapshot.
 
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self._inner, name)
+            A real subclass rather than a forwarding proxy: every other method
+            is genuinely ``SessionServiceImpl``'s, so the route exercises
+            production code and a renamed/removed ``get_messages`` fails loudly
+            instead of being absorbed by a ``__getattr__``.
+            """
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self.get_messages_calls = 0
 
             async def get_messages(self, session_id, limit=100, offset=0):
                 self.get_messages_calls += 1
                 return []
 
-        wrapper = _StaleGetMessagesService(service)
+        wrapper = _StaleGetMessagesService(
+            app.state.session_engine,
+            telemetry=app.state.sessions_telemetry,
+            log=structlog.get_logger("test"),
+        )
         app.state.session_service = wrapper
         client = TestClient(app)
         session_id = client.post("/api/sessions", json={"title": "Stale snapshot"}).json()["id"]
@@ -13018,18 +13041,19 @@ class TestSendMessageTranscriptSnapshot:
         its snapshot is taken inside the insert's own transaction.
         """
         mock_composer = _make_composer_mock(response_text="Still fine")
-        app, service = _make_app(tmp_path)
+        app, _service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
 
-        class _TrailingAuditRowService:
-            def __init__(self, inner: SessionServiceImpl) -> None:
-                self._inner = inner
+        class _TrailingAuditRowService(SessionServiceImpl):
+            """The real service, with one audit sidecar row appended to the transcript.
 
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self._inner, name)
+            A real subclass rather than a forwarding proxy: the combined
+            insert+snapshot method runs for real and only its return value is
+            extended, so the guard under test sees a genuine transcript.
+            """
 
             async def add_message_with_transcript(self, *args: Any, **kwargs: Any):
-                record, transcript = await self._inner.add_message_with_transcript(*args, **kwargs)
+                record, transcript = await super().add_message_with_transcript(*args, **kwargs)
                 assert record.sequence_no is not None
                 trailing_audit_row = ChatMessageRecord(
                     id=uuid.uuid4(),
@@ -13047,7 +13071,11 @@ class TestSendMessageTranscriptSnapshot:
                 )
                 return record, [*transcript, trailing_audit_row]
 
-        app.state.session_service = _TrailingAuditRowService(service)
+        app.state.session_service = _TrailingAuditRowService(
+            app.state.session_engine,
+            telemetry=app.state.sessions_telemetry,
+            log=structlog.get_logger("test"),
+        )
         client = TestClient(app)
         session_id = client.post("/api/sessions", json={"title": "Trailing audit"}).json()["id"]
 

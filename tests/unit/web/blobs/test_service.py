@@ -26,7 +26,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import delete, event, func, insert, select
+from sqlalchemy import Column, delete, event, func, insert, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
@@ -2992,7 +2992,7 @@ class TestInlineCustody:
             def execute(self, statement, *args, **kwargs):
                 if statement.is_select and not self._missed_blob_lookup:
                     selected = tuple(statement.selected_columns)
-                    if selected and getattr(selected[0], "table", None) is blobs_table:
+                    if selected and isinstance(selected[0], Column) and selected[0].table is blobs_table:
                         self._missed_blob_lookup = True
                         return SimpleNamespace(first=lambda: None)
                 if statement.is_insert and statement.table is blobs_table:
@@ -4139,7 +4139,7 @@ class TestCopyBlobsForFork:
             await self._copy(blob_service, session_id, target_session_id)
 
         assert type(exc_info.value) is RuntimeError
-        assert getattr(exc_info.value, "__notes__", []) == []
+        assert vars(exc_info.value).get("__notes__", []) == []
         assert len(await blob_service.list_blobs(target_session_id, limit=None)) == 1
 
     @pytest.mark.asyncio

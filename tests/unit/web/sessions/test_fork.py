@@ -3277,7 +3277,7 @@ class TestForkEndpoint:
         assert response.status_code == 500
 
         # RecoveryFailed[...] note identifies residual copied-blob custody.
-        notes = getattr(primary, "__notes__", [])
+        notes = primary.__notes__
         assert any("RecoveryFailed[OSError]" in note for note in notes), f"expected RecoveryFailed[OSError] note, got: {notes!r}"
         assert any("permission denied removing blob dir" in note for note in notes)
         assert any("fork blob cleanup failed" in note.lower() for note in notes)

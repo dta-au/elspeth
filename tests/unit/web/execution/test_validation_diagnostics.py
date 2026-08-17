@@ -31,15 +31,23 @@ def _edge_error() -> EdgeContractError:
 
 def test_facade_diagnostic_exports_are_the_direct_implementations() -> None:
     """Legacy imports and patch targets must keep resolving by identity."""
-    exported_names = (
-        "_edge_patch_target_for_node_id",
-        "_find_identity_node_advisories",
-        "_graph_warning_to_validation_warning",
-        "_infer_component_type_from_plugin_error",
+    exported_pairs = (
+        ("_edge_patch_target_for_node_id", validation_facade._edge_patch_target_for_node_id, diagnostics._edge_patch_target_for_node_id),
+        ("_find_identity_node_advisories", validation_facade._find_identity_node_advisories, diagnostics._find_identity_node_advisories),
+        (
+            "_graph_warning_to_validation_warning",
+            validation_facade._graph_warning_to_validation_warning,
+            diagnostics._graph_warning_to_validation_warning,
+        ),
+        (
+            "_infer_component_type_from_plugin_error",
+            validation_facade._infer_component_type_from_plugin_error,
+            diagnostics._infer_component_type_from_plugin_error,
+        ),
     )
 
-    for name in exported_names:
-        assert getattr(validation_facade, name) is getattr(diagnostics, name)
+    for name, exported, implementation in exported_pairs:
+        assert exported is implementation, f"validation.{name} no longer resolves to the _validation_diagnostics implementation"
     assert validation_facade._collect_secret_refs is authoring._collect_secret_refs
 
 

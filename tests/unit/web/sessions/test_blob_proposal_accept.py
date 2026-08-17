@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -26,6 +25,7 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes import create_session_router
+from elspeth.web.sessions.routes.composer import proposals as proposals_routes
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -92,20 +92,16 @@ def _make_app(tmp_path: Path, user_id: str = "alice") -> tuple[FastAPI, SessionS
 
 
 def _patch_route_execute_tool(monkeypatch: pytest.MonkeyPatch, wrapper_factory) -> None:
-    for module_name in (
-        "elspeth.web.sessions.routes.composer",
-        "elspeth.web.sessions.routes.composer.proposals",
-    ):
-        try:
-            module = importlib.import_module(module_name)
-        except ModuleNotFoundError:
-            continue
-        original = getattr(module, "execute_tool", None)
-        if original is None:
-            continue
-        monkeypatch.setattr(module, "execute_tool", wrapper_factory(original))
-        return
-    raise AssertionError("could not locate composer proposal route execute_tool binding")
+    """Wrap the ``execute_tool`` binding the proposal-accept route actually calls.
+
+    The route imports ``execute_tool`` into
+    ``elspeth.web.sessions.routes.composer.proposals``; patching that one
+    module-level binding is what the accept path resolves. Naming the module
+    directly (rather than probing a list of candidates) means a move of the
+    binding fails this helper loudly instead of silently patching nothing.
+    """
+
+    monkeypatch.setattr(proposals_routes, "execute_tool", wrapper_factory(proposals_routes.execute_tool))
 
 
 def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp_path: Path) -> None:
