@@ -9,6 +9,7 @@ exclusion verdict only for the abort rules. Compose + validate only; never
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import hashlib
 import json
@@ -217,7 +218,9 @@ class Battery:
         if self._status is None:
             r = self.client.request("GET", "/api/system/status", timeout=30)
             if r.status_code != 200 or not isinstance(r.body, dict):
-                raise RuntimeError(f"/api/system/status returned {r.status_code}")
+                raise BatteryIdentityError(
+                    f"/api/system/status returned {r.status_code}; binding identity would be incomplete — refusing to fire"
+                )
             for key in ("composer_model", "composer_timeout_seconds"):
                 if r.body.get(key) in (None, ""):
                     raise BatteryIdentityError(
@@ -226,8 +229,19 @@ class Battery:
             self._status = r.body
         return self._status
 
+    def _prime_status(self) -> None:
+        """Best-effort ``system_status()`` warm-up: swallow any failure so a status outage degrades
+        ``_identity``'s binding fields to ``None`` rather than escaping into a caller that cannot
+        afford to raise (``fire()``'s top-of-round call, and ``run_prompt``'s own entry so a direct
+        caller — a test, ``planner_probe`` — still gets real identity data whenever the status
+        endpoint is actually reachable). Idempotent: a no-op once ``self._status`` is cached."""
+        if self._status is None:
+            with contextlib.suppress(Exception):
+                self.system_status()
+
     # -- one run --
     def run_prompt(self, *, label: str, prompt: str, run_dir: Path, case: str, repeat: int, capture_proposals: bool = False) -> str | None:
+        self._prime_status()
         run_dir = Path(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         http: list[dict[str, Any]] = []
@@ -410,7 +424,11 @@ class Battery:
             self._sleep(SETTLE_INTERVAL_S)
 
     def _identity(self, messages: list[dict[str, Any]], reviews: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        st = self.system_status()
+        """Never performs I/O: reads the ALREADY-CACHED status (primed by ``fire()``/``main()`` via
+        ``system_status()``). Called from exception-containment paths (``_contained`` → ``_write_meta``),
+        so a live request here could itself fail and escape containment — an unprimed cache degrades the
+        binding fields to ``None`` instead, which the report already treats as an incomparable run."""
+        st = self._status or {}
         review_hash = next(
             (
                 rv["event"].get("composer_skill_hash")
@@ -546,15 +564,23 @@ class Battery:
         self, cases: Mapping[str, CorpusCase], *, tripwire: Callable[[Battery], None] | None, only: set[str] | None = None
     ) -> dict[str, Any]:
         self._firing["started_at"] = self._firing["started_at"] or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._prime_status()  # once up front; main() already primes too (idempotent) and surfaces a hard failure separately
         selected = {n: c for n, c in cases.items() if only is None or n in only}
+        streak: list[str | None] = []  # shared across canary AND corpus runs: instrument failures don't reset at the seam
         if "canary" in selected:
             for rep in range(1, CANARY_N + 1):
                 verdict = self._contained("canary", rep, selected["canary"].prompt)
                 self._record("canary", rep, self._label("canary", rep), verdict)
+                streak.append(verdict)
+                reason = should_abort(streak)
+                if reason:
+                    self._firing["aborted"] = True
+                    self._firing["abort_reason"] = reason
+                    self._record_flush()
+                    return self._firing
         if tripwire is not None:
             tripwire(self)
         corpus_names = sorted(n for n in selected if n != "canary")
-        streak: list[str | None] = []
         per_case: dict[str, list[str | None]] = {n: [] for n in corpus_names}
         total = excluded_n = 0
         for rep in range(1, self.repeats + 1):
@@ -605,12 +631,18 @@ class Battery:
 
 
 def _load_credentials(state_dir: Path) -> tuple[str, str]:
+    """Raises ``ValueError`` for any credentials-file config problem (bad mode, unparseable, missing key) —
+    a config/usage failure (exit 64), never the bare ``SystemExit``/``KeyError`` that would otherwise land
+    on the exit-1 "aborted by the instrument rules" code."""
     p = state_dir / "credentials.json"
     if p.exists():
         if p.stat().st_mode & 0o077:
-            raise SystemExit(f"{p}: must be mode 600")
-        doc = json.loads(p.read_text())
-        return str(doc["username"]), str(doc["password"])
+            raise ValueError(f"{p}: must be mode 600")
+        try:
+            doc = json.loads(p.read_text())
+            return str(doc["username"]), str(doc["password"])
+        except (json.JSONDecodeError, KeyError) as exc:
+            raise ValueError(f"{p}: {exc}") from exc
     user = os.environ.get("ELSPETH_EVAL_USER", "battery_local")  # sibling-harness names (evals/lib/common.sh)
     pw = os.environ.get("ELSPETH_EVAL_PASS") or getpass.getpass(f"password for {user}: ")
     return user, pw
@@ -635,8 +667,8 @@ def main(argv: list[str] | None = None) -> int:
     from planner_probe import run_probe, run_tripwire  # local import: same directory
 
     version, cases = load_corpus()
-    user, pw = _load_credentials(Path(ns.state_dir))
     try:
+        user, pw = _load_credentials(Path(ns.state_dir))
         env_budgets = read_env_budgets(Path(ns.env_file))
     except (OSError, ValueError) as exc:
         print(f"config: {exc}", file=sys.stderr)

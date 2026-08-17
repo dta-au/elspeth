@@ -253,6 +253,34 @@ def test_fire_aborts_after_three_consecutive_instrument_errors(tmp_path: Path) -
     assert all(c["excluded"] == "http" for c in doc["completed"])
 
 
+def test_canary_instrument_failures_abort_before_tripwire_and_corpus(tmp_path: Path) -> None:
+    dead = happy_responders([tg.user_row(1)], state=None)
+    dead["GET /api/sessions/s1/messages"] = lambda c: ok({"detail": "bad gateway"}, 502)  # capture read fails ⇒ http (instrument)
+    b = _battery(tmp_path, FakeClient(dead), repeats=5)
+    tripped: list[str] = []
+    cases = {"canary": CorpusCase("canary", "c"), "fork_coalesce": CorpusCase("fork_coalesce", "f")}
+    doc = b.fire(cases, tripwire=lambda bt: tripped.append("tw"))
+    assert doc["aborted"] is True and doc["abort_reason"] == "3 consecutive instrument_error"
+    # 3 canary reps, not the full 10 — the streak aborts as soon as it hits 3 consecutive, before the tripwire fires
+    assert len(doc["completed"]) == 3 and all(c["case"] == "canary" for c in doc["completed"])
+    assert tripped == []  # aborted before the tripwire — and thus before any corpus case — could run
+
+
+def test_canary_measurement_exclusions_never_abort_and_corpus_still_fires(tmp_path: Path) -> None:
+    routed = happy_responders(
+        [tg.user_row(1), tg.assistant_row(2, content="hi")], state=None
+    )  # zero audit rows ⇒ surface undetermined (measurement kind)
+    b = _battery(tmp_path, FakeClient(routed), repeats=1)
+    tripped: list[str] = []
+    cases = {"canary": CorpusCase("canary", "c"), "fork_coalesce": CorpusCase("fork_coalesce", "f")}
+    doc = b.fire(cases, tripwire=lambda bt: tripped.append("tw"))
+    assert doc["aborted"] is False
+    canary_runs = [c for c in doc["completed"] if c["case"] == "canary"]
+    assert len(canary_runs) == 10 and all(c["excluded"] == "surface" for c in canary_runs)
+    assert tripped == ["tw"]  # measurement kinds never abort — the round proceeds normally
+    assert any(c["case"] == "fork_coalesce" for c in doc["completed"])
+
+
 def test_fire_never_aborts_on_measurement_exclusions(tmp_path: Path) -> None:
     routed = happy_responders(
         [tg.user_row(1), tg.assistant_row(2, content="hi")], state=None
@@ -301,6 +329,79 @@ def test_fire_contains_an_unexpected_exception_and_continues(tmp_path: Path) -> 
     assert meta["instrument"]["http_unrecovered"].startswith("driver exception: RuntimeError")
 
 
+def test_identity_never_performs_io_when_status_is_unprimed_and_unreachable(tmp_path: Path) -> None:
+    """The re-entrancy hole this guards: _write_meta (called from _contained's exception handler) builds
+    identity via _identity — if _identity did I/O and that I/O failed too, the second failure would escape
+    containment and kill fire() outright. _identity must read only the (possibly still-unprimed) cache."""
+    good = happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS))
+
+    def status_unreachable(c):
+        raise db.HttpTimeout("status unreachable")
+
+    good["GET /api/system/status"] = status_unreachable
+    b = _battery(tmp_path, FakeClient(good), repeats=1)
+    real = b.run_prompt
+
+    def boom(**kw):
+        if kw["case"] == "boolean_routing":
+            raise RuntimeError("unexpected")
+        return real(**kw)
+
+    b.run_prompt = boom  # type: ignore[method-assign]
+    cases = {"fork_coalesce": CorpusCase("fork_coalesce", "f"), "boolean_routing": CorpusCase("boolean_routing", "b")}
+    doc = b.fire(cases, tripwire=None, only=set(cases))
+    assert doc["aborted"] is False  # fire() survives the unreachable status endpoint entirely
+    assert [c["excluded"] for c in doc["completed"]] == ["http", None]
+    meta = json.loads((tmp_path / "runs/r1/boolean_routing/1/meta.json").read_text())
+    assert meta["instrument"]["http_unrecovered"].startswith("driver exception: RuntimeError")
+    assert meta["identity"]["binding"]["composer_model"] is None  # status never reachable; no I/O escaped containment
+
+
+def test_system_status_non_200_raises_battery_identity_error(tmp_path: Path) -> None:
+    client = FakeClient(
+        {
+            "POST /api/auth/login": lambda c: ok({"access_token": "tok"}),
+            "GET /api/system/status": lambda c: ok({"detail": "unavailable"}, 503),
+        }
+    )
+    b = db.Battery(client, base="x", round_name="r1", runs_dir=tmp_path, corpus_version=0, env_budgets=ENV, sleep=lambda s: None)
+    b.login("u", "p")
+    with pytest.raises(db.BatteryIdentityError):
+        b.system_status()
+
+
+def _write_valid_env_file(env_file: Path) -> None:
+    env_file.write_text(
+        "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=30\n"
+        "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10\n"
+        "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL=m\n"
+    )
+
+
+def test_load_credentials_bad_mode_exits_64_via_main(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    creds = state_dir / "credentials.json"
+    creds.write_text(json.dumps({"username": "u", "password": "p"}))
+    creds.chmod(0o644)  # group/other-readable: must be 600
+    env_file = tmp_path / "web.env"
+    _write_valid_env_file(env_file)
+    rc = db.main(["--round", "r1", "--state-dir", str(state_dir), "--env-file", str(env_file), "--runs-dir", str(tmp_path / "runs")])
+    assert rc == 64  # config/usage — never the exit-1 "aborted by the instrument rules" code
+
+
+def test_load_credentials_missing_key_exits_64_via_main(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    creds = state_dir / "credentials.json"
+    creds.write_text(json.dumps({"username": "u"}))  # no "password"
+    creds.chmod(0o600)
+    env_file = tmp_path / "web.env"
+    _write_valid_env_file(env_file)
+    rc = db.main(["--round", "r1", "--state-dir", str(state_dir), "--env-file", str(env_file), "--runs-dir", str(tmp_path / "runs")])
+    assert rc == 64
+
+
 def test_resume_skips_complete_runs_and_never_refetches(tmp_path: Path) -> None:
     client = FakeClient(happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS)))
     b = _battery(tmp_path, client, repeats=1)
@@ -310,7 +411,9 @@ def test_resume_skips_complete_runs_and_never_refetches(tmp_path: Path) -> None:
     stamp = (tmp_path / "runs/r1/fork_coalesce/1/messages.json").read_text()
     b2 = _battery(tmp_path, client, repeats=1, resume=True)
     b2.fire(cases, tripwire=None, only={"fork_coalesce"})
-    assert len(client.calls) == n_calls + 1  # only the login of the second battery
+    # login of the second battery, plus fire()'s once-up-front identity-cache priming — never a re-fetch of the
+    # resumed run's capture artifacts (no create_session/messages/state/etc. calls for the completed case)
+    assert len(client.calls) == n_calls + 2
     assert (tmp_path / "runs/r1/fork_coalesce/1/messages.json").read_text() == stamp
 
 
