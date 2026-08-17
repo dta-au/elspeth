@@ -322,6 +322,7 @@ extend-immutable-calls = ["typer.Option", "typer.Argument"]
 "tests/**/*.py" = ["T20"]  # Allow print in tests
 "scripts/**/*.py" = ["T20"]  # Allow print in CLI scripts
 "evals/composer-parity/live_acceptance.py" = ["T20"]  # CLI oracle: print/stderr is the accept/reject output channel
+"evals/composer-battery/*.py" = ["T20"]  # CLI: print is the report/stderr output channel
 "notes/**/*.py" = ["T20"]  # Ad-hoc diagnostic scripts — print is the output channel
 "docs-archive/**/*.py" = ["T20"]  # Archived sources are frozen-as-of-relocation; not maintained against current lint rules
 "elspeth-lints/src/elspeth_lints/rules/trust_tier/tier_model/rule.py" = [
