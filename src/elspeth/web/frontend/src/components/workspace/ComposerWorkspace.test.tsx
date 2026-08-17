@@ -235,7 +235,12 @@ describe("ComposerWorkspace", () => {
     )?.[1];
 
     expect(narrowRule).toBeDefined();
-    expect(narrowRule).toMatch(/min-height:\s*420px;/);
+    // 480, not the desktop 420 (elspeth-7aa9787996): at 320px wide the docked
+    // .chat-input's controls wrap to ~181px, so the shared 420 floor left the
+    // conversation log 81px against WCAG-reflow's 120px readable minimum. The
+    // floor has to clear the NARROWEST supported width, not the desktop one —
+    // do not "correct" this back to 420 to match the desktop rule.
+    expect(narrowRule).toMatch(/min-height:\s*480px;/);
     expect(narrowRule).not.toMatch(/min-height:\s*0;/);
   });
 
