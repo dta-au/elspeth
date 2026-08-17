@@ -45,9 +45,13 @@ not the derived `discovery 1 + mutation 1`. Derivation prose corrected.
 Prompt: two-field invented list, one field dropped on the way out.
 **Topology correct 10/10** (`field_mapper` built every time, `wrong_shape`
 never fired) — so the prompt reliably elicits the intended shape. But
-0/10 clean: `schema_fumble` in 6 runs (up to 3 `get_plugin_schema` reads then
+**2 clean of 9 included** (run 3 is an `http` instrument exclusion —
+`post_message 524`, elspeth-ad5628ecda — and leaves the denominator; my first
+write-up of this block said "0/10 clean" because the ad-hoc scoring script
+read `judge()` without checking `path.excluded`, which is the rule the report
+itself applies). Of the 9 included runs: `schema_fumble` in 6 (up to 3 `get_plugin_schema` reads then
 repeated `patch_node_options` against the same node), plus `repair`,
-`data_setup_detour`, `abandoned_mutation`, and one run ending `not is_valid`.
+`data_setup_detour`, `abandoned_mutation`, and one run ending `not is_valid`. Both tickets from this block: elspeth-ad5628ecda (edge cut) and the field_mapper authoring difficulty itself, which is the case's own signal.
 Excess up to 8 over a floor of 2; cost $3.04 for the block vs $2.05.
 
 **Decision: keep it as a corpus case (`field_drop`), not as the canary.** It
@@ -152,3 +156,19 @@ the tripwire measures the planner surface, the corpus measures the loop, and
 the loop's 10/10 clean 200s are direct evidence the edge does not touch it.
 
 Probe reading (§7): (not yet fired — `--probe`).
+
+## Correction log
+
+- 2026-08-17 — block 4's tripwire reading ("a product finding, not an
+  instrument one") was WRONG and is corrected in place above: all three arms
+  carry `post_message` 524/502/524. Filed consequences: elspeth-ad5628ecda
+  (the edge cut, P1) and elspeth-c18073bd8f (corrected and re-scoped to the
+  one observed arm, P1 → P2). Scorer defect that hid it: fixed in 65d551ee5
+  and ca8cd7ef2.
+- 2026-08-17 — block 2's "0/10 clean" was computed without checking
+  `path.excluded`; the correct reading is 2 clean of 9 included.
+
+**Reading rule for every block above:** an `excluded` run leaves the
+denominator. Quote rates as "k of n included, e excluded", never as k/10 —
+`battery_report.py` does this correctly; hand-rolled analysis scripts are
+where it goes wrong.
