@@ -157,6 +157,46 @@ the loop's 10/10 clean 200s are direct evidence the edge does not touch it.
 
 Probe reading (§7): (not yet fired — `--probe`).
 
+## Block 5 — full round (`2026-08-17-calib5`): ABORTED by the instrument rule after 5 of 19 corpus cases
+
+Fired as `--repeats 1` (canary block, tripwire pre-flight, then one pass over
+the corpus). Outcome: `aborted: true, abort_reason: "3 consecutive
+instrument_error"` — the abort rule doing exactly its job.
+
+**Canary: PASSES the instrument rule again.** 10/10 captured, zero
+exclusions, `compose_loop` 10/10, 2 runs at floor. So the harness is healthy
+and the abort is attributable to the substrate, not to us.
+
+**Tripwire: all three arms `excluded: http (post_message 524)`** — no planner
+evidence at all this round (contrast block 4, where `fork_coalesce` got far
+enough to return an origin terminal).
+
+**Corpus: 2 measurements from 19 attempted.**
+
+| case | elapsed | status | verdict |
+| --- | --- | --- | --- |
+| `boolean_routing` | 50 328 ms | 200 | measured — `data_setup_detour`, 4 calls vs floor 2 |
+| `batch_aggregation` | 124 452 ms | 200 | measured — `passivity` + 3× `excess_discovery`, 6 calls vs floor 2 |
+| `deaggregation` | 125 024 ms | 524 | excluded `http` |
+| `deep_routing` | 125 059 ms | 524 | excluded `http` |
+| `error_routing` | 125 030 ms | 524 | excluded `http` |
+| remaining 14 | — | — | never fired (abort) |
+
+The three failures agree to within 35 ms and `batch_aggregation` cleared the
+cut by 0.6 s, so the edge limit is **125.0 s**, between 124.45 s and 125.02 s
+— against the origin's 600 s budget. Filed and measured in
+elspeth-ad5628ecda; a sibling session has since added server-side journal
+forensics showing the origin *does* cancel on the cut (nothing is orphaned)
+and that the declared transport-idle ceiling is unvalidatable, fixed in
+`f10895f7c`.
+
+**Consequence for calibration: it cannot proceed on the public hostname.**
+Three of the first five ordinary stratified cases exceed the edge limit, so a
+corpus pass produces exclusions rather than measurements. Options: fix the
+edge limit, or fire against the origin directly (`--base`), bypassing
+Cloudflare. Nothing about the corpus, the floors or the oracles is implicated
+— the two runs that completed were scored cleanly.
+
 ## Correction log
 
 - 2026-08-17 — block 4's tripwire reading ("a product finding, not an
