@@ -15,7 +15,7 @@ from evals.lib.battery_scenario import (
     topology_to_dict,
     validate_canonical_arguments,
 )
-from evals.lib.battery_topology import topology_from_pipeline
+from evals.lib.battery_topology import observed_option_values, topologies_match, topology_from_pipeline
 
 from elspeth.web.composer.no_tool_policy import PipelineMutationIntentDecision, classify_pipeline_mutation_intent
 
@@ -51,6 +51,14 @@ def test_parse_corpus_takes_first_unlabelled_fence_verbatim() -> None:
     assert cases[0].prompt == "  Verbatim  bytes\nline two"
 
 
+def test_parse_corpus_refuses_a_duplicated_case_heading() -> None:
+    """load_corpus keys by name: a duplicated heading silently kept the LAST prompt while the scenario, the
+    floor and every captured prompt_sha256 still referred to the first."""
+    md = "corpus_version: 1\n\n## alpha\n\n```\nfirst\n```\n\n## alpha\n\n```\nsecond\n```\n"
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_corpus(md)
+
+
 def _present_cases() -> list[str]:
     _, cases = load_corpus()
     return sorted(cases)
@@ -75,6 +83,16 @@ def test_scenario_is_sound(case: str) -> None:
     derived = topology_from_pipeline(sc.canonical_arguments)
     assert topology_to_dict(derived) == sc.expected_topology, f"{case}: expected_topology is stale — regenerate"
     assert topology_from_dict(sc.expected_topology) == derived
+    # the payload must satisfy its OWN option_assertions through the comparator the scorer uses — a stale or
+    # mistyped assertion (a threshold the canonical payload does not carry) would otherwise fail every live
+    # run as wrong_shape, and nothing else in the tree exercises the three assertion-bearing scenarios.
+    match = topologies_match(
+        topology_from_dict(sc.expected_topology),
+        derived,
+        option_values=observed_option_values(sc.canonical_arguments),
+        option_assertions=[tuple(a) for a in sc.option_assertions],
+    )
+    assert match.ok, f"{case}: canonical payload fails its own option_assertions — {match.reason}"
     assert extractor_cross_check(sc, REPO) == []
     assert sc.floor.tool_bearing_calls == sum(sc.floor.components.values())
     assert sc.floor.repairs == 0 and sc.floor.backtracks == 0

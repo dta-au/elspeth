@@ -1,7 +1,8 @@
 """§7 planner probe (paired, calibration only) and tripwire (standing, every round) — the OFFLINE half.
 
 Both reuse the parity fixtures verbatim; scoring is over captured run directories only. Nothing here
-enters a pooled rate. The live wrapper (``evals/composer-battery/planner_probe.py``) is ~25 lines.
+enters a pooled rate. The live wrapper (``evals/composer-battery/planner_probe.py``) fires the arms
+through the Battery and calls into this module; all logic lives here.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from elspeth.web.composer.protocol import (
     PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE,
 )
 from elspeth.web.composer.tools.discovery import is_mutation_tool
-from evals.lib.battery_capture import assistant_turns, llm_calls, load_capture, planner_attempts, tool_outcomes
+from evals.lib.battery_capture import CaptureError, assistant_turns, llm_calls, load_capture, planner_attempts, tool_outcomes
 from evals.lib.battery_score import score_path, surface_of
 from evals.lib.battery_topology import topologies_match, topology_from_pipeline
 
@@ -259,7 +260,22 @@ def score_tripwire_dir(round_dir: Path) -> list[dict[str, Any]]:
                 }
             )
             continue
-        r = score_arm(run_dir, fixture, "P")
+        try:
+            r = score_arm(run_dir, fixture, "P")
+        except CaptureError as exc:
+            # a half-written tripwire capture is a failed tripwire, not a traceback out of the round
+            table.append(
+                {
+                    "fixture": fixture,
+                    "pass": False,
+                    "staged_variant": None,
+                    "planner_calls": 0,
+                    "planner_codes": {},
+                    "surface": "undetermined",
+                    "reason": f"capture: {exc}",
+                }
+            )
+            continue
         passed = r.surface == "planner" and r.staged_variant is not None and r.staged_topology_ok is True
         reason = None if passed else (r.reason or ("no PIPELINE_STAGED_* message" if r.staged_variant is None else "topology mismatch"))
         table.append(
@@ -284,8 +300,17 @@ def score_probe_dir(round_dir: Path) -> dict[str, Any]:
     for fixture in PROBE_FIXTURES:
         for arm in ("P", "L"):
             run_dir = pd / fixture / arm
-            if run_dir.exists():
+            if not run_dir.exists():
+                continue
+            try:
                 arms.append(score_arm(run_dir, fixture, arm).to_dict())
+            except CaptureError as exc:
+                # one unreadable arm never costs the scoring of the arms that did fire
+                arms.append(
+                    ArmResult(
+                        fixture, arm, "undetermined", False, [], [], False, 0, {}, {}, [], None, None, False, 0, f"capture: {exc}"
+                    ).to_dict()
+                )
     doc = {
         "classifier_fingerprint": classifier_fingerprint(),
         "rule": "floor = required information classes seen before the accepting mutation + one accepted terminal; surface asserted per arm from artifacts",

@@ -63,7 +63,7 @@ def happy_responders(
 
     def state_resp(call: Call):
         if state is None:
-            return ok({"detail": "no state"}, 404)
+            return ok(None)  # the real route answers "no composition state yet" with 200 + a null body, never a 404
         return ok(
             {"id": "state-2", "session_id": session_id, "version": 2, "is_valid": True, "created_at": "2026-08-17T00:00:00Z", **state}
         )

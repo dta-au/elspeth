@@ -169,6 +169,34 @@ def test_tripwire_table_pass_fail_and_undetermined(tmp_path: Path) -> None:
     assert json.loads((rd / "_tripwire" / "tripwire.json").read_text()) == table
 
 
+def test_an_unreadable_capture_is_a_failed_tripwire_not_a_traceback(tmp_path: Path) -> None:
+    """score_arm calls load_capture, which raises CaptureError. Uncontained, one malformed tripwire capture
+    killed the whole round from inside fire()."""
+    rd = tmp_path / "runs" / "r1"
+    _write(rd / "_tripwire" / "fork_coalesce" / "1", _planner_thread(), state={"id": "s", "version": 2, **copy.deepcopy(ARGS)})
+    broken = rd / "_tripwire" / "error_routing" / "1"
+    broken.mkdir(parents=True)
+    (broken / "messages.json").write_text("[1, 2, 3]")  # elements are not objects
+    (broken / "meta.json").write_text(json.dumps(tg.meta()))
+    table = {t["fixture"]: t for t in pp.score_tripwire_dir(rd)}
+    assert table["error_routing"]["pass"] is False and table["error_routing"]["reason"].startswith("capture: ")
+    assert table["fork_coalesce"]["pass"] is True  # the readable fixture is still scored
+
+
+def test_an_unreadable_probe_arm_never_costs_the_arms_that_fired(tmp_path: Path) -> None:
+    rd = tmp_path / "runs" / "r1"
+    name = pp.PROBE_FIXTURES[0]
+    args = pp.load_fixture(name)["canonical_arguments"]
+    _write(rd / "_probe" / name / "P", _planner_thread(), state={"id": "s", "version": 2, **copy.deepcopy(args)})
+    arm_l = rd / "_probe" / name / "L"
+    arm_l.mkdir(parents=True)
+    (arm_l / "messages.json").write_text("[1, 2, 3]")
+    (arm_l / "meta.json").write_text(json.dumps(tg.meta()))
+    arms = {(a["fixture"], a["arm"]): a for a in pp.score_probe_dir(rd)["arms"]}
+    assert arms[(name, "P")]["surface_ok"] is True
+    assert arms[(name, "L")]["clean"] is False and arms[(name, "L")]["reason"].startswith("capture: ")
+
+
 def test_probe_dir_scores_ten_by_two_and_binds_fingerprint(tmp_path: Path) -> None:
     rd = tmp_path / "runs" / "r1"
     for name in pp.PROBE_FIXTURES:

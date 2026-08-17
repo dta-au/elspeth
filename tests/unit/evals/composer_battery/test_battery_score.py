@@ -340,6 +340,61 @@ def test_decline_and_passivity_are_hard_and_not_terminal_missing() -> None:
     assert _classes(s2) == ["decline"] and s2.red
 
 
+def test_courteous_closing_after_an_applied_valid_mutation_is_still_clean() -> None:
+    """spec §3: passivity is 'no mutation + permission-seeking'. A finished, valid, at-floor build whose last
+    sentence offers further help must stay clean/optimal — folding the RGR phrase list into red would dent the
+    headline rates with an EMPTY deviation ledger, so nothing in the report could explain the dent."""
+    rows = tg.ideal_thread(ARGS)
+    rows[-2]["content"] = "Pipeline built and validated. Let me know if you want any changes."
+    cap = tg.capture(rows, state=copy.deepcopy(ARGS))
+    path = score_path(cap)
+    # the phrase is still OBSERVED — this is a judgement change, not a blinding (a gate that dropped
+    # passivity_hits, or the deviation, would pass a clean-only assertion)
+    assert path.passivity_hits == ("let me know if",) and path.applied_any
+    assert [d.cls for d in path.deviations] == []
+    s = judge(SC, path)
+    assert s.red_reasons == [] and not s.red and s.green
+    assert s.clean and s.optimal and s.deviations == []
+    # and the same sentence with NOTHING applied is still red passivity
+    passive = tg.capture(
+        [tg.user_row(1), tg.audit_row(2), tg.assistant_row(3, content="Ready when you are. Let me know if you want me to build it.")],
+        state=None,
+        is_valid=None,
+    )
+    s2 = score_run(passive, SC)
+    assert _classes(s2) == ["passivity"] and s2.red and "let me know if" in s2.red_reasons[0]
+
+
+def test_build_failure_sentinel_stays_red_even_after_an_applied_mutation() -> None:
+    """Only the passivity list is gated on applied_any: a sentinel says the build did NOT finish, which is a
+    contradiction worth reporting no matter what the tool timeline claims."""
+    rows = tg.ideal_thread(ARGS)
+    rows[-2]["content"] = "I cannot mark this pipeline complete."
+    s = score_run(tg.capture(rows, state=copy.deepcopy(ARGS)), SC)
+    assert s.red and s.red_reasons == ["build failure sentinels in final message: ['i cannot mark this pipeline complete']"]
+    assert not s.clean
+
+
+def test_zero_audit_rows_with_a_non_200_compose_is_an_instrument_fault_not_a_surface_finding() -> None:
+    """A dead substrate (5xx before any provider call) must EXCLUDE as an instrument kind so it feeds the
+    abort rule and the 15% flag — not land in the measurement bucket that never aborts and reads as a
+    product finding. The 200-with-zero-rows and planner shapes stay measurement kinds."""
+    dead = [tg.user_row(1)]
+    s = score_run(tg.capture(dead, state=None, is_valid=None, meta_doc=tg.meta(post_status=500)), SC)
+    assert s.surface_observed == "undetermined"
+    assert s.excluded != "surface" and s.excluded in INSTRUMENT_KINDS and "500" in (s.exclusion_evidence or "")
+    p = score_path(tg.capture(dead, state=None, is_valid=None, meta_doc=tg.meta(post_status=500)))
+    assert p.excluded_by_instrument  # the property the driver's abort rule reads
+    # a client timeout with nothing written is the same class of fault
+    assert score_path(tg.capture(dead, state=None, is_valid=None, meta_doc=tg.meta(post_status=None))).excluded_by_instrument
+    # …but a 200 that simply never called a provider is a PRODUCT finding, and so are planner rows
+    ok200 = score_path(tg.capture(dead, state=None, is_valid=None, meta_doc=tg.meta(post_status=200)))
+    assert ok200.excluded == "surface" and not ok200.excluded_by_instrument
+    planner = tg.ideal_thread(ARGS)
+    planner.append(tg.planner_attempt_row(30))
+    assert score_run(tg.capture(planner, state=ARGS), SC).excluded == "surface"
+
+
 def test_wrong_shape_and_option_assertions() -> None:
     wrong = copy.deepcopy(ARGS)
     wrong["outputs"][0]["plugin"] = "jsonl"

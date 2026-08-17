@@ -325,6 +325,53 @@ def test_markdown_carries_n_exclusions_and_formula_beside_every_rate(tmp_path: P
     assert "compose-loop surface only" in md  # caveats header
 
 
+def test_criteria_ledger_makes_a_non_clean_run_with_no_deviation_visible(tmp_path: Path) -> None:
+    """A criterion failure (is_valid false, empty state, no schema before the first mutation, a build
+    sentinel) fires no deviation event, so `clean` dropped with an empty histogram and nothing in the report
+    a reader could act on without opening the raw transcript."""
+    rd = _round(tmp_path)
+    fc = SC.canonical_arguments
+    _write_run(  # a completed thread the server declared invalid: red + green reasons, zero deviations
+        rd / "fork_coalesce" / "3",
+        tg.ideal_thread(fc),
+        state=copy.deepcopy(fc),
+        meta=tg.meta(case="fork_coalesce", repeat=3),
+        is_valid=False,
+    )
+    rep = build_report(rd, scenarios=SCENARIOS, corpus_version=0)
+    case = next(c for c in rep["by_case"] if c["case"] == "fork_coalesce")
+    assert case["clean"] == 2 and case["histogram"] == {"repair": 1}  # the drop is invisible in the histogram
+    row = next(c for c in rep["criteria"] if c["case"] == "fork_coalesce" and c["repeat"] == 3)
+    assert row["red_reasons"] == ["final composition state has is_valid=false"]
+    assert row["green_reasons"] == ["not is_valid", "topology: no valid state"]
+    md = render_markdown(rep)
+    assert "## Criteria ledger" in md and "fork_coalesce/3" in md and "is_valid=false" in md
+    # and a round with no criterion failure says so rather than rendering an empty section
+    assert "## Criteria ledger" in render_markdown(build_report(_round(tmp_path, "r9"), scenarios=SCENARIOS, corpus_version=0))
+
+
+def test_a_tripwire_crash_recorded_by_the_driver_degrades_the_firing(tmp_path: Path) -> None:
+    rd = _round(tmp_path)
+    doc = json.loads((rd / "firing.json").read_text())
+    doc["tripwire_error"] = "RuntimeError('boom')"
+    (rd / "firing.json").write_text(json.dumps(doc))
+    rep = build_report(rd, scenarios=SCENARIOS, corpus_version=0)
+    assert rep["degraded"]["flag"] is True and any("tripwire raised" in r for r in rep["degraded"]["reasons"])
+
+
+def test_an_expected_topology_edit_trips_the_compare_refusal(tmp_path: Path) -> None:
+    """M5: floors_sha256 bound only the floor and the option assertions, so an oracle edit moved `wrong_shape`
+    silently between rounds — exactly what a floor edit is refused for."""
+    prev = _round(tmp_path, "r0")
+    write_report(prev, build_report(prev, scenarios=SCENARIOS, corpus_version=0))
+    cur = _round(tmp_path, "r1")
+    moved = {**SCENARIOS, "fork_coalesce": copy.deepcopy(SC)}
+    moved["fork_coalesce"].expected_topology = copy.deepcopy(SC.expected_topology)
+    moved["fork_coalesce"].expected_topology["nodes"][0]["plugin"] = "some_other_source"
+    with pytest.raises(CompareRefused, match="floors_sha256"):
+        build_report(cur, scenarios=moved, corpus_version=0, compare_to=prev)
+
+
 def test_unknown_case_dir_is_loud(tmp_path: Path) -> None:
     rd = _round(tmp_path)
     (rd / "not_a_case" / "1").mkdir(parents=True)

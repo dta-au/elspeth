@@ -6,6 +6,7 @@ from pathlib import Path
 
 import drive_battery as db
 import pytest
+from evals.lib import battery_planner as db_planner
 from evals.lib.battery_corpus import CorpusCase
 from evals.lib.battery_scenario import load_scenario
 
@@ -165,6 +166,83 @@ def test_pagination_full_page_triggers_next_fetch_and_truncation_is_flagged(tmp_
     _battery(tmp_path, client3).run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/x/3", case="x", repeat=3)
     inst = json.loads((tmp_path / "runs/r1/x/3/meta.json").read_text())["instrument"]
     assert inst["truncated"] is True and inst["http_unrecovered"] == "GET /messages 502 at offset 500"
+
+
+def test_capture_step_server_failures_are_instrument_exclusions_not_product_findings(tmp_path: Path) -> None:
+    """C2: a 5xx on validate / state / messages is a SERVER fault. Without an instrument flag the missing
+    artifact reads as `not is_valid` / an empty final state — a product finding for an outage — and never
+    feeds the abort rule."""
+    # (a) validate 5xx: state.json is written, validate.json is not
+    r = happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS))
+    r["POST /api/sessions/"] = lambda c: (
+        ok({"detail": "boom"}, 503) if c.path.endswith("/validate") else ok({"message": {}, "state": None, "proposals": []})
+    )
+    b = _battery(tmp_path, FakeClient(r), repeats=1)
+    verdict = b.run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/x/1", case="x", repeat=1)
+    inst = json.loads((tmp_path / "runs/r1/x/1/meta.json").read_text())["instrument"]
+    assert inst["http_unrecovered"] == "validate 503" and verdict in db.INSTRUMENT_KINDS
+    assert not (tmp_path / "runs/r1/x/1/validate.json").exists()
+
+    # (b) state 5xx: the legitimate "no state yet" answer is 200 + a null body, so only a non-200 is a fault
+    r2 = happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS))
+    r2["GET /api/sessions/s1/state"] = lambda c: ok({"detail": "boom"}, 502)
+    b2 = _battery(tmp_path, FakeClient(r2), repeats=1)
+    v2 = b2.run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/x/2", case="x", repeat=2)
+    inst2 = json.loads((tmp_path / "runs/r1/x/2/meta.json").read_text())["instrument"]
+    assert inst2["http_unrecovered"] == "get_state 502" and v2 in db.INSTRUMENT_KINDS
+    r3 = happy_responders(tg.ideal_thread(ARGS), state=None)  # 200 + null body
+    b3 = _battery(tmp_path, FakeClient(r3), repeats=1)
+    b3.run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/x/3", case="x", repeat=3)
+    assert json.loads((tmp_path / "runs/r1/x/3/meta.json").read_text())["instrument"]["http_unrecovered"] is None
+
+
+def test_a_5xx_compose_before_any_provider_call_aborts_the_round(tmp_path: Path) -> None:
+    """C2 third shape: a crash-looping substrate answers POST /messages 5xx and writes zero audit rows. The
+    composer's structured terminal is a 422, so a 5xx is a server fault — it must exclude as an instrument
+    kind and trip the three-consecutive abort rather than burn the round as 95 product findings."""
+    r = happy_responders([tg.user_row(1)], state=None)
+    r["POST /api/sessions/"] = lambda c: (
+        ok({"detail": "service_setup_failed"}, 500) if c.path.endswith("/messages") else ok({"is_valid": False, "errors": []})
+    )
+    b = _battery(tmp_path, FakeClient(r), repeats=5)
+    cases = {"fork_coalesce": CorpusCase("fork_coalesce", "f"), "boolean_routing": CorpusCase("boolean_routing", "b")}
+    doc = b.fire(cases, tripwire=None, only=set(cases))
+    assert all(c["excluded"] in db.INSTRUMENT_KINDS for c in doc["completed"])
+    assert doc["aborted"] is True and doc["abort_reason"] == "3 consecutive instrument_error"
+    inst = json.loads((tmp_path / "runs/r1/fork_coalesce/1/meta.json").read_text())["instrument"]
+    assert inst["http_unrecovered"] == "post_message 500"
+
+
+def test_composer_progress_reasons_map_to_every_budget_and_a_missing_snapshot_is_source_none(tmp_path: Path) -> None:
+    """M1: the scorer's terminal_missing keys on ``source``, so a progress read that produced no reason must
+    not claim one; and the composition/discovery budgets must map as well as the wall clock."""
+    for reason, budget in (("convergence_composition_budget", "composition"), ("convergence_discovery_budget", "discovery")):
+        r = happy_responders([tg.user_row(1), tg.audit_row(2)], state=None)
+
+        def timeout_then(c, _r=reason):
+            if c.path.endswith("/messages"):
+                raise db.HttpTimeout("620s")
+            return ok({"is_valid": False, "checks": [], "errors": [], "warnings": [], "readiness": "blocked"})
+
+        r["POST /api/sessions/"] = timeout_then
+        r["GET /api/sessions/s1/composer-progress"] = lambda c, _r=reason: ok({"phase": "failed", "reason": _r})
+        _battery(tmp_path, FakeClient(r), repeats=1).run_prompt(
+            label="l", prompt="p", run_dir=tmp_path / "runs/r1/x" / budget, case="x", repeat=1
+        )
+        meta = json.loads((tmp_path / "runs/r1/x" / budget / "meta.json").read_text())
+        assert meta["server_terminal"] == {"budget_exhausted": budget, "reason": reason, "source": "composer_progress"}
+    r2 = happy_responders([tg.user_row(1), tg.audit_row(2)], state=None)
+
+    def timeout_then_none(c):
+        if c.path.endswith("/messages"):
+            raise db.HttpTimeout("620s")
+        return ok({"is_valid": False, "checks": [], "errors": [], "warnings": [], "readiness": "blocked"})
+
+    r2["POST /api/sessions/"] = timeout_then_none
+    r2["GET /api/sessions/s1/composer-progress"] = lambda c: ok({"detail": "gone"}, 404)
+    _battery(tmp_path, FakeClient(r2), repeats=1).run_prompt(label="l", prompt="p", run_dir=tmp_path / "runs/r1/x/none", case="x", repeat=1)
+    meta2 = json.loads((tmp_path / "runs/r1/x/none/meta.json").read_text())
+    assert meta2["server_terminal"] == {"budget_exhausted": None, "reason": None, "source": "none"}
 
 
 def test_read_integrity_error_is_recorded(tmp_path: Path) -> None:
@@ -329,6 +407,62 @@ def test_fire_contains_an_unexpected_exception_and_continues(tmp_path: Path) -> 
     assert meta["instrument"]["http_unrecovered"].startswith("driver exception: RuntimeError")
 
 
+def test_a_crashing_tripwire_is_contained_and_recorded_not_fatal(tmp_path: Path) -> None:
+    """spec §4: a multi-hour round never dies on one traceback. The tripwire ran outside containment, so a
+    malformed tripwire capture killed fire() AFTER the canary's ten runs were already spent."""
+    client = FakeClient(happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS)))
+    b = _battery(tmp_path, client, repeats=1)
+
+    def boom(_battery_arg):
+        raise RuntimeError("tripwire capture unreadable")
+
+    cases = {"fork_coalesce": CorpusCase("fork_coalesce", "f")}
+    doc = b.fire(cases, tripwire=boom, only={"fork_coalesce"})
+    assert doc["aborted"] is False and len(doc["completed"]) == 1  # the corpus still fired
+    assert doc["tripwire_error"] == "RuntimeError('tripwire capture unreadable')"
+    assert json.loads((tmp_path / "runs/r1/firing.json").read_text())["tripwire_error"] == doc["tripwire_error"]
+
+
+def test_preflight_runs_before_the_canary_is_spent(tmp_path: Path) -> None:
+    """Classifier drift used to raise at tripwire time — i.e. after ten canary runs. It is a config failure
+    and must fire before anything is fired at the substrate."""
+    client = FakeClient(happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS)))
+    b = _battery(tmp_path, client, repeats=1)
+    fired: list[str] = []
+    real = b.run_prompt
+
+    def spy(**kw):
+        fired.append(kw["label"])
+        return real(**kw)
+
+    b.run_prompt = spy  # type: ignore[method-assign]
+
+    def unpaired():
+        raise db_planner.ProbeUnpaired("pair does not route")
+
+    with pytest.raises(db_planner.ProbeUnpaired):
+        b.fire({"canary": CorpusCase("canary", "c")}, tripwire=None, preflight=unpaired)
+    assert fired == []  # nothing fired at the substrate at all
+
+
+def test_contained_run_survives_a_second_failure_inside_the_handler(tmp_path: Path) -> None:
+    """I4: the containment handler itself re-scores the run. If that second read raises, the exception escapes
+    containment and kills the round — so the handler falls back to the `capture` verdict without re-scoring."""
+    client = FakeClient(happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS)))
+    b = _battery(tmp_path, client, repeats=1)
+
+    def boom(**kw):
+        raise RuntimeError("first failure")
+
+    def boom_again(*a, **kw):
+        raise OSError("read-only filesystem")
+
+    b.run_prompt = boom  # type: ignore[method-assign]
+    b._write_meta = boom_again  # type: ignore[method-assign]
+    doc = b.fire({"fork_coalesce": CorpusCase("fork_coalesce", "f")}, tripwire=None, only={"fork_coalesce"})
+    assert doc["aborted"] is False and [c["excluded"] for c in doc["completed"]] == ["capture"]
+
+
 def test_identity_never_performs_io_when_status_is_unprimed_and_unreachable(tmp_path: Path) -> None:
     """The re-entrancy hole this guards: _write_meta (called from _contained's exception handler) builds
     identity via _identity — if _identity did I/O and that I/O failed too, the second failure would escape
@@ -446,6 +580,80 @@ def test_cleanup_deletes_only_this_rounds_complete_sessions(tmp_path: Path) -> N
     b.fire({"fork_coalesce": CorpusCase("fork_coalesce", "f")}, tripwire=None, only={"fork_coalesce"})
     assert b.cleanup() == ["s1"]
     assert [c.path for c in client.calls if c.method == "DELETE"] == ["/api/sessions/s1"]
+
+
+def test_cleanup_paginates_and_reaches_tripwire_sessions(tmp_path: Path) -> None:
+    """I5: GET /api/sessions defaults to limit=50 and caps at 200, so an unpaginated read left most of a
+    95-run round undeleted, silently. Tripwire/probe titles carry three segments after the prefix and were
+    skipped forever."""
+    sessions = [
+        {"id": f"s{i}", "user_id": "u", "title": f"battery/r1/fork_coalesce/{i}", "created_at": "t", "updated_at": "t", "archived": False}
+        for i in range(1, 251)
+    ]
+    sessions.append(
+        {
+            "id": "tw",
+            "user_id": "u",
+            "title": "battery/r1/_tripwire/fork_coalesce/1",
+            "created_at": "t",
+            "updated_at": "t",
+            "archived": False,
+        }
+    )
+    r = happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS))
+    pages: list[dict] = []
+
+    def listed(c):
+        params = c.params or {}
+        pages.append(params)
+        off, lim = int(params.get("offset", 0)), int(params.get("limit", 50))
+        return ok(sessions[off : off + min(lim, 200)])
+
+    r["GET /api/sessions"] = listed
+    client = FakeClient(r)
+    b = _battery(tmp_path, client, repeats=1)
+    # captures on disk for run 250 (page 2) and for the tripwire fixture; nothing else is complete
+    for run_dir in (tmp_path / "runs/r1/fork_coalesce/250", tmp_path / "runs/r1/_tripwire/fork_coalesce/1"):
+        run_dir.mkdir(parents=True)
+        for name in ("messages.json", "reviews.json"):
+            (run_dir / name).write_text("[]")
+        (run_dir / "meta.json").write_text("{}")
+    assert b.cleanup() == ["s250", "tw"]
+    assert [p["offset"] for p in pages] == [0, 200]  # a full page always fetches again; the short page stops
+
+
+def test_cleanup_survives_a_non_200_listing_body(tmp_path: Path) -> None:
+    """A non-200 body is a dict: iterating it yielded strings, not sessions."""
+    r = happy_responders(tg.ideal_thread(ARGS), state=copy.deepcopy(ARGS))
+    r["GET /api/sessions"] = lambda c: ok({"detail": "unavailable"}, 503)
+    b = _battery(tmp_path, FakeClient(r), repeats=1)
+    assert b.cleanup() == []
+
+
+def test_unknown_case_name_exits_64_before_any_network(tmp_path: Path) -> None:
+    """I6: `--cases fork_coalese` used to fire nothing and exit 0 — a silently empty round."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    creds = state_dir / "credentials.json"
+    creds.write_text(json.dumps({"username": "u", "password": "p"}))
+    creds.chmod(0o600)
+    env_file = tmp_path / "web.env"
+    _write_valid_env_file(env_file)
+    rc = db.main(
+        [
+            "--round",
+            "r1",
+            "--cases",
+            "fork_coalese,canary",
+            "--state-dir",
+            str(state_dir),
+            "--env-file",
+            str(env_file),
+            "--runs-dir",
+            str(tmp_path / "runs"),
+        ]
+    )
+    assert rc == 64  # returned before login: no RequestsClient call was ever made
 
 
 def test_read_env_budgets(tmp_path: Path) -> None:

@@ -232,7 +232,6 @@ def meta(
                 "local_skill_file_sha256": "skill-local",
                 "env_file_sha256": "env-x",
                 "first_call_messages_hash": "mh2",
-                "server_version": None,
                 "frontend_build": None,
             },
         },

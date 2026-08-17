@@ -82,13 +82,26 @@ scratch/
 !/evals/composer-battery/
 !/evals/composer-battery/**
 /evals/composer-battery/runs/
+# Preserve the repository-wide credential safeguards after the broad corpus
+# exception above (the last matching gitignore rule wins) — the full mirror of
+# composer-parity's block, plus this instrument's credentials.json.
 /evals/composer-battery/**/jwt.txt
-/evals/composer-battery/**/login.json
-/evals/composer-battery/**/*.access_token
+/evals/composer-battery/**/jwt-*.txt
+/evals/composer-battery/**/jwt_*.txt
 /evals/composer-battery/**/*.api_key
-/evals/composer-battery/**/*.pem
+/evals/composer-battery/**/*.access_token
+/evals/composer-battery/**/*.bearer_token
+/evals/composer-battery/**/login.json
+/evals/composer-battery/**/login_*.json
 /evals/composer-battery/**/credentials.json
+/evals/composer-battery/**/*.pem
+/evals/composer-battery/**/*.p12
+/evals/composer-battery/**/*.pfx
 /evals/composer-battery/**/.env
+/evals/composer-battery/**/.env.*
+!/evals/composer-battery/**/.env.example
+!/evals/composer-battery/**/.env.template
+!/evals/composer-battery/**/.env.sample
 
 # Generated bug analysis docs (can be regenerated)
 docs/bugs/generated/

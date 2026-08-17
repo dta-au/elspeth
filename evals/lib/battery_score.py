@@ -11,11 +11,16 @@ and oracle: excess, ``below_floor``, ``wrong_shape``, green/red,
 ``unattributed_excess``, clean/optimal. ``score_run`` composes the two.
 
 Every excess above the floor lands in exactly one deviation class or in
-``unattributed_excess`` — silence is not an option. Exclusions
-(``instrument_error`` sub-kinds) remove the run from every rate and are
-reported beside it; they are partitioned into INSTRUMENT_KINDS (the harness
-failed — abort/flag material) and MEASUREMENT_KINDS (the product did
-something the loop-only instrument cannot score — reported, never an abort).
+``unattributed_excess`` — an above-floor run is never silently clean. A run
+can also fail a *criterion* (``red_reasons`` / ``green_reasons``: a build
+sentinel, an empty or invalid final state, no schema read before the first
+mutation) with no deviation event at all; those reasons are carried on every
+``Score`` and rendered by the report's criteria ledger, not folded into the
+deviation histogram. Exclusions (``instrument_error`` sub-kinds) remove the
+run from every rate and are reported beside it; they are partitioned into
+INSTRUMENT_KINDS (the harness failed — abort/flag material) and
+MEASUREMENT_KINDS (the product did something the loop-only instrument cannot
+score — reported, never an abort).
 """
 
 from __future__ import annotations
@@ -93,9 +98,11 @@ _NOT_APPLIED = frozenset({"rejected", "failed", "cancelled"})
 _REMOVAL_TOOLS = frozenset({"remove_node", "remove_edge", "remove_output", "clear_source"})
 _PATCH_TOOLS = frozenset({"patch_source_options", "patch_node_options", "patch_output_options"})
 _TERMINAL_CLASSES = frozenset({"turn_exhaustion", "wall_timeout"})
-# spec §3: the four DATA tools are a separate vocabulary from pipeline mutations — they manage blob-store
-# content, not CompositionState. They are mutation tools in the registry (is_mutation_tool is True for all
-# four) but must never count as a pipeline mutation: not for schema_read_before_first_mutation, not for
+# spec §3: the four DATA tools are a separate vocabulary from pipeline mutations. Three of them manage
+# blob-store content only; wire_blob_inline_ref DOES write CompositionState (it patches a source/node/output
+# option and bumps the state version) and is treated as the bind half of a create_blob detour by convention —
+# create_blob already charged the deviation. All four are mutation tools in the registry (is_mutation_tool is
+# True for each) but none counts as a pipeline mutation: not for schema_read_before_first_mutation, not for
 # attempted_any (which gates passivity/decline), and never as applied_any/applied_set_pipeline.
 _DATA_TOOLS = frozenset({"create_blob", "update_blob", "delete_blob", "wire_blob_inline_ref"})
 
@@ -183,7 +190,7 @@ class Score:
     green_reasons: list[str] = field(default_factory=list)
     exclusion_evidence: str | None = None
     below_floor: bool = False  # tool-bearing calls < floor: the floor may be too high; never "optimal" hides it
-    scenario_sha256: str | None = None  # the scenario file that produced this score (late-binding guard, report checks it)
+    scenario_sha256: str | None = None  # the scenario file that produced this score: per-run provenance, read by hand at triage
 
     def to_dict(self) -> dict[str, Any]:
         d = {k: v for k, v in self.__dict__.items() if k != "deviations"}
@@ -467,6 +474,13 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
         excluded, evidence = "http", instrument.http_unrecovered
     elif instrument.review_rounds_exhausted:
         excluded, evidence = "http", "interpretation review rounds exhausted (5)"
+    elif surface == "undetermined" and post_status != 200:
+        # Zero audit rows AND a non-200 compose response: the substrate never ran the loop at all (a crash
+        # loop / service_setup_failed / a client timeout with nothing written). That is an INSTRUMENT fault —
+        # it must feed the abort rule and the 15% flag — not the MEASUREMENT `surface` bucket. A 200 with zero
+        # rows stays `surface` (the product answered without calling a provider), and planner rows stay
+        # `surface` too; both are product findings the loop-only instrument cannot score.
+        excluded, evidence = "terminal_missing", f"zero audit rows and post_message status {post_status}"
     elif surface != "compose_loop":
         excluded, evidence = "surface", f"surface_observed={surface}"
     elif unrecovered and budget is None:
@@ -580,7 +594,12 @@ def judge(scenario: Scenario, path: PathScore) -> Score:
         deviations.append(Deviation("wrong_shape", (0, 0), None, None, (shape_reason or "",), None))
 
     red_reasons: list[str] = []
-    if path.passivity_hits:
+    if path.passivity_hits and not path.applied_any:
+        # spec §3 defines decline/passivity as "no mutation + permission-seeking": the RGR phrase list is only
+        # a red signal when NOTHING was built. On a finished, applied build a closing "let me know if you want
+        # any changes" is ordinary courtesy, and folding it into red would drop the run out of clean/optimal
+        # with an empty deviation ledger — an unexplainable dent in the headline rates. The phrases are still
+        # observed (PathScore.passivity_hits) and still drive the passivity/decline deviation upstream.
         red_reasons.append(f"forbidden passivity phrases in final message: {list(path.passivity_hits)}")
     if path.sentinel_hits:
         red_reasons.append(f"build failure sentinels in final message: {list(path.sentinel_hits)}")

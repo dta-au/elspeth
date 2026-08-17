@@ -43,7 +43,11 @@ def test_run_tripwire_and_probe_use_the_battery_with_proposal_capture(tmp_path: 
         round = "r1"
         round_dir = tmp_path / "runs" / "r1"
         runs_dir = tmp_path / "runs"
+        resume = False
         calls: ClassVar[list[dict]] = []
+
+        def resume_skip(self, run_dir: Path) -> bool:
+            return self.resume and (run_dir / "messages.json").exists()
 
         def run_prompt(self, **kw):
             self.calls.append(kw)
@@ -67,3 +71,80 @@ def test_run_tripwire_and_probe_use_the_battery_with_proposal_capture(tmp_path: 
         and b.calls[1]["prompt"].startswith("Hi. ")
     )
     assert (tmp_path / "runs/r1/_probe/probe.json").exists()
+
+
+def test_resume_never_refires_a_complete_tripwire_capture(tmp_path: Path) -> None:
+    """spec §4: `--resume` never re-fetches or overwrites a captured page. The tripwire fired unconditionally,
+    so resuming an interrupted round overwrote `_tripwire/<fixture>/1`."""
+
+    class StubBattery:
+        round = "r1"
+        round_dir = tmp_path / "runs" / "r1"
+        runs_dir = tmp_path / "runs"
+        resume = True
+        calls: ClassVar[list[dict]] = []
+
+        def resume_skip(self, run_dir: Path) -> bool:
+            return self.resume and (run_dir / "messages.json").exists()
+
+        def run_prompt(self, **kw):
+            self.calls.append(kw)
+            _write(kw["run_dir"], _planner_thread(), state={"id": "s", "version": 2, **copy.deepcopy(ARGS)})
+            return None
+
+    done = bp.TRIPWIRE_FIXTURES[0]
+    _write(tmp_path / "runs/r1/_tripwire" / done / "1", _planner_thread(), state={"id": "s", "version": 2, **copy.deepcopy(ARGS)})
+    stamp = (tmp_path / "runs/r1/_tripwire" / done / "1" / "messages.json").read_text()
+    b = StubBattery()
+    pp.run_tripwire(b)  # type: ignore[arg-type]
+    assert [c["run_dir"].parent.name for c in b.calls] == list(bp.TRIPWIRE_FIXTURES[1:])
+    assert (tmp_path / "runs/r1/_tripwire" / done / "1" / "messages.json").read_text() == stamp
+
+
+def test_a_crashing_arm_never_stops_the_remaining_fixtures(tmp_path: Path) -> None:
+    class StubBattery:
+        round = "r1"
+        round_dir = tmp_path / "runs" / "r1"
+        runs_dir = tmp_path / "runs"
+        resume = False
+        calls: ClassVar[list[dict]] = []
+
+        def resume_skip(self, run_dir: Path) -> bool:
+            return False
+
+        def run_prompt(self, **kw):
+            self.calls.append(kw)
+            fixture = kw["run_dir"].parent.name
+            if fixture == bp.TRIPWIRE_FIXTURES[0]:
+                raise RuntimeError("substrate refused the connection")
+            args = bp.load_fixture(fixture)["canonical_arguments"]
+            _write(kw["run_dir"], _planner_thread(), state={"id": "s", "version": 2, **copy.deepcopy(args)})
+            return None
+
+    b = StubBattery()
+    pp.run_tripwire(b)  # type: ignore[arg-type]
+    assert len(b.calls) == len(bp.TRIPWIRE_FIXTURES)  # every fixture was still attempted
+    table = {t["fixture"]: t for t in json.loads((tmp_path / "runs/r1/_tripwire/tripwire.json").read_text())}
+    assert table[bp.TRIPWIRE_FIXTURES[0]] == {
+        "fixture": bp.TRIPWIRE_FIXTURES[0],
+        "pass": False,
+        "staged_variant": None,
+        "planner_calls": 0,
+        "planner_codes": {},
+        "surface": "undetermined",
+        "reason": "not fired",
+    }
+    assert table[bp.TRIPWIRE_FIXTURES[1]]["pass"] is True
+
+
+def test_preflight_asserts_pair_routing_for_every_tripwire_fixture() -> None:
+    """The routing assertion used to run inside the firing loop — i.e. after the canary was already spent."""
+    pp.tripwire_preflight()  # the real fixtures route correctly today
+    calls: list[str] = []
+    original = pp.assert_pair_routes
+    try:
+        pp.assert_pair_routes = lambda intent: calls.append(intent)  # type: ignore[assignment]
+        pp.tripwire_preflight()
+    finally:
+        pp.assert_pair_routes = original  # type: ignore[assignment]
+    assert calls == [bp.load_fixture(f)["intent"] for f in bp.TRIPWIRE_FIXTURES]

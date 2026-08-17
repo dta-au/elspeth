@@ -40,8 +40,22 @@ an account.
 `--round`. `--cleanup` fires normally and then also runs the cleanup
 afterward. Both delete only sessions whose capture is complete
 (`messages.json`, `meta.json`, `reviews.json` all present and parseable);
-incomplete captures are left alone. `--no-tripwire` skips the tripwire
+incomplete captures are left alone. The listing is paginated (`limit=200`,
+the route's maximum; it defaults to 50), and the cleanup covers **both**
+corpus sessions (`battery/<round>/<case>/<n>`) **and** the tripwire/probe
+sessions (`battery/<round>/_tripwire/<fixture>/1`,
+`battery/<round>/_probe/<fixture>/<arm>`) — they are this round's sessions
+too, and their captures are on disk under the same names.
+`--no-tripwire` skips both the tripwire firing and its classifier
 pre-flight (calibration/debugging only — never for a rate-bearing round).
+
+Other flags: `--base <url>` (default `$ELSPETH_EVAL_BASE_URL`, else
+`https://elspeth.foundryside.dev`), `--env-file` (default
+`deploy/elspeth-web.env`), `--state-dir` (default `~/.elspeth-battery`),
+`--runs-dir` (default `evals/composer-battery/runs`). `--cases canary`
+still fires the tripwire — pass `--no-tripwire` as well to fire the canary
+alone. An unknown `--cases` name exits 64 naming it, before any network
+call.
 
 Exit codes, as implemented in `drive_battery.py main()` / `report.py main()`:
 
@@ -53,9 +67,10 @@ Exit codes, as implemented in `drive_battery.py main()` / `report.py main()`:
   composer never called a tool) never count toward the abort streak and
   never abort on their own; `64` config/identity — a malformed or
   wrong-mode credentials file, a missing env budget in
-  `deploy/elspeth-web.env`, or an unusable `/api/system/status` (identity
-  resolution never does I/O beyond reading these); `70` auth — login
-  rejected.
+  `deploy/elspeth-web.env`, an unknown `--cases` name, a tripwire/probe
+  pre-flight that no longer routes P→planner / L→loop (classifier drift),
+  or an unusable `/api/system/status` (identity resolution never does I/O
+  beyond reading these); `70` auth — login rejected.
 - `report.py`: `65` (`EX_DATAERR`) on a refused `--compare` (binding-identity
   mismatch without `--force-compare`) or a late-binding refusal (a round
   captured under a different `corpus_version` or prompt hash than the
@@ -75,14 +90,26 @@ instrument exclusions (harness faults — `capture`/`truncated`/
 never called a tool — product findings the loop-only instrument cannot
 score, listed separately and never pooled into the rate), then the
 **deviation ledger** grouped case → class with evidence (`sequence_no`
-range, tool, args digest, codes, audit ordinal). `unattributed_excess` and
+range, tool, args digest, codes, audit ordinal), then the **criteria
+ledger** (case/repeat → `red_reasons`/`green_reasons`): a run can fail a
+criterion — invalid or empty final state, a build sentinel, no schema read
+before the first mutation — with no deviation event at all, and without
+that section its `clean` would drop against an empty histogram.
+`unattributed_excess` and
 `below_floor` are printed on their own headline line — a high
 `unattributed_excess` rate is a taxonomy gap to fix, never a floor to
 widen. A degraded firing (`report["degraded"]["reasons"]`, e.g. exclusions
-above 15%, canary >1/10 non-optimal, a driver abort) is called out at the
-top of the markdown; `report["findings"]` is a separate list — corpus/
-product findings that are reported but do not by themselves mark the
-firing degraded.
+above 15%, canary >1/10 non-optimal, a driver abort, a tripwire that
+raised) is called out at the top of the markdown; `report["findings"]` is a
+separate list — corpus/product findings that are reported but do not by
+themselves mark the firing degraded.
+
+`runs/<round>/firing.json` is the driver's own ledger (`completed`,
+`aborted`/`abort_reason`, `tripwire_error`, `case_flags`). The report reads
+`aborted`/`abort_reason` and `tripwire_error`; it does **not** read
+`case_flags` — it re-derives the per-case exclusion streak and the 15%
+exclusion flag from the captured bytes, which is the stronger reading.
+`firing.json` remains the record of what the driver saw as it fired.
 Triage reads the ledger; kit defects become Filigree issues by hand.
 
 `--compare <prev>` prints `compare.recorded_deltas` — a dict keyed by
@@ -183,4 +210,4 @@ says so (`…-calib`).
 | `planner_probe.py` | §7 probe + tripwire |
 | `report.py` | offline scoring + report |
 | `calibration/README.md` | calibration decisions (pre/post floors) |
-| `../lib/battery_*.py` | tracked libraries (topology, scenario, capture, score, report) |
+| `../lib/battery_*.py` | tracked libraries (topology, scenario, corpus, capture, score, report, planner) |

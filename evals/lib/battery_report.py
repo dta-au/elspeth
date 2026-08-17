@@ -150,8 +150,15 @@ def _median(values: list[float]) -> float | None:
 
 
 def _floors_sha(scenarios: Mapping[str, Scenario], cases: set[str]) -> str:
+    """The oracle binding: floor, option assertions AND expected_topology. A topology edit moves `wrong_shape`
+    exactly as a floor edit moves `excess`, so it must trip the same cross-round compare refusal."""
     rows = sorted(
-        (c, scenarios[c].floor.tool_bearing_calls, json.dumps(scenarios[c].option_assertions, sort_keys=True))
+        (
+            c,
+            scenarios[c].floor.tool_bearing_calls,
+            json.dumps(scenarios[c].option_assertions, sort_keys=True),
+            json.dumps(scenarios[c].expected_topology, sort_keys=True),
+        )
         for c in cases
         if c in scenarios
     )
@@ -202,6 +209,8 @@ def build_report(
         degraded_reasons.append("provider retries in >10% of runs")
     if firing.get("aborted"):
         degraded_reasons.append(f"driver aborted: {firing.get('abort_reason')}")
+    if firing.get("tripwire_error"):
+        degraded_reasons.append(f"tripwire raised: {firing.get('tripwire_error')}")
 
     by_repeat: list[dict[str, Any]] = []
     for rep in sorted({s.repeat for s in corpus}):
@@ -220,6 +229,7 @@ def build_report(
         )
 
     by_case: list[dict[str, Any]] = []
+    criteria: list[dict[str, Any]] = []  # criterion failures carry no deviation event: without this they are invisible
     ledger_map: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     exclusions: list[dict[str, Any]] = []
     measurement_exclusions: list[dict[str, Any]] = []
@@ -233,6 +243,10 @@ def build_report(
                     {"case": case, "repeat": s.repeat, "kind": s.excluded, "evidence": s.exclusion_evidence}
                 )
                 continue
+            if s.red_reasons or s.green_reasons:
+                criteria.append(
+                    {"case": case, "repeat": s.repeat, "red_reasons": list(s.red_reasons), "green_reasons": list(s.green_reasons)}
+                )
             for d in s.deviations:
                 hist[d.cls] += 1
                 ledger_map[(case, d.cls)].append(
@@ -285,6 +299,7 @@ def build_report(
         "exclusions": exclusions,
         "measurement_exclusions": measurement_exclusions,
         "ledger": ledger,
+        "criteria": criteria,
         "compare": None,
     }
     if compare_to is not None:
@@ -366,7 +381,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "## Identity",
         "",
         f"- binding: `{json.dumps(b, sort_keys=True)}`",
-        f"- recorded: composer_skill_hash=`{r.get('composer_skill_hash')}` server_version=`{r.get('server_version')}` first_call_messages_hash=`{r.get('first_call_messages_hash')}`",
+        f"- recorded: composer_skill_hash=`{r.get('composer_skill_hash')}` frontend_build=`{r.get('frontend_build')}` first_call_messages_hash=`{r.get('first_call_messages_hash')}`",
         "",
     ]
     if report.get("compare"):
@@ -439,6 +454,13 @@ def render_markdown(report: dict[str, Any]) -> str:
         out.append("")
     if not report["ledger"]:
         out.append("- none")
+    out += ["", "## Criteria ledger (green/red criteria — a non-clean run can carry no deviation event at all)", ""] + (
+        [
+            f"- {c['case']}/{c['repeat']}: red={c['red_reasons'] or '-'} green={c['green_reasons'] or '-'}"
+            for c in report.get("criteria") or []
+        ]
+        or ["- none"]
+    )
     return "\n".join(out) + "\n"
 
 

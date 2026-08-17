@@ -42,6 +42,11 @@ def parse_corpus(md: str) -> tuple[int, list[CorpusCase]]:
         if prompt is None:
             raise ValueError(f"case {h.group('name')!r} has no unlabelled fenced prompt")
         cases.append(CorpusCase(h.group("name"), prompt))
+    duplicates = sorted({c.name for c in cases if sum(1 for other in cases if other.name == c.name) > 1})
+    if duplicates:
+        # load_corpus keys by name, so a duplicated heading would silently keep the LAST prompt while the
+        # scenario, the floor and every captured prompt_sha256 still refer to the first — refuse instead.
+        raise ValueError(f"corpus.md declares duplicate `## case` headings: {duplicates}")
     return version, cases
 
 

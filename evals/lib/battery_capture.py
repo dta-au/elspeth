@@ -143,6 +143,11 @@ def load_capture(run_dir: Path) -> Capture:
     meta = _read_json(run_dir / "meta.json", required=True)
     if not isinstance(messages, list) or not isinstance(meta, dict):
         raise CaptureError(f"{run_dir}: messages.json must be a list and meta.json an object")
+    if not all(isinstance(m, dict) for m in messages):
+        # the element type is part of the contract: every accessor below (and the sort key on the next line)
+        # reads `m.get(...)`, so a non-object element would escape the CaptureError seam as an AttributeError
+        # and break the "never raises" promise path_from_disk/score_from_disk make to their callers.
+        raise CaptureError(f"{run_dir}: every element of messages.json must be an object")
     reviews = _read_json(run_dir / "reviews.json", required=False)
     return Capture(
         messages=sorted(messages, key=lambda m: (m.get("sequence_no") is None, m.get("sequence_no") or 0)),

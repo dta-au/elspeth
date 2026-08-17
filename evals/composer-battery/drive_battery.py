@@ -30,6 +30,7 @@ from evals.lib.battery_score import INSTRUMENT_KINDS, path_from_disk  # noqa: E4
 
 CLIENT_TIMEOUT_S = 620.0
 PAGE = 500
+SESSION_PAGE = 200  # GET /api/sessions caps limit at 200 and defaults to 50 (web/sessions.py list_sessions)
 MAX_PAGES = 40
 MAX_REVIEW_ROUNDS = 5
 SETTLE_POLLS = 12
@@ -41,6 +42,12 @@ PINNED_PREFERENCES = {
     "trust_mode": "auto_commit",
     "density_default": "high",
 }  # the product defaults (sessions/models.py), pinned per session for comparability
+# composer-progress `reason` → the terminal budget it reports (contracts/composer_progress.py convergence set).
+PROGRESS_BUDGETS: dict[str, str] = {
+    "convergence_wall_clock_timeout": "timeout",
+    "convergence_composition_budget": "composition",
+    "convergence_discovery_budget": "discovery",
+}
 
 
 # ── HTTP seam ──────────────────────────────────────────────────────────────
@@ -203,6 +210,7 @@ class Battery:
             "completed": [],
             "aborted": False,
             "abort_reason": None,
+            "tripwire_error": None,
             "case_flags": {},
         }
 
@@ -308,9 +316,11 @@ class Battery:
             pr = step("composer_progress", "GET", f"/api/sessions/{sid}/composer-progress", timeout=30)
             reason = pr.body.get("reason") if pr is not None and isinstance(pr.body, dict) else None
             terminal = {
-                "budget_exhausted": "timeout" if reason == "convergence_wall_clock_timeout" else None,
+                "budget_exhausted": PROGRESS_BUDGETS.get(str(reason)) if reason is not None else None,
                 "reason": reason,
-                "source": "composer_progress",
+                # no reason means no snapshot (progress endpoint non-200/empty): the scorer's terminal_missing
+                # keys on `source`, so claiming composer_progress here would hide a missing terminal.
+                "source": "composer_progress" if reason is not None else "none",
             }
             self._settle(sid, step)
         elif r.status_code != 200:
@@ -320,6 +330,11 @@ class Battery:
                 terminal = {"budget_exhausted": detail.get("budget_exhausted"), "reason": detail.get("reason"), "source": "422_detail"}
             if r.status_code in (401, 403):
                 instrument["auth_failed"] = True
+            if r.status_code >= 500:
+                # the composer's structured terminal (turn/wall budget) is a 422, so a 5xx here is a SERVER
+                # fault, never a product outcome: exclude the run as an instrument error and let it feed the
+                # abort rule rather than scoring a dead substrate as 95 product findings.
+                instrument["http_unrecovered"] = instrument["http_unrecovered"] or f"post_message {r.status_code}"
             self._settle(sid, step)
         # 4. reviews
         reviews: list[dict[str, Any]] = []
@@ -348,12 +363,21 @@ class Battery:
         # 5. state + validate (pinned to state_id)
         state_id: str | None = None
         sr = step("get_state", "GET", f"/api/sessions/{sid}/state", timeout=30)
+        if sr is not None and sr.status_code != 200:
+            # "no state yet" is 200 + a null body (composer/state.py get_current_state); only a non-200 is a
+            # fault, and without this the missing state.json would score as an empty final state — a PRODUCT
+            # finding for a server outage.
+            instrument["http_unrecovered"] = instrument["http_unrecovered"] or f"get_state {sr.status_code}"
         if sr is not None and sr.status_code == 200 and isinstance(sr.body, dict):
             (run_dir / "state.json").write_text(json.dumps(sr.body, indent=2))
             state_id = str(sr.body.get("id"))
             vr = step("validate", "POST", f"/api/sessions/{sid}/validate", params={"state_id": state_id}, timeout=120)
             if vr is not None and vr.status_code == 200:
                 (run_dir / "validate.json").write_text(json.dumps(vr.body, indent=2))
+            else:
+                # same reasoning: no validate.json reads as `not is_valid`, which is a product verdict the
+                # capture never actually obtained.
+                instrument["http_unrecovered"] = instrument["http_unrecovered"] or f"validate {vr.status_code if vr else 'timeout'}"
         # 6. paginated thread capture
         messages: list[dict[str, Any]] = []
         last_full = False
@@ -467,7 +491,8 @@ class Battery:
                 "local_skill_file_sha256": self.local_skill_hash,
                 "env_file_sha256": self.env_file_sha256,
                 "first_call_messages_hash": (first_call or {}).get("messages_hash"),
-                "server_version": st.get("version"),
+                # no server_version: /api/system/status carries no version key, so recording one only ever
+                # rendered a null. frontend_build is the real build fingerprint the endpoint does return.
                 "frontend_build": st.get("frontend_build"),
             },
         }
@@ -518,10 +543,15 @@ class Battery:
         self.round_dir.mkdir(parents=True, exist_ok=True)
         (self.round_dir / "firing.json").write_text(json.dumps(self._firing, indent=2))
 
+    def resume_skip(self, run_dir: Path) -> bool:
+        """True when ``--resume`` is on and this run's capture is already complete (spec §4: a resume never
+        re-fetches or overwrites a captured page). Public so the tripwire/probe wrappers honour --resume too."""
+        return self.resume and run_dir_is_complete(Path(run_dir))
+
     def _run_or_resume(self, case: str, repeat: int, prompt: str) -> str | None:
         run_dir = self.round_dir / case / str(repeat)
         label = self._label(case, repeat)
-        if self.resume and run_dir_is_complete(run_dir):
+        if self.resume_skip(run_dir):
             return self._verdict(run_dir, case)
         if self._fired_any:
             self._sleep(MIN_RUN_SPACING_S)
@@ -534,36 +564,51 @@ class Battery:
         try:
             return self._run_or_resume(case, repeat, prompt)
         except Exception as exc:  # containment is the point
-            run_dir.mkdir(parents=True, exist_ok=True)
-            for name, body in (("messages.json", "[]"), ("reviews.json", "[]")):
-                if not (run_dir / name).exists():
-                    (run_dir / name).write_text(body)
-            if not (run_dir / "meta.json").exists():
-                self._write_meta(
-                    run_dir,
-                    case=case,
-                    repeat=repeat,
-                    label=self._label(case, repeat),
-                    prompt=prompt,
-                    session_id=None,
-                    state_id=None,
-                    http=[],
-                    terminal={"budget_exhausted": None, "reason": None, "source": "none"},
-                    instrument={
-                        "truncated": False,
-                        "read_integrity": None,
-                        "http_unrecovered": f"driver exception: {exc!r}",
-                        "auth_failed": False,
-                        "review_rounds_exhausted": False,
-                    },
-                    messages=[],
-                )
-            return path_from_disk(run_dir).excluded
+            try:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                for name, body in (("messages.json", "[]"), ("reviews.json", "[]")):
+                    if not (run_dir / name).exists():
+                        (run_dir / name).write_text(body)
+                if not (run_dir / "meta.json").exists():
+                    self._write_meta(
+                        run_dir,
+                        case=case,
+                        repeat=repeat,
+                        label=self._label(case, repeat),
+                        prompt=prompt,
+                        session_id=None,
+                        state_id=None,
+                        http=[],
+                        terminal={"budget_exhausted": None, "reason": None, "source": "none"},
+                        instrument={
+                            "truncated": False,
+                            "read_integrity": None,
+                            "http_unrecovered": f"driver exception: {exc!r}",
+                            "auth_failed": False,
+                            "review_rounds_exhausted": False,
+                        },
+                        messages=[],
+                    )
+                return path_from_disk(run_dir).excluded
+            except Exception:
+                # a SECOND failure inside the handler (an unwritable dir, a partial capture the scorer cannot
+                # even reach a CaptureError on) must not escape either: fall back to the capture verdict
+                # without re-scoring. The round survives; the run is excluded and visible.
+                return "capture"
 
     def fire(
-        self, cases: Mapping[str, CorpusCase], *, tripwire: Callable[[Battery], None] | None, only: set[str] | None = None
+        self,
+        cases: Mapping[str, CorpusCase],
+        *,
+        tripwire: Callable[[Battery], None] | None,
+        preflight: Callable[[], None] | None = None,
+        only: set[str] | None = None,
     ) -> dict[str, Any]:
         self._firing["started_at"] = self._firing["started_at"] or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # The classifier-drift check runs BEFORE the canary: it is a config failure, and discovering it after
+        # ten canary runs (once the tripwire fires) would spend the canary to learn the round cannot be read.
+        if preflight is not None:
+            preflight()
         self._prime_status()  # once up front; main() already primes too (idempotent) and surfaces a hard failure separately
         selected = {n: c for n, c in cases.items() if only is None or n in only}
         streak: list[str | None] = []  # shared across canary AND corpus runs: instrument failures don't reset at the seam
@@ -579,7 +624,11 @@ class Battery:
                     self._record_flush()
                     return self._firing
         if tripwire is not None:
-            tripwire(self)
+            try:
+                tripwire(self)
+            except Exception as exc:  # same containment a run gets: a multi-hour round never dies on one traceback
+                self._firing["tripwire_error"] = repr(exc)
+                self._record_flush()
         corpus_names = sorted(n for n in selected if n != "canary")
         per_case: dict[str, list[str | None]] = {n: [] for n in corpus_names}
         total = excluded_n = 0
@@ -610,20 +659,42 @@ class Battery:
         self.round_dir.mkdir(parents=True, exist_ok=True)
         (self.round_dir / "firing.json").write_text(json.dumps(self._firing, indent=2))
 
+    def _safe_request(self, method: str, path: str, **kw: Any) -> HttpResponse | None:
+        """The step/error seam without a run to attach to: a timeout or transport failure is None, never a raise."""
+        try:
+            return self.client.request(method, path, **kw)
+        except (HttpTimeout, HttpTransportError):
+            return None
+
     def cleanup(self) -> list[str]:
-        r = self.client.request("GET", "/api/sessions", timeout=60)
+        """Delete this round's sessions whose capture is complete — corpus runs (``<case>/<n>``) AND the
+        tripwire/probe runs (``_tripwire/<fixture>/1``, ``_probe/<fixture>/<arm>``), which carry three path
+        segments after the prefix. Paginates: the route defaults to 50 and caps at 200, so an unpaginated read
+        left most of a 95-run round's sessions behind."""
         deleted: list[str] = []
         prefix = f"battery/{self.round}/"
-        for s in r.body or []:
-            title = str(s.get("title") or "")
-            if not title.startswith(prefix):
-                continue
-            rest = title[len(prefix) :].split("/")
-            if len(rest) != 2 or not run_dir_is_complete(self.round_dir / rest[0] / rest[1]):
-                continue
-            d = self.client.request("DELETE", f"/api/sessions/{s['id']}", timeout=30)
-            if d.status_code in (200, 204):
-                deleted.append(str(s["id"]))
+        offset = 0
+        for _ in range(MAX_PAGES):
+            r = self._safe_request("GET", "/api/sessions", params={"limit": SESSION_PAGE, "offset": offset}, timeout=60)
+            if r is None or r.status_code != 200 or not isinstance(r.body, list):
+                break  # a non-200 body is a dict: iterating it would yield strings, not sessions
+            for s in r.body:
+                if not isinstance(s, Mapping) or not s.get("id"):
+                    continue
+                title = str(s.get("title") or "")
+                if not title.startswith(prefix):
+                    continue
+                rest = title[len(prefix) :].split("/")
+                if len(rest) not in (2, 3) or any(part in ("", ".", "..") for part in rest):
+                    continue  # a title is server-supplied text: never let it address a directory of its choosing
+                if not run_dir_is_complete(self.round_dir.joinpath(*rest)):
+                    continue
+                d = self._safe_request("DELETE", f"/api/sessions/{s['id']}", timeout=30)
+                if d is not None and d.status_code in (200, 204):
+                    deleted.append(str(s["id"]))
+            if len(r.body) < SESSION_PAGE:
+                break
+            offset += SESSION_PAGE
         return deleted
 
 
@@ -664,7 +735,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--runs-dir", default=str(REPO / "evals/composer-battery/runs"))
     ns = ap.parse_args(argv)
 
-    from planner_probe import run_probe, run_tripwire  # local import: same directory
+    from evals.lib.battery_planner import ProbeUnpaired
+    from planner_probe import run_probe, run_tripwire, tripwire_preflight  # local import: same directory
 
     version, cases = load_corpus()
     try:
@@ -673,6 +745,13 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"config: {exc}", file=sys.stderr)
         return 64
+    only = set(ns.cases.split(",")) if ns.cases else None
+    if only is not None:
+        # before the network: a typo'd case name used to fire nothing and exit 0 — a silently empty round
+        unknown = sorted(only - set(cases))
+        if unknown:
+            print(f"config: unknown --cases: {', '.join(unknown)}", file=sys.stderr)
+            return 64
     battery = Battery(
         RequestsClient(ns.base),
         base=ns.base,
@@ -696,11 +775,23 @@ def main(argv: list[str] | None = None) -> int:
     if ns.cleanup_only:
         print(f"cleanup deleted {len(battery.cleanup())} sessions", file=sys.stderr)
         return 0
-    only = set(ns.cases.split(",")) if ns.cases else None
     if ns.probe:
-        run_probe(battery)
+        try:
+            run_probe(battery)
+        except ProbeUnpaired as exc:
+            print(f"probe pairing: {exc}", file=sys.stderr)
+            return 64
         return 0
-    doc = battery.fire(cases, tripwire=None if ns.no_tripwire else run_tripwire, only=only)
+    try:
+        doc = battery.fire(
+            cases,
+            tripwire=None if ns.no_tripwire else run_tripwire,
+            preflight=None if ns.no_tripwire else tripwire_preflight,
+            only=only,
+        )
+    except ProbeUnpaired as exc:
+        print(f"tripwire preflight: {exc}", file=sys.stderr)
+        return 64
     if ns.cleanup:
         print(f"cleanup deleted {len(battery.cleanup())} sessions", file=sys.stderr)
     print(
@@ -708,6 +799,7 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "aborted": doc["aborted"],
                 "abort_reason": doc["abort_reason"],
+                "tripwire_error": doc["tripwire_error"],
                 "completed": len(doc["completed"]),
                 "case_flags": doc["case_flags"],
             }

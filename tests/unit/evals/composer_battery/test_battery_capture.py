@@ -75,6 +75,22 @@ def test_missing_messages_is_a_capture_error(tmp_path: Path) -> None:
         load_capture(tmp_path)
 
 
+def test_non_object_message_elements_are_a_capture_error_not_an_attribute_error(tmp_path: Path) -> None:
+    """The element TYPE is part of the contract: every accessor calls ``m.get(...)``, so a list of scalars
+    used to escape as an AttributeError through ``path_from_disk`` — which is documented "never raises" and is
+    the driver's containment seam and the report's whole-round scoring loop."""
+    from evals.lib.battery_score import path_from_disk
+
+    (tmp_path / "meta.json").write_text(json.dumps(tg.meta()))
+    (tmp_path / "messages.json").write_text("[1, 2, 3]")
+    with pytest.raises(CaptureError, match="must be an object"):
+        load_capture(tmp_path)
+    assert path_from_disk(tmp_path).excluded == "capture"
+    (tmp_path / "messages.json").write_text(json.dumps([tg.user_row(1), "not a row"]))
+    with pytest.raises(CaptureError, match="must be an object"):
+        load_capture(tmp_path)
+
+
 def test_instrument_contract_is_closed() -> None:
     assert set(INSTRUMENT_KEYS) == {"truncated", "read_integrity", "http_unrecovered", "auth_failed", "review_rounds_exhausted"}
     good = {"instrument": Instrument(truncated=True).to_dict()}
