@@ -90,6 +90,18 @@ def instrument_exclusion(instrument: Instrument, post_status: int | None) -> tup
     return None, None
 
 
+def captured_is_valid(capture: Capture) -> bool | None:
+    """Did the captured run's final composition state validate? ``None`` = never asked, NOT invalid.
+
+    Surface-agnostic, and shared for the same reason as ``instrument_exclusion``: a planner arm that declines
+    the loop-only ``score_path`` would otherwise be graded without the validity check the loop arm is charged
+    for — a bias in the one comparison the paired probe exists to make.
+    """
+    if isinstance(capture.validate, Mapping) and "is_valid" in capture.validate:
+        return bool(capture.validate["is_valid"])
+    return None
+
+
 SEVERITY: dict[str, str] = {
     "excess_discovery": "soft",
     "schema_fumble": "soft",
@@ -359,9 +371,7 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
     ends = [t for t in (_parse_ts(c.finished_at) for c in calls) if t]
     wall_ms = int((max(ends) - min(starts)).total_seconds() * 1000) if starts and ends else 0
 
-    is_valid: bool | None = None
-    if isinstance(capture.validate, Mapping) and "is_valid" in capture.validate:
-        is_valid = bool(capture.validate["is_valid"])
+    is_valid = captured_is_valid(capture)
     state = capture.state if isinstance(capture.state, Mapping) else None
     state_empty = state is None or (
         not (state.get("sources") or state.get("source")) and not state.get("nodes") and not state.get("outputs")
@@ -695,6 +705,7 @@ __all__ = [
     "Deviation",
     "PathScore",
     "Score",
+    "captured_is_valid",
     "instrument_exclusion",
     "judge",
     "path_from_disk",

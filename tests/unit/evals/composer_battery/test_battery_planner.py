@@ -12,6 +12,10 @@ from tests.unit.evals.composer_battery import threadgen as tg
 
 FC = pp.load_fixture("fork_coalesce")
 ARGS = FC["canonical_arguments"]
+_PENDING = {
+    "proposals": [{"id": "p1", "status": "pending", "tool_name": "set_pipeline", "arguments_redacted_json": copy.deepcopy(ARGS)}],
+    "events": [],
+}
 
 
 def _write(
@@ -153,6 +157,19 @@ def test_a_captured_planner_terminal_outranks_an_http_exclusion(tmp_path: Path) 
     r = pp.score_arm(tmp_path / "P", "fork_coalesce", "P")
     assert r.excluded is None and not r.clean
     assert r.planner_codes == {"MALFORMED_RESPONSE": 1} and r.triage == {"model": 1}
+
+
+def test_a_planner_arm_that_stages_an_invalid_pipeline_is_not_clean(tmp_path: Path) -> None:
+    """``is_valid`` is a surface-agnostic fact that only the loop branch read (via ``score_path``), so a planner
+    arm staging a pipeline the validator REJECTS scored clean. In a paired probe that biases the comparison
+    toward the planner — the arm graded without the check wins on a defect the other arm is charged for."""
+    _write(tmp_path / "P", _planner_thread(), state={"id": "s", "version": 2, **copy.deepcopy(ARGS)}, is_valid=False)
+    r = pp.score_arm(tmp_path / "P", "fork_coalesce", "P")
+    assert r.staged_topology_ok is True and not r.accepted_terminal and not r.clean
+    # absent validation is NOT evidence of invalidity: a review-mode staging commits no state to validate
+    _write(tmp_path / "P2", _planner_thread(staged=PIPELINE_STAGED_REVIEW_MESSAGE), state=None, is_valid=None, proposals=_PENDING)
+    r2 = pp.score_arm(tmp_path / "P2", "fork_coalesce", "P")
+    assert r2.accepted_terminal and r2.clean
 
 
 def test_tripwire_reports_an_instrument_exclusion_instead_of_a_topology_failure(tmp_path: Path) -> None:

@@ -111,19 +111,44 @@ format removed the csv/json source variance. Every non-clean run's only
 deviation was `unattributed_excess`; no detours, repairs or backtracks in
 this block. Post-calibration canary floor: **2, confirmed reachable.**
 
-**Tripwire FAILS 3/3 — a product finding, not an instrument one.** Routing is
-correct (`surface: planner` 3/3, so the pair-routing precondition holds), but
-no arm stages a candidate: `error_routing` runs ten consecutive
-`discovery_executed` attempts to the discovery-budget ceiling and is
-cancelled; `fork_coalesce` and `linear_transform` degenerate into prose and
-`malformed_response`. Filed as **elspeth-c18073bd8f** (P1) with the capture
-paths. Secondary instrument gap recorded in the same ticket: `server_terminal`
-is null/`source: none` even where the discovery budget was demonstrably
-exhausted, so the driver's terminal capture does not describe a
-planner-surface termination.
+**Tripwire FAILS 3/3.** Routing is correct (`surface: planner` 3/3, so the
+pair-routing precondition holds), but no arm stages a candidate.
 
-The tripwire is therefore RED for reasons outside the battery. It should stay
-red — that is what it is for — and the corpus firing may proceed, because the
-tripwire measures the planner surface and the corpus measures the loop.
+> **CORRECTED 2026-08-17.** This block originally read "a product finding, not
+> an instrument one", and attributed `error_routing` to the discovery budget.
+> Re-reading the captures falsifies both claims. **All three arms died at the
+> edge**: `meta.http` records `post_message` 524 / 524 / 502 and the driver
+> flagged `instrument.http_unrecovered` on every one. The two 524s land at
+> 125.0 s and 125.0 s of cumulative provider latency, and `linear_transform`
+> reached that after only 2 planner attempts — nowhere near the 10-turn
+> discovery budget — so the terminator is a wall-clock cut, not a budget.
+> The `_tripwire` scorer did not consult those flags (fixed in `65d551ee5`),
+> which is why an aborted read was reported as `topology: no committed state`.
+>
+> The cut is Cloudflare's, in front of `elspeth.foundryside.dev` (`server:
+> cloudflare` on any response; Caddy configures no timeout and the origin
+> allows 600 s). Ten canary runs in the same hour returned 200 in 25–41 s and
+> never came near it. **The planner surface is not reachable through the
+> public hostname**: its normal duration exceeds the edge budget, so the run
+> is killed mid-loop having staged nothing — for a real operator exactly as
+> for the battery. That is the P1, and it is a deployment defect, not the
+> "planner declines to stage" defect originally filed.
+>
+> What SURVIVES as genuine planner signal, unaffected by the truncation:
+> `fork_coalesce` reached its own terminal before its 502 — prose ×3 →
+> `MALFORMED_RESPONSE`, nothing staged; and `error_routing` burned all ten
+> discovery turns in 68 s with every attempt `led_to: continue`, selecting
+> `explain_validation_error` twice on a session with no validation error and
+> `get_plugin_assistance` four times, with `repeated_fingerprint` never
+> firing. Those are real and still want investigation.
+>
+> The "secondary instrument gap" (`server_terminal` null / `source: none`) is
+> explained, not a shape mismatch: on a ≥500 the driver does not fetch
+> `/composer-progress` (only the client-timeout branch does), and an aborted
+> run has no terminal to report in any case.
+
+The tripwire is therefore RED, and the corpus firing may still proceed —
+the tripwire measures the planner surface, the corpus measures the loop, and
+the loop's 10/10 clean 200s are direct evidence the edge does not touch it.
 
 Probe reading (§7): (not yet fired — `--probe`).

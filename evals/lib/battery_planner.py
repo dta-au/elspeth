@@ -36,7 +36,7 @@ from evals.lib.battery_capture import (
     planner_attempts,
     tool_outcomes,
 )
-from evals.lib.battery_score import instrument_exclusion, score_path, surface_of
+from evals.lib.battery_score import captured_is_valid, instrument_exclusion, score_path, surface_of
 from evals.lib.battery_topology import topologies_match, topology_from_pipeline
 
 REPO = Path(__file__).resolve().parents[2]
@@ -202,7 +202,11 @@ def score_arm(run_dir: Path, fixture: str, arm: str) -> ArmResult:
         if any(a.repeated_fingerprint for a in attempts):
             codes["repeated_fingerprint"] += 1
         triage = Counter(triage_code(c) for c in codes.elements())
-        accepted = accepted_idx is not None
+        # A staged pipeline the validator REJECTED is not an accepted terminal. Absent validation is not
+        # evidence of invalidity, though: a review-mode staging commits no state for `validate` to run against,
+        # which is why this is `is not False` and not the loop branch's `bool(...)` (there, an APPLIED mutation
+        # always leaves a committed state, so a missing verdict really is a missing capture).
+        accepted = accepted_idx is not None and captured_is_valid(cap) is not False
         deviations = sorted(codes)
         if excluded == "http" and any(a.led_to != "continue" for a in attempts):
             # A captured planner DECISION (`done`/`terminal`) outranks a delivery failure — the same rule the loop
