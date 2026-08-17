@@ -9,11 +9,42 @@
 /* ---------------------------------------------------------------------------
    App Root & Alert Banners
    --------------------------------------------------------------------------- */
+/* The band along the top is RESERVED for the app-level overlay strips
+   (.app-notice-center in styles/shared.css, .run-outcome-notice-overlay in
+   execution.css), which are fixed at top: 0 and one --size-control tall.
+
+   Why reserve instead of letting them overlay (elspeth-1c4687ff67 follow-up):
+   those strips were taken out of flow so a notice's arrival would stop
+   displacing the whole viewport, but at top: 0 the 44px opaque bar covered the
+   header outright — the session switcher, version control and account menu all
+   sat inside its band, elementFromPoint returned the bar, and none of them
+   could be clicked while any notice was up.
+
+   Reserving is the only escape that keeps the no-shift contract. Seating the
+   strips BELOW the header instead was measured and rejected: there is no 44px
+   band anywhere in this layout that is neither chrome nor content the operator
+   must reach — header, then the artifact tab strip immediately under it, then
+   the workspace action bar at the bottom — so a full-width pinned strip always
+   covers something. Offsetting merely moved the occlusion onto Graph/Spec/
+   YAML/Run.
+
+   The reserve is the STRIP's height (a constant), not the header's (which is
+   40/37/45/~130px across the wrap and compact rules), so no measurement is
+   involved. It is unconditional because making it conditional on a notice
+   being mounted reintroduces exactly the arrival/dismiss shift
+   elspeth-1c4687ff67 removed. */
 .app-root {
   display: flex;
   flex-direction: column;
   height: 100vh;
   height: 100dvh;
+  padding-top: var(--size-control);
+}
+
+/* The shared-inspect route renders neither the header nor either overlay strip
+   (App.tsx short-circuits before both), so there is nothing to reserve for. */
+.app-root--shared-inspect {
+  padding-top: 0;
 }
 
 .alert-banner {

@@ -268,9 +268,11 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
     "Identity hook beside the defined .composing-row; also the base the " +
     "defined .composing-indicator--terminal compound builds on, and " +
     "ChatPanel.test.tsx queries it as a selector.",
-  "app-root--shared-inspect":
-    "Route marker beside the defined .app-root, which supplies the shell " +
-    "layout; kept so a future shared-inspect stylesheet can scope to it.",
+  // "app-root--shared-inspect" was here as a route marker "kept so a future
+  // shared-inspect stylesheet can scope to it". That future arrived: it now
+  // carries a real rule (header.css) cancelling the shell's top reserve, which
+  // the shared-inspect route has nothing to reserve for — it renders neither
+  // the header nor either overlay strip.
   "audit-readiness--shared":
     "Read-only variant marker beside the defined .audit-readiness; the " +
     "shared panel deliberately renders identically to the composer's.",

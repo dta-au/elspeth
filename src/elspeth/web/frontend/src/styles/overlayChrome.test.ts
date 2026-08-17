@@ -238,6 +238,27 @@ describe("the notice bar overlays the app instead of displacing it (elspeth-1c46
     expect(winningValue(".app-notice-center", "position")).toBe("fixed");
   });
 
+  it("reserves the strip's band at the top of the app shell", () => {
+    // The strips are fixed at top: 0 and one --size-control tall, so without a
+    // matching reserve on .app-root the bar covers the header: every header
+    // control sat inside its band and elementFromPoint returned the bar, so
+    // none of them could be clicked while a notice was up. Seating the strips
+    // below the header instead was measured and rejected — it moved the
+    // occlusion onto the artifact tab strip. The reserve must stay the STRIP's
+    // height and stay unconditional; making it conditional on a notice being
+    // mounted reintroduces the arrival/dismiss shift elspeth-1c4687ff67 removed.
+    expect(winningValue(".app-notice-center", "top")).toBe("0");
+    expect(
+      winningValue(".app-notice-center", "height"),
+      "the wrapper takes its height from the strip it holds",
+    ).toBeNull();
+    expect(winningValue(".app-root", "padding-top")).toBe("var(--size-control)");
+    expect(
+      winningValue(".app-notice-primary.alert-banner", "height"),
+      "the reserve is only correct while the strip is exactly that tall",
+    ).toBe("var(--size-control)");
+  });
+
   it("stacks it on a tokenised band above page chrome and below dialogs", () => {
     const zIndex = winningValue(".app-notice-center", "z-index");
     expect(zIndex).toMatch(/^var\(--z-[\w-]+\)$/);
