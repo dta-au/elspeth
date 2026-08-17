@@ -2765,3 +2765,58 @@ def test_assessment_wrapper_precedes_ambient_pythonpath_packages(tmp_path: Path)
     assert result.returncode == 0, result.stderr
     assert "usage:" in result.stdout
     assert not marker.exists()
+
+
+def test_init_full_publishes_package_with_reviewed_permissions(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    """Pin the published package permissions reviewed for CodeQL 1244/1245.
+
+    ``initialize_full`` reserves the destination at 0o700 so a half-built
+    package is never observable, then publishes it at 0o755 (5afd0e21e). The
+    two mode literals are what CodeQL's ``py/overly-permissive-file`` flags;
+    the dismissal rests on two facts, pinned here under a deliberately
+    restrictive umask so neither assertion depends on the developer's:
+
+    * the directory is published at exactly 0o755 — the standard traversable
+      mode for a directory in a git working tree, and never wider;
+    * the completion marker's 0o644 literal is a ceiling, not a grant. The
+      process umask masks ``os.open`` modes, so a restrictive umask still
+      yields 0o600 and the literal grants nothing on its own.
+
+    Both umasks are exercised because neither alone is sufficient: a
+    restrictive umask proves the marker literal is masked but would hide a
+    widening of that literal to 0o666, while an empty umask pins the literal
+    itself. Widening either mode — group/other write especially —
+    invalidates that dismissal, so re-open the alerts rather than
+    re-dismissing them.
+    """
+    repository, _assessment_path = assessment_repository
+    initialize_full = _assessment_namespace()["initialize_full"]
+
+    def publish(name: str, umask: int) -> tuple[int, int]:
+        destination = repository / "docs/architecture/state_engine/assessments" / name
+        previous_umask = os.umask(umask)
+        try:
+            initialize_full(
+                name,
+                destination,
+                Path("docs/architecture/state_engine/proof-catalog/v2/catalog.json"),
+            )
+        finally:
+            os.umask(previous_umask)
+        marker = destination / ".state-engine-assessment.ready"
+        return destination.stat().st_mode & 0o777, marker.stat().st_mode & 0o777
+
+    restrictive_directory, restrictive_marker = publish("permissions-restrictive", 0o077)
+    permissive_directory, permissive_marker = publish("permissions-permissive", 0o000)
+
+    # chmod is not umask-masked: the published directory mode is the literal.
+    assert restrictive_directory == 0o755
+    assert permissive_directory == 0o755
+    # os.open modes are umask-masked: 0o644 is a ceiling, not a grant.
+    assert restrictive_marker == 0o600
+    assert permissive_marker == 0o644
+    # No group or other write bit is ever granted, under any umask.
+    for mode in (restrictive_directory, permissive_directory, restrictive_marker, permissive_marker):
+        assert mode & 0o022 == 0

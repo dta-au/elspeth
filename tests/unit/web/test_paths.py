@@ -133,3 +133,57 @@ class TestSessionOwnedLocalPaths:
         allowed = allowed_sink_directories(str(tmp_path), session_id="sess-a")
 
         assert not any(resolved.is_relative_to(directory) for directory in allowed)
+
+
+TRAVERSAL_PAYLOADS = (
+    "../../etc/passwd",
+    "/etc/passwd",
+    "outputs/../../../etc/passwd",
+    "outputs/./../../etc/shadow",
+    "outputs/../../blobs/sess-b/secret.csv",
+    "outputs/sess-a/../../sess-b/report.csv",
+)
+
+
+class TestResolutionNeverAdoptsAnEscapingPath:
+    """The containment invariant every caller of these resolvers depends on.
+
+    These resolvers deliberately do NOT block traversal — they canonicalize,
+    and the caller decides containment with ``is_relative_to`` against
+    ``allowed_*_directories``. That split is only safe while resolution never
+    *adopts* an escaping value into the allowlist, so this class pins the
+    property rather than the caller's check.
+
+    It is also the standing evidence behind the dismissal of CodeQL alerts
+    1241/1242/1243 (``py/path-injection`` at ``paths.py`` lines 39/41/124),
+    which flag the ``Path.resolve()`` calls below as taint sinks. The flagged
+    call is the normalization step the containment check depends on: it reads
+    no file content and creates nothing, and every caller checks containment
+    on its result before any real filesystem access. If a change makes one of
+    these assertions fail, that dismissal is no longer true and the alerts
+    must be re-opened rather than re-dismissed.
+    """
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_sink_traversal_never_resolves_inside_the_allowlist(self, payload: str) -> None:
+        resolved = resolve_sink_data_path(payload, "/tmp/data", session_id="sess-a")
+        allowed = allowed_sink_directories("/tmp/data", session_id="sess-a")
+
+        assert not any(resolved.is_relative_to(directory) for directory in allowed)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_source_traversal_never_resolves_inside_the_allowlist(self, payload: str) -> None:
+        resolved = resolve_data_path(payload, "/tmp/data")
+        allowed = allowed_source_directories("/tmp/data", session_id="sess-a")
+
+        assert not any(resolved.is_relative_to(directory) for directory in allowed)
+
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    def test_traversal_without_a_session_identity_has_no_allowed_target(self, payload: str) -> None:
+        """Fail-closed: with no session identity the allowlist is empty, so no
+        resolved value — escaping or not — can ever be contained."""
+        resolved = resolve_sink_data_path(payload, "/tmp/data", session_id=None)
+        allowed = allowed_sink_directories("/tmp/data", session_id=None)
+
+        assert not any(resolved.is_relative_to(directory) for directory in allowed)
+        assert allowed == ()
