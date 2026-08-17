@@ -43,6 +43,27 @@ from elspeth.web.validation import (
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _MIN_NON_LOCAL_JWT_SECRET_KEY_BYTES = 32
+# The transport idle ceiling is the SMALLEST idle/read timeout of EVERY hop in
+# front of this process, not just the reverse proxy the deployment configures.
+# It is a DECLARED value — nothing here can measure it — so a declaration that
+# names one hop and misses another silently makes the wall-clock guard below
+# vacuous, which is the failure it exists to prevent.
+#
+# Derive it, do not type it. The ECS path does this correctly:
+# `deploy/aws-ecs/terraform/modules/scenario/locals.tf` wires
+# ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS to
+# `var.alb_idle_timeout_seconds` — the ALB's own configured idle timeout — with a
+# plan-time cap and a test pinning the mirror. A deployment that cannot bind the
+# value to real proxy config must enumerate the hops by hand and take the MINIMUM.
+#
+# Measured failure (2026-08-17, elspeth-ad5628ecda): the bare-metal deployment
+# declared 660.0 on the reasoning that Caddy configures no response timeout —
+# true, and irrelevant, because that host also sits behind Cloudflare, which cut
+# composer requests at 125s. The guard passed against a ceiling 5x higher than
+# reality and the proxy abort it exists to stay ahead of happened anyway: the
+# origin's structured terminal was never reached, the client got a bare gateway
+# error, and an in-flight run with ~475s of its budget left was destroyed.
+# A CDN in front of the reverse proxy is the hop most likely to be missed.
 _DEFAULT_COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS = 300.0
 _DEFAULT_COMPOSER_TRANSPORT_HEADROOM_SECONDS = 30.0
 # Conservative planning floor for one authoring turn (LLM call + tool work).
@@ -276,6 +297,16 @@ class WebSettings(BaseModel):
     composer_transport_idle_ceiling_seconds: float = Field(
         default=_DEFAULT_COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS,
         gt=0,
+        description=(
+            "Smallest idle/read timeout of EVERY hop in front of this process — "
+            "CDN, load balancer, and reverse proxy — not just the one this "
+            "deployment configures. Bind it to real proxy config where you can "
+            "(the ECS module wires it to the ALB idle timeout); otherwise "
+            "enumerate every hop and take the minimum. Declaring a ceiling "
+            "higher than reality does not raise it: it only makes the "
+            "wall-clock guard vacuous, so the proxy aborts the request before "
+            "the composer can return its structured terminal."
+        ),
     )
     composer_transport_headroom_seconds: float = Field(
         default=_DEFAULT_COMPOSER_TRANSPORT_HEADROOM_SECONDS,
@@ -965,7 +996,16 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_composer_timeout_transport_headroom(self) -> WebSettings:
-        """Keep composer wall-clock failures ahead of browser/proxy aborts."""
+        """Keep composer wall-clock failures ahead of browser/proxy aborts.
+
+        This validates against the DECLARED ceiling, which nothing here can
+        measure. It is therefore only as good as that declaration: a ceiling
+        naming one hop while another sits in front passes this check and still
+        loses the race it exists to win (elspeth-ad5628ecda — see the
+        derivation rule on ``_DEFAULT_COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS``).
+        When diagnosing a gateway error on a long compose, suspect the declared
+        ceiling before the guard.
+        """
         max_backend_timeout_seconds = self.composer_transport_idle_ceiling_seconds - self.composer_transport_headroom_seconds
         if max_backend_timeout_seconds <= 0:
             raise ValueError("composer_transport_headroom_seconds must be less than composer_transport_idle_ceiling_seconds")
