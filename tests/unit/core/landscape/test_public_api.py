@@ -16,8 +16,11 @@ def test_landscape_root_does_not_export_raw_schema_tables() -> None:
     assert schema.tokens_table is not None
     assert schema.token_outcomes_table is not None
 
-    missing = object()
-    leaked_names = [name for name in raw_schema_names if getattr(landscape, name, missing) is not missing]
+    # ``vars(landscape)`` is the module's own namespace: a raw schema object that
+    # leaked into the facade appears there. Inspecting the namespace directly
+    # states the invariant without a sentinel-defaulted attribute probe.
+    module_namespace = vars(landscape)
+    leaked_names = [name for name in raw_schema_names if name in module_namespace]
     exported_names = [name for name in raw_schema_names if name in landscape.__all__]
     assert leaked_names == []
     assert exported_names == []

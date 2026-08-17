@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1683,9 +1684,18 @@ def test_incomplete_token_spec_rejects_empty_optional_string(field: str) -> None
         IncompleteTokenSpec(**kwargs)
 
 
-@pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id", "token_data_ref"])
-def test_incomplete_token_spec_accepts_none_optional_string(field: str) -> None:
+@pytest.mark.parametrize(
+    ("field", "read_field"),
+    (
+        pytest.param("branch_name", lambda spec: spec.branch_name, id="branch_name"),
+        pytest.param("fork_group_id", lambda spec: spec.fork_group_id, id="fork_group_id"),
+        pytest.param("join_group_id", lambda spec: spec.join_group_id, id="join_group_id"),
+        pytest.param("expand_group_id", lambda spec: spec.expand_group_id, id="expand_group_id"),
+        pytest.param("token_data_ref", lambda spec: spec.token_data_ref, id="token_data_ref"),
+    ),
+)
+def test_incomplete_token_spec_accepts_none_optional_string(field: str, read_field: Callable[[IncompleteTokenSpec], str | None]) -> None:
     kwargs = _valid_incomplete_token_spec_kwargs()
     kwargs[field] = None
     spec = IncompleteTokenSpec(**kwargs)
-    assert getattr(spec, field) is None
+    assert read_field(spec) is None

@@ -12,13 +12,16 @@ while the repo is tested directly.
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from _pytest.mark import ParameterSet
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.sql import Select, Update
 
 from elspeth.contracts import (
     BatchStatus,
@@ -344,7 +347,7 @@ class TestCompleteNodeStateCrashPaths:
                 original_execute = conn.execute
 
                 def patched_execute(stmt, *args: Any, **kwargs: Any):
-                    if getattr(stmt, "is_select", False):
+                    if isinstance(stmt, Select):
                         compiled = stmt.compile(dialect=conn.dialect, compile_kwargs={"render_postcompile": True})
                         statement = str(compiled)
                         if "FROM node_states" in statement and "node_states.state_id IN" in statement:
@@ -397,12 +400,15 @@ class TestCompleteNodeStateCrashPaths:
             original_execute = conn.execute
 
             def observed_execute(stmt: Any, *args: Any, **kwargs: Any) -> Any:
-                if getattr(stmt, "is_select", False) and "FROM node_states" in str(stmt):
-                    if getattr(stmt, "_for_update_arg", None) is not None:
+                # Narrow on the concrete SQLAlchemy statement types this repository
+                # issues; ``Select._for_update_arg`` is None unless with_for_update()
+                # was applied, so the prelock is read directly off the narrowed type.
+                if isinstance(stmt, Select) and "FROM node_states" in str(stmt):
+                    if stmt._for_update_arg is not None:
                         events.append(("lock", None))
                     else:
                         events.append(("read", None))
-                elif getattr(stmt, "is_update", False) and stmt.table is node_states_table:
+                elif isinstance(stmt, Update) and stmt.table is node_states_table:
                     events.append(("update", None))
                 return original_execute(stmt, *args, **kwargs)
 
@@ -2549,45 +2555,222 @@ class TestDelegationSignatureAlignment:
     drift from the repository.
     """
 
-    # Methods expected on RecorderFactory.execution (ExecutionRepository)
-    _DELEGATED_METHODS: ClassVar[list[str]] = [
-        "begin_node_state",
-        "complete_node_state",
-        "get_node_state",
-        "record_routing_event",
-        "record_routing_events",
-        "allocate_call_index",
-        "record_call",
-        "begin_operation",
-        "complete_operation",
-        "allocate_operation_call_index",
-        "record_operation_call",
-        "get_operation",
-        "get_operation_calls",
-        "get_operations_for_run",
-        "get_all_operation_calls_for_run",
-        "find_call_by_request_hash",
-        "get_call_response_data",
-        "create_batch",
-        "add_batch_member",
-        "update_batch_status",
-        "complete_batch",
-        "get_batch",
-        "get_batches",
-        "get_incomplete_batches",
-        "get_batch_members",
-        "get_all_batch_members_for_run",
-        "retry_batch",
-        "register_artifact",
-        "get_artifacts",
-    ]
+    # Every public ExecutionRepository method, paired with an explicit accessor for
+    # the factory side and the unbound repository function. Written out (rather
+    # than resolved by name) so a factory that stopped exposing a method raises
+    # AttributeError here; the coverage assertion below keeps the table pinned to
+    # the live class, so a newly added repository method fails until it is listed.
+    _DELEGATED_METHODS: ClassVar[tuple[ParameterSet, ...]] = (
+        pytest.param(
+            "begin_node_state", lambda execution: execution.begin_node_state, ExecutionRepository.begin_node_state, id="begin_node_state"
+        ),
+        pytest.param(
+            "complete_node_state",
+            lambda execution: execution.complete_node_state,
+            ExecutionRepository.complete_node_state,
+            id="complete_node_state",
+        ),
+        pytest.param("get_node_state", lambda execution: execution.get_node_state, ExecutionRepository.get_node_state, id="get_node_state"),
+        pytest.param(
+            "record_routing_event",
+            lambda execution: execution.record_routing_event,
+            ExecutionRepository.record_routing_event,
+            id="record_routing_event",
+        ),
+        pytest.param(
+            "record_routing_events",
+            lambda execution: execution.record_routing_events,
+            ExecutionRepository.record_routing_events,
+            id="record_routing_events",
+        ),
+        pytest.param(
+            "allocate_call_index",
+            lambda execution: execution.allocate_call_index,
+            ExecutionRepository.allocate_call_index,
+            id="allocate_call_index",
+        ),
+        pytest.param("record_call", lambda execution: execution.record_call, ExecutionRepository.record_call, id="record_call"),
+        pytest.param(
+            "begin_operation", lambda execution: execution.begin_operation, ExecutionRepository.begin_operation, id="begin_operation"
+        ),
+        pytest.param(
+            "complete_operation",
+            lambda execution: execution.complete_operation,
+            ExecutionRepository.complete_operation,
+            id="complete_operation",
+        ),
+        pytest.param(
+            "allocate_operation_call_index",
+            lambda execution: execution.allocate_operation_call_index,
+            ExecutionRepository.allocate_operation_call_index,
+            id="allocate_operation_call_index",
+        ),
+        pytest.param(
+            "record_operation_call",
+            lambda execution: execution.record_operation_call,
+            ExecutionRepository.record_operation_call,
+            id="record_operation_call",
+        ),
+        pytest.param("get_operation", lambda execution: execution.get_operation, ExecutionRepository.get_operation, id="get_operation"),
+        pytest.param(
+            "get_operation_calls",
+            lambda execution: execution.get_operation_calls,
+            ExecutionRepository.get_operation_calls,
+            id="get_operation_calls",
+        ),
+        pytest.param(
+            "get_operations_for_run",
+            lambda execution: execution.get_operations_for_run,
+            ExecutionRepository.get_operations_for_run,
+            id="get_operations_for_run",
+        ),
+        pytest.param(
+            "get_all_operation_calls_for_run",
+            lambda execution: execution.get_all_operation_calls_for_run,
+            ExecutionRepository.get_all_operation_calls_for_run,
+            id="get_all_operation_calls_for_run",
+        ),
+        pytest.param(
+            "find_call_by_request_hash",
+            lambda execution: execution.find_call_by_request_hash,
+            ExecutionRepository.find_call_by_request_hash,
+            id="find_call_by_request_hash",
+        ),
+        pytest.param(
+            "get_call_response_data",
+            lambda execution: execution.get_call_response_data,
+            ExecutionRepository.get_call_response_data,
+            id="get_call_response_data",
+        ),
+        pytest.param("create_batch", lambda execution: execution.create_batch, ExecutionRepository.create_batch, id="create_batch"),
+        pytest.param(
+            "add_batch_member", lambda execution: execution.add_batch_member, ExecutionRepository.add_batch_member, id="add_batch_member"
+        ),
+        pytest.param(
+            "update_batch_status",
+            lambda execution: execution.update_batch_status,
+            ExecutionRepository.update_batch_status,
+            id="update_batch_status",
+        ),
+        pytest.param("complete_batch", lambda execution: execution.complete_batch, ExecutionRepository.complete_batch, id="complete_batch"),
+        pytest.param("get_batch", lambda execution: execution.get_batch, ExecutionRepository.get_batch, id="get_batch"),
+        pytest.param("get_batches", lambda execution: execution.get_batches, ExecutionRepository.get_batches, id="get_batches"),
+        pytest.param(
+            "get_incomplete_batches",
+            lambda execution: execution.get_incomplete_batches,
+            ExecutionRepository.get_incomplete_batches,
+            id="get_incomplete_batches",
+        ),
+        pytest.param(
+            "get_batch_members",
+            lambda execution: execution.get_batch_members,
+            ExecutionRepository.get_batch_members,
+            id="get_batch_members",
+        ),
+        pytest.param(
+            "get_all_batch_members_for_run",
+            lambda execution: execution.get_all_batch_members_for_run,
+            ExecutionRepository.get_all_batch_members_for_run,
+            id="get_all_batch_members_for_run",
+        ),
+        pytest.param("retry_batch", lambda execution: execution.retry_batch, ExecutionRepository.retry_batch, id="retry_batch"),
+        pytest.param(
+            "register_artifact",
+            lambda execution: execution.register_artifact,
+            ExecutionRepository.register_artifact,
+            id="register_artifact",
+        ),
+        pytest.param("get_artifacts", lambda execution: execution.get_artifacts, ExecutionRepository.get_artifacts, id="get_artifacts"),
+        pytest.param(
+            "begin_node_states_many",
+            lambda execution: execution.begin_node_states_many,
+            ExecutionRepository.begin_node_states_many,
+            id="begin_node_states_many",
+        ),
+        pytest.param(
+            "complete_aggregation_result",
+            lambda execution: execution.complete_aggregation_result,
+            ExecutionRepository.complete_aggregation_result,
+            id="complete_aggregation_result",
+        ),
+        pytest.param(
+            "complete_node_states_completed_many",
+            lambda execution: execution.complete_node_states_completed_many,
+            ExecutionRepository.complete_node_states_completed_many,
+            id="complete_node_states_completed_many",
+        ),
+        pytest.param(
+            "get_completed_row_ids_for_nodes",
+            lambda execution: execution.get_completed_row_ids_for_nodes,
+            ExecutionRepository.get_completed_row_ids_for_nodes,
+            id="get_completed_row_ids_for_nodes",
+        ),
+        pytest.param(
+            "get_max_node_state_attempts",
+            lambda execution: execution.get_max_node_state_attempts,
+            ExecutionRepository.get_max_node_state_attempts,
+            id="get_max_node_state_attempts",
+        ),
+        pytest.param(
+            "get_open_node_state_ids",
+            lambda execution: execution.get_open_node_state_ids,
+            ExecutionRepository.get_open_node_state_ids,
+            id="get_open_node_state_ids",
+        ),
+        pytest.param(
+            "get_released_row_ids_for_nodes",
+            lambda execution: execution.get_released_row_ids_for_nodes,
+            ExecutionRepository.get_released_row_ids_for_nodes,
+            id="get_released_row_ids_for_nodes",
+        ),
+        pytest.param(
+            "has_completed_row_for_node",
+            lambda execution: execution.has_completed_row_for_node,
+            ExecutionRepository.has_completed_row_for_node,
+            id="has_completed_row_for_node",
+        ),
+        pytest.param(
+            "has_released_row_for_node",
+            lambda execution: execution.has_released_row_for_node,
+            ExecutionRepository.has_released_row_for_node,
+            id="has_released_row_for_node",
+        ),
+        pytest.param(
+            "reconcile_source_completions_from_scheduler",
+            lambda execution: execution.reconcile_source_completions_from_scheduler,
+            ExecutionRepository.reconcile_source_completions_from_scheduler,
+            id="reconcile_source_completions_from_scheduler",
+        ),
+        pytest.param(
+            "record_completed_node_state",
+            lambda execution: execution.record_completed_node_state,
+            ExecutionRepository.record_completed_node_state,
+            id="record_completed_node_state",
+        ),
+        pytest.param(
+            "record_completed_node_state_on",
+            lambda execution: execution.record_completed_node_state_on,
+            ExecutionRepository.record_completed_node_state_on,
+            id="record_completed_node_state_on",
+        ),
+    )
 
-    @pytest.mark.parametrize("method_name", _DELEGATED_METHODS)
-    def test_signature_alignment(self, method_name: str) -> None:
+    def test_delegation_table_covers_every_public_repository_method(self) -> None:
+        """The table above must name exactly ExecutionRepository's public methods."""
+        listed = {str(param.id) for param in self._DELEGATED_METHODS}
+        public = {name for name, value in vars(ExecutionRepository).items() if not name.startswith("_") and callable(value)}
+        assert listed == public, f"delegation table drifted: missing={public - listed}, extra={listed - public}"
+
+    @pytest.mark.parametrize(("method_name", "read_factory_method", "repo_method"), _DELEGATED_METHODS)
+    def test_signature_alignment(
+        self,
+        method_name: str,
+        read_factory_method: Callable[[ExecutionRepository], object],
+        repo_method: object,
+    ) -> None:
         """Method must exist on RecorderFactory.execution with correct signature."""
         factory = make_factory()
-        factory_method = getattr(factory.execution, method_name)
-        repo_method = getattr(ExecutionRepository, method_name)
+        factory_method = read_factory_method(factory.execution)
 
         factory_sig = inspect.signature(factory_method)
         repo_sig = inspect.signature(repo_method)

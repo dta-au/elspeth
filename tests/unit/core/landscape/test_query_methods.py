@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -2268,10 +2270,16 @@ class TestAuditRunStatusProjection:
 # =============================================================================
 
 
-def _grouped_by(items: list, key: str) -> dict[str, list]:
+def _grouped_by(items: list, key: Callable[[Any], str]) -> dict[str, list]:
+    """Group owned audit records by an explicit accessor.
+
+    The caller passes the accessor (``lambda token: token.row_id``) rather than a
+    field name, so the parent-id read is a direct attribute access on the owned
+    record type instead of a reflective lookup.
+    """
     grouped: dict[str, list] = {}
     for item in items:
-        grouped.setdefault(getattr(item, key), []).append(item)
+        grouped.setdefault(key(item), []).append(item)
     return grouped
 
 
@@ -2361,7 +2369,7 @@ class TestGetTokensForRows:
 
         tokens = factory.query.get_tokens_for_rows("run-1", ["row-a", "row-b"])
 
-        grouped = _grouped_by(tokens, "row_id")
+        grouped = _grouped_by(tokens, lambda token: token.row_id)
         for row_id in ("row-a", "row-b"):
             assert [t.token_id for t in grouped[row_id]] == [t.token_id for t in factory.query.get_tokens(row_id)]
 
@@ -2390,9 +2398,9 @@ class TestGetTokensForRows:
         factory.query._QUERY_CHUNK_SIZE = 1  # force one IN-chunk per row
 
         chunked = factory.query.get_tokens_for_rows("run-1", ["row-a", "row-b"])
-        assert _grouped_by(chunked, "row_id").keys() == _grouped_by(unchunked, "row_id").keys()
-        for row_id, group in _grouped_by(unchunked, "row_id").items():
-            assert [t.token_id for t in _grouped_by(chunked, "row_id")[row_id]] == [t.token_id for t in group]
+        assert _grouped_by(chunked, lambda token: token.row_id).keys() == _grouped_by(unchunked, lambda token: token.row_id).keys()
+        for row_id, group in _grouped_by(unchunked, lambda token: token.row_id).items():
+            assert [t.token_id for t in _grouped_by(chunked, lambda token: token.row_id)[row_id]] == [t.token_id for t in group]
 
 
 class TestGetTokenParentsForTokens:
@@ -2415,7 +2423,7 @@ class TestGetTokenParentsForTokens:
 
         parents = factory.query.get_token_parents_for_tokens(child_ids)
 
-        grouped = _grouped_by(parents, "token_id")
+        grouped = _grouped_by(parents, lambda parent: parent.token_id)
         assert set(grouped.keys()) == set(child_ids)
         for child_id in child_ids:
             assert [(p.parent_token_id, p.ordinal) for p in grouped[child_id]] == [
@@ -2457,7 +2465,7 @@ class TestGetNodeStatesForTokens:
 
         states = factory.query.get_node_states_for_tokens("run-1", ["tok-1", "tok-2"])
 
-        grouped = _grouped_by(states, "token_id")
+        grouped = _grouped_by(states, lambda state: state.token_id)
         for token_id in ("tok-1", "tok-2"):
             assert [s.state_id for s in grouped[token_id]] == [s.state_id for s in factory.query.get_node_states_for_token(token_id)]
         assert [s.state_id for s in grouped["tok-1"]] == ["st-1-early", "st-1-late"]
@@ -2504,8 +2512,8 @@ class TestGetTokenOutcomesForTokens:
 
         outcomes = factory.query.get_token_outcomes_for_tokens("run-1", ["tok-1", "tok-2"])
 
-        grouped = _grouped_by(outcomes, "token_id")
-        full = _grouped_by(factory.query.get_all_token_outcomes_for_run("run-1"), "token_id")
+        grouped = _grouped_by(outcomes, lambda outcome: outcome.token_id)
+        full = _grouped_by(factory.query.get_all_token_outcomes_for_run("run-1"), lambda outcome: outcome.token_id)
         assert grouped.keys() == full.keys()
         for token_id, group in full.items():
             assert [o.outcome_id for o in grouped[token_id]] == [o.outcome_id for o in group]
@@ -2557,8 +2565,8 @@ class TestGetSchedulerEventsForTokens:
 
         events = factory.query.get_scheduler_events_for_tokens("run-1", ["tok-1", "tok-2"])
 
-        grouped = _grouped_by(events, "token_id")
-        full = _grouped_by(factory.query.get_scheduler_events(run_id="run-1"), "token_id")
+        grouped = _grouped_by(events, lambda event: event.token_id)
+        full = _grouped_by(factory.query.get_scheduler_events(run_id="run-1"), lambda event: event.token_id)
         assert grouped.keys() == full.keys()
         for token_id, group in full.items():
             assert [e.event_id for e in grouped[token_id]] == [e.event_id for e in group]

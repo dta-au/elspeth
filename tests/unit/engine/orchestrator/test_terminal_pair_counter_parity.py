@@ -56,11 +56,35 @@ def _expected_counters(effect: TerminalPairCounterEffect) -> ExecutionCounters:
     return expected
 
 
+def _governed_field_pairs(actual: ExecutionCounters, expected: ExecutionCounters) -> tuple[tuple[str, int, int], ...]:
+    """Explicit ``(field, actual, expected)`` triples for the table-governed counters.
+
+    Written out rather than reflected: a counters object missing a governed field
+    raises ``AttributeError`` here instead of silently skipping the comparison.
+    The assertion keeps the table pinned to ``_TABLE_GOVERNED_FIELDS``, which is
+    still derived from the live ``ExecutionCounters`` dataclass.
+    """
+    pairs: tuple[tuple[str, int, int], ...] = (
+        ("rows_succeeded", actual.rows_succeeded, expected.rows_succeeded),
+        ("rows_failed", actual.rows_failed, expected.rows_failed),
+        ("rows_routed_success", actual.rows_routed_success, expected.rows_routed_success),
+        ("rows_routed_failure", actual.rows_routed_failure, expected.rows_routed_failure),
+        ("rows_quarantined", actual.rows_quarantined, expected.rows_quarantined),
+        ("rows_forked", actual.rows_forked, expected.rows_forked),
+        ("rows_coalesced", actual.rows_coalesced, expected.rows_coalesced),
+        ("rows_expanded", actual.rows_expanded, expected.rows_expanded),
+        ("rows_buffered", actual.rows_buffered, expected.rows_buffered),
+        ("rows_diverted", actual.rows_diverted, expected.rows_diverted),
+    )
+    covered = {name for name, _, _ in pairs}
+    governed = set(_TABLE_GOVERNED_FIELDS)
+    assert covered == governed, f"governed-counter table drifted: missing={governed - covered}, extra={covered - governed}"
+    return pairs
+
+
 def _assert_governed_fields_match(actual: ExecutionCounters, expected: ExecutionCounters, *, context: str) -> None:
-    for field_name in _TABLE_GOVERNED_FIELDS:
-        assert getattr(actual, field_name) == getattr(expected, field_name), (
-            f"{context}: {field_name} diverged from the counter-effect table"
-        )
+    for field_name, actual_value, expected_value in _governed_field_pairs(actual, expected):
+        assert actual_value == expected_value, f"{context}: {field_name} diverged from the counter-effect table"
     assert dict(actual.routed_destinations) == dict(expected.routed_destinations), f"{context}: routed_destinations diverged"
 
 

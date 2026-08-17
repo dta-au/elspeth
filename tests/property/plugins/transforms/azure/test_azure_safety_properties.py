@@ -94,8 +94,18 @@ class TestContentSafetyThresholdsValidation:
     def test_valid_thresholds_accepted(self, config: dict[str, int]) -> None:
         """Property: All values in [0, 6] produce valid thresholds."""
         t = ContentSafetyThresholds(**config)
-        for cat in CATEGORIES:
-            assert 0 <= getattr(t, cat) <= 6
+        # Explicit (category, value) table over the owned pydantic model: a model
+        # that dropped a category raises AttributeError here rather than having
+        # its severity silently unchecked.
+        severities: tuple[tuple[str, int], ...] = (
+            ("hate", t.hate),
+            ("violence", t.violence),
+            ("sexual", t.sexual),
+            ("self_harm", t.self_harm),
+        )
+        assert tuple(name for name, _ in severities) == CATEGORIES
+        for cat, severity in severities:
+            assert 0 <= severity <= 6, f"{cat}={severity} outside [0, 6]"
 
     @given(category=st.sampled_from(CATEGORIES), bad_value=out_of_range_severity)
     @settings(max_examples=100)

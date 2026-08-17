@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from dataclasses import fields as dataclass_fields
 from hashlib import sha256
 from types import SimpleNamespace
 
@@ -456,7 +457,32 @@ def test_exact_final_manifest_descriptor_converges_across_reader_instances() -> 
 
 def test_export_cross_mapping_fails_before_hashing() -> None:
     snapshot = _export_input()
-    forged = SimpleNamespace(**{name: getattr(snapshot, name) for name in snapshot.__dataclass_fields__})
+    # Explicit field-by-field copy of the owned snapshot input: the forgery has to
+    # carry every field, and the coverage assertion below fails if the dataclass
+    # grows one, so the lookalike can never go stale and pass vacuously.
+    forged_fields: dict[str, object] = {
+        "snapshot_id": snapshot.snapshot_id,
+        "source_run_id": snapshot.source_run_id,
+        "registry_key_hash": snapshot.registry_key_hash,
+        "manifest_hash": snapshot.manifest_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "serialization_version": snapshot.serialization_version,
+        "export_format": snapshot.export_format,
+        "signing_mode": snapshot.signing_mode,
+        "signer_key_id": snapshot.signer_key_id,
+        "record_count": snapshot.record_count,
+        "total_bytes": snapshot.total_bytes,
+        "chunk_count": snapshot.chunk_count,
+        "chunks": snapshot.chunks,
+        "signed_manifest": snapshot.signed_manifest,
+        "reader": snapshot.reader,
+    }
+    declared = {field.name for field in dataclass_fields(SinkEffectAuditExportSnapshotInput)}
+    assert forged_fields.keys() == declared, (
+        f"forged lookalike drifted from SinkEffectAuditExportSnapshotInput: "
+        f"missing={declared - forged_fields.keys()}, extra={forged_fields.keys() - declared}"
+    )
+    forged = SimpleNamespace(**forged_fields)
     forged.signer_key_id = "different-key"
     with pytest.raises((TypeError, ValueError), match=r"signer|snapshot"):
         compute_audit_export_effect_identity(forged, {"path": "safe/export.json"}, sink_node_id="audit-export", role=SinkEffectRole.PRIMARY)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -482,24 +483,31 @@ def test_registration_rejects_forged_graph_before_registry_insert() -> None:
 
 
 @pytest.mark.parametrize(
-    ("field_name", "message"),
+    ("field_name", "message", "read_field"),
     (
-        ("public_export_config_hash", "registry_key_hash"),
-        ("registry_key_hash", "registry_key_hash"),
-        ("snapshot_hash", "snapshot_hash"),
-        ("snapshot_id", "snapshot_id"),
-        ("manifest_hash", "manifest_hash"),
-        ("snapshot_seal_hash", "snapshot_seal_hash"),
-        ("final_hash", "final_hash"),
+        pytest.param(
+            "public_export_config_hash",
+            "registry_key_hash",
+            lambda snapshot: snapshot.public_export_config_hash,
+            id="public_export_config_hash",
+        ),
+        pytest.param("registry_key_hash", "registry_key_hash", lambda snapshot: snapshot.registry_key_hash, id="registry_key_hash"),
+        pytest.param("snapshot_hash", "snapshot_hash", lambda snapshot: snapshot.snapshot_hash, id="snapshot_hash"),
+        pytest.param("snapshot_id", "snapshot_id", lambda snapshot: snapshot.snapshot_id, id="snapshot_id"),
+        pytest.param("manifest_hash", "manifest_hash", lambda snapshot: snapshot.manifest_hash, id="manifest_hash"),
+        pytest.param("snapshot_seal_hash", "snapshot_seal_hash", lambda snapshot: snapshot.snapshot_seal_hash, id="snapshot_seal_hash"),
+        pytest.param("final_hash", "final_hash", lambda snapshot: snapshot.final_hash, id="final_hash"),
     ),
 )
-def test_bound_winner_recomputes_persisted_graph_hashes_from_registered_bytes(field_name: str, message: str) -> None:
+def test_bound_winner_recomputes_persisted_graph_hashes_from_registered_bytes(
+    field_name: str, message: str, read_field: Callable[[AuditExportSnapshot], str]
+) -> None:
     db = LandscapeDB.in_memory()
     store = _MemoryContentStore()
     resolver = AuditExportContentStoreResolver()
     resolver.register(store)
     candidate = _candidate(store)
-    observed = getattr(candidate.snapshot, field_name)
+    observed = read_field(candidate.snapshot)
     forged_hash = "f" * 64 if observed != "f" * 64 else "e" * 64
     if field_name == "public_export_config_hash":
         forged_snapshot = replace(candidate.snapshot, public_export_config_hash=forged_hash)

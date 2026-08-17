@@ -15,6 +15,7 @@ Migrated from tests/integration/test_telemetry_wiring.py
 from __future__ import annotations
 
 from collections.abc import Iterator
+from types import MethodType
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -356,12 +357,16 @@ class TestOrchestratorWiresTelemetryToContext:
         # The callback should have been captured
         assert captured_callback is not None, "ctx.telemetry_emit was not set"
 
-        # It should NOT be the default no-op lambda
-        # The default is: lambda event: None
-        # A real callback is: orchestrator._emit_telemetry (a bound method)
-        callback_name = getattr(captured_callback, "__name__", str(captured_callback))
-        assert callback_name != "<lambda>", (
-            f"ctx.telemetry_emit is still the default no-op lambda, not the real callback. Got: {captured_callback}"
+        # It should NOT be the default no-op lambda.
+        # The default is a plain function: ``lambda event: None``.
+        # The real callback is a bound method (the ceremony's ``emit_telemetry``,
+        # wired in run_context_factory), so narrowing on ``MethodType`` states the
+        # contract directly instead of sniffing a ``__name__``.
+        assert isinstance(captured_callback, MethodType), (
+            f"ctx.telemetry_emit is still the default no-op lambda, not the real bound callback. Got: {captured_callback!r}"
+        )
+        assert captured_callback.__func__.__name__ == "emit_telemetry", (
+            f"ctx.telemetry_emit is bound to an unexpected method: {captured_callback!r}"
         )
 
     def test_telemetry_wiring_works_in_resume_path(

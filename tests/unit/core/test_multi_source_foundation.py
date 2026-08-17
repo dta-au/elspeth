@@ -8,7 +8,10 @@ from typing import Literal
 
 import pytest
 from sqlalchemy import create_engine, event, insert, select
+from sqlalchemy.engine.default import DefaultExecutionContext
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.sql import Update
+from sqlalchemy.sql.compiler import SQLCompiler
 
 from elspeth.contracts import NodeType, RoutingMode
 from elspeth.contracts.coordination import CoordinationToken
@@ -31,6 +34,24 @@ from elspeth.core.landscape.schema import (
 _COORD_TOKEN_RUN1 = CoordinationToken(run_id="run-1", worker_id="test-leader", leader_epoch=1)
 
 _SchedulerTransition = Literal["blocked", "terminal", "failed"]
+
+
+def _is_token_work_items_update(context: object) -> bool:
+    """True when a ``before_cursor_execute`` context carries a compiled UPDATE
+    against ``token_work_items``.
+
+    The listener signature hands over SQLAlchemy's own execution context, so the
+    concrete types are known and narrowed with ``isinstance`` instead of probed:
+    raw driver SQL arrives with ``compiled is None``, and only a compiled
+    ``Update`` naming this table is the statement these races interpose on.
+    """
+    if not isinstance(context, DefaultExecutionContext):
+        return False
+    compiled = context.compiled
+    if not isinstance(compiled, SQLCompiler):
+        return False
+    statement = compiled.statement
+    return isinstance(statement, Update) and statement.table.name == token_work_items_table.name
 
 
 def test_plural_sources_are_canonical_and_stable_named() -> None:
@@ -1611,10 +1632,7 @@ def test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_leas
     @event.listens_for(engine, "before_cursor_execute")
     def peer_re_leases_between_select_and_update(conn, cursor, statement, parameters, context, executemany) -> None:  # type: ignore[no-untyped-def]
         nonlocal raced
-        compiled_statement = getattr(getattr(context, "compiled", None), "statement", None)
-        if raced or getattr(compiled_statement, "__visit_name__", None) != "update":
-            return
-        if getattr(getattr(compiled_statement, "table", None), "name", None) != token_work_items_table.name:
+        if raced or not _is_token_work_items_update(context):
             return
         raced = True
         # Simulate: peer reaper has already returned the row to PENDING_SINK
@@ -1816,10 +1834,7 @@ def test_scheduler_claim_ready_returns_none_when_selected_row_was_claimed_by_pee
     @event.listens_for(engine, "before_cursor_execute")
     def lease_selected_item_before_claim_update(conn, cursor, statement, parameters, context, executemany) -> None:  # type: ignore[no-untyped-def]
         nonlocal raced
-        compiled_statement = getattr(getattr(context, "compiled", None), "statement", None)
-        if raced or getattr(compiled_statement, "__visit_name__", None) != "update":
-            return
-        if getattr(getattr(compiled_statement, "table", None), "name", None) != token_work_items_table.name:
+        if raced or not _is_token_work_items_update(context):
             return
         raced = True
         cursor.execute(
@@ -1887,10 +1902,7 @@ def test_scheduler_claim_pending_sink_returns_none_when_selected_row_was_claimed
     @event.listens_for(engine, "before_cursor_execute")
     def lease_selected_pending_sink_before_claim_update(conn, cursor, statement, parameters, context, executemany) -> None:  # type: ignore[no-untyped-def]
         nonlocal raced
-        compiled_statement = getattr(getattr(context, "compiled", None), "statement", None)
-        if raced or getattr(compiled_statement, "__visit_name__", None) != "update":
-            return
-        if getattr(getattr(compiled_statement, "table", None), "name", None) != token_work_items_table.name:
+        if raced or not _is_token_work_items_update(context):
             return
         raced = True
         cursor.execute(

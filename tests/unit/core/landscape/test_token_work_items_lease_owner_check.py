@@ -26,6 +26,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import CheckConstraint
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.scheduler import TokenWorkStatus
@@ -157,12 +158,14 @@ class TestLeaseOwnerCheckConstraint:
         Catches a future regression that re-introduces case drift in the
         schema definition — keeps the schema literal honest with the enum.
         """
+        # ``Table.constraints`` mixes constraint kinds; narrow to the concrete
+        # CheckConstraint, which is the only one carrying ``sqltext``.
         check = next(
             c
             for c in token_work_items_table.constraints
-            if getattr(c, "name", "") == "ck_token_work_items_lease_owner_required_when_leased"
+            if isinstance(c, CheckConstraint) and c.name == "ck_token_work_items_lease_owner_required_when_leased"
         )
-        sqltext = str(check.sqltext)  # type: ignore[attr-defined]
+        sqltext = str(check.sqltext)
         assert f"'{TokenWorkStatus.LEASED.value}'" in sqltext, (
             f"CHECK literal must match TokenWorkStatus.LEASED.value={TokenWorkStatus.LEASED.value!r}; got sqltext={sqltext!r}"
         )

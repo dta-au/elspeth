@@ -20,6 +20,7 @@ Fork terminology:
 
 from __future__ import annotations
 
+from dataclasses import fields as dataclass_fields
 from datetime import UTC
 from typing import Any
 
@@ -57,6 +58,34 @@ from tests.helpers.checkpoint import create_checkpoint
 # =============================================================================
 # Audit Verification Helpers
 # =============================================================================
+
+
+def counter_reconciliation_pairs(uninterrupted: RunResult, resumed: RunResult) -> tuple[tuple[str, int, int], ...]:
+    """Explicit ``(field, uninterrupted, resumed)`` triples for every RunResult counter.
+
+    The table is written out rather than reflected so a masquerading run result
+    (one missing a counter) raises ``AttributeError`` here instead of silently
+    skipping a comparison. The exact-set assertion below keeps the table honest:
+    adding a counter to ``RunResult`` fails this helper until it is listed.
+    """
+    pairs: tuple[tuple[str, int, int], ...] = (
+        ("rows_processed", uninterrupted.rows_processed, resumed.rows_processed),
+        ("rows_succeeded", uninterrupted.rows_succeeded, resumed.rows_succeeded),
+        ("rows_failed", uninterrupted.rows_failed, resumed.rows_failed),
+        ("rows_routed_success", uninterrupted.rows_routed_success, resumed.rows_routed_success),
+        ("rows_routed_failure", uninterrupted.rows_routed_failure, resumed.rows_routed_failure),
+        ("rows_quarantined", uninterrupted.rows_quarantined, resumed.rows_quarantined),
+        ("rows_forked", uninterrupted.rows_forked, resumed.rows_forked),
+        ("rows_coalesced", uninterrupted.rows_coalesced, resumed.rows_coalesced),
+        ("rows_coalesce_failed", uninterrupted.rows_coalesce_failed, resumed.rows_coalesce_failed),
+        ("rows_expanded", uninterrupted.rows_expanded, resumed.rows_expanded),
+        ("rows_buffered", uninterrupted.rows_buffered, resumed.rows_buffered),
+        ("rows_diverted", uninterrupted.rows_diverted, resumed.rows_diverted),
+    )
+    covered = {name for name, _, _ in pairs}
+    expected = {field.name for field in dataclass_fields(RunResult)} - {"run_id", "status", "routed_destinations"}
+    assert covered == expected, f"counter table drifted from RunResult: missing={expected - covered}, extra={covered - expected}"
+    return pairs
 
 
 def count_fork_children_missing_parents(db: LandscapeDB, run_id: str) -> int:
@@ -2657,23 +2686,7 @@ class TestForkRecoveryInvariant:
             f"that arm regressed or the barrier failed to re-fire on resume."
         )
 
-        counter_fields = (
-            "rows_processed",
-            "rows_succeeded",
-            "rows_failed",
-            "rows_routed_success",
-            "rows_routed_failure",
-            "rows_quarantined",
-            "rows_forked",
-            "rows_coalesced",
-            "rows_coalesce_failed",
-            "rows_expanded",
-            "rows_buffered",
-            "rows_diverted",
-        )
-        for field in counter_fields:
-            a_val = getattr(run_a, field)
-            b_val = getattr(run_b_resume, field)
+        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
             assert b_val == a_val, (
                 f"F2 reconciliation failure on '{field}': resumed run (run1 + resume) must equal "
                 f"the uninterrupted run field-for-field. uninterrupted={a_val}, resumed={b_val}. "
@@ -2920,23 +2933,7 @@ class TestForkRecoveryInvariant:
             f"arm regressed or the BUFFERED records were not preserved across resume."
         )
 
-        counter_fields = (
-            "rows_processed",
-            "rows_succeeded",
-            "rows_failed",
-            "rows_routed_success",
-            "rows_routed_failure",
-            "rows_quarantined",
-            "rows_forked",
-            "rows_coalesced",
-            "rows_coalesce_failed",
-            "rows_expanded",
-            "rows_buffered",
-            "rows_diverted",
-        )
-        for field in counter_fields:
-            a_val = getattr(run_a, field)
-            b_val = getattr(run_b_resume, field)
+        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
             assert b_val == a_val, (
                 f"F2 reconciliation failure on '{field}': resumed run (run1 + resume) must equal "
                 f"the uninterrupted run field-for-field. uninterrupted={a_val}, resumed={b_val}. "
@@ -3025,23 +3022,7 @@ class TestForkRecoveryInvariant:
         )
 
         # ── EVERY counter field must reconcile (no divergent field remains) ────
-        all_fields = (
-            "rows_processed",
-            "rows_succeeded",
-            "rows_failed",
-            "rows_routed_success",
-            "rows_routed_failure",
-            "rows_quarantined",
-            "rows_forked",
-            "rows_coalesced",
-            "rows_coalesce_failed",
-            "rows_expanded",
-            "rows_buffered",
-            "rows_diverted",
-        )
-        for field in all_fields:
-            a_val = getattr(run_a, field)
-            b_val = getattr(run_b_resume, field)
+        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
             assert b_val == a_val, (
                 f"'{field}' must reconcile on the count==N topology (live/derive unification, "
                 f"elspeth-e1dd5e1303). uninterrupted={a_val}, resumed={b_val}."

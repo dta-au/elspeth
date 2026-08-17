@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -11,7 +11,7 @@ from sqlalchemy import event, insert, select, update
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -26,6 +26,19 @@ from elspeth.core.landscape.schema import (
 
 RUN_ID = "run-pending-sink-admission"
 NOW = datetime(2026, 7, 16, 9, 0, tzinfo=UTC)
+
+# Explicit accessors for every column a legal PENDING_SINK bundle may carry. The
+# parametrized bundles below are keyed by column name (they are written straight
+# into the table), so the readback resolves through this table rather than a
+# reflective attribute lookup on the owned TokenWorkItem: an unlisted key raises
+# KeyError here instead of silently reading nothing.
+_BUNDLE_FIELD_READERS: dict[str, Callable[[TokenWorkItem], object]] = {
+    "pending_outcome": lambda item: item.pending_outcome,
+    "pending_path": lambda item: item.pending_path,
+    "pending_error_hash": lambda item: item.pending_error_hash,
+    "pending_error_message": lambda item: item.pending_error_message,
+    "join_group_id": lambda item: item.join_group_id,
+}
 
 
 @pytest.fixture
@@ -172,7 +185,7 @@ def test_claim_pending_sink_accepts_complete_legal_bundle(
     assert claimed.row_payload_json == payload
     assert claimed.pending_sink_name == "sink-a"
     for field_name, expected in bundle_values.items():
-        assert getattr(claimed, field_name) == expected
+        assert _BUNDLE_FIELD_READERS[field_name](claimed) == expected, field_name
 
 
 def test_claim_pending_sink_update_rechecks_bundle_atomically(

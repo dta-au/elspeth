@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 import pytest
+from sqlalchemy import CheckConstraint
 
 import elspeth.core.landscape.schema as schema
 from elspeth.contracts import Determinism
@@ -25,8 +26,11 @@ def _check_sql(table_name: str, constraint_name: str) -> str:
         "scheduler_events": scheduler_events_table,
         "token_work_items": token_work_items_table,
     }[table_name]
-    check = next(c for c in table.constraints if getattr(c, "name", "") == constraint_name)
-    return str(check.sqltext)  # type: ignore[attr-defined]
+    # Narrow to the concrete CheckConstraint before reading its name and sqltext:
+    # ``Table.constraints`` mixes primary-key/unique/foreign-key constraints in,
+    # and only a CheckConstraint carries the ``sqltext`` this helper returns.
+    check = next(c for c in table.constraints if isinstance(c, CheckConstraint) and c.name == constraint_name)
+    return str(check.sqltext)
 
 
 def _enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:

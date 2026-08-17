@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import delete, event, insert, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.sql import Executable
+from sqlalchemy.sql import Executable, Select
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from tests.fixtures.landscape import register_test_node
 from tests.fixtures.stores import MockPayloadStore
@@ -820,7 +820,9 @@ def test_postgres_bulk_state_completion_prelock_chunks_large_batches(
         original_execute = conn.execute
 
         def spy(stmt: Any, *args: Any, **kwargs: Any) -> Any:
-            if getattr(stmt, "_for_update_arg", None) is not None:
+            # Only a SELECT ... FOR UPDATE is a prelock: narrow to the concrete
+            # Select before reading the with_for_update() marker off it.
+            if isinstance(stmt, Select) and stmt._for_update_arg is not None:
                 compiled = stmt.compile(dialect=conn.dialect)
                 chunk_ids = [value for value in compiled.params.values() if isinstance(value, (list, tuple))]
                 assert len(chunk_ids) == 1
