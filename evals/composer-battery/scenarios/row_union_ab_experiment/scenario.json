@@ -1,0 +1,243 @@
+{
+  "case": "row_union_ab_experiment",
+  "example": "examples/row_union_ab_experiment",
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "AMBIGUOUS"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "csv",
+      "on_success": "routed",
+      "options": {
+        "path": "tickets.csv",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "variant_fork",
+        "node_type": "gate",
+        "input": "routed",
+        "condition": "True",
+        "routes": {
+          "true": "fork",
+          "false": "fork"
+        },
+        "fork_to": [
+          "control_branch",
+          "treatment_branch"
+        ]
+      },
+      {
+        "id": "tag_control",
+        "node_type": "transform",
+        "plugin": "value_transform",
+        "input": "control_branch",
+        "on_success": "control_scored",
+        "on_error": "discard",
+        "options": {
+          "schema": {
+            "mode": "observed"
+          },
+          "operations": [
+            {
+              "target": "prompt_variant",
+              "expression": "'control'"
+            },
+            {
+              "target": "score",
+              "expression": "row['baseline_quality'] * 1.0"
+            }
+          ]
+        }
+      },
+      {
+        "id": "tag_treatment",
+        "node_type": "transform",
+        "plugin": "value_transform",
+        "input": "treatment_branch",
+        "on_success": "treatment_scored",
+        "on_error": "discard",
+        "options": {
+          "schema": {
+            "mode": "observed"
+          },
+          "operations": [
+            {
+              "target": "prompt_variant",
+              "expression": "'treatment'"
+            },
+            {
+              "target": "score",
+              "expression": "row['baseline_quality'] * 1.25"
+            }
+          ]
+        }
+      },
+      {
+        "id": "variant_union",
+        "node_type": "row_union",
+        "input": "control_scored",
+        "branches": {
+          "control_branch": "control_scored",
+          "treatment_branch": "treatment_scored"
+        },
+        "on_success": "experiment_rows",
+        "timeout_seconds": 12.5
+      },
+      {
+        "id": "compare_variants",
+        "node_type": "aggregation",
+        "plugin": "batch_experiment_compare",
+        "input": "experiment_rows",
+        "on_success": "experiment_results",
+        "on_error": "discard",
+        "options": {
+          "schema": {
+            "mode": "observed"
+          },
+          "variant_field": "prompt_variant",
+          "score_field": "score",
+          "baseline_variant": "control"
+        },
+        "trigger": {},
+        "output_mode": "transform"
+      }
+    ],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "experiment_results",
+        "plugin": "json",
+        "options": {
+          "path": "outputs/experiment_results.json",
+          "schema": {
+            "mode": "observed"
+          },
+          "format": "jsonl"
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "fork_count": "2",
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "transform",
+        "plugin": "value_transform",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "value_transform",
+        "extras": {}
+      },
+      {
+        "kind": "row_union",
+        "plugin": null,
+        "extras": {
+          "branch_count": "2"
+        }
+      },
+      {
+        "kind": "aggregation",
+        "plugin": "batch_experiment_compare",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "json",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
+        "fork"
+      ],
+      [
+        1,
+        3,
+        "fork"
+      ],
+      [
+        2,
+        4,
+        "on_success"
+      ],
+      [
+        3,
+        4,
+        "on_success"
+      ],
+      [
+        4,
+        5,
+        "on_success"
+      ],
+      [
+        5,
+        6,
+        "on_success"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: schemas for csv source, gate, value_transform, row_union, batch_experiment_compare aggregation, json sink \u2014 one batched call",
+      "data: invented rows travel as source.inline_blob inside the mutation \u2014 0 extra",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors the whole graph"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": true,
+    "is_valid": true
+  }
+}

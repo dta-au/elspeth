@@ -115,3 +115,42 @@ region. I don't want the individual rows out — take them five at a time and, f
 each group of five, give me the count, the total and the average amount broken down
 by category. Write those summaries out as CSV.
 ```
+
+## statistical_batch_plugins
+
+```
+Make up a couple of dozen model prediction records — an id, the model name, the
+label it predicted and the task family. Take them eight at a time and, for each
+model in the batch, tell me its three most frequent predicted labels. Write those
+out as JSON lines.
+```
+
+## deaggregation
+
+```
+Make up a dozen product lines with an id, a name, a category and a copies column
+saying how many labels that product needs. Work through them three at a time and
+give me one row per label — a product needing four labels appears four times — with
+each copy numbered. Write the result out as CSV.
+```
+
+## report_assemble
+
+```
+I have a plain text file of log lines — make up something that looks like one, one
+line per row and blank lines kept as they are. Collect the lines two at a time and
+turn each pair into a small markdown report headed Run report, then write those
+reports out as JSON.
+```
+
+## row_union_ab_experiment
+
+```
+Make up eight support tickets, each with an id, the ticket text and a baseline
+quality score. I want every ticket tried both ways at once — a control arm that
+keeps the baseline score and a treatment arm that scores twenty-five percent higher
+— with each arm labelled, and then both labelled versions of a ticket brought back
+into one stream together, two rows per ticket rather than one merged row. Once the
+whole stream is through, compare the arms against the control and write the
+comparison out as JSON lines.
+```
