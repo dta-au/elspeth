@@ -48,6 +48,15 @@ def test_missing_key_is_a_loud_error(tmp_path: Path) -> None:
         load_scenario(p)
 
 
+def test_missing_surface_subkey_is_a_load_error(tmp_path: Path) -> None:
+    doc = json.loads((SCENARIOS / "fork_coalesce/scenario.json").read_text())
+    del doc["surface"]["classifier_decision"]
+    p = tmp_path / "scenario.json"
+    p.write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="classifier_decision"):
+        load_scenario(p)
+
+
 def test_criteria_vocabulary_is_closed(tmp_path: Path) -> None:
     doc = json.loads((SCENARIOS / "fork_coalesce/scenario.json").read_text())
     doc["green_criteria"]["topology_matches_expcted"] = True  # typo must not silently create an unchecked gate

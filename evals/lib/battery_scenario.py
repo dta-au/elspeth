@@ -31,6 +31,7 @@ GREEN_KEYS: frozenset[str] = frozenset(
 )
 RED_KEYS: frozenset[str] = frozenset({"passivity_phrases", "build_failure_sentinels"})
 _FLOOR_KEYS = ("tool_bearing_calls", "components", "repairs", "backtracks", "derivation", "pre_calibration", "post_calibration")
+_SURFACE_KEYS = ("required", "classifier_decision")
 
 
 @dataclass
@@ -71,6 +72,9 @@ def load_scenario(path: Path) -> Scenario:
     if fmissing:
         raise ValueError(f"{path}: floor missing keys {fmissing}")
     surface = doc["surface"]
+    smissing = [k for k in _SURFACE_KEYS if k not in surface]
+    if smissing:
+        raise ValueError(f"{path}: surface missing keys {smissing}")
     bad_green = sorted(set(doc["green_criteria"]) - GREEN_KEYS)
     bad_red = sorted(set(doc["red_criteria"]) - RED_KEYS)
     if bad_green or bad_red:
