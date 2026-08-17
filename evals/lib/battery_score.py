@@ -93,6 +93,11 @@ _NOT_APPLIED = frozenset({"rejected", "failed", "cancelled"})
 _REMOVAL_TOOLS = frozenset({"remove_node", "remove_edge", "remove_output", "clear_source"})
 _PATCH_TOOLS = frozenset({"patch_source_options", "patch_node_options", "patch_output_options"})
 _TERMINAL_CLASSES = frozenset({"turn_exhaustion", "wall_timeout"})
+# spec §3: the four DATA tools are a separate vocabulary from pipeline mutations — they manage blob-store
+# content, not CompositionState. They are mutation tools in the registry (is_mutation_tool is True for all
+# four) but must never count as a pipeline mutation: not for schema_read_before_first_mutation, not for
+# attempted_any (which gates passivity/decline), and never as applied_any/applied_set_pipeline.
+_DATA_TOOLS = frozenset({"create_blob", "update_blob", "delete_blob", "wire_blob_inline_ref"})
 
 
 @dataclass(frozen=True)
@@ -349,8 +354,10 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
                 deviations.append(Deviation("excess_discovery", (ev.turn_seq, ev.row_seq), name, digest, (), ev.audit_ordinal))
             seen_discovery.add(key)
             continue
-        # blob tools ARE mutation tools in the registry; they are classified here, ahead of the generic
-        # mutation path, so a data detour never reads as a repair/backtrack — keep this ordering.
+        # data tools (spec §3, _DATA_TOOLS) ARE mutation tools in the registry; they are classified here,
+        # ahead of the generic pipeline-mutation path, so a data detour never reads as a repair/backtrack.
+        # wire_blob_inline_ref is the BIND half of a create_blob detour — create_blob already charged the
+        # deviation, so the bind fires none of its own and must never become a pipeline first_mut.
         if name == "create_blob":
             deviations.append(
                 Deviation(
@@ -361,6 +368,8 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
             continue
         if name in {"update_blob", "delete_blob"}:
             deviations.append(Deviation("data_rework", (ev.turn_seq, ev.row_seq), name, digest, (), ev.audit_ordinal))
+            continue
+        if name == "wire_blob_inline_ref":
             continue
         if not is_mutation_tool(name):
             continue
@@ -396,7 +405,7 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
         applied_any = True
         applied_set_pipeline = applied_set_pipeline or name in {"set_pipeline", "apply_pipeline_recipe"}
         seen_discovery.clear()  # a mutation licenses a fresh read
-    attempted_any = any(is_mutation_tool(e.call.name) for e in events)
+    attempted_any = any(is_mutation_tool(e.call.name) and e.call.name not in _DATA_TOOLS for e in events)
     if pending_failed is not None:
         # a rejected/failed mutation that was never retried: keep its codes — the most useful triage datum
         deviations.append(
@@ -409,7 +418,10 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
                 pending_failed.audit_ordinal,
             )
         )
-    first_mut = next((e for e in events if is_mutation_tool(e.call.name) and e.outcome not in _NOT_APPLIED), None)
+    first_mut = next(
+        (e for e in events if is_mutation_tool(e.call.name) and e.call.name not in _DATA_TOOLS and e.outcome not in _NOT_APPLIED),
+        None,
+    )
     schema_before: bool | None = (
         None if first_mut is None else any(e.call.name == "get_plugin_schema" and e.row_seq < first_mut.row_seq for e in events)
     )

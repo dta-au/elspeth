@@ -188,6 +188,59 @@ def test_data_setup_detour_and_rework() -> None:
     assert [SEVERITY[c] for c in _classes(s)] == ["soft", "soft"]
 
 
+def test_wire_blob_inline_ref_is_the_bind_half_of_the_detour() -> None:
+    rows = [
+        tg.user_row(1),
+        tg.audit_row(2),
+        tg.assistant_row(3, [tg.call("cb", "create_blob", {"filename": "rows.csv", "content": "a,b\n1,2"})]),
+        tg.tool_row(4, "cb", "as3", content={"success": True, "blob_id": "b1"}),
+        tg.audit_row(5),
+        tg.assistant_row(6, [tg.call("wb", "wire_blob_inline_ref", {"blob_id": "b1", "target": "source.options.path"})]),
+        tg.tool_row(7, "wb", "as6", content={"success": True}, state_id="state-2"),
+        tg.audit_row(8),
+        tg.assistant_row(9, content="I have prepared the inline data."),
+    ]
+    s = score_run(tg.capture(rows, state=None, is_valid=None), SC)
+    # wire_blob_inline_ref (spec §3 data tool) is the BIND half of the create_blob detour: it fires no
+    # deviation of its own and never becomes a pipeline first_mut. Since no PIPELINE mutation was ever
+    # attempted, the thread still ends in a decline — the same "nothing built" outcome as a pure data-only
+    # thread with no passivity phrase (mirrors test_blob_only_thread_still_fires_passivity below).
+    assert _classes(s) == ["decline", "data_setup_detour"]
+    assert "repair" not in _classes(s) and "backtrack" not in _classes(s)
+    assert score_path(tg.capture(rows, state=None, is_valid=None)).schema_read_before_first_mutation is None
+
+
+def test_blob_only_thread_still_fires_passivity() -> None:
+    rows = [
+        tg.user_row(1),
+        tg.audit_row(2),
+        tg.assistant_row(3, [tg.call("cb", "create_blob", {"filename": "rows.csv", "content": "a,b\n1,2"})]),
+        tg.tool_row(4, "cb", "as3", content={"success": True, "blob_id": "b1"}),
+        tg.audit_row(5, tools=True),
+        tg.assistant_row(6, content="I have the data ready. Would you like me to proceed?"),
+    ]
+    s = score_run(tg.capture(rows, state=None, is_valid=None), SC)
+    assert _classes(s) == ["passivity", "data_setup_detour"]
+
+
+def test_schema_before_first_pipeline_mutation_ignores_a_preceding_data_tool() -> None:
+    rows = [
+        tg.user_row(1),
+        tg.audit_row(2),
+        tg.assistant_row(3, [tg.call("cb", "create_blob", {"filename": "rows.csv", "content": "a,b\n1,2"})]),
+        tg.tool_row(4, "cb", "as3", content={"success": True, "blob_id": "b1"}),
+        tg.audit_row(5),
+        tg.assistant_row(6, [tg.call("d0", "get_plugin_schema", {"plugin_type": "source", "plugin_name": "csv"})]),
+        tg.tool_row(7, "d0", "as6", content={"success": True, "schema": {}}),
+        tg.audit_row(8),
+        tg.assistant_row(9, [tg.call("sp", "set_pipeline", ARGS)]),
+        tg.tool_row(10, "sp", "as9", content={"success": True}, state_id="state-2"),
+    ]
+    p = score_path(tg.capture(rows, state=ARGS))
+    assert p.schema_read_before_first_mutation is True
+    assert _classes(p) == ["data_setup_detour"]
+
+
 def test_retried_provider_error_counts_but_unrecovered_transport_excludes() -> None:
     rows = tg.ideal_thread(ARGS)
     rows.insert(
