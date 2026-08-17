@@ -32,6 +32,27 @@ gate `condition`s), because thresholds live in `condition`, not `options`;
 on a multi-gate case this confirms presence, not which gate carries the
 value.
 
+**Errata (2026-08-17, post-calibration — ruled by the operator after 30 live
+canary runs; evidence in `evals/composer-battery/calibration/README.md`):**
+(e) §6's canary rule ("expect ≥ 9/10 optimal, otherwise the instrument, not
+the corpus, is wrong") is **withdrawn**. Two prompts and three N=10 blocks
+against a healthy rig produced 8/10, 0/10 and 2/10 at floor; the same prompt
+scored 8/10 and 2/10 on consecutive blocks. The kit's path length varies
+2–5 calls on a single-shape task, so an optimality threshold on ten runs
+reads variance as an instrument fault. The canary asserts the **instrument**:
+zero exclusions, `surface_observed == compose_loop` 10/10,
+`other_text_calls == 0`, and at least one run at floor. Optimality is what
+the corpus measures, pooled, with `n` beside it.
+(f) `must_discover_schema_before_first_mutation` is **false in every
+scenario**. Observed: the composer authors `set_pipeline` directly for
+plugins it knows (json→json) and fetches `get_plugin_schema` up to three
+times for one it does not (`field_mapper`), so the criterion tracks plugin
+familiarity, not path quality — and it marked the straightest observed path
+non-green. The failure it was meant to catch (authoring blind, then
+patching) is already measured by outcome rather than ritual:
+`schema_fumble`, `repair` and `excess_discovery` fire on the consequences in
+either direction. The per-case switch remains, so any case can re-enable it.
+
 ## Purpose
 
 The Web Composer is an LLM tool loop: an operator states what they want, the

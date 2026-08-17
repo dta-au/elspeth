@@ -120,7 +120,7 @@
   "green_criteria": {
     "topology_matches_expected": true,
     "option_assertions_hold": true,
-    "must_discover_schema_before_first_mutation": true,
+    "must_discover_schema_before_first_mutation": false,
     "is_valid": true
   }
 }

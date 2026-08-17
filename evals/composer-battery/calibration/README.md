@@ -79,18 +79,25 @@ Prompt tightened after block 3 (not yet re-fired): the input format is now
 stated ("sitting in a JSON file"), which should remove the csv/json source
 variance seen in run 10.
 
-### Decision 3 — the canary threshold (OPEN, needs the operator)
+### Decision 3 — the canary threshold — RULED 2026-08-17 (operator: yes)
 
-Recommended: restate the canary rule as an **instrument** check, not an
-optimality check — e.g. "0 exclusions, `compose_loop` 10/10, `other_text_calls`
-0, and ≥1 run at floor" — and let optimality be measured by the corpus. As
-written, spec §6's ≥9/10 would abort calibration on a healthy instrument.
+**Ruled: adopted.** The canary asserts the instrument — zero exclusions,
+`compose_loop` 10/10, `other_text_calls == 0`, ≥1 run at floor — and
+optimality is measured by the corpus, pooled, with `n` beside it. Spec §6's
+≥9/10 rule is withdrawn in the spec errata (e); the runbook's calibration
+step 1 now carries the instrument rule. Under it, all three blocks PASS
+(30/30 clean surface, 0 exclusions, 0 stray text calls, floor reached in
+blocks 1 and 3).
 
-### Decision 2 (carried from block 1) — schema discovery before the first mutation
+### Decision 2 — schema discovery before the first mutation — RULED 2026-08-17 (operator: yes)
 
-Set to `false` for the canary only, with the reason recorded above. Whether
-it stays green-critical for the other 19 cases is unresolved: the composer
-skipped discovery on trivial plugins and fumbled it on `field_mapper`, so the
-criterion may be measuring plugin familiarity rather than path quality.
+**Ruled: false in every scenario** (all 20). The criterion tracks plugin
+familiarity, not path quality — the composer authors `set_pipeline` directly
+for plugins it knows and reads `get_plugin_schema` up to three times for one
+it does not, so as written it marked the straightest observed path non-green.
+The failure it was meant to catch (author blind, then patch) is already
+measured by outcome rather than ritual: `schema_fumble`, `repair` and
+`excess_discovery` fire on the consequences in either direction. Recorded in
+spec errata (f); the per-case switch remains, so any case can re-enable it.
 
 Probe reading (§7): (not yet fired — `--probe`).

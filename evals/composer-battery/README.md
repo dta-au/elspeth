@@ -146,8 +146,14 @@ Calibration runs are corpus QA. They enter no rate. Use a round name that
 says so (`…-calib`).
 
 1. **Canary at N=10**: `--cases canary` (the canary block runs at N=10 by
-   design). Expect ≥ 9/10 optimal; otherwise the instrument, not the corpus,
-   is wrong — stop and read the exclusions.
+   design). The canary asserts the **instrument**, not optimality — pass is
+   zero exclusions, `surface_observed == compose_loop` 10/10,
+   `other_text_calls == 0`, and at least one run at floor. Anything else:
+   stop and read the exclusions. (Do **not** expect ≥ 9/10 optimal: measured
+   2026-08-17, the same prompt scored 8/10 and 2/10 at floor on consecutive
+   blocks — path variance on a single-shape task is 2–5 calls, so an
+   optimality threshold here reads the kit's variance as an instrument
+   fault. Spec §6's original rule is withdrawn in the errata.)
 2. **Tripwire**: runs automatically at the start of every round; check
    `runs/<r>/_tripwire/tripwire.json` — all three `pass: true`.
 3. **Paired planner probe**: `--probe`. Read `runs/<r>/_probe/probe.md`:
