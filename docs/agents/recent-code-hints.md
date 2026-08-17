@@ -427,6 +427,24 @@ NOT try to clear it. The obligation is: capture the corpus BEFORE your
 change, capture it AFTER, and diff — you must add nothing. Never hand-edit a
 `judge_metadata_signature`; never shape code to reduce signature churn.
 
+**Exception — release closeout (2026-08-17, 0.7.2).** The "do not clear it"
+rule above scopes to *ordinary feature work*, which is the same qualifier
+AGENTS.md uses. When a release package is being made ready for merge, clearing
+the corpus IS the work and the operator signs at the end. During 0.7.2 closeout
+the standing ban is lifted by the operator; treat the corpus as a worklist, not
+a fixed backdrop. Two things do NOT relax, ever: never hand-edit a signature,
+and never shape code to reduce churn. Measured 2026-08-17 for scale — the
+tier_model allowlist held 606 entries, 351 requiring action (178
+`NO_MATCHING_FINDING` orphans, 127 `AST_PATH_BINDING_DRIFT`, 39
+`IDENTITY_PREFIX_REPLACEMENT`, 35 `PRE_JUDGE`, 6 `SCOPE_BINDING_DRIFT`, 1
+`SOURCE_FILE_MISSING`; 229 of them in `web.yaml`). Those binding failures are
+INVISIBLE to `check --rules trust_tier.tier_model`, which reported only 6
+per-file `max_hits` overflows — use `mcp__elspeth-judge__verify_signatures` for
+the signature-health surface, and remember it is shape-only without the key.
+Stage the bundle LAST: bundles are exact-source-bound to Git HEAD plus a digest
+of every scannable file, so any sibling edit that shifts an AST position
+invalidates one already staged.
+
 ### 4. Wire-shape templates (2026-08-08)
 
 The wrapped-diagnostic producer templates and `_split_wrapped_diagnostic` in
