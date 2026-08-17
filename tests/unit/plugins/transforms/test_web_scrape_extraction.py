@@ -171,9 +171,7 @@ def test_compact_declaration_is_true_of_what_extraction_actually_emits(content: 
     html = f"<html><body><p>{content}</p><div>More content</div></body></html>"
 
     for separator in (" ", "\t", " | ", "\r", "\n", "\r\n"):
-        declared = _build_web_scrape_output_semantics(
-            content_field="content", format="text", text_separator=separator
-        ).fields[0]
+        declared = _build_web_scrape_output_semantics(content_field="content", format="text", text_separator=separator).fields[0]
         emitted = extract_content(html, format="text", text_separator=separator)
 
         if declared.text_framing is TextFraming.COMPACT:

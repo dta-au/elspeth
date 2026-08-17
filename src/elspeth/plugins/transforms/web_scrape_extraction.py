@@ -74,10 +74,7 @@ def extract_content(
                 # the row at runtime (elspeth-afdf55a17c's own failure mode, with a
                 # green certification on top). Normalise on the sink's exact rule —
                 # CR or LF, not every Unicode line boundary — so the claim is true.
-                segments = (
-                    segment.strip()
-                    for segment in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-                )
+                segments = (segment.strip() for segment in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
                 text = text_separator.join(segment for segment in segments if segment)
             return text
 

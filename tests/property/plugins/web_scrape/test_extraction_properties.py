@@ -273,6 +273,7 @@ def test_extract_content_text_no_html_tags(content: str):
     assert "<body>" not in result
     assert "<p>" not in result
     assert "<div>" not in result
+
     # Original content should be present, modulo whitespace normalisation — which
     # this docstring always intended but the old assertion could not express: it
     # tolerated only EDGE stripping, via an `or content.strip()` escape hatch.

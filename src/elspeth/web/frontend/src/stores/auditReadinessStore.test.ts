@@ -14,11 +14,19 @@ const READY_READINESS = {
   blockers: [],
 };
 
+// snapshot() is a value-equality fixture: call sites compare a snapshot the
+// store already holds against a freshly built one, so it must be a pure
+// function of `version`. Reading the wall clock here made two calls differ
+// whenever a millisecond ticked between them, which failed the deep-equality
+// assertions intermittently. The version number is the discriminator; the
+// timestamp carries no test meaning, so it is fixed.
+const CHECKED_AT = "2026-01-01T00:00:00.000Z";
+
 function snapshot(version: number): AuditReadinessSnapshot {
   return {
     session_id: SESSION_ID,
     composition_version: version,
-    checked_at: new Date().toISOString(),
+    checked_at: CHECKED_AT,
     rows: [
       { id: "validation", label: "Validation", status: "ok", summary: "All checks pass", detail: null, component_ids: [] },
       { id: "plugin_trust", label: "Plugin trust", status: "ok", summary: "All Tier 1/2", detail: null, component_ids: [] },
