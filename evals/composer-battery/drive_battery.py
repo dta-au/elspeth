@@ -327,7 +327,15 @@ class Battery:
             detail = r.body.get("detail") if isinstance(r.body, dict) else None
             http[-1]["detail"] = detail
             if r.status_code == 422 and isinstance(detail, dict):
-                terminal = {"budget_exhausted": detail.get("budget_exhausted"), "reason": detail.get("reason"), "source": "422_detail"}
+                # `reason` is the compose loop's ComposerProgressReason; a PLANNER 422 (`policy_blocked`)
+                # carries no `reason` and names its outcome in `planner_code` instead. Reading only the
+                # former records a terminal whose `source` is set and whose content is empty — which reads
+                # downstream as "terminal captured" while carrying nothing.
+                terminal = {
+                    "budget_exhausted": detail.get("budget_exhausted"),
+                    "reason": detail.get("reason") or detail.get("planner_code"),
+                    "source": "422_detail",
+                }
             if r.status_code in (401, 403):
                 instrument["auth_failed"] = True
             # A PLANNER terminal arrives as a 5xx, not only as a 422: `_handle_planner_failure` answers

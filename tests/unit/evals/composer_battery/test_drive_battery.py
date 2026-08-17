@@ -261,7 +261,8 @@ def test_a_5xx_carrying_a_planner_terminal_is_a_product_outcome_not_an_instrumen
         "error_type": "composer_planner_failure",
         "failure_code": "policy_blocked",
         "planner_code": "VALIDATION_FAILED",
-        "reason": "p",
+        # No compose-loop `reason` key: that is the real planner-422 shape (_helpers.py returns
+        # error_type/failure_code/planner_code/detail only), which is why the fallback is needed.
     }
     r3 = happy_responders([tg.user_row(1)], state=None)
     r3["POST /api/sessions/"] = lambda c: (
@@ -269,7 +270,10 @@ def test_a_5xx_carrying_a_planner_terminal_is_a_product_outcome_not_an_instrumen
     )
     b3 = _battery(tmp_path / "b3", FakeClient(r3), repeats=1)
     b3.fire(cases, tripwire=None, only=set(cases))
-    assert json.loads((tmp_path / "b3" / "runs/r1/fork_coalesce/1/meta.json").read_text())["server_terminal"]["source"] == "422_detail"
+    t3 = json.loads((tmp_path / "b3" / "runs/r1/fork_coalesce/1/meta.json").read_text())["server_terminal"]
+    # ...and still recovers a reason: a planner 422 carries `planner_code`, not the compose loop's `reason`,
+    # so reading only the latter would record a terminal with `source` set and nothing in it.
+    assert t3 == {"budget_exhausted": None, "reason": "VALIDATION_FAILED", "source": "422_detail"}
 
     # A 5xx WITHOUT a planner envelope is still a substrate fault — the rule narrows, it does not vanish.
     r2 = happy_responders([tg.user_row(1)], state=None)

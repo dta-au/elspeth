@@ -338,7 +338,9 @@ export type ComposerProgressPhase =
 /**
  * Stable machine-readable reason code for composer progress events.
  *
- * Mirrors `ComposerProgressReason` in src/elspeth/web/composer/progress.py.
+ * Mirrors `ComposerProgressReason` in src/elspeth/contracts/composer_progress.py.
+ * Pinned by tests/unit/web/composer/test_progress.py — this union had silently
+ * drifted a member before that pin existed.
  * This is the public taxonomy the SPA should branch on (instead of parsing
  * `headline` text). The Python validator requires this field for any
  * `phase: "failed"` event, so the SPA can rely on it being present whenever
@@ -348,6 +350,10 @@ export type ComposerProgressReason =
   | "convergence_composition_budget"
   | "convergence_discovery_budget"
   | "convergence_wall_clock_timeout"
+  // Per-turn tool-call cap. Python-only until 2026-08-17: the only surface that
+  // reached it was guided, and freeform hardcoded `provider_unavailable` over
+  // every planner outcome, so the gap was invisible (elspeth-ad5628ecda).
+  | "tool_call_cap_exceeded"
   | "provider_auth_failed"
   | "provider_unavailable"
   | "plugin_crash"

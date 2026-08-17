@@ -598,3 +598,31 @@ class TestComposerProgressRegistry:
 
         assert alice_active == ()
         assert {snap.session_id for snap in bob_active} == {"session-shared-id"}
+
+
+def test_composer_progress_reason_typescript_mirror_is_complete() -> None:
+    """The SPA's ``ComposerProgressReason`` union is a HAND-WRITTEN mirror with no pin — and it had drifted.
+
+    Python carried ``tool_call_cap_exceeded``; the TypeScript union did not, so the type asserted a value the
+    server could send could not occur. It went unnoticed because the only surface reaching that code was the
+    guided one, and freeform hardcoded ``provider_unavailable`` over every planner outcome — fixing that
+    attribution (elspeth-ad5628ecda) made the missing member reachable on a second surface. The sibling
+    vocabulary (``GuidedOperationFailureCode``) is pinned both by a test and by a pre-commit mirror check
+    (``scripts/cicd/check_slot_type_cross_language.py``); this one was not.
+    """
+    import re
+    from pathlib import Path
+    from typing import get_args
+
+    from elspeth.contracts.composer_progress import ComposerProgressReason
+
+    ts_path = Path(__file__).resolve().parents[4] / "src/elspeth/web/frontend/src/types/index.ts"
+    body = re.search(r"export type ComposerProgressReason =(.*?);", ts_path.read_text(), re.S)
+    assert body is not None, "the TypeScript union was renamed or removed; update this pin"
+    # Only the union arms — a bare `"..."` on a `|` line. Comment prose is skipped by construction.
+    declared = {m.group(1) for line in body.group(1).splitlines() if (m := re.match(r'\s*\|\s*"([a-z_]+)"\s*$', line))}
+
+    assert declared == set(get_args(ComposerProgressReason.__value__)), (
+        f"missing from TypeScript: {sorted(set(get_args(ComposerProgressReason.__value__)) - declared)}; "
+        f"absent from Python: {sorted(declared - set(get_args(ComposerProgressReason.__value__)))}"
+    )
