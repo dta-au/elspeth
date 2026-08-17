@@ -8,6 +8,25 @@
 **Owner:** the ELSPETH maintainer; the corpus is curated by whoever edits
 the affordance kit, in the same change.
 
+**Errata (2026-08-17, post-implementation):**
+(a) §5's "MDE" is, as implemented, a one-sample 95% CI half-width
+(`ci_half_width_pp`) — read every per-case interval as "95% CI ±X pp
+(one-sample half-width; a two-round delta needs more)", not as a minimum
+detectable effect.
+(b) §2's "Graphs are ≤ 12 nodes" does not hold for the shipped corpus:
+`deep_routing` is 16 nodes. Isomorphism is still cheap at that size
+(worst-case rejection measured ~1.4 s).
+(c) A new named v1 blind spot beside §1's multi-source one: the compose
+surface cannot author repo-relative asset files, so `template_lookups`'
+template and lookup files are inlined as a `prompt_template`, and its
+`expected_topology` is identical to `openrouter_sentiment`'s — v1 measures
+the same shape twice under two case names.
+(d) Gate thresholds are pinned by a `condition_literal` membership
+assertion (the numeric literal must be present somewhere in the graph's
+gate `condition`s), because thresholds live in `condition`, not `options`;
+on a multi-gate case this confirms presence, not which gate carries the
+value.
+
 ## Purpose
 
 The Web Composer is an LLM tool loop: an operator states what they want, the

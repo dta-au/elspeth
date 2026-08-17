@@ -1,7 +1,184 @@
-# Composer battery
+# Composer path-quality battery
 
-The composer path-quality battery — see `docs/superpowers/specs/2026-08-13-composer-battery-design.md`.
+Spec: `docs/superpowers/specs/2026-08-13-composer-battery-design.md` (rev 4).
+Plan: `docs/superpowers/plans/2026-08-17-composer-battery.md`.
 
-Run tests: `source .venv/bin/activate && python -m pytest tests/unit/evals/composer_battery/ -q -n 0`.
+The battery fires a fixed operator-voice corpus (`corpus.md`, 18 stratified
+cases + canary) at the local live composer, captures every run to
+`runs/<round>/<case>/<n>/`, and scores **offline** against each case's
+pre-registered floor (`scenarios/<case>/scenario.json`) with the §3
+deviation taxonomy. Nothing here executes a pipeline; nothing here registers
+an account.
 
-Runbook: see Task 9 once written.
+## Prerequisites
+
+- `source .venv/bin/activate` in the main checkout.
+- `~/.elspeth-battery/credentials.json` (mode 600):
+  `{"username": "battery_local", "password": "…"}` — the account must
+  already exist on the substrate (`elspeth-web` local auth); the driver
+  logs in and **never registers**. The sibling harnesses' env names
+  `ELSPETH_EVAL_USER` / `ELSPETH_EVAL_PASS` / `ELSPETH_EVAL_BASE_URL`
+  work for one-off runs.
+- `deploy/elspeth-web.env` present (advisor model and the two turn budgets
+  are read from it into the binding identity).
+- The substrate is healthy: `curl -s https://elspeth.foundryside.dev/api/system/status | jq .composer_available` → `true`.
+
+## Commands
+
+| Step | Command |
+| --- | --- |
+| Unit gate (offline) | `pytest tests/unit/evals/composer_battery -q` |
+| Dry-run the corpus through the classifier | `python -c 'from evals.lib.battery_corpus import load_corpus; from elspeth.web.composer.no_tool_policy import classify_pipeline_mutation_intent as c; [print(n, c(k.prompt).name) for n,k in load_corpus()[1].items()]'` |
+| Fire a round (canary N=10 → tripwire → round-robin) | `python evals/composer-battery/drive_battery.py --round 2026-08-20-baseline --repeats 5` |
+| Fire a subset / resume after an interruption | `python evals/composer-battery/drive_battery.py --round <r> --cases fork_coalesce,error_routing --resume` |
+| §7 planner probe (calibration only) | `python evals/composer-battery/drive_battery.py --round <r>-calib --probe` |
+| Score + report | `python evals/composer-battery/report.py --round <r>` |
+| Compare with a previous round | `python evals/composer-battery/report.py --round <r> --compare <prev>` (refuses on binding-identity mismatch; `--force-compare` overrides and stamps the report FORCED/not-attributable; prints recorded deltas, skill hash first) |
+| Delete this round's sessions (only complete captures) | `python evals/composer-battery/drive_battery.py --round <r> --cleanup-only` |
+
+`--cleanup-only` skips firing entirely and only runs the cleanup for
+`--round`. `--cleanup` fires normally and then also runs the cleanup
+afterward. Both delete only sessions whose capture is complete
+(`messages.json`, `meta.json`, `reviews.json` all present and parseable);
+incomplete captures are left alone. `--no-tripwire` skips the tripwire
+pre-flight (calibration/debugging only — never for a rate-bearing round).
+
+Exit codes, as implemented in `drive_battery.py main()` / `report.py main()`:
+
+- driver `0` completed; `1` aborted by the instrument rules — **three
+  consecutive INSTRUMENT-class exclusions** (`capture`, `truncated`,
+  `read_integrity`, `auth`, `http`, `transport`, `terminal_missing`;
+  canary runs count toward this streak). MEASUREMENT-class exclusions
+  (`surface` — the prompt routed to the planner, or `no_calls` — the
+  composer never called a tool) never count toward the abort streak and
+  never abort on their own; `64` config/identity — a malformed or
+  wrong-mode credentials file, a missing env budget in
+  `deploy/elspeth-web.env`, or an unusable `/api/system/status` (identity
+  resolution never does I/O beyond reading these); `70` auth — login
+  rejected.
+- `report.py`: `65` (`EX_DATAERR`) on a refused `--compare` (binding-identity
+  mismatch without `--force-compare`) or a late-binding refusal (a round
+  captured under a different `corpus_version` or prompt hash than the
+  scenarios on disk).
+
+## Reading a report
+
+`runs/<round>/report.md` — headline (clean / optimal / hard, each with `n`,
+excluded count and the Σ/Σ pooling formula, correct under unequal per-case
+`n` after exclusions), the canary block (`n`, `non_optimal`, `flag`), the
+tripwire table (its own table; never pooled), per-repeat bins, per-case
+rates (indicative at N=5 — 95% CI ±X pp, one-sample half-width; see
+"Calibration before freeze" below), an **Exclusions** section split into
+instrument exclusions (harness faults — `capture`/`truncated`/
+`read_integrity`/`auth`/`http`/`transport`/`terminal_missing`) and
+**Measurement exclusions** (the composer routed a prompt to the planner or
+never called a tool — product findings the loop-only instrument cannot
+score, listed separately and never pooled into the rate), then the
+**deviation ledger** grouped case → class with evidence (`sequence_no`
+range, tool, args digest, codes, audit ordinal). `unattributed_excess` and
+`below_floor` are printed on their own headline line — a high
+`unattributed_excess` rate is a taxonomy gap to fix, never a floor to
+widen. A degraded firing (`report["degraded"]["reasons"]`, e.g. exclusions
+above 15%, canary >1/10 non-optimal, a driver abort) is called out at the
+top of the markdown; `report["findings"]` is a separate list — corpus/
+product findings that are reported but do not by themselves mark the
+firing degraded.
+Triage reads the ledger; kit defects become Filigree issues by hand.
+
+`--compare <prev>` prints `compare.recorded_deltas` — a dict keyed by
+recorded-identity field, **`composer_skill_hash` always first**, then every
+other differing field sorted — plus pooled and per-case rate deltas
+(per-case deltas are labelled indicative; claims are made on the pooled
+aggregate only).
+
+Every `score.json` carries `red_reasons`, `green_reasons` and
+`exclusion_evidence` so a single run can be read without the report.
+
+## Calibration before freeze (spec §6) — operator procedure
+
+Calibration runs are corpus QA. They enter no rate. Use a round name that
+says so (`…-calib`).
+
+1. **Canary at N=10**: `--cases canary` (the canary block runs at N=10 by
+   design). Expect ≥ 9/10 optimal; otherwise the instrument, not the corpus,
+   is wrong — stop and read the exclusions.
+2. **Tripwire**: runs automatically at the start of every round; check
+   `runs/<r>/_tripwire/tripwire.json` — all three `pass: true`.
+3. **Paired planner probe**: `--probe`. Read `runs/<r>/_probe/probe.md`:
+   every arm `surface_ok`; write the reading against the pre-registered rule
+   into `calibration/README.md`.
+4. **One N=1 pass over the 18 cases**: `--repeats 1 --cases <all but canary>`
+   then `report.py`. Check, per case:
+   - `surface_observed == compose_loop` (an `instrument_error: surface`
+     means the prompt routes to the planner — reword, re-dry-run);
+   - advisor rows are on the advisor model with null `tools_spec_hash`
+     (`llm_calls` in the capture); `other_text_calls` should be 0;
+   - `first_call_messages_hash` stable across two runs of one case
+     (fire one case twice with `--repeats 2 --cases <case>`);
+   - the floor is reachable: at least one run at floor across calibration,
+     else the derivation is wrong — re-derive (structural reason only) and
+     record pre/post in `calibration/README.md`;
+   - the data path actually taken (`inline_blob` in the `set_pipeline` args
+     vs a `create_blob` detour) — record per case; a corpus-wide detour is a
+     kit finding, not a floor change;
+   - passivity/decline rate as a corpus-QA signal — a prompt that reads as a
+     question gets tightened.
+
+   A per-case rate at this stage is a single N=1 read: report it as the
+   observed floor/deviation, not as a rate claim (rate claims need the
+   pooled aggregate over a real round, see "Reading a report" above).
+5. **Freeze**: bump `corpus_version: 0 → 1` in `corpus.md` and in every
+   `scenarios/*/scenario.json` (`floor.post_calibration` filled in), commit
+   as one change: `git commit -m "feat(evals): freeze composer battery corpus v1" -- evals/composer-battery`.
+   From here any prompt or floor edit is a version bump and a new baseline.
+
+## Known v1 limits
+
+- **Multi-source deferred** (spec §1): `multi_source_queue` and
+  `multi_flow` need multiple invented-data sources; `set_pipeline` v1
+  cannot bind named/multiple blob-backed sources, so their mutation floor
+  is not derivable by the pre-registered rules. Corpus v1 is single-source
+  only — a named blind spot.
+- **`template_lookups` inlining**: the compose surface cannot author
+  repo-relative asset files, so `template_lookups`' template and lookup
+  files are inlined as a `prompt_template`; its `expected_topology` is
+  identical to `openrouter_sentiment`'s — the two cases currently measure
+  the same shape.
+- **`condition_literal` is a membership assertion**, not an attribution:
+  on a multi-gate case it confirms the pinned threshold value is *present
+  somewhere* in the graph's conditions, not *which* gate carries it. Only
+  single-gate cases (`threshold_gate`, `schema_contracts_demo`) assert this
+  today.
+- **Volunteered no-op passthrough**: `explicit_routing`,
+  `schema_contracts_demo`, and `canary` require the composer to volunteer a
+  no-op passthrough node to match the registered floor. Watch this at
+  calibration — if the composer reliably omits it, the floor derivation
+  needs review, not the composer.
+- **Likely second-discovery-call cases**: `deep_routing` (16 nodes — still
+  cheap to score; worst-case rejection isomorphism measured ~1.4 s) and
+  `multi_query_assessment` are the cases most likely to need a second
+  discovery call before composing; watch these first at calibration.
+
+## Operational posture
+
+- Serial; a full 19×5 round runs a few hours. Off-peak; the OpenRouter key
+  and `sessions.db` are shared with real use — say so in the round name.
+- The per-user composer rate limit is 10/min; the driver's serial cadence
+  stays under it.
+- Sessions are titled `battery/<round>/<case>/<n>` **before** the prompt is
+  posted (suppresses the unaudited auto-title call). `--cleanup` deletes
+  only this round's sessions whose capture is complete; default off.
+- `runs/` is git-ignored; `report.md` for a round worth keeping is copied
+  into `docs/` by hand.
+
+## Layout
+
+| Path | What |
+| --- | --- |
+| `corpus.md` | verbatim prompts, `corpus_version` |
+| `scenarios/<case>/scenario.json` | oracle payload, expected topology, floor + derivation, criteria |
+| `drive_battery.py` | live driver (capture only) |
+| `planner_probe.py` | §7 probe + tripwire |
+| `report.py` | offline scoring + report |
+| `calibration/README.md` | calibration decisions (pre/post floors) |
+| `../lib/battery_*.py` | tracked libraries (topology, scenario, capture, score, report) |
