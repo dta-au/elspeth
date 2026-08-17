@@ -671,30 +671,34 @@ class Battery:
         tripwire/probe runs (``_tripwire/<fixture>/1``, ``_probe/<fixture>/<arm>``), which carry three path
         segments after the prefix. Paginates: the route defaults to 50 and caps at 200, so an unpaginated read
         left most of a 95-run round's sessions behind."""
-        deleted: list[str] = []
-        prefix = f"battery/{self.round}/"
+        # Phase 1: read the whole listing BEFORE deleting anything. Deleting mid-pagination shrinks the table
+        # the server's OFFSET applies to, so the rows that were at absolute 200..200+n slide down into the
+        # page already consumed and are never seen — the same silent under-deletion I5 was filed for.
+        rows: list[Mapping[str, Any]] = []
         offset = 0
         for _ in range(MAX_PAGES):
             r = self._safe_request("GET", "/api/sessions", params={"limit": SESSION_PAGE, "offset": offset}, timeout=60)
             if r is None or r.status_code != 200 or not isinstance(r.body, list):
                 break  # a non-200 body is a dict: iterating it would yield strings, not sessions
-            for s in r.body:
-                if not isinstance(s, Mapping) or not s.get("id"):
-                    continue
-                title = str(s.get("title") or "")
-                if not title.startswith(prefix):
-                    continue
-                rest = title[len(prefix) :].split("/")
-                if len(rest) not in (2, 3) or any(part in ("", ".", "..") for part in rest):
-                    continue  # a title is server-supplied text: never let it address a directory of its choosing
-                if not run_dir_is_complete(self.round_dir.joinpath(*rest)):
-                    continue
-                d = self._safe_request("DELETE", f"/api/sessions/{s['id']}", timeout=30)
-                if d is not None and d.status_code in (200, 204):
-                    deleted.append(str(s["id"]))
+            rows.extend(s for s in r.body if isinstance(s, Mapping) and s.get("id"))
             if len(r.body) < SESSION_PAGE:
                 break
             offset += SESSION_PAGE
+        # Phase 2: delete this round's complete captures.
+        deleted: list[str] = []
+        prefix = f"battery/{self.round}/"
+        for s in rows:
+            title = str(s.get("title") or "")
+            if not title.startswith(prefix):
+                continue
+            rest = title[len(prefix) :].split("/")
+            if len(rest) not in (2, 3) or any(part in ("", ".", "..") for part in rest):
+                continue  # a title is server-supplied text: never let it address a directory of its choosing
+            if not run_dir_is_complete(self.round_dir.joinpath(*rest)):
+                continue
+            d = self._safe_request("DELETE", f"/api/sessions/{s['id']}", timeout=30)
+            if d is not None and d.status_code in (200, 204):
+                deleted.append(str(s["id"]))
         return deleted
 
 

@@ -607,18 +607,31 @@ def test_cleanup_paginates_and_reaches_tripwire_sessions(tmp_path: Path) -> None
         params = c.params or {}
         pages.append(params)
         off, lim = int(params.get("offset", 0)), int(params.get("limit", 50))
-        return ok(sessions[off : off + min(lim, 200)])
+        return ok(sessions[off : off + min(lim, 200)])  # OFFSET over the LIVE table, as the server does
+
+    def delete(c):
+        sid = c.path.rsplit("/", 1)[-1]
+        # the fake models the real effect of a delete: the row leaves the table every later OFFSET applies to.
+        # Without this, deleting mid-pagination silently skips as many sessions as it deleted and no test sees it.
+        sessions[:] = [s for s in sessions if s["id"] != sid]
+        return ok(None, 204)
 
     r["GET /api/sessions"] = listed
+    r["DELETE /api/sessions/"] = delete
     client = FakeClient(r)
     b = _battery(tmp_path, client, repeats=1)
-    # captures on disk for run 250 (page 2) and for the tripwire fixture; nothing else is complete
-    for run_dir in (tmp_path / "runs/r1/fork_coalesce/250", tmp_path / "runs/r1/_tripwire/fork_coalesce/1"):
-        run_dir.mkdir(parents=True)
+    # Complete captures on disk for runs 1-3 (page 1), runs 201-203 (the FIRST three rows of page 2) and the
+    # tripwire fixture. The 201-203 placement is the guard: delete-while-paginating removes three rows from the
+    # live table before asking for offset=200, so those three slide into the page already consumed and are
+    # never seen — the same silent under-deletion this finding was filed for, one page further in.
+    targets = ["fork_coalesce/1", "fork_coalesce/2", "fork_coalesce/3", "fork_coalesce/201", "fork_coalesce/202", "fork_coalesce/203"]
+    for rel in [*targets, "_tripwire/fork_coalesce/1"]:
+        run_dir = tmp_path / "runs/r1" / rel
+        run_dir.mkdir(parents=True, exist_ok=True)
         for name in ("messages.json", "reviews.json"):
             (run_dir / name).write_text("[]")
         (run_dir / "meta.json").write_text("{}")
-    assert b.cleanup() == ["s250", "tw"]
+    assert b.cleanup() == ["s1", "s2", "s3", "s201", "s202", "s203", "tw"]
     assert [p["offset"] for p in pages] == [0, 200]  # a full page always fetches again; the short page stops
 
 

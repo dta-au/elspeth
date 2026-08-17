@@ -94,7 +94,11 @@ range, tool, args digest, codes, audit ordinal), then the **criteria
 ledger** (case/repeat → `red_reasons`/`green_reasons`): a run can fail a
 criterion — invalid or empty final state, a build sentinel, no schema read
 before the first mutation — with no deviation event at all, and without
-that section its `clean` would drop against an empty histogram.
+that section its `clean` would drop against an empty histogram. Like the
+deviation ledger and the per-case table, it covers **corpus cases only**;
+the canary is summarised in its own block (`n`, `non_optimal`, `flag`), and
+a non-optimal canary is read from its `score.json`, which carries the same
+`red_reasons`/`green_reasons`.
 `unattributed_excess` and
 `below_floor` are printed on their own headline line — a high
 `unattributed_excess` rate is a taxonomy gap to fix, never a floor to
