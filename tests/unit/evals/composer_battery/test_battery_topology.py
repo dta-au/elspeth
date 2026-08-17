@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from evals.lib.battery_topology import topologies_match, topology_from_pipeline
+from evals.lib.battery_topology import observed_option_values, topologies_match, topology_from_pipeline
 
 FIXTURE = Path(__file__).resolve().parents[4] / "evals/composer-parity/fixtures/fork_coalesce.json"
 
@@ -184,3 +184,75 @@ def test_option_assertion_pins_threshold_only_when_listed() -> None:
     assert not result.ok and "threshold" in (result.reason or "")
     held = topologies_match(exp, obs, option_values={"gate": {"threshold": 100}}, option_assertions=[("gate", "threshold", 100)])
     assert held.ok  # positive arm: an assertion that holds must not fail merely because assertions are listed
+
+
+def _gate_args(condition: str) -> dict[str, Any]:
+    return {
+        "source": {"plugin": "csv", "on_success": "in", "options": {"path": "r.csv"}},
+        "nodes": [
+            {
+                "id": "g",
+                "node_type": "gate",
+                "input": "in",
+                "condition": condition,
+                "routes": {"true": "hi", "false": "lo"},
+            }
+        ],
+        "outputs": [{"sink_name": "hi", "plugin": "json"}, {"sink_name": "lo", "plugin": "json"}],
+    }
+
+
+def _condition_literal_holds(condition: str, expected: Any) -> bool:
+    """Score one gate condition against a ``condition_literal`` membership assertion."""
+    args = _gate_args(condition)
+    topology = topology_from_pipeline(args)
+    return topologies_match(
+        topology,
+        topology,
+        option_values=observed_option_values(args),
+        option_assertions=[("gate", "condition_literal", expected)],
+    ).ok
+
+
+def test_condition_literal_assertion_separates_a_correct_threshold_from_a_wrong_one() -> None:
+    """The gate threshold lives in `condition`, not `options` — without this the oracle cannot see it."""
+    assert not _condition_literal_holds("row['amount'] > 10", 1000)
+    assert _condition_literal_holds("row['amount'] > 1000", 1000)
+    assert _condition_literal_holds("row['amount'] > 1000.0", 1000)  # float spelling of the same threshold
+
+
+def test_condition_literal_assertion_is_membership_not_equality() -> None:
+    both = "row['amount'] > 1000 and row['credit_score'] >= 700"
+    assert _condition_literal_holds(both, 1000)
+    assert _condition_literal_holds(both, 700)
+    assert not _condition_literal_holds(both, 500)
+
+
+def test_condition_literal_assertion_fails_when_the_node_has_no_condition() -> None:
+    args = {
+        "source": {"plugin": "csv", "on_success": "in", "options": {"path": "r.csv"}},
+        "nodes": [
+            {
+                "id": "t",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "in",
+                "on_success": "out",
+                "options": {"schema": {"mode": "observed"}},
+            }
+        ],
+        "outputs": [{"sink_name": "out", "plugin": "json"}],
+    }
+    topology = topology_from_pipeline(args)
+    result = topologies_match(
+        topology,
+        topology,
+        option_values=observed_option_values(args),
+        option_assertions=[("transform", "condition_literal", 1000)],
+    )
+    assert not result.ok and "condition_literal" in (result.reason or "")
+
+
+def test_condition_literals_ignore_digits_inside_identifiers() -> None:
+    assert not _condition_literal_holds("row['field2'] == row['other2']", 2)
+    assert _condition_literal_holds("row['field2'] > 50", 50)

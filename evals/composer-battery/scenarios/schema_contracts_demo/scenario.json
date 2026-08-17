@@ -14,7 +14,15 @@
       "options": {
         "path": "transactions.csv",
         "schema": {
-          "mode": "observed"
+          "mode": "flexible",
+          "fields": [
+            "customer_id: str",
+            "amount_usd: float",
+            "transaction_date_time: str",
+            "product_name: str",
+            "status_active_inactive: str",
+            "notes_comments: str"
+          ]
         }
       },
       "on_validation_failure": "discard"
@@ -124,7 +132,13 @@
       ]
     ]
   },
-  "option_assertions": [],
+  "option_assertions": [
+    [
+      "gate",
+      "condition_literal",
+      500
+    ]
+  ],
   "floor": {
     "tool_bearing_calls": 2,
     "components": {

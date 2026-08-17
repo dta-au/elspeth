@@ -10,7 +10,7 @@
   "canonical_arguments": {
     "source": {
       "plugin": "llm",
-      "on_success": "result",
+      "on_success": "tickets",
       "options": {
         "provider": "openrouter",
         "model": "openai/gpt-4.1-mini",
@@ -28,21 +28,7 @@
       },
       "on_validation_failure": "discard"
     },
-    "nodes": [
-      {
-        "id": "keep_tickets",
-        "node_type": "transform",
-        "plugin": "passthrough",
-        "input": "result",
-        "on_success": "tickets",
-        "on_error": "discard",
-        "options": {
-          "schema": {
-            "mode": "observed"
-          }
-        }
-      }
-    ],
+    "nodes": [],
     "edges": [],
     "outputs": [
       {
@@ -69,11 +55,6 @@
         "extras": {}
       },
       {
-        "kind": "transform",
-        "plugin": "passthrough",
-        "extras": {}
-      },
-      {
         "kind": "output",
         "plugin": "json",
         "extras": {}
@@ -83,11 +64,6 @@
       [
         0,
         1,
-        "on_success"
-      ],
-      [
-        1,
-        2,
         "on_success"
       ]
     ]
@@ -103,7 +79,7 @@
     "repairs": 0,
     "backtracks": 0,
     "derivation": [
-      "discovery: schemas for llm source, passthrough, json sink \u2014 one batched call",
+      "discovery: schemas for llm source, json sink \u2014 one batched call",
       "data: the model is the data source \u2014 no rows travel with the mutation \u2014 0 extra",
       "dependent_listing: none",
       "mutation: single set_pipeline authors the whole graph"

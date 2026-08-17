@@ -39,6 +39,41 @@ def test_canonical_arguments_reject_unknown_plugin() -> None:
         validate_canonical_arguments(args)
 
 
+def _zero_node_payload() -> dict:
+    """A complete source→sink pipeline with no nodes (the ``examples/llm_source`` shape, csv-ised)."""
+    return {
+        "source": {
+            "plugin": "csv",
+            "on_success": "out",
+            "options": {"path": "rows.csv", "schema": {"mode": "observed"}},
+            "on_validation_failure": "discard",
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "out",
+                "plugin": "json",
+                "options": {"path": "outputs/out.json", "schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
+            }
+        ],
+        "metadata": {},
+    }
+
+
+def test_zero_node_source_to_sink_payload_validates() -> None:
+    """A source wired straight to a sink is a real pipeline; requiring a node forced a fake one."""
+    validate_canonical_arguments(_zero_node_payload())  # must not raise
+
+
+def test_zero_outputs_still_fails() -> None:
+    args = _zero_node_payload()
+    args["outputs"] = []
+    with pytest.raises(ValueError, match="output"):
+        validate_canonical_arguments(args)
+
+
 def test_missing_key_is_a_loud_error(tmp_path: Path) -> None:
     doc = json.loads((SCENARIOS / "fork_coalesce/scenario.json").read_text())
     del doc["floor"]

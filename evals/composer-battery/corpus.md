@@ -65,10 +65,12 @@ are the only thing that decides it, and nothing about the rows changes.
 ```
 Make up a dozen loan applications with an id, the applicant's name, the amount, a
 credit score, the loan type, the term in months, and a free-text notes field.
-Notes that mention a password, a secret, or anything confidential or internal must
-be pulled aside into a quarantine file. Everything else gets its columns renamed to
-application_id, applicant_name and loan_amount, its notes shortened to forty
-characters, and then sorted out in this order: under 5000 is a micro loan; from
+Every application is first screened on its notes for passwords, secrets, or
+anything confidential or internal; an application that fails that screening step is
+an error, not one of the decisions below, and rather than being dropped it is set
+aside in a quarantine file. The ones that pass get their columns renamed to
+application_id, applicant_name and loan_amount, their notes shortened to forty
+characters, and are then sorted out in this order: under 5000 is a micro loan; from
 5000 up, a credit score of 700 or better and a mortgage is split by term, with 240
 months or more long-term and anything shorter short-term, while a good score on any
 other loan type is simply approved; below 700, an amount of 50000 or more is high
@@ -79,12 +81,13 @@ risk and everything else goes to manual review. Each outcome gets its own CSV fi
 
 ```
 Make up a dozen sales deals — an id, the customer, the amount, a category and a
-free-text notes field. Any deal whose notes trip a check for passwords, secrets or
-confidential material must not be dropped; those go to their own quarantine file.
-The rest get their notes shortened to fifty characters, and then deals of ten
-thousand or more are split by category — enterprise ones to their own file and the
-other large ones to a commercial file — while everything under ten thousand goes to
-a standard file.
+free-text notes field. Every deal is first screened on its notes for passwords,
+secrets or confidential material; a deal that fails that screening step is an error
+rather than a business outcome, and it must not be dropped — set it aside in a
+quarantine file. The deals that pass carry on: their notes are shortened to fifty
+characters, and then deals of ten thousand or more are split by category —
+enterprise ones to their own file and the other large ones to a commercial file —
+while everything under ten thousand goes to a standard file.
 ```
 
 ## schema_contracts_demo

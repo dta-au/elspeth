@@ -101,7 +101,13 @@
       ]
     ]
   },
-  "option_assertions": [],
+  "option_assertions": [
+    [
+      "gate",
+      "condition_literal",
+      1000
+    ]
+  ],
   "floor": {
     "tool_bearing_calls": 2,
     "components": {

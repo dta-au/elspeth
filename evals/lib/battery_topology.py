@@ -8,10 +8,25 @@ output whose name matches). Node ids and fork labels are author-chosen
 strings and are ignored; plugin, node type, edge type, coalesce ``policy``
 and ``merge``, and node cardinality are exact. Option values are ignored
 unless an ``option_assertion`` names them.
+
+**The ``condition_literal`` pseudo-option.** A gate's stratum-defining value
+(``row['amount'] > 1000``) lives in the node's ``condition`` string, not in its
+``options`` — a committed gate node carries ``options: {}`` — so a plain option
+assertion cannot tell a correct threshold from a wrong one. To close that hole
+:func:`observed_option_values` synthesises ``"condition_literals"``: the sorted
+numeric literals appearing in every ``condition`` under that kind/plugin key,
+UNIONed across nodes. An assertion whose key is the singular
+``"condition_literal"`` is then a MEMBERSHIP test against that list
+(``["gate", "condition_literal", 1000]`` holds for ``row['amount'] > 1000`` and
+for ``> 1000.0``, and fails for ``> 10``). Every other key keeps exact equality.
+Membership rather than equality is deliberate: a condition may legitimately
+carry more than one literal, and the assertion pins the one the operator asked
+for without over-fitting the rest of the expression.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +34,11 @@ from typing import Any
 OptionAssertion = tuple[str, str, Any]
 
 _EXTRA_KEYS: tuple[str, ...] = ("policy", "merge")
+
+CONDITION_LITERALS_KEY: str = "condition_literals"
+CONDITION_LITERAL_ASSERTION_KEY: str = "condition_literal"
+# Numeric literals only: the lookarounds keep `field2`, `row.x2` and `v1.5` out of the list.
+_NUMERIC_LITERAL = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])")
 
 
 @dataclass(frozen=True)
@@ -174,10 +194,40 @@ def topologies_match(
     if not search(0, set(), []):
         return MatchResult(False, "edge structure differs (no node correspondence reproduces the expected edges)")
     for kind_or_plugin, key, expected_value in option_assertions:
-        actual = (option_values or {}).get(kind_or_plugin, {}).get(key, _MISSING)
+        observed_for = (option_values or {}).get(kind_or_plugin, {})
+        if key == CONDITION_LITERAL_ASSERTION_KEY:
+            literals = observed_for.get(CONDITION_LITERALS_KEY)
+            if not isinstance(literals, (list, tuple)) or not any(_same_number(x, expected_value) for x in literals):
+                observed_repr = list(literals) if isinstance(literals, (list, tuple)) else None
+                return MatchResult(
+                    False,
+                    f"option assertion failed: {kind_or_plugin}.{CONDITION_LITERAL_ASSERTION_KEY} "
+                    f"{expected_value!r} not among observed condition literals {observed_repr!r}",
+                )
+            continue
+        actual = observed_for.get(key, _MISSING)
         if actual is _MISSING or actual != expected_value:
             return MatchResult(False, f"option assertion failed: {kind_or_plugin}.{key} expected {expected_value!r}, observed {actual!r}")
     return MatchResult(True, None)
+
+
+def _same_number(observed: Any, expected: Any) -> bool:
+    """Numeric equality across int/float/str spellings; anything non-numeric is a non-match, never a crash."""
+    try:
+        return float(observed) == float(expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def _condition_literals(condition: Any) -> list[float | int]:
+    """The numeric literals in one ``condition`` string, in source order (ints stay ints)."""
+    if not isinstance(condition, str):
+        return []
+    out: list[float | int] = []
+    for match in _NUMERIC_LITERAL.finditer(condition):
+        text = match.group(0)
+        out.append(float(text) if "." in text else int(text))
+    return out
 
 
 _MISSING = object()
@@ -188,14 +238,35 @@ def _sig_key(sig: tuple[str, str | None, tuple[tuple[str, str], ...]]) -> tuple[
 
 
 def observed_option_values(doc: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """Collect ``options`` per node kind and per plugin name for option assertions."""
+    """Collect ``options`` per node kind and per plugin name, plus the ``condition_literals`` pseudo-option.
+
+    ``condition_literals`` is UNIONed across every node sharing a key (two gates under ``"gate"``
+    contribute both thresholds) rather than overwritten, so a ``condition_literal`` membership
+    assertion sees the whole pipeline's literals. Plain options keep last-node-wins semantics.
+    """
     out: dict[str, dict[str, Any]] = {}
     for n in doc.get("nodes") or []:
         opts = dict(n.get("options") or {})
+        literals = _condition_literals(n.get("condition"))
         for key in (n.get("node_type"), n.get("plugin")):
-            if key:
-                out.setdefault(str(key), {}).update(opts)
+            if not key:
+                continue
+            bucket = out.setdefault(str(key), {})
+            bucket.update(opts)
+            if literals:
+                merged = set(bucket.get(CONDITION_LITERALS_KEY, ())) | set(literals)
+                bucket[CONDITION_LITERALS_KEY] = sorted(merged)
     return out
 
 
-__all__ = ["MatchResult", "OptionAssertion", "TNode", "Topology", "observed_option_values", "topologies_match", "topology_from_pipeline"]
+__all__ = [
+    "CONDITION_LITERALS_KEY",
+    "CONDITION_LITERAL_ASSERTION_KEY",
+    "MatchResult",
+    "OptionAssertion",
+    "TNode",
+    "Topology",
+    "observed_option_values",
+    "topologies_match",
+    "topology_from_pipeline",
+]

@@ -124,8 +124,11 @@ def validate_canonical_arguments(args: Mapping[str, Any]) -> None:
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 
     model = SetPipelineArgumentsModel.model_validate(dict(args))
-    if not model.nodes or not model.outputs:
-        raise ValueError("canonical_arguments must declare at least one node and one output")
+    # A pipeline needs a terminal sink, but NOT a node: an ``llm`` source wired straight to a sink is a
+    # complete, server-accepted pipeline (``examples/llm_source``), and requiring a node here forced a
+    # passthrough into that scenario's canonical payload that no faithful live run would ever author.
+    if not model.outputs:
+        raise ValueError("canonical_arguments must declare at least one output")
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     view = PolicyCatalogView.for_trained_operator(catalog, snapshot)
