@@ -78,6 +78,18 @@ scratch/
 !/evals/composer-parity/**/.env.template
 !/evals/composer-parity/**/.env.sample
 
+# composer-battery: tracked instrument (spec docs/superpowers/specs/2026-08-13-composer-battery-design.md)
+!/evals/composer-battery/
+!/evals/composer-battery/**
+/evals/composer-battery/runs/
+/evals/composer-battery/**/jwt.txt
+/evals/composer-battery/**/login.json
+/evals/composer-battery/**/*.access_token
+/evals/composer-battery/**/*.api_key
+/evals/composer-battery/**/*.pem
+/evals/composer-battery/**/credentials.json
+/evals/composer-battery/**/.env
+
 # Generated bug analysis docs (can be regenerated)
 docs/bugs/generated/
 

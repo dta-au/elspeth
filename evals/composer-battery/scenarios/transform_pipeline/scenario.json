@@ -1,0 +1,157 @@
+{
+  "case": "transform_pipeline",
+  "example": "examples/transform_pipeline",
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "AMBIGUOUS"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "csv",
+      "on_success": "raw",
+      "options": {
+        "path": "rows.csv",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "coerce_types",
+        "node_type": "transform",
+        "plugin": "type_coerce",
+        "input": "raw",
+        "on_success": "computed",
+        "on_error": "discard",
+        "options": {
+          "schema": {
+            "mode": "observed"
+          },
+          "conversions": [
+            {
+              "field": "quantity",
+              "to": "int"
+            },
+            {
+              "field": "unit_price",
+              "to": "float"
+            }
+          ]
+        }
+      },
+      {
+        "id": "compute_total",
+        "node_type": "transform",
+        "plugin": "value_transform",
+        "input": "computed",
+        "on_success": "out",
+        "on_error": "discard",
+        "options": {
+          "schema": {
+            "mode": "observed"
+          },
+          "operations": [
+            {
+              "target": "line_total",
+              "expression": "row['quantity'] * row['unit_price']"
+            }
+          ]
+        }
+      }
+    ],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "out",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/out.csv",
+          "schema": {
+            "mode": "observed"
+          },
+          "mode": "write",
+          "collision_policy": "auto_increment"
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "type_coerce",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "value_transform",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
+        "on_success"
+      ],
+      [
+        2,
+        3,
+        "on_success"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: schemas for csv, type_coerce, value_transform, csv \u2014 one batched call",
+      "data: invented rows travel as source.inline_blob inside the mutation \u2014 0 extra",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors the whole graph"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": true,
+    "is_valid": true
+  }
+}
