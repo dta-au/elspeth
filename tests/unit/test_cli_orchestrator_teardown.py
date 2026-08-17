@@ -256,7 +256,10 @@ def test_explain_exit_not_masked_by_db_close_failure():
         )
 
     assert result.exit_code == 1
-    assert getattr(result.exception, "code", None) == 1
+    # The CLI signals its exit by raising SystemExit; narrow to that before
+    # reading ``code`` so a different exception cannot pass as "no code".
+    assert isinstance(result.exception, SystemExit)
+    assert result.exception.code == 1
     assert "No runs found in database" in result.output
     assert "close failed" not in str(result.exception)
 

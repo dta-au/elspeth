@@ -12,6 +12,7 @@ sync by hand" comments with an enforced round-trip invariant.
 from __future__ import annotations
 
 from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -215,8 +216,33 @@ class TestReadyEmissionParity:
         emission = codec.ready_emission(item)
 
         assert isinstance(emission, BarrierEmission)
-        for field in dataclass_fields(ScheduledWorkFields):
-            assert getattr(emission, field.name) == getattr(fields, field.name), field.name
+        # Explicit (field, emission, ready-fields) table. Both sides are owned
+        # dataclasses, so direct access makes a dropped field an AttributeError
+        # instead of a silently skipped comparison; the coverage assertion keeps
+        # the table pinned to the live ScheduledWorkFields shape.
+        parity: tuple[tuple[str, object, object], ...] = (
+            ("token_id", emission.token_id, fields.token_id),
+            ("row_id", emission.row_id, fields.row_id),
+            ("node_id", emission.node_id, fields.node_id),
+            ("step_index", emission.step_index, fields.step_index),
+            ("ingest_sequence", emission.ingest_sequence, fields.ingest_sequence),
+            ("row_payload_json", emission.row_payload_json, fields.row_payload_json),
+            ("queue_key", emission.queue_key, fields.queue_key),
+            ("barrier_key", emission.barrier_key, fields.barrier_key),
+            ("on_success_sink", emission.on_success_sink, fields.on_success_sink),
+            ("branch_name", emission.branch_name, fields.branch_name),
+            ("fork_group_id", emission.fork_group_id, fields.fork_group_id),
+            ("join_group_id", emission.join_group_id, fields.join_group_id),
+            ("expand_group_id", emission.expand_group_id, fields.expand_group_id),
+            ("coalesce_node_id", emission.coalesce_node_id, fields.coalesce_node_id),
+            ("coalesce_name", emission.coalesce_name, fields.coalesce_name),
+            ("row_union_name", emission.row_union_name, fields.row_union_name),
+        )
+        covered = {name for name, _, _ in parity}
+        declared = {field.name for field in dataclass_fields(ScheduledWorkFields)}
+        assert covered == declared, f"parity table drifted: missing={declared - covered}, extra={covered - declared}"
+        for name, emitted, ready in parity:
+            assert emitted == ready, name
 
     def test_emission_is_ready_lane_shaped(self) -> None:
         codec = _make_codec()
@@ -237,12 +263,9 @@ class TestRehydrateCursor:
         codec = _make_codec()
         fields = codec.ready_fields(_make_item())
         row = _scheduler_row_from_fields(fields)
-        terminal_row = TokenWorkItem(
-            **{
-                **{f.name: getattr(row, f.name) for f in dataclass_fields(TokenWorkItem)},
-                "node_id": stored_node_id,
-            }
-        )
+        # ``replace`` copies the frozen owned dataclass field-for-field without a
+        # reflective read per field.
+        terminal_row = replace(row, node_id=stored_node_id)
 
         rehydrated = codec.work_item_from_scheduler(terminal_row)
 

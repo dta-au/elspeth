@@ -385,9 +385,16 @@ def _make_processor(
         elif isinstance(plugin, GateSettings):
             node_type = NodeType.GATE
             plugin_name = "gate"
-        else:
+        elif isinstance(plugin, TransformProtocol):
             node_type = NodeType.TRANSFORM
-            plugin_name = getattr(plugin, "name", "transform")
+            plugin_name = plugin.name
+        else:
+            # Bare traversal nodes (no plugin) and the deliberately malformed
+            # stand-ins used by TestUnknownTransformType register under the
+            # generic name. The type test mirrors token_traversal's own dispatch,
+            # which is what must reject a malformed plugin — not this harness.
+            node_type = NodeType.TRANSFORM
+            plugin_name = "transform"
         factory.data_flow.register_node(
             run_id=run_id,
             plugin_name=str(plugin_name),

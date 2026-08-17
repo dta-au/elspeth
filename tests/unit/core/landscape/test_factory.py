@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy.engine import Connection, Engine
@@ -130,18 +131,31 @@ class TestPluginAuditWriter:
         assert "PluginAuditWriterAdapter" not in vars(factory_module)
 
 
-class _RecordingRepo:
-    """Duck-typed repository stub: records every call, returns a per-method sentinel."""
+def _recording_repo_stub(
+    repo_cls: type,
+    method_names: list[str],
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]],
+) -> Mock:
+    """A spec-bound stand-in for ``repo_cls`` that records every delegated call.
 
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    ``spec=repo_cls`` is what makes this an explicit contract rather than a
+    masquerade: the stub answers only names the real repository actually
+    defines, so a facade delegating to a method that does not exist on the
+    repository raises ``AttributeError`` here instead of being quietly absorbed
+    by a catch-all ``__getattr__``. Each recorded method returns a per-method
+    sentinel so the facade's return value can be checked for pass-through.
+    """
 
-    def __getattr__(self, name: str) -> Any:
-        def _method(*args: object, **kwargs: object) -> tuple[str, str]:
-            self.calls.append((name, args, dict(kwargs)))
+    def make_side_effect(name: str) -> Callable[..., tuple[str, str]]:
+        def side_effect(*args: object, **kwargs: object) -> tuple[str, str]:
+            calls.append((name, args, dict(kwargs)))
             return ("delegated", name)
 
-        return _method
+        return side_effect
+
+    stub = Mock(spec=repo_cls)
+    stub.configure_mock(**{f"{name}.side_effect": make_side_effect(name) for name in method_names})
+    return stub
 
 
 class TestReadPortDelegation:
@@ -155,14 +169,19 @@ class TestReadPortDelegation:
     """
 
     @pytest.mark.parametrize(
-        "facade_cls",
-        [RunLifecycleReadRepository, DataFlowReadRepository, ExecutionReadRepository],
+        ("facade_cls", "repo_cls"),
+        [
+            pytest.param(RunLifecycleReadRepository, RunLifecycleRepository, id="run-lifecycle"),
+            pytest.param(DataFlowReadRepository, DataFlowRepository, id="data-flow"),
+            pytest.param(ExecutionReadRepository, ExecutionRepository, id="execution"),
+        ],
     )
-    def test_every_public_method_delegates_to_same_named_repo_method(self, facade_cls: type) -> None:
-        stub = _RecordingRepo()
-        facade = facade_cls(cast(Any, stub))
+    def test_every_public_method_delegates_to_same_named_repo_method(self, facade_cls: type, repo_cls: type) -> None:
         methods = [(name, func) for name, func in inspect.getmembers(facade_cls, inspect.isfunction) if not name.startswith("_")]
         assert methods, f"{facade_cls.__name__} exposes no public methods"
+        calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+        stub = _recording_repo_stub(repo_cls, [name for name, _func in methods], calls)
+        facade = facade_cls(cast(Any, stub))
         for name, func in methods:
             args: list[object] = []
             kwargs: dict[str, object] = {}
@@ -176,9 +195,11 @@ class TestReadPortDelegation:
                     args.extend((f"var-{param.name}-0", f"var-{param.name}-1"))
                 else:  # VAR_KEYWORD
                     kwargs[f"extra_{param.name}"] = f"kw-{param.name}"
-            result = getattr(facade, name)(*args, **kwargs)
+            # ``func`` is the facade's own unbound function from the walk above,
+            # so it is invoked directly rather than re-resolved by name.
+            result = func(facade, *args, **kwargs)
             assert result == ("delegated", name), f"{facade_cls.__name__}.{name} did not return the repository result"
-            recorded_name, recorded_args, recorded_kwargs = stub.calls[-1]
+            recorded_name, recorded_args, recorded_kwargs = calls[-1]
             assert recorded_name == name, f"{facade_cls.__name__}.{name} delegated to {recorded_name!r}"
             assert recorded_args == tuple(args), f"{facade_cls.__name__}.{name} altered positional arguments"
             assert recorded_kwargs == kwargs, f"{facade_cls.__name__}.{name} altered keyword arguments"

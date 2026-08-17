@@ -10,12 +10,15 @@ sentinel).
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from elspeth.contracts.declaration_contracts import (
     BatchFlushInputs,
     BatchFlushOutputs,
     DeclarationContractViolation,
+    DispatchSite,
     PostEmissionInputs,
     PostEmissionOutputs,
     _clear_registry_for_tests,
@@ -333,7 +336,14 @@ def test_post_emission_check_preserves_orchestrationinvarianterror_on_missing_no
 def test_negative_example_fires_violation() -> None:
     c = PassThroughDeclarationContract()
     bundle = c.negative_example()
-    method = getattr(c, bundle.site.value)
+    # Explicit dispatch table over the two sites this contract claims (see
+    # test_contract_claims_both_dispatch_sites): a bundle tagged with any other
+    # site raises KeyError rather than resolving some unrelated attribute.
+    dispatch: dict[DispatchSite, Callable[..., object]] = {
+        DispatchSite.POST_EMISSION: c.post_emission_check,
+        DispatchSite.BATCH_FLUSH: c.batch_flush_check,
+    }
+    method = dispatch[bundle.site]
     with pytest.raises(PassThroughContractViolation):
         method(*bundle.args)
 

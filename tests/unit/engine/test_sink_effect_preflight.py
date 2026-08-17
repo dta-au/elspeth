@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import gc
-import inspect
 import pickle
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -527,7 +526,9 @@ def test_admission_receipt_is_private_and_forged_lookalike_is_rejected() -> None
 
     sink = EffectCapableSink()
     assert "SinkEffectCapabilityAdmission" not in preflight.__all__
-    assert inspect.getattr_static(preflight, "SinkEffectCapabilityAdmission", None) is None
+    # ``vars(module)`` is the module namespace itself: the receipt type must not
+    # be bound there at all, not merely absent from ``__all__``.
+    assert "SinkEffectCapabilityAdmission" not in vars(preflight)
 
     forged = SimpleNamespace(
         sinks={"output": sink},
@@ -555,9 +556,13 @@ def test_module_private_receipt_parts_cannot_forge_or_replace_authority() -> Non
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
     )
 
-    assert inspect.getattr_static(preflight, "_ADMISSION_ISSUER", None) is None
-    assert inspect.getattr_static(preflight, "_AdmittedSinkBinding", None) is None
-    issue = inspect.getattr_static(preflight, "_issue_sink_effect_admission", None)
+    # Namespace inspection, not attribute resolution: these private parts must be
+    # unbound in the module, and the issuer must be bound (a KeyError names the
+    # missing symbol directly instead of surfacing as a None call later).
+    preflight_namespace = vars(preflight)
+    assert "_ADMISSION_ISSUER" not in preflight_namespace
+    assert "_AdmittedSinkBinding" not in preflight_namespace
+    issue = preflight_namespace["_issue_sink_effect_admission"]
     assert callable(issue)
     with pytest.raises(SinkEffectCapabilityError, match="effect protocol"):
         issue(

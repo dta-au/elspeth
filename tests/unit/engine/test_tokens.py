@@ -890,9 +890,11 @@ class TestTokenManagerBoundaryPaths:
     def test_source_identity_parameters_are_required_by_signature(self) -> None:
         from elspeth.engine.tokens import TokenManager
 
-        for method_name in ("create_initial_token", "create_quarantine_token"):
-            signature = inspect.signature(getattr(TokenManager, method_name))
-            type_hints = get_type_hints(getattr(TokenManager, method_name))
+        # Iterate the method objects themselves: a renamed or deleted method is a
+        # NameError at collection instead of a silently skipped signature check.
+        for method in (TokenManager.create_initial_token, TokenManager.create_quarantine_token):
+            signature = inspect.signature(method)
+            type_hints = get_type_hints(method)
             for parameter_name in ("source_row_index", "ingest_sequence"):
                 parameter = signature.parameters[parameter_name]
                 assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
