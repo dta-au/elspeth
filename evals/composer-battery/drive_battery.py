@@ -20,6 +20,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -100,6 +101,76 @@ class RequestsClient:
         except ValueError:
             body = None
         return HttpResponse(r.status_code, body, r.text)
+
+
+class UnixSocketClient:
+    """Address the origin directly over its uvicorn unix socket, bypassing every proxy.
+
+    The public hostname sits behind Cloudflare, whose origin read timeout cuts any
+    response slower than a measured ~125s and synthesizes a 524 — against the origin's
+    own 600s composer budget (elspeth-ad5628ecda). Three of the first five corpus cases
+    exceed that, so the corpus cannot be measured through the hostname at all.
+
+    This is a property of the free-tier edge in front of the development substrate, not
+    of the product: the ECS deployment derives its transport ceiling from
+    ``var.alb_idle_timeout_seconds``. Talking to the socket removes the edge, TLS and
+    Caddy as confounds and leaves exactly the application under test.
+
+    The socket path is carried in the ``--base`` URL (``unix:///run/elspeth/uvicorn.sock``)
+    so it lands verbatim in the firing record's ``base`` field: a round measured off the
+    edge must be distinguishable from one measured through it, or the two are silently
+    compared.
+    """
+
+    def __init__(self, base: str) -> None:
+        import httpx
+
+        self._httpx = httpx
+        self._socket_path = unix_socket_path(base)
+        if not Path(self._socket_path).is_socket():
+            raise ValueError(f"{base}: {self._socket_path} is not a unix socket — refusing to fire against nothing")
+        self._c = httpx.Client(
+            transport=httpx.HTTPTransport(uds=self._socket_path),
+            base_url="http://localhost",
+            # requests follows redirects by default and httpx does not; keep the seam's
+            # two implementations behaving identically.
+            follow_redirects=True,
+        )
+
+    def set_token(self, token: str) -> None:
+        self._c.headers["Authorization"] = f"Bearer {token}"
+
+    def request(
+        self, method: str, path: str, *, json: Any = None, params: Mapping[str, Any] | None = None, timeout: float | None = None
+    ) -> HttpResponse:
+        try:
+            r = self._c.request(method, path, json=json, params=dict(params or {}), timeout=timeout or 60.0)
+        except self._httpx.TimeoutException as exc:
+            raise HttpTimeout(str(exc)) from exc
+        except self._httpx.HTTPError as exc:
+            raise HttpTransportError(f"{type(exc).__name__}: {exc}") from exc
+        try:
+            body = r.json() if r.content else None
+        except ValueError:
+            body = None
+        return HttpResponse(r.status_code, body, r.text)
+
+
+def unix_socket_path(base: str) -> str:
+    """Extract the socket path from a ``unix://`` base URL, or reject the base."""
+    parts = urlsplit(base)
+    if parts.scheme != "unix":
+        raise ValueError(f"{base}: not a unix:// base URL")
+    if parts.netloc:
+        raise ValueError(f"{base}: expected unix:///absolute/path (three slashes), got a host component")
+    if not parts.path.startswith("/"):
+        raise ValueError(f"{base}: socket path must be absolute")
+    return parts.path
+
+
+def build_client(base: str) -> HttpClient:
+    """Select the transport the ``--base`` URL names."""
+    return UnixSocketClient(base) if base.startswith("unix://") else RequestsClient(base)
 
 
 class BatteryAuthError(RuntimeError):
@@ -750,7 +821,12 @@ def _load_credentials(state_dir: Path) -> tuple[str, str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--base", default=os.environ.get("ELSPETH_EVAL_BASE_URL", DEFAULT_BASE))
+    ap.add_argument(
+        "--base",
+        default=os.environ.get("ELSPETH_EVAL_BASE_URL", DEFAULT_BASE),
+        help="substrate URL; use unix:///run/elspeth/uvicorn.sock to address the origin directly "
+        "and bypass the edge read timeout (elspeth-ad5628ecda)",
+    )
     ap.add_argument("--round", required=True)
     ap.add_argument("--repeats", type=int, default=5)
     ap.add_argument("--cases", default=None, help="comma-separated case names; omit for all")
@@ -782,7 +858,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"config: unknown --cases: {', '.join(unknown)}", file=sys.stderr)
             return 64
     battery = Battery(
-        RequestsClient(ns.base),
+        build_client(ns.base),
         base=ns.base,
         round_name=ns.round,
         runs_dir=Path(ns.runs_dir),

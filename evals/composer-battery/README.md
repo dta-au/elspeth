@@ -72,6 +72,46 @@ still fires the tripwire — pass `--no-tripwire` as well to fire the canary
 alone. An unknown `--cases` name exits 64 naming it, before any network
 call.
 
+### Fire against the origin, not the public hostname (elspeth-ad5628ecda)
+
+`https://elspeth.foundryside.dev` is served through Cloudflare, whose origin
+read timeout cuts any response the origin has not begun answering within a
+**measured ~125.0 s** and returns a 524. The origin's own composer budget is
+`ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=600.0`, so the two limits disagree by
+~4.8×, and the origin *cancels* the in-flight run when the edge hangs up —
+the result is destroyed, not merely delayed. Round `2026-08-17-calib5`
+aborted after 5 of 19 corpus cases on `3 consecutive instrument_error`; three
+of those first five (`deaggregation`, `deep_routing`, `error_routing`)
+exceeded the cut, and `batch_aggregation` cleared it by 0.6 s. **The corpus
+cannot be measured through the hostname.**
+
+Address the uvicorn socket directly instead — this bypasses Cloudflare, Caddy
+and TLS in one step:
+
+```bash
+python evals/composer-battery/drive_battery.py \
+  --base unix:///run/elspeth/uvicorn.sock --round <r> --repeats 5
+```
+
+Notes:
+
+- This is a property of the free-tier edge in front of the **development**
+  substrate, not a product defect. The ECS deployment derives its transport
+  ceiling from `var.alb_idle_timeout_seconds` (`locals.tf`, with a plan-time
+  cap and a test pinning the mirror), and an enterprise edge configures the
+  origin timeout directly.
+- The base URL is recorded verbatim in `firing.json`'s `base`, so a round
+  fired off the edge is distinguishable from one fired through it. Do not
+  compare the two silently — the transport is part of the binding identity in
+  practice even though `report.py` does not yet refuse on it.
+- What the socket path removes is transport, not application behaviour: the
+  same request returns a byte-identical body on both paths (verified on
+  `POST /api/auth/login` and `/api/system/status`). Latency measurements will
+  shed the edge's TLS and proxy overhead, which is small next to a compose.
+- The health check in **Prerequisites** above can be run the same way:
+  `curl -s --unix-socket /run/elspeth/uvicorn.sock
+  http://localhost/api/system/status | jq .composer_available`.
+
 Exit codes, as implemented in `drive_battery.py main()` / `report.py main()`:
 
 - driver `0` completed; `1` aborted by the instrument rules — **three
