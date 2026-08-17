@@ -126,7 +126,7 @@ per_file_rules:
     never zero — the audit row records what the provider actually said.
 
     '
-  expires: null
+  expires: '2026-10-06'
   max_hits: 22
 - pattern: contracts/secret_scrub.py
   rules:
@@ -162,7 +162,7 @@ per_file_rules:
     Direct attribute access would crash on legitimate inputs (builtins, C functions,
     functional-syntax TypedDicts, non-global co_names, and dependency cycles). Ceiling
     pinned to 35 — adding a 36th site requires explicit review, not silent absorption.'
-  expires: null
+  expires: '2026-10-06'
   max_hits: 35
 allow_hits:
 - key: contracts/tier_registry.py:R5:_register_with_module_prefix:fp=ce98be6cf59df4d5

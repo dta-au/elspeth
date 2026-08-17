@@ -32,7 +32,7 @@ per_file_rules:
   - R6
   reason: Configuration loading parses user YAML (Tier 3) - defensive optional field
     access required
-  expires: null
+  expires: '2026-10-06'
 - pattern: core/config.py
   rules:
   - R5

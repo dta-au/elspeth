@@ -29,7 +29,7 @@ per_file_rules:
   - R9
   reason: Azure API responses are external data (Tier 3) - all defensive patterns
     legitimate
-  expires: null
+  expires: '2026-10-06'
 - pattern: plugins/transforms/azure/*
   rules:
   - R5
@@ -43,7 +43,7 @@ per_file_rules:
   - R6
   reason: Dataverse OData API responses are external data (Tier 3) — isinstance/type
     checks for response validation, error classification, and retry-after parsing
-  expires: null
+  expires: '2026-10-06'
 - pattern: plugins/infrastructure/clients/fingerprinting.py
   rules:
   - R1
@@ -63,7 +63,7 @@ per_file_rules:
   - R5
   reason: R5 offensive guard for alternate key type; R4 broad except in telemetry
     emission (must not crash audit trail — same pattern as AuditedHTTPClient._record_and_emit)
-  expires: null
+  expires: '2026-10-06'
   max_hits: 1
 - pattern: plugins/sinks/chroma_sink.py
   rules:

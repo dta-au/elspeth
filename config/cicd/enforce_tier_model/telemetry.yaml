@@ -7,7 +7,7 @@ per_file_rules:
   - R6
   - R9
   reason: Telemetry services are external (Tier 3) - all defensive patterns legitimate
-  expires: null
+  expires: '2026-10-06'
 - pattern: telemetry/exporters/*
   rules:
   - R5

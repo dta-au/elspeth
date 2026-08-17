@@ -5,7 +5,7 @@ per_file_rules:
   - R4
   - R6
   reason: CLI handles user input, env vars, and external system checks (Tier 3)
-  expires: null
+  expires: '2026-10-06'
 - pattern: cli.py
   rules:
   - R5
