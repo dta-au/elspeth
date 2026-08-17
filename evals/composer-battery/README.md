@@ -100,14 +100,26 @@ Notes:
   ceiling from `var.alb_idle_timeout_seconds` (`locals.tf`, with a plan-time
   cap and a test pinning the mirror), and an enterprise edge configures the
   origin timeout directly.
-- The base URL is recorded verbatim in `firing.json`'s `base`, so a round
-  fired off the edge is distinguishable from one fired through it. Do not
-  compare the two silently — the transport is part of the binding identity in
-  practice even though `report.py` does not yet refuse on it.
+- The base URL is already part of the **binding identity**
+  (`identity.binding.substrate`, alongside `firing.json`'s `base`), so
+  `report.py --compare` refuses across transports rather than silently
+  diffing an edge-fired round against a socket-fired one. `--force-compare`
+  still overrides and stamps the report FORCED/not-attributable — which is
+  the right call only if you have separately established that the edge did
+  not perturb the round it fired.
 - What the socket path removes is transport, not application behaviour: the
   same request returns a byte-identical body on both paths (verified on
   `POST /api/auth/login` and `/api/system/status`). Latency measurements will
   shed the edge's TLS and proxy overhead, which is small next to a compose.
+  Verified end-to-end 2026-08-17 — `deaggregation`, which died at 125.024 s
+  with a 524 through the hostname, returned **200 after 130,405 ms** over the
+  socket with every instrument flag clear
+  (`runs/2026-08-17-socket-verify/deaggregation/1/meta.json`).
+- Nothing proxies the socket, so no intermediary remains that could impose a
+  ceiling: the only deadlines left are the driver's `CLIENT_TIMEOUT_S` (620 s)
+  and the origin's own `composer_timeout_seconds` (600 s), which is the
+  arrangement `_validate_composer_timeout_transport_headroom` exists to keep
+  ordered.
 - The health check in **Prerequisites** above can be run the same way:
   `curl -s --unix-socket /run/elspeth/uvicorn.sock
   http://localhost/api/system/status | jq .composer_available`.
