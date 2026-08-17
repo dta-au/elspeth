@@ -40,6 +40,7 @@ EXPECTED_CASES = {
     "llm_source",
     "schema_contracts_demo",
     "report_assemble",
+    "field_drop",
 }
 
 
@@ -65,7 +66,7 @@ def _present_cases() -> list[str]:
 
 
 def test_corpus_and_scenarios_cover_the_same_cases() -> None:
-    """The corpus is the roster. Every corpus case has a scenario and vice versa; the FULL 19-name roster is
+    """The corpus is the roster. Every corpus case has a scenario and vice versa; the FULL 20-name roster is
     required once the corpus is frozen (corpus_version >= 1) — while it is under construction (version 0) a
     subset is allowed so the tree stays green between authoring batches (Task 3a → 3b)."""
     version, cases = load_corpus()

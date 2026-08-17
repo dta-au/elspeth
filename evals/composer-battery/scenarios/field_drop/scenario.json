@@ -1,5 +1,5 @@
 {
-  "case": "canary",
+  "case": "field_drop",
   "example": null,
   "variant": null,
   "corpus_version": 0,
@@ -10,7 +10,7 @@
   "canonical_arguments": {
     "source": {
       "plugin": "json",
-      "on_success": "out",
+      "on_success": "in",
       "options": {
         "path": "colours.json",
         "schema": {
@@ -19,7 +19,25 @@
       },
       "on_validation_failure": "discard"
     },
-    "nodes": [],
+    "nodes": [
+      {
+        "id": "keep_names",
+        "node_type": "transform",
+        "plugin": "field_mapper",
+        "input": "in",
+        "on_success": "out",
+        "on_error": "discard",
+        "options": {
+          "mapping": {
+            "name": "name"
+          },
+          "select_only": true,
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      }
+    ],
     "edges": [],
     "outputs": [
       {
@@ -47,6 +65,11 @@
         "extras": {}
       },
       {
+        "kind": "transform",
+        "plugin": "field_mapper",
+        "extras": {}
+      },
+      {
         "kind": "output",
         "plugin": "json",
         "extras": {}
@@ -56,6 +79,11 @@
       [
         0,
         1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
         "on_success"
       ]
     ]
@@ -71,10 +99,10 @@
     "repairs": 0,
     "backtracks": 0,
     "derivation": [
-      "discovery: 0 \u2014 json in, json out; observed 2026-08-17, the composer authors these directly and the green criterion must_discover_schema_before_first_mutation is false for this case (see calibration/README.md)",
-      "data: the invented rows travel with the mutation \u2014 0 extra (this substrate resolves them via a blob and one interpretation-review round, which is the second tool-bearing turn)",
+      "discovery: schemas for json, field_mapper \u2014 one batched call",
+      "data: the invented rows travel with the mutation \u2014 0 extra (observed 2026-08-17: this substrate routes them via a blob resolved by one interpretation-review round; see calibration/README.md)",
       "dependent_listing: none",
-      "mutation: single set_pipeline authors the source and the sink"
+      "mutation: single set_pipeline authors source, the field_mapper node and the sink"
     ],
     "pre_calibration": 2,
     "post_calibration": null
@@ -89,7 +117,7 @@
   "green_criteria": {
     "topology_matches_expected": true,
     "option_assertions_hold": true,
-    "must_discover_schema_before_first_mutation": false,
+    "must_discover_schema_before_first_mutation": true,
     "is_valid": true
   }
 }

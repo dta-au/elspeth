@@ -10,8 +10,8 @@ The first unlabelled fenced block under each heading is sent byte-for-byte.
 ## canary
 
 ```
-I've got a tiny list of three colours with a name and a hex code — just make it up.
-I only want it read in and written back out as JSON, nothing else done to it.
+I've got a tiny list of three colours with a name and a hex code, sitting in a JSON file — just make it up.
+I only want it read in and written straight back out to JSON, nothing else done to it.
 ```
 
 ## fork_coalesce
@@ -196,4 +196,11 @@ JSON lines.
 I have no data for this one. The rows should come from a model instead: ask it for
 five plausible support tickets, one per row, and keep whatever it returns as it
 comes. Write them straight out as JSON lines.
+```
+
+## field_drop
+
+```
+I've got a tiny list of three colours — each one has a name and a hex code. Make the data up.
+In the file that comes out I only want the colour names, not the hex codes. JSON both ends.
 ```
