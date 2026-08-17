@@ -248,13 +248,17 @@ def test_strict_helper_type_contract_forbids_optional_authority() -> None:
     assert get_type_hints(helper)["coordination_token"] is CoordinationToken
 
 
+# The ids reproduce the node ids the previous stacked ``method_name`` x
+# ``repository_type`` parametrization produced, because the state-engine v3
+# proof catalog selects these tests by exact node id
+# (docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json).
 @pytest.mark.parametrize(
     "method",
     [
-        pytest.param(BarrierJournalRepository.mark_blocked_barrier_terminal, id="journal-terminal"),
-        pytest.param(BarrierJournalRepository.mark_blocked_barrier_pending_sink_many, id="journal-pending-sink"),
-        pytest.param(TokenSchedulerRepository.mark_blocked_barrier_terminal, id="facade-terminal"),
-        pytest.param(TokenSchedulerRepository.mark_blocked_barrier_pending_sink_many, id="facade-pending-sink"),
+        pytest.param(BarrierJournalRepository.mark_blocked_barrier_terminal, id="terminal-journal"),
+        pytest.param(TokenSchedulerRepository.mark_blocked_barrier_terminal, id="terminal-facade"),
+        pytest.param(BarrierJournalRepository.mark_blocked_barrier_pending_sink_many, id="pending-sink-journal"),
+        pytest.param(TokenSchedulerRepository.mark_blocked_barrier_pending_sink_many, id="pending-sink-facade"),
     ],
 )
 def test_barrier_wrapper_type_contract_requires_authority(method: FunctionType) -> None:
@@ -307,11 +311,13 @@ def test_required_coordination_parameter_rejects_wrong_runtime_binding(monkeypat
         _assert_required_coordination_parameter(cast(FunctionType, probe))
 
 
+# The ids reproduce the class-derived node ids of the previous
+# ``repository_type`` parametrization — see the proof-catalog note above.
 @pytest.mark.parametrize(
     "method",
     [
-        pytest.param(SchedulerLeaseRepository.recover_expired_leases_legacy_unfenced, id="leases"),
-        pytest.param(TokenSchedulerRepository.recover_expired_leases_legacy_unfenced, id="facade"),
+        pytest.param(SchedulerLeaseRepository.recover_expired_leases_legacy_unfenced, id="SchedulerLeaseRepository"),
+        pytest.param(TokenSchedulerRepository.recover_expired_leases_legacy_unfenced, id="TokenSchedulerRepository"),
     ],
 )
 def test_legacy_recovery_api_is_explicitly_named_and_has_no_authority_selector(method: Callable[..., object]) -> None:

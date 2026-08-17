@@ -1232,7 +1232,10 @@ class TestExportRunStreaming:
                 yield batch
 
         read_model = _SpyReadModel(read_model)
-        read_model.iter_rows_for_run = counting_iter  # type: ignore[attr-defined]
+        # Shadowing the explicit method with an instance attribute: the counting
+        # generator matches iter_rows_for_run's signature exactly, so no
+        # suppression is needed now that the method is written out.
+        read_model.iter_rows_for_run = counting_iter
         exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model, row_batch_size=1)
 
         iterator = exporter.export_run("run-1")
