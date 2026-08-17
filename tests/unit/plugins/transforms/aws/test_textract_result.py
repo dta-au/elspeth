@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from types import MappingProxyType
 from typing import Any
 
 import pytest
 
-from elspeth.contracts.freeze import deep_freeze
+from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.plugins.transforms.aws.textract_result import (
     MalformedTextractResponse,
     normalize_analyze_document_result,
@@ -151,7 +152,12 @@ def test_normalize_text_pages_metadata_and_native_result() -> None:
     assert result.text == "Invoice\nTotal $42\n\f\nThank you"
     assert result.page_count == 2
     assert result.block_count == len(result.native_result["Blocks"])
-    assert result.pages == (
+    # ``NormalizedTextractResult`` deep-freezes its container fields, so these
+    # compare the thawed projection — exactly what both plugins put on the row
+    # via ``deep_thaw`` in ``_build_enriched_result``. The frozen carriers
+    # themselves are pinned by
+    # ``test_normalized_result_container_fields_are_deeply_frozen``.
+    assert deep_thaw(result.pages) == [
         {
             "page": 1,
             "text": "Invoice\nTotal $42",
@@ -169,8 +175,8 @@ def test_normalize_text_pages_metadata_and_native_result() -> None:
                 {"id": "line-3", "text": "Thank you", "confidence": 97.5, "geometry": _geometry()},
             ],
         },
-    )
-    assert result.metadata == {
+    ]
+    assert deep_thaw(result.metadata) == {
         "job_id": "job-1",
         "job_status": "SUCCEEDED",
         "page_count": 2,
@@ -180,11 +186,64 @@ def test_normalize_text_pages_metadata_and_native_result() -> None:
         "feature_types": ["FORMS", "TABLES"],
         "s3_version": "version-1",
     }
-    assert result.native_result["Warnings"] == [{"ErrorCode": "PAGE_CHARACTERS_EXCEEDED", "Pages": [1]}]
+    assert deep_thaw(result.native_result["Warnings"]) == [{"ErrorCode": "PAGE_CHARACTERS_EXCEEDED", "Pages": [1]}]
     assert result.native_result["Blocks"][2]["UnknownMember"] == {"preserved": True}
     assert "ResponseMetadata" not in result.native_result
     assert "NextToken" not in result.native_result
     assert "UnknownTopLevel" not in result.native_result
+
+
+def test_normalized_result_container_fields_are_deeply_frozen() -> None:
+    """Every container field is immutable in place, not merely un-rebindable.
+
+    ``frozen=True`` alone stops rebinding the attribute; it leaves the ``dict``
+    entries behind the facet tuples, and the ``metadata``/``native_result``
+    mappings, mutable through any retained reference. This pins the
+    ``__post_init__`` freeze that closes that gap, and is the contract the
+    thawed content assertions above deliberately no longer check.
+    """
+    result = _normalize()
+
+    for facet_name in ("pages", "tables", "forms", "queries", "signatures", "layout"):
+        facet = getattr(result, facet_name)
+        assert type(facet) is tuple, facet_name
+        for entry in facet:
+            assert type(entry) is MappingProxyType, facet_name
+            with pytest.raises(TypeError):
+                entry["injected"] = "mutated"  # type: ignore[index]
+
+    for mapping_name in ("metadata", "native_result"):
+        mapping = getattr(result, mapping_name)
+        assert type(mapping) is MappingProxyType, mapping_name
+        with pytest.raises(TypeError):
+            mapping["injected"] = "mutated"  # type: ignore[index]
+
+    # Nested, not just top level: the block graph is the payload that matters.
+    assert type(result.native_result["Blocks"]) is tuple
+    assert type(result.native_result["Blocks"][0]) is MappingProxyType
+    with pytest.raises(TypeError):
+        result.native_result["Blocks"][0]["BlockType"] = "TAMPERED"
+
+
+def test_normalized_result_does_not_alias_a_caller_retained_page() -> None:
+    """Mutating the source pages after construction cannot change the result.
+
+    This passes with or without the ``__post_init__`` freeze — normalization
+    already detaches (``deep_thaw`` per block, fresh literals for the metadata
+    and native-result heads). It is a regression guard for THAT detachment,
+    which is why the freeze above can be justified as a class-contract
+    defence rather than the repair of a live aliasing defect. Do not read it
+    as evidence that the freeze works; that is the test above.
+    """
+    first, second = _first_page(), _second_page()
+    result = _normalize(first, second)
+
+    original_block_type = result.native_result["Blocks"][0]["BlockType"]
+    first["Blocks"][0]["BlockType"] = "TAMPERED"
+    first["Warnings"].append({"ErrorCode": "INJECTED", "Pages": [9]})
+
+    assert result.native_result["Blocks"][0]["BlockType"] == original_block_type
+    assert deep_thaw(result.native_result["Warnings"]) == [{"ErrorCode": "PAGE_CHARACTERS_EXCEEDED", "Pages": [1]}]
 
 
 def test_normalize_accepts_deeply_frozen_audited_client_pages() -> None:
@@ -200,7 +259,7 @@ def test_normalize_accepts_deeply_frozen_audited_client_pages() -> None:
     )
 
     assert result.text == "Invoice\nTotal $42\n\f\nThank you"
-    assert result.native_result["Blocks"][0]["Relationships"] == [{"Type": "CHILD", "Ids": ["line-1", "line-2"]}]
+    assert deep_thaw(result.native_result["Blocks"][0]["Relationships"]) == [{"Type": "CHILD", "Ids": ["line-1", "line-2"]}]
 
 
 def test_duplicate_block_id_fails_closed() -> None:
@@ -527,7 +586,9 @@ def _facet_first_page() -> dict[str, Any]:
 def test_normalize_tables_forms_queries_signatures_and_layout() -> None:
     result = _normalize(_facet_first_page(), _second_page())
 
-    assert result.tables == (
+    # Thawed like the plugins' own facet emission: ``tables`` is the one facet
+    # with a nested list (``rows``), which the deep freeze turns into a tuple.
+    assert deep_thaw(result.tables) == [
         {
             "id": "table-1",
             "page": 1,
@@ -561,8 +622,8 @@ def test_normalize_tables_forms_queries_signatures_and_layout() -> None:
                 ]
             ],
         },
-    )
-    assert result.forms == (
+    ]
+    assert deep_thaw(result.forms) == [
         {
             "page": 1,
             "key": "Invoice number",
@@ -585,8 +646,8 @@ def test_normalize_tables_forms_queries_signatures_and_layout() -> None:
             "key_geometry": _geometry(),
             "value_geometry": None,
         },
-    )
-    assert result.queries == (
+    ]
+    assert deep_thaw(result.queries) == [
         {
             "page": 1,
             "query": "What is the invoice total?",
@@ -605,9 +666,9 @@ def test_normalize_tables_forms_queries_signatures_and_layout() -> None:
             "query_block_id": "query-2",
             "answer_block_id": None,
         },
-    )
-    assert result.signatures == ({"id": "signature-1", "page": 1, "confidence": 94.0, "geometry": _geometry(left=0.4)},)
-    assert result.layout == (
+    ]
+    assert deep_thaw(result.signatures) == [{"id": "signature-1", "page": 1, "confidence": 94.0, "geometry": _geometry(left=0.4)}]
+    assert deep_thaw(result.layout) == [
         {
             "id": "layout-1",
             "block_type": "LAYOUT_TITLE",
@@ -616,7 +677,7 @@ def test_normalize_tables_forms_queries_signatures_and_layout() -> None:
             "confidence": 93.0,
             "geometry": _geometry(),
         },
-    )
+    ]
 
 
 def test_duplicate_table_cell_coordinates_fail_closed() -> None:
@@ -704,7 +765,7 @@ def test_analyze_document_normalizes_single_response() -> None:
     assert result.page_count == 1
     assert result.block_count == 6
     assert [page["page"] for page in result.pages] == [1]
-    assert result.metadata == {
+    assert deep_thaw(result.metadata) == {
         "page_count": 1,
         "block_count": 6,
         "model_version": "1.0",
@@ -719,7 +780,7 @@ def test_analyze_document_accepts_deeply_frozen_response() -> None:
     result = _normalize_sync(deep_freeze(_sync_response()))
 
     assert result.text == "Invoice\nTotal $42"
-    assert result.native_result["Blocks"][0]["Relationships"] == [{"Type": "CHILD", "Ids": ["line-1", "line-2"]}]
+    assert deep_thaw(result.native_result["Blocks"][0]["Relationships"]) == [{"Type": "CHILD", "Ids": ["line-1", "line-2"]}]
 
 
 def test_analyze_document_rejects_human_loop_activation_output() -> None:

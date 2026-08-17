@@ -23,6 +23,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import pairwise
+from types import MappingProxyType
 from typing import Any, Final, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
@@ -1140,7 +1141,15 @@ class GuidedAdvisoryGraphAuthority:
                 raise InvariantError("guided advisory graph authority coverage contains a malformed intent id")
         if len(set(self.covered_deferred_intent_ids)) != len(self.covered_deferred_intent_ids):
             raise InvariantError("guided advisory graph authority coverage contains duplicate intent ids")
-        if not isinstance(self.payload, Mapping):
+        # Exact carriers, matching every other check in this __post_init__
+        # (``type(x) is not str`` / ``is not tuple``) rather than a structural
+        # ``isinstance(..., Mapping)``: per ADR-032 a nominal check is what
+        # belongs on an authority record ELSPETH constructs itself. These two
+        # are the only shapes that reach the field — the sole production
+        # caller passes ``PreparedGuidedJsonPayload.payload``, already
+        # ``freeze_fields``d to a ``MappingProxyType``, and direct
+        # constructions pass a plain ``dict``.
+        if type(self.payload) not in (dict, MappingProxyType):
             raise InvariantError("guided advisory graph authority payload must be a mapping")
         payload_error = validate_payload(self.turn_type, self.payload)
         if payload_error is not None:

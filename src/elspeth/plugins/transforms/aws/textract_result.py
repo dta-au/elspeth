@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json
 
@@ -37,6 +37,44 @@ class NormalizedTextractResult:
     layout: tuple[Mapping[str, Any], ...]
     metadata: Mapping[str, Any]
     native_result: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        # The six facet tuples carry mutable ``dict`` entries behind an
+        # immutable tuple, and ``metadata``/``native_result`` are mappings, so
+        # ``frozen=True`` alone leaves every one of them mutable in place.
+        #
+        # On today's two construction paths nothing outside this module holds
+        # a reference: ``_project_*`` build fresh dicts from validated
+        # scalars, ``native_result``'s ``Blocks`` are ``deep_thaw`` copies,
+        # and both ``native_result_head``/``metadata`` are fresh literals over
+        # fresh values. The guard therefore defends the CLASS contract, not a
+        # live alias — this is a retained-provider-data record two plugins
+        # import, and a third constructor must not be able to hand it a live
+        # mapping.
+        #
+        # Not free: ``deep_freeze`` rebuilds mappings unconditionally, so this
+        # is one extra full walk of ``native_result``. Measured on
+        # Textract-shaped blocks: ~9ms at 1k blocks, ~266ms at 20k, ~5s at the
+        # ``max_blocks=200_000`` ceiling. The path already spends two such
+        # walks (``deep_thaw`` per block here, ``deep_thaw`` again in each
+        # plugin's ``_build_enriched_result``) and is gated behind a Textract
+        # job that costs seconds to minutes, so the walk is proportionate.
+        #
+        # No consumer sees the change: every reader of these eight fields
+        # either ``deep_thaw``s first or reads a scalar, and the one raw read
+        # (``metadata["warnings"]``) is already ``isinstance(..., list | tuple)``
+        # tolerant.
+        freeze_fields(
+            self,
+            "pages",
+            "tables",
+            "forms",
+            "queries",
+            "signatures",
+            "layout",
+            "metadata",
+            "native_result",
+        )
 
 
 def _malformed(path: str, detail: str) -> NoReturn:

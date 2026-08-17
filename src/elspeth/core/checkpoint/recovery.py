@@ -33,7 +33,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.barrier_scalars import BarrierScalars
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError
-from elspeth.contracts.freeze import deep_freeze
+from elspeth.contracts.freeze import deep_freeze, freeze_fields
 from elspeth.contracts.types import NodeID
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator, IncompatibleCheckpointError
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError, CheckpointManager
@@ -192,6 +192,18 @@ class SourceLifecycleResumeGate:
     lifecycle_by_source: Mapping[str, str]
     incomplete_sources: Mapping[str, str]
     check: ResumeCheck
+
+    def __post_init__(self) -> None:
+        # Both mappings are built fresh per gate call from one SQL read, and
+        # ``incomplete_sources`` is a derived subset of ``lifecycle_by_source``
+        # — so the two share str values but no container. Freezing them keeps
+        # the gate's evidence identical between the advisory ``can_resume()``
+        # read and the enforcing ``resume()`` guard, which is the whole point
+        # of the elspeth-1f5b83cd28 parity contract. Both readers are
+        # read-only: ``resume()`` truth-tests ``lifecycle_by_source`` and hands
+        # ``incomplete_sources`` to ``IncompleteSourceResumeError``, which
+        # copies it via ``dict(source_states)``.
+        freeze_fields(self, "lifecycle_by_source", "incomplete_sources")
 
 
 def check_source_lifecycle_resumable(db: LandscapeDB, run_id: str) -> SourceLifecycleResumeGate:

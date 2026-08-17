@@ -23,7 +23,7 @@ import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.events import ExternalCallCompleted
-from elspeth.contracts.freeze import deep_freeze
+from elspeth.contracts.freeze import deep_freeze, freeze_fields
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
 
@@ -97,6 +97,15 @@ class AnalysisResultPage:
     semantic_response: Mapping[str, Any]
     next_token: str | None
 
+    def __post_init__(self) -> None:
+        # Retained provider data: it is audited, size-bounded, and re-read by
+        # the polling loop, so it must not change after construction.
+        # ``get_document_analysis`` already passes the ``deep_freeze``d form
+        # from ``_bounded_semantic_response``, so on the production path this
+        # guard re-walks an already-frozen mapping; it is stated for the
+        # constructors that do NOT pre-freeze (test doubles pass live dicts).
+        freeze_fields(self, "semantic_response")
+
 
 @dataclass(frozen=True, slots=True)
 class InlineAnalysisResult:
@@ -109,6 +118,12 @@ class InlineAnalysisResult:
 
     semantic_response: Mapping[str, Any]
     sdk_attempts: int
+
+    def __post_init__(self) -> None:
+        # Same contract as ``AnalysisResultPage.semantic_response``:
+        # ``analyze_document`` passes the already-``deep_freeze``d form, so
+        # this guard covers the non-production constructors.
+        freeze_fields(self, "semantic_response")
 
 
 class TextractSDKClient(Protocol):
