@@ -1,0 +1,136 @@
+{
+  "case": "boolean_routing",
+  "example": "examples/boolean_routing",
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "AMBIGUOUS"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "csv",
+      "on_success": "gate_in",
+      "options": {
+        "path": "reviews.csv",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "approval_check",
+        "node_type": "gate",
+        "input": "gate_in",
+        "condition": "row['approved'] == 'true'",
+        "routes": {
+          "true": "approved",
+          "false": "rejected"
+        }
+      }
+    ],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "approved",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/approved.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "rejected",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/rejected.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
+        "route"
+      ],
+      [
+        1,
+        3,
+        "route"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: schemas for csv source, gate, csv sink \u2014 one batched call",
+      "data: invented rows travel as source.inline_blob inside the mutation \u2014 0 extra",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors the whole graph"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": true,
+    "is_valid": true
+  }
+}

@@ -1,0 +1,421 @@
+{
+  "case": "deep_routing",
+  "example": "examples/deep_routing",
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "AMBIGUOUS"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "csv",
+      "on_success": "raw",
+      "options": {
+        "path": "applications.csv",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "content_screen",
+        "node_type": "transform",
+        "plugin": "keyword_filter",
+        "input": "raw",
+        "on_success": "screened",
+        "on_error": "quarantine",
+        "options": {
+          "fields": [
+            "notes"
+          ],
+          "blocked_patterns": [
+            "(?i)\\bpassword\\b",
+            "(?i)\\bconfidential\\b",
+            "(?i)\\bsecret\\b",
+            "(?i)\\binternal\\b"
+          ],
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      },
+      {
+        "id": "normalize",
+        "node_type": "transform",
+        "plugin": "field_mapper",
+        "input": "screened",
+        "on_success": "fields",
+        "on_error": "discard",
+        "options": {
+          "mapping": {
+            "id": "application_id",
+            "applicant": "applicant_name",
+            "amount": "loan_amount",
+            "credit_score": "credit_score",
+            "loan_type": "loan_type",
+            "term_months": "term_months",
+            "notes": "notes"
+          },
+          "select_only": true,
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      },
+      {
+        "id": "trim_notes",
+        "node_type": "transform",
+        "plugin": "truncate",
+        "input": "fields",
+        "on_success": "trimmed",
+        "on_error": "discard",
+        "options": {
+          "fields": {
+            "notes": 40
+          },
+          "suffix": "...",
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      },
+      {
+        "id": "amount_tier",
+        "node_type": "gate",
+        "input": "trimmed",
+        "condition": "row['loan_amount'] >= 5000",
+        "routes": {
+          "true": "regular",
+          "false": "micro_loans"
+        }
+      },
+      {
+        "id": "credit_check",
+        "node_type": "gate",
+        "input": "regular",
+        "condition": "row['credit_score'] >= 700",
+        "routes": {
+          "true": "good_credit",
+          "false": "poor_credit"
+        }
+      },
+      {
+        "id": "loan_type_check",
+        "node_type": "gate",
+        "input": "good_credit",
+        "condition": "row['loan_type'] == 'mortgage'",
+        "routes": {
+          "true": "mortgage_path",
+          "false": "approved_other"
+        }
+      },
+      {
+        "id": "term_check",
+        "node_type": "gate",
+        "input": "mortgage_path",
+        "condition": "row['term_months'] >= 240",
+        "routes": {
+          "true": "long_term_mortgages",
+          "false": "short_term_mortgages"
+        }
+      },
+      {
+        "id": "risk_level",
+        "node_type": "gate",
+        "input": "poor_credit",
+        "condition": "row['loan_amount'] >= 50000",
+        "routes": {
+          "true": "high_risk",
+          "false": "manual_review"
+        }
+      }
+    ],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "quarantine",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/quarantine.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "micro_loans",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/micro_loans.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "approved_other",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/approved_other.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "long_term_mortgages",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/long_term_mortgages.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "short_term_mortgages",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/short_term_mortgages.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "high_risk",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/high_risk.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      },
+      {
+        "sink_name": "manual_review",
+        "plugin": "csv",
+        "options": {
+          "path": "outputs/manual_review.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "keyword_filter",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "field_mapper",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "truncate",
+        "extras": {}
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "gate",
+        "plugin": null,
+        "extras": {
+          "route_count": "2"
+        }
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "csv",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
+        "on_success"
+      ],
+      [
+        1,
+        9,
+        "on_error"
+      ],
+      [
+        2,
+        3,
+        "on_success"
+      ],
+      [
+        3,
+        4,
+        "on_success"
+      ],
+      [
+        4,
+        5,
+        "route"
+      ],
+      [
+        4,
+        10,
+        "route"
+      ],
+      [
+        5,
+        6,
+        "route"
+      ],
+      [
+        5,
+        8,
+        "route"
+      ],
+      [
+        6,
+        7,
+        "route"
+      ],
+      [
+        6,
+        11,
+        "route"
+      ],
+      [
+        7,
+        12,
+        "route"
+      ],
+      [
+        7,
+        13,
+        "route"
+      ],
+      [
+        8,
+        14,
+        "route"
+      ],
+      [
+        8,
+        15,
+        "route"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: schemas for csv source, keyword_filter, field_mapper, truncate, gate, csv sink \u2014 one batched call",
+      "data: invented rows travel as source.inline_blob inside the mutation \u2014 0 extra",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors the whole graph"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": true,
+    "is_valid": true
+  }
+}
