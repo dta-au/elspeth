@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import inspect
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -157,15 +157,17 @@ def _method_attribute_references(
 
 
 def _strict_fenced_write() -> _StrictFencedWrite:
-    helper = getattr(fencing, "fenced_write", None)
-    assert helper is not None, "scheduler fencing must expose a strict fenced_write helper"
-    return cast(_StrictFencedWrite, helper)
+    """The strict helper, resolved directly so a rename fails at attribute access."""
+    return cast(_StrictFencedWrite, fencing.fenced_write)
 
 
 def _legacy_unfenced_recovery_write() -> _LegacyUnfencedRecoveryWrite:
-    helper = getattr(fencing, LEGACY_RECOVERY_HELPER, None)
-    assert helper is not None, "scheduler fencing must expose a recovery-specific legacy unfenced helper"
-    return cast(_LegacyUnfencedRecoveryWrite, helper)
+    """The recovery-specific legacy unfenced helper, resolved directly.
+
+    ``LEGACY_RECOVERY_HELPER`` still names this helper for the AST mutation
+    cases below; this direct access is what pins the helper's existence.
+    """
+    return cast(_LegacyUnfencedRecoveryWrite, fencing.legacy_unfenced_recover_expired_leases_write)
 
 
 def _resolved_parameter_annotation(method: FunctionType, parameter_name: str) -> object:
@@ -247,21 +249,15 @@ def test_strict_helper_type_contract_forbids_optional_authority() -> None:
 
 
 @pytest.mark.parametrize(
-    "repository_type",
-    [BarrierJournalRepository, TokenSchedulerRepository],
-    ids=["journal", "facade"],
+    "method",
+    [
+        pytest.param(BarrierJournalRepository.mark_blocked_barrier_terminal, id="journal-terminal"),
+        pytest.param(BarrierJournalRepository.mark_blocked_barrier_pending_sink_many, id="journal-pending-sink"),
+        pytest.param(TokenSchedulerRepository.mark_blocked_barrier_terminal, id="facade-terminal"),
+        pytest.param(TokenSchedulerRepository.mark_blocked_barrier_pending_sink_many, id="facade-pending-sink"),
+    ],
 )
-@pytest.mark.parametrize(
-    "method_name",
-    ["mark_blocked_barrier_terminal", "mark_blocked_barrier_pending_sink_many"],
-    ids=["terminal", "pending-sink"],
-)
-def test_barrier_wrapper_type_contract_requires_authority(
-    repository_type: type[BarrierJournalRepository] | type[TokenSchedulerRepository],
-    method_name: str,
-) -> None:
-    method = cast(FunctionType, getattr(repository_type, method_name))
-
+def test_barrier_wrapper_type_contract_requires_authority(method: FunctionType) -> None:
     _assert_required_coordination_parameter(method)
 
 
@@ -311,11 +307,20 @@ def test_required_coordination_parameter_rejects_wrong_runtime_binding(monkeypat
         _assert_required_coordination_parameter(cast(FunctionType, probe))
 
 
-@pytest.mark.parametrize("repository_type", [SchedulerLeaseRepository, TokenSchedulerRepository])
-def test_legacy_recovery_api_is_explicitly_named_and_has_no_authority_selector(repository_type: type[object]) -> None:
-    method = getattr(repository_type, LEGACY_RECOVERY_METHOD, None)
+@pytest.mark.parametrize(
+    "method",
+    [
+        pytest.param(SchedulerLeaseRepository.recover_expired_leases_legacy_unfenced, id="leases"),
+        pytest.param(TokenSchedulerRepository.recover_expired_leases_legacy_unfenced, id="facade"),
+    ],
+)
+def test_legacy_recovery_api_is_explicitly_named_and_has_no_authority_selector(method: Callable[..., object]) -> None:
+    """The legacy API keeps its explicit name and offers no authority selector.
 
-    assert method is not None
+    The explicit name is pinned twice over: this module fails to import if the
+    attribute below is renamed, and the AST reference tests assert the literal
+    ``LEGACY_RECOVERY_METHOD`` against the production call sites.
+    """
     assert "coordination_token" not in inspect.signature(method).parameters
 
 

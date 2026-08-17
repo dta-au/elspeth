@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import time
 from pathlib import Path
 from typing import Any
 
@@ -108,14 +107,13 @@ def test_run_ceremony_emits_partial_summary_from_run_result(monkeypatch: pytest.
         ``time.perf_counter`` for the whole process during the test.
         Rebinding the ``time`` *name inside the ceremony module's own
         namespace* keeps the freeze local to the code path under test;
-        everything else (the ceremony module only calls ``time.perf_counter``)
-        delegates to the real module.
+        ``perf_counter`` is the only member the ceremony module reads from
+        ``time``, so it is the only member this stand-in defines: any other
+        name raises ``AttributeError`` and fails the test loudly rather than
+        being forwarded to the real module behind the test's back.
         """
 
         perf_counter = staticmethod(lambda: 42.5)
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(time, name)
 
     monkeypatch.setattr("elspeth.engine.orchestrator.ceremony.time", _FrozenClockTime())
 

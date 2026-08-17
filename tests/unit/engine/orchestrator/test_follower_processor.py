@@ -84,7 +84,13 @@ class _FollowerDrainResult:
 
 
 class _UnusedScheduler:
-    """Scheduler surface required for RowProcessor construction in focused tests."""
+    """Scheduler surface required for RowProcessor construction in focused tests.
+
+    Only the two payload codec staticmethods are defined, because they are the
+    only scheduler members these focused tests reach. Any other member raises
+    ``AttributeError`` at the call site, which is the same failure a catch-all
+    ``__getattr__`` tripwire produced — without the forwarding hook.
+    """
 
     @staticmethod
     def serialize_row_payload(row: Any) -> str:
@@ -97,9 +103,6 @@ class _UnusedScheduler:
         from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 
         return TokenSchedulerRepository.deserialize_row_payload(row_payload_json)
-
-    def __getattr__(self, name: str) -> Any:
-        raise AssertionError(f"scheduler method {name!r} should not be used in this focused processor test")
 
 
 class _UncalledBatchTransform:
