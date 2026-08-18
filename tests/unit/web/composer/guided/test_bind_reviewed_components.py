@@ -33,7 +33,7 @@ from elspeth.web.composer.guided.planning import (
 )
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
-from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession
+from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession, SourceIntent
 from elspeth.web.composer.pipeline_planner import _CANDIDATE_SHAPE_INTEGRITY_PREFIX
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate
@@ -3348,3 +3348,351 @@ def test_correction_on_an_edgeless_predecessor_still_draws_no_edges() -> None:
 
     assert bound["edges"] == []
     assert bound["nodes"][2]["on_success"] == "output"
+
+
+# --------------------------------------------------------------------------- #
+# Reviewed-authority rejections carry the component and the legal alternatives #
+# --------------------------------------------------------------------------- #
+#
+# Every rejection below used to be a bare AuditIntegrityError whose only
+# planner-visible projection was "match the canonical schema" — naming neither
+# the component nor the mismatch, while the server held both halves. The
+# planner already classified them repairable by message prefix, so typing them
+# changes the FEEDBACK, never the terminal/repair decision: each keeps its
+# message (and therefore that prefix) and gains the closed code plus the facts
+# a one-turn repair needs.
+
+
+def _sources_free_candidate() -> dict[str, object]:
+    return {
+        "nodes": [],
+        "edges": [],
+        "outputs": [{"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"}],
+    }
+
+
+def _wired_candidate() -> dict[str, object]:
+    return {
+        "sources": {
+            "source": {"plugin": "csv", "options": {}, "on_success": "output", "on_validation_failure": "discard"},
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [{"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"}],
+    }
+
+
+def test_sources_free_candidate_is_told_which_sources_were_reviewed() -> None:
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"does not identify reviewed sources") as raised:
+        bind_guided_reviewed_components(_sources_free_candidate(), _guided())
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {"component_kind": "sources", "reviewed_source_names": ["source"]}
+    assert str(raised.value).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX)
+
+
+def test_singular_source_named_off_authority_is_told_the_reviewed_name() -> None:
+    """The exact defect the old feedback hid: a wrong source NAME read as a
+    wrong JSON SHAPE, so the planner re-emitted the same name in a different
+    envelope until the repair budget was gone."""
+    candidate = {
+        "source": {"name": "colours_csv", "plugin": "csv", "options": {}, "on_success": "output"},
+        "nodes": [],
+        "edges": [],
+        "outputs": [{"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"}],
+    }
+
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"source name differs from reviewed authority") as raised:
+        bind_guided_reviewed_components(candidate, _guided())
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {
+        "component_kind": "sources",
+        "candidate_source_names": ["colours_csv"],
+        "reviewed_source_names": ["source"],
+    }
+
+
+def test_sources_map_named_off_authority_names_both_halves() -> None:
+    candidate = _wired_candidate()
+    candidate["sources"] = {"colours_csv": {"plugin": "csv", "options": {}, "on_success": "output"}}
+
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"sources differ from reviewed authority") as raised:
+        bind_guided_reviewed_components(candidate, _guided())
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {
+        "component_kind": "sources",
+        "candidate_source_names": ["colours_csv"],
+        "reviewed_source_names": ["source"],
+    }
+
+
+def test_source_missing_on_success_names_the_source_and_the_required_key() -> None:
+    candidate = _wired_candidate()
+    candidate["sources"] = {"source": {"plugin": "csv", "options": {}}}
+
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"source topology is malformed") as raised:
+        bind_guided_reviewed_components(candidate, _guided())
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {
+        "component_kind": "sources",
+        "source_name": "source",
+        "required_keys": ["on_success"],
+    }
+
+
+def test_non_list_outputs_names_the_reviewed_outputs() -> None:
+    candidate = _wired_candidate()
+    candidate["outputs"] = {"sink_name": "output"}
+
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"outputs are malformed") as raised:
+        bind_guided_reviewed_components(candidate, _guided())
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {"component_kind": "outputs", "reviewed_output_names": ["output"]}
+
+
+def test_output_count_mismatch_names_both_counts_and_the_reviewed_names() -> None:
+    candidate = _wired_candidate()
+    candidate["outputs"] = [
+        {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        {"sink_name": "second", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+    ]
+
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"outputs differ from reviewed authority") as raised:
+        bind_guided_reviewed_components(candidate, _guided())
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {
+        "component_kind": "outputs",
+        "candidate_output_count": 2,
+        "reviewed_output_names": ["output"],
+    }
+
+
+_PREDECESSOR_NODE_IDS = ["amount_gate", "summarize_standard", "format_high_value"]
+
+
+def test_correction_with_non_list_nodes_names_the_predecessor_node_ids() -> None:
+    candidate = _planner_correction_candidate()
+    candidate["nodes"] = {}
+
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"nodes are malformed") as raised:
+        bind_guided_reviewed_components(
+            candidate,
+            _guided(),
+            predecessor=_correction_predecessor(),
+            correction_target=_format_node_correction_target(),
+        )
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {
+        "component_kind": "nodes",
+        "predecessor_node_ids": _PREDECESSOR_NODE_IDS,
+    }
+
+
+def test_dropped_unselected_node_names_the_node_and_the_legal_identities() -> None:
+    candidate = _planner_correction_candidate()
+    nodes = candidate["nodes"]
+    assert type(nodes) is list
+    nodes.pop(0)
+
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"changed a unselected predecessor node identity") as raised:
+        bind_guided_reviewed_components(
+            candidate,
+            _guided(),
+            predecessor=_correction_predecessor(),
+            correction_target=_format_node_correction_target(),
+        )
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {
+        "component_kind": "nodes",
+        "node_id": "amount_gate",
+        "node_occurrences": 0,
+        "selected_node": False,
+        "predecessor_node_ids": _PREDECESSOR_NODE_IDS,
+    }
+
+
+def test_selected_node_plugin_substitution_names_only_what_the_candidate_supplied() -> None:
+    """Facts stay on the candidate's own side of the custody line: the
+    reviewed node's type and plugin reach the planner through current_state,
+    so the rejection names what the planner CHANGED, not what it must be."""
+    candidate = _planner_correction_candidate()
+    nodes = candidate["nodes"]
+    assert type(nodes) is list
+    nodes[2]["plugin"] = "passthrough"
+
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"changed selected predecessor node type or plugin") as raised:
+        bind_guided_reviewed_components(
+            candidate,
+            _guided(),
+            predecessor=_correction_predecessor(),
+            correction_target=_format_node_correction_target(),
+        )
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {
+        "component_kind": "nodes",
+        "node_id": "format_high_value",
+        "candidate_node_type": "transform",
+        "candidate_plugin": "passthrough",
+    }
+
+
+def test_prose_binder_non_list_nodes_names_the_predecessor_node_ids() -> None:
+    candidate = _minimal_amend_reconstruction()
+    candidate["nodes"] = "every node"
+
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"nodes are malformed") as raised:
+        guided_planning.bind_guided_prose_revision_candidate(
+            candidate,
+            _guided(),
+            authority=_amend_authority(),
+        )
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {
+        "component_kind": "nodes",
+        "predecessor_node_ids": _PREDECESSOR_NODE_IDS,
+    }
+
+
+def test_amend_binder_surfaces_every_seeded_violation_with_its_own_facts() -> None:
+    """The disposition stays one closed code; the FACTS are per-violation.
+
+    Accumulating into a single boolean meant a candidate breaching the amend
+    contract twice was answered exactly like one breaching it once — the
+    planner could not see the second, so a repair that fixed only the first
+    came back rejected with the identical opaque code.
+    """
+    candidate = _correction_predecessor().to_dict()
+    candidate.pop("version")
+    nodes = candidate["nodes"]
+    nodes[0]["condition"] = "True"
+    nodes[1]["node_type"] = "gate"
+
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        candidate,
+        _guided(),
+        authority=_amend_authority(),
+    )
+
+    assert result.rejection_code == "guided_amend_contract_violation"
+    assert result.violations == (
+        {"violation": "protected_fields_changed", "node_id": "amount_gate", "protected_keys": ["condition"]},
+        {"violation": "node_type_changed", "node_id": "summarize_standard"},
+    )
+
+
+def test_amend_binder_reports_no_violations_for_an_honest_reconstruction() -> None:
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        _minimal_amend_reconstruction(),
+        _guided(),
+        authority=_amend_authority(),
+    )
+
+    assert result.rejection_code is None
+    assert result.violations == ()
+
+
+def test_delta_member_rejection_names_the_member_and_its_key_mismatch() -> None:
+    """One closed code covers ~20 delta conditions, so without the member name
+    and the keys the planner is told a member it cannot identify carries keys
+    it cannot see. Both fact values are KEYS the advertised delta schema
+    already publishes — no reviewed option value crosses."""
+    predecessor = _correction_predecessor()
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {
+                "source_routes": [{"stable_id": SOURCE_ID, "on_success": "rows", "options": {}}],
+                "nodes": [],
+                "edges": [],
+            },
+            authority=_source_correction_target(),
+            guided=_guided(),
+            current_state=predecessor,
+        )
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {
+        "delta_member": "source_routes",
+        "unexpected_keys": ["options"],
+        "allowed_keys": ["on_success", "stable_id"],
+    }
+
+
+def test_edge_missing_its_id_is_not_reported_as_a_duplicate_identity() -> None:
+    """A missing id and a repeated id are different authoring slips; the old
+    shared arm sent the planner hunting for a collision that was not there."""
+    predecessor = _correction_predecessor()
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {
+                "source_routes": [{"stable_id": SOURCE_ID, "on_success": "rows"}],
+                "nodes": [],
+                "edges": [{"from_node": "source", "to_node": "output", "edge_type": "on_success"}],
+            },
+            authority=_source_correction_target(),
+            guided=_guided(),
+            current_state=predecessor,
+        )
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {"delta_member": "edges", "required_keys": ["id"]}
+
+
+def test_delta_node_missing_its_id_is_not_reported_as_a_duplicate_identity() -> None:
+    """The `edges` twin of this split, on the delta `nodes[]` loop."""
+    predecessor = _correction_predecessor()
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {
+                "source_routes": [{"stable_id": SOURCE_ID, "on_success": "rows"}],
+                "nodes": [{"node_type": "transform", "plugin": "passthrough", "input": "rows", "on_success": "output"}],
+                "edges": [],
+            },
+            authority=_source_correction_target(),
+            guided=_guided(),
+            current_state=predecessor,
+        )
+
+    assert raised.value.error_code == "guided_delta_authority_violation"
+    assert raised.value.connectivity == {"delta_member": "nodes", "required_keys": ["id"]}
+
+
+def test_a_session_still_mid_review_still_gets_its_repairable_rejection() -> None:
+    """``source_order`` is a permutation of reviewed PLUS pending ids, so any
+    fact list derived from it must tolerate a pending component. Deriving the
+    reviewed names eagerly for the facts turned this repairable rejection into
+    an unhandled KeyError — a 500 on the way to reporting a repair."""
+    pending_id = "22222222-2222-4222-8222-222222222222"
+    guided = replace(
+        _guided(),
+        source_order=(SOURCE_ID, pending_id),
+        pending_source_intents={
+            pending_id: SourceIntent(
+                name="second",
+                phase="plugin_selection",
+                plugin=None,
+                options=None,
+                inspection_facts=None,
+                observed_columns=(),
+                sample_rows=(),
+            )
+        },
+    )
+
+    with pytest.raises(GuidedCandidateBindingRejected, match=r"does not identify reviewed sources") as raised:
+        bind_guided_reviewed_components(_sources_free_candidate(), guided)
+
+    # Only the REVIEWED name is offered: a pending component has no reviewed
+    # name to name, and inventing one would be a fact the operator never set.
+    assert raised.value.connectivity == {"component_kind": "sources", "reviewed_source_names": ["source"]}
