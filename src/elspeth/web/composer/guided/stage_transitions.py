@@ -1270,12 +1270,36 @@ def transition_sink_field_review(
     _require_no_other_pending(session.pending_output_intents, stable_id, "output")
     reviewed = dict(session.reviewed_outputs)
     plugin_options, on_write_failure = _split_pending_structural(intent.options, "on_write_failure")
+    schema_mode = _sink_schema_mode(plugin_options)
+    selected = () if passthrough else (*chosen, *custom)
+    # A selection the sink's own explicit schema does not declare is a
+    # deterministic dead end, not a reviewable choice: guided_reviewed_sink_options
+    # later merges required_fields into options.schema.required_fields, and
+    # SchemaConfig requires required_fields to be a subset of the declared field
+    # names — a rejection that surfaces only at candidate validation, where sink
+    # options are server-restored reviewed authority the planner cannot repair
+    # (elspeth-398f150859; incident session 847ef691). Reject at review time
+    # instead, while the operator can still change the selection. Declared-name
+    # extraction mirrors the validator's precedence
+    # (reviewed_schema_declared_field_names). An explicit schema that declares
+    # no extractable fields is a schema-form defect on a different axis; it is
+    # deliberately not adjudicated here, so the guard keys on declared fields
+    # being present, not on the mode alone.
+    declared = reviewed_schema_declared_field_names(plugin_options.get("schema"))
+    if selected and declared:
+        undeclared = sorted(set(selected) - set(declared))
+        if undeclared:
+            raise ValueError(
+                f"selected fields are not declared by the sink's explicit {schema_mode!r} schema: "
+                f"{', '.join(undeclared)}. Declared fields are: {', '.join(sorted(declared))}. "
+                "Choose declared fields, or author the sink schema to include these."
+            )
     reviewed[stable_id] = SinkOutputResolved(
         name=intent.name,
         plugin=intent.plugin,
         options=plugin_options,
-        required_fields=() if passthrough else (*chosen, *custom),
-        schema_mode=_sink_schema_mode(plugin_options),
+        required_fields=selected,
+        schema_mode=schema_mode,
         on_write_failure=on_write_failure,
     )
     pending = dict(session.pending_output_intents)

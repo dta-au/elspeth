@@ -1125,6 +1125,70 @@ def test_sink_field_review_resolves_same_id_and_stays_in_output_stage() -> None:
         _ = result.topology
 
 
+def _sink_review_session_with_schema(schema: dict) -> tuple[GuidedSession, AnsweredTurn]:
+    """A field-review-phase session whose sink intent carries an explicit schema."""
+    session = GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        source_order=(SOURCE_A, SOURCE_B),
+        reviewed_sources={
+            SOURCE_A: _source("source", ("id", "name")),
+            SOURCE_B: _source("source_2", ("name", "email")),
+        },
+        output_order=(OUTPUT_A,),
+        pending_output_intents={
+            OUTPUT_A: SinkIntent(
+                name="output",
+                phase="field_review",
+                plugin="json",
+                options={"path": "/data/out.jsonl", "on_write_failure": "discard", "schema": schema},
+            )
+        },
+    )
+    return _with_unanswered_turn(session, TurnType.MULTI_SELECT_WITH_CUSTOM)
+
+
+def test_sink_field_review_rejects_chosen_field_undeclared_by_explicit_sink_schema() -> None:
+    """elspeth-398f150859: a source-observed column absent from the sink's own
+    fixed schema passed review and died later as an unrepairable
+    plugin_options_invalid at candidate validation. Review time is where the
+    operator can still change the selection, so the cross-check lives here."""
+    session, turn = _sink_review_session_with_schema({"mode": "fixed", "fields": ["id: str", "label: str"]})
+
+    with pytest.raises(ValueError, match=r"not declared by the sink's explicit 'fixed' schema.*name"):
+        transition_sink_field_review(
+            session,
+            target_id=OUTPUT_A,
+            turn=turn,
+            response=FieldSelectionResponse(chosen=("id", "name"), custom_inputs=(), control_signal=None),
+        )
+
+
+def test_sink_field_review_rejects_custom_field_undeclared_by_flexible_sink_schema() -> None:
+    session, turn = _sink_review_session_with_schema({"mode": "flexible", "fields": ["id: str"]})
+
+    with pytest.raises(ValueError, match=r"not declared by the sink's explicit 'flexible' schema.*derived"):
+        transition_sink_field_review(
+            session,
+            target_id=OUTPUT_A,
+            turn=turn,
+            response=FieldSelectionResponse(chosen=("id",), custom_inputs=("derived",), control_signal=None),
+        )
+
+
+def test_sink_field_review_accepts_selection_declared_by_explicit_sink_schema() -> None:
+    session, turn = _sink_review_session_with_schema({"mode": "fixed", "fields": ["id: str", "label: str", "derived: str"]})
+
+    resolved = transition_sink_field_review(
+        session,
+        target_id=OUTPUT_A,
+        turn=turn,
+        response=FieldSelectionResponse(chosen=("id",), custom_inputs=("derived",), control_signal=None),
+    ).reviewed_outputs[OUTPUT_A]
+
+    assert resolved.required_fields == ("id", "derived")
+    assert resolved.schema_mode == "fixed"
+
+
 def test_sink_field_review_explicit_passthrough_is_the_only_empty_selection() -> None:
     session, turn = _sink_review_session()
     result = transition_sink_field_review(
