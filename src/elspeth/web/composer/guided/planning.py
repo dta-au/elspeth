@@ -1116,8 +1116,9 @@ def guided_redacted_planner_context(guided: GuidedSession) -> dict[str, object]:
         # lifting it: zero new egress, and it states only what the binder
         # already does.
         #
-        # Phrased as what is RESTORED, never as what the planner "owns": this
-        # context is also the correction path's (service.py plan_pipeline),
+        # Phrased as what is RESTORED, never as what the planner "owns": guided
+        # corrections receive this same projection (ComposerServiceImpl
+        # .plan_guided_pipeline merges the correction target into it),
         # and during an exact guided correction pre-existing nodes outside the
         # correction owner are server-owned too, so an ownership claim would
         # be false on a path that shares this projection.
@@ -1265,6 +1266,14 @@ def guided_unproducible_output_fields(guided: GuidedSession) -> tuple[dict[str, 
     does fire it is an opaque ``sink_contract_violation`` the planner burns its
     repair budget on. The guided seam holds both halves of the fact BEFORE any
     pipeline is built, so it names the gap here and lets the caller act on it.
+
+    Epistemics: the gap is computed against what sources OBSERVE or DECLARE. A
+    source whose observed-mode schema has no observed columns has an unknown —
+    not empty — inventory, and multi-source sessions union all inventories, so
+    an EMPTY result means "no gap provable", never "coverage proven". Consumers
+    that steer on absence (the service.py planner-context enrichment, step 3's
+    no-transform branch) must keep that asymmetry; sink-side schema-subset
+    validation can still reject a pass-through this function stayed silent on.
 
     Advisory shape only — this reports; the caller decides. The returned
     projection is provider-safe: every value is already in
@@ -2429,9 +2438,11 @@ def bind_guided_reviewed_components(
     # nothing binds the planner to that name, and the freeform-shaped habit of
     # inventing a sink name and wiring sibling on_success/on_error to it survives.
     # Enforce STRUCTURAL authority (one candidate dict per reviewed output, in order
-    # — plugin-by-position is validated separately) rather than an unsatisfiable NAME
-    # equality, then remap the planner-invented output name to the reviewed authority
-    # and rewrite every reference so the topology stays wired.
+    # — plugin-by-position is validated separately) rather than NAME equality: names
+    # are provider-visible, so equality is satisfiable, but demanding it would reject
+    # an otherwise-wired candidate over a label the server restores anyway. Remap the
+    # planner-authored output name to the reviewed authority and rewrite every
+    # reference so the topology stays wired.
     if len(raw_outputs) != len(expected_output_names) or any(type(item) is not dict for item in raw_outputs):
         raise AuditIntegrityError("guided planner candidate outputs differ from reviewed authority")
     node_ids, connection_names, branch_connection_names = _candidate_topology_reference_names(bound)
@@ -2465,8 +2476,8 @@ def bind_guided_reviewed_components(
             error_code="guided_output_alias_collision",
             connectivity={"colliding_aliases": cast(JsonValue, sorted(colliding_aliases))},
         )
-    # The reverse direction: the planner never sees reviewed sink NAMES, so it
-    # can innocently author a node id / connection / branch value equal to one.
+    # The reverse direction: reviewed sink NAMES are provider-visible, but nothing
+    # stops the planner authoring a node id / connection / branch value equal to one.
     # The rename below then injects that reviewed name as a sink, and the DAG
     # builder resolves route targets against sink names BEFORE node/connection
     # names — every reference meant for the planner's node would silently

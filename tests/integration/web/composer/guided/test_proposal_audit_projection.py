@@ -477,9 +477,8 @@ def test_planner_context_is_redacted_but_private_anchor_keeps_exact_reviewed_fac
         # invent options reads that gap as missing data worth discovery turns
         # (elspeth-63cf3803e6). Pinned here because the line is the redaction's
         # provider-visible contract — deleting it silently restores the defect,
-        # and rewording it must stay a claim about what is RESTORED rather than
-        # what the planner owns (the correction path shares this projection and
-        # server-owns more).
+        # and the rewording constraints live at the source, on this key's
+        # comment in guided_redacted_planner_context (planning.py).
         "reviewed_configuration_usage": (
             "Reviewed source and output plugin configuration is operator-approved and is restored "
             "server-side after your call. `option_keys` names which options exist; their values are "

@@ -7,17 +7,24 @@ future-stage intent; do not ask the user to repeat those facts.
 
 ## Stage timing
 
-1. First decide whether the intent needs a transform at all. When the user asked
-   for no processing and the server named no `unproducible_output_fields`, the
-   reviewed facts already satisfy the intent and the correct transform set is
-   EMPTY. Propose the direct source-to-output pass-through and say plainly that
-   no processing step is needed. Do not spend a discovery call confirming a
-   negative. Read that gap from the server rather than re-deriving it: a source
-   with an observed schema and no observed columns has an UNKNOWN inventory, not
-   an empty one, so comparing required fields against it yourself answers
-   nothing. This is not a silent downgrade — it applies only where no capability
-   was requested. When the server DID name `unproducible_output_fields`, the
-   intent needs transforms: go to 2.
+1. First decide whether the intent needs a transform at all. When the user
+   asked for no processing, no deferred intents are pending, and the server
+   named no `unproducible_output_fields`, the correct transform set is EMPTY:
+   propose the direct source-to-output pass-through. Do not spend a discovery
+   call confirming a negative — read the gap from the server rather than
+   re-deriving it (a source with an observed schema and no observed columns
+   has an UNKNOWN inventory, not an empty one, so comparing required fields
+   against it yourself answers nothing). Proposal validation remains the
+   authority on whether the pass-through seals; if it rejects, repair from the
+   named feedback rather than pre-emptively adding steps. This is not a silent
+   downgrade: it applies only where nothing was requested or deferred. When
+   the server DID name `unproducible_output_fields`, the intent needs
+   transforms — go to 2. Two scope limits. When you are only answering a
+   question rather than authoring a candidate, describe the pass-through as
+   the default this stage will propose — the gap check runs at proposal time,
+   so do not certify on your own authority that no processing is needed. And
+   during an exact correction, work within the correction's terminal contract;
+   this fresh-candidate shape does not apply there.
 2. Otherwise, discover the policy-visible transforms that can implement the
    intent and load the authoritative schema/assistance for each selected
    plugin.
