@@ -32,7 +32,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Lock
-from typing import Any, Final, NotRequired, Required, TypedDict, cast
+from typing import Any, Final, NotRequired, Required, TypedDict, cast, get_args
 
 from rfc8785 import CanonicalizationError
 
@@ -40,9 +40,26 @@ from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.value_source import get_catalog_values
+
+# The model-catalog aid restates what ``list_models`` serves, so it reads the
+# SAME accessors that tool reads (``tools/generation.py`` imports this exact
+# module) rather than re-deriving OpenRouter's slug normalisation. The
+# authorable-provider vocabulary comes from the two live ``provider``
+# discriminators themselves, so a new provider variant cannot leave the aid
+# behind.
+from elspeth.plugins.sources.llm.config import LLMSourceConfig
+from elspeth.plugins.transforms.llm.base import LLMConfig
+from elspeth.plugins.transforms.llm.model_catalog import (
+    MODEL_CATALOG_OPENROUTER,
+    OPENROUTER_LITELLM_PREFIX,
+    read_litellm_model_list,
+    read_openrouter_catalog_snapshot_id,
+)
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.plugin_policy_disclosure import ProhibitedPluginDisclosure, prohibited_plugin_section
+from elspeth.web.composer.tools.generation import get_expression_grammar
 
 # The registered shield-review constants and the untrusted-producer set are the
 # contract's single source of truth (interpretation_state); importing them —
@@ -245,6 +262,53 @@ class _DiscoveryDigestAid(TypedDict):
     plugins: _DiscoveryDigest
 
 
+class _OmittedModelIdentifiers(TypedDict):
+    """Disclosure that one authorable provider's model ids moved to JIT discovery."""
+
+    provider: str
+    model_count: int
+    details_via: str
+
+
+class _ModelCatalogBudget(TypedDict):
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+    omitted_provider_count: int
+
+
+class _ModelCatalog(TypedDict):
+    """Closed projection of the model catalog the models listing serves.
+
+    ``provider_model_counts`` and ``total_models`` are the tool's unfiltered
+    mode verbatim; ``models_by_provider`` carries the per-provider identifier
+    lists in the exact form its filtered mode returns them.
+    """
+
+    provider_model_counts: dict[str, int]
+    total_models: int
+    authorable_providers: list[str]
+    models_by_provider: dict[str, list[str]]
+    models_omitted: list[_OmittedModelIdentifiers]
+    budget: _ModelCatalogBudget
+
+
+class _ModelCatalogAid(TypedDict):
+    guidance: str
+    catalog: _ModelCatalog
+
+
+class _ExpressionGrammarBudget(TypedDict):
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+
+
+class _ExpressionGrammarAid(TypedDict, total=False):
+    guidance: Required[str]
+    budget: Required[_ExpressionGrammarBudget]
+    grammar: str
+    grammar_omitted: _OmittedPublicText
+
+
 class _PlannerAuthoringAids(TypedDict, total=False):
     """Closed section vocabulary for the live planner-authoring payload."""
 
@@ -261,6 +325,8 @@ class _PlannerAuthoringAids(TypedDict, total=False):
     raw_html_cleanup: _RulesAid
     web_scrape_http_identity: _RulesAid
     discovery_digest: _DiscoveryDigestAid
+    model_catalog: _ModelCatalogAid
+    expression_grammar: _ExpressionGrammarAid
 
 
 _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
@@ -551,11 +617,13 @@ def _model_custody_rules(profile_alias: str | None) -> list[str]:
     else:
         rules.append(
             "No llm operator profile is currently usable in this deployment: "
-            "bind a model only through a literal slug that list_models served "
-            "in THIS session."
+            "bind a model only through a literal slug a served catalog carries "
+            "— the authoring_aids model_catalog section for this request, or a "
+            "list_models result in THIS session."
         )
     rules.append(
-        "Author options.model ONLY with a slug served by a list_models call — "
+        "Author options.model ONLY with a slug a served catalog carries — the "
+        "authoring_aids model_catalog section, or a list_models result — "
         "never invented, never recalled from training. A literal slug "
         "auto-stages the llm_model_choice review, which must be surfaced and "
         "resolved before the pipeline can run."
@@ -717,12 +785,23 @@ _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
     "required_control_auto_wired — that disclosure is staged exclusively by "
     "the server's required-control auto-wire pass, and a hand-authored row "
     "forges a policy_required entry in the audit disclosure.",
+    # The staging half is unconditional; the CALL half is not. These aids ride
+    # on two surfaces with different palettes — the planner request, whose
+    # palette carries no request_interpretation_review (obeying an
+    # unconditional instruction to call it lands on the DISCOVERY_ONLY terminal
+    # guard), and the compose-loop catalog context, whose palette does carry
+    # it. The scoping clause borrows the capability core's phrasing — the two
+    # texts ride in the same context, so where they overlap they must not
+    # disagree. A test pins the overlapping phrases against the live core.
     "When YOU chose a gate's threshold, cutoff, category literal, or route "
     "direction — rather than carrying a value the user stated verbatim or a "
     "reviewed schema fact established — stage a pipeline_decision row with "
-    "user_term gate_condition_authored ON THAT GATE NODE and call "
-    "request_interpretation_review for it. The row is valid only on a gate "
-    "node; the review pins the gate's condition and every route destination.",
+    "user_term gate_condition_authored ON THAT GATE NODE. Where your palette "
+    "carries request_interpretation_review, also call it for that row; where "
+    "it does not, the staged requirement rides in that gate node's own options "
+    "inside the terminal proposal and its review card is surfaced from the "
+    "sealed proposal. The row is valid only on a gate node; the review pins "
+    "the gate's condition and every route destination.",
 )
 
 
@@ -964,6 +1043,15 @@ _PLANNER_CONTRACT_MAX_NODES: Final[int] = 4096
 _PLANNER_CONTRACT_MAX_CANONICAL_BYTES: Final[int] = 48 * 1024
 _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES: Final[int] = 24 * 1024
 _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES: Final[int] = 1024
+# The planner request is append-only and carries no cache markers, so every
+# aid byte is re-sent on every turn of one plan. That is why the model-catalog
+# aid carries identifier lists only for the providers an llm node can actually
+# declare: the whole litellm inventory canonicalizes to ~57 KiB, which costs
+# more across a multi-turn plan than the discovery turns it would save. The
+# ceiling is sized for the live OpenRouter catalog (measured 2026-08-18: 9.6
+# KiB against the bundled slice, 20.5 KiB against a 330-model live snapshot).
+_MODEL_CATALOG_MAX_CANONICAL_BYTES: Final[int] = 32 * 1024
+_EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES: Final[int] = 8 * 1024
 
 
 def _contract_json_schema_scalar(key: str, value: object) -> object:
@@ -1598,13 +1686,197 @@ _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "Entries carry no worked example; the worked shapes validated for this "
     "deployment are the other authoring_aids sections. "
     "You rarely need list_sources/list_transforms/"
-    "list_sinks calls. Model identifiers still come only from "
-    "list_models. A list_models result is a session snapshot and can become "
-    "stale, so refresh it before binding a literal model; blob/secret "
+    "list_sinks calls. Model identifiers still come only from a served "
+    "catalog — the model_catalog section beside this one, or a list_models "
+    "result — never from training. A model catalog is a session snapshot and "
+    "can become stale, so refresh it through list_models before binding a "
+    "literal model the served catalog does not carry; blob/secret "
     "discovery is unchanged. Use "
     "get_plugin_assistance and explain_validation_error for structured "
     "repair when a proposal is rejected."
 )
+
+_MODEL_CATALOG_DETAILS_VIA: Final[str] = "list_models"
+
+
+def _authorable_llm_provider_names() -> tuple[str, ...]:
+    """Return the provider vocabulary an llm node may actually declare.
+
+    Both llm surfaces carry their own closed ``provider`` literal; the union is
+    taken so a variant added to one and not yet the other still reaches the
+    aid. This bounds which identifier lists are worth carrying: a provider
+    outside this set cannot be named by an llm node at all, so its identifiers
+    would be prompt weight the author can never spend.
+    """
+    return tuple(
+        sorted(
+            {
+                *get_args(LLMConfig.model_fields["provider"].annotation),
+                *get_args(LLMSourceConfig.model_fields["provider"].annotation),
+            }
+        )
+    )
+
+
+def _model_catalog_size(catalog: _ModelCatalog) -> int:
+    """Settle the self-describing canonical byte count."""
+    while True:
+        rendered_size = len(canonical_json(catalog).encode("utf-8"))
+        if catalog["budget"]["canonical_bytes_used"] == rendered_size:
+            return rendered_size
+        catalog["budget"]["canonical_bytes_used"] = rendered_size
+
+
+def planner_model_catalog() -> _ModelCatalog:
+    """Project the model catalog the models listing serves for this process.
+
+    Targets the discovery turn every llm-node intent paid for a catalog that is
+    deployment-static and already policy-visible to this same provider through
+    the models listing. The listing is two-mode: without a provider argument it
+    returns provider names and counts plus a hint to call again, so an author
+    that does not already know the provider paid TWO turns. Both modes are
+    restated here — ``provider_model_counts``/``total_models`` are the
+    unfiltered mode verbatim, ``models_by_provider`` the filtered mode's
+    identifier lists — so neither turn is needed to bind a slug.
+
+    Identifiers are grouped on the same ``provider/`` segment the unfiltered
+    mode groups on, which is what keeps each carried list exactly as long as
+    the count beside it. (A filtered call is a bare prefix match, so
+    ``provider="azure"`` there also returns ``azure_ai/`` entries; a grouping
+    that disagreed with its own counts would teach the author a catalog it
+    could not reconcile.) OpenRouter's slugs come from the live catalog
+    accessor, not the bundled litellm slice, because that accessor is what a
+    filtered call returns AND what the value-source walker validates a bound
+    slug against — one source of truth, so the composer cannot recommend a
+    model its own preflight then rejects.
+    """
+    authorable_providers = _authorable_llm_provider_names()
+    all_models = list(read_litellm_model_list())
+    grouped: dict[str, list[str]] = {}
+    for identifier in all_models:
+        prefix = identifier.split("/", 1)[0] if "/" in identifier else ""
+        # ``grouped`` is our own freshly-built accumulator, so the slot is
+        # initialized explicitly rather than read defensively.
+        if prefix not in grouped:
+            grouped[prefix] = []
+        grouped[prefix].append(identifier)
+    provider_model_counts = {prefix: len(identifiers) for prefix, identifiers in grouped.items()}
+    openrouter_key = OPENROUTER_LITELLM_PREFIX.rstrip("/")
+    live_openrouter = get_catalog_values(MODEL_CATALOG_OPENROUTER)
+    if openrouter_key in provider_model_counts:
+        total_models = len(all_models) - provider_model_counts[openrouter_key] + len(live_openrouter)
+    else:
+        total_models = len(all_models) + len(live_openrouter)
+    provider_model_counts[openrouter_key] = len(live_openrouter)
+    grouped[openrouter_key] = sorted(live_openrouter)
+
+    models_by_provider: dict[str, list[str]] = {}
+    for provider in authorable_providers:
+        # A provider the catalog knows nothing about carries no key at all: an
+        # empty list would assert that this deployment serves no model for it,
+        # which is a claim about the operator's runtime, not about the catalog.
+        if provider in grouped and grouped[provider]:
+            models_by_provider[provider] = list(grouped[provider])
+
+    catalog: _ModelCatalog = {
+        "provider_model_counts": provider_model_counts,
+        "total_models": total_models,
+        "authorable_providers": list(authorable_providers),
+        "models_by_provider": models_by_provider,
+        "models_omitted": [],
+        "budget": {
+            "max_canonical_bytes": _MODEL_CATALOG_MAX_CANONICAL_BYTES,
+            "canonical_bytes_used": 0,
+            "omitted_provider_count": 0,
+        },
+    }
+    if _model_catalog_size(catalog) > _MODEL_CATALOG_MAX_CANONICAL_BYTES:
+        # Whole lists or none. A sliced identifier list reads as a complete
+        # one, and binding a slug this deployment does not serve is the exact
+        # rejection the carried catalog exists to prevent — so an oversized
+        # catalog falls back to the counts plus a marker per dropped provider
+        # and the listing tool stays the way to reach the identifiers.
+        catalog["models_omitted"] = [
+            {
+                "provider": provider,
+                "model_count": len(identifiers),
+                "details_via": _MODEL_CATALOG_DETAILS_VIA,
+            }
+            for provider, identifiers in sorted(models_by_provider.items())
+        ]
+        catalog["budget"]["omitted_provider_count"] = len(catalog["models_omitted"])
+        catalog["models_by_provider"] = {}
+        _model_catalog_size(catalog)
+    if _model_catalog_size(catalog) > _MODEL_CATALOG_MAX_CANONICAL_BYTES:
+        raise RuntimeError("model_catalog_budget_invariant")
+    return catalog
+
+
+_MODEL_CATALOG_GUIDANCE: Final[str] = (
+    "This model catalog is rendered at prompt build from the same catalog the "
+    "list_models tool serves and is current for this deployment. A slug in "
+    "models_by_provider is served: bind it directly, with no discovery call. "
+    "provider_model_counts and total_models are every provider the catalog "
+    "knows, so a provider absent from models_by_provider is still a real "
+    "provider — its identifiers were not carried. authorable_providers is the "
+    "closed set an llm node's provider option may name; identifiers are "
+    "carried only for those, because a slug from any other provider cannot be "
+    "authored here. A provider named in authorable_providers with no "
+    "provider_model_counts entry has no catalogued identifiers on this "
+    "deployment — those endpoints are operator-configured. Each models_omitted "
+    "entry names a provider whose identifiers exceeded the byte budget and "
+    "carries its model_count and a details_via marker; follow the marker "
+    "before binding a slug for that provider. Never invent a slug and never "
+    "recall one from training: an unserved slug is rejected at preflight."
+)
+
+_EXPRESSION_GRAMMAR_GUIDANCE: Final[str] = (
+    "This is the expression syntax reference for gate conditions and "
+    "value_transform expressions, verbatim from the same reference the "
+    "get_expression_grammar tool returns. It is deployment-static: author gate "
+    "and fork conditions directly from it with no discovery call. When "
+    "grammar_omitted replaces it, its whole sha256 and details_via marker "
+    "stand in its place and the syntax must be fetched before authoring a "
+    "condition."
+)
+
+
+def _expression_grammar_size(aid: _ExpressionGrammarAid) -> int:
+    """Settle the self-describing canonical byte count."""
+    while True:
+        rendered_size = len(canonical_json(aid).encode("utf-8"))
+        if aid["budget"]["canonical_bytes_used"] == rendered_size:
+            return rendered_size
+        aid["budget"]["canonical_bytes_used"] = rendered_size
+
+
+def planner_expression_grammar() -> _ExpressionGrammarAid:
+    """Carry the authoring reference for gate and value_transform expressions.
+
+    The grammar is static public text with no policy projection, yet every gate
+    or fork shape paid a discovery turn to fetch it. It is carried whole: the
+    reference is entirely authoring material, and a hand-picked subset would be
+    a second, unvalidated statement of a syntax the parser alone defines.
+    """
+    grammar = get_expression_grammar()
+    aid: _ExpressionGrammarAid = {
+        "guidance": _EXPRESSION_GRAMMAR_GUIDANCE,
+        "grammar": grammar,
+        "budget": {
+            "max_canonical_bytes": _EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES,
+            "canonical_bytes_used": 0,
+        },
+    }
+    if _expression_grammar_size(aid) > _EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES:
+        del aid["grammar"]
+        aid["grammar_omitted"] = {
+            "sha256": hashlib.sha256(grammar.encode("utf-8")).hexdigest(),
+            "details_via": "get_expression_grammar",
+        }
+        _expression_grammar_size(aid)
+    if _expression_grammar_size(aid) > _EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES:
+        raise RuntimeError("expression_grammar_budget_invariant")
+    return aid
 
 
 def _llm_source_generation_rules(*, profile_alias: str | None, output_control: str | None) -> list[str]:
@@ -1618,8 +1890,9 @@ def _llm_source_generation_rules(*, profile_alias: str | None, output_control: s
         "Use options.lookup for explicit authored values and reference them through {{ lookup... }}; Jinja globals are also available.",
         "Prompt Shield is not applicable to this static author-authored source prompt. Content Safety still applies downstream "
         "to the generated row when deployment policy requires it.",
-        "Model-catalog results from list_models are a session snapshot and can become stale; refresh before binding a literal "
-        "model on a trained-operator/provider-form surface. Never invent or recall a model identifier from training.",
+        "A model catalog — the authoring_aids model_catalog section or a list_models result — is a session snapshot and can "
+        "become stale; refresh through list_models before binding a literal model the served catalog does not carry on a "
+        "trained-operator/provider-form surface. Never invent or recall a model identifier from training.",
     ]
     if profile_alias is not None:
         rules.append(
@@ -2141,13 +2414,19 @@ def fork_row_union_exemplar_args(
     }
 
 
-# Payload memo keyed by plugin-policy snapshot hash. The aids depend only on
-# the policy-visible catalog projection (plugin classes are static per
-# process; visibility and profile aliases are exactly what the snapshot hash
-# covers), and a cold build costs a full catalog sweep (~50ms) — too much to
-# repeat inside every planner call's wall-clock budget. Bounded so snapshot
-# rotation cannot grow it without limit; callers receive a deep copy so no
-# caller can poison the cached payload.
+# Payload memo keyed by plugin-policy snapshot hash AND model-catalog
+# identity. Most of the aids depend only on the policy-visible catalog
+# projection (plugin classes are static per process; visibility and profile
+# aliases are exactly what the snapshot hash covers), and a cold build costs a
+# full catalog sweep (~50ms) — too much to repeat inside every planner call's
+# wall-clock budget. The carried model catalog is the exception: it is read
+# from the OpenRouter catalog accessor, which the boot lifespan primes and
+# which no policy snapshot covers, so the snapshot hash alone would serve a
+# pre-prime catalog for the process lifetime. The catalog's own canonical
+# snapshot id — the identity the Landscape run record persists — joins the
+# key, which also distinguishes a live snapshot from the bundled fallback of
+# equal content. Bounded so snapshot rotation cannot grow it without limit;
+# callers receive a deep copy so no caller can poison the cached payload.
 _AIDS_MEMO: dict[str, _PlannerAuthoringAids] = {}
 _AIDS_MEMO_MAX: Final[int] = 8
 _AIDS_MEMO_LOCK = Lock()
@@ -2156,11 +2435,13 @@ _AIDS_MEMO_LOCK = Lock()
 def build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthoringAids:
     """Assemble the live authoring-aids payload for one planner call.
 
-    Rendered from the policy-visible catalog (memoized per snapshot hash), so
-    it can never drift from the deployment. Sections whose plugins are
-    policy-hidden are omitted rather than rendered with invented names.
+    Rendered from the policy-visible catalog (memoized per snapshot hash and
+    model-catalog identity), so it can never drift from the deployment.
+    Sections whose plugins are policy-hidden are omitted rather than rendered
+    with invented names.
     """
-    key = catalog.snapshot.snapshot_hash
+    catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
+    key = f"{catalog.snapshot.snapshot_hash}:{catalog_source}:{catalog_sha256}"
     with _AIDS_MEMO_LOCK:
         cached = _AIDS_MEMO.get(key)
     if cached is None:
@@ -2272,6 +2553,18 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
         "guidance": _DISCOVERY_DIGEST_GUIDANCE,
         "plugins": discovery_digest(catalog, summaries=summaries),
     }
+    # Carried only where an llm node can be authored at all: on a deployment
+    # whose policy hides both llm surfaces the catalog is unspendable, and the
+    # planner request is append-only and uncached, so every carried byte is
+    # re-sent on every turn of the plan.
+    if "llm" in visible["transform"] or "llm" in visible["source"]:
+        aids["model_catalog"] = {
+            "guidance": _MODEL_CATALOG_GUIDANCE,
+            "catalog": planner_model_catalog(),
+        }
+    # Gate conditions are structural, so the expression reference is
+    # authorable on every deployment regardless of which plugins are visible.
+    aids["expression_grammar"] = planner_expression_grammar()
     return aids
 
 
@@ -2285,6 +2578,8 @@ __all__ = [
     "discovery_digest_detail_tools",
     "fork_coalesce_exemplar_args",
     "fork_row_union_exemplar_args",
+    "planner_expression_grammar",
+    "planner_model_catalog",
     "planner_plugin_contract",
     "source_custody_exemplar_args",
 ]

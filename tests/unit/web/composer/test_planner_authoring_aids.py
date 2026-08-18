@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 from uuid import uuid4
 
 import pytest
@@ -35,6 +35,8 @@ from elspeth.web.composer.planner_authoring_aids import (
     build_planner_authoring_aids,
     discovery_digest,
     fork_coalesce_exemplar_args,
+    planner_expression_grammar,
+    planner_model_catalog,
     source_custody_exemplar_args,
 )
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -110,6 +112,7 @@ def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -
     memo = LockCheckedMemo({"old-snapshot": {"key": "old-value"}})
     monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO", memo)
     monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO_MAX", 1)
+    monkeypatch.setattr(planner_authoring_aids, "read_openrouter_catalog_snapshot_id", lambda: ("catalog-sha", "live"))
 
     def build(_catalog: object) -> dict[str, str]:
         assert not planner_authoring_aids._AIDS_MEMO_LOCK.locked()
@@ -123,7 +126,7 @@ def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -
 
     assert first == second == {"key": "value"}
     assert first is not second
-    assert dict(memo) == {"snapshot": {"key": "value"}}
+    assert dict(memo) == {"snapshot:live:catalog-sha": {"key": "value"}}
 
 
 @pytest.mark.parametrize("snapshot_hashes", [["same"] * 4, ["one", "two", "three", "four"]])
@@ -1370,8 +1373,14 @@ class TestDiscoveryDigest:
             assert phrase in core_flat, f"core lacks shared phrase: {phrase!r}"
             assert phrase in _DISCOVERY_DIGEST_GUIDANCE, f"digest guidance lacks shared phrase: {phrase!r}"
         # The narrowing must not disturb the closed provenance rules the core
-        # keeps: model ids only from list_models, secret discovery intact.
-        assert "Model identifiers come only from `list_models`" in core
+        # keeps: model ids from the request-supplied catalog or list_models
+        # and nothing else, secret discovery intact. The provenance set is
+        # closed either way — a supplied catalog is the same policy-projected
+        # fact list_models returns, so pre-supplying it removes a discovery
+        # turn without widening where an identifier may come from.
+        assert (
+            "Model identifiers come from the supplied model catalog where the request provides one, and otherwise only from `list_models`"
+        ) in core_flat
         assert "list_secret_refs" in core
 
     def test_payload_carries_digest_with_discovery_short_circuit_guidance(self) -> None:
@@ -1388,10 +1397,353 @@ class TestDiscoveryDigest:
         assert "omitted_public_text_count" in guidance
         assert "details_via" in guidance
         # The digest short-circuits catalog re-discovery only: model ids still
-        # come solely from list_models, and structured-repair tooling
-        # (get_plugin_assistance) keeps its role.
+        # come from a served catalog and nothing else, and structured-repair
+        # tooling (get_plugin_assistance) keeps its role.
         assert "list_models" in guidance
         assert "get_plugin_assistance" in guidance
+
+
+def _llmless_view() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot, Any]:
+    """Trained catalog with both llm surfaces closed by policy.
+
+    Returns the profile registry too: this helper can only prove the registry
+    was untouched by its OWN probe, and the build under test runs later. Each
+    consuming test re-asserts ``mock_calls == []`` AFTER
+    ``build_planner_authoring_aids``, which is where a registry touch would
+    actually put a mock repr into a digest entry.
+    """
+    from unittest.mock import MagicMock
+
+    from elspeth.web.plugin_policy.models import PluginId
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+
+    catalog = create_catalog_service()
+    trained = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="model-catalog-llmless",
+        principal_scope="local:model-catalog",
+        available=frozenset(plugin_id for plugin_id in trained.available if plugin_id.name != "llm"),
+        unavailable=(),
+        selected=(),
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="model-catalog-llmless-generation",
+    )
+    assert PluginId("transform", "llm") not in snapshot.available
+    profiles = MagicMock(spec=OperatorProfileRegistry)
+    view = PolicyCatalogView(catalog, snapshot, profiles)
+    # No plugin has a usable alias here, so the projection must short-circuit
+    # before the registry: a MagicMock summary reaching the digest would render
+    # a mock repr as a plugin purpose and still leave the grammar assertions
+    # green. Prove the view is real, not merely non-crashing.
+    assert [plugin.name for plugin in view.list_transforms()] == [
+        plugin.name for plugin in catalog.list_transforms() if PluginId("transform", plugin.name) in snapshot.available
+    ]
+    assert profiles.mock_calls == []
+    return view, snapshot, profiles
+
+
+class TestModelCatalogAid:
+    """F3: every llm-node intent bought a deployment-static catalog with a turn.
+
+    ``list_models`` is two-mode — unfiltered it returns provider names and
+    counts plus a hint to call again with a provider, so an author that did not
+    already know the provider paid TWO turns for a catalog that is fixed for
+    the process. The aid restates both modes from the same accessors, so the
+    tests below are parity tests against the real tool rather than restatements
+    of its filter rule.
+    """
+
+    def test_provider_summary_matches_the_models_listing_unfiltered_mode(self) -> None:
+        view, snapshot = _trained_view()
+
+        catalog = planner_model_catalog()
+        result = _dispatch_tool("list_models", {}, _empty_state(), view, plugin_snapshot=snapshot)
+
+        assert result.success is True, result.to_dict()
+        assert catalog["provider_model_counts"] == result.data["providers"]
+        assert catalog["total_models"] == result.data["total_models"]
+
+    def test_every_carried_list_matches_the_models_listing_filtered_mode(self) -> None:
+        """The identifiers are the tool's own, in the tool's own form.
+
+        A trailing-slash provider argument is an exact segment match in the
+        tool, which is the grouping the unfiltered mode reports counts for —
+        so each carried list must equal the tool's answer for its provider,
+        OpenRouter's live-catalog substitution included.
+        """
+        view, snapshot = _trained_view()
+
+        catalog = planner_model_catalog()
+
+        assert catalog["models_by_provider"]
+        for provider, identifiers in catalog["models_by_provider"].items():
+            result = _dispatch_tool(
+                "list_models",
+                {"provider": f"{provider}/", "limit": 10_000},
+                _empty_state(),
+                view,
+                plugin_snapshot=snapshot,
+            )
+            assert result.success is True, result.to_dict()
+            assert result.data["truncated"] is False
+            # The tool result is deep-frozen on the way out; only the sequence
+            # type differs from the aid's mutable list.
+            assert identifiers == list(result.data["models"]), provider
+            assert len(identifiers) == catalog["provider_model_counts"][provider]
+
+    def test_carried_providers_are_the_live_llm_provider_vocabulary(self) -> None:
+        """The carried set is derived from the two live ``provider`` literals.
+
+        The subset direction alone is not enough. It permits an authorable
+        provider with a non-zero count to be missing from BOTH
+        ``models_by_provider`` and ``models_omitted`` while
+        ``authorable_providers`` still names it — identifiers that vanish with
+        no disclosure and no marker to follow, which is exactly the silent
+        under-supply the aid exists to prevent. The positive direction is
+        pinned below: every authorable provider the catalog knows models for is
+        either carried or explicitly deferred.
+        """
+        from elspeth.plugins.sources.llm.config import LLMSourceConfig
+        from elspeth.plugins.transforms.llm.base import LLMConfig
+
+        catalog = planner_model_catalog()
+
+        declared = {*get_args(LLMConfig.model_fields["provider"].annotation)} | {
+            *get_args(LLMSourceConfig.model_fields["provider"].annotation)
+        }
+        assert catalog["authorable_providers"] == sorted(declared)
+        assert set(catalog["models_by_provider"]) <= declared
+        for provider in catalog["authorable_providers"]:
+            if provider in catalog["provider_model_counts"] and catalog["provider_model_counts"][provider]:
+                assert provider in catalog["models_by_provider"] or any(
+                    omission["provider"] == provider for omission in catalog["models_omitted"]
+                ), provider
+
+    def test_identifiers_are_not_carried_for_providers_an_llm_node_cannot_name(self) -> None:
+        """Counts stay complete; only the unspendable identifier lists drop out."""
+        catalog = planner_model_catalog()
+
+        unauthorable = set(catalog["provider_model_counts"]) - set(catalog["authorable_providers"])
+        assert unauthorable, "the litellm catalog should know providers an llm node cannot name"
+        assert not unauthorable & set(catalog["models_by_provider"])
+        assert all(catalog["provider_model_counts"][provider] > 0 for provider in unauthorable)
+
+    def test_an_authorable_provider_the_catalog_knows_nothing_about_carries_no_key(self) -> None:
+        """An empty list would claim the deployment serves no model for it."""
+        catalog = planner_model_catalog()
+
+        for provider in catalog["authorable_providers"]:
+            if provider not in catalog["provider_model_counts"]:
+                assert provider not in catalog["models_by_provider"]
+        assert all(identifiers for identifiers in catalog["models_by_provider"].values())
+
+    def test_catalog_fits_its_canonical_utf8_budget(self) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        catalog = planner_model_catalog()
+
+        rendered = canonical_json(catalog).encode("utf-8")
+        assert len(rendered) <= 32 * 1024
+        assert catalog["budget"]["canonical_bytes_used"] == len(rendered)
+        assert catalog["budget"]["max_canonical_bytes"] == 32 * 1024
+        assert catalog["models_omitted"] == []
+        assert catalog["budget"]["omitted_provider_count"] == 0
+
+    def test_over_budget_defers_whole_lists_and_keeps_the_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Whole lists or none: a sliced list reads as a complete one."""
+        from elspeth.core.canonical import canonical_json
+
+        full = planner_model_catalog()
+        monkeypatch.setattr(planner_authoring_aids, "_MODEL_CATALOG_MAX_CANONICAL_BYTES", 4 * 1024)
+
+        catalog = planner_model_catalog()
+
+        assert catalog["models_by_provider"] == {}
+        assert catalog["provider_model_counts"] == full["provider_model_counts"]
+        assert catalog["total_models"] == full["total_models"]
+        assert catalog["models_omitted"] == [
+            {"provider": provider, "model_count": len(identifiers), "details_via": "list_models"}
+            for provider, identifiers in sorted(full["models_by_provider"].items())
+        ]
+        assert catalog["budget"]["omitted_provider_count"] == len(full["models_by_provider"])
+        assert len(canonical_json(catalog).encode("utf-8")) <= 4 * 1024
+
+    def test_catalog_fails_closed_when_the_counts_alone_exceed_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The raise is the SECOND gate, reached only after deferral still failed."""
+        settled: list[dict[str, Any]] = []
+        measure = planner_authoring_aids._model_catalog_size
+
+        def spy(catalog: Any) -> int:
+            settled.append(json.loads(json.dumps(catalog)))
+            return measure(catalog)
+
+        monkeypatch.setattr(planner_authoring_aids, "_model_catalog_size", spy)
+        monkeypatch.setattr(planner_authoring_aids, "_MODEL_CATALOG_MAX_CANONICAL_BYTES", 64)
+
+        with pytest.raises(RuntimeError, match=r"model_catalog_budget_invariant"):
+            planner_model_catalog()
+
+        # A no-op deferral arm would raise here too, and this is what tells the
+        # two apart: the lists were dropped and disclosed before the raise.
+        assert settled[-1]["models_by_provider"] == {}
+        assert settled[-1]["models_omitted"]
+        assert settled[0]["models_by_provider"]
+
+    def test_payload_carries_the_catalog_only_where_an_llm_surface_is_visible(self) -> None:
+        view, _snapshot = _trained_view()
+        llmless, _llmless_snapshot, profiles = _llmless_view()
+
+        assert build_planner_authoring_aids(view)["model_catalog"]["catalog"] == planner_model_catalog()
+        assert "model_catalog" not in build_planner_authoring_aids(llmless)
+        # After the build, not only after the helper's own probe: a registry
+        # touch during the sweep is what would put a mock repr in a digest.
+        assert profiles.mock_calls == []
+
+    def test_guidance_names_the_closed_provenance_and_the_deferral_marker(self) -> None:
+        view, _snapshot = _trained_view()
+
+        guidance = build_planner_authoring_aids(view)["model_catalog"]["guidance"]
+
+        assert "no discovery call" in guidance
+        assert "authorable_providers" in guidance
+        assert "models_omitted" in guidance
+        assert "details_via" in guidance
+        assert "Never invent a slug" in guidance
+
+    def test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory(self, tmp_path: Path) -> None:
+        """The operator's binding stays private; the public catalog stays public.
+
+        ``_source_only_profile_view`` binds ``anthropic/claude-sonnet-4.6``
+        privately through the ``sonnet`` alias, and the public profile
+        projection deliberately hides ``model``. That slug is also an ordinary
+        member of OpenRouter's public catalog, which ``list_models`` already
+        returns in full to this same planner — so carrying the catalog
+        discloses nothing about which member the operator chose. What proves it
+        is that the carried list is the public reader's whole content, never a
+        deployment-selected subset.
+        """
+        from elspeth.contracts.value_source import get_catalog_values
+        from elspeth.plugins.transforms.llm.model_catalog import MODEL_CATALOG_OPENROUTER
+
+        view, _snapshot = _source_only_profile_view(tmp_path)
+
+        aids = build_planner_authoring_aids(view)
+        carried = aids["model_catalog"]["catalog"]["models_by_provider"]["openrouter"]
+
+        # The profile view's catalog is the profile-free one, key for key: a
+        # leak that landed under some OTHER provider key could never reach the
+        # prompt either, whatever it was.
+        assert aids["model_catalog"]["catalog"] == planner_model_catalog()
+        assert carried == sorted(get_catalog_values(MODEL_CATALOG_OPENROUTER))
+        assert "anthropic/claude-sonnet-4.6" in carried
+        without_public_inventory = json.loads(json.dumps(aids))
+        without_public_inventory["model_catalog"]["catalog"]["models_by_provider"] = {}
+        assert "anthropic/claude-sonnet-4.6" not in json.dumps(without_public_inventory)
+        assert "OPENROUTER_API_KEY" not in json.dumps(aids)
+
+    def test_memo_keys_on_the_model_catalog_identity_not_the_snapshot_alone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A catalog primed after the first build must not serve the old aids.
+
+        The OpenRouter catalog is a process-global the boot lifespan primes,
+        and no plugin-policy snapshot covers it — so a memo keyed on
+        ``snapshot_hash`` alone would pin the pre-prime catalog for the
+        process lifetime. Reverting the key to the snapshot hash makes the
+        second build below return the first build's payload.
+        """
+        builds: list[str] = []
+        identity = ["bundled-sha", "bundled"]
+
+        def build(_catalog: object) -> dict[str, str]:
+            builds.append(identity[0])
+            return {"purpose": identity[0]}
+
+        monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", build)
+        monkeypatch.setattr(
+            planner_authoring_aids,
+            "read_openrouter_catalog_snapshot_id",
+            lambda: (identity[0], identity[1]),
+        )
+        catalog: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="one-policy-snapshot"))
+
+        first = planner_authoring_aids.build_planner_authoring_aids(catalog)
+        repeat = planner_authoring_aids.build_planner_authoring_aids(catalog)
+        identity[0], identity[1] = "live-sha", "live"
+        after_prime = planner_authoring_aids.build_planner_authoring_aids(catalog)
+
+        assert first == repeat == {"purpose": "bundled-sha"}
+        assert after_prime == {"purpose": "live-sha"}
+        assert builds == ["bundled-sha", "live-sha"]
+        assert sorted(planner_authoring_aids._AIDS_MEMO) == [
+            "one-policy-snapshot:bundled:bundled-sha",
+            "one-policy-snapshot:live:live-sha",
+        ]
+
+
+class TestExpressionGrammarAid:
+    """F5: a deployment-static public reference cost one turn per gate shape."""
+
+    def test_grammar_is_the_tools_own_reference_verbatim(self) -> None:
+        from elspeth.web.composer.tools.generation import get_expression_grammar
+
+        view, _snapshot = _trained_view()
+
+        section = build_planner_authoring_aids(view)["expression_grammar"]
+
+        assert section["grammar"] == get_expression_grammar()
+        assert "grammar_omitted" not in section
+
+    def test_grammar_is_carried_on_every_deployment(self) -> None:
+        """Gate conditions are structural, so no plugin visibility gates it."""
+        llmless, _snapshot, profiles = _llmless_view()
+
+        assert build_planner_authoring_aids(llmless)["expression_grammar"] == planner_expression_grammar()
+        # After the build: a registry touch during the sweep would put a mock
+        # repr into a digest entry and leave this assertion the only witness.
+        assert profiles.mock_calls == []
+
+    def test_grammar_fits_its_canonical_utf8_budget(self) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        section = planner_expression_grammar()
+
+        rendered = canonical_json(section).encode("utf-8")
+        assert len(rendered) <= 8 * 1024
+        assert section["budget"]["canonical_bytes_used"] == len(rendered)
+        assert section["budget"]["max_canonical_bytes"] == 8 * 1024
+
+    def test_over_budget_defers_the_whole_reference_with_its_hash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.core.canonical import canonical_json
+        from elspeth.web.composer.tools.generation import get_expression_grammar
+
+        monkeypatch.setattr(planner_authoring_aids, "_EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES", 2 * 1024)
+
+        section = planner_expression_grammar()
+
+        assert "grammar" not in section
+        assert section["grammar_omitted"] == {
+            "sha256": hashlib.sha256(get_expression_grammar().encode("utf-8")).hexdigest(),
+            "details_via": "get_expression_grammar",
+        }
+        assert len(canonical_json(section).encode("utf-8")) <= 2 * 1024
+
+    def test_grammar_fails_closed_when_the_marker_alone_exceeds_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(planner_authoring_aids, "_EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES", 32)
+
+        with pytest.raises(RuntimeError, match=r"expression_grammar_budget_invariant"):
+            planner_expression_grammar()
+
+    def test_guidance_names_the_static_reference_and_its_deferral_marker(self) -> None:
+        view, _snapshot = _trained_view()
+
+        guidance = build_planner_authoring_aids(view)["expression_grammar"]["guidance"]
+
+        assert "no discovery call" in guidance
+        assert "grammar_omitted" in guidance
+        assert "details_via" in guidance
 
 
 class TestAuthoringAidsPayload:
@@ -1729,7 +2081,17 @@ class TestLlmSourceGenerationAid:
         assert "list_models" in guidance
         assert "session snapshot" in guidance
         assert "stale" in guidance
-        assert "anthropic/claude-sonnet-4.6" not in json.dumps(aids)
+        # The operator's profile binds a concrete model privately and the
+        # public profile projection hides it. That slug is separately an
+        # ordinary member of OpenRouter's public catalog, which the served
+        # model_catalog section carries whole — so the canary blanks the public
+        # identifier lists and still holds over every other section, including
+        # that catalog's own counts, guidance and omission markers. The
+        # discrimination itself is pinned by
+        # TestModelCatalogAid.test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory.
+        without_public_inventory = json.loads(json.dumps(aids))
+        without_public_inventory["model_catalog"]["catalog"]["models_by_provider"] = {}
+        assert "anthropic/claude-sonnet-4.6" not in json.dumps(without_public_inventory)
 
     def test_source_generation_requires_discard_when_content_safety_is_required(self, tmp_path: Path) -> None:
         view, _snapshot = _source_only_profile_view(tmp_path, content_safety_required=True)
@@ -1789,6 +2151,41 @@ class TestReviewRegistry:
         assert "auto-stage" in rules
         assert "llm_prompt_template" in rules
         assert "llm_model_choice" in rules
+
+    def test_gate_decision_rule_scopes_its_call_half_to_the_actual_palette(self) -> None:
+        """F8: one aid payload, two surfaces, two different palettes.
+
+        These aids ride in the planner request — whose palette carries no
+        ``request_interpretation_review``, so obeying an unconditional
+        instruction to call it lands on the DISCOVERY_ONLY terminal guard — and
+        in the compose-loop catalog context, whose palette does carry it. The
+        STAGING half is unconditional on both surfaces and stays verbatim; only
+        the CALL half is scoped. The conditional clause is shared word-for-word
+        with the capability core because both texts ride in the same context,
+        and where they overlap they must not disagree.
+        """
+        from elspeth.web.composer.capability_skill import load_pipeline_capability_core
+
+        view, _snapshot = _trained_view()
+
+        rules = " ".join(build_planner_authoring_aids(view)["review_registry"]["rules"])
+        # Word-for-word agreement is about words: collapse the markdown's hard
+        # line wrapping before comparing.
+        core_flat = " ".join(load_pipeline_capability_core().split())
+
+        # The staging half survives, and the unconditional call is gone.
+        assert "user_term gate_condition_authored ON THAT GATE NODE." in rules
+        assert "ON THAT GATE NODE and call request_interpretation_review" not in rules
+        assert "The row is valid only on a gate node" in rules
+        for phrase in (
+            "Where your palette carries",
+            (
+                "the staged requirement rides in that gate node's own options inside the terminal "
+                "proposal and its review card is surfaced from the sealed proposal"
+            ),
+        ):
+            assert phrase in rules, f"review-registry rule lacks shared phrase: {phrase!r}"
+            assert phrase in core_flat, f"capability core lacks shared phrase: {phrase!r}"
 
 
 class TestOwnershipAlignedExemplars:
