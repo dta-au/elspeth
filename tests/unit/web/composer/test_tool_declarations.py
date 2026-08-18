@@ -351,37 +351,65 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("list_sources") == {
             "name": "list_sources",
             "description": (
-                "List available source plugins with name and summary. The result's "
-                "`prohibited` array names any source categorically banned from the web "
-                "authoring surface by security policy, with its closed reason and "
-                "explanation — cite it when a user asks why a specific plugin is unavailable."
+                "List available source plugins. Each entry carries its full `config_fields` "
+                "(name, type, required, description, default per option), usage guidance, "
+                "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+                "The result's `prohibited` array names any source categorically banned from "
+                "the web authoring surface by security policy, with its closed reason and "
+                "explanation — cite it when a user asks why a specific plugin is unavailable. "
+                "Call get_plugin_schema only for enum values, nested option shapes, or the "
+                "raw JSON schema; this listing already answers ordinary configuration questions."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
+
+    def test_list_sources_description_states_config_fields_not_name_and_summary(self) -> None:
+        """The listing already carries config_fields; the description must say so."""
+        description = self._get("list_sources")["description"]
+        assert "config_fields" in description
+        assert "with name and summary" not in description
 
     def test_list_transforms(self) -> None:
         assert self._get("list_transforms") == {
             "name": "list_transforms",
             "description": (
-                "List available transform plugins with name and summary. The result's "
-                "`prohibited` array names any transform categorically banned from the web "
-                "authoring surface by security policy, with its closed reason and "
-                "explanation — cite it when a user asks why a specific plugin is unavailable."
+                "List available transform plugins. Each entry carries its full `config_fields` "
+                "(name, type, required, description, default per option), usage guidance, "
+                "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+                "The result's `prohibited` array names any transform categorically banned from "
+                "the web authoring surface by security policy, with its closed reason and "
+                "explanation — cite it when a user asks why a specific plugin is unavailable. "
+                "Call get_plugin_schema only for enum values, nested option shapes, or the "
+                "raw JSON schema; this listing already answers ordinary configuration questions."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
+
+    def test_list_transforms_description_states_config_fields_not_name_and_summary(self) -> None:
+        description = self._get("list_transforms")["description"]
+        assert "config_fields" in description
+        assert "with name and summary" not in description
 
     def test_list_sinks(self) -> None:
         assert self._get("list_sinks") == {
             "name": "list_sinks",
             "description": (
-                "List available sink plugins with name and summary. The result's "
-                "`prohibited` array names any sink categorically banned from the web "
-                "authoring surface by security policy, with its closed reason and "
-                "explanation — cite it when a user asks why a specific plugin is unavailable."
+                "List available sink plugins. Each entry carries its full `config_fields` "
+                "(name, type, required, description, default per option), usage guidance, "
+                "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+                "The result's `prohibited` array names any sink categorically banned from "
+                "the web authoring surface by security policy, with its closed reason and "
+                "explanation — cite it when a user asks why a specific plugin is unavailable. "
+                "Call get_plugin_schema only for enum values, nested option shapes, or the "
+                "raw JSON schema; this listing already answers ordinary configuration questions."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
+
+    def test_list_sinks_description_states_config_fields_not_name_and_summary(self) -> None:
+        description = self._get("list_sinks")["description"]
+        assert "config_fields" in description
+        assert "with name and summary" not in description
 
     def test_get_plugin_schema(self) -> None:
         assert self._get("get_plugin_schema") == {

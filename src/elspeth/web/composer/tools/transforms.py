@@ -144,10 +144,14 @@ _LIST_TRANSFORMS_DECLARATION = ToolDeclaration(
     handler=_handle_list_transforms,
     kind=ToolKind.DISCOVERY,
     description=(
-        "List available transform plugins with name and summary. The result's "
-        "`prohibited` array names any transform categorically banned from the web "
-        "authoring surface by security policy, with its closed reason and "
-        "explanation — cite it when a user asks why a specific plugin is unavailable."
+        "List available transform plugins. Each entry carries its full `config_fields` "
+        "(name, type, required, description, default per option), usage guidance, "
+        "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+        "The result's `prohibited` array names any transform categorically banned from "
+        "the web authoring surface by security policy, with its closed reason and "
+        "explanation — cite it when a user asks why a specific plugin is unavailable. "
+        "Call get_plugin_schema only for enum values, nested option shapes, or the "
+        "raw JSON schema; this listing already answers ordinary configuration questions."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
@@ -173,10 +177,14 @@ _LIST_SINKS_DECLARATION = ToolDeclaration(
     handler=_handle_list_sinks,
     kind=ToolKind.DISCOVERY,
     description=(
-        "List available sink plugins with name and summary. The result's "
-        "`prohibited` array names any sink categorically banned from the web "
-        "authoring surface by security policy, with its closed reason and "
-        "explanation — cite it when a user asks why a specific plugin is unavailable."
+        "List available sink plugins. Each entry carries its full `config_fields` "
+        "(name, type, required, description, default per option), usage guidance, "
+        "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+        "The result's `prohibited` array names any sink categorically banned from "
+        "the web authoring surface by security policy, with its closed reason and "
+        "explanation — cite it when a user asks why a specific plugin is unavailable. "
+        "Call get_plugin_schema only for enum values, nested option shapes, or the "
+        "raw JSON schema; this listing already answers ordinary configuration questions."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,

@@ -151,10 +151,14 @@ _LIST_SOURCES_DECLARATION = ToolDeclaration(
     handler=_handle_list_sources,
     kind=ToolKind.DISCOVERY,
     description=(
-        "List available source plugins with name and summary. The result's "
-        "`prohibited` array names any source categorically banned from the web "
-        "authoring surface by security policy, with its closed reason and "
-        "explanation — cite it when a user asks why a specific plugin is unavailable."
+        "List available source plugins. Each entry carries its full `config_fields` "
+        "(name, type, required, description, default per option), usage guidance, "
+        "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+        "The result's `prohibited` array names any source categorically banned from "
+        "the web authoring surface by security policy, with its closed reason and "
+        "explanation — cite it when a user asks why a specific plugin is unavailable. "
+        "Call get_plugin_schema only for enum values, nested option shapes, or the "
+        "raw JSON schema; this listing already answers ordinary configuration questions."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
