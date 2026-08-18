@@ -40,7 +40,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.audit import BufferingRecorder, planner_attempt_audit_envelope
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
@@ -115,7 +115,12 @@ from elspeth.web.interpretation_state import (
     pipeline_decision_artifact_hash,
 )
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.models import (
+    PluginAvailability,
+    PluginAvailabilitySnapshot,
+    PluginId,
+    PluginUnavailableReason,
+)
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
@@ -648,15 +653,22 @@ async def _plan(
     conversation_context: PlannerConversationContext | None = None,
     information_aware: bool = False,
     terminal_contract: PlannerTerminalContract | None = None,
+    schemas_loaded: frozenset[tuple[str, str]] = frozenset(),
+    mark_schema_loaded: Any = None,
+    catalog_service: Any = None,
+    policy_override: Any = None,
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
     # the API accepts the same context types, but its deliberately skeletal
     # MagicMock catalog is insufficient for a complete pipeline.
     del tool_context
-    full_catalog = create_catalog_service()
-    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
-    policy_catalog = PolicyCatalogView.for_trained_operator(full_catalog, plugin_snapshot)
+    if policy_override is not None:
+        policy_catalog, plugin_snapshot = policy_override
+    else:
+        full_catalog = catalog_service if catalog_service is not None else create_catalog_service()
+        plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
+        policy_catalog = PolicyCatalogView.for_trained_operator(full_catalog, plugin_snapshot)
     if information_aware:
         policy_context = nullcontext()
     else:
@@ -678,6 +690,8 @@ async def _plan(
             reviewed_facts={"request": "Build the requested pipeline."},
             reviewed_planner_context={"request": "Build the requested pipeline."},
             unproducible_output_fields=unproducible_output_fields,
+            schemas_loaded=schemas_loaded,
+            mark_schema_loaded=mark_schema_loaded,
             eligible_deferred_intent_ids=eligible_deferred_intent_ids,
             claim_evaluator=claim_evaluator,
             supersedes_draft_hash=supersedes_draft_hash,
@@ -1759,15 +1773,28 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
     # decline-eligible from turn 1, so the affordance notice follows it.
     payload = json.loads(request["messages"][1]["content"])
     assert 'starting with "DECLINE: "' in str(request["messages"][-1]["content"])
+    # The full catalog carries a policy-visible llm surface and both aids
+    # land complete on this deployment, so model.catalog and
+    # expression.grammar are manifest-SUPPLIED from turn 1 (F3/F5): the
+    # payload names the aid channel and drops the keys from the discoverable
+    # classes, while their palette tools stay advertised below.
     assert payload["information_manifest"]["supplied"] == {
         "pipeline_state": "current_projection",
         "plugin_selection": "policy_snapshot",
+        "model_catalog": "authoring_aids",
+        "expression_grammar": "authoring_aids",
     }
     assert "plugin.schema" in payload["information_manifest"]["discoverable_classes"]
+    assert "model.catalog" not in payload["information_manifest"]["discoverable_classes"]
+    assert "expression.grammar" not in payload["information_manifest"]["discoverable_classes"]
     assert payload["information_manifest"]["unresolved"] == []
     assert "unresolved_classes" not in payload["information_manifest"]
+    # F1: the manifest names the batching affordance as a static usage line.
+    assert payload["information_manifest"]["discovery_usage"] == ("Remaining discovery calls may be issued together in a single turn.")
     names = [tool["function"]["name"] for tool in request["tools"]]
     assert not {"get_pipeline_state", "list_sources", "list_transforms", "list_sinks"} & set(names)
+    # Aid-supplied keys keep their parity tools in the palette (F3/F5).
+    assert {"list_models", "get_expression_grammar"} <= set(names)
     assert names[-1] == "emit_pipeline_proposal"
     fixed_payload = {
         key: value for key, value in payload.items() if key not in {"intent", "conversation_context", "current_state", "reviewed_facts"}
@@ -7933,6 +7960,387 @@ async def test_manifest_satisfied_marker_decline_resolves_planner_declined(
     assert attempt.outcome is ComposerPlannerAttemptOutcome.DECLINED
     assert attempt.planner_code is ComposerPlannerCode.DECLINED
     assert attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
+
+
+class _EvidenceSchemaCatalog:
+    """Mutable toy catalog: evidence must reflect CURRENT bytes, never history."""
+
+    def __init__(self) -> None:
+        self.mode_values = ["strict", "lenient"]
+
+    def list_sources(self) -> list[PluginSummary]:
+        return [PluginSummary(name="csv", description="CSV source", plugin_type="source", config_fields=[])]
+
+    def list_transforms(self) -> list[PluginSummary]:
+        return []
+
+    def list_sinks(self) -> list[PluginSummary]:
+        return []
+
+    def get_schema(self, plugin_type: str, name: str) -> PluginSchemaInfo:
+        if (plugin_type, name) != ("source", "csv"):
+            raise ValueError("plugin_not_found")
+        return PluginSchemaInfo(
+            name="csv",
+            plugin_type="source",
+            description="metadata",
+            json_schema={
+                "type": "object",
+                "properties": {"mode": {"type": "string", "enum": list(self.mode_values)}},
+                "required": ["mode"],
+                "additionalProperties": False,
+            },
+            knob_schema={"fields": [{"name": "mode", "kind": "enum", "required": True, "nullable": False, "enum": list(self.mode_values)}]},
+        )
+
+
+@pytest.mark.asyncio
+async def test_session_loaded_schema_rides_the_planner_request_rehydrated(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """F2: a schema loaded earlier this session rides the next planner request.
+
+    ``schemas_loaded`` is identity history only — the carried contract must be
+    rehydrated through the CURRENT policy view on every request, so a catalog
+    that changed between requests supplies the new bytes, never the fetch-time
+    ones.
+    """
+    catalog = _EvidenceSchemaCatalog()
+
+    async def _declined_payload() -> dict[str, Any]:
+        completion = _ScriptedCompletion(_text_response("DECLINE: nothing to build here."))
+        with pytest.raises(PlannerDeclined):
+            await _plan(
+                tmp_path=tmp_path,
+                tool_context=tool_context,
+                completion=completion,
+                information_aware=True,
+                catalog_service=catalog,
+                schemas_loaded=frozenset({("source", "csv")}),
+            )
+        return cast(dict[str, Any], json.loads(completion.requests[0]["messages"][1]["content"]))
+
+    payload = await _declined_payload()
+    evidence = payload["schema_contract_evidence"]
+    assert [entry["plugin_id"] for entry in evidence["schemas"]] == ["source/csv"]
+    assert evidence["schemas"][0]["json_schema"]["properties"]["mode"]["enum"] == ["strict", "lenient"]
+    # No llm surface is policy-visible on this toy catalog, so the
+    # model_catalog aid is ABSENT — the section-absent arm reads as "not
+    # supplied" while the always-present grammar aid is supplied.
+    assert "model_catalog" not in payload["information_manifest"]["supplied"]
+    assert "model.catalog" in payload["information_manifest"]["discoverable_classes"]
+    assert payload["information_manifest"]["supplied"]["expression_grammar"] == "authoring_aids"
+
+    catalog.mode_values = ["strict", "recover"]
+    second = await _declined_payload()
+    rehydrated = second["schema_contract_evidence"]["schemas"][0]
+    assert rehydrated["json_schema"]["properties"]["mode"]["enum"] == ["strict", "recover"]
+    assert "lenient" not in canonical_json(second["schema_contract_evidence"])
+
+
+@pytest.mark.asyncio
+async def test_policy_hidden_identity_marked_earlier_never_reenters_evidence(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A historical load is not authority to redisclose a policy-hidden name."""
+    catalog = _EvidenceSchemaCatalog()
+    base = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash=base.policy_hash,
+        principal_scope=base.principal_scope,
+        available=frozenset(),
+        unavailable=(PluginAvailability(PluginId("source", "csv"), PluginUnavailableReason.NOT_AUTHORIZED),),
+        selected=base.selected,
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint=base.binding_generation_fingerprint,
+        authority=base.authority,
+    )
+    view = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    completion = _ScriptedCompletion(_text_response("DECLINE: nothing available."))
+
+    with pytest.raises(PlannerDeclined):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            information_aware=True,
+            policy_override=(view, snapshot),
+            schemas_loaded=frozenset({("source", "csv")}),
+        )
+
+    payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    evidence = payload["schema_contract_evidence"]
+    assert evidence["schemas"] == []
+    # An unreferenced hidden identity earns no omission row either: naming it
+    # would itself redisclose the name the policy withdrew.
+    assert evidence["omitted"] == []
+    assert "csv" not in canonical_json(evidence)
+
+
+@pytest.mark.asyncio
+async def test_referenced_policy_hidden_identity_yields_only_the_closed_omission_marker(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A referenced, loaded, now-hidden identity carries the closed marker and nothing more.
+
+    Mirrors the builder-level pin
+    (test_schema_contract_carry_forward.py::test_current_policy_unavailability_removes_stale_evidence_and_reopens_gap)
+    at the planner binding: the name is already present in current_state, so
+    the closed ``unavailable_in_current_policy`` omission adds no disclosure —
+    and no schema bytes ride.
+    """
+    catalog = _EvidenceSchemaCatalog()
+    base = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash=base.policy_hash,
+        principal_scope=base.principal_scope,
+        available=frozenset(),
+        unavailable=(PluginAvailability(PluginId("source", "csv"), PluginUnavailableReason.NOT_AUTHORIZED),),
+        selected=base.selected,
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint=base.binding_generation_fingerprint,
+        authority=base.authority,
+    )
+    view = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    referencing_state = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={"schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        ),
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    completion = _ScriptedCompletion(_text_response("DECLINE: the configured source is not available."))
+
+    with pytest.raises(PlannerDeclined):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            information_aware=True,
+            policy_override=(view, snapshot),
+            current_state=referencing_state,
+            schemas_loaded=frozenset({("source", "csv")}),
+        )
+
+    payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    evidence = payload["schema_contract_evidence"]
+    assert evidence["schemas"] == []
+    assert evidence["omitted"] == [{"plugin_id": "source/csv", "reason": "unavailable_in_current_policy"}]
+    assert evidence["omissions_withheld_count"] == 0
+    # The identity appears exactly once — as the marker — and no schema
+    # content (the toy schema's enum) rides anywhere in the evidence.
+    rendered = canonical_json(evidence)
+    assert rendered.count("csv") == 1
+    assert "lenient" not in rendered
+
+
+def test_discovery_policy_rejects_unknown_aid_supplied_keys_on_direct_construction() -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    with pytest.raises(ValueError, match="unknown aid-supplied information key"):
+        planner_module.PlannerDiscoveryPolicy(
+            manifest=planner_module.PlannerInformationManifest(supplied=frozenset()),
+            discovery_tool_names=PLANNER_DISCOVERY_TOOL_NAMES,
+            unresolved_classes=(),
+            aid_supplied_information=frozenset({"plugin.schema"}),
+        )
+
+
+@pytest.mark.asyncio
+async def test_planner_schema_discovery_success_marks_the_session_tracker(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    marks: list[tuple[str, str]] = []
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        mark_schema_loaded=lambda plugin_type, name: marks.append((plugin_type, name)),
+    )
+
+    assert marks == [("source", "csv")]
+
+
+@pytest.mark.asyncio
+async def test_planner_schema_discovery_failure_never_marks_the_session_tracker(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "no_such_plugin"})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    marks: list[tuple[str, str]] = []
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        mark_schema_loaded=lambda plugin_type, name: marks.append((plugin_type, name)),
+    )
+
+    assert marks == []
+
+
+@pytest.mark.asyncio
+async def test_aid_deferral_arms_keep_the_manifest_discoverable(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F3/F5 honesty: a budget-deferred aid must never claim SUPPLIED."""
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    original = planner_module.build_planner_authoring_aids
+
+    def aids_with_deferrals(catalog: PolicyCatalogView) -> dict[str, Any]:
+        aids = original(catalog)
+        catalog_section = aids["model_catalog"]["catalog"]
+        catalog_section["models_omitted"] = [
+            {"provider": provider, "model_count": len(identifiers), "details_via": "list_models"}
+            for provider, identifiers in sorted(catalog_section["models_by_provider"].items())
+        ]
+        catalog_section["budget"]["omitted_provider_count"] = len(catalog_section["models_omitted"])
+        catalog_section["models_by_provider"] = {}
+        grammar_aid = aids["expression_grammar"]
+        del grammar_aid["grammar"]
+        grammar_aid["grammar_omitted"] = {"sha256": "0" * 64, "details_via": "get_expression_grammar"}
+        return aids
+
+    monkeypatch.setattr(planner_module, "build_planner_authoring_aids", aids_with_deferrals)
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
+
+    request = completion.requests[0]
+    payload = json.loads(request["messages"][1]["content"])
+    assert payload["information_manifest"]["supplied"] == {
+        "pipeline_state": "current_projection",
+        "plugin_selection": "policy_snapshot",
+    }
+    assert "model.catalog" in payload["information_manifest"]["discoverable_classes"]
+    assert "expression.grammar" in payload["information_manifest"]["discoverable_classes"]
+    names = {tool["function"]["name"] for tool in request["tools"]}
+    assert {"list_models", "get_expression_grammar"} <= names
+
+
+@pytest.mark.asyncio
+async def test_aid_supplied_no_gain_pair_in_one_turn_never_escalates(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A same-turn list_models + get_expression_grammar pair must not kill the request.
+
+    Both keys are aid-supplied and both tools stay advertised, and the
+    manifest usage line invites batching — so this exact pair is the taught
+    first move. Each call still draws its DISCOVERY_NO_GAIN teaching, but the
+    escalation counter is exempt: the request proceeds on the planner model
+    (the one-shot hatch is NOT spent) and the terminal lands.
+    """
+    completion = _ScriptedCompletion(
+        _response(("list_models", {}), ("get_expression_grammar", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        information_aware=True,
+        model_overrides={
+            "escape_hatch_model": "openrouter/advisor-under-test",
+            "escape_hatch_provider": "openrouter",
+        },
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 2
+    # Not the hatch: the follow-up turn stays on the planner model.
+    assert completion.requests[1]["model"] == "anthropic/claude-planner"
+    tool_results = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
+    assert [result["error_code"] for result in tool_results] == ["DISCOVERY_NO_GAIN", "DISCOVERY_NO_GAIN"]
+    assert recorder.invocations == ()
+
+
+@pytest.mark.asyncio
+async def test_aid_supplied_no_gain_calls_across_turns_never_escalate(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """One aid-supplied no-gain call per turn must not accumulate to a kill."""
+    completion = _ScriptedCompletion(
+        _response(("list_models", {})),
+        _response(("get_expression_grammar", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        information_aware=True,
+        model_overrides={
+            "escape_hatch_model": "openrouter/advisor-under-test",
+            "escape_hatch_provider": "openrouter",
+        },
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 3
+    assert [request["model"] for request in completion.requests] == ["anthropic/claude-planner"] * 3
+    for request_index in (1, 2):
+        tool_results = [
+            json.loads(message["content"]) for message in completion.requests[request_index]["messages"] if message["role"] == "tool"
+        ]
+        assert tool_results and tool_results[-1]["error_code"] == "DISCOVERY_NO_GAIN"
+    assert recorder.invocations == ()
+
+
+@pytest.mark.asyncio
+async def test_aid_supplied_tools_stay_in_the_palette_after_a_discovery_turn(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """F3/F5: aid-supplied keys keep their parity tools advertised.
+
+    Every other supplied key drops its tool from the follow-up palette
+    (list_recipes below proves the drop rule still fires); list_models and
+    get_expression_grammar stay because the aid channel supplied their
+    content and the tools remain the parity/oversize escape.
+    """
+    completion = _ScriptedCompletion(
+        _response(("list_recipes", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
+
+    first_names = {tool["function"]["name"] for tool in completion.requests[0]["tools"]}
+    assert {"list_recipes", "list_models", "get_expression_grammar"} <= first_names
+    second_names = {tool["function"]["name"] for tool in completion.requests[1]["tools"]}
+    assert "list_recipes" not in second_names
+    assert {"list_models", "get_expression_grammar"} <= second_names
 
 
 @pytest.mark.asyncio

@@ -245,6 +245,115 @@ async def test_sink_loop_threads_parallel_tool_calls() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sink_loop_schema_success_marks_the_session_tracker() -> None:
+    """F2: a step-2 get_plugin_schema SUCCESS reaches the marking hook.
+
+    The hook is the seam the route binds to
+    ``ComposerServiceImpl._mark_plugin_schema_loaded`` — same
+    ``(plugin_type, plugin_name)`` key shape the freeform batch writes.
+    ``list_sinks`` is discovery too but is deliberately NOT a schema load.
+    """
+    responses = [
+        _response(
+            tool_calls=[
+                _tool_call("c1", "list_sinks", {}),
+                _tool_call("c2", "get_plugin_schema", {"plugin_type": "sink", "name": "json"}),
+            ]
+        ),
+        _response(tool_calls=[_tool_call("c3", "resolve_sink", _RESOLVE_SINK_ARGS)]),
+    ]
+    marks: list[tuple[str, str]] = []
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        return responses.pop(0)
+
+    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+        result = await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="save as jsonl",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            state=_empty_state(),
+            catalog=_POLICY_CATALOG,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            user_id="u1",
+            max_tool_calls_per_turn=2,
+            mark_schema_loaded=lambda plugin_type, name: marks.append((plugin_type, name)),
+        )
+
+    assert result.sink is not None
+    assert marks == [("sink", "json")]
+
+
+class _FailingSchemaCatalog(_SinkCatalog):
+    """A policy-visible sink whose schema fetch fails the catalog contract."""
+
+    def list_sources(self) -> list[PluginSummary]:
+        return []
+
+    def list_transforms(self) -> list[PluginSummary]:
+        return []
+
+    def list_sinks(self) -> list[PluginSummary]:
+        return [
+            *super().list_sinks(),
+            PluginSummary(name="broken", description="Broken sink", plugin_type="sink", config_fields=[]),
+        ]
+
+    def get_schema(self, plugin_type: str, name: str) -> PluginSchemaInfo:
+        if (plugin_type, name) == ("sink", "json"):
+            return super().get_schema(plugin_type, name)
+        raise ValueError("plugin_not_found")
+
+
+@pytest.mark.asyncio
+async def test_sink_loop_schema_failure_never_marks_the_session_tracker() -> None:
+    """A semantically-failed get_plugin_schema threads back but never marks."""
+    catalog = _FailingSchemaCatalog()
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="guided-sink-policy",
+        principal_scope="local:alice",
+        available=frozenset({PluginId("sink", "json"), PluginId("sink", "broken")}),
+        unavailable=(),
+        selected=(),
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="guided-sink-generation",
+    )
+    profiles = MagicMock(spec=OperatorProfileRegistry)
+    profiles.public_schema.side_effect = lambda _plugin_id, schema, **_kwargs: schema
+    view = PolicyCatalogView(catalog, snapshot, profiles)
+    responses = [
+        _response(tool_calls=[_tool_call("c1", "get_plugin_schema", {"plugin_type": "sink", "name": "broken"})]),
+        _response(tool_calls=[_tool_call("c2", "resolve_sink", _RESOLVE_SINK_ARGS)]),
+    ]
+    marks: list[tuple[str, str]] = []
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        return responses.pop(0)
+
+    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+        result = await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="save as jsonl",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            state=_empty_state(),
+            catalog=view,
+            plugin_snapshot=snapshot,
+            user_id="u1",
+            mark_schema_loaded=lambda plugin_type, name: marks.append((plugin_type, name)),
+        )
+
+    assert result.sink is not None
+    assert marks == []
+
+
+@pytest.mark.asyncio
 async def test_sink_loop_rejects_over_limit_batch_before_any_dispatch() -> None:
     """An oversized allowed batch is one malformed response, not partial work."""
     response = _response(

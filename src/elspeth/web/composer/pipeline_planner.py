@@ -22,6 +22,7 @@ from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import partial
 from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast, final
 from uuid import UUID
 
@@ -83,6 +84,7 @@ from elspeth.web.composer.planner_authoring_aids import (
     PlannerPluginContract,
     SchemaContractProjectionUnsupported,
     build_planner_authoring_aids,
+    build_schema_contract_evidence,
     discovery_digest_detail_tools,
     planner_plugin_contract,
 )
@@ -93,6 +95,13 @@ from elspeth.web.composer.progress import (
     tool_completed_progress_event,
     tool_started_progress_event,
 )
+
+# Private by name, deliberate import: one derivation of "plugins the current
+# state names" for every surface that builds schema evidence — the freeform
+# context message and this planner must not disagree about which referenced
+# identity closes a gap. (Runtime-safe: prompts reaches this module only
+# through protocol's TYPE_CHECKING block.)
+from elspeth.web.composer.prompts import _state_referenced_plugins
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
@@ -138,6 +147,9 @@ _CATALOG_DETAIL_INFORMATION_BY_TOOL: Final[Mapping[str, str]] = {
     "list_sinks": "catalog.details.sink",
 }
 _RECIPE_INDEX_INFORMATION: Final[str] = "recipe.index"
+# The only manifest keys the authoring aids may close. Their palette tools
+# (list_models / get_expression_grammar) stay advertised either way.
+_AID_SUPPLIED_INFORMATION_KEYS: Final[frozenset[str]] = frozenset({"model.catalog", "expression.grammar"})
 _FULL_STATE_ALIASES: Final[frozenset[str]] = frozenset({"", "all", "full", "pipeline"})
 _ALL_INFORMATION_GAPS_CLOSED_NOTICE: Final[str] = "All declared information gaps are closed; emit the terminal proposal now."
 
@@ -228,13 +240,29 @@ class PlannerInformationManifest:
         discoverable_classes: tuple[str, ...],
         unresolved_keys: frozenset[str],
     ) -> dict[str, object]:
+        supplied: dict[str, str] = {
+            "pipeline_state": "current_projection",
+            "plugin_selection": "policy_snapshot",
+        }
+        # An aid-closed key is claimed here only when the manifest itself
+        # supplies it — the flip is honest by construction because the aids
+        # builder withholds the key on every deferral arm (absent section,
+        # over-budget catalog, grammar_omitted), and each of those arms stays
+        # in discoverable_classes instead.
+        if "model.catalog" in self.supplied:
+            supplied["model_catalog"] = "authoring_aids"
+        if "expression.grammar" in self.supplied:
+            supplied["expression_grammar"] = "authoring_aids"
         return {
-            "supplied": {
-                "pipeline_state": "current_projection",
-                "plugin_selection": "policy_snapshot",
-            },
+            "supplied": supplied,
             "discoverable_classes": list(discoverable_classes),
             "unresolved": sorted(unresolved_keys),
+            # Static usage line, never per-request data: it names an
+            # affordance the tool protocol already grants (parallel tool
+            # calls in one assistant turn) that the turn-loop guards already
+            # honor, so it adds zero provider egress. Without it a planner
+            # that needs three facts rationally spends three turns.
+            "discovery_usage": ("Remaining discovery calls may be issued together in a single turn."),
         }
 
 
@@ -245,6 +273,15 @@ class PlannerDiscoveryPolicy:
     manifest: PlannerInformationManifest
     discovery_tool_names: tuple[str, ...]
     unresolved_classes: tuple[str, ...]
+    # Keys the request's authoring aids closed with complete content. Unlike
+    # every other supplied key, an aid-closed key keeps its palette tool
+    # advertised: the tool is the parity check for served content and the
+    # escape for a deployment whose next request lands on a deferral arm.
+    aid_supplied_information: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if type(self.aid_supplied_information) is not frozenset or self.aid_supplied_information - _AID_SUPPLIED_INFORMATION_KEYS:
+            raise ValueError("planner discovery policy contains an unknown aid-supplied information key")
 
     @classmethod
     def initial(
@@ -252,19 +289,25 @@ class PlannerDiscoveryPolicy:
         surface: PlannerSurface,
         *,
         required_catalog_detail_tools: tuple[str, ...] = (),
+        aid_supplied_information: frozenset[str] = frozenset(),
     ) -> PlannerDiscoveryPolicy:
         unknown_detail_tools = set(required_catalog_detail_tools) - set(_CATALOG_DETAIL_INFORMATION_BY_TOOL)
         if unknown_detail_tools:
             raise ValueError("planner discovery policy contains an unknown catalog detail tool")
+        if set(aid_supplied_information) - _AID_SUPPLIED_INFORMATION_KEYS:
+            raise ValueError("planner discovery policy contains an unknown aid-supplied information key")
         unavailable = (
             frozenset({"pipeline.preview"}) if surface in {PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE} else frozenset()
         )
         detail_gaps = frozenset(_CATALOG_DETAIL_INFORMATION_BY_TOOL[tool] for tool in required_catalog_detail_tools)
         manifest = PlannerInformationManifest(
-            supplied=frozenset({_PIPELINE_CURRENT_INFORMATION, _CATALOG_SELECTION_INFORMATION}),
+            supplied=frozenset({_PIPELINE_CURRENT_INFORMATION, _CATALOG_SELECTION_INFORMATION}) | aid_supplied_information,
             unavailable=unavailable,
             unresolved=detail_gaps,
         )
+        # list_models / get_expression_grammar deliberately never join
+        # ``omitted``: an aid-supplied key changes what the manifest claims,
+        # not which tools the palette offers.
         omitted = {"get_pipeline_state", *set(_CATALOG_DETAIL_INFORMATION_BY_TOOL) - set(required_catalog_detail_tools)}
         if unavailable:
             omitted.add("preview_pipeline")
@@ -275,23 +318,30 @@ class PlannerDiscoveryPolicy:
             unresolved_classes=(
                 "plugin.schema",
                 "plugin.assistance",
-                "model.catalog",
+                *(() if "model.catalog" in aid_supplied_information else ("model.catalog",)),
                 "recipe.index",
                 "blob.metadata",
                 "validation.code",
                 "secret.reference",
+                *(() if "expression.grammar" in aid_supplied_information else ("expression.grammar",)),
                 *tuple(_CATALOG_DETAIL_INFORMATION_BY_TOOL[tool] for tool in required_catalog_detail_tools),
             ),
+            aid_supplied_information=aid_supplied_information,
         )
 
+    def _retains_tool(self, manifest: PlannerInformationManifest, name: str) -> bool:
+        keys = _tool_information_keys(name, {})
+        if keys and all(key in self.aid_supplied_information for key in keys):
+            return True
+        return not all(manifest.covers(key) for key in keys)
+
     def with_manifest(self, manifest: PlannerInformationManifest) -> PlannerDiscoveryPolicy:
-        retained = tuple(
-            name for name in self.discovery_tool_names if not all(manifest.covers(key) for key in _tool_information_keys(name, {}))
-        )
+        retained = tuple(name for name in self.discovery_tool_names if self._retains_tool(manifest, name))
         return PlannerDiscoveryPolicy(
             manifest=manifest,
             discovery_tool_names=retained,
             unresolved_classes=self.unresolved_classes,
+            aid_supplied_information=self.aid_supplied_information,
         )
 
 
@@ -363,6 +413,28 @@ def _intent_selected_schema_keys(intent: str) -> frozenset[str]:
     return frozenset(
         f"plugin.schema:{kind}/{name}" for kind, name in re.findall(r"\b(source|transform|sink):([a-z0-9][a-z0-9_.-]*)\b", intent.lower())
     )
+
+
+def _aid_supplied_information(authoring_aids: Mapping[str, Any]) -> frozenset[str]:
+    """Return the manifest keys the authoring aids close with complete content.
+
+    The two aid sections signal "not supplied" differently, and a manifest
+    flip that ignored the asymmetry would lie in one arm or the other:
+    ``model_catalog`` is entirely absent when no llm surface is
+    policy-visible, and in the over-budget arm it is present with
+    ``models_by_provider`` empty and a ``models_omitted`` marker per dropped
+    provider; ``expression_grammar`` always rides and swaps ``grammar`` for a
+    ``grammar_omitted`` marker over budget. Every one of those arms must stay
+    DISCOVERABLE — the identifiers or syntax still require the palette tool.
+    """
+    supplied: set[str] = set()
+    if "model_catalog" in authoring_aids:
+        catalog = authoring_aids["model_catalog"]["catalog"]
+        if catalog["models_by_provider"] and catalog["budget"]["omitted_provider_count"] == 0:
+            supplied.add("model.catalog")
+    if "expression_grammar" in authoring_aids and "grammar" in authoring_aids["expression_grammar"]:
+        supplied.add("expression.grammar")
+    return frozenset(supplied)
 
 
 class _Completion(Protocol):
@@ -3274,6 +3346,8 @@ async def plan_pipeline(
     reviewed_facts: Mapping[str, Any],
     reviewed_planner_context: Mapping[str, Any],
     unproducible_output_fields: tuple[str, ...],
+    schemas_loaded: frozenset[tuple[str, str]],
+    mark_schema_loaded: Callable[[str, str], None] | None,
     eligible_deferred_intent_ids: tuple[str, ...],
     claim_evaluator: PipelineClaimEvaluator | None,
     supersedes_draft_hash: str | None,
@@ -3320,6 +3394,12 @@ async def plan_pipeline(
     selected_terminal_contract = terminal_contract or canonical_planner_terminal_contract()
     if type(unproducible_output_fields) is not tuple or any(type(field) is not str for field in unproducible_output_fields):
         raise TypeError("unproducible_output_fields must be an exact string tuple")
+    if type(schemas_loaded) is not frozenset or any(
+        type(pair) is not tuple or len(pair) != 2 or type(pair[0]) is not str or type(pair[1]) is not str for pair in schemas_loaded
+    ):
+        raise TypeError("schemas_loaded must be an exact frozenset of (kind, plugin) string pairs")
+    if mark_schema_loaded is not None and not callable(mark_schema_loaded):
+        raise TypeError("mark_schema_loaded must be callable or None")
     if type(eligible_deferred_intent_ids) is not tuple or any(type(intent_id) is not str for intent_id in eligible_deferred_intent_ids):
         raise TypeError("eligible_deferred_intent_ids must be an exact string tuple")
     if len(set(eligible_deferred_intent_ids)) != len(eligible_deferred_intent_ids):
@@ -3357,6 +3437,8 @@ async def plan_pipeline(
                 reviewed_facts=reviewed_facts,
                 reviewed_planner_context=reviewed_planner_context,
                 unproducible_output_fields=unproducible_output_fields,
+                schemas_loaded=schemas_loaded,
+                mark_schema_loaded=mark_schema_loaded,
                 eligible_deferred_intent_ids=eligible_deferred_intent_ids,
                 claim_evaluator=claim_evaluator,
                 supersedes_draft_hash=supersedes_draft_hash,
@@ -3425,6 +3507,8 @@ async def _plan_pipeline_inner(
     reviewed_facts: Mapping[str, Any],
     reviewed_planner_context: Mapping[str, Any],
     unproducible_output_fields: tuple[str, ...],
+    schemas_loaded: frozenset[tuple[str, str]],
+    mark_schema_loaded: Callable[[str, str], None] | None,
     eligible_deferred_intent_ids: tuple[str, ...],
     claim_evaluator: PipelineClaimEvaluator | None,
     supersedes_draft_hash: str | None,
@@ -3467,6 +3551,20 @@ async def _plan_pipeline_inner(
     # teach. Memoized per snapshot hash; a cold build sweeps the catalog, so
     # it runs off-loop like the other sync planner phases.
     authoring_aids = await run_planner_sync(build_planner_authoring_aids, policy_catalog)
+    # Server-side re-supply of server-owned catalog facts for identities whose
+    # get_plugin_schema already succeeded this session. ``schemas_loaded`` is
+    # identity history only: every contract byte is rehydrated through THIS
+    # request's policy view (stale bytes are impossible, policy-hidden
+    # identities are withheld as closed omissions), so no provider output is
+    # ever persisted or replayed.
+    schema_contract_evidence, _schemas_evidenced = await run_planner_sync(
+        partial(
+            build_schema_contract_evidence,
+            policy_catalog,
+            schemas_loaded=schemas_loaded,
+            referenced=_state_referenced_plugins(current_state),
+        )
+    )
     request_context = ToolContext(
         catalog=policy_catalog,
         plugin_snapshot=plugin_snapshot,
@@ -3498,6 +3596,7 @@ async def _plan_pipeline_inner(
     discovery_policy = PlannerDiscoveryPolicy.initial(
         surface,
         required_catalog_detail_tools=discovery_digest_detail_tools(authoring_aids),
+        aid_supplied_information=_aid_supplied_information(authoring_aids),
     )
     information_manifest = discovery_policy.manifest
     declared_pending_information = frozenset(information_manifest.unresolved) | frozenset(_intent_selected_schema_keys(intent))
@@ -3508,6 +3607,7 @@ async def _plan_pipeline_inner(
         "current_state": provider_current_state,
         "reviewed_facts": reviewed_planner_context,
         "authoring_aids": authoring_aids,
+        "schema_contract_evidence": schema_contract_evidence,
         "information_manifest": information_manifest.provider_payload(
             discoverable_classes=discovery_policy.unresolved_classes,
             unresolved_keys=frozenset(pending_information),
@@ -4649,8 +4749,21 @@ async def _plan_pipeline_inner(
             if information_keys[call.call_id] and all(information_manifest.covers(key) for key in information_keys[call.call_id])
         )
         useful_calls = tuple(call for call in calls if call not in no_gain_calls)
-        no_gain_calls_in_round += len(no_gain_calls)
-        escalate_no_gain = bool(no_gain_calls) and no_gain_calls_in_round >= 2
+        # Aid-supplied keys draw the same per-call no-gain teaching below but
+        # never feed the escalation counter: their palette tools stay
+        # advertised BY DESIGN (the parity/oversize escape), so calling one is
+        # an invited redundancy for the turn budget to absorb — not the
+        # stuck-planner signal this escalation exists for. Without the
+        # exemption, one list_models + get_expression_grammar pair (the exact
+        # batching the manifest usage line teaches) terminates the request or
+        # burns the one-shot hatch on turn 1.
+        escalating_no_gain_calls = tuple(
+            call
+            for call in no_gain_calls
+            if not all(key in discovery_policy.aid_supplied_information for key in information_keys[call.call_id])
+        )
+        no_gain_calls_in_round += len(escalating_no_gain_calls)
+        escalate_no_gain = bool(escalating_no_gain_calls) and no_gain_calls_in_round >= 2
         for call in useful_calls:
             pending_information.update(information_keys[call.call_id])
         keys = tuple((call.name, stable_hash(call.arguments)) for call in useful_calls)
@@ -4833,6 +4946,11 @@ async def _plan_pipeline_inner(
             information_available = result.success
             newly_covered_keys = tuple(key for key in information_keys[call.call_id] if not information_manifest.covers(key))
             if call.name == "get_plugin_schema" and result.success:
+                if mark_schema_loaded is not None:
+                    # Same per-session tracker and key shape the freeform
+                    # batch writes (tool_batch.py); a successful dispatch has
+                    # already validated both arguments. Failures never mark.
+                    mark_schema_loaded(str(call.arguments["plugin_type"]), str(call.arguments["name"]))
                 contract, projection_available = _project_planner_plugin_contract(result.data)
                 if not projection_available:
                     information_available = False

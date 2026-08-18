@@ -8,6 +8,20 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-19 — `plan_pipeline` requires the session schema tracker; aid-supplied
+  manifest keys are palette-retained AND escalation-exempt** (landed with
+  elspeth-cb3561382e/275e05bf71/ac44757161). `plan_pipeline` takes
+  `schemas_loaded`/`mark_schema_loaded` as REQUIRED kwargs — a new call site
+  must thread the per-session tracker (`ComposerServiceImpl._mark_plugin_schema_loaded`
+  via `functools.partial`), never default it away. Manifest keys supplied by
+  authoring aids (`model.catalog`, `expression.grammar` — the closed
+  `_AID_SUPPLIED_INFORMATION_KEYS` set) keep their palette tools advertised as
+  the oversize escape AND are exempt from no-gain ESCALATION (per-call
+  DISCOVERY_NO_GAIN feedback still fires; the turn budget is the doom-loop
+  backstop). Extending either set means revisiting both properties together —
+  a supplied key whose tool stays advertised without the exemption is a
+  request-killer (two no-gain calls = terminal), which is exactly the shape
+  review caught here.
 - **2026-08-18 — `ToolResult.to_dict()` keys are declared TWICE: the dataclass
   and the redaction manifest** (landed with elspeth-f14aba9686). Adding a
   serialized key to `ToolResult.to_dict()` without declaring it in

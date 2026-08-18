@@ -4,17 +4,26 @@ from __future__ import annotations
 
 import inspect
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from decimal import Decimal
 from itertools import permutations, product
-from typing import get_type_hints
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, get_type_hints
 from uuid import UUID
 
 import pytest
+import structlog
+from sqlalchemy.pool import StaticPool
 
 import elspeth.web.composer.guided.planning as guided_planning
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import stable_hash
+from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.guided.planning import (
     build_guided_proposal_projection,
     guided_candidate_state,
@@ -40,9 +49,23 @@ from elspeth.web.composer.guided.stage_subjects import (
     StatedGateRoutingConstraint,
 )
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
-from elspeth.web.composer.pipeline_planner import plan_pipeline
+from elspeth.web.composer.pipeline_planner import (
+    PlannerBudgetPolicy,
+    PlannerCustodyConfig,
+    PlannerDeclined,
+    PlannerModelConfig,
+    PlannerOriginatingMessage,
+    PlannerRequestLifecycle,
+    plan_pipeline,
+)
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, PresentBase
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 SOURCE_ID = "00000000-0000-4000-8000-000000000101"
 OUTPUT_ID = "00000000-0000-4000-8000-000000000102"
@@ -1752,11 +1775,205 @@ def test_transform_with_on_error_omitted_projects_the_derived_discard_error_flow
     )
 
 
+@pytest.mark.asyncio
+async def test_guided_planner_request_carries_evidence_and_manifest_without_private_values(tmp_path: Path) -> None:
+    """The guided planner provider request's Task-10 additions leak nothing.
+
+    Pins the request-level context the planner actually sends: the
+    session-tracked schema evidence (rehydrated through the live policy view)
+    and the information manifest with its aid-supplied flips and static
+    batching usage line. The canary sweep runs over the WHOLE serialized
+    payload BEFORE the equality pins — it is the no-egress proof for every
+    addition, evidence content included (no option values, no policy-hidden
+    identities).
+    """
+    # A deferred intent carrying the private option path/value canaries rides
+    # the session, so the DEFERRED_* sweeps below can actually fail: the
+    # provider projection must reduce the constraint to closed structural
+    # facts (value_present, value_type) with neither canary present.
+    guided = replace(
+        _guided(),
+        deferred_intents=(
+            DeferredStageIntent.create(
+                intent_id="00000000-0000-4000-8000-000000000120",
+                receiving_stage="output",
+                target_stage="topology",
+                catalog_kind="source",
+                catalog_name="csv",
+                redacted_summary="Apply a private option constraint.",
+                originating_message_id="00000000-0000-4000-8000-000000000121",
+                message_content_hash=stable_hash("private option instruction"),
+                constraints=(
+                    OptionValueConstraint(
+                        kind="option_value",
+                        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+                        option_path=(DEFERRED_PATH_CANARY, "value"),
+                        operator="equals",
+                        value=DEFERRED_VALUE_CANARY,
+                    ),
+                ),
+            ),
+        ),
+    )
+    state = CompositionState(
+        sources={},
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+        guided_session=guided,
+    )
+    full_catalog = create_catalog_service()
+    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
+    policy_catalog = PolicyCatalogView.for_trained_operator(full_catalog, plugin_snapshot)
+    # Reviewed guided facts activate blob-custody verification, which
+    # requires a live session database and an owning session row even when
+    # no source is blob-bound.
+    session_engine = create_session_engine(
+        "sqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    initialize_session_schema(session_engine)
+    sessions = SessionServiceImpl(
+        session_engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.proposal-audit-projection"),
+    )
+    session = await sessions.create_session("planner-user", "guided planner request pin", "local")
+    requests: list[dict[str, Any]] = []
+
+    async def completion(**kwargs: Any) -> Any:
+        requests.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="DECLINE: nothing further to add.", tool_calls=None))],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+            model="provider/planner-v1",
+            id="request-1",
+        )
+
+    async def before_start() -> None:
+        return None
+
+    @asynccontextmanager
+    async def request_scope() -> Any:
+        yield
+
+    async def on_settled(outcome: str) -> None:
+        return None
+
+    with pytest.raises(PlannerDeclined):
+        await plan_pipeline(
+            intent="Wire the reviewed input to the reviewed output.",
+            current_state=state,
+            provider_current_state=guided_redacted_current_state_context(state),
+            reviewed_facts=guided_private_reviewed_facts(guided),
+            reviewed_planner_context=guided_redacted_planner_context(guided),
+            unproducible_output_fields=(),
+            schemas_loaded=frozenset({("source", "csv"), ("sink", "json"), ("transform", "field_mapper")}),
+            mark_schema_loaded=None,
+            eligible_deferred_intent_ids=(),
+            claim_evaluator=None,
+            supersedes_draft_hash=None,
+            surface=PlannerSurface.GUIDED_STAGED,
+            profile="ordinary",
+            policy_catalog=policy_catalog,
+            plugin_snapshot=plugin_snapshot,
+            originating_message=PlannerOriginatingMessage(
+                session_id=str(session.id),
+                message_id=str(CHECKPOINT_ID),
+                content="Wire the reviewed input to the reviewed output.",
+                user_id="planner-user",
+            ),
+            base=PresentBase(state_id=CHECKPOINT_ID, composition_content_hash="a" * 64),
+            model_config=PlannerModelConfig(
+                completion=completion,
+                model_identifier="anthropic/claude-planner",
+                provider="test-provider",
+                temperature=0.0,
+                seed=7,
+                timeout_seconds=5.0,
+                max_composition_turns=4,
+                max_discovery_turns=3,
+                max_tool_calls_per_turn=3,
+                max_api_attempts=1,
+                api_retry_base_seconds=0.0,
+                discovery_reasoning_effort="none",
+                candidate_reasoning_effort="none",
+            ),
+            rendered_skill=f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
+            repair_budget=1,
+            budget_policy=PlannerBudgetPolicy(
+                max_total_provider_calls=4,
+                max_request_bytes=1_000_000,
+                max_completion_tokens=800,
+                max_cumulative_provider_cost=Decimal("1.00"),
+            ),
+            custody_config=PlannerCustodyConfig(
+                data_dir=str(tmp_path),
+                session_engine=session_engine,
+                max_storage_per_session=1_000_000,
+                secret_service=None,
+                runtime_preflight=None,
+            ),
+            lifecycle=PlannerRequestLifecycle(
+                before_start=before_start,
+                request_scope=request_scope,
+                on_settled=on_settled,
+                progress=None,
+            ),
+            recorder=BufferingRecorder(),
+            candidate_finalizer=lambda candidate: candidate,
+        )
+
+    assert len(requests) == 1
+    payload_text = requests[0]["messages"][1]["content"]
+    # Canary sweep FIRST: the equality pins below are meaningful only after
+    # the whole payload — evidence included — is proven value-free.
+    for canary in CANARIES:
+        assert canary not in payload_text
+    assert DEFERRED_VALUE_CANARY not in payload_text
+    assert DEFERRED_PATH_CANARY not in payload_text
+
+    payload = json.loads(payload_text)
+    evidence = payload["schema_contract_evidence"]
+    # Referenced-first ordering with an empty topology falls back to
+    # (kind, name); every session-loaded identity is rehydrated whole.
+    assert [entry["plugin_id"] for entry in evidence["schemas"]] == ["sink/json", "source/csv", "transform/field_mapper"]
+    assert evidence["omitted"] == []
+    assert payload["information_manifest"] == {
+        "supplied": {
+            "pipeline_state": "current_projection",
+            "plugin_selection": "policy_snapshot",
+            "model_catalog": "authoring_aids",
+            "expression_grammar": "authoring_aids",
+        },
+        "discoverable_classes": [
+            "plugin.schema",
+            "plugin.assistance",
+            "recipe.index",
+            "blob.metadata",
+            "validation.code",
+            "secret.reference",
+        ],
+        "unresolved": [],
+        "discovery_usage": "Remaining discovery calls may be issued together in a single turn.",
+    }
+    # The redacted reviewed context rides unchanged beside the additions.
+    assert payload["reviewed_facts"] == guided_redacted_planner_context(guided)
+
+
 def test_planner_requires_private_provider_safe_and_model_claim_authority() -> None:
     model_signature = inspect.signature(plan_pipeline)
     for name in (
         "reviewed_facts",
         "reviewed_planner_context",
+        # F2: the session schema tracker is threaded explicitly — a caller
+        # that stops passing it fails loudly instead of silently reverting
+        # the planner surface to "no schemas loaded".
+        "schemas_loaded",
+        "mark_schema_loaded",
         "eligible_deferred_intent_ids",
         "claim_evaluator",
         "supersedes_draft_hash",

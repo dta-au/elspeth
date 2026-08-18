@@ -3433,6 +3433,8 @@ class ComposerServiceImpl:
             unproducible_output_fields=(),
             reviewed_facts={},
             reviewed_planner_context={},
+            schemas_loaded=self._schemas_loaded_for_session(originating_message.session_id),
+            mark_schema_loaded=functools.partial(self._mark_plugin_schema_loaded, originating_message.session_id),
             eligible_deferred_intent_ids=(),
             claim_evaluator=None,
             supersedes_draft_hash=None,
@@ -3789,6 +3791,8 @@ class ComposerServiceImpl:
             reviewed_facts=reviewed_facts,
             reviewed_planner_context=reviewed_context,
             unproducible_output_fields=unproducible_output_fields,
+            schemas_loaded=self._schemas_loaded_for_session(originating_message.session_id),
+            mark_schema_loaded=functools.partial(self._mark_plugin_schema_loaded, originating_message.session_id),
             eligible_deferred_intent_ids=tuple(item.intent_id for item in guided.deferred_intents),
             claim_evaluator=evaluate_claims,
             supersedes_draft_hash=supersedes_draft_hash,
@@ -4215,6 +4219,8 @@ class ComposerServiceImpl:
                 # has declared a sink field contract a gap could exist
                 # against.
                 unproducible_output_fields=(),
+                schemas_loaded=self._schemas_loaded_for_session(session_id),
+                mark_schema_loaded=functools.partial(self._mark_plugin_schema_loaded, session_id),
                 eligible_deferred_intent_ids=(),
                 claim_evaluator=None,
                 supersedes_draft_hash=None,

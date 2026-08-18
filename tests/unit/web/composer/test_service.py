@@ -161,6 +161,9 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
     monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
     current_state = _empty_state()
     session_id = uuid4()
+    # F2: the guided planner threads the same per-session schema tracker the
+    # freeform batch writes — seeded here so the threading is observable.
+    composer_service_with_real_sessions._mark_plugin_schema_loaded(str(session_id), "source", "csv")
     custody_fence = GuidedOperationFence(
         session_id=session_id,
         operation_id=str(uuid4()),
@@ -194,6 +197,13 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
         operation_id=custody_fence.operation_id,
         lease_token=custody_fence.lease_token,
         attempt=custody_fence.attempt,
+    )
+    # F2 threading: the tracker's current view rides in, and the marking
+    # callback writes back into the SAME per-session tracker (no parallel one).
+    assert captured[0]["schemas_loaded"] == frozenset({("source", "csv")})
+    captured[0]["mark_schema_loaded"]("transform", "field_mapper")
+    assert composer_service_with_real_sessions._schemas_loaded_for_session(str(session_id)) == frozenset(
+        {("source", "csv"), ("transform", "field_mapper")}
     )
 
 

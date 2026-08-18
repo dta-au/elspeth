@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import structlog
@@ -710,6 +711,9 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     api_base: str | None = None,
     api_key: str | None = None,
     reasoning_effort: str | None = None,
+    # F2 marking hook, threaded verbatim to the solver's discovery loop —
+    # binds ComposerServiceImpl._mark_plugin_schema_loaded at the route.
+    mark_schema_loaded: Callable[[str, str], None] | None = None,
 ) -> Step2SinkChatResult:
     """Wrap Step-2 ``resolve_sink`` chat with the guided-chat fallback contract.
 
@@ -749,6 +753,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
             api_base=api_base,
             api_key=api_key,
             reasoning_effort=reasoning_effort,
+            mark_schema_loaded=mark_schema_loaded,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         if type(outcome) is Step2SinkResolvedOutcome:

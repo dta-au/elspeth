@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -366,6 +367,9 @@ async def run_guided_chat_provider_attempt(
     progress: Any,
     current_turn: Turn | None = None,
     current_payload: PreparedGuidedJsonPayload | None = None,
+    # F2 marking hook: the caller binds the composer service's per-session
+    # get_plugin_schema tracker; only the Step-2 discovery loop consumes it.
+    mark_schema_loaded: Callable[[str, str], None] | None = None,
 ) -> GuidedChatProviderOutcome:
     """Run the only provider-bearing phase, with no compose lock held."""
 
@@ -469,6 +473,7 @@ async def run_guided_chat_provider_attempt(
             api_base=endpoint_base_url,
             api_key=endpoint_api_key,
             reasoning_effort=settings.composer_discovery_reasoning_effort,
+            mark_schema_loaded=mark_schema_loaded,
         )
         if not isinstance(sink_outcome, GuidedStepChatEmptyResult):
             if revision_form == "output":
@@ -1196,6 +1201,14 @@ async def post_guided_chat_schema8(
                             progress=progress_sink,
                             current_turn=frozen.current_turn,
                             current_payload=frozen.current_payload,
+                            # Same per-session tracker the freeform batch and
+                            # planner surfaces write; a Step-2 get_plugin_schema
+                            # success recorded here saves the NEXT planner
+                            # request a re-fetch (F2).
+                            mark_schema_loaded=functools.partial(
+                                request.app.state.composer_service._mark_plugin_schema_loaded,
+                                str(session_id),
+                            ),
                         )
                         chat_result = provider_outcome.chat
                         source_resolution = provider_outcome.resolution if type(provider_outcome) is Step1SourceResolvedResult else None

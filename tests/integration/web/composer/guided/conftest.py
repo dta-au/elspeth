@@ -169,6 +169,26 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     class _DeterministicGuidedPlanner:
         """Explicit test double for the shared planner route seam."""
 
+        def __init__(self) -> None:
+            # Mirrors ComposerServiceImpl's per-session get_plugin_schema
+            # tracker contract: the guided chat route binds
+            # ``_mark_plugin_schema_loaded`` eagerly for every provider
+            # attempt (F2), so the double must model it — fix the fake,
+            # never the production code, per the masquerade doctrine.
+            self._schemas_loaded_by_session: dict[str, set[tuple[str, str]]] = {}
+
+        def _mark_plugin_schema_loaded(self, session_id: str | None, plugin_type: str, plugin_name: str) -> None:
+            if session_id is None:
+                return
+            if session_id not in self._schemas_loaded_by_session:
+                self._schemas_loaded_by_session[session_id] = set()
+            self._schemas_loaded_by_session[session_id].add((plugin_type, plugin_name))
+
+        def _schemas_loaded_for_session(self, session_id: str | None) -> frozenset[tuple[str, str]]:
+            if session_id is None or session_id not in self._schemas_loaded_by_session:
+                return frozenset()
+            return frozenset(self._schemas_loaded_by_session[session_id])
+
         async def plan_guided_full_pipeline(self, *, base, recorder, policy_catalog, **_kwargs):
             pipeline = {
                 "sources": {

@@ -53,6 +53,18 @@ class _ReturningLiteLLMCompletion:
 
 
 @dataclass
+class _SequencedLiteLLMCompletion:
+    """LiteLLM fake returning one scripted response per provider round."""
+
+    responses: list[object]
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def __call__(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+@dataclass
 class _RaisingLiteLLMCompletion:
     exception: BaseException
     calls: list[dict[str, object]] = field(default_factory=list)
@@ -1546,6 +1558,81 @@ class TestStepChatCrossStep:
             ("assistant", "step_2_sink", 3, "step-2 advice"),
         ]
         assert final["guided_session"]["chat_turn_seq"] == 4
+
+
+def _fake_sink_schema_discovery_call(name: str) -> SimpleNamespace:
+    """LiteLLM-shaped response carrying one Step-2 get_plugin_schema call."""
+    tool_call = SimpleNamespace(
+        id="discovery-1",
+        function=SimpleNamespace(
+            name="get_plugin_schema",
+            arguments=json.dumps({"plugin_type": "sink", "name": name}),
+        ),
+    )
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+
+
+class TestStep2SchemaLoadMarking:
+    """F2 e2e: the route binds the composer service's per-session tracker.
+
+    Drives the REAL /guided/chat route at step_2_sink so the whole wiring
+    chain is under test — post_guided_chat_schema8's ``functools.partial``
+    binding, run_guided_chat_provider_attempt's pass-through,
+    resolve_step_2_sink_chat_with_auto_drop's pass-through, and the solver's
+    success-only marking. A success lands the (kind, plugin) pair in the
+    tracker the next planner request reads; a semantic failure never does.
+    """
+
+    def _advance_to_step_2(self, client: TestClient) -> str:
+        session_id = _create_session(client)
+        _seed_guided_session(client, session_id)
+        TestStepChatCrossStep._seed_csv_blob(client, session_id)
+        TestStepChatCrossStep._configure_csv_source(client, session_id)
+        guided = client.get(f"/api/sessions/{session_id}/guided").json()
+        assert guided["guided_session"]["step"] == "step_2_sink", guided
+        return session_id
+
+    def test_step_2_schema_success_marks_the_composer_tracker_through_the_route(self, composer_test_client: TestClient) -> None:
+        session_id = self._advance_to_step_2(composer_test_client)
+        completion = _SequencedLiteLLMCompletion(
+            [
+                _fake_sink_schema_discovery_call("json"),
+                _fake_llm_reply("The JSON Lines sink writes one object per row."),
+            ]
+        )
+
+        with patch(_CHAT_SOLVER_ACOMPLETION, new=completion):
+            status, body = _post_chat(
+                composer_test_client,
+                session_id,
+                message="what options does the json sink take?",
+            )
+
+        assert status == 200, body
+        assert len(completion.calls) == 2
+        tracker = composer_test_client.app.state.composer_service._schemas_loaded_for_session(session_id)
+        assert tracker == frozenset({("sink", "json")})
+
+    def test_step_2_schema_failure_never_marks_the_composer_tracker(self, composer_test_client: TestClient) -> None:
+        session_id = self._advance_to_step_2(composer_test_client)
+        completion = _SequencedLiteLLMCompletion(
+            [
+                _fake_sink_schema_discovery_call("not_a_sink"),
+                _fake_llm_reply("That sink is not available here."),
+            ]
+        )
+
+        with patch(_CHAT_SOLVER_ACOMPLETION, new=completion):
+            status, body = _post_chat(
+                composer_test_client,
+                session_id,
+                message="what options does the imaginary sink take?",
+            )
+
+        assert status == 200, body
+        assert len(completion.calls) == 2
+        tracker = composer_test_client.app.state.composer_service._schemas_loaded_for_session(session_id)
+        assert tracker == frozenset()
 
 
 class TestGuidedChatWireDiscriminator:

@@ -19,7 +19,7 @@ import json
 import math
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import pairwise
@@ -3089,6 +3089,12 @@ async def maybe_resolve_step_2_sink_chat(
     api_base: str | None = None,
     api_key: str | None = None,
     reasoning_effort: str | None = None,
+    # Per-session get_plugin_schema success tracker hook — the same tracker
+    # the freeform batch and planner surfaces write
+    # (ComposerServiceImpl._mark_plugin_schema_loaded, bound to a session id;
+    # key shape (plugin_type, plugin_name)). Only SUCCESSES mark; a
+    # semantically-failed result threads back to the model unmarked.
+    mark_schema_loaded: Callable[[str, str], None] | None = None,
 ) -> Step2SinkChatOutcome:
     """Resolve a Step-2 chat message into a sink config via a discovery loop.
 
@@ -3454,18 +3460,26 @@ async def maybe_resolve_step_2_sink_chat(
             )
             messages.append(_assistant_tool_calls_message(message, tool_calls))
             for tool_call in tool_calls:
-                messages.append(
-                    _execute_discovery_call(
-                        tool_call=tool_call,
-                        state=state,
-                        catalog=catalog,
-                        plugin_snapshot=plugin_snapshot,
-                        secret_service=secret_service,
-                        user_id=user_id,
-                        actor=actor,
-                        recorder=recorder,
-                    )
+                result_message = _execute_discovery_call(
+                    tool_call=tool_call,
+                    state=state,
+                    catalog=catalog,
+                    plugin_snapshot=plugin_snapshot,
+                    secret_service=secret_service,
+                    user_id=user_id,
+                    actor=actor,
+                    recorder=recorder,
                 )
+                messages.append(result_message)
+                if mark_schema_loaded is not None and tool_call.function is not None and tool_call.function.name == "get_plugin_schema":
+                    # ``content`` is our own serialize_tool_result output, so
+                    # ``success`` is authoritative; the dispatch above already
+                    # validated the arguments or raised. Same key shape the
+                    # freeform batch writes; failures never mark.
+                    result_payload = json.loads(result_message["content"])
+                    if result_payload["success"] is True:
+                        call_arguments = json.loads(tool_call.function.arguments)
+                        mark_schema_loaded(str(call_arguments["plugin_type"]), str(call_arguments["name"]))
             status = ComposerLLMCallStatus.SUCCESS
             # fall through to finally (records this round), then loop again
         except TimeoutError:
