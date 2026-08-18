@@ -18,15 +18,20 @@ from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, get_args
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCallStatus
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSecretRequirement, PluginSummary
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided import chat_solver
 from elspeth.web.composer.guided.chat_solver import (
+    _STEP_2_SINK_DIGEST_MAX_UTF8_BYTES,
     AssistantScaffoldLeakError,
     DeferredIntentManagementChatRequest,
     Step1SourceChatResolution,
@@ -34,6 +39,7 @@ from elspeth.web.composer.guided.chat_solver import (
     _build_step_2_sink_tool_prompt,
     _parse_step_1_source_tool_arguments,
     _parse_step_2_sink_tool_arguments,
+    _step_2_sink_digest_block,
     build_step_chat_context_block,
     maybe_manage_deferred_intent_chat,
     maybe_resolve_step_1_source_chat,
@@ -63,6 +69,14 @@ from elspeth.web.composer.guided.stage_transitions import (
     transition_source_schema_form,
 )
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
+from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.plugin_policy.models import (
+    PluginAvailability,
+    PluginAvailabilitySnapshot,
+    PluginId,
+    PluginUnavailableReason,
+)
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.sessions import _guided_step_chat as guided_step_chat_module
 from elspeth.web.sessions._guided_step_chat import (
     resolve_deferred_intent_management_chat_with_auto_drop,
@@ -4171,6 +4185,371 @@ def test_step_2_revision_prompt_uses_llm_safe_sink_context() -> None:
     assert '"email_hash"' not in prompt
     assert '"profile_url"' not in prompt
     assert '"option_count": 3' in prompt
+
+
+def _digest_composition_state() -> CompositionState:
+    return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+
+def _sink_digest_catalog(sinks: list[PluginSummary]) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Build the policy-projected view these sinks are visible through."""
+    catalog = MagicMock(spec=CatalogService)
+    catalog.list_sources.return_value = []
+    catalog.list_transforms.return_value = []
+    catalog.list_sinks.return_value = sinks
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    return PolicyCatalogView.for_trained_operator(catalog, snapshot), snapshot
+
+
+def _digest_fixture_sinks() -> list[PluginSummary]:
+    return [
+        PluginSummary(
+            name="csv",
+            description="Write rows to a CSV file.",
+            plugin_type="sink",
+            config_fields=[
+                ConfigFieldSummary(name="path", type="string", required=True, description="Destination file path."),
+                ConfigFieldSummary(name="delimiter", type="string", required=False, default=","),
+            ],
+        ),
+        PluginSummary(
+            name="json",
+            description="Write rows to a JSON file.",
+            plugin_type="sink",
+            config_fields=[
+                ConfigFieldSummary(name="path", type="string", required=True),
+                # A structured default exercises the one permitted field whose
+                # value is neither scalar nor length-bounded.
+                ConfigFieldSummary(name="schema", type="object", required=False, default={"mode": "observed"}),
+            ],
+        ),
+    ]
+
+
+def test_step_2_sink_digest_carries_the_policy_visible_selection_facts() -> None:
+    catalog, _snapshot = _sink_digest_catalog(_digest_fixture_sinks())
+
+    block = _step_2_sink_digest_block(catalog)
+
+    assert "## Policy-visible sink plugins" in block
+    assert '"name": "csv"' in block
+    assert '"name": "json"' in block
+    assert '"purpose": "Write rows to a CSV file."' in block
+    assert '"name": "path", "required": true, "type": "string"' in block
+    assert '"description": "Destination file path."' in block
+    assert '"default": ","' in block
+    assert '"default": {"mode": "observed"}' in block
+    assert "did not fit this digest" not in block
+    assert len(block.encode("utf-8")) <= _STEP_2_SINK_DIGEST_MAX_UTF8_BYTES
+
+
+def test_step_2_sink_digest_carries_no_hint_secret_or_reference_material() -> None:
+    """Only the catalog facts this stage's inventory already discloses travel.
+
+    ``composer_hints`` are binding policy coaching that must be read whole
+    from the plugin's schema, so a selection index must not paraphrase them;
+    secret-inventory names and reference prose are outside the digest's
+    remit entirely.
+    """
+    hint_canary = "COMPOSER_HINT_CANARY_MUST_NOT_TRAVEL"
+    secret_canary = "PROD_SINK_SECRET_REF_CANARY"
+    example_canary = "EXAMPLE_USE_YAML_CANARY"
+    usage_canary = "USAGE_WHEN_TO_USE_CANARY"
+    prohibition_canary = "USAGE_WHEN_NOT_TO_USE_CANARY"
+    catalog, _snapshot = _sink_digest_catalog(
+        [
+            PluginSummary(
+                name="azure_blob",
+                description="Write rows to blob storage.",
+                plugin_type="sink",
+                config_fields=[ConfigFieldSummary(name="container", type="string", required=True)],
+                composer_hints=(hint_canary,),
+                secret_requirements=(PluginSecretRequirement(field="sas_token", candidates=(secret_canary,)),),
+                example_use=example_canary,
+                usage_when_to_use=usage_canary,
+                usage_when_not_to_use=prohibition_canary,
+            ),
+        ]
+    )
+
+    block = _step_2_sink_digest_block(catalog)
+
+    assert '"name": "azure_blob"' in block
+    assert '"name": "container"' in block
+    assert hint_canary not in block
+    assert secret_canary not in block
+    assert "sas_token" not in block
+    assert example_canary not in block
+    assert usage_canary not in block
+    assert prohibition_canary not in block
+
+
+def test_step_2_sink_digest_overflow_keeps_every_name_and_marks_the_omission() -> None:
+    """Names are the irreplaceable half; option detail degrades first."""
+    filler = "x" * 4096
+    sinks = [
+        PluginSummary(
+            name=f"sink_{index}",
+            description=f"Sink {index}.",
+            plugin_type="sink",
+            config_fields=[ConfigFieldSummary(name="path", type="string", required=True, description=filler)],
+        )
+        for index in range(12)
+    ]
+    catalog, _snapshot = _sink_digest_catalog(sinks)
+
+    block = _step_2_sink_digest_block(catalog)
+
+    assert len(block.encode("utf-8")) <= _STEP_2_SINK_DIGEST_MAX_UTF8_BYTES
+    for index in range(12):
+        assert f'"name": "sink_{index}"' in block
+        assert f'"purpose": "Sink {index}."' in block
+    assert "did not fit this digest and is omitted" in block
+    assert "every policy-visible sink name is still listed above" in block
+    assert "this stage's sink inventory" in block
+    # The tail sheds detail first, so the head keeps its options.
+    assert block.count(filler) >= 1
+    assert '"name": "sink_11"' in block
+
+
+def test_step_2_sink_digest_budget_bounds_the_whole_emitted_block() -> None:
+    """The preamble and the omission marker reach the prompt too.
+
+    A guard that measured only the JSON payload would stop degrading while
+    the emitted block still overran the constant that names it — by the width
+    of the preamble plus a marker that grows with every name it lists. Sized
+    so that payload-only measurement overruns and whole-block measurement
+    does not.
+    """
+    sinks = [
+        PluginSummary(
+            name=f"long_named_sink_for_budget_{index:03d}",
+            description="D" * 40,
+            plugin_type="sink",
+            config_fields=[
+                ConfigFieldSummary(name=f"opt_{position}", type="string", required=False, description="z" * 300) for position in range(2)
+            ],
+        )
+        for index in range(60)
+    ]
+    catalog, _snapshot = _sink_digest_catalog(sinks)
+
+    block = _step_2_sink_digest_block(catalog)
+
+    assert len(block.encode("utf-8")) <= _STEP_2_SINK_DIGEST_MAX_UTF8_BYTES
+    # Degradation ran, so the marker is present and paying for its own bytes.
+    assert "did not fit this digest and is omitted" in block
+    for index in range(60):
+        assert f'"name": "long_named_sink_for_budget_{index:03d}"' in block
+
+
+def test_step_2_sink_digest_names_no_tool_outside_the_step_2_palette() -> None:
+    catalog, _snapshot = _sink_digest_catalog(_digest_fixture_sinks())
+
+    block = _step_2_sink_digest_block(catalog)
+
+    assert "list_sources" not in block
+    assert "list_transforms" not in block
+    assert "list_models" not in block
+
+
+def _restricted_sink_view(
+    sinks: list[PluginSummary],
+    *,
+    unavailable: tuple[PluginAvailability, ...] = (),
+    profile_aliases: tuple[tuple[PluginId, tuple[str, ...]], ...] = (),
+    profiles: Any = None,
+) -> PolicyCatalogView:
+    """Build the RESTRICTED projection — the production path, not the trained-operator one.
+
+    ``for_trained_operator`` makes ``_visible``'s availability filter a no-op
+    and never reaches ``public_summary``; a digest that read the unprojected
+    registry would look identical through it. Mirrors ``_snapshot_with_unavailable``
+    in test_discovery_prohibited_listing.py.
+    """
+    catalog = MagicMock(spec=CatalogService)
+    catalog.list_sources.return_value = []
+    catalog.list_transforms.return_value = []
+    catalog.list_sinks.return_value = sinks
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="sink-digest-test-policy",
+        principal_scope="local:test-user",
+        available=unrestricted.available - {entry.plugin_id for entry in unavailable},
+        unavailable=unavailable,
+        selected=unrestricted.selected,
+        usable_profile_aliases=profile_aliases,
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="sink-digest-test-generation",
+    )
+    return PolicyCatalogView(catalog, snapshot, profiles if profiles is not None else MagicMock(spec=OperatorProfileRegistry))
+
+
+def test_step_2_sink_digest_omits_a_web_surface_prohibited_sink() -> None:
+    """A categorically banned sink must not reach the prompt as selectable.
+
+    The digest must read the policy-projected view, never the unprojected
+    registry: a prohibited sink's name and options travelling into every
+    step-2 prompt would present it as available for this request.
+    """
+    view = _restricted_sink_view(
+        [
+            *_digest_fixture_sinks(),
+            PluginSummary(
+                name="prohibited_sink",
+                description="Banned on the web authoring surface.",
+                plugin_type="sink",
+                config_fields=[ConfigFieldSummary(name="forbidden_option", type="string", required=True)],
+            ),
+        ],
+        unavailable=(PluginAvailability(PluginId("sink", "prohibited_sink"), PluginUnavailableReason.WEB_SURFACE_PROHIBITED),),
+    )
+
+    block = _step_2_sink_digest_block(view)
+
+    assert "prohibited_sink" not in block
+    assert "forbidden_option" not in block
+    assert "Banned on the web authoring surface." not in block
+    assert '"name": "csv"' in block
+    assert '"name": "json"' in block
+
+
+def test_step_2_sink_digest_renders_the_operator_profile_projection() -> None:
+    """What the projection returns is what travels — not the raw catalog entry.
+
+    ``_visible`` substitutes ``public_summary`` for a sink carrying usable
+    profile aliases, and that projection rebuilds ``config_fields`` from the
+    PUBLIC schema. Reading the raw summary instead would put internal knob
+    names into the prompt.
+    """
+    registry = MagicMock(spec=OperatorProfileRegistry)
+    registry.public_summary.return_value = PluginSummary(
+        name="profiled_sink",
+        description="Writes through an operator-approved profile.",
+        plugin_type="sink",
+        config_fields=[ConfigFieldSummary(name="profile", type="string", required=True)],
+    )
+    view = _restricted_sink_view(
+        [
+            PluginSummary(
+                name="profiled_sink",
+                description="Writes through an operator-approved profile.",
+                plugin_type="sink",
+                config_fields=[ConfigFieldSummary(name="internal_endpoint_knob", type="string", required=True)],
+            ),
+        ],
+        profile_aliases=((PluginId("sink", "profiled_sink"), ("approved-profile",)),),
+        profiles=registry,
+    )
+
+    block = _step_2_sink_digest_block(view)
+
+    # Guards the assertions below against passing vacuously: with an empty
+    # alias tuple ``_visible`` never calls the projection at all.
+    assert registry.public_summary.called
+    assert '"name": "profile"' in block
+    assert "internal_endpoint_knob" not in block
+
+
+@pytest.mark.asyncio
+async def test_step_2_chat_system_prompt_carries_the_sink_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The routine resolution round already holds the selection facts.
+
+    Without this the model must spend a ``list_sinks`` round (and usually a
+    schema round) before it can resolve anything.
+    """
+    catalog, snapshot = _sink_digest_catalog(_digest_fixture_sinks())
+    captured: dict[str, Any] = {}
+
+    async def fake_acompletion(**kwargs: Any) -> _FakeLLMResponse:
+        captured.update(kwargs)
+        return _ok_response("Which file should I write?")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+
+    await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save the results.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        state=_digest_composition_state(),
+        catalog=catalog,
+        plugin_snapshot=snapshot,
+    )
+
+    system_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "system")
+    assert "## Policy-visible sink plugins" in system_content
+    assert '"name": "csv"' in system_content
+    assert '"name": "delimiter"' in system_content
+
+
+@pytest.mark.asyncio
+async def test_step_2_chat_withholds_the_sink_digest_without_the_discovery_palette(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No palette, no restatement: the digest may not widen what this surface discloses."""
+    captured: dict[str, Any] = {}
+
+    async def fake_acompletion(**kwargs: Any) -> _FakeLLMResponse:
+        captured.update(kwargs)
+        return _ok_response("Which file should I write?")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+
+    await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save the results.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    system_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "system")
+    assert "## Policy-visible sink plugins" not in system_content
+
+
+@pytest.mark.asyncio
+async def test_step_2_form_directed_revision_withholds_the_sink_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The form-directed branch offers no ``resolve_sink`` at all.
+
+    Selection material there is pressure toward an authoring act the wizard
+    form owns, so the digest is scoped to the resolving path.
+    """
+    catalog, snapshot = _sink_digest_catalog(_digest_fixture_sinks())
+    captured: dict[str, Any] = {}
+
+    async def fake_acompletion(**kwargs: Any) -> _FakeLLMResponse:
+        captured.update(kwargs)
+        return _ok_response("Use the output form to change that.")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+    context_block = build_step_chat_context_block(
+        step=GuidedStep.STEP_2_SINK,
+        current_source=None,
+        current_sink=None,
+        state=None,
+        deferred_intents=(),
+        authoritative_revision_form="output",
+    )
+
+    await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Change the output path.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        context_block=context_block,
+        state=_digest_composition_state(),
+        catalog=catalog,
+        plugin_snapshot=snapshot,
+    )
+
+    system_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "system")
+    assert "## Policy-visible sink plugins" not in system_content
 
 
 @pytest.mark.asyncio

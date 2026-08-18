@@ -37,6 +37,7 @@ from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError, get_sink_config_model
 from elspeth.web.blobs.protocol import ALLOWED_MIME_TYPES, AllowedMimeType
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads
 from elspeth.web.composer.guided._discovery import _assistant_tool_calls_message, _execute_discovery_call
@@ -2675,14 +2676,139 @@ _STEP_2_SINK_TOOL: dict[str, Any] = {
 }
 
 
+_STEP_2_SINK_DIGEST_MAX_UTF8_BYTES: Final[int] = 24 * 1024
+"""Byte budget for the step-2 sink selection digest.
+
+Bounds the WHOLE emitted block — preamble and omission marker included, not
+only the JSON payload — because the block is what reaches the prompt. The
+built-in sink catalog emits ~14 KiB across nine plugins, so the budget leaves
+real headroom for a larger deployment catalog before any degradation is
+needed. Overflow drops per-sink option detail rather than whole entries: an
+absent NAME hides a selectable sink outright, while absent option detail
+stays recoverable from this stage's own sink inventory.
+"""
+
+
+class _Step2SinkDigestField(TypedDict):
+    name: str
+    type: str
+    required: bool
+    description: NotRequired[str]
+    default: NotRequired[Any]
+
+
+class _Step2SinkDigestEntry(TypedDict):
+    name: str
+    purpose: str
+    config_fields: NotRequired[list[_Step2SinkDigestField]]
+
+
+def _step_2_sink_digest_entries(sinks: list[PluginSummary]) -> list[_Step2SinkDigestEntry]:
+    """Render one selection entry per policy-visible sink.
+
+    ``PluginSummary``/``ConfigFieldSummary`` are strict Tier-1 response models
+    the catalog service already built, so attribute reads need no reparsing.
+    ``description`` and ``default`` are carried only when present: the catalog
+    cannot distinguish "no default" from "defaults to null" either, so
+    absence is projected as absence rather than invented as an explicit null.
+
+    Deliberately absent: ``composer_hints`` (binding policy coaching that must
+    be read whole from the plugin's schema, never paraphrased through a
+    selection index), ``secret_requirements``, and every reference-content
+    field. Option enums and nested option shapes are schema facts, not
+    selection facts.
+    """
+    entries: list[_Step2SinkDigestEntry] = []
+    for plugin in sinks:
+        fields: list[_Step2SinkDigestField] = []
+        for config_field in plugin.config_fields:
+            digest_field: _Step2SinkDigestField = {
+                "name": config_field.name,
+                "type": config_field.type,
+                "required": config_field.required,
+            }
+            if config_field.description is not None:
+                digest_field["description"] = config_field.description
+            if config_field.default is not None:
+                digest_field["default"] = config_field.default
+            fields.append(digest_field)
+        entries.append({"name": plugin.name, "purpose": plugin.description, "config_fields": fields})
+    return entries
+
+
+def _step_2_sink_digest_json(entries: list[_Step2SinkDigestEntry]) -> str:
+    """Serialize the digest. Every value originates in a parsed JSON schema."""
+    return json.dumps(entries, sort_keys=True, ensure_ascii=False)
+
+
+def _step_2_sink_digest_compose(entries: list[_Step2SinkDigestEntry], detail_omitted: list[str]) -> str:
+    """Render the whole emitted block for one degradation state."""
+    omission_note = ""
+    if detail_omitted:
+        omission_note = (
+            f"Option detail for {json.dumps(sorted(detail_omitted))} did not fit this digest and is "
+            "omitted; every policy-visible sink name is still listed above. Read those options from "
+            "this stage's sink inventory before configuring one of them.\n"
+        )
+    return (
+        "\n## Policy-visible sink plugins\n\n"
+        "Every sink available for this request, with its one-line purpose and its configurable "
+        "options as the live catalog reports them. Choose only from this server-supplied list; an "
+        "absent sink is not available for this request. These are the same selection facts this "
+        "stage's sink inventory returns, so a sink whose options this digest describes in full needs "
+        "no further lookup. It is a selection index, not the option contract: option enums, nested "
+        "option shapes, and the plugin's binding composer hints are schema facts and are not carried "
+        "here — read them from the plugin's live schema before setting an option this digest does not "
+        "fully describe. Sink list:\n"
+        f"{_step_2_sink_digest_json(entries)}\n"
+        f"{omission_note}"
+    )
+
+
+def _step_2_sink_digest_block(catalog: PolicyCatalogView) -> str:
+    """Compose the step-2 sink selection digest from the policy-visible catalog.
+
+    Built from ``catalog.list_sinks()`` — the same policy-projected view the
+    stage's own sink inventory serves, operator profile projection included —
+    so the digest restates facts this palette already discloses on this
+    surface rather than widening what the model can see.
+    """
+    entries = _step_2_sink_digest_entries(catalog.list_sinks())
+    detail_omitted: list[str] = []
+    block = _step_2_sink_digest_compose(entries, detail_omitted)
+    # Composed before each measurement, never measured on the JSON alone: the
+    # preamble and the growing omission marker are part of what reaches the
+    # prompt, so a payload-only guard would under-report the emitted size.
+    #
+    # Degradation is BEST-EFFORT, not monotonic: dropping an entry whose option
+    # detail is small frees less than the name it adds to the marker, so a step
+    # can grow the block. Entries with nothing to shed are skipped for that
+    # reason. The post-loop check is the guarantee — the loop is bounded by the
+    # entry count and the budget is enforced after it, fail-closed.
+    for entry in reversed(entries):
+        if len(block.encode("utf-8")) <= _STEP_2_SINK_DIGEST_MAX_UTF8_BYTES:
+            break
+        if "config_fields" not in entry or not entry["config_fields"]:
+            continue
+        del entry["config_fields"]
+        detail_omitted.append(entry["name"])
+        block = _step_2_sink_digest_compose(entries, detail_omitted)
+    if len(block.encode("utf-8")) > _STEP_2_SINK_DIGEST_MAX_UTF8_BYTES:
+        raise InvariantError("Step 2 sink digest exceeds its byte budget with every option detail already omitted")
+    return block
+
+
 def _build_step_2_sink_tool_prompt(
     *,
     current_sink: SinkResolved | None,
     field_aliases: Mapping[str, str] | None = None,
     revision_target_index: int | None = None,
     form_directed_revision: bool = False,
+    sink_digest: str | None = None,
 ) -> str:
     """Compose the Step-2 sink tool prompt."""
+    if sink_digest is not None and (type(sink_digest) is not str or not sink_digest):
+        raise TypeError("sink_digest must be a non-empty exact string when supplied")
     if current_sink is not None and len(current_sink.outputs) != 1:
         raise InvariantError("Step 2 mutation prompt accepts zero or one current output")
     if type(form_directed_revision) is not bool:
@@ -2732,8 +2858,9 @@ def _build_step_2_sink_tool_prompt(
             "output stage.\n"
         )
     return (
-        f"{load_step_chat_skill(GuidedStep.STEP_2_SINK).rstrip()}\n\n"
-        "## Step 2 Sink Tool\n\n"
+        f"{load_step_chat_skill(GuidedStep.STEP_2_SINK).rstrip()}\n"
+        f"{sink_digest or ''}"
+        "\n## Step 2 Sink Tool\n\n"
         f"{revise_block}"
         "If the user's message provides enough information to configure the "
         "pipeline output, call `resolve_sink` with the complete output "
@@ -3029,6 +3156,13 @@ async def maybe_resolve_step_2_sink_chat(
     field_aliases: Mapping[str, str] | None = _context_field_aliases(context_block)
     if current_sink is not None:
         field_aliases = _sink_field_aliases(current_sink, field_aliases=field_aliases)
+    # Gated on ``discovery_enabled``, not merely on a catalog: without the
+    # discovery palette the same facts are not otherwise reachable on this
+    # surface, so the digest would widen disclosure instead of restating it.
+    # Withheld from the form-directed branch, which offers no ``resolve_sink``
+    # at all — selection material there is pressure toward an authoring act
+    # the wizard form owns.
+    sink_digest = _step_2_sink_digest_block(catalog) if discovery_enabled and catalog is not None and not form_directed_revision else None
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
@@ -3037,6 +3171,7 @@ async def maybe_resolve_step_2_sink_chat(
                 field_aliases=field_aliases,
                 revision_target_index=revision_target_index,
                 form_directed_revision=form_directed_revision,
+                sink_digest=sink_digest,
             ),
         },
     ]

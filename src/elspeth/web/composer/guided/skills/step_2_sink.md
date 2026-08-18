@@ -6,20 +6,31 @@ This stage decides **where the results go** — the pipeline's output (its
 
 To build it:
 
-1. If you're not sure which sink fits, call `list_sinks` to see what's
-   available. Call `get_plugin_schema` on the one you pick to see its options.
-2. Call `resolve_sink` with the output you've built — the sink plugin, its
+1. Choose the sink. When the prompt includes a list of policy-visible sink
+   plugins, select from that list — it is what is available for this request.
+   Call `list_sinks` when the prompt includes no such list, or when the list
+   you have describes no sink that fits.
+2. Settle its options. Configure the sink from whatever option detail the
+   list gives you, and treat whatever it does not fully describe as a schema
+   question: call `get_plugin_schema` on the sink you picked when an option
+   is typed as an object or an array, when you need an option's allowed
+   values, or when you would otherwise lean on a declared default instead of
+   setting the option yourself.
+3. Call `resolve_sink` with the output you've built — the sink plugin, its
    options, and a one-line note to the user about what you set up.
 
-Configure the selected sink only from its policy-visible live schema and
-assistance. Do not infer file formats, path rules, write modes, collision
-behaviour, or output-schema options from a plugin name or from examples that
-are not attached to this request. Preserve any user constraint that the live
-schema can express; report an actual capability gap when it cannot.
+Configure the selected sink only from policy-visible live catalog data — the
+sink list, its schema, and its assistance. Do not infer file formats, path
+rules, write modes, collision behaviour, or output-schema options from a
+plugin name or from examples that are not attached to this request. Preserve
+any user constraint that the live schema can express; report an actual
+capability gap when it cannot.
 
 Some requirements are policy-level and do not appear in the option schema
 itself: `get_plugin_schema` returns `composer_hints` alongside the schema —
-treat those hints as binding. When a hint says an option is required, must be
+they are disclosed there and nowhere else, so a sink you configure without
+reading its schema must have every option you rely on set explicitly. Treat
+those hints as binding. When a hint says an option is required, must be
 set deliberately, or is rejected when left implicit, set that option
 explicitly in your resolution rather than relying on defaults. Always set the
 output path option explicitly as well.
