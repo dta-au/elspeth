@@ -95,7 +95,6 @@ from elspeth.web.composer.progress import (
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
-from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import (
     COMPOSER_NODE_TYPES,
@@ -2899,125 +2898,6 @@ async def _build_valid_pipeline_plan(
     )
 
 
-async def prepare_pipeline_plan(
-    *,
-    pipeline: Mapping[str, Any],
-    current_state: CompositionState,
-    reviewed_facts: Mapping[str, Any],
-    reviewed_planner_context: Mapping[str, Any],
-    supersedes_draft_hash: str | None,
-    surface: PlannerSurface,
-    policy_catalog: PolicyCatalogView,
-    plugin_snapshot: PluginAvailabilitySnapshot,
-    originating_message: PlannerOriginatingMessage,
-    base: ProposalBase,
-    rendered_skill: str,
-    tool_call_id: str,
-    model_identifier: str,
-    model_version: str,
-    provider: str,
-    repair_count: int,
-    timeout_seconds: float,
-    custody_config: PlannerCustodyConfig,
-) -> PipelinePlanResult:
-    """Prepare a server-derived pipeline through the planner's final gate."""
-
-    if policy_catalog.snapshot is not plugin_snapshot:
-        raise ValueError("plugin_snapshot_catalog_mismatch")
-    # R2-F10: server-derived proposals (recipe router, guided sketch) never
-    # pass through a planner candidate_finalizer, so the required-control
-    # auto-wire pass runs here — BEFORE the pipeline is sealed into a proposal
-    # and its authority hash is computed. It cannot run any later: the commit
-    # path (pipeline_commit.prepare_pipeline_proposal_commit) re-executes the
-    # exact sealed arguments under the proposal's authority-hash binding, so a
-    # commit-time mutation would be an integrity violation by construction.
-    # The pass is idempotent — a covered pipeline passes through unchanged.
-    pipeline = wire_required_controls(pipeline, plugin_snapshot, policy_catalog)
-    # Server-derived plans do not send this context to a provider, but accept
-    # the same explicit authority split as the model-driven entry point.
-    canonical_json(reviewed_planner_context)
-    if type(rendered_skill) is not str or not rendered_skill.strip():
-        raise ValueError("rendered_skill must be a non-empty exact string")
-    if type(repair_count) is not int or repair_count < 0:
-        raise ValueError("repair_count must be a non-negative exact integer")
-    deadline = asyncio.get_running_loop().time() + timeout_seconds
-
-    async def bounded(func: Callable[..., Any], *args: Any) -> Any:
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            raise PipelinePlannerError("pipeline preparation timed out", code="TIMEOUT")
-        try:
-            return await asyncio.wait_for(run_sync_in_worker(func, *args), timeout=remaining)
-        except TimeoutError as exc:
-            raise PipelinePlannerError("pipeline preparation timed out", code="TIMEOUT") from exc
-
-    validation = await bounded(policy_catalog.validate_composition_state, current_state)
-    skill_hash = hashlib.sha256(rendered_skill.encode("utf-8")).hexdigest()
-    context = ToolContext(
-        catalog=policy_catalog,
-        plugin_snapshot=plugin_snapshot,
-        data_dir=custody_config.data_dir,
-        require_data_dir_for_paths=True,
-        session_engine=custody_config.session_engine,
-        session_id=originating_message.session_id,
-        secret_service=custody_config.secret_service,
-        user_id=originating_message.user_id,
-        baseline=current_state,
-        current_validation=validation.validation,
-        runtime_preflight=custody_config.runtime_preflight,
-        max_blob_storage_per_session_bytes=custody_config.max_storage_per_session,
-        user_message_id=originating_message.message_id,
-        user_message_content=originating_message.content,
-        composer_model_identifier=model_identifier,
-        composer_model_version=model_version,
-        composer_provider=provider,
-        composer_skill_hash=skill_hash,
-        tool_arguments_hash=None,
-        reviewed_source_authority=resolve_reviewed_source_authority(
-            engine=custody_config.session_engine,
-            session_id=originating_message.session_id,
-            user_id=originating_message.user_id,
-            reviewed_facts=reviewed_facts,
-            expected_reviewed_anchor_hash=reviewed_anchor_hash(reviewed_facts),
-        ),
-    )
-    try:
-        return await _build_valid_pipeline_plan(
-            pipeline=pipeline,
-            current_state=current_state,
-            base=base,
-            reviewed_facts=reviewed_facts,
-            claimed_deferred_intent_ids=(),
-            claim_evaluator=None,
-            candidate_acceptance=None,
-            supersedes_draft_hash=supersedes_draft_hash,
-            surface=surface,
-            repair_count=repair_count,
-            skill_hash=skill_hash,
-            tool_call_id=tool_call_id,
-            terminal_context=context,
-            custody_config=custody_config,
-            originating_message=originating_message,
-            run_sync=bounded,
-            model_identifier=model_identifier,
-            model_version=model_version,
-            provider=provider,
-        )
-    except _PipelineCandidateRejected as exc:
-        # Carry the rejection's closed codes exactly as the model-driven
-        # exhaustion path does (``_rejection_exhausted``). Discarding them here
-        # made the server-derived path structurally undiagnosable: the route
-        # recorded VALIDATION_FAILED with rejection_codes=[] while a coded
-        # rejection existed, so the durable disposition named no cause at all
-        # and a policy refusal was indistinguishable from a wiring mistake
-        # (guided S3 investigation, 2026-07-31).
-        raise PipelinePlannerError(
-            "server-derived pipeline failed candidate validation",
-            code="VALIDATION_FAILED",
-            detail_codes=_candidate_rejection_codes(exc.result),
-        ) from exc
-
-
 async def plan_pipeline(
     *,
     intent: str,
@@ -4564,5 +4444,4 @@ __all__ = [
     "planner_discovery_information_keys",
     "planner_terminal_tool_definition",
     "planner_tool_definitions",
-    "prepare_pipeline_plan",
 ]

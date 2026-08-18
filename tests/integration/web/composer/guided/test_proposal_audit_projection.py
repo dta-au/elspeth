@@ -40,7 +40,7 @@ from elspeth.web.composer.guided.stage_subjects import (
     StatedGateRoutingConstraint,
 )
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
-from elspeth.web.composer.pipeline_planner import plan_pipeline, prepare_pipeline_plan
+from elspeth.web.composer.pipeline_planner import plan_pipeline
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, PresentBase
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 
@@ -1762,11 +1762,6 @@ def test_planner_requires_private_provider_safe_and_model_claim_authority() -> N
         "supersedes_draft_hash",
     ):
         assert model_signature.parameters[name].default is inspect.Parameter.empty
-
-    server_signature = inspect.signature(prepare_pipeline_plan)
-    for name in ("reviewed_facts", "reviewed_planner_context", "supersedes_draft_hash"):
-        assert server_signature.parameters[name].default is inspect.Parameter.empty
-    assert "covered_deferred_intent_ids" not in server_signature.parameters
 
     verifier_signature = inspect.signature(verified_remaining_deferred_intents)
     assert tuple(verifier_signature.parameters) == ("guided", "proposal")

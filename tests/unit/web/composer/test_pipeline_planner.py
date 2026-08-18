@@ -75,7 +75,6 @@ from elspeth.web.composer.pipeline_planner import (
     _transform_node_count,
     plan_pipeline,
     planner_tool_definitions,
-    prepare_pipeline_plan,
 )
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
@@ -1494,61 +1493,6 @@ def _web_authored_policy_pair() -> tuple[PolicyCatalogView, PluginAvailabilitySn
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
     profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
     return PolicyCatalogView(full_catalog, snapshot, profiles), snapshot
-
-
-def _aws_s3_source_pipeline(data_dir: Path) -> dict[str, Any]:
-    pipeline = _pipeline(data_dir)
-    pipeline["source"] = {
-        "plugin": "aws_s3",
-        "on_success": "rows",
-        "options": {"bucket": "operator-bucket", "key": "input.csv", "schema": {"mode": "observed"}},
-        "on_validation_failure": "discard",
-    }
-    return pipeline
-
-
-@pytest.mark.asyncio
-async def test_server_derived_rejection_carries_its_closed_codes(tmp_path: Path) -> None:
-    """The server-derived gate must name WHY it refused, not just that it did.
-
-    ``prepare_pipeline_plan`` makes no provider call: the pipeline is
-    server-synthesized, so a candidate rejection here is the only signal the
-    route ever gets. Dropping ``detail_codes`` recorded VALIDATION_FAILED with
-    ``rejection_codes=[]`` while a coded policy refusal existed — the run looked
-    rejection-free exactly when the cause mattered, and the failure was
-    indistinguishable from a provider fault. The model-driven exhaustion path
-    (``_rejection_exhausted``) already carried these codes; this pins the two
-    paths symmetric.
-    """
-    policy_catalog, snapshot = _web_authored_policy_pair()
-
-    with pytest.raises(PipelinePlannerError) as caught:
-        await prepare_pipeline_plan(
-            pipeline=_aws_s3_source_pipeline(tmp_path),
-            current_state=_empty_state(),
-            reviewed_facts={"request": "Read the archive from S3."},
-            reviewed_planner_context={"request": "Read the archive from S3."},
-            supersedes_draft_hash=None,
-            surface=PlannerSurface.GUIDED_STAGED,
-            policy_catalog=policy_catalog,
-            plugin_snapshot=snapshot,
-            originating_message=_origin(),
-            base=AbsentBase(),
-            rendered_skill="server-derived pass-through plan",
-            tool_call_id=str(uuid4()),
-            model_identifier="server-derived",
-            model_version="server-derived",
-            provider="server-derived",
-            repair_count=0,
-            timeout_seconds=10.0,
-            custody_config=_custody(tmp_path),
-        )
-
-    assert caught.value.code == "VALIDATION_FAILED"
-    assert caught.value.detail_codes == ("plugin_options_invalid",)
-    # The code must resolve to actionable guidance, or the planner and the
-    # durable disposition both carry a bare token.
-    assert explain_validation_code("plugin_options_invalid") is not None
 
 
 @pytest.mark.asyncio

@@ -3373,10 +3373,10 @@ class TestStep2IntraStep:
         provider that was never called and instructing a retry that could not
         possibly succeed.
 
-        The planner exception raised here is exactly what
-        ``prepare_pipeline_plan`` produces on that path: ``VALIDATION_FAILED``
-        carrying the gate's own closed code (pinned end-to-end by
-        ``test_server_derived_rejection_carries_its_closed_codes``). Stubbing the
+        The planner exception raised here matches what the guided planner
+        surfaces on a policy refusal: ``VALIDATION_FAILED`` carrying the
+        gate's own closed code (the model path's carriage is pinned by the
+        exhaustion coverage in ``test_pipeline_planner.py``). Stubbing the
         planner keeps this test about the ROUTE's classification, which is the
         seam that mis-answered.
         """

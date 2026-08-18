@@ -1058,10 +1058,19 @@ def _assert_no_pipeline_side_effects(engine: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_incomplete_recipe_request_falls_back_before_custody_without_side_effects(
+async def test_freeform_compose_routes_to_the_planner_without_pipeline_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Freeform compose has exactly one planning path: plan_pipeline.
+
+    This test formerly guarded the excised recipe router's fallback seam with
+    a prepare_pipeline_plan never-called sentinel. The router died in
+    9700470e2 and prepare_pipeline_plan itself was deleted with the guided
+    sketch bypass (elspeth-b4a286d517), so no server-derived branch exists to
+    sentinel against; what survives is the routing half — compose reaches the
+    provider planner, and a planner failure leaves zero pipeline side effects.
+    """
     message = "Build the requested pipeline."
     engine, _sessions, session, user_message, composer = await _recipe_composer_context(
         tmp_path,
@@ -1070,11 +1079,6 @@ async def test_incomplete_recipe_request_falls_back_before_custody_without_side_
     )
     from elspeth.web.composer import service as composer_service
 
-    prepare = AsyncMock(
-        spec=composer_service.prepare_pipeline_plan,
-        side_effect=AssertionError("invalid recipe must not reach custody preparation"),
-    )
-    monkeypatch.setattr("elspeth.web.composer.service.prepare_pipeline_plan", prepare)
     fallback = AsyncMock(
         spec=composer_service.plan_pipeline,
         side_effect=PipelinePlannerError("fallback stopped", code="TEST_STOP"),
@@ -1091,6 +1095,5 @@ async def test_incomplete_recipe_request_falls_back_before_custody_without_side_
             user_message_id=str(user_message.id),
         )
 
-    prepare.assert_not_awaited()
     fallback.assert_awaited_once()
     _assert_no_pipeline_side_effects(engine)
