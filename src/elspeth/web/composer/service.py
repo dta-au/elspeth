@@ -57,7 +57,6 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
-from elspeth.core.canonical import canonical_json
 from elspeth.core.templates import extract_jinja2_fields
 from elspeth.plugins.transforms.llm.model_catalog import OPENROUTER_LITELLM_PREFIX
 from elspeth.web.async_workers import run_sync_in_worker
@@ -132,7 +131,6 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerTerminalContract,
     PlannerTerminalMaterialization,
     plan_pipeline,
-    prepare_pipeline_plan,
 )
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
@@ -3557,7 +3555,6 @@ class ComposerServiceImpl:
             guided_private_reviewed_facts,
             guided_redacted_current_state_context,
             guided_redacted_planner_context,
-            guided_reviewed_sink_options,
             guided_revision_execution_hash,
             guided_unproducible_output_field_names,
             guided_unproducible_output_fields,
@@ -3650,27 +3647,15 @@ class ComposerServiceImpl:
             ),
         )
 
-        passthrough_sketch_shape = (
-            correction_target is None
-            and supersedes_draft_hash is None
-            and guided.root_intent_message_id is None
-            and not guided.deferred_intents
-            and len(guided.source_order) == 1
-            and len(guided.output_order) == 1
-        )
         # A zero-transform pipeline emits exactly what the reviewed source
         # carries, so a declared sink field no source can supply makes it
-        # unbuildable. Validation cannot be the guard (R2-F4): without the
-        # declared-contract merge below the sink had no required_fields at all,
-        # so the contract check skipped and the sketch sealed GREEN; with the
-        # merge it fires only when the producer participates in propagation
-        # (an observed-schema source abstains under ADR-007), and even then as
-        # an opaque sink_contract_violation the planner cannot repair away.
-        #
-        # The gap is computed for EVERY guided plan, not just the sketch:
-        # ``passthrough_sketch_shape`` only decides whether the server-built
-        # sketch is safe to seal, while the planner loop refuses any
-        # zero-transform candidate carrying the gap. That is not a general
+        # unbuildable. Validation cannot be the guard (R2-F4): the sink
+        # contract check fires only when the producer participates in
+        # propagation (an observed-schema source abstains under ADR-007), and
+        # even then as an opaque sink_contract_violation the planner cannot
+        # repair away. The gap is therefore named to the planner up front, and
+        # the planner loop refuses any zero-transform candidate carrying it
+        # (passthrough_cannot_produce_declared_fields). That is not a general
         # satisfiability gate — with a transform present a field may
         # legitimately be produced, and the loop's guard says nothing.
         output_field_gaps = guided_unproducible_output_fields(guided)
@@ -3694,101 +3679,6 @@ class ComposerServiceImpl:
                     "produce them from. Propose the transform(s) that do."
                 ),
             }
-        if passthrough_sketch_shape and not output_field_gaps:
-            # The rootless step-2→3 starting sketch is ALWAYS the same
-            # pass-through (reviewed source → reviewed output, zero nodes),
-            # withheld from acceptance (supersedes_draft_hash null) and
-            # discarded by design once the transforms instruction arrives —
-            # tutorial final3 spent 222s of provider time producing it (op
-            # 424021cd). Seal it server-side through the same canonical final
-            # gate the recipe router uses: full candidate validation, custody,
-            # and proposal sealing, zero provider calls. Revisions, wire
-            # corrections, rooted intents, deferred-intent coverage, and
-            # plural source/output topologies keep the provider planner.
-            source = guided.reviewed_sources[guided.source_order[0]]
-            reviewed_output = guided.reviewed_outputs[guided.output_order[0]]
-            sketch_pipeline: dict[str, Any] = {
-                "sources": {
-                    source.name: {
-                        "plugin": source.plugin,
-                        "options": deep_thaw(source.options),
-                        "on_success": reviewed_output.name,
-                        "on_validation_failure": source.on_validation_failure,
-                    }
-                },
-                "nodes": [],
-                "edges": [],
-                "outputs": [
-                    {
-                        "sink_name": reviewed_output.name,
-                        "plugin": reviewed_output.plugin,
-                        # Same seam as the planner-authored binder
-                        # (bind_guided_reviewed_components): step-2's declared
-                        # output fields must reach options.schema.required_fields
-                        # here too, or the sink contract this sketch commits to
-                        # is display-only (R2-F4).
-                        "options": guided_reviewed_sink_options(reviewed_output),
-                        "on_write_failure": reviewed_output.on_write_failure,
-                    }
-                ],
-                "metadata": {
-                    "name": "Starting sketch",
-                    "description": (
-                        "Direct pass-through: the reviewed source feeds the reviewed output. "
-                        "Send the transforms instruction to shape processing."
-                    ),
-                },
-            }
-            synthesis_contract = canonical_json(
-                {
-                    "schema": "composer.guided-passthrough-synthesis.v1",
-                    "surface": planner_surface.value,
-                }
-            )
-            # prepare_pipeline_plan makes no provider call at all (server-
-            # synthesized pass-through), so it cannot raise PlannerDeclined —
-            # no escape-hatch decline handling is added here; only the two
-            # provider-calling plan_pipeline() sites (below, and in
-            # plan_guided_full_pipeline) need it.
-            try:
-                plan = await prepare_pipeline_plan(
-                    pipeline=sketch_pipeline,
-                    current_state=current_state,
-                    reviewed_facts=reviewed_facts,
-                    reviewed_planner_context=reviewed_context,
-                    supersedes_draft_hash=None,
-                    surface=planner_surface,
-                    policy_catalog=policy_catalog,
-                    plugin_snapshot=plugin_snapshot,
-                    originating_message=originating_message,
-                    base=base,
-                    rendered_skill=synthesis_contract,
-                    tool_call_id=(
-                        "server-passthrough-"
-                        + stable_hash(
-                            {
-                                "schema": "composer.guided-passthrough-synthesis.v1",
-                                "session_id": str(operation_fence.session_id),
-                                "operation_id": str(operation_fence.operation_id),
-                            }
-                        )
-                    ),
-                    model_identifier="composer-guided-passthrough-synthesis",
-                    model_version="composer.guided-passthrough-synthesis.v1",
-                    provider="server",
-                    repair_count=0,
-                    timeout_seconds=self._timeout_seconds,
-                    custody_config=custody_config,
-                )
-            except PipelinePlannerError as exc:
-                _log_guided_planner_failure(
-                    exc,
-                    session_id=originating_message.session_id,
-                    operation_id=str(operation_fence.operation_id),
-                    surface=planner_surface.value,
-                )
-                raise
-            return plan, catalog_ids
 
         # Build the coroutine, then await inside a try so a typed planner failure
         # is logged with its code+rejection_codes before it re-raises to the

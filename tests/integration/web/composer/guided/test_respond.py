@@ -888,21 +888,22 @@ class TestStep2IntraStep:
         return _finish_review(client, session_id, "output")
 
     @pytest.mark.parametrize("profile", ("live", "tutorial"))
-    def test_rootless_step_3_entry_synthesizes_the_sketch_without_a_provider_call(
+    def test_rootless_step_3_entry_routes_through_the_provider_planner(
         self,
         composer_test_client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
         profile: str,
     ) -> None:
-        """The discarded starting sketch is server-synthesized, not planned.
+        """The rootless step-2→3 entry is planned by the provider, like every transition.
 
-        The step-2→3 auto-proposal on a rootless walk (no root intent, no
-        deferred intents, one reviewed source and output) is always the same
-        passthrough sketch, withheld from acceptance (supersedes_draft_hash
-        null) and discarded by design once the transforms instruction lands.
-        Tutorial final3 spent 222s of provider time producing it (op
-        424021cd). It must now seal server-side through the same canonical
-        final gate (prepare_pipeline_plan) with zero provider calls.
+        elspeth-b4a286d517: this transition was server-synthesized
+        (provider="server", model "composer-guided-passthrough-synthesis",
+        zero provider calls, zero llm_call_audit rows) — banned by the
+        composer invariant (the LLM does the job) and by ADR-031 (the
+        tutorial exercises the same backend as every guided walk). The
+        pass-through answer itself is fine; its AUTHOR must be the planner.
+        This is the per-transition provenance pin: the walk-level harness
+        counts provider calls per WALK and cannot see one silent transition.
         """
         app = composer_test_client.app
         session_id = _create_session(composer_test_client)
@@ -927,7 +928,11 @@ class TestStep2IntraStep:
                 },
             },
         )
-        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+        reviewed = _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+        guided_facts = _full_guided_session(reviewed)
+        source_stable_id = next(iter(guided_facts["reviewed_sources"]))
+        output_stable_id = next(iter(guided_facts["reviewed_outputs"]))
+        reviewed_output_name = guided_facts["reviewed_outputs"][output_stable_id]["name"]
 
         monkeypatch.setattr(
             ComposerServiceImpl,
@@ -949,10 +954,37 @@ class TestStep2IntraStep:
             operator_profile_registry=app.state.operator_profile_registry,
         )
 
-        async def poisoned_completion(**_kwargs: Any) -> _PlannerResponse:
-            raise AssertionError("the rootless starting sketch must never call the provider")
+        planner_pipeline = {
+            "source_routes": [{"stable_id": source_stable_id, "on_success": reviewed_output_name}],
+            "nodes": [],
+            "edges": [],
+            "output_targets": [{"stable_id": output_stable_id}],
+        }
+        provider_calls: list[Mapping[str, Any]] = []
 
-        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", poisoned_completion)
+        async def terminal_completion(**kwargs: Any) -> _PlannerResponse:
+            provider_calls.append(kwargs)
+            return _PlannerResponse(
+                choices=[
+                    _PlannerChoice(
+                        message=_PlannerMessage(
+                            content=None,
+                            tool_calls=[
+                                _PlannerToolCall(
+                                    id="guided-terminal",
+                                    function=_PlannerFunction(
+                                        name="emit_pipeline_proposal",
+                                        arguments=json.dumps({"pipeline": planner_pipeline}),
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+            )
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", terminal_completion)
 
         settled = _post_current_response(
             composer_test_client,
@@ -961,8 +993,8 @@ class TestStep2IntraStep:
         )
 
         assert settled.status_code == 200, settled.json()
-        body = settled.json()
-        assert body["next_turn"]["type"] == "propose_pipeline"
+        assert settled.json()["next_turn"]["type"] == "propose_pipeline"
+        assert provider_calls, "the step-2→3 entry must be planned by the provider"
         with app.state.session_engine.connect() as conn:
             proposal = conn.execute(
                 select(
@@ -970,49 +1002,50 @@ class TestStep2IntraStep:
                     composition_proposals_table.c.composer_provider,
                 ).where(composition_proposals_table.c.session_id == session_id)
             ).one()
-        assert proposal.composer_model_identifier == "composer-guided-passthrough-synthesis"
-        assert proposal.composer_provider == "server"
+        # Pin truth, not just non-server: the stubbed availability records
+        # provider="test" and the configured composer model. If these ever read
+        # "server" / "composer-guided-passthrough-synthesis" again, the bypass
+        # is back (elspeth-b4a286d517).
+        assert proposal.composer_provider == "test"
+        assert proposal.composer_model_identifier == "test/guided-planner"
         audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
         llm_audits = [
             envelope for message in audit_messages for envelope in (message.tool_calls or ()) if envelope.get("_kind") == "llm_call_audit"
         ]
-        assert llm_audits == []
+        assert llm_audits, "a planned transition must leave llm_call_audit evidence"
 
     @pytest.mark.parametrize("provider_heeds_gap", (True, False))
-    def test_rootless_step_3_entry_with_unproducible_output_fields_never_seals_the_sketch(
+    def test_step_3_entry_with_unproducible_output_fields_names_the_gap_to_the_planner(
         self,
         composer_test_client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
         provider_heeds_gap: bool,
     ) -> None:
-        """R2-F4: an unsatisfiable zero-transform sketch is never a complete answer.
+        """R2-F4: an unsatisfiable zero-transform pipeline is never a complete answer.
 
         The reviewed source observes ``order_id, region``; step-2 field review
-        declares ``client`` and ``amount_aud`` on top of them. The
-        server-synthesized pass-through has zero transforms, so nothing in it
-        can ever produce those two fields, yet the sketch was sealed as a green
-        "Starting sketch" — an unbuildable pipeline presented as complete,
-        because the sketch never merged the declared fields into the sink's
-        ``schema.required_fields`` and the sink-contract check therefore
-        skipped. The guided seam holds both facts (source observed/declared
-        fields, output required fields), so it must skip the sketch and route
-        to the provider planner with the gap named in the reviewed planner
-        context.
+        declares ``client`` and ``amount_aud`` on top of them. A pass-through
+        has zero transforms, so nothing in it can ever produce those two
+        fields. The provider planner is the only planning path
+        (elspeth-b4a286d517 removed the server-synthesized sketch); what this
+        test pins is that the gap is named in the reviewed planner context and
+        that no zero-transform candidate seals while it stands.
 
-        Both parameters assert the same two invariants — no server-synthesized
-        pass-through proposal is sealed, and the gap reaches the planner. They
-        differ in what the provider does with the named gap:
+        Both parameters assert the same two invariants — no server-authored
+        pass-through proposal exists in the corpus (a cheap standing provenance
+        sweep), and the gap reaches the planner. They differ in what the
+        provider does with the named gap:
 
         - ``True``: the planner adds a transform, and an ordinary provider
           proposal is sealed.
         - ``False``: the planner ignores the gap and re-proposes the same bare
-          zero-transform pass-through. The diversion alone would not save this
-          — the candidate is provider-authored, so it would seal as a COMPLETE
-          normal proposal and re-open R2-F4 one layer down. The planner loop
-          must therefore refuse every zero-transform candidate while the gap
-          stands (``passthrough_cannot_produce_declared_fields``), and the
-          resulting exhaustion must hand the operator the missing field names
-          rather than a bare "retry the request".
+          zero-transform pass-through. A provider-authored candidate would
+          otherwise seal as a COMPLETE normal proposal and re-open R2-F4 one
+          layer down, so the planner loop must refuse every zero-transform
+          candidate while the gap stands
+          (``passthrough_cannot_produce_declared_fields``), and the resulting
+          exhaustion must hand the operator the missing field names rather
+          than a bare "retry the request".
         """
         import elspeth.web.composer.service as service_module
 
