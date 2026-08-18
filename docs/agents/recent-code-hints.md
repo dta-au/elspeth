@@ -8,6 +8,28 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-18 — a guided step skill (`guided/skills/step_*.md`) MAY NOT name a
+  tool outside that step's palette, and the planner context is where you explain
+  a redaction**: two conventions for the guided brief surface, landed with
+  elspeth-63cf3803e6. (a) `test_guided_chat_prompts_name_only_tools_in_their_actual_palette`
+  asserts the literal strings `list_sources`, `list_transforms`, and `list_models`
+  appear in **no** step prompt, `list_sinks`/`get_plugin_schema` only from step 2,
+  and `confirm_wiring` never in step 4 — so a brief edit that reads naturally
+  ("don't call `list_transforms` to confirm a negative") turns that test red. Say
+  what to do, never which tool not to call. `test_guided_chat_prompts_are_interaction_only...`
+  additionally bans `emit_pipeline_proposal` and the whole capability core from
+  every chat prompt. (b) When a redaction makes the planner burn discovery turns,
+  the fix seam is a static usage line INSIDE `guided_redacted_planner_context`
+  (the `output_usage` / `reviewed_configuration_usage` precedent) — adjacent to
+  the confusing keys, zero new egress — not the system prompt. Phrase such a line
+  as a claim about what the server RESTORES, never about what the planner "owns":
+  the same projection is handed to the guided **correction** path, where
+  pre-existing nodes outside the correction owner are server-owned too, so an
+  ownership claim is false there. That projection is pinned by full-dict equality
+  in `test_proposal_audit_projection.py`, so any added key is a deliberate test
+  update, and the canary assertions above it prove the addition leaked no private
+  value.
+
 - **2026-08-17 — a full-suite run in the SHARED checkout is not evidence unless
   HEAD is unchanged across it, and a worktree A/B UNDER-COLLECTS**: two ways a
   whole-tree measurement lies. (a) `pytest tests/` takes ~18 minutes; four sibling
