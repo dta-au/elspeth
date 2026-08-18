@@ -113,6 +113,12 @@ def test_guided_chat_prompts_name_only_tools_in_their_actual_palette() -> None:
         assert "list_sources" not in prompt
         assert "list_transforms" not in prompt
         assert "list_models" not in prompt
+        # The per-step chat palettes are the step build tools and the
+        # deferred-intent tools; neither carries interpretation review, and
+        # neither does the planner palette these step files also render on.
+        # The capability core keeps the name for the freeform compose loop,
+        # which does carry it — and the core is never part of a chat prompt.
+        assert "request_interpretation_review" not in prompt
 
     assert "list_sinks" not in prompts[GuidedStep.STEP_1_SOURCE]
     assert "get_plugin_schema" not in prompts[GuidedStep.STEP_1_SOURCE]

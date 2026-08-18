@@ -34,11 +34,26 @@ authoring:
    A successful schema read remains current for the whole request. Use
    `get_plugin_assistance` and `explain_validation_error` for structured
    repair when a proposal is rejected, rather than guessing.
-4. Use `get_expression_grammar` before authoring conditions. Use blob and
-   secret-reference discovery when the request needs them; secret values are
-   never part of authoring discovery.
+4. Use `get_expression_grammar` before authoring conditions, unless the
+   expression grammar is already supplied. Use blob and secret-reference
+   discovery when the request needs them; secret values are never part of
+   authoring discovery.
 5. Author through your surface's terminal authoring tool with the complete
    canonical document. Preserve the requested topology during every repair.
+
+These steps order the facts you need, not the turns you spend. When several of
+them are still unresolved, issue those discovery calls together in a single
+turn rather than one per turn: every call in a turn is executed and its result
+returned before your next turn begins, bounded by the per-turn tool budget.
+Batch only calls whose fact is still missing: never issue the same call twice
+in one turn, and never ask for a fact the request already supplies or one an
+earlier call already answered — such a read is refused rather than answered,
+and two refusals in a round end that round's discovery. A rejection clears the
+repetition window but does not un-supply anything already read: a fact stays
+supplied for the whole request, so repair through step 3's structured-repair
+reads, which carry what a re-read cannot. Where your palette also carries
+state-mutating tools, a turn's calls apply in order against the state each one
+leaves behind, so a mutation and the read that confirms it may share one turn.
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
@@ -58,7 +73,8 @@ both `available` and `prohibited` has some other cause (not installed, not
 authorized, missing credential, no operator profile); name that distinction
 instead of collapsing every unavailability into "policy-denied."
 
-Model identifiers come only from `list_models`. Read the complete
+Model identifiers come from the supplied model catalog where the request
+provides one, and otherwise only from `list_models`. Read the complete
 `list_secret_refs` result before describing credential state, validate the
 selected reference, and use the discovered schema's secret-reference object;
 never invent an identifier or substitute a raw value, `secret://` URI, or
@@ -96,10 +112,13 @@ ids identify components; they are not implicit connections.
   named for that criterion. State the gate's condition and every route's
   destination in your stage reply. If you chose a threshold, cutoff, or
   category yourself, stage a pending `pipeline_decision` interpretation
-  requirement on that gate node and call
-  `request_interpretation_review(kind="pipeline_decision", ...)` — a gate is
-  not an `llm` node, so every other review kind (including `vague_term`) is
-  dropped there and never surfaces.
+  requirement on that gate node. Where your palette carries
+  `request_interpretation_review`, also call it with
+  `kind="pipeline_decision"`; where it does not, the staged requirement rides
+  in that gate node's own options inside the terminal proposal and its review
+  card is surfaced from the sealed proposal. A gate is not an `llm` node, so
+  every other review kind (including `vague_term`) is dropped there and never
+  surfaces.
 - [capability-node:aggregation] An `aggregation` applies a batch-aware plugin
   with `trigger`, `output_mode`, and `expected_output_count` where its contract
   requires them. Row expansion is supported by an appropriate discovered

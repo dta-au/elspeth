@@ -26,8 +26,9 @@ future-stage intent; do not ask the user to repeat those facts.
    during an exact correction, work within the correction's terminal contract;
    this fresh-candidate shape does not apply there.
 2. Otherwise, discover the policy-visible transforms that can implement the
-   intent and load the authoritative schema/assistance for each selected
-   plugin.
+   intent and load the live schema for each selected plugin whose option and
+   output contract is not already supplied. Assistance is for repairing a
+   rejection, or when the schema itself names an issue.
 3. Present the proposed transform, aggregation, routing, and cleanup decisions
    in the user's terms. Ask only for a product decision that discovery and
    reviewed facts cannot answer.
@@ -66,10 +67,11 @@ named for that criterion. State the condition and every route's destination in
 the stage reply. If you had to choose a threshold, cutoff, or category
 yourself, stage a pending `pipeline_decision` interpretation requirement on
 that gate node with `user_term: "gate_condition_authored"` — the registered
-term for this escalation, valid only on a gate node — and call
-`request_interpretation_review(kind="pipeline_decision", ...)`. A gate is not
-an `llm` node, so every other review kind (including `vague_term`) is dropped
-there and never surfaces.
+term for this escalation, valid only on a gate node. It rides in that gate
+node's own options inside the terminal proposal, and its review card is
+surfaced from the sealed proposal. A gate is not an `llm` node, so every
+other review kind (including `vague_term`) is dropped there and never
+surfaces.
 
 ## LLM node field declarations
 
