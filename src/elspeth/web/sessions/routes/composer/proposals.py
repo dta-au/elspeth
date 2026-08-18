@@ -89,6 +89,12 @@ def _missing_proposal_composer_context(
         ("tool_arguments_hash", proposal.tool_arguments_hash),
     )
     missing = [name for name, value in context_fields if value is None]
+    if proposal.composer_provider == "server":
+        # provider="server" was the deleted guided synthesis gate's provenance
+        # (elspeth-b4a286d517). No code path can stage it any more, so a row
+        # carrying it is INVALID provenance, not merely legacy-incomplete —
+        # refuse it even when every provenance field is present.
+        missing.append("composer_provider (provider='server' is never valid provenance)")
     if user_message_content is None:
         missing.insert(0, "user_message_content")
     return tuple(missing)

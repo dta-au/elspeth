@@ -2270,6 +2270,85 @@ def test_accept_inline_blob_proposal_without_composer_provenance_fails_closed(tm
     assert blob_count == []
 
 
+def test_accept_refuses_server_provider_proposal_provenance(tmp_path, monkeypatch) -> None:
+    """provider='server' is never valid proposal provenance (elspeth-b4a286d517).
+
+    The guided synthesis gate that wrote it is deleted; no code path can stage
+    such a row any more, so one that carries it is invalid provenance — not
+    merely legacy-incomplete — and acceptance must refuse it even though every
+    provenance field is present and non-null.
+    """
+    from elspeth.web.catalog.schemas import PluginSchemaInfo
+
+    app, service = _make_app(tmp_path)
+    app.state.session_engine = service._engine
+    catalog = MagicMock(spec=CatalogService)
+    catalog.get_schema.return_value = PluginSchemaInfo(
+        name="csv",
+        plugin_type="source",
+        description="CSV source",
+        json_schema={"title": "Config", "properties": {}},
+        knob_schema={"fields": []},
+    )
+    app.state.catalog_service = catalog
+    monkeypatch.setattr(
+        "elspeth.web.sessions.routes._helpers._runtime_preflight_for_state",
+        _async_return(ValidationResult(is_valid=True, checks=[], errors=[])),
+    )
+    client = TestClient(app)
+    session = client.post("/api/sessions", json={"title": "Server-provider proposal"}).json()
+    session_id = uuid.UUID(session["id"])
+    user_message = asyncio.run(
+        service.add_message(
+            session_id,
+            "user",
+            "Build a generated CSV pipeline with one Ada score row.",
+            writer_principal="route_user_message",
+        )
+    )
+    proposal = asyncio.run(
+        service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_set_pipeline_inline_blob_server",
+            tool_name="set_pipeline",
+            summary="Replace the pipeline with inline CSV.",
+            rationale="Server-synthesized proposal provenance.",
+            affects=("graph", "blob"),
+            arguments_json={
+                "source": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {"schema": {"mode": "observed"}},
+                    "inline_blob": {
+                        "filename": "ada.csv",
+                        "mime_type": "text/csv",
+                        "content": "name,score\nada,42\n",
+                    },
+                },
+                "nodes": [],
+                "edges": [],
+                "outputs": [],
+                "metadata": {"name": "server-provider-proposal"},
+            },
+            arguments_redacted_json={"summary": "redacted"},
+            base_state_id=None,
+            actor="composer-web:user:alice",
+            user_message_id=user_message.id,
+            composer_model_identifier="composer-guided-passthrough-synthesis",
+            composer_model_version="composer.guided-passthrough-synthesis.v1",
+            composer_provider="server",
+            composer_skill_hash="deadbeef" * 8,
+            tool_arguments_hash="feedface" * 8,
+        )
+    )
+
+    response = client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/accept")
+
+    assert response.status_code == 409
+    assert "never valid provenance" in response.json()["detail"]
+    assert asyncio.run(service.get_current_state(session_id)) is None
+
+
 def test_accept_empty_inline_blob_proposal_without_composer_provenance_fails_closed(tmp_path, monkeypatch) -> None:
     from sqlalchemy import select
 
