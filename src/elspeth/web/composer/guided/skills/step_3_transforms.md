@@ -7,16 +7,26 @@ future-stage intent; do not ask the user to repeat those facts.
 
 ## Stage timing
 
-1. Discover the policy-visible transforms that can implement the intent and
-   load the authoritative schema/assistance for each selected plugin.
-2. Present the proposed transform, aggregation, routing, and cleanup decisions
+1. First decide whether the intent needs a transform at all. When the reviewed
+   source and output facts already satisfy it — every field the output requires
+   is present in the source's observed or declared fields, and the user asked
+   for no processing — the correct transform set is EMPTY. Propose the direct
+   source-to-output pass-through and say plainly that no processing step is
+   needed. Do not spend a discovery call confirming a negative. This is not a
+   silent downgrade: it applies only where no capability was requested. If the
+   server named `unproducible_output_fields`, the intent does need transforms —
+   go to 2.
+2. Otherwise, discover the policy-visible transforms that can implement the
+   intent and load the authoritative schema/assistance for each selected
+   plugin.
+3. Present the proposed transform, aggregation, routing, and cleanup decisions
    in the user's terms. Ask only for a product decision that discovery and
    reviewed facts cannot answer.
-3. Retain structural decisions for the topology proposal. A request involving
+4. Retain structural decisions for the topology proposal. A request involving
    wiring, branching, fan-in, gates, coalescing, or multiple outputs remains a
    supported canonical capability even though final graph review occurs in the
    wiring stage.
-4. Do not silently replace a requested capability with a simpler transform.
+5. Do not silently replace a requested capability with a simpler transform.
    Policy-proven unavailability is a named deployment gap; a different stage is
    a timing distinction, not a capability denial.
 

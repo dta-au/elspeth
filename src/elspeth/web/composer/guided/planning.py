@@ -1105,6 +1105,28 @@ def guided_redacted_planner_context(guided: GuidedSession) -> dict[str, object]:
             "Reviewed sink names are commit targets for the pipeline's FINAL producer only — "
             "never for branch transforms feeding a coalesce."
         ),
+        # Static usage line, never per-request data. Both projections above
+        # carry ``option_keys`` WITHOUT their values, and nothing else on the
+        # provider-visible surface says why. A planner that sees keys with no
+        # values, and is told by base.md not to invent options, rationally
+        # reads the gap as missing data and spends discovery turns on the
+        # state/catalog tools trying to recover values that
+        # bind_guided_reviewed_components overwrites the moment its call
+        # returns (elspeth-63cf3803e6). Explain the redaction rather than
+        # lifting it: zero new egress, and it states only what the binder
+        # already does.
+        #
+        # Phrased as what is RESTORED, never as what the planner "owns": this
+        # context is also the correction path's (service.py plan_pipeline),
+        # and during an exact guided correction pre-existing nodes outside the
+        # correction owner are server-owned too, so an ownership claim would
+        # be false on a path that shares this projection.
+        "reviewed_configuration_usage": (
+            "Reviewed source and output plugin configuration is operator-approved and is restored "
+            "server-side after your call. `option_keys` names which options exist; their values are "
+            "withheld by design and are NOT missing data — no state or catalog lookup can return "
+            "them, and you never need them to author a candidate."
+        ),
         "deferred_intents": [
             {
                 "intent_id": intent.intent_id,
@@ -2402,8 +2424,10 @@ def bind_guided_reviewed_components(
     if type(raw_outputs) is not list:
         raise AuditIntegrityError("guided planner candidate outputs are malformed")
     expected_output_names = [guided.reviewed_outputs[stable_id].name for stable_id in guided.output_order]
-    # The planner is NOT given the reviewed output NAMES (only stable_id + plugin),
-    # so it authors its own output name and wires sibling on_success/on_error to it.
+    # The planner MAY author its own output name rather than reusing the reviewed
+    # one: guided_redacted_planner_context names reviewed outputs (6a54abbdc), but
+    # nothing binds the planner to that name, and the freeform-shaped habit of
+    # inventing a sink name and wiring sibling on_success/on_error to it survives.
     # Enforce STRUCTURAL authority (one candidate dict per reviewed output, in order
     # — plugin-by-position is validated separately) rather than an unsatisfiable NAME
     # equality, then remap the planner-invented output name to the reviewed authority

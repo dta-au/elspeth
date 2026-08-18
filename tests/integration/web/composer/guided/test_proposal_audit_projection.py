@@ -472,6 +472,20 @@ def test_planner_context_is_redacted_but_private_anchor_keeps_exact_reviewed_fac
             "Reviewed sink names are commit targets for the pipeline's FINAL producer only — "
             "never for branch transforms feeding a coalesce."
         ),
+        # Static redaction-explanation, never per-request data: both projections
+        # above carry option_keys WITHOUT values, and a planner told not to
+        # invent options reads that gap as missing data worth discovery turns
+        # (elspeth-63cf3803e6). Pinned here because the line is the redaction's
+        # provider-visible contract — deleting it silently restores the defect,
+        # and rewording it must stay a claim about what is RESTORED rather than
+        # what the planner owns (the correction path shares this projection and
+        # server-owns more).
+        "reviewed_configuration_usage": (
+            "Reviewed source and output plugin configuration is operator-approved and is restored "
+            "server-side after your call. `option_keys` names which options exist; their values are "
+            "withheld by design and are NOT missing data — no state or catalog lookup can return "
+            "them, and you never need them to author a candidate."
+        ),
         "deferred_intents": [],
     }
 
