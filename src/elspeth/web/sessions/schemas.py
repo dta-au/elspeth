@@ -268,9 +268,11 @@ class CompositionProposalResponse(_StrictResponse):
 class GuidedPlanDeclinedResponse(_StrictResponse):
     """Response for POST /api/sessions/{id}/guided/plan on an honest decline.
 
-    The escape-hatch advisor answered in text instead of proposing a
-    pipeline: no proposal was created. ``message`` is the ordinary
-    assistant chat message persisted from the advisor's own words —
+    The planner answered in text instead of proposing a pipeline: either
+    an ordinary manifest-satisfied turn whose reply led with the taught
+    ``DECLINE:`` marker, or the escape-hatch advisor turn, which accepts any
+    text. No proposal was created. ``message`` is the ordinary
+    assistant chat message persisted from the model's own words —
     same wire shape as ``MessageWithStateResponse.message`` on the
     freeform surface, which handles the identical ``PlannerDeclined``
     outcome the same way. Distinguished from ``CompositionProposalResponse``

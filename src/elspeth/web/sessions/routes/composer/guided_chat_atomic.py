@@ -1186,6 +1186,21 @@ async def post_guided_chat_schema8(
                         deferred_clarification = False
                         deferred_paired_resolution = False
                     else:
+                        # F2 marking hook, bound ONLY for the step that
+                        # consumes it. Step 2's discovery loop is the sole
+                        # consumer (run_guided_chat_provider_attempt passes it
+                        # to resolve_step_2_sink_chat_with_auto_drop and
+                        # nowhere else), so binding the service attribute
+                        # eagerly on every turn coupled steps 1/3/4 to a
+                        # collaborator they never use.
+                        mark_schema_loaded = (
+                            functools.partial(
+                                request.app.state.composer_service._mark_plugin_schema_loaded,
+                                str(session_id),
+                            )
+                            if frozen.guided.step is GuidedStep.STEP_2_SINK
+                            else None
+                        )
                         provider_outcome = await provider_runner(
                             session_id=session_id,
                             user=user,
@@ -1205,10 +1220,7 @@ async def post_guided_chat_schema8(
                             # planner surfaces write; a Step-2 get_plugin_schema
                             # success recorded here saves the NEXT planner
                             # request a re-fetch (F2).
-                            mark_schema_loaded=functools.partial(
-                                request.app.state.composer_service._mark_plugin_schema_loaded,
-                                str(session_id),
-                            ),
+                            mark_schema_loaded=mark_schema_loaded,
                         )
                         chat_result = provider_outcome.chat
                         source_resolution = provider_outcome.resolution if type(provider_outcome) is Step1SourceResolvedResult else None

@@ -415,10 +415,11 @@ async def post_guided_plan(
             )
 
         if isinstance(outcome, GuidedPlannerDecline):
-            # Honest decline from the escape-hatch advisor turn: a
-            # successful conversational outcome, not a planner failure.
-            # Persist the advisor's own words as an ordinary assistant
-            # message and complete the operation — never
+            # Honest decline — a manifest-satisfied ordinary turn's
+            # DECLINE:-marked reply, or the escape-hatch advisor's
+            # any-text reply: a successful conversational outcome, not a
+            # planner failure. Persist the model's own words as an
+            # ordinary assistant message and complete the operation — never
             # GuidedOperationFailureCode (mirrors the freeform surface's
             # identical PlannerDeclined handling in ComposerServiceImpl).
             decline_text = outcome.decline_text.strip() or _EMPTY_DECLINE_FALLBACK

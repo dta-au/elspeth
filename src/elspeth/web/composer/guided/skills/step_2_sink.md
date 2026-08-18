@@ -27,13 +27,14 @@ any user constraint that the live schema can express; report an actual
 capability gap when it cannot.
 
 Some requirements are policy-level and do not appear in the option schema
-itself: `get_plugin_schema` returns `composer_hints` alongside the schema —
-they are disclosed there and nowhere else, so a sink you configure without
-reading its schema must have every option you rely on set explicitly. Treat
-those hints as binding. When a hint says an option is required, must be
-set deliberately, or is rejected when left implicit, set that option
-explicitly in your resolution rather than relying on defaults. Always set the
-output path option explicitly as well.
+itself: `composer_hints`. Both descriptions of a sink carry them — every
+`list_sinks` entry alongside its `config_fields`, and `get_plugin_schema`
+alongside the schema, which stays authoritative for enum values and nested
+option shapes. Read them wherever you meet the sink, and treat them as
+binding. When a hint says an option is required, must be set deliberately,
+or is rejected when left implicit, set that option explicitly in your
+resolution rather than relying on defaults. Always set the output path
+option explicitly as well.
 
 Pick the sink that matches what the user asked for and configure it yourself from
 what they told you. Don't make them choose from a list, and don't ask them to

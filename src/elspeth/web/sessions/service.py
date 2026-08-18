@@ -10807,11 +10807,12 @@ class SessionServiceImpl:
         self,
         command: GuidedFullPipelineDeclineCommand,
     ) -> GuidedFullPipelineDeclineSettlement:
-        """Persist one guided-full escape-hatch decline as an ordinary chat turn.
+        """Persist one guided-full planner decline as an ordinary chat turn.
 
         Sibling of stage_guided_full_pipeline_proposal for the planner's
-        other outcome (PlannerDeclined, surfaced as GuidedPlannerDecline):
-        no proposal is created. The advisor's own words become an ordinary
+        other outcome (PlannerDeclined, surfaced as GuidedPlannerDecline —
+        an ordinary turn's DECLINE:-marked reply or the escape hatch's
+        any-text reply): no proposal is created. The model's own words become an ordinary
         assistant chat message and the operation completes with
         GuidedDeclinedResult — never GuidedOperationFailureCode, per the
         same "decline is a conversational outcome, not a failure" rule the

@@ -7720,11 +7720,14 @@ async def test_discovery_repetition_within_one_repair_round_still_trips(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """The per-round window still catches a genuinely stuck planner.
+    """A stuck planner is still caught after a rejection opens a fresh round.
 
-    After a rejection opens a fresh round, the first re-read is served but a
-    second identical read in the SAME round is cycling by definition and must
-    trip DISCOVERY_CYCLE exactly as before.
+    Exact-call repetition is round-scoped, but the information manifest is
+    request-scoped: a fact read once stays read across a candidate rejection.
+    So neither re-read here reaches the repetition window at all -- both are
+    classified DISCOVERY_NO_GAIN and refused before the cycle guard sees
+    them, and the second one in the same round escalates that refusal to the
+    terminal DISCOVERY_NO_GAIN disposition asserted below.
     """
     completion = _ScriptedCompletion(
         _response(("list_sources", {})),
@@ -8694,6 +8697,132 @@ async def test_discovery_argument_error_alongside_valid_call_both_feed_back(
     tool_messages = [m for m in completion.requests[1]["messages"] if m["role"] == "tool"]
     assert len(tool_messages) == 2
     assert {inv.tool_name for inv in recorder.invocations} == {"get_plugin_schema", "list_sources"}
+
+
+@pytest.mark.asyncio
+async def test_argument_error_discovery_call_leaves_decline_eligibility_intact(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """An arg-error discovery call must not revoke the decline affordance.
+
+    F1 (final review of the call-efficiency epic): every useful call's minted
+    keys enter the pending-information set BEFORE dispatch, and an argument
+    error resolves nothing — so a key minted from BAD arguments (the model
+    guessing plugin_type='node', live session bf109c43) would otherwise stay
+    pending and forever uncovered. ``prose_decline_eligible`` conjoins over
+    every pending key, so that one bad guess would silently make the taught
+    DECLINE: marker inadmissible for the rest of the request: two nudges then
+    the hatch, or terminal MALFORMED_RESPONSE when no hatch model is
+    configured. Rolling the call's keys back keeps an honest decline a
+    one-turn move on the very next turn.
+    """
+    body = "I can't do this here: the request needs a streaming join no available plugin provides."
+    completion = _ScriptedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "node", "name": "coalesce"})),
+        _text_response(f"DECLINE: {body}"),
+    )
+
+    with pytest.raises(PlannerDeclined) as excinfo:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            information_aware=True,
+            model_overrides={"escape_hatch_model": None},
+        )
+
+    assert excinfo.value.code == "DECLINED"
+    assert excinfo.value.decline_text == body
+    # Exactly two provider calls: the arg-error turn, then the decline. A
+    # revoked affordance spends nudge turns here instead of declining.
+    assert len(completion.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_argument_error_does_not_poison_a_corrected_retry_of_the_same_key(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The corrected retry of an arg-errored key must still be served.
+
+    This is the shape that rules OUT the alternative fix for F1 — resolving an
+    arg-error call's keys as ``available=False`` instead of rolling them back.
+    ``PlannerInformationManifest.covers`` treats unavailable as covered, so
+    marking them would classify this legitimate retry as DISCOVERY_NO_GAIN and
+    refuse it, trading one trap for another. The bad call here carries an
+    unsupported property, so it mints exactly the same information key as the
+    corrected call that follows.
+    """
+    completion = _ScriptedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv", "unsupported": "x"})),
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        information_aware=True,
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 3
+    rejected = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
+    assert len(rejected) == 1
+    assert json.loads(rejected[0]["content"])["success"] is False
+    retried = [message for message in completion.requests[2]["messages"] if message["role"] == "tool"][-1]
+    retried_payload = json.loads(retried["content"])
+    assert retried_payload["success"] is True
+    assert retried_payload.get("error_code") != "DISCOVERY_NO_GAIN"
+    # The manifest genuinely learned the key: the closure notice fires only
+    # when every pending key is SUPPLIED, never merely covered.
+    closure_notice = "All declared information gaps are closed; emit the terminal proposal now."
+    assert sum(message.get("content") == closure_notice for message in completion.requests[2]["messages"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_argument_error_rollback_keeps_a_key_the_intent_still_owes(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The rollback removes only what the failed call alone made pending.
+
+    An intent that names ``source:csv`` declares that schema key up front, so
+    an arg-errored call minting the SAME key must leave it pending: the
+    request still owes it, and a decline while a declared gap is open is not
+    an informed one. The surviving owner therefore keeps the affordance shut,
+    and a marker reply draws the ordinary nudge instead of resolving.
+    """
+    completion = _ScriptedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv", "unsupported": "x"})),
+        _text_response("DECLINE: nothing here can read that file."),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Use source:csv for this pipeline.",
+        information_aware=True,
+        model_overrides={"escape_hatch_model": None},
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    # The marker never classified: the declared key is still unresolved, so
+    # the turn was not decline-eligible and the reply drew the nudge.
+    nudges = [
+        message
+        for message in completion.requests[2]["messages"]
+        if message["role"] == "user" and "called no tool" in str(message.get("content"))
+    ]
+    assert len(nudges) == 1
+    assert not any(
+        message["role"] == "user" and 'starting with "DECLINE: "' in str(message.get("content"))
+        for message in completion.requests[2]["messages"]
+    )
 
 
 @pytest.mark.asyncio

@@ -3506,8 +3506,11 @@ class ComposerServiceImpl:
         try:
             plan = await guided_full_planner_call
         except PlannerDeclined as declined:
-            # Honest decline from the escape-hatch advisor turn: a
-            # successful conversational outcome, not a planner failure.
+            # Honest decline: a successful conversational outcome, not a
+            # planner failure. Either origin lands here — an ordinary
+            # manifest-satisfied turn whose text reply led with the taught
+            # DECLINE: marker, or the escape-hatch advisor turn, which
+            # accepts any text.
             # Return it (rather than letting it fall into the broad
             # PipelinePlannerError handler below) so the caller can persist
             # an ordinary assistant message and complete the guided
@@ -3845,8 +3848,9 @@ class ComposerServiceImpl:
         try:
             plan = await guided_planner_call
         except PlannerDeclined as declined:
-            # Same escape-hatch decline handling as plan_guided_full_pipeline
-            # above: a decline is a conversational outcome, not a planner
+            # Same decline handling as plan_guided_full_pipeline above —
+            # marker decline on an ordinary turn or the escape-hatch advisor
+            # turn alike: a decline is a conversational outcome, not a planner
             # failure, so it must not fall into the broad
             # PipelinePlannerError handler below and must never route
             # through GuidedOperationFailureCode.
@@ -4268,10 +4272,12 @@ class ComposerServiceImpl:
                 ),
             )
         except PlannerDeclined as declined:
-            # Honest decline from the escape-hatch advisor turn: a
-            # successful conversational outcome, not a provider failure.
-            # Mirror the success path's audit persistence, then surface
-            # the advisor's own words as the assistant message.
+            # Honest decline — from an ordinary manifest-satisfied turn
+            # led by the taught DECLINE: marker, or from the escape-hatch
+            # advisor turn, which accepts any text: a successful
+            # conversational outcome, not a provider failure. Mirror the
+            # success path's audit persistence, then surface the model's own
+            # words as the assistant message.
             await self._persist_pipeline_planner_audit(
                 session_id=session_uuid,
                 current_state_id=state_uuid,

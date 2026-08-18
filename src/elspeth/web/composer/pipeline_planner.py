@@ -4969,6 +4969,18 @@ async def _plan_pipeline_inner(
                 )
                 new_information.extend(_planner_information_classes(newly_covered_keys))
             else:
+                # An argument error resolves nothing, so the call's keys are
+                # rolled back to exactly what they were before it was seen:
+                # its keys entered pending BEFORE dispatch, and a key minted
+                # from bad arguments (plugin_type='node') is otherwise pending
+                # and uncovered forever, which silently revokes the DECLINE:
+                # affordance for the rest of the request. Subtracting the
+                # declared set is what makes this a rollback rather than a
+                # forget: a key the intent or the initial manifest also owes
+                # is still owed after this call fails. Marking the keys
+                # available=False instead was rejected -- covers() treats
+                # unavailable as covered, so the corrected retry of the same
+                # key would be refused as DISCOVERY_NO_GAIN.
                 pending_information.difference_update(set(information_keys[call.call_id]) - declared_pending_information)
             await emit_progress(lifecycle.progress, tool_completed_progress_event(call.name, result.success))
         if next(discovery_results, None) is not None:

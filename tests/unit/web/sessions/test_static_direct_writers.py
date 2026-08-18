@@ -1035,6 +1035,18 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "inline-blob provenance without routing setup through the behavior under test"
         ),
     ),
+    ReviewedWriter(
+        path="tests/unit/web/composer/test_applied_component_echo.py",
+        enclosing_symbol="blob_env",
+        table="chat_messages",
+        operation="sqlalchemy_table_insert",
+        purpose=(
+            "Applied-component echo fixture seeds the originating user chat row so "
+            "create_blob can bind its content as inline custody; the test owns a "
+            "test-scoped in-memory engine and sets sequence_no and writer_principal "
+            "explicitly, so no production sequence allocation or lock is under test"
+        ),
+    ),
     # ------ tests/unit/web/sessions/test_models.py — schema test direct rows (7 sites) ------
     ReviewedWriter(
         path="tests/unit/web/sessions/test_models.py",
