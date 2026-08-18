@@ -110,6 +110,31 @@ code, releases, exports, runtime data, or deployed artifacts. If removing a
 practice is a marginal call or may discard a real safeguard, surface the tradeoff
 to the developer before removing it.
 
+## Composer invariants (non-negotiable)
+
+Two rules govern every change to the Web Composer. Neither is subject to a
+latency, cost, or convenience argument. If you believe you need an exception,
+STOP and ask the developer before writing code.
+
+**1. The LLM does the job. No composer path bypasses the provider.**
+ELSPETH must never synthesize, template, route, match, or otherwise derive
+pipeline structure server-side in place of the planner. If the planner is slow,
+wrong, or wasteful, that is a planner defect to diagnose — not a reason to
+remove the planner from the path. A server-authored graph that reaches the user
+as a proposal is banned regardless of what it is called (sketch, recipe, router,
+fallback, fast path, synthesis) and regardless of whether it is later
+superseded. `provider="server"` must not author pipeline structure.
+
+**2. There are no tutorial-special paths. None. Ever.**
+The tutorial runs the same backend as every other session
+([ADR-031](docs/architecture/adr/031-tutorial-is-a-fixed-script-canary.md)). No
+tutorial-only normalization, short-circuit, prompt, or code branch. A defect
+visible in the tutorial is a defect in the composer.
+
+Both rules are absolute in the composer's authoring path. They do not prohibit
+server-side *validation*, *rejection*, or *redaction* of what the planner
+produces, nor the required-control admission gates that protect runtime data.
+
 ## Standing authorization: skills and subagents
 
 Agents are always authorized to invoke skills and dispatch subagents at their
