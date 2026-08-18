@@ -529,16 +529,24 @@ def build_set_pipeline_candidate(
         error_msg: str,
         *,
         error_code: str | None = None,
+        plugin_identity: tuple[str, str] | None = None,
     ) -> SetPipelineCandidate:
         # set_pipeline authors a full replacement: the pre-mutation state's
         # validate() entries are phantom repair targets for this candidate
         # and are withheld from the failure envelope (elspeth-e89e6bf47a).
+        #
+        # ``plugin_identity`` is the in-memory carrier the planner's contract
+        # attach reads. Pass it only AFTER ``_validate_plugin_name`` has
+        # resolved this identity through the request policy view; an
+        # unresolved name is precisely the input that makes the downstream
+        # catalog lookup raise.
         return _candidate(
             _tool_failure_result(
                 rejected_state,
                 error_msg,
                 error_code=error_code,
                 with_state_validation=False,
+                plugin_identity=plugin_identity,
             )
         )
 
@@ -874,7 +882,7 @@ def build_set_pipeline_candidate(
             # option-shape message was coded there and codeless here (pack
             # pressure-suite run 1 surfaced the asymmetry as a bare
             # 'validation_error' in the planner view).
-            return _failure_result(state, src_prevalidation, error_code="plugin_options_invalid")
+            return _failure_result(state, src_prevalidation, error_code="plugin_options_invalid", plugin_identity=("source", src_plugin))
         source_specs["source"] = SourceSpec(
             plugin=src_plugin,
             on_success=legacy_source_model.on_success,
@@ -1011,7 +1019,12 @@ def build_set_pipeline_candidate(
             )
             if src_prevalidation is not None:
                 _record_component_rejection(
-                    _failure_result(state, f"Source '{source_name}': {src_prevalidation}", error_code="plugin_options_invalid")
+                    _failure_result(
+                        state,
+                        f"Source '{source_name}': {src_prevalidation}",
+                        error_code="plugin_options_invalid",
+                        plugin_identity=("source", src_plugin),
+                    )
                 )
                 continue
             source_specs[source_name] = SourceSpec(
@@ -1118,7 +1131,12 @@ def build_set_pipeline_candidate(
             node_prevalidation = _prevalidate_transform_for_context(context, node_plugin, review_options)
             if node_prevalidation is not None:
                 _record_component_rejection(
-                    _failure_result(state, f"Node '{node_id}': {node_prevalidation}", error_code="plugin_options_invalid")
+                    _failure_result(
+                        state,
+                        f"Node '{node_id}': {node_prevalidation}",
+                        error_code="plugin_options_invalid",
+                        plugin_identity=("transform", node_plugin),
+                    )
                 )
                 continue
 
@@ -1207,6 +1225,12 @@ def build_set_pipeline_candidate(
             canonical_out_options[index] = dict(canonical_sink_local_paths(output.options))
         except ValueError as exc:
             uncanonical_output_indexes.add(index)
+            # Deliberately carries NO plugin_identity: this loop runs BEFORE
+            # the one that resolves each output's plugin through the policy
+            # view, so ``output.plugin`` here is unvalidated model text. The
+            # consumer fails closed on its absence — the rejection loses an
+            # advisory contract, which is the correct trade against handing a
+            # catalog lookup a name nothing admitted.
             _record_component_rejection(
                 _failure_result(
                     state,
@@ -1274,7 +1298,12 @@ def build_set_pipeline_candidate(
         out_prevalidation = _prevalidate_sink(out_plugin, out_options)
         if out_prevalidation is not None:
             _record_component_rejection(
-                _failure_result(state, f"Output '{out_name}': {out_prevalidation}", error_code="plugin_options_invalid")
+                _failure_result(
+                    state,
+                    f"Output '{out_name}': {out_prevalidation}",
+                    error_code="plugin_options_invalid",
+                    plugin_identity=("sink", out_plugin),
+                )
             )
             continue
         out_collision_error = validate_composer_file_sink_collision_policy(
@@ -1461,6 +1490,7 @@ def build_set_pipeline_candidate(
             new_state,
             affected,
             data=data,
+            full_replacement=True,
         )
     )
 
@@ -1998,9 +2028,17 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
     name="get_pipeline_state",
     handler=_execute_get_pipeline_state,
     kind=ToolKind.DISCOVERY,
+    # Presence-keyed on the response field, never on a tool name: the planner
+    # palette carries this tool but no mutating tool, so a sentence asserting
+    # that a mutation already echoed the state would be false there. Keyed on
+    # "when a result carries applied_component" it is simply vacuous on a
+    # surface that never mutates, and true wherever it can apply.
     description="Inspect the full current pipeline state including all "
-    "options for source, nodes, and outputs. Use this during correction "
-    "loops to see what is currently configured before patching.",
+    "options for source, nodes, and outputs. When a mutation result carries "
+    "an applied_component field, that field is already the post-change state "
+    "of everything that mutation touched — read it there, and call this tool "
+    "for what it does not cover: a component the change did not touch, or "
+    "the whole document.",
     json_schema={
         "type": "object",
         "properties": {

@@ -502,7 +502,12 @@ def _affected_component_for_inline_field_path(field_path: str) -> tuple[str, ...
     if prefix == "source":
         return ("source",)
     if prefix.startswith("source:"):
-        return (prefix.removeprefix("source:"),)
+        # Sources keep their prefix where nodes and outputs drop theirs: the
+        # affected-component vocabulary is bare ids for nodes/outputs but
+        # ``source_component_id(name)`` — i.e. "source:<name>" — for sources,
+        # which is what every other source-mutating site reports. Stripping it
+        # here made the bare name collide with a node id of the same name.
+        return (prefix,)
     if prefix.startswith("node:"):
         return (prefix.removeprefix("node:"),)
     if prefix.startswith("output:"):

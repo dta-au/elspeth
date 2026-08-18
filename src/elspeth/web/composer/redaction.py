@@ -3320,6 +3320,7 @@ class _ToolResultResponseModel(BaseModel):
     validation_delta: _SafeResponseEnvelope = None
     post_call_hints: _SafeResponseEnvelope = None
     plugin_schemas: _SafeResponseEnvelope = None
+    applied_component: _SafeResponseEnvelope = None
     pipeline_content_hash_schema: Literal["composer.pipeline-dispatch-result.v1"] | None = None
     pipeline_content_hash: Annotated[str | None, Sensitive(summarizer=_summarize_external_response_value)] = None
 
@@ -3528,6 +3529,7 @@ _TOOL_RESULT_OPTIONAL_RESPONSE_KEYS: tuple[str, ...] = (
     "validation_delta",
     "post_call_hints",
     "plugin_schemas",
+    "applied_component",
 )
 
 

@@ -72,6 +72,7 @@ from elspeth.web.composer.pipeline_planner import (
     _materialize_terminal_payload,
     _parse_response_tool_calls,
     _ParsedToolCall,
+    _project_planner_plugin_contract,
     _rejection_fingerprint,
     _serialize_provider_discovery_result,
     _transform_node_count,
@@ -84,7 +85,7 @@ from elspeth.web.composer.pipeline_proposal import (
     PlannerSurface,
     pipeline_draft_hash,
 )
-from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
+from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, planner_plugin_contract
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.state import (
     CoalesceUnionTypeDetail,
@@ -104,7 +105,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools._common import ToolContext, ToolResult
 from elspeth.web.composer.tools.generation import explain_validation_code, explain_withheld_validation_code
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
-from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
+from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
@@ -7062,6 +7063,402 @@ async def test_oscillating_option_and_wiring_rejections_converge_within_budget(
     # Distinct fingerprints: neither turn is a repetition, so no repeat notice.
     assert "repeat_notice" not in first_feedback
     assert "repeat_notice" not in second_feedback
+
+
+@pytest.mark.asyncio
+async def test_plugin_options_rejection_carries_the_violated_plugin_contract(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A ``plugin_options_invalid`` repair turn ships the plugin's contract.
+
+    The detail names only the VIOLATED keys, so the planner had to spend a
+    ``get_plugin_schema`` turn to learn what the plugin actually accepts —
+    bytes the server already held while writing the rejection
+    (elspeth-1d8fc3da83). The freeform surface has inlined the same schema on
+    the same failure class since the option-shape augmentation landed; this
+    closes the planner half. Zero new egress: ``get_plugin_schema`` is on this
+    palette and returns the same policy-view projection.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_bogus_source_option(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=1,
+        model_overrides={"escape_hatch_model": None},
+    )
+
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    options_entry = next(e for e in feedback["validation"]["errors"] if e["error_code"] == "plugin_options_invalid")
+    assert "bogus_option" in options_entry["detail"]
+    contracts = options_entry["plugin_contracts"]
+    assert [contract["plugin_id"] for contract in contracts] == ["source/csv"]
+    # The contract is the SAME bounded projection a get_plugin_schema
+    # discovery turn would have produced — this is a turn saved, not a new
+    # disclosure surface.
+    full_catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
+    expected = planner_plugin_contract(PolicyCatalogView.for_trained_operator(full_catalog, snapshot).get_schema("source", "csv"))
+    assert contracts[0] == expected.to_dict()
+    # Entries whose code is not the option-shape class stay contract-free.
+    assert all("plugin_contracts" not in e for e in feedback["validation"]["errors"] if e is not options_entry)
+
+
+def test_violated_plugin_contract_is_withheld_for_a_config_owned_component() -> None:
+    """Config-owned entries withhold the contract with the detail it rides on.
+
+    The identity now arrives structurally, so withholding is no longer a
+    side effect of withholding the message — it is its own decision, and it
+    must still be made: naming which plugin a finalizer-config-owned component
+    runs discloses reviewed private configuration exactly as the message would
+    (elspeth-5904b1683a). One gate governs both facts.
+    """
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="rejected_mutation",
+                message="Source 'reviewed': Invalid options for source 'csv': unknown option 'bogus_option'.",
+                severity="error",
+                error_code="plugin_options_invalid",
+                plugin_identity=("source", "csv"),
+            ),
+        ),
+    )
+    result = cast(Any, SimpleNamespace(validation=summary))
+    resolved: list[tuple[str, str]] = []
+
+    def _resolver(kind: Any, plugin_name: str) -> Mapping[str, Any]:
+        resolved.append((kind, plugin_name))
+        return {"plugin_id": f"{kind}/{plugin_name}"}
+
+    disclosed = _allowlisted_candidate_feedback(result, plugin_contract_resolver=_resolver)
+    assert disclosed["validation"]["errors"][0]["plugin_contracts"] == [{"plugin_id": "source/csv"}]
+    assert resolved == [("source", "csv")]
+
+    resolved.clear()
+    withheld = _allowlisted_candidate_feedback(
+        result,
+        finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"source:reviewed"}), routing=frozenset()),
+        plugin_contract_resolver=_resolver,
+    )
+    entry = withheld["validation"]["errors"][0]
+    assert "plugin_contracts" not in entry
+    assert "detail" not in entry
+    # Never even asked: the resolver call itself would be a policy read keyed
+    # on a withheld identity.
+    assert resolved == []
+
+
+def test_an_entry_without_a_carried_identity_attaches_nothing() -> None:
+    """Fail closed on absence — there is no parse fallback.
+
+    The message still names a plugin in the option-shape pattern, and reading
+    it would "work". That is exactly the fallback this must not have: the
+    entries lacking a carrier are the ones whose identity nothing resolved, so
+    a fallback would reopen every injection vector for precisely them.
+    """
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="rejected_mutation",
+                message="Output 'out': Invalid options for sink 'json': bad path.",
+                severity="error",
+                error_code="plugin_options_invalid",
+            ),
+        ),
+    )
+    called: list[tuple[str, str]] = []
+
+    def _resolver(kind: Any, plugin_name: str) -> Mapping[str, Any]:
+        called.append((kind, plugin_name))
+        return {"plugin_id": f"{kind}/{plugin_name}"}
+
+    feedback = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary)),
+        plugin_contract_resolver=_resolver,
+    )
+
+    entry = feedback["validation"]["errors"][0]
+    assert "plugin_contracts" not in entry
+    assert called == []
+    # The repair keeps every other fact — losing the enrichment is the cost.
+    assert "bad path" in entry["detail"]
+
+
+def test_violated_plugin_contract_omitted_when_the_budget_cannot_seat_it() -> None:
+    """Budget pressure omits the contract; it never truncates one.
+
+    A resolver returning ``None`` is the aggregate-budget refusal the planner
+    loop's closure produces. The entry keeps every other fact — the repair
+    stays possible on the detail alone, one turn slower.
+    """
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="rejected_mutation",
+                message="Node 'summarize': Invalid options for transform 'llm': bad options.",
+                severity="error",
+                error_code="plugin_options_invalid",
+                plugin_identity=("transform", "llm"),
+            ),
+        ),
+    )
+
+    feedback = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary)),
+        plugin_contract_resolver=lambda _kind, _plugin: None,
+    )
+
+    entry = feedback["validation"]["errors"][0]
+    assert "plugin_contracts" not in entry
+    assert "bad options" in entry["detail"]
+
+
+def _candidate_context(tmp_path: Path, session_id: str) -> tuple[ToolContext, PolicyCatalogView, Path]:
+    """Production-shaped candidate context: data_dir, session_id, real catalog."""
+    blobs = tmp_path / "blobs" / session_id
+    blobs.mkdir(parents=True, exist_ok=True)
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy_catalog = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    context = ToolContext(
+        catalog=policy_catalog,
+        plugin_snapshot=snapshot,
+        data_dir=str(tmp_path),
+        session_id=session_id,
+    )
+    return context, policy_catalog, blobs
+
+
+def _bad_source(blobs: Path, **overrides: Any) -> dict[str, Any]:
+    """A csv source whose options fail prevalidation (no ``schema``)."""
+    return {
+        "plugin": "csv",
+        "on_success": "clean",
+        "options": {"path": str(blobs / "in.csv"), **overrides},
+        "on_validation_failure": "discard",
+    }
+
+
+_INJECTED_PLUGIN = "no_such_plugin_xyz"
+_INJECTED_CLAUSE = f"Invalid options for transform '{_INJECTED_PLUGIN}'"
+
+
+@pytest.mark.parametrize(
+    ("label", "sources", "nodes", "outputs", "expected"),
+    (
+        pytest.param(
+            "default-source",
+            None,
+            [],
+            None,
+            [("source", "csv")],
+            id="producer-default-source",
+        ),
+        pytest.param(
+            "named-source",
+            {"alt": None},
+            [],
+            None,
+            [("source", "csv")],
+            id="producer-named-source",
+        ),
+        pytest.param(
+            "node",
+            None,
+            [
+                {
+                    "id": "clean",
+                    "node_type": "transform",
+                    "plugin": "field_mapper",
+                    "input": "clean",
+                    "on_success": "out",
+                    "options": {"bogus_option": True},
+                }
+            ],
+            None,
+            [("source", "csv"), ("transform", "field_mapper")],
+            id="producer-node",
+        ),
+        pytest.param(
+            "output",
+            None,
+            [],
+            [{"sink_name": "out", "plugin": "json", "options": {}}],
+            [("source", "csv"), ("sink", "json")],
+            id="producer-output",
+        ),
+    ),
+)
+def test_every_producer_records_the_identity_it_resolved(
+    tmp_path: Path,
+    label: str,
+    sources: dict[str, Any] | None,
+    nodes: list[dict[str, Any]],
+    outputs: list[dict[str, Any]] | None,
+    expected: list[tuple[str, str]],
+) -> None:
+    """Each ``plugin_options_invalid`` producer carries its ``(kind, plugin)``.
+
+    The consumer fails closed on absence, so a producer that forgets the
+    carrier loses its attach SILENTLY — no error, just a repair turn that
+    never learns the contract. These positive pins per producer shape are the
+    only thing that catches that, which is why they exist per shape rather
+    than as one representative case.
+    """
+    del label
+    context, _policy_catalog, blobs = _candidate_context(tmp_path, "session-producer-pins")
+    source_block = _bad_source(blobs)
+    arguments: dict[str, Any] = {
+        "nodes": nodes,
+        "edges": [],
+        "outputs": outputs
+        if outputs is not None
+        else [{"sink_name": "out", "plugin": "json", "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}}}],
+        "metadata": {"name": "p"},
+    }
+    if sources is None:
+        arguments["source"] = source_block
+    else:
+        arguments["sources"] = dict.fromkeys(sources, source_block)
+
+    result = build_set_pipeline_candidate(arguments, _empty_state(), context).result
+
+    assert result.success is False
+    carried = [entry.plugin_identity for entry in result.validation.errors if entry.error_code == "plugin_options_invalid"]
+    assert carried == expected, [e.message[:80] for e in result.validation.errors]
+
+
+def test_the_secret_ref_placement_producer_records_its_identity_too(tmp_path: Path) -> None:
+    """The head with no subject clause still carries the identity.
+
+    ``_prevalidate_plugin_options``'s first branch emits
+    ``Invalid secret_ref placement for <kind> '<plugin>': <option-keys> ...``,
+    whose head no option-shape parser recognises — but its CALLER was
+    validating a known plugin, so the carrier is populated regardless of which
+    branch produced the text. That is the structural point: the producer's
+    knowledge does not depend on how it phrased the message.
+    """
+    context, _policy_catalog, blobs = _candidate_context(tmp_path, "session-secret-ref-pin")
+    result = build_set_pipeline_candidate(
+        {
+            "source": _bad_source(blobs, **{"schema": {"mode": "observed"}, _INJECTED_CLAUSE: {"secret_ref": "N"}}),
+            "nodes": [],
+            "edges": [],
+            "outputs": [{"sink_name": "out", "plugin": "json", "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}}}],
+            "metadata": {"name": "p"},
+        },
+        _empty_state(),
+        context,
+    ).result
+
+    entry = next(e for e in result.validation.errors if e.error_code == "plugin_options_invalid")
+    assert "Invalid secret_ref placement for source 'csv'" in entry.message
+    assert entry.plugin_identity == ("source", "csv")
+
+
+@pytest.mark.parametrize(
+    ("vector", "source_name", "source_overrides"),
+    (
+        pytest.param(
+            "option value",
+            "alt",
+            {"schema": {"mode": "observed"}, "delimiter": _INJECTED_CLAUSE},
+            id="injected-via-option-value",
+        ),
+        pytest.param(
+            "option key (secret_ref-placement head)",
+            "alt",
+            {"schema": {"mode": "observed"}, _INJECTED_CLAUSE: {"secret_ref": "N"}},
+            id="injected-via-option-key",
+        ),
+        pytest.param(
+            "component name closing the quote",
+            f"x': {_INJECTED_CLAUSE}",
+            {},
+            id="injected-via-component-name",
+        ),
+    ),
+)
+def test_no_model_authored_text_can_inject_an_identity_into_the_contract_attach(
+    tmp_path: Path,
+    vector: str,
+    source_name: str,
+    source_overrides: dict[str, Any],
+) -> None:
+    """Every place these messages interpolate model text is closed at once.
+
+    Three independent vectors defeated three successive parsers: the rejected
+    option VALUES quoted in a validator's details, the option KEYS quoted in
+    the secret_ref-placement head, and the component NAME in the attribution
+    prefix — which is unvalidated for exactly the components that fail, so the
+    model can close the quote itself and put a clause at any anchor's offset.
+    Reading the identity from the producer instead closes all three by
+    construction rather than one at a time, which is the whole reason the
+    parsing approach was abandoned (elspeth-1d8fc3da83).
+
+    The failure mode being prevented is not a bad enrichment: resolving an
+    injected name raises ``plugin_not_enabled`` out of the feedback synthesis,
+    past the ``except _PipelineCandidateRejected`` arm, and kills the request
+    that one repair turn would have fixed.
+    """
+    del vector
+    context, policy_catalog, blobs = _candidate_context(tmp_path, "session-injection")
+    result = build_set_pipeline_candidate(
+        {
+            "sources": {source_name: _bad_source(blobs, **source_overrides)},
+            "nodes": [
+                {
+                    "id": "clean",
+                    "node_type": "transform",
+                    "plugin": "field_mapper",
+                    "input": "clean",
+                    "on_success": "out",
+                    "options": {"bogus_option": True},
+                }
+            ],
+            "edges": [],
+            "outputs": [{"sink_name": "out", "plugin": "json", "options": {"path": str(blobs / "o.json"), "schema": {"mode": "observed"}}}],
+            "metadata": {"name": "p"},
+        },
+        _empty_state(),
+        context,
+    ).result
+    assert result.success is False
+    assert any(_INJECTED_PLUGIN in entry.message for entry in result.validation.errors), "the injection must reach the message"
+
+    charged: list[str] = []
+
+    def _resolver(kind: Any, plugin_name: str) -> Mapping[str, Any] | None:
+        # No try/except, exactly as the shipped closure: an identity the policy
+        # view never admitted raises straight through this synthesis.
+        contract, projection_available = _project_planner_plugin_contract(policy_catalog.get_schema(kind, plugin_name))
+        if not projection_available:
+            return None
+        assert contract is not None
+        payload = contract.to_dict()
+        charged.append(str(payload["plugin_id"]))
+        return payload
+
+    feedback = _allowlisted_candidate_feedback(result, plugin_contract_resolver=_resolver)
+
+    # The injected identity is never resolved, never attached, never charged.
+    assert all(_INJECTED_PLUGIN not in identity for identity in charged), charged
+    attached = [c["plugin_id"] for e in feedback["validation"]["errors"] for c in e.get("plugin_contracts", [])]
+    assert all(_INJECTED_PLUGIN not in identity for identity in attached), attached
+    # The sibling node's genuine contract still rides the same repair turn —
+    # one poisoned entry must not cost the others their facts.
+    assert "transform/field_mapper" in attached
+    assert "transform/field_mapper" in charged
 
 
 @pytest.mark.asyncio

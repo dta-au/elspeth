@@ -8,6 +8,24 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-18 — `ToolResult.to_dict()` keys are declared TWICE: the dataclass
+  and the redaction manifest** (landed with elspeth-f14aba9686). Adding a
+  serialized key to `ToolResult.to_dict()` without declaring it in
+  `redaction.py` does not degrade gracefully: `_ToolResultResponseModel` is
+  `extra="forbid"`, so every type-driven mutating tool REJECTS the response at
+  the audit-persistence boundary (a scoped tool test stays green; the failure
+  is in `redact_tool_call_response`). Declare the key on the model (Sensitive
+  envelope for payload-bearing keys) AND in `_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS`,
+  then regenerate `redaction_policy_snapshot.json` via
+  `scripts/cicd/bootstrap_redaction_snapshot.py --write` — never by hand. Know
+  the two carve-outs: (a) declarative entries with `handles_no_sensitive_data=True`
+  have EMPTY `known_response_keys` — the shared-list edit never reaches them and
+  the new key aggregates as `REDACTED_UNKNOWN_RESPONSE_FIELD` (value-free, safe,
+  +1 telemetry event — the pre-existing `affected_nodes` pattern); (b)
+  `check_redaction_direction.py` can verdict a pure strengthening as `weaken`
+  via its conservative same-count rule when an entry's hash moves only by
+  gaining a non-sensitive key — that needs the `policy-weaken-justified` label
+  + exact-phrase rationale on the PR, not a code workaround.
 - **2026-08-18 — guided prompt traps: the palette gate polices the COMPOSED
   prompt, step skills feed THREE surfaces, and the planner context is where
   you explain a redaction** (conventions landed with elspeth-63cf3803e6; the

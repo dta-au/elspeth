@@ -35,7 +35,7 @@ from sqlalchemy import Engine
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
 from elspeth.core.config import TriggerConfig
@@ -62,6 +62,7 @@ from elspeth.web.composer.plugin_policy_disclosure import (
     prohibited_plugin_section,
 )
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
@@ -81,11 +82,13 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
     SOURCE_AUTHORING_KEY,
+    SOURCE_COMPONENT_ID,
     InterpretationRequirement,
     ServerStagedRequiredControlUserTerm,
     composer_pipeline_decision_user_term_error,
     parse_interpretation_requirements,
     serialize_authoring_review_options,
+    source_name_from_component_id,
     strip_authoring_options,
 )
 from elspeth.web.paths import (
@@ -792,6 +795,15 @@ class ToolResult:
             field *only when non-empty*. Eliminates the second
             round-trip the LLM would otherwise burn calling
             ``get_plugin_schema`` separately after each rejection.
+        applied_component: Post-finalizer projection of the components a
+            successful mutation applied — the exact ``set_pipeline``
+            arguments ``get_pipeline_state(component="set_pipeline_arguments")``
+            serves, narrowed to what the mutation touched (see
+            ``_applied_component_echo``). Populated only on successful
+            incremental mutations by ``_mutation_result``; never on failures
+            and never on a full replacement. ``to_dict`` emits this field
+            *only when set*. Eliminates the ``get_pipeline_state`` round-trip
+            the LLM would otherwise burn to see what the server stored.
     """
 
     success: bool
@@ -803,6 +815,7 @@ class ToolResult:
     runtime_preflight: ValidationResult | None = None
     post_call_hints: tuple[str, ...] = ()
     plugin_schemas: Mapping[str, Mapping[str, Any]] | None = None
+    applied_component: Mapping[str, Any] | None = None
     _validation_snapshot_hash: str | None = field(default=None, compare=False, repr=False)
     # True when this failure envelope deliberately withheld the pre-mutation
     # state's validate() entries (full-replacement rejections,
@@ -817,6 +830,8 @@ class ToolResult:
             freeze_fields(self, "data")
         if self.plugin_schemas is not None:
             freeze_fields(self, "plugin_schemas")
+        if self.applied_component is not None:
+            freeze_fields(self, "applied_component")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a dict suitable for LLM tool response.
@@ -865,6 +880,9 @@ class ToolResult:
 
         if self.plugin_schemas:
             result["plugin_schemas"] = deep_thaw(self.plugin_schemas)
+
+        if self.applied_component:
+            result["applied_component"] = deep_thaw(self.applied_component)
 
         return result
 
@@ -1025,6 +1043,7 @@ def _failure_result(
     *,
     error_code: str | None = None,
     with_state_validation: bool = True,
+    plugin_identity: tuple[str, str] | None = None,
 ) -> ToolResult:
     """Build a ToolResult for a failed mutation.
 
@@ -1043,11 +1062,17 @@ def _failure_result(
     (freeform chat tool messages, composer MCP responses) serialize
     ``ToolResult.to_dict()`` verbatim (elspeth-e89e6bf47a; tutorial session
     38e3e7f8 burned its repair budget on exactly that noise).
+
+    ``plugin_identity`` records the ``(kind, plugin)`` this rejection is about,
+    for the in-process planner consumer that attaches the plugin's contract.
+    Pass it ONLY when the identity has already been resolved through the
+    request's policy view — the caller knows; the message does not, and cannot
+    be made to. Omitting it costs an enrichment, never correctness.
     """
     if with_state_validation:
-        validation = _prepend_rejection_entry(state.validate(), error_msg, error_code=error_code)
+        validation = _prepend_rejection_entry(state.validate(), error_msg, error_code=error_code, plugin_identity=plugin_identity)
     else:
-        validation = _rejection_only_validation(error_msg, error_code=error_code)
+        validation = _rejection_only_validation(error_msg, error_code=error_code, plugin_identity=plugin_identity)
     data = {_DATA_ERROR_KEY: error_msg}
     if error_code is not None:
         data["error_code"] = error_code
@@ -1071,6 +1096,30 @@ def _failure_result(
 _INVALID_OPTIONS_PLUGIN_RE: Final[re.Pattern[str]] = re.compile(
     r"Invalid options for (source|transform|sink) '([^']+)'",
 )
+
+
+def plugin_identities_in_option_failure(message: str) -> tuple[tuple[PluginKind, str], ...]:
+    """Return the ``(kind, plugin)`` pairs one option-shape message names.
+
+    Scans the WHOLE message, so it reports identities the validator never
+    resolved. These messages interpolate model-authored text in three places —
+    the details tail quotes rejected option VALUES, the secret_ref-placement
+    head quotes option KEYS, and the ``set_pipeline`` attribution prefix
+    quotes the component NAME, which is unvalidated for exactly the components
+    that fail — and each one is enough to plant a plugin identity here. No
+    reading of the message is trustworthy; that is why the in-process consumer
+    now carries ``ValidationEntry.plugin_identity`` from the producer instead
+    (elspeth-1d8fc3da83).
+
+    The freeform augmentation below is this function's only caller and keeps
+    the whole-message reading, its own pre-existing behaviour: changing it
+    would move the schema bytes it inlines. Its exposure is real and tracked
+    separately.
+
+    Ordering is sorted and duplicates dropped.
+    """
+    identities = {(cast(PluginKind, match.group(1)), match.group(2)) for match in _INVALID_OPTIONS_PLUGIN_RE.finditer(message)}
+    return tuple(sorted(identities))
 
 
 def build_plugin_schemas_for_failure(
@@ -1108,10 +1157,8 @@ def build_plugin_schemas_for_failure(
         return None
     discovered: dict[tuple[str, str], Mapping[str, Any]] = {}
     for entry in result.validation.errors:
-        for match in _INVALID_OPTIONS_PLUGIN_RE.finditer(entry.message):
-            kind = cast(PluginKind, match.group(1))
-            plugin_name = match.group(2)
-            key = (kind, plugin_name)
+        for key in plugin_identities_in_option_failure(entry.message):
+            kind, plugin_name = key
             if key in discovered:
                 continue
             schema = catalog.get_schema(kind, plugin_name)
@@ -1128,6 +1175,7 @@ def _prepend_rejection_entry(
     error_msg: str,
     *,
     error_code: str | None = None,
+    plugin_identity: tuple[str, str] | None = None,
 ) -> ValidationSummary:
     """Return a ValidationSummary with a leading rejected_mutation entry.
 
@@ -1141,6 +1189,7 @@ def _prepend_rejection_entry(
         message=error_msg,
         severity="high",
         error_code=error_code,
+        plugin_identity=plugin_identity,
     )
     return ValidationSummary(
         is_valid=False,
@@ -1156,6 +1205,7 @@ def _rejection_only_validation(
     error_msg: str,
     *,
     error_code: str | None = None,
+    plugin_identity: tuple[str, str] | None = None,
 ) -> ValidationSummary:
     """Return a ValidationSummary holding only a rejected_mutation entry.
 
@@ -1171,6 +1221,7 @@ def _rejection_only_validation(
         message=error_msg,
         severity="high",
         error_code=error_code,
+        plugin_identity=plugin_identity,
     )
     return ValidationSummary(is_valid=False, errors=(rejection,))
 
@@ -1227,6 +1278,7 @@ def _mutation_result(
     prior_validation: ValidationSummary | None = None,
     data: Any = None,
     post_call_hints: tuple[str, ...] = (),
+    full_replacement: bool = False,
 ) -> ToolResult:
     """Build a ToolResult for a successful mutation.
 
@@ -1237,6 +1289,15 @@ def _mutation_result(
     ``affected_nodes``. See ``contracts/plugin_assistance.py`` for
     the discipline; ``ToolResult.to_dict`` emits the field only when
     non-empty.
+
+    ``affected`` is also what scopes the applied-component echo, so every
+    mutating tool gets it from the identifiers it already reports — node ids,
+    source component ids, and sink names — with no per-tool wiring.
+    ``full_replacement`` suppresses that echo for the whole-document authoring
+    tools (``set_pipeline`` / ``apply_pipeline_recipe``): there every component
+    is affected, so the echo would be the whole-state read it exists to
+    replace, and the model already holds those bytes verbatim in the call it
+    just made.
     """
     validation = new_state.validate()
     return ToolResult(
@@ -1247,6 +1308,7 @@ def _mutation_result(
         prior_validation=prior_validation,
         data=data,
         post_call_hints=post_call_hints,
+        applied_component=None if full_replacement else _applied_component_echo(new_state, affected),
     )
 
 
@@ -3188,3 +3250,103 @@ def _serialize_set_pipeline_arguments(state: CompositionState) -> tuple[dict[str
         serialized_sources[source_name] = source_payload
     payload["sources"] = serialized_sources
     return payload, None
+
+
+# Ceiling on one applied-component echo, canonically encoded. Sized against
+# the provider-payload budget family in ``planner_authoring_aids`` (8 KiB
+# expression grammar, 24 KiB discovery digest, 48 KiB plugin contract) rather
+# than the blob-reading caps: this is a provider response surface, not a file
+# read. The echo replaces a ``get_pipeline_state`` call whose payload is the
+# WHOLE state in the wider diagnostic serialization, so the cap bounds a
+# pathological single response — it is not a parsimony budget.
+_APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES: Final[int] = 16 * 1024
+
+
+def _applied_component_echo(
+    state: CompositionState,
+    affected: tuple[str, ...],
+) -> Mapping[str, Any] | None:
+    """Project the components a successful mutation applied, post-finalizer.
+
+    The echo is the exact ``set_pipeline`` arguments that
+    ``get_pipeline_state(component="set_pipeline_arguments")`` already serves
+    to this same surface, narrowed to the components named in ``affected``
+    plus the edges on their endpoints. After a successful mutation the model
+    knows THAT it worked and which errors remain, but not what the server
+    stored where it transformed the input — canonicalized routes, merged
+    defaults, reconciled sink-mirror edges. Echoing the applied component
+    closes that gap without the model spending a ``get_pipeline_state`` turn
+    reading the whole document back.
+
+    Component scope is the natural bound: an incremental mutation touches one
+    component and the edges on it. Full-replacement mutations do not echo at
+    all (see ``_mutation_result``'s ``full_replacement``) — there "the applied
+    component" is the entire document, which is the whole-state read this
+    exists to avoid.
+
+    Returns ``None`` when nothing resolves (a removal whose subject is gone
+    from the new state), when the state cannot be represented as exact
+    ``set_pipeline`` arguments, or when the canonical projection exceeds
+    ``_APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES``. An oversized echo is
+    dropped WHOLE, never truncated: half a component reads as a complete one
+    and would author a wrong repair.
+    """
+    if not affected:
+        return None
+    payload, round_trip_error = _serialize_set_pipeline_arguments(state)
+    if round_trip_error is not None:
+        # The public authoring payload is unavailable for this state; the
+        # model can still get the diagnostic view (and the exact reason) from
+        # get_pipeline_state. An echo is never worth a second projection.
+        return None
+    assert payload is not None
+
+    state_node_ids = {node.id for node in state.nodes}
+    state_output_names = {output.name for output in state.outputs}
+    source_names: list[str] = []
+    node_ids: set[str] = set()
+    output_names: set[str] = set()
+    for component in affected:
+        # Source component ids are a closed spelling ('source' / 'source:<name>'),
+        # so they resolve first exactly as _execute_get_pipeline_state resolves
+        # its 'source' argument ahead of node and output lookup.
+        source_name = source_name_from_component_id(component)
+        if source_name is not None:
+            if source_name in state.sources and source_name not in source_names:
+                source_names.append(source_name)
+            continue
+        if component in state_node_ids:
+            node_ids.add(component)
+        elif component in state_output_names:
+            output_names.add(component)
+
+    echo: dict[str, Any] = {}
+    if "source" in payload and SOURCE_COMPONENT_ID in source_names:
+        echo["source"] = payload["source"]
+    if "sources" in payload:
+        serialized_sources = payload["sources"]
+        selected = {name: serialized_sources[name] for name in source_names if name in serialized_sources}
+        if selected:
+            echo["sources"] = selected
+    nodes = [node for node in payload["nodes"] if node["id"] in node_ids]
+    if nodes:
+        echo["nodes"] = nodes
+    outputs = [output for output in payload["outputs"] if output["sink_name"] in output_names]
+    if outputs:
+        echo["outputs"] = outputs
+    # Sink-targeting edges name an OUTPUT on one endpoint, so the endpoint set
+    # spans all three component kinds. These edges are the mirror the mutation
+    # tools reconcile server-side (_reconcile_node_sink_mirror_edges); without
+    # them the echo would restate bytes the model already authored and hide the
+    # one thing it did not write.
+    edge_endpoints = node_ids | output_names | set(source_names)
+    edges = [edge for edge in payload["edges"] if edge["from_node"] in edge_endpoints or edge["to_node"] in edge_endpoints]
+    if edges:
+        echo["edges"] = edges
+    if not echo:
+        return None
+
+    echo = redact_source_storage_path(echo)
+    if len(canonical_json(echo).encode("utf-8")) > _APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES:
+        return None
+    return echo

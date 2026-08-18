@@ -559,8 +559,11 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("get_pipeline_state") == {
             "name": "get_pipeline_state",
             "description": "Inspect the full current pipeline state including all "
-            "options for source, nodes, and outputs. Use this during correction "
-            "loops to see what is currently configured before patching.",
+            "options for source, nodes, and outputs. When a mutation result carries "
+            "an applied_component field, that field is already the post-change state "
+            "of everything that mutation touched — read it there, and call this tool "
+            "for what it does not cover: a component the change did not touch, or "
+            "the whole document.",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -52,6 +52,7 @@ from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.protocol import PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.authority_hashing import project_composer_authority_payload
@@ -1536,6 +1537,13 @@ def _truncated_response_notice() -> str:
 # died terminal on a single prose reply with its whole repair budget unspent).
 _PROSE_NUDGE_BUDGET = 2
 
+# Aggregate ceiling on every plugin contract this request hands the planner —
+# the ones it asked for through get_plugin_schema AND the ones a rejection
+# attaches for a violated plugin. One budget because the planner request is
+# append-only: every selected contract is re-sent on every later turn, so what
+# matters is the total the conversation carries, not any single payload.
+_SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES: Final[int] = 48 * 1024
+
 # Message prefix every ``bind_guided_reviewed_components`` complaint about the
 # SHAPE OF THE CANDIDATE carries (guided/planning.py). Those describe what the
 # planner authored, so they are repairable; every other AuditIntegrityError
@@ -2202,6 +2210,7 @@ def _allowlisted_candidate_feedback(
     repeated_fingerprint: bool = False,
     finalizer_owned: _FinalizerOwnedRefs = _FINALIZER_OWNS_NOTHING,
     components_withheld: int = 0,
+    plugin_contract_resolver: Callable[[PluginKind, str], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Project only structured validation fields already safe for tool output.
 
@@ -2244,6 +2253,21 @@ def _allowlisted_candidate_feedback(
     facts (``declared_sinks``, contract producer/consumer ids) are
     structural labels, never option values, and remain the repair
     vocabulary the model must use.
+
+    ``plugin_contract_resolver`` attaches the projected planner contract for
+    every plugin a ``plugin_options_invalid`` entry names, under the SAME
+    entry-scoped withholding as ``detail`` — a config-owned component's
+    validator message is withheld, and so is the plugin identity inside it.
+    The freeform surface has done this since the option-shape augmentation
+    landed (``build_plugin_schemas_for_failure``); the planner surface was
+    denied it and had to buy the same bytes with a ``get_plugin_schema`` turn.
+    The contract is rehydrated through the request's live policy view at
+    synthesis time — never stored bytes — so a plugin the policy view no
+    longer exposes cannot be resurrected from an earlier turn, and it is
+    charged against the same aggregate contract budget the model-requested
+    schemas draw on. Charging it HERE is what makes a violated plugin's
+    contract win the budget over a later speculative ``get_plugin_schema``;
+    nothing already sent is ever evicted to make room.
     """
     validation = result.validation
     errors: list[dict[str, Any]] = []
@@ -2289,6 +2313,35 @@ def _allowlisted_candidate_feedback(
             # instruction its own prompt was built from, or the reviewed output
             # field names already in its ``reviewed_planner_context``.
             projected["detail"] = entry.message
+        if code == "plugin_options_invalid" and not withhold_candidate_facts and plugin_contract_resolver is not None:
+            # The detail above names only the VIOLATED keys; the contract names
+            # every key the plugin accepts and how. Same custody class as the
+            # detail it rides with — a public plugin schema this provider can
+            # already read with get_plugin_schema on this surface — so the only
+            # thing attaching it changes is which turn the planner learns it on.
+            #
+            # The identity comes from the PRODUCER, never from the message.
+            # These messages interpolate model-authored text in three separate
+            # places — the rejected option values, the secret_ref-placement
+            # head's option keys, and the component-name attribution prefix,
+            # which is unvalidated for exactly the components that fail — and
+            # each one was enough to plant a plugin identity that no validator
+            # had admitted. Resolving one of those raises out of this synthesis
+            # and kills the whole request where a repair turn was correct.
+            # ``ValidationEntry.plugin_identity`` is recorded where the failure
+            # is built, from what the validator actually resolved.
+            #
+            # No parse fallback: an entry without the carrier attaches nothing.
+            # A fallback would reopen every one of those vectors for precisely
+            # the entries that lack it.
+            contract = None
+            if entry.plugin_identity is not None:
+                contract = plugin_contract_resolver(*entry.plugin_identity)
+            if contract is not None:
+                # A list because attribution belongs to the entry, not the
+                # message: every collected entry carries its own subject, and
+                # this key is where a future producer attributing two would go.
+                projected["plugin_contracts"] = [contract]
         if code in _ROUTE_DESTINATION_FACT_CODES and not withholding.connectivity:
             # Instance wiring facts derived from the REJECTED candidate state
             # the result carries — the dangling value and the exact valid
@@ -3441,6 +3494,35 @@ async def _plan_pipeline_inner(
     # of letting the model burn budget without knowing it is looping.
     seen_rejection_fingerprints: set[tuple[tuple[str, str], ...]] = set()
 
+    def _violated_plugin_contract(kind: PluginKind, plugin_name: str) -> Mapping[str, Any] | None:
+        """Rehydrate and charge one violated plugin's planner contract.
+
+        Defined beside the ledger it charges rather than at the rejection
+        site, so the aggregate contract budget has exactly one mutator.
+
+        ``get_schema`` raising here is a Tier-1 anomaly, not a miss: the
+        candidate reached option prevalidation only because
+        ``_validate_plugin_name`` already resolved this identity through this
+        same request-scoped policy view, so a failure means the view changed
+        under the request. That propagates, exactly as
+        ``build_plugin_schemas_for_failure`` documents for the freeform twin.
+        A schema the BOUNDED projection cannot represent is an ordinary miss
+        and simply goes unattached — the model still has
+        ``get_plugin_assistance``.
+        """
+        contract, projection_available = _project_planner_plugin_contract(
+            policy_catalog.get_schema(kind, plugin_name),
+        )
+        if not projection_available:
+            return None
+        assert contract is not None
+        contract_payload = contract.to_dict()
+        candidate_contracts = [*selected_schema_contracts, contract_payload]
+        if len(canonical_json(candidate_contracts).encode("utf-8")) > _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES:
+            return None
+        selected_schema_contracts.append(contract_payload)
+        return contract_payload
+
     async def call_model(
         *,
         model_override: str | None = None,
@@ -4302,11 +4384,13 @@ async def _plan_pipeline_inner(
                 repeated_fingerprint = rejection_fingerprint in seen_rejection_fingerprints
                 seen_rejection_fingerprints.add(rejection_fingerprint)
                 candidate_facts_withheld = _rejection_facts_withheld(exc.result, finalizer_owned_refs)
+
                 candidate_feedback = _allowlisted_candidate_feedback(
                     exc.result,
                     repeated_fingerprint=repeated_fingerprint,
                     finalizer_owned=finalizer_owned_refs,
                     components_withheld=_withheld_component_count(exc.result),
+                    plugin_contract_resolver=_violated_plugin_contract,
                 )
                 if os.environ.get("ELSPETH_PLANNER_REJECTION_DETAIL_LOG") == "1":
                     # Operator-opted diagnostic seam. Validator messages are never
@@ -4642,7 +4726,7 @@ async def _plan_pipeline_inner(
             if result_call is not call:
                 raise AuditIntegrityError("planner discovery result order diverged from admitted calls")
             encoded_contracts = len(canonical_json(selected_schema_contracts).encode("utf-8"))
-            budget_remaining = 48 * 1024 - encoded_contracts - (1 if selected_schema_contracts else 0)
+            budget_remaining = _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES - encoded_contracts - (1 if selected_schema_contracts else 0)
             serialized_result = _serialize_provider_discovery_result(
                 call=call,
                 result=result,
@@ -4667,7 +4751,7 @@ async def _plan_pipeline_inner(
                     assert contract is not None
                     contract_payload = contract.to_dict()
                     candidate_contracts = [*selected_schema_contracts, contract_payload]
-                    if len(canonical_json(candidate_contracts).encode("utf-8")) > 48 * 1024:
+                    if len(canonical_json(candidate_contracts).encode("utf-8")) > _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES:
                         information_available = False
                     else:
                         selected_schema_contracts.append(contract_payload)

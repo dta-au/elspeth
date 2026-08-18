@@ -1,7 +1,7 @@
 {
   "apply_pipeline_recipe": {
-    "hash": "ee77023691b197eb5324f445749e402658cdff78ff21c5fb67142f96ad03d564",
-    "sensitive_path_count": 8,
+    "hash": "3219efa35a90d639389d1e690594bece00b6f28bc71e0b8f0f355a78ace30219",
+    "sensitive_path_count": 9,
     "shape": "type_driven"
   },
   "clear_source": {
@@ -10,8 +10,8 @@
     "shape": "declarative"
   },
   "create_blob": {
-    "hash": "9c517ff4fccfdeed81a4ab157a7a93d8f5caad76b7d0bfbea3d6bda875a28094",
-    "sensitive_path_count": 8,
+    "hash": "a1f75e097bb8f3ac169dc36c1132b2c9e1e7471ba3280de6ff7990e47e2ec013",
+    "sensitive_path_count": 9,
     "shape": "type_driven"
   },
   "delete_blob": {
@@ -110,18 +110,18 @@
     "shape": "declarative"
   },
   "patch_node_options": {
-    "hash": "be2ca964c622b0d6fb327408f483f4bf79611597195c2717fb9359a319ec6985",
-    "sensitive_path_count": 8,
+    "hash": "f690debe51134748eae2ed32c6a045036bbccfc737f63307a0ee880db7846467",
+    "sensitive_path_count": 9,
     "shape": "type_driven"
   },
   "patch_output_options": {
-    "hash": "531ecbdd9e6ae307a0e109eb8fc07aee1546a6bf29edbf6426fa93807554255b",
-    "sensitive_path_count": 8,
+    "hash": "a304875cdb66d0b3c3e620caccbbb0cd77f86053d351330d37b5406423bd573d",
+    "sensitive_path_count": 9,
     "shape": "type_driven"
   },
   "patch_source_options": {
-    "hash": "7cdda12f8b4646091cdc35dd608d1e7337b686ae52f7c41c240b31a8595accc9",
-    "sensitive_path_count": 8,
+    "hash": "e87a4b48597b01f8192e2a44216e30a10fecaaeba3cccb8fcefd0fdb3a8a54f9",
+    "sensitive_path_count": 9,
     "shape": "type_driven"
   },
   "preview_pipeline": {
@@ -155,43 +155,43 @@
     "shape": "type_driven"
   },
   "set_metadata": {
-    "hash": "8449060c98b7f2ef4833198e649a0ce7589f81e0e7c86d446d974ff654cb1268",
+    "hash": "03e120925852c3a5fd3d0f877c485a668c548501eb87bf788a6383854214c75f",
     "sensitive_path_count": 1,
     "shape": "declarative"
   },
   "set_output": {
-    "hash": "050be0ce234b0e9fb2a7614aafd5afdf5af32b66cf4b2306bd71a8f448d81b53",
+    "hash": "e16e384524c9cddce7263d6b634c31b307283d374789479cd77df2b2c6bd17f0",
     "sensitive_path_count": 1,
     "shape": "declarative"
   },
   "set_pipeline": {
-    "hash": "31a322cdea83c62ec429513224b9d804a88e3e54ff0cf48a0544abe0e47aea7c",
-    "sensitive_path_count": 13,
+    "hash": "2be00ea4558632ce540cb0dd4f588a306b0b4c2d1e76ba7a428db72dba70fff6",
+    "sensitive_path_count": 14,
     "shape": "type_driven"
   },
   "set_source": {
-    "hash": "d51669ceb24b3f56615b7258ea9e82cb9ee921ae57d92aa4087e717689e711e2",
-    "sensitive_path_count": 8,
+    "hash": "b5ad35fd44b5b15f9de3b756e01c66ac2af5d748d0b45febc708269db45f6f2c",
+    "sensitive_path_count": 9,
     "shape": "type_driven"
   },
   "set_source_from_blob": {
-    "hash": "3a1db583fd2c6710ed5a228e8f9956e9639700a6bcb0a67833e18fb76db434d1",
-    "sensitive_path_count": 8,
+    "hash": "dd6f8268d5dbf573244b3c7fcd1770f7605c8b12106b4024a60987a2f2db98af",
+    "sensitive_path_count": 9,
     "shape": "type_driven"
   },
   "set_source_from_blobs": {
-    "hash": "ab9c4231102aba99f74a55b92e9c482a0d6fb083cb729af3e53b47034b63bcbd",
-    "sensitive_path_count": 8,
+    "hash": "132353e5b058c10a3d02469dc4ff54fddb5d99b9e70adc77f2a9c2bac95acf00",
+    "sensitive_path_count": 9,
     "shape": "type_driven"
   },
   "splice_transform": {
-    "hash": "eb468b135403722f674650e81031700c74c1e85936d61e03b756438406b8dde8",
-    "sensitive_path_count": 8,
+    "hash": "f954d9c1e969bb73d043d3ec88e8b980bf50170f97eca5ea89f505a196e08c4d",
+    "sensitive_path_count": 9,
     "shape": "type_driven"
   },
   "update_blob": {
-    "hash": "2986003a656619b2b47e720ed4c26dd77231a4cbe955b75a71a2619060edacd2",
-    "sensitive_path_count": 8,
+    "hash": "0475fb6b9a86e4b7dd21e7ddf1e17e72d88927ef09b85a1afaff534e6ab166a1",
+    "sensitive_path_count": 9,
     "shape": "type_driven"
   },
   "upsert_edge": {
@@ -200,7 +200,7 @@
     "shape": "declarative"
   },
   "upsert_node": {
-    "hash": "398109b50ca0ca81358fa274e07478bcb94423d0ab0a3e82cbb4398243f6b835",
+    "hash": "5e655ce50aed0c23614781e07992623e85bf1d15d25ead43d8ba5d048eeb69c9",
     "sensitive_path_count": 3,
     "shape": "declarative"
   },

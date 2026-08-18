@@ -1099,6 +1099,24 @@ class ValidationEntry:
     contract: SchemaContractDetail | None = None
     row_union_schema: RowUnionSchemaDetail | None = None
     coalesce_union_type: CoalesceUnionTypeDetail | None = None
+    # The ``(kind, plugin)`` this entry is ABOUT, recorded by the producer at
+    # the moment it builds the failure — where the identity is known
+    # authoritatively — for the in-process consumer that would otherwise have
+    # to recover it by parsing ``message``. Parsing is not recoverable here:
+    # these messages interpolate model-authored option values, option KEYS,
+    # and the component name itself, and three successive parsers were each
+    # defeated by a different one of those (elspeth-1d8fc3da83).
+    #
+    # Set it ONLY where the identity has already been resolved through the
+    # request's policy view; a name that has not been is exactly the input
+    # that makes a downstream catalog lookup raise. Absent is the safe value —
+    # consumers must fail closed on ``None`` rather than fall back to parsing.
+    #
+    # Deliberately IN-MEMORY ONLY: absent from ``ValidationEntryDict`` and
+    # from ``to_dict`` below, so no wire shape, redaction manifest, or audit
+    # projection moves. Keep it that way unless a wire consumer genuinely
+    # needs it.
+    plugin_identity: tuple[str, str] | None = None
 
     def to_dict(self) -> ValidationEntryDict:
         """Serialize to a plain dict for JSON responses."""
