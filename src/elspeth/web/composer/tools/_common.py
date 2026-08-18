@@ -1175,6 +1175,51 @@ def _rejection_only_validation(
     return ValidationSummary(is_valid=False, errors=(rejection,))
 
 
+# Key under which a merged rejection envelope reports the components it
+# collected but did not list. Present only when the cap actually truncated,
+# so a reader never has to distinguish "no overflow" from "not counted".
+COMPONENTS_WITHHELD_KEY: Final[str] = "components_withheld"
+
+
+def _merged_component_rejection_result(
+    results: Sequence[ToolResult],
+    *,
+    components_withheld: int,
+) -> ToolResult:
+    """Merge one full-replacement candidate's per-component rejections.
+
+    A full-replacement candidate is validated component by component; each
+    failing component produces its own single-entry rejection envelope. This
+    joins them into ONE envelope so a single repair turn names every defective
+    component instead of the first (elspeth-4fad98a453): three defective
+    components used to cost three turns, which is deterministic
+    REPAIR_EXHAUSTED against the default repair budget.
+
+    The FIRST failing component's envelope is the base — its ``data`` payload
+    (including the credential-rejection repair block) and its leading entry
+    stay exactly what a single-component rejection would have produced, so
+    ordering is stable and no response shape moves. Later components
+    contribute their rejection entries only. ``components_withheld`` records
+    the components the caller's reporting cap dropped; truncation is never
+    silent.
+    """
+    base = results[0]
+    entries = tuple(entry for result in results for entry in result.validation.errors if entry.component == "rejected_mutation")
+    data = base.data
+    merged_data: Any = data
+    if components_withheld:
+        merged_data = (
+            {**data, COMPONENTS_WITHHELD_KEY: components_withheld}
+            if isinstance(data, Mapping)
+            else {COMPONENTS_WITHHELD_KEY: components_withheld}
+        )
+    return replace(
+        base,
+        validation=ValidationSummary(is_valid=False, errors=entries),
+        data=merged_data,
+    )
+
+
 def _mutation_result(
     new_state: CompositionState,
     affected: tuple[str, ...],

@@ -679,10 +679,18 @@ def test_reviewed_source_rehydrates_trusted_options_and_runs_b_before_plugin_val
         expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
     )
 
-    def _plugin_validation_must_not_run(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("plugin validation ran before canonical invariant B")
+    # Scoped to the SOURCE's own plugin validation: since a rejected component
+    # no longer stops the node and output sections (elspeth-4fad98a453), a
+    # blanket stub would fire on the unrelated transform node and prove
+    # nothing about this ordering.
+    real_validate_plugin_name = sessions_tools._validate_plugin_name
 
-    monkeypatch.setattr(sessions_tools, "_validate_plugin_name", _plugin_validation_must_not_run)
+    def _source_plugin_validation_must_not_run(context: Any, kind: str, plugin_name: str) -> Any:
+        if kind == "source":
+            raise AssertionError("source plugin validation ran before canonical invariant B")
+        return real_validate_plugin_name(context, kind, plugin_name)
+
+    monkeypatch.setattr(sessions_tools, "_validate_plugin_name", _source_plugin_validation_must_not_run)
     candidate = build_set_pipeline_candidate(
         _named_reviewed_pipeline(tmp_path, facts),
         _empty_state(),
@@ -2860,3 +2868,94 @@ def test_reviewed_source_authority_rejects_stale_authoring_content_hash(tmp_path
             reviewed_facts=facts,
             expected_reviewed_anchor_hash=anchor,
         )
+
+
+def _multi_defect_args(tmp_path: Path) -> dict[str, Any]:
+    """A candidate whose source, transform node, and sink are each misconfigured.
+
+    Three independent option-shape defects — the shape that used to cost three
+    repair turns because validation returned at the first one
+    (elspeth-4fad98a453).
+    """
+    args = _linear_args(tmp_path)
+    args["source"]["options"]["bogus_source_option"] = True
+    args["nodes"][0]["options"]["bogus_node_option"] = True
+    args["outputs"][0]["options"]["bogus_sink_option"] = True
+    return args
+
+
+def test_every_defective_component_is_reported_in_one_rejection(tmp_path: Path) -> None:
+    candidate = build_set_pipeline_candidate(
+        _multi_defect_args(tmp_path),
+        _empty_state(),
+        _trained_context(data_dir=tmp_path),
+    )
+
+    assert candidate.acceptable is False
+    messages = [entry.message for entry in candidate.result.validation.errors]
+    assert len(messages) == 3, messages
+    assert any(message.startswith("Source 'source':") or "Invalid options for source" in message for message in messages)
+    assert any(message.startswith("Node 'copy':") for message in messages)
+    assert any(message.startswith("Output 'main':") for message in messages)
+    assert all(entry.error_code == "plugin_options_invalid" for entry in candidate.result.validation.errors)
+
+
+def test_multi_component_rejection_keeps_the_first_failure_first(tmp_path: Path) -> None:
+    """Ordering is stable: the component that failed first still leads."""
+    candidate = build_set_pipeline_candidate(
+        _multi_defect_args(tmp_path),
+        _empty_state(),
+        _trained_context(data_dir=tmp_path),
+    )
+
+    messages = [entry.message for entry in candidate.result.validation.errors]
+    assert "bogus_source_option" in messages[0] or "Invalid options for source" in messages[0]
+    assert messages[1].startswith("Node 'copy':")
+    assert messages[2].startswith("Output 'main':")
+    # The leading rejection's own envelope is untouched, so a single-defect
+    # candidate and a multi-defect candidate agree on the `error` payload.
+    assert candidate.result.data["error"] == messages[0]
+
+
+def test_one_defective_component_is_reported_exactly_once(tmp_path: Path) -> None:
+    """Component granularity: a failed component runs none of its later checks."""
+    args = _linear_args(tmp_path)
+    args["nodes"][0]["options"]["bogus_node_option"] = True
+    args["nodes"][0]["options"]["provider_config"] = {"persist_directory": "/etc"}
+
+    candidate = build_set_pipeline_candidate(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    entries = candidate.result.validation.errors
+    assert len(entries) == 1, [entry.message for entry in entries]
+    assert entries[0].message.startswith("Node 'copy':")
+    # Exactly one rejection means the envelope is byte-identical to the
+    # pre-collection single-rejection shape: no withheld counter rides along.
+    assert "components_withheld" not in candidate.result.data
+
+
+def test_component_rejections_are_bounded_and_report_what_they_withheld(tmp_path: Path) -> None:
+    # Only the ELEVEN outputs are defective: the source and the transform are
+    # left valid (the node is repointed at a sink that exists). Nodes are
+    # validated before outputs, so a node defect would lead the entry list and
+    # the per-index assertion below would fail — the eight entries being
+    # outputs 1..8 is by construction, not by ordering luck.
+    args = _linear_args(tmp_path)
+    args["nodes"][0]["on_success"] = "main1"
+    args["outputs"] = [
+        {
+            "sink_name": f"main{index}",
+            "plugin": "json",
+            "options": _file_options(Path(f"outputs/result{index}.jsonl")) | {"format": "jsonl", "bogus_sink_option": True},
+            "on_write_failure": "discard",
+        }
+        for index in range(1, 12)
+    ]
+
+    candidate = build_set_pipeline_candidate(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    entries = candidate.result.validation.errors
+    assert len(entries) == 8
+    assert [entry.message.split(":", 1)[0] for entry in entries] == [f"Output 'main{index}'" for index in range(1, 9)]
+    # Truncation is reported, never silent: eleven components failed, eight
+    # are listed, and the remaining three are counted.
+    assert candidate.result.data["components_withheld"] == 3

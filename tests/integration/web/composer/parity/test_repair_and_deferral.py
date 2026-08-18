@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import replace
 from typing import Any
 from uuid import uuid4
@@ -215,9 +216,22 @@ def _assert_allowlisted_feedback_shape(feedback: dict[str, Any], *, error_class:
     # "guidance" rides candidate-rejection feedback only (not the canonical
     # schema projection) and is a STATIC usage line — never per-request data —
     # so it does not widen the redaction boundary this allowlist protects.
-    assert {"success", "validation"} <= set(feedback) <= {"success", "validation", "guidance"}, feedback
+    # "truncation_notice" rides a rejection the candidate builder capped
+    # (elspeth-4fad98a453). Its only variable part is the integer count of
+    # defective components the builder did not list — a number ELSPETH
+    # derived from its own gates, never candidate content — so the closed
+    # equality below is what keeps it at zero egress.
+    assert {"success", "validation"} <= set(feedback) <= {"success", "validation", "guidance", "truncation_notice"}, feedback
     if "guidance" in feedback:
         assert feedback["guidance"] == ("To expand any code, call explain_validation_error with the exact code string.")
+    if "truncation_notice" in feedback:
+        withheld_count = re.fullmatch(
+            r"(\d+) further component\(s\) of this candidate also failed validation and are not listed here\. "
+            r"Repair every component named above and re-emit; the remaining failures are reported on the next turn\.",
+            feedback["truncation_notice"],
+        )
+        assert withheld_count is not None, feedback["truncation_notice"]
+        assert int(withheld_count.group(1)) > 0, feedback["truncation_notice"]
     assert feedback["success"] is False
     validation = feedback["validation"]
     assert set(validation) == {"is_valid", "errors"}, validation
@@ -233,11 +247,29 @@ def _assert_allowlisted_feedback_shape(feedback: dict[str, Any], *, error_class:
         # (producer/consumer component ids + schema FIELD NAMES from validated
         # config — pipeline metadata, never row content; see
         # SchemaContractDetail in composer.state). Nothing else may ride.
+        # A canonical-schema rejection may additionally carry
+        # "schema_violations": the JSON path of each structural violation, the
+        # violated keyword, and a scalar constraint from the schema the SAME
+        # provider was advertised — location and rule only, never the rejected
+        # value (elspeth-4fad98a453). Nothing else may ride.
         assert {"component", "severity", "error_code", "error_class"} <= set(entry), entry
-        assert set(entry) <= {"component", "severity", "error_code", "error_class", "explanation", "suggested_fix", "contract"}, entry
+        assert set(entry) <= {
+            "component",
+            "severity",
+            "error_code",
+            "error_class",
+            "explanation",
+            "suggested_fix",
+            "contract",
+            "schema_violations",
+            "schema_violations_withheld",
+        }, entry
         assert ("explanation" in entry) == ("suggested_fix" in entry), entry
         if "contract" in entry:
             assert set(entry["contract"]) <= {"producer", "consumer", "missing_fields", "extra_fields"}, entry
+        for violation in entry["schema_violations"] if "schema_violations" in entry else ():
+            assert {"path", "rule"} <= set(violation), violation
+            assert set(violation) <= {"path", "rule", "constraint", "detail"}, violation
         assert entry["error_class"] == error_class
     # No provider prose, plugin name, option value, or raw message may ride
     # the feedback. The static catalogue enrichment legitimately mentions the

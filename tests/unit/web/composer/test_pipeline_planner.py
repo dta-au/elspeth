@@ -69,8 +69,10 @@ from elspeth.web.composer.pipeline_planner import (
     _derive_finalizer_owned_refs,
     _feedback_error_codes,
     _FinalizerOwnedRefs,
+    _materialize_terminal_payload,
     _parse_response_tool_calls,
     _ParsedToolCall,
+    _rejection_fingerprint,
     _serialize_provider_discovery_result,
     _transform_node_count,
     plan_pipeline,
@@ -4093,11 +4095,14 @@ async def test_finalizer_mutation_keeps_model_authored_component_detail(
     repair_messages = completion.requests[1]["messages"]
     feedback = json.loads(repair_messages[-1]["content"])
     entries = {entry["component"]: entry for entry in feedback["validation"]["errors"]}
-    # Pre-application rejections surface as ``rejected_mutation`` with the
-    # subject in the message prefix; the prefix parser attributes it to the
-    # model-authored node, so the entry keeps its true component and detail.
-    assert "rejected_mutation" in entries, feedback
-    node_entry = entries["rejected_mutation"]
+    # Pre-application rejections carry the literal component
+    # ``rejected_mutation`` and name their subject in the message prefix; the
+    # prefix parser attributes it to the model-authored node, so the projected
+    # entry is filed under that node's canonical ref and keeps its detail.
+    # One rejection can now name several components (elspeth-4fad98a453), so
+    # the projected component has to discriminate.
+    assert "node:clean_rows" in entries, feedback
+    node_entry = entries["node:clean_rows"]
     assert node_entry["error_code"] == "plugin_options_invalid"
     assert node_entry["detail"].startswith("Node 'clean_rows':")
     assert "mapping" in node_entry["detail"]
@@ -4369,7 +4374,12 @@ async def test_invalid_candidate_gets_allowlisted_feedback_then_repairs(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    raw_canary = "RAW_VALIDATION_EXCEPTION_CANARY"
+    # Lowercase because sink names are: the advertised terminal schema now
+    # discloses that rule, so an upper-cased name is intercepted by the
+    # structural pre-check and this test would never reach the Stage-1
+    # allowlist it exists to pin (elspeth-2e9df07c69). The canary's job is to
+    # ride along in the candidate and prove no raw validator text escapes.
+    raw_canary = "raw_validation_exception_canary"
     completion = _ScriptedCompletion(
         _response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path, output_name=raw_canary)})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
@@ -4540,10 +4550,17 @@ def test_budget_policy_is_frozen_slotted_and_rejects_non_decimal_cost() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pydantic_invalid_terminal_draft_gets_bounded_schema_repair(
+async def test_structurally_invalid_terminal_draft_gets_located_schema_repair(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
+    """The pre-check names WHERE the candidate broke the advertised schema.
+
+    A bare ``canonical_schema`` code cost a whole repair turn to localize; the
+    JSON path, the violated keyword, and the scalar constraint are all facts
+    the planner already holds (it authored the payload; it was handed the
+    schema), so naming them is zero-egress (elspeth-4fad98a453).
+    """
     malformed = _pipeline(tmp_path)
     malformed["source"]["plugin"] = 123
     completion = _ScriptedCompletion(
@@ -4565,10 +4582,14 @@ async def test_pydantic_invalid_terminal_draft_gets_bounded_schema_repair(
                     "severity": "high",
                     "error_code": "canonical_schema",
                     "error_class": "SchemaValidationError",
+                    "schema_violations": [{"path": "source/plugin", "rule": "type", "constraint": "string"}],
                 }
             ],
         },
     }
+    # The rejected VALUE never rides along — jsonschema puts it in the
+    # message, which this projection deliberately never reads.
+    assert "123" not in completion.requests[1]["messages"][-1]["content"]
 
 
 _CANONICAL_SCHEMA_FEEDBACK = {
@@ -4604,7 +4625,8 @@ def _missing_source_feedback() -> dict[str, Any]:
                 }
             ],
         },
-        "guidance": "To expand any code, call explain_validation_error with the exact code string.",
+        # See _binding_rejection_expected_feedback: an enriched entry makes
+        # the explain_validation_error advertisement information-free.
     }
 
 
@@ -4724,7 +4746,15 @@ async def test_binder_candidate_shape_defect_gets_bounded_schema_repair(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """Every remaining binder candidate-shape defect is repairable too."""
+    """An UNTYPED binder candidate-shape complaint still repairs, never 500s.
+
+    Every binder site in ``src/`` raises the typed
+    ``GuidedCandidateBindingRejected`` (elspeth-989c4108ef finished the
+    conversion), so this arm is production-unreachable and the stubbed
+    finalizer below is the only way to reach it. It is kept deliberately: the
+    canonical-schema fallback is the fail-closed net for a future untyped
+    site, and losing it would turn an authoring slip into a terminal 500.
+    """
     attempts: list[Mapping[str, Any]] = []
 
     def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -4786,7 +4816,10 @@ def _binding_rejection_expected_feedback() -> dict[str, Any]:
                 }
             ],
         },
-        "guidance": "To expand any code, call explain_validation_error with the exact code string.",
+        # No "guidance": the entry already carries the catalogue's
+        # (explanation, suggested_fix), so calling explain_validation_error
+        # would return byte-equivalent text for a whole provider turn
+        # (elspeth-41b406c9fc).
     }
 
 
@@ -7611,7 +7644,13 @@ async def test_opted_in_rejection_diagnostics_never_log_authored_values(
 ) -> None:
     from structlog.testing import capture_logs
 
-    authored_canary = "AUTHORED_VALUE_MUST_NOT_ENTER_LOGS"
+    # Lowercase for the same reason as
+    # test_invalid_candidate_gets_allowlisted_feedback_then_repairs: an
+    # upper-cased sink name is now a structural pre-check rejection, and this
+    # test pins the STAGE-1 diagnostic emission. The pre-check's own
+    # diagnostic is pinned by
+    # test_schema_precheck_diagnostics_log_only_closed_schema_classifiers.
+    authored_canary = "authored_value_must_not_enter_logs"
     invalid = _pipeline(tmp_path)
     invalid["outputs"][0]["sink_name"] = authored_canary
     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": invalid})))
@@ -8225,3 +8264,447 @@ async def test_none_reasoning_effort_leaves_planner_kwargs_unhinted(
     (sent,) = completion.requests
     assert "reasoning" not in sent
     assert "reasoning_effort" not in sent
+
+
+def test_explain_tool_advertisement_is_dropped_once_every_code_is_enriched() -> None:
+    """The advertisement earns its turn only while some code arrived bare.
+
+    The projection and ``explain_validation_error`` read the SAME closed
+    catalogue, so for an enriched entry the call returns byte-equivalent text
+    — a whole provider turn spent re-reading what is already in the context
+    (elspeth-41b406c9fc).
+    """
+    enriched_only = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="node:fork_it",
+                message="RAW_MESSAGE_CANARY",
+                severity="error",
+                error_code="unknown_node_type",
+            ),
+        ),
+    )
+
+    feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=enriched_only)))
+
+    (entry,) = feedback["validation"]["errors"]
+    assert entry["explanation"] and entry["suggested_fix"]
+    assert "guidance" not in feedback
+
+    with_bare_code = ValidationSummary(
+        is_valid=False,
+        errors=(
+            *enriched_only.errors,
+            ValidationEntry(component="pipeline", message="RAW_MESSAGE_CANARY", severity="error", error_code=None),
+        ),
+    )
+
+    mixed_feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=with_bare_code)))
+
+    assert mixed_feedback["guidance"] == "To expand any code, call explain_validation_error with the exact code string."
+
+
+def test_withheld_mode_never_advertises_the_guaranteed_empty_explain_call() -> None:
+    """Blind-mode guidance is attached to every entry, so the call cannot add anything."""
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="source",
+                message="RAW_MESSAGE_CANARY",
+                severity="error",
+                error_code="plugin_options_invalid",
+            ),
+        ),
+    )
+
+    feedback = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"source"}), routing=frozenset()),
+    )
+
+    (entry,) = feedback["validation"]["errors"]
+    assert entry["component"] == "pipeline"
+    assert entry["explanation"]
+    assert "guidance" not in feedback
+
+
+def test_truncated_component_rejection_feedback_reports_what_was_withheld() -> None:
+    """A capped rejection says so; the model must not read it as the whole set."""
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=tuple(
+            ValidationEntry(
+                component="rejected_mutation",
+                message=f"Output 'main{index}': Invalid options for sink 'json': RAW_MESSAGE_CANARY",
+                severity="high",
+                error_code="plugin_options_invalid",
+            )
+            for index in range(1, 9)
+        ),
+    )
+
+    feedback = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        components_withheld=3,
+    )
+
+    assert [entry["component"] for entry in feedback["validation"]["errors"]] == [f"output:main{index}" for index in range(1, 9)]
+    assert feedback["truncation_notice"].startswith("3 further component(s)")
+
+
+@pytest.mark.asyncio
+async def test_multi_component_rejection_repairs_every_component_in_one_turn(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Three defective components cost ONE repair turn, not three.
+
+    With the default repair budget a candidate whose source, transform, and
+    sink were each misconfigured was a deterministic REPAIR_EXHAUSTED: each
+    turn revealed one more defect (elspeth-4fad98a453).
+    """
+    defective = _pipeline(tmp_path)
+    # Named-source form: its rejections carry the ``Source '<name>': `` subject
+    # prefix, so the projection can attribute them. (The legacy single
+    # ``source`` block emits several messages without that prefix; those
+    # entries stay filed under ``rejected_mutation``.)
+    defective["sources"] = {"input_rows": defective.pop("source")}
+    defective["sources"]["input_rows"]["options"]["bogus_source_option"] = True
+    defective["nodes"] = [
+        {
+            "id": "copy",
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "rows",
+            "on_success": "rows",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}, "bogus_node_option": True},
+        }
+    ]
+    defective["outputs"][0]["options"]["bogus_sink_option"] = True
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": defective})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, repair_budget=1)
+
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    entries = feedback["validation"]["errors"]
+    # Every defective component is named, in the order it was validated, and
+    # each carries the validator detail its repair needs.
+    assert [entry["component"] for entry in entries] == ["source:input_rows", "node:copy", "output:rows"]
+    assert all(entry["error_code"] == "plugin_options_invalid" for entry in entries)
+    assert "bogus_source_option" in entries[0]["detail"]
+    assert "bogus_node_option" in entries[1]["detail"]
+    assert "bogus_sink_option" in entries[2]["detail"]
+    assert "truncation_notice" not in feedback
+
+
+@pytest.mark.asyncio
+async def test_schema_precheck_diagnostics_log_only_closed_schema_classifiers(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Candidates stopped at the pre-check reach the operator diagnostic too.
+
+    The pre-check answers a candidate before any tool runs, so this whole
+    class used to be invisible to ``composer.planner_rejection_detail``. It
+    logs the schema-side location and the violated keyword only: an INSTANCE
+    path can contain a mapping key the planner authored, and authored values
+    never enter logs.
+    """
+    from structlog.testing import capture_logs
+
+    authored_canary = "AUTHORED_SINK_NAME_MUST_NOT_ENTER_LOGS"
+    invalid = _pipeline(tmp_path)
+    invalid["outputs"][0]["sink_name"] = authored_canary
+    invalid["source"]["on_success"] = authored_canary
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": invalid})))
+    monkeypatch.setenv("ELSPETH_PLANNER_REJECTION_DETAIL_LOG", "1")
+
+    with capture_logs() as logs, pytest.raises(PipelinePlannerError):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            repair_budget=0,
+            model_overrides={"escape_hatch_model": None},
+        )
+
+    diagnostic = next(entry for entry in logs if entry["event"] == "composer.planner_rejection_detail")
+    assert authored_canary not in json.dumps(diagnostic)
+    assert all(entry["error_code"] == "canonical_schema" for entry in diagnostic["entries"])
+    assert all("message" not in entry for entry in diagnostic["entries"])
+    assert {entry["rule"] for entry in diagnostic["entries"]} <= {"pattern", "maxLength", "not", "type"}
+    assert all(entry["schema_path"].startswith("properties/") for entry in diagnostic["entries"])
+
+
+def _binder_rejection(error_code: str, **facts: Any) -> GuidedCandidateBindingRejected:
+    return GuidedCandidateBindingRejected(
+        "guided planner candidate delta violates reviewed mutation authority",
+        error_code=error_code,
+        connectivity=facts,
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_different_binder_defects_do_not_share_a_repeat_fingerprint(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A second, DIFFERENT binder defect is not a repeat of the first.
+
+    Ten binder sites share ``guided_delta_authority_violation``, so a code-only
+    fingerprint told a planner that had genuinely fixed one defect that its
+    rejection set was "EXACTLY the same" and to keep every other part
+    byte-identical — advice that can steer it into reverting the fix.
+    """
+    attempts: list[Mapping[str, Any]] = []
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        attempts.append(candidate)
+        if len(attempts) == 1:
+            raise _binder_rejection("guided_delta_authority_violation", component_kind="sources")
+        if len(attempts) == 2:
+            raise _binder_rejection("guided_delta_authority_violation", component_kind="nodes")
+        return candidate
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=2,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 2
+    first = json.loads(completion.requests[1]["messages"][-1]["content"])
+    second = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert "repeat_notice" not in first
+    assert "repeat_notice" not in second
+
+
+@pytest.mark.asyncio
+async def test_identical_binder_defect_still_draws_the_repeat_notice(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Discrimination must not cost the genuine-repeat signal: same code, same facts."""
+    attempts: list[Mapping[str, Any]] = []
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        attempts.append(candidate)
+        if len(attempts) <= 2:
+            raise _binder_rejection("guided_delta_authority_violation", component_kind="sources", delta_member="source_routes")
+        return candidate
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=2,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 2
+    second = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert second["repeat_notice"] == _REPEAT_NOTICE
+
+
+@pytest.mark.asyncio
+async def test_materializer_schema_defects_are_located_in_the_repair_feedback(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The post-materialize argument-model check names every failing field path.
+
+    This gate runs on the MATERIALIZED candidate, so its locations can name a
+    field the server bound; the located paths and pydantic's own closed error
+    types are structural either way, and no rejected value crosses.
+    """
+    value_canary = "MATERIALIZED_VALUE_CANARY"
+    materializations: list[Mapping[str, Any]] = []
+
+    def materialize(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        materializations.append(payload)
+        materialized = deepcopy(dict(payload))
+        if len(materializations) == 1:
+            materialized["nodes"] = [{"id": value_canary, "node_type": "transform", "input": 7, "options": {}}]
+            materialized["edges"] = value_canary
+        return materialized
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=1,
+        terminal_contract=PlannerTerminalContract(
+            schema=dict(canonical_set_pipeline_schema()),
+            materialize=materialize,
+        ),
+    )
+
+    assert proposal.proposal.repair_count == 1
+    content = completion.requests[1]["messages"][-1]["content"]
+    feedback = json.loads(content)
+    (entry,) = feedback["validation"]["errors"]
+    assert entry["error_code"] == "canonical_schema"
+    located = {violation["path"]: violation["rule"] for violation in entry["schema_violations"]}
+    assert "nodes/0/input" in located
+    assert "edges" in located
+    assert value_canary not in content
+
+
+def test_finalizer_owned_schema_defects_are_reported_without_their_location() -> None:
+    """The argument-model projection obeys the same custody rule its siblings do.
+
+    This gate runs on the MATERIALIZED candidate and ``sources`` is a mapping,
+    so a violation path can name a component by a name only the server holds:
+    on a guided surface the finalizer keys that mapping by a REVIEWED source's
+    user-given name. Defence in depth — the guided delta schema types every
+    member, so no planner-authored input reaches this arm today, which is why
+    the arm's inputs are synthesized here rather than driven through a plan.
+    """
+    reviewed_canary = "reviewed_private_source_name"
+
+    def materialize(payload: Mapping[str, Any]) -> PlannerTerminalMaterialization:
+        return PlannerTerminalMaterialization(
+            pipeline={
+                "sources": {
+                    reviewed_canary: {"plugin": 7, "on_success": "rows"},
+                    "authored_open": {"plugin": 7, "on_success": "rows"},
+                },
+                "nodes": [],
+                "edges": [],
+                "outputs": [],
+            },
+            config_owned_refs=frozenset({f"source:{reviewed_canary}"}),
+        )
+
+    pipeline_result, owned_refs, feedback, repeated = _materialize_terminal_payload(
+        payload={},
+        terminal_contract=PlannerTerminalContract(schema=dict(canonical_set_pipeline_schema()), materialize=materialize),
+        seen_rejection_fingerprints=set(),
+    )
+
+    assert pipeline_result is None
+    assert repeated is False
+    assert owned_refs.config == frozenset({f"source:{reviewed_canary}"})
+    assert feedback is not None
+    (entry,) = feedback["validation"]["errors"]
+    assert entry["error_code"] == "canonical_schema"
+    violations = entry["schema_violations"]
+    # The model-authored source keeps its location and its value-free rule
+    # detail; the finalizer-owned one is reported as an unlocated rule with
+    # the detail stripped, so neither the name nor a measure of its content
+    # crosses. The canary is the load-bearing assertion: an unlocated path is
+    # spelled "pipeline", which a root-level violation would also produce.
+    assert {violation["path"] for violation in violations} == {"sources/authored_open/plugin", "pipeline"}
+    assert reviewed_canary not in canonical_json(feedback)
+    by_path = {violation["path"]: violation for violation in violations}
+    assert by_path["pipeline"] == {"path": "pipeline", "rule": "string_type"}
+    assert by_path["sources/authored_open/plugin"]["detail"]
+
+
+def test_candidate_rejection_fingerprint_discriminates_disjoint_component_sets() -> None:
+    """Disjoint component sets are not "EXACTLY the same rejection set".
+
+    Every pre-application entry is filed under the literal
+    ``rejected_mutation``, so a fingerprint keyed on the raw component
+    collapsed wholly disjoint rejections onto one identity — and the repeat
+    notice then told the planner to keep every other part of its candidate
+    byte-identical (elspeth-4fad98a453).
+    """
+
+    def rejection(*subjects: str) -> Any:
+        return SimpleNamespace(
+            validation=ValidationSummary(
+                is_valid=False,
+                errors=tuple(
+                    ValidationEntry(
+                        component="rejected_mutation",
+                        message=f"{subject}: Invalid options for plugin 'json': RAW_MESSAGE_CANARY",
+                        severity="high",
+                        error_code="plugin_options_invalid",
+                    )
+                    for subject in subjects
+                ),
+            )
+        )
+
+    disjoint_first = _rejection_fingerprint(cast(Any, rejection("Source 'rows_in'", "Node 'clean'")))
+    disjoint_second = _rejection_fingerprint(cast(Any, rejection("Output 'rows_out'", "Node 'score'")))
+    assert disjoint_first != disjoint_second
+
+    # A genuine repeat — same components, same codes — still fingerprints the
+    # same, so the notice it earns still fires.
+    assert _rejection_fingerprint(cast(Any, rejection("Source 'rows_in'", "Node 'clean'"))) == disjoint_first
+
+
+@pytest.mark.asyncio
+async def test_disjoint_candidate_rejections_do_not_draw_the_repeat_notice(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Two different defective components in a row are not a repetition.
+
+    Same candidate skeleton both turns; only WHICH component carries the
+    unknown option moves. Both rejections are ``plugin_options_invalid`` on
+    ``rejected_mutation``, which is exactly the pair the old fingerprint could
+    not tell apart.
+    """
+
+    def named_source_candidate() -> dict[str, Any]:
+        candidate = _pipeline(tmp_path)
+        candidate["sources"] = {"input_rows": candidate.pop("source")}
+        return candidate
+
+    defective_source = named_source_candidate()
+    defective_source["sources"]["input_rows"]["options"]["bogus_source_option"] = True
+    defective_output = named_source_candidate()
+    defective_output["outputs"][0]["options"]["bogus_sink_option"] = True
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": defective_source})),
+        _response(("emit_pipeline_proposal", {"pipeline": defective_output})),
+        _response(("emit_pipeline_proposal", {"pipeline": named_source_candidate()})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=2,
+        model_overrides={"escape_hatch_model": None},
+    )
+
+    assert proposal.proposal.repair_count == 2
+    first = json.loads(completion.requests[1]["messages"][-1]["content"])
+    second = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert [entry["component"] for entry in first["validation"]["errors"]] == ["source:input_rows"]
+    assert [entry["component"] for entry in second["validation"]["errors"]] == ["output:rows"]
+    assert "repeat_notice" not in first
+    assert "repeat_notice" not in second

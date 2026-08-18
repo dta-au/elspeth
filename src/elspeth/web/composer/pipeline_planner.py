@@ -17,7 +17,7 @@ import math
 import os
 import re
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -106,7 +106,13 @@ from elspeth.web.composer.state import (
     gate_condition_is_constant,
     route_destination_facts,
 )
-from elspeth.web.composer.tools._common import PendingCustodyBlobView, RuntimePreflight, ToolContext, ToolResult
+from elspeth.web.composer.tools._common import (
+    COMPONENTS_WITHHELD_KEY,
+    PendingCustodyBlobView,
+    RuntimePreflight,
+    ToolContext,
+    ToolResult,
+)
 from elspeth.web.composer.tools._dispatch import (
     execute_discovery_tool_with_context,
     get_tool_definitions,
@@ -1980,8 +1986,19 @@ def _rejection_fingerprint(result: ToolResult) -> tuple[tuple[str, str], ...]:
     Project doctrine: an identical fingerprint repeating across attempts is a
     feedback-quality defect (ours), so the loop must at minimum TELL the model
     the repetition happened instead of silently burning budget on it.
+
+    The component half must be the ATTRIBUTED ref, not the raw one: every
+    pre-application entry is filed under the literal ``rejected_mutation``, so
+    keying on it collapsed wholly disjoint component sets onto one
+    fingerprint and told a planner its rejection set was "EXACTLY the same"
+    when nothing about it was. This fingerprint is internal — it never leaves
+    the loop — so the authored name inside a ref carries no egress.
     """
-    return tuple(sorted((entry.component, entry.error_code or "validation_error") for entry in _rejection_entries(result)))
+    return tuple(
+        sorted(
+            (_entry_component_ref(entry) or entry.component, entry.error_code or "validation_error") for entry in _rejection_entries(result)
+        )
+    )
 
 
 _REPEAT_NOTICE = (
@@ -2148,11 +2165,43 @@ def _rejection_facts_withheld(result: ToolResult, finalizer_owned: _FinalizerOwn
     return any(_entry_withholding(entry, finalizer_owned).withheld for entry in _rejection_entries(result))
 
 
+def _withheld_component_count(result: ToolResult) -> int:
+    """How many defective components the candidate builder counted but did not list."""
+    data = result.data
+    if not isinstance(data, Mapping) or COMPONENTS_WITHHELD_KEY not in data:
+        return 0
+    withheld = data[COMPONENTS_WITHHELD_KEY]
+    return withheld if type(withheld) is int else 0
+
+
+# Static usage line, never per-request data. Live planners called
+# explain_validation_error with junk ({"error_text": "ValidationError"})
+# because nothing said the exact code string is the lookup key. Kept
+# deliberately free of topology hints — mid-repair suggestions have derailed
+# otherwise-converging repairs.
+_EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explain_validation_error with the exact code string."
+
+
+def _explain_tool_advertisement_earns_its_turn(errors: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether pointing at ``explain_validation_error`` can still tell the model anything.
+
+    The tool and this projection read the SAME closed catalogue, so for an
+    entry that already carries its inline ``(explanation, suggested_fix)``
+    the call returns byte-equivalent guidance — a whole provider turn spent
+    to re-read text already in the context (elspeth-41b406c9fc). Advertise it
+    only while some entry arrived without that enrichment, which is exactly
+    when the call can add something; in withheld mode every entry is enriched
+    by construction, so the guaranteed-empty call is never suggested.
+    """
+    return any("explanation" not in entry for entry in errors)
+
+
 def _allowlisted_candidate_feedback(
     result: ToolResult,
     *,
     repeated_fingerprint: bool = False,
     finalizer_owned: _FinalizerOwnedRefs = _FINALIZER_OWNS_NOTHING,
+    components_withheld: int = 0,
 ) -> dict[str, Any]:
     """Project only structured validation fields already safe for tool output.
 
@@ -2206,7 +2255,16 @@ def _allowlisted_candidate_feedback(
         withholding = _entry_withholding(entry, finalizer_owned)
         withhold_candidate_facts = withholding.config
         any_facts_withheld = any_facts_withheld or withholding.withheld
-        component = "pipeline" if withhold_candidate_facts else entry.component
+        # A pre-application rejection entry is filed under the literal
+        # component ``rejected_mutation`` and names its subject only in the
+        # message prefix — which this projection withholds. One rejection can
+        # now carry several such entries (elspeth-4fad98a453), so projecting
+        # the raw component would give the model N indistinguishable entries.
+        # ``_entry_component_ref`` resolves the prefix into the same canonical
+        # vocabulary state-validation entries already use; the name inside it
+        # is one the planner authored in the candidate being answered.
+        attributed_component = _entry_component_ref(entry)
+        component = "pipeline" if withhold_candidate_facts else entry.component if attributed_component is None else attributed_component
         projected: dict[str, Any] = {
             "component": component,
             "severity": entry.severity,
@@ -2300,13 +2358,18 @@ def _allowlisted_candidate_feedback(
             "is_valid": validation.is_valid,
             "errors": errors,
         },
-        # Static usage line, never per-request data. Live planners called
-        # explain_validation_error with junk ({"error_text": "ValidationError"})
-        # because nothing said the exact code string is the lookup key. Kept
-        # deliberately free of topology hints — mid-repair suggestions have
-        # derailed otherwise-converging repairs.
-        "guidance": "To expand any code, call explain_validation_error with the exact code string.",
     }
+    if _explain_tool_advertisement_earns_its_turn(errors):
+        feedback["guidance"] = _EXPLAIN_VALIDATION_ERROR_GUIDANCE
+    if components_withheld:
+        # Never silent: the candidate builder caps how many defective
+        # components one rejection lists, and the model must be able to tell
+        # "these are all of them" from "these are the first of them".
+        feedback["truncation_notice"] = (
+            f"{components_withheld} further component(s) of this candidate also failed validation and are not "
+            "listed here. Repair every component named above and re-emit; the remaining failures are reported "
+            "on the next turn."
+        )
     if repeated_fingerprint:
         # Static text, never per-request data: names the repetition the model
         # cannot see on its own (it has no attempt counter) so budget stops
@@ -2384,26 +2447,209 @@ def _binding_rejection_feedback(
             "is_valid": False,
             "errors": [entry],
         },
-        "guidance": "To expand any code, call explain_validation_error with the exact code string.",
     }
+    if _explain_tool_advertisement_earns_its_turn([entry]):
+        feedback["guidance"] = _EXPLAIN_VALIDATION_ERROR_GUIDANCE
     if repeated_fingerprint:
         feedback["repeat_notice"] = _REPEAT_NOTICE
     return feedback
 
 
-def _canonical_schema_feedback() -> dict[str, Any]:
+def _binding_rejection_fingerprint(rejection: GuidedCandidateBindingRejected) -> tuple[tuple[str, str], ...]:
+    """Identity of one binder rejection: its code plus what the code is ABOUT.
+
+    The code alone is far too coarse. Ten binder sites share
+    ``guided_delta_authority_violation``, so a candidate that fixed a wrong
+    source name and then tripped a missing ``on_success`` drew the repeat
+    notice — which asserts the rejection set is EXACTLY the same and tells
+    the model to keep every other part byte-identical. That is false, and it
+    can steer a planner into reverting a genuine fix. The rejection's own
+    connectivity facts carry the discriminators: which collection the
+    complaint is about, and which delta member the binder was reading. Both
+    are closed structural labels the binder authors, never candidate values,
+    so a genuine repeat — same code, same facts — still fingerprints the same
+    and still draws the notice.
+    """
+    facts = rejection.connectivity
+    discriminators: list[tuple[str, str]] = []
+    for key in ("component_kind", "delta_member"):
+        if key not in facts:
+            continue
+        fact = facts[key]
+        if type(fact) is str:
+            discriminators.append((key, fact))
+    return (("pipeline", rejection.error_code), *discriminators)
+
+
+# How many schema violations one canonical-schema rejection names. A bare
+# ``canonical_schema`` code costs a whole repair turn to localize
+# (elspeth-4fad98a453), but an unbounded list of a pathological payload's
+# every violation is its own wall; the withheld count keeps truncation
+# visible.
+_MAX_REPORTED_SCHEMA_VIOLATIONS: Final[int] = 8
+
+
+class _SchemaViolation(TypedDict):
+    """One structural violation, as location + rule with no rejected value."""
+
+    path: str
+    rule: str
+    constraint: NotRequired[str | int]
+    detail: NotRequired[str]
+
+
+def _schema_violation_path(parts: Sequence[Any]) -> str:
+    """Name a violation's location inside the candidate the planner authored."""
+    return "/".join(str(part) for part in parts) if parts else "pipeline"
+
+
+def _schema_violation_component_ref(parts: Sequence[Any]) -> str | None:
+    """Canonical component ref a violation path names, or ``None``.
+
+    Only the two source shapes carry a component's NAME in the path itself
+    (``source/…`` and ``sources/<name>/…``, the same vocabulary
+    ``_candidate_component_blocks`` produces). ``nodes`` / ``outputs`` locate
+    by list INDEX and the remaining top-level members name no component at
+    all, so those paths are unattributable by construction — which the custody
+    rule reads as fail-closed, exactly as ``_entry_withholding`` does for an
+    unattributable rejection entry.
+    """
+    if not parts:
+        return None
+    if parts[0] == "source":
+        return "source"
+    if parts[0] == "sources" and len(parts) > 1 and type(parts[1]) is str and parts[1]:
+        return "source" if parts[1] == "source" else f"source:{parts[1]}"
+    return None
+
+
+def _structural_schema_violations(errors: Iterable[Any]) -> tuple[list[_SchemaViolation], int]:
+    """Project JSON-Schema errors into located, value-free repair facts.
+
+    The pre-check runs against the payload the planner itself authored, and
+    the schema is the one already advertised to it on this surface: the JSON
+    path, the violated keyword, and a scalar constraint are all facts the
+    same provider holds, so naming them discloses nothing new. The error's
+    own ``message`` is NOT projected — jsonschema embeds the rejected
+    instance in it, and a rejected value is the one thing this projection
+    must never echo back into an audited transcript.
+    """
+    violations: list[_SchemaViolation] = []
+    withheld = 0
+    for error in errors:
+        if len(violations) >= _MAX_REPORTED_SCHEMA_VIOLATIONS:
+            withheld += 1
+            continue
+        violation: _SchemaViolation = {
+            "path": _schema_violation_path(list(error.absolute_path)),
+            "rule": str(error.validator),
+        }
+        constraint = error.validator_value
+        if type(constraint) is str or type(constraint) is int:
+            violation["constraint"] = constraint
+        violations.append(violation)
+    return violations, withheld
+
+
+def _pydantic_schema_violations(
+    exc: PydanticValidationError,
+    *,
+    finalizer_owned: _FinalizerOwnedRefs,
+) -> tuple[list[_SchemaViolation], int]:
+    """Project argument-model errors into located repair facts, under custody.
+
+    Runs on the MATERIALIZED candidate, so a location can name a component
+    the server bound rather than one the planner wrote: ``sources`` is a
+    mapping, and on a guided surface the finalizer keys it by a REVIEWED
+    source's user-given name. Entry-scoped custody therefore applies here
+    exactly as it does to a rejection entry (elspeth-5904b1683a) — a
+    violation about a config-owned component, or one whose path attributes to
+    no component at all, is reported as an unlocated rule. The mask also
+    drops ``detail``: pydantic's length family renders a count derived from
+    the rejected input ("…not 5"), and a derived measure of private
+    configuration is disclosure.
+
+    Where custody permits the location, pydantic's closed error ``type`` and
+    the human ``msg`` ride with it — for pydantic's own built-in types the
+    text is a value-free template. ``value_error`` / ``assertion_error``
+    messages are written by a validator and can quote whatever it was handed,
+    so those two arms keep the location and drop the text.
+    """
+    server_owns_something = finalizer_owned.owns_anything()
+    violations: list[_SchemaViolation] = []
+    withheld = 0
+    for error in exc.errors():
+        if len(violations) >= _MAX_REPORTED_SCHEMA_VIOLATIONS:
+            withheld += 1
+            continue
+        rule = str(error["type"])
+        parts = list(error["loc"])
+        ref = _schema_violation_component_ref(parts)
+        if server_owns_something and (ref is None or ref in finalizer_owned.config):
+            violations.append({"path": "pipeline", "rule": rule})
+            continue
+        violation: _SchemaViolation = {
+            "path": _schema_violation_path(parts),
+            "rule": rule,
+        }
+        if rule not in {"value_error", "assertion_error"}:
+            violation["detail"] = str(error["msg"])
+        violations.append(violation)
+    return violations, withheld
+
+
+def _log_schema_precheck_rejection(trail: _PlannerAttemptTrail, errors: Sequence[Any]) -> None:
+    """Emit the opted-in diagnostic for a candidate stopped at the schema pre-check.
+
+    The Stage-1 emission (below, in the candidate-rejected arm) never saw
+    these candidates: the pre-check answers them before any tool runs, so an
+    operator debugging a repair loop lost the whole class. Same seam, same
+    rule — closed classifiers only. The INSTANCE path is deliberately not
+    logged: a mapping key inside it is authored text (a source name, a route
+    label). The schema path is our own advertised schema's structure and the
+    validator keyword is a JSON Schema keyword, so neither can carry an
+    authored value.
+    """
+    if os.environ.get("ELSPETH_PLANNER_REJECTION_DETAIL_LOG") != "1":
+        return
+    slog.warning(
+        "composer.planner_rejection_detail",
+        session_id=trail.session_id,
+        operation_id=trail.operation_id,
+        attempt=trail.attempts,
+        entries=[
+            {
+                "component": "pipeline",
+                "error_code": "canonical_schema",
+                "severity": "high",
+                "rule": str(error.validator),
+                "schema_path": "/".join(str(part) for part in error.absolute_schema_path),
+            }
+            for error in errors[:_MAX_REPORTED_SCHEMA_VIOLATIONS]
+        ],
+    )
+
+
+def _canonical_schema_feedback(
+    violations: Sequence[_SchemaViolation] = (),
+    *,
+    violations_withheld: int = 0,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "component": "pipeline",
+        "severity": "high",
+        "error_code": "canonical_schema",
+        "error_class": "SchemaValidationError",
+    }
+    if violations:
+        entry["schema_violations"] = list(violations)
+        if violations_withheld:
+            entry["schema_violations_withheld"] = violations_withheld
     return {
         "success": False,
         "validation": {
             "is_valid": False,
-            "errors": [
-                {
-                    "component": "pipeline",
-                    "severity": "high",
-                    "error_code": "canonical_schema",
-                    "error_class": "SchemaValidationError",
-                }
-            ],
+            "errors": [entry],
         },
     }
 
@@ -2433,7 +2679,7 @@ def _materialize_terminal_payload(
             raise AuditIntegrityError("planner terminal materializer must return an exact dict")
         SetPipelineArgumentsModel.model_validate(pipeline_result)
     except GuidedCandidateBindingRejected as exc:
-        binding_fingerprint = (("pipeline", exc.error_code),)
+        binding_fingerprint = _binding_rejection_fingerprint(exc)
         repeated = binding_fingerprint in seen_rejection_fingerprints
         seen_rejection_fingerprints.add(binding_fingerprint)
         return (
@@ -2442,8 +2688,22 @@ def _materialize_terminal_payload(
             _binding_rejection_feedback(exc, repeated_fingerprint=repeated),
             repeated,
         )
-    except PydanticValidationError:
-        return None, owned_refs, _canonical_schema_feedback(), False
+    except PydanticValidationError as exc:
+        # Locate every argument-model defect rather than answering with a bare
+        # code: the materialized candidate can be large, and "it does not match
+        # the canonical schema" told the planner nothing about WHERE
+        # (elspeth-4fad98a453). The custody refs are passed HERE rather than
+        # applied inside ``_canonical_schema_feedback``: that builder also
+        # serves the pre-check arm, whose instance paths are planner-authored
+        # by construction (it runs before materialization), and a mask there
+        # would degrade those back toward the bare code.
+        violations, violations_withheld = _pydantic_schema_violations(exc, finalizer_owned=owned_refs)
+        return (
+            None,
+            owned_refs,
+            _canonical_schema_feedback(violations, violations_withheld=violations_withheld),
+            False,
+        )
     return pipeline_result, owned_refs, None, False
 
 
@@ -3698,10 +3958,27 @@ async def _plan_pipeline_inner(
                     terminal_feedback = _deferred_intent_claim_feedback() if claim_shape_error else _canonical_schema_feedback()
                 else:
                     claimed_deferred_intent_ids = tuple(str(intent_id) for intent_id in payload.claimed_deferred_intent_ids)
+                    schema_errors = (
+                        []
+                        if payload.pipeline is None
+                        else list(Draft202012Validator(terminal_contract.schema).iter_errors(payload.pipeline))
+                    )
                     if not set(claimed_deferred_intent_ids).issubset(eligible_deferred_intent_ids):
                         terminal_feedback = _deferred_intent_claim_feedback()
-                    elif next(Draft202012Validator(terminal_contract.schema).iter_errors(payload.pipeline), None) is not None:
-                        terminal_feedback = _canonical_schema_feedback()
+                    elif schema_errors:
+                        # The structural pre-check runs ahead of Stage 1, so a
+                        # naming or shape violation never reaches the validator
+                        # whose codes name the failing field. Carrying the JSON
+                        # path and the violated rule keeps this gate as
+                        # actionable as its Stage-1 counterparts
+                        # (node_id_invalid / connection_label_invalid) instead
+                        # of spending a repair turn on "somewhere, something".
+                        schema_violations, schema_violations_withheld = _structural_schema_violations(schema_errors)
+                        terminal_feedback = _canonical_schema_feedback(
+                            schema_violations,
+                            violations_withheld=schema_violations_withheld,
+                        )
+                        _log_schema_precheck_rejection(trail, schema_errors)
                     else:
                         (
                             pipeline,
@@ -3742,11 +4019,15 @@ async def _plan_pipeline_inner(
                         # planner authored — repairable in one budgeted turn,
                         # never a 500. Typed rejections carry their closed
                         # code and custody-safe connectivity facts
-                        # (elspeth-572c642dbf); the residue (an empty
-                        # ``sources`` map, an invented component name) gets
-                        # the canonical schema complaint.
+                        # (elspeth-572c642dbf). Every binder site in ``src/``
+                        # now raises the typed form, so the ``else`` arm is
+                        # production-unreachable and stays only as the
+                        # fail-closed net for a future untyped site: an
+                        # unclassified candidate-shape complaint must still
+                        # reach the planner as a repairable rejection rather
+                        # than a 500.
                         if type(exc) is GuidedCandidateBindingRejected:
-                            binding_fingerprint = (("pipeline", exc.error_code),)
+                            binding_fingerprint = _binding_rejection_fingerprint(exc)
                             repeated_binding_fingerprint = binding_fingerprint in seen_rejection_fingerprints
                             seen_rejection_fingerprints.add(binding_fingerprint)
                             terminal_feedback = _binding_rejection_feedback(exc, repeated_fingerprint=repeated_binding_fingerprint)
@@ -4025,6 +4306,7 @@ async def _plan_pipeline_inner(
                     exc.result,
                     repeated_fingerprint=repeated_fingerprint,
                     finalizer_owned=finalizer_owned_refs,
+                    components_withheld=_withheld_component_count(exc.result),
                 )
                 if os.environ.get("ELSPETH_PLANNER_REJECTION_DETAIL_LOG") == "1":
                     # Operator-opted diagnostic seam. Validator messages are never

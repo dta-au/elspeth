@@ -238,17 +238,16 @@ class TestFailureSchemaAugmentationSetPipeline:
     def test_failed_set_pipeline_includes_plugin_schemas_for_named_plugins(self) -> None:
         """set_pipeline rejection naming a plugin → that plugin's schema inline.
 
-        set_pipeline is documented atomic: it bails at the first
-        per-component validation failure and does not gather every
-        option-shape rejection across source / nodes / sink. So this
-        end-to-end test asserts schemas inline for whichever plugin
-        the handler surfaced first. Multi-plugin error handling is
+        set_pipeline stays atomic as a MUTATION — nothing is applied — but its
+        validation now reports every defective component in one rejection
+        (elspeth-4fad98a453), so a candidate whose source and sink are both
+        misconfigured surfaces both option-shape errors and therefore both
+        schemas. Keys are emitted in sorted ``kind/plugin`` order by
+        ``build_plugin_schemas_for_failure``; prompts.py consumes that order.
+        Deduplication and the synthetic multi-plugin iteration contract are
         covered separately by
         ``test_plugin_schemas_deduplicated_when_multiple_errors_name_same_plugin``
-        and ``test_synthetic_multi_plugin_errors_produce_both_schemas``
-        which feed a hand-crafted ValidationSummary through
-        ``build_plugin_schemas_for_failure`` to prove the iteration
-        contract.
+        and ``test_synthetic_multi_plugin_errors_produce_both_schemas``.
         """
         catalog = _make_catalog_with_schemas(
             source_schemas={"csv": _csv_schema()},
@@ -279,21 +278,18 @@ class TestFailureSchemaAugmentationSetPipeline:
         payload = result.to_dict()
 
         assert result.success is False
-        # set_pipeline is atomic — it stops at the first per-component
-        # rejection it builds. The contract for plugin_schemas is "every
-        # plugin named in a surfaced 'Invalid options for ...' error",
-        # so we assert the exact iteration order that actually appears.
+        # The contract for plugin_schemas is "every plugin named in a
+        # surfaced 'Invalid options for ...' error". Both defective
+        # components are surfaced in the one rejection, so both schemas ride.
         assert "plugin_schemas" in payload
         # Build named_kinds as an ordered list (dict iteration is insertion
         # order in CPython 3.7+) so the assertion below is order-sensitive.
         named_kinds = [key.split("/", 1)[0] for key in payload["plugin_schemas"]]
-        # set_pipeline reports the source schema first — this ordering is
-        # the surface contract relied on by composer prompt construction
-        # (prompts.py consumes plugin_schemas in iteration order). If this
-        # flips to sink-first, or if multiple kinds appear (meaning atomic
-        # bail-at-first-failure was relaxed), the LLM context will reorder;
-        # reassess prompts.py before changing this expectation.
-        assert named_kinds == ["source"]
+        # Sorted kind/plugin order — the surface contract composer prompt
+        # construction relies on (prompts.py consumes plugin_schemas in
+        # iteration order). Reassess prompts.py before changing it.
+        assert named_kinds == ["sink", "source"]
+        assert [entry["component"] for entry in payload["validation"]["errors"]] == ["rejected_mutation", "rejected_mutation"]
         for key, schema in payload["plugin_schemas"].items():
             kind, plugin = key.split("/", 1)
             assert schema["name"] == plugin
