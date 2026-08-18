@@ -1285,7 +1285,8 @@ def transition_sink_field_review(
     # no extractable fields is a schema-form defect on a different axis; it is
     # deliberately not adjudicated here, so the guard keys on declared fields
     # being present, not on the mode alone.
-    declared = reviewed_schema_declared_field_names(plugin_options.get("schema"))
+    sink_schema = plugin_options["schema"] if "schema" in plugin_options else None
+    declared = reviewed_schema_declared_field_names(sink_schema)
     if selected and declared:
         undeclared = sorted(set(selected) - set(declared))
         if undeclared:

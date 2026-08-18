@@ -3847,13 +3847,12 @@ async def _plan_pipeline_inner(
                 if unproducible_output_fields and _transform_node_count(finalized_pipeline) == 0:
                     # R2-F4 (elspeth-6e311df389). The reviewed outputs declare
                     # fields no reviewed source declares or observes, and this
-                    # candidate has nothing that could produce them. The
-                    # server-synthesized sketch is diverted here before it is
-                    # ever built (ComposerServiceImpl.plan_guided_pipeline);
-                    # without this guard a planner that answers the diverted
-                    # request with the same bare pass-through re-opens the
-                    # identical defect, provider-authored and sealed as a
-                    # COMPLETE proposal.
+                    # candidate has nothing that could produce them. Every
+                    # guided plan arrives here as an ordinary planner request
+                    # (the server-synthesized sketch this guard once diverted
+                    # was removed with elspeth-b4a286d517); without it a
+                    # planner that answers with a bare pass-through seals an
+                    # unbuildable pipeline as a COMPLETE proposal.
                     #
                     # Unlike the two nudges around it this fires on EVERY
                     # attempt including the hatch, and has no omit-valve: the

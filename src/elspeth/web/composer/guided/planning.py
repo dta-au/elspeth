@@ -1232,13 +1232,13 @@ def guided_reviewed_sink_options(reviewed_output: SinkOutputResolved) -> dict[st
     """Return one reviewed sink's options with its declared contract materialized.
 
     The single seam every pipeline carrying a reviewed output must pass
-    through: the planner-authored candidate binder below, and the
-    server-synthesized zero-transform sketch in
-    ``ComposerServiceImpl.plan_guided_pipeline``. Those two seams had diverged —
-    the sketch merged nothing, so step-2's declared output fields never reached
-    ``options.schema.required_fields`` and the sink-contract check skipped
-    (R2-F4). Both call ``guided_reviewed_sink_options`` now so a future third
-    pipeline builder cannot re-open the same gap.
+    through — today that is the planner-authored candidate binder below, the
+    only production pipeline builder (the server-synthesized sketch that once
+    shared this seam was removed with elspeth-b4a286d517). The seam exists
+    because builders had diverged: the sketch merged nothing, so step-2's
+    declared output fields never reached ``options.schema.required_fields``
+    and the sink-contract check skipped (R2-F4). Any future pipeline builder
+    must call ``guided_reviewed_sink_options`` too, or it re-opens that gap.
     """
     if type(reviewed_output) is not SinkOutputResolved:
         raise TypeError("reviewed_output must be an exact SinkOutputResolved")

@@ -210,8 +210,9 @@ def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
     if isinstance(exc, PipelinePlannerError):
         # Detail codes FIRST: a categorical deployment-policy refusal is
         # permanent and arrives under whichever planner code exhausted
-        # (VALIDATION_FAILED from the server-derived gate, REPAIR_EXHAUSTED when
-        # the model kept re-authoring the prohibited component). Collapsing it
+        # (REPAIR_EXHAUSTED when the model kept re-authoring the prohibited
+        # component; VALIDATION_FAILED historically from the server-derived
+        # gate elspeth-b4a286d517 removed). Collapsing it
         # into ``invalid_provider_response`` blamed the provider for a policy
         # decision and told the user to retry an operation that can never
         # succeed. Shared predicate with the freeform mirror so the two

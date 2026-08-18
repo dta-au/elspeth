@@ -2305,8 +2305,9 @@ async def _failed_turn_response_body(
 # keyed on the rejection's ``detail_codes`` (see
 # :data:`PLANNER_POLICY_DETAIL_CODES`), because a deployment-policy refusal
 # surfaces under whichever planner code the refusal happened to exhaust
-# (``VALIDATION_FAILED`` on the server-derived path, ``REPAIR_EXHAUSTED`` when the
-# model burnt its budget re-authoring the same prohibited component). The code
+# (``REPAIR_EXHAUSTED`` when the model burnt its budget re-authoring the same
+# prohibited component; ``VALIDATION_FAILED`` from commit-time re-validation, and
+# historically from the server-derived gate elspeth-b4a286d517 removed). The code
 # alone cannot distinguish "the model produced garbage" from "the deployment
 # forbids this", so the detail-code test runs FIRST on both surfaces.
 _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(

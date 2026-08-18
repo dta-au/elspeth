@@ -1144,9 +1144,11 @@ def test_guided_full_planner_failure_mapping_is_closed(
 def test_guided_full_policy_refusal_outranks_the_planner_code(code: str, policy_code: str) -> None:
     """A categorical policy refusal is permanent, whatever code it exhausted under.
 
-    The same refusal arrives as VALIDATION_FAILED from the server-derived
-    pass-through gate and as REPAIR_EXHAUSTED once the model has burnt its repair
-    budget re-authoring the prohibited component. Both are permanent, so the
+    The same refusal arrives as REPAIR_EXHAUSTED once the model has burnt its
+    repair budget re-authoring the prohibited component (and, historically, as
+    VALIDATION_FAILED from the server-derived pass-through gate that
+    elspeth-b4a286d517 removed — the code stays in the closed map because
+    commit-time re-validation still raises it). Both are permanent, so the
     classification is keyed on the rejection's closed detail codes rather than the
     planner code — otherwise the user is told to retry a request that can never
     succeed (guided S3, 2026-07-31).
