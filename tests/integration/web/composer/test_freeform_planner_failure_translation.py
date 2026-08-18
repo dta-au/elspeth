@@ -112,13 +112,45 @@ class _Response:
 
 
 def _malformed_completion() -> Any:
-    """A non-tool response — trips MALFORMED_RESPONSE during terminal parsing."""
+    """A prose overrun whose escape-hatch turn is also unusable.
 
-    async def completion(**_kwargs: Any) -> _Response:
+    Three no-tool-call replies exhaust the nudge budget and engage the escape
+    hatch; the advisor then answers with malformed tool-call arguments, so the
+    hatch is spent and the overrun's terminal MALFORMED_RESPONSE disposition
+    stands. Every reply carries the leak sentinel.
+    """
+
+    def _prose() -> _Response:
         return _Response(
             choices=[_Choice(message=_Message(content=f"I cannot help. {_PROVIDER_LEAK_SENTINEL}", tool_calls=[]))],
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
         )
+
+    def _malformed_arguments() -> _Response:
+        return _Response(
+            choices=[
+                _Choice(
+                    message=_Message(
+                        content=None,
+                        tool_calls=[
+                            _ToolCall(
+                                id="call-1",
+                                function=_Function(
+                                    name="emit_pipeline_proposal",
+                                    arguments=f"not strict json {_PROVIDER_LEAK_SENTINEL}",
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+        )
+
+    responses = [_prose(), _prose(), _prose(), _malformed_arguments()]
+
+    async def completion(**_kwargs: Any) -> _Response:
+        return responses.pop(0)
 
     return completion
 
@@ -470,9 +502,11 @@ def test_complete_multi_clause_request_enters_empty_pipeline_planner(
     ("completion_factory", "expected_status", "expected_failure_code", "expected_planner_code", "expected_llm_audit_rows"),
     [
         # The prose (no-tool-call) reply is nudge-retried on its own bounded
-        # budget before the terminal MALFORMED_RESPONSE, so every nudged
-        # attempt lands as durable audit evidence alongside the terminal one.
-        (_malformed_completion, 502, "invalid_provider_response", "MALFORMED_RESPONSE", _PROSE_NUDGE_BUDGET + 1),
+        # budget, the overrun engages the escape hatch, and the advisor's
+        # malformed reply spends it — so every nudged attempt AND the hatch
+        # call land as durable audit evidence alongside the terminal
+        # MALFORMED_RESPONSE.
+        (_malformed_completion, 502, "invalid_provider_response", "MALFORMED_RESPONSE", _PROSE_NUDGE_BUDGET + 2),
         (_timeout_completion, 504, "provider_timeout", "TIMEOUT", 1),
         # LiteLLM API errors are the declared retryable provider failure, so
         # every configured physical attempt must be present in the audit.
@@ -792,6 +826,50 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
     with engine.connect() as conn:
         rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.content)).all()
     assistant_rows = [row for row in rows if row.role == "assistant" and _DECLINE_TEXT in (row.content or "")]
+    assert len(assistant_rows) == 1
+
+
+def _marker_decline_completion() -> Any:
+    """The planner declines on its first, decline-eligible ordinary turn."""
+
+    async def completion(**_kwargs: Any) -> _Response:
+        return _Response(
+            choices=[_Choice(message=_Message(content=f"DECLINE: {_DECLINE_TEXT}", tool_calls=[]))],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+        )
+
+    return completion
+
+
+def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manifest-satisfied ordinary-turn decline reaches the client exactly
+    as a hatch decline does: 200 with the model's own words (marker stripped)
+    as an assistant message, no failure disposition, in ONE provider call."""
+    client, engine, _sessions = _build_app(tmp_path, monkeypatch, _marker_decline_completion())
+    session_id = client.post("/api/sessions", json={"title": "ordinary turn decline"}).json()["id"]
+
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT})
+
+    assert response.status_code == 200, response.text
+    assert _DECLINE_TEXT in response.text
+    assert "DECLINE:" not in response.json()["message"]["content"]
+
+    # Not a failure: no disposition row, and progress is not "failed".
+    assert _disposition_rows(engine) == []
+    progress = client.get(f"/api/sessions/{session_id}/composer-progress").json()
+    assert progress.get("phase") != "failed"
+
+    # The F6 objective at its minimum: the decision cost one provider call.
+    assert len(_llm_audit_rows(engine)) == 1
+
+    # The decline lands in the visible conversation as an assistant message,
+    # marker stripped, body verbatim.
+    with engine.connect() as conn:
+        rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.content)).all()
+    assistant_rows = [row for row in rows if row.role == "assistant" and (row.content or "") == _DECLINE_TEXT]
     assert len(assistant_rows) == 1
 
 

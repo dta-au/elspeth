@@ -463,11 +463,17 @@ class PipelinePlannerError(RuntimeError):
 
 
 class PlannerDeclined(PipelinePlannerError):
-    """Honest decline: the escape-hatch advisor answered in text, not a proposal.
+    """Honest decline: the model answered in text on a turn where text is legal.
 
-    Raised only from the overtime turn. ``decline_text`` is the advisor's own
-    explanation and is intended to be surfaced to the user as an ordinary
-    assistant message, never as a provider failure.
+    Raised from the overtime escape-hatch turn (any text — the advisor is
+    tool-restricted and taught), and from an ordinary turn once the
+    information manifest shows every declared or requested fact supplied or
+    proven unavailable AND the reply leads with the taught
+    ``_PROSE_DECLINE_MARKER`` — ordinary turns keep the full palette, so
+    marker-less text stays narration and is nudged. ``decline_text`` is the
+    model's own explanation (marker stripped) and is intended to be surfaced
+    to the user as an ordinary assistant message, never as a provider
+    failure.
     """
 
     def __init__(self, message: str, *, decline_text: str) -> None:
@@ -1466,11 +1472,37 @@ def _parse_json_object(raw: object, *, label: str) -> Mapping[str, Any]:
     return cast(Mapping[str, Any], parsed)
 
 
+# Protocol token an ordinary-turn text decline must lead with. The hatch turn
+# accepts any text because its advisor is tool-restricted and taught by
+# _escape_hatch_notice; an ordinary turn keeps the full palette, so text there
+# is ambiguous between narration and decline and needs this mechanical
+# discriminator, taught by _prose_decline_notice.
+_PROSE_DECLINE_MARKER: Final[str] = "DECLINE:"
+
+
+def _marked_decline_body(content: str, marker: str) -> str | None:
+    """Return the decline body when content leads with marker, else None.
+
+    Removing the protocol token (and its separating whitespace) is
+    classification, not authorship: the returned body is the model's own
+    words verbatim. A bare marker with no body is NOT a decline — there are
+    no server-authored decline words, so an empty body routes to the nudge
+    lane instead of a fallback. The marker is case-sensitive by design; the
+    fail-safe direction is cheap (an uncased attempt costs one nudge).
+    """
+    stripped = content.lstrip()
+    if not stripped.startswith(marker):
+        return None
+    body = stripped[len(marker) :].lstrip()
+    return body if body else None
+
+
 def _parse_response_tool_calls(
     response: Any,
     *,
     max_tool_calls: int,
     allow_text: bool = False,
+    text_marker: str | None = None,
 ) -> tuple[Any, tuple[_ParsedToolCall, ...]]:
     choices = _provider_field(response, "choices")
     if type(choices) not in {list, tuple} or len(choices) != 1:
@@ -1481,17 +1513,27 @@ def _parse_response_tool_calls(
     raw_calls = _provider_field(message, "tool_calls")
     if type(raw_calls) not in {list, tuple} or not raw_calls:
         content = _provider_field(message, "content")
-        if allow_text and type(content) is str and content.strip():
+        if (
+            allow_text
+            and type(content) is str
+            and content.strip()
+            and (text_marker is None or _marked_decline_body(content, text_marker) is not None)
+        ):
             try:
                 require_bounded_text(content, label="planner text response")
-            except JsonBoundaryError as exc:
-                raise PipelinePlannerError("planner text response exceeds local bounds", code="MALFORMED_RESPONSE") from exc
-            return message, ()
-        # The no-tool-call class (prose thinking-aloud or an empty reply)
-        # gets its own code so the loop can nudge-retry it — mid-plan prose
-        # is ordinary LLM behaviour, not provider breakage. The loop
-        # converts it back to terminal MALFORMED_RESPONSE once the nudge
-        # budget is spent; the code never escapes the planner.
+            except JsonBoundaryError:
+                # An over-bounds text reply cannot be admitted as a decline;
+                # it stays in the no-tool-call class below so its treatment
+                # matches every other unadmitted prose reply.
+                pass
+            else:
+                return message, ()
+        # The no-tool-call class (prose thinking-aloud, an empty reply,
+        # marker-less text where a marker is required, or a text reply too
+        # large to admit) gets its own code so the loop can nudge-retry it —
+        # mid-plan prose is ordinary LLM behaviour, not provider breakage.
+        # The loop converts it back to terminal MALFORMED_RESPONSE once the
+        # nudge budget is spent; the code never escapes the planner.
         raise PipelinePlannerError("planner response must call a declared tool", code="PROSE_REPLY")
     if len(raw_calls) > max_tool_calls:
         raise PipelinePlannerError("planner response exceeds the per-turn tool call limit", code="MALFORMED_RESPONSE")
@@ -1577,6 +1619,19 @@ def _prose_reply_notice() -> str:
         "Your previous reply called no tool. You must respond with a declared tool call — "
         "if your design is settled, call emit_pipeline_proposal with the complete proposal now; "
         "otherwise continue discovery from where you were."
+    )
+
+
+def _prose_decline_notice() -> str:
+    # Static teaching text only: it names the decline format and nothing
+    # else — no deployment, catalog, or policy facts — so it adds zero
+    # provider egress. Appended once, on the first turn where a text decline
+    # is legal.
+    return (
+        "If this request cannot be built with the capabilities available to this planning session, "
+        f'reply in plain text starting with "{_PROSE_DECLINE_MARKER} " and state plainly, in the '
+        "user's terms, what is missing. Use that prefix only for an honest decline; otherwise "
+        "continue with tool calls."
     )
 
 
@@ -3475,6 +3530,7 @@ async def _plan_pipeline_inner(
     composition_turns = 0
     repair_count = 0
     prose_nudges = 0
+    decline_notice_given = False
     nodeless_nudge_given = False
     threshold_nudge_given = False
     # Computed once: the current instruction and bounded earlier-user context
@@ -3528,6 +3584,7 @@ async def _plan_pipeline_inner(
         model_override: str | None = None,
         tools_override: list[dict[str, Any]] | None = None,
         allow_text_reply: bool = False,
+        text_reply_marker: str | None = None,
         reasoning_effort: str | None = None,
         attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
     ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
@@ -3806,6 +3863,7 @@ async def _plan_pipeline_inner(
                     response,
                     max_tool_calls=model_config.max_tool_calls_per_turn,
                     allow_text=allow_text_reply,
+                    text_marker=text_reply_marker,
                 )
             except PipelinePlannerError as exc:
                 if exc.code not in ("MALFORMED_RESPONSE", "PROSE_REPLY"):
@@ -3896,6 +3954,20 @@ async def _plan_pipeline_inner(
     while True:
         is_hatch_turn = hatch_turn_next
         hatch_turn_next = False
+        # A text decline is legal on an ordinary turn once catalog.selection
+        # is supplied and no declared or requested information key remains
+        # unresolved — vacuously true on turn 1 for a gapless request, which
+        # permits a one-call decline by design. Because eligible turns keep
+        # the full tool palette, classification requires the taught marker
+        # prefix; marker-less text keeps the nudge treatment. The hatch turn
+        # accepts any text (its advisor is tool-restricted and taught by its
+        # own notice).
+        prose_decline_eligible = information_manifest.supplies(_CATALOG_SELECTION_INFORMATION) and all(
+            information_manifest.covers(key) for key in pending_information
+        )
+        if prose_decline_eligible and not is_hatch_turn and not decline_notice_given:
+            decline_notice_given = True
+            messages.append({"role": "user", "content": _prose_decline_notice()})
         try:
             if is_hatch_turn:
                 assert model_config.escape_hatch_model is not None
@@ -3909,6 +3981,8 @@ async def _plan_pipeline_inner(
                 )
             else:
                 message, calls, audited_call = await call_model(
+                    allow_text_reply=prose_decline_eligible,
+                    text_reply_marker=_PROSE_DECLINE_MARKER,
                     reasoning_effort=(
                         # A prose reply is the model announcing it is at
                         # emission stage: at discovery effort "low" sonnet-5
@@ -3931,8 +4005,10 @@ async def _plan_pipeline_inner(
                 # A no-tool-call reply (thinking aloud) mid-plan: nudge the
                 # model back to tool calling on its own bounded budget —
                 # separate from the repair budget, which answers candidate
-                # rejections. Past the budget, the original terminal
-                # MALFORMED_RESPONSE disposition stands unchanged.
+                # rejections. Past the budget the puzzle goes to the escape
+                # hatch like every other exhaustion; the terminal
+                # MALFORMED_RESPONSE disposition stands only when no hatch
+                # is available.
                 if is_hatch_turn:
                     # The advisor's one shot produced nothing usable: the
                     # hatch is spent, the original exhaustion stands.
@@ -3941,6 +4017,10 @@ async def _plan_pipeline_inner(
                     raise hatch_error from None
                 prose_nudges += 1
                 if prose_nudges > _PROSE_NUDGE_BUDGET:
+                    if _hatch_available():
+                        trail.finish_attempt("prose", "prose_reply", planner_code="MALFORMED_RESPONSE", led_to="hatch")
+                        _engage_escape_hatch(PipelinePlannerError("planner response must call a declared tool", code="MALFORMED_RESPONSE"))
+                        continue
                     trail.finish_attempt("prose", "prose_reply", planner_code="MALFORMED_RESPONSE", led_to="terminal")
                     raise PipelinePlannerError(
                         "planner response must call a declared tool",
@@ -3980,7 +4060,8 @@ async def _plan_pipeline_inner(
             raise
         terminal_calls = tuple(call for call in calls if call.name == _TERMINAL_TOOL_NAME)
         # Phase of a terminal-tool turn: the first candidate is "candidate",
-        # every post-rejection retry is "repair"; the advisor turn is "hatch".
+        # every post-rejection retry is "repair"; the advisor turn is "hatch";
+        # an admitted no-tool-call text reply is "prose".
         attempt_phase = (
             ComposerPlannerAttemptPhase.HATCH
             if is_hatch_turn
@@ -3988,15 +4069,23 @@ async def _plan_pipeline_inner(
             if terminal_calls and repair_count == 0
             else ComposerPlannerAttemptPhase.REPAIR
             if terminal_calls
+            else ComposerPlannerAttemptPhase.PROSE
+            if not calls
             else ComposerPlannerAttemptPhase.DISCOVERY
         )
         trail.set_active_phase(attempt_phase)
-        if is_hatch_turn and not calls:
+        if not calls and (is_hatch_turn or prose_decline_eligible):
             decline_content = _provider_field(message, "content")
-            trail.finish_attempt("hatch", "declined", planner_code="DECLINED", led_to="terminal")
+            raw_text = decline_content if type(decline_content) is str else ""
+            # The parser admitted an ordinary-turn text reply only with the
+            # marker present; stripping that protocol token is classification,
+            # and the body is the model's words verbatim. The hatch turn keeps
+            # its any-text rule, content untouched.
+            marker_body = _marked_decline_body(raw_text, _PROSE_DECLINE_MARKER)
+            trail.finish_attempt(attempt_phase, "declined", planner_code="DECLINED", led_to="terminal")
             raise PlannerDeclined(
-                "planner escape-hatch advisor declined the request",
-                decline_text=decline_content if type(decline_content) is str else "",
+                "planner escape-hatch advisor declined the request" if is_hatch_turn else "planner declined the request",
+                decline_text=raw_text if is_hatch_turn else (marker_body if marker_body is not None else ""),
             )
         if len(calls) > model_config.max_tool_calls_per_turn:
             trail.finish_attempt(

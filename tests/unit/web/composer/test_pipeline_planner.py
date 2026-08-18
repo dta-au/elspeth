@@ -1731,12 +1731,15 @@ async def test_discovery_round_uses_real_read_only_tool_then_terminal(
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
     assert len(completion.requests) == 2
-    # Tool results land before the budget-pressure and information-closure notices.
-    assert completion.requests[1]["messages"][-3]["role"] == "tool"
-    assert completion.requests[1]["messages"][-2]["role"] == "user"
-    assert completion.requests[1]["messages"][-1]["content"] == (
+    # Tool results land before the budget-pressure, information-closure, and
+    # decline-affordance notices (the discovery round resolved
+    # catalog.selection, so the decline affordance unlocks on the next turn).
+    assert completion.requests[1]["messages"][-4]["role"] == "tool"
+    assert completion.requests[1]["messages"][-3]["role"] == "user"
+    assert completion.requests[1]["messages"][-2]["content"] == (
         "All declared information gaps are closed; emit the terminal proposal now."
     )
+    assert 'starting with "DECLINE: "' in str(completion.requests[1]["messages"][-1]["content"])
     assert len(recorder.invocations) == 1
     assert recorder.invocations[0].tool_name == "list_sources"
     assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
@@ -1752,7 +1755,10 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
 
     request = completion.requests[0]
-    payload = json.loads(request["messages"][-1]["content"])
+    # messages[1] is the canonical request payload; a gapless request is
+    # decline-eligible from turn 1, so the affordance notice follows it.
+    payload = json.loads(request["messages"][1]["content"])
+    assert 'starting with "DECLINE: "' in str(request["messages"][-1]["content"])
     assert payload["information_manifest"]["supplied"] == {
         "pipeline_state": "current_projection",
         "plugin_selection": "policy_snapshot",
@@ -1802,7 +1808,7 @@ async def test_supplied_prohibited_plugin_fact_does_not_reenable_inventory_calls
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
 
     request = completion.requests[0]
-    payload = json.loads(request["messages"][-1]["content"])
+    payload = json.loads(request["messages"][1]["content"])
     assert payload["authoring_aids"]["discovery_digest"]["plugins"]["prohibited"][kind][0]["name"] == ("named_but_prohibited")
     names = {tool["function"]["name"] for tool in request["tools"]}
     assert not {"list_sources", "list_transforms", "list_sinks"} & names
@@ -2246,7 +2252,10 @@ async def test_explicit_multi_turn_selected_schema_set_closes_only_after_last_sc
     ]
     assert "plugin.schema" in initial_payload["information_manifest"]["discoverable_classes"]
     assert not any(message.get("content") == notice for message in completion.requests[1]["messages"])
-    assert completion.requests[2]["messages"][-1]["content"] == notice
+    # Closure lands first; the decline affordance unlocks on the same turn
+    # and its teaching notice rides immediately after.
+    assert completion.requests[2]["messages"][-2]["content"] == notice
+    assert 'starting with "DECLINE: "' in str(completion.requests[2]["messages"][-1]["content"])
 
 
 @pytest.mark.asyncio
@@ -7877,6 +7886,284 @@ async def test_prose_nudge_names_the_terminal_tool(
     ]
     assert len(notices) == 1
     assert "emit_pipeline_proposal" in str(notices[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_manifest_satisfied_marker_decline_resolves_planner_declined(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A marker-led decline is a legal first move once the manifest is satisfied.
+
+    F6 (elspeth-ae8b92ea2a): with catalog.selection supplied and no declared
+    or requested information key unresolved, a text reply leading with the
+    taught DECLINE: marker resolves as an honest decline in ONE provider
+    call — no nudges, no MALFORMED_RESPONSE. The turn is taught the marker
+    by a runtime notice on the same request.
+    """
+    body = "I can't do this here: the request needs a streaming join no available plugin provides."
+    completion = _ScriptedCompletion(_text_response(f"DECLINE: {body}"))
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PlannerDeclined) as excinfo:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            information_aware=True,
+        )
+
+    assert excinfo.value.code == "DECLINED"
+    # The marker is a protocol token; the body is the model's own words,
+    # verbatim — the server classifies, never rewrites.
+    assert excinfo.value.decline_text == body
+    assert len(completion.requests) == 1
+    # The affordance is taught, not assumed: the first eligible request
+    # carries the static notice naming the marker.
+    notices = [
+        message
+        for message in completion.requests[0]["messages"]
+        if message["role"] == "user" and 'starting with "DECLINE: "' in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+    # Same disposition shape as a hatch-turn decline, with the honest origin.
+    attempt = recorder.planner_attempts[-1]
+    assert attempt.phase is ComposerPlannerAttemptPhase.PROSE
+    assert attempt.outcome is ComposerPlannerAttemptOutcome.DECLINED
+    assert attempt.planner_code is ComposerPlannerCode.DECLINED
+    assert attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A bare marker carries no model-authored decline words: it must
+        # nudge, never surface a server-written fallback as a decline.
+        pytest.param("DECLINE:", id="bare-marker-no-body"),
+        pytest.param("DECLINE:   ", id="bare-marker-whitespace-body"),
+        # The marker is case-sensitive by design — an uncased attempt fails
+        # safe to the nudge lane.
+        pytest.param("decline: nothing available can perform this join.", id="lowercase-marker"),
+    ],
+)
+async def test_marker_shapes_without_a_decline_body_still_draw_the_nudge(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    text: str,
+) -> None:
+    completion = _ScriptedCompletion(
+        _text_response(text),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        information_aware=True,
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 2
+    notices = [
+        message
+        for message in completion.requests[1]["messages"]
+        if message["role"] == "user" and "called no tool" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+
+
+@pytest.mark.asyncio
+async def test_manifest_satisfied_narration_prose_still_nudges_then_converges(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The a2513c3c narration shape must keep its nudge on the SHIPPING manifest.
+
+    The default-mode twin (test_prose_reply_gets_bounded_nudge_then_converges)
+    runs against a patched empty manifest that can never be decline-eligible;
+    this mirror runs information_aware so the turn IS eligible — and
+    marker-less plan narration must still draw the nudge and converge, never
+    resolve as a decline.
+    """
+    completion = _ScriptedCompletion(
+        _text_response("I think a csv source feeding one passthrough is right; let me lay that out."),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        information_aware=True,
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 2
+    notices = [
+        message
+        for message in completion.requests[1]["messages"]
+        if message["role"] == "user" and "called no tool" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+
+
+@pytest.mark.asyncio
+async def test_nudged_narration_then_marker_decline_classifies(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Two-call decline: narration draws the nudge, then the marker resolves.
+
+    The nudge path (and its candidate-effort bump) stays live on eligible
+    turns; a marker-led reply after it still classifies as the honest
+    decline rather than burning the remaining nudge budget.
+    """
+    completion = _ScriptedCompletion(
+        _text_response("Let me think about which transform fits here."),
+        _text_response("DECLINE: nothing available can perform the requested streaming join."),
+    )
+
+    with pytest.raises(PlannerDeclined) as excinfo:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            information_aware=True,
+        )
+
+    assert excinfo.value.decline_text == "nothing available can perform the requested streaming join."
+    assert len(completion.requests) == 2
+    notices = [
+        message
+        for message in completion.requests[1]["messages"]
+        if message["role"] == "user" and "called no tool" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+
+
+@pytest.mark.asyncio
+async def test_manifest_satisfied_non_decline_prose_still_draws_the_nudge(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Prose the hatch contract refuses to admit keeps its nudge treatment.
+
+    A whitespace-only reply is the no-tool-call class, not a decline, so a
+    manifest-satisfied turn still nudges it exactly as before F6.
+    """
+    completion = _ScriptedCompletion(
+        _text_response("   "),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        information_aware=True,
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 2
+    notices = [
+        message
+        for message in completion.requests[1]["messages"]
+        if message["role"] == "user" and "called no tool" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+
+
+@pytest.mark.asyncio
+async def test_manifest_unsatisfied_marker_decline_still_draws_the_nudge(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Before the manifest is satisfied even a marker-led decline has no evidence.
+
+    An intent naming a kind-qualified plugin declares that plugin's schema
+    as pending information; until the model resolves it, a marker-led text
+    reply keeps today's nudge path unchanged — it never resolves to
+    PlannerDeclined — and the teaching notice is withheld.
+    """
+    completion = _ScriptedCompletion(
+        _text_response("DECLINE: the llm_query transform is not available in this deployment."),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        information_aware=True,
+        intent="Score each row with transform:llm_query before writing results.",
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 2
+    notices = [
+        message
+        for message in completion.requests[1]["messages"]
+        if message["role"] == "user" and "called no tool" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+    assert not any(
+        'starting with "DECLINE: "' in str(message.get("content"))
+        for request in completion.requests
+        for message in request["messages"]
+        if message["role"] == "user"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prose_overrun_engages_the_hatch_when_available(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Prose exhaustion hands the puzzle to the advisor like every sibling.
+
+    F6 hatch parity: past the nudge budget the loop engages the escape
+    hatch when one is configured instead of dying terminal
+    MALFORMED_RESPONSE; the advisor's text reply is then an honest decline.
+    """
+    completion = _ScriptedCompletion(
+        _text_response("Thinking aloud, round one."),
+        _text_response("Thinking aloud, round two."),
+        _text_response("Thinking aloud, round three."),
+        _text_response("I can't do this here: no available plugin satisfies the request."),
+    )
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PlannerDeclined) as excinfo:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={
+                "escape_hatch_model": "openrouter/advisor-under-test",
+                "escape_hatch_provider": "openrouter",
+            },
+        )
+
+    assert excinfo.value.decline_text == "I can't do this here: no available plugin satisfies the request."
+    assert len(completion.requests) == 4
+    hatch_request = completion.requests[3]
+    assert hatch_request["model"] == "openrouter/advisor-under-test"
+    assert [tool["function"]["name"] for tool in hatch_request["tools"]] == ["emit_pipeline_proposal"]
+    notices = [
+        message for message in hatch_request["messages"] if message["role"] == "user" and "escape hatch" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+    # The overrun attempt records the handoff, keeping the terminal
+    # MALFORMED_RESPONSE disposition in reserve for a spent hatch.
+    overrun = recorder.planner_attempts[2]
+    assert overrun.phase is ComposerPlannerAttemptPhase.PROSE
+    assert overrun.outcome is ComposerPlannerAttemptOutcome.PROSE_REPLY
+    assert overrun.planner_code is ComposerPlannerCode.MALFORMED_RESPONSE
+    assert overrun.led_to is ComposerPlannerAttemptLedTo.HATCH
 
 
 @pytest.mark.asyncio
