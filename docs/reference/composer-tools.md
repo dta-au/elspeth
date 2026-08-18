@@ -64,11 +64,11 @@ tool-driven editing or custom topology.
 
 ### `list_sources`
 
-List available source plugins with name and summary.
+List available source plugins with their full catalog summaries.
 
 **Parameters:** None
 
-**Returns:** Array of `{name, summary}` for each registered source plugin.
+**Returns:** Array of full `PluginSummary` entries — `name`, `description`, `config_fields` (name, type, required, description, default per option), usage guidance, `composer_hints`, and `secret_requirements` — plus a `prohibited` array naming any source banned from the web authoring surface, with its closed reason. `get_plugin_schema` is needed only for enum values, nested option shapes, or the raw JSON schema.
 
 **When to use:** At the start of composition to discover what source types are available, or when the user asks what data formats are supported.
 
@@ -76,11 +76,11 @@ List available source plugins with name and summary.
 
 ### `list_transforms`
 
-List available transform plugins with name and summary.
+List available transform plugins with their full catalog summaries.
 
 **Parameters:** None
 
-**Returns:** Array of `{name, summary}` for each registered transform plugin.
+**Returns:** Array of full `PluginSummary` entries — `name`, `description`, `config_fields` (name, type, required, description, default per option), usage guidance, `composer_hints`, and `secret_requirements` — plus a `prohibited` array naming any transform banned from the web authoring surface, with its closed reason. `get_plugin_schema` is needed only for enum values, nested option shapes, or the raw JSON schema.
 
 **When to use:** When exploring what processing steps are available — field mapping, LLM classification, content safety, RAG retrieval, etc.
 
@@ -88,11 +88,11 @@ List available transform plugins with name and summary.
 
 ### `list_sinks`
 
-List available sink plugins with name and summary.
+List available sink plugins with their full catalog summaries.
 
 **Parameters:** None
 
-**Returns:** Array of `{name, summary}` for each registered sink plugin.
+**Returns:** Array of full `PluginSummary` entries — `name`, `description`, `config_fields` (name, type, required, description, default per option), usage guidance, `composer_hints`, and `secret_requirements` — plus a `prohibited` array naming any sink banned from the web authoring surface, with its closed reason. `get_plugin_schema` is needed only for enum values, nested option shapes, or the raw JSON schema.
 
 **When to use:** When the user describes where output should go — CSV files, databases, vector stores, cloud storage.
 
