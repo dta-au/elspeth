@@ -1187,6 +1187,12 @@ export interface SystemStatus {
    * server always sends it.
    */
   composer_timeout_seconds?: number;
+  /**
+   * Operator-declared protective marking for the deployment
+   * (ELSPETH_WEB__CLASSIFICATION_BANNER), rendered by ClassificationBanner
+   * in the reserved overlay band. Null/absent renders no banner.
+   */
+  classification_banner?: "unofficial" | "official" | null;
 }
 
 export type PluginPolicyReadinessRowId =

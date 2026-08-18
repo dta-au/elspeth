@@ -228,6 +228,13 @@ class WebSettings(BaseModel):
     # node; that node uses the plugin default allowed_hosts="public_only" and the
     # server injects no allowlist. Set this only to host your own copy (a fork).
     tutorial_sample_base_url: str | None = Field(default=None)
+    # Operator-declared protective marking for the deployment, rendered by the
+    # SPA as a full-width banner in the reserved overlay band above the header.
+    # Closed vocabulary: the two non-classification PSPF markings. Colours are
+    # fixed by convention (Purview PSPF label colours: UNOFFICIAL green,
+    # OFFICIAL grey), not themed — see --color-classification-* in the
+    # frontend token sheet. None (the default) renders no banner.
+    classification_banner: Literal["unofficial", "official"] | None = Field(default=None)
     composer_model: str = "gpt-5.5"
     # Reasoning-effort hints for the composer plane (elspeth-dc459d438e).
     # All composer roles run reasoning-capable models; these knobs bound the

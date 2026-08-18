@@ -149,6 +149,18 @@ describe("light theme colour contrast", () => {
     expect(contrastRatio(mutedText, background)).toBeGreaterThanOrEqual(4.5);
   });
 
+  it("keeps classification-banner marking text at WCAG AA on both fixed grounds", () => {
+    // The classification tokens are deliberately theme-invariant (a
+    // protective marking must not restyle with the viewer's theme), so only
+    // the :root definitions exist and one pin covers both themes.
+    const markingText = extractRootToken("--color-classification-text");
+    const unofficial = extractRootToken("--color-classification-unofficial-bg");
+    const official = extractRootToken("--color-classification-official-bg");
+
+    expect(contrastRatio(markingText, unofficial)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(markingText, official)).toBeGreaterThanOrEqual(4.5);
+  });
+
   it("keeps the dark theme focus ring distinct from gate badges", () => {
     const background = extractRootToken("--color-bg");
     const gateBadge = extractRootToken("--color-badge-gate");

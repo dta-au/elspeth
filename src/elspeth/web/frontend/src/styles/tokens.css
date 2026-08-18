@@ -114,6 +114,18 @@
   --color-badge-row-union-border:   rgba(174, 184, 255, 0.35);
   --color-badge-queue-border:       rgba(255, 145, 200, 0.3);
 
+  /* ── Classification banner — protective-marking colours ──────────────────
+     Operator-declared deployment marking (WebSettings.classification_banner),
+     rendered as the full-width strip in the reserved overlay band. These are
+     FIXED conventional colours (Purview PSPF label colours: UNOFFICIAL green,
+     OFFICIAL grey), deliberately theme-invariant — a protective marking must
+     not restyle with the viewer's theme — so the light block defines no
+     overrides. White marking text: 5.13:1 on the green, 7.17:1 on the grey
+     (both pinned in colorContrast.test.ts). */
+  --color-classification-unofficial-bg: #2e7d32;
+  --color-classification-official-bg:   #54585d;
+  --color-classification-text:          #ffffff;
+
   /* ── Semantic colours — DTA/GOLD dark theme ──────────────────────────────── */
   --color-success:           #63d487;
   /* Lifted from #ef8784 (+0.016 L in HLS, hue and saturation held exactly).

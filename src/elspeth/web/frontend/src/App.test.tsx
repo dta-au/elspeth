@@ -363,6 +363,32 @@ describe("App banner roles", () => {
     errorSpy.mockRestore();
   });
 
+  it("renders the operator-declared classification banner from the status payload", async () => {
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+      classification_banner: "unofficial",
+    } satisfies SystemStatus);
+
+    render(<App />);
+
+    const banner = await screen.findByTestId("classification-banner");
+    expect(banner).toHaveTextContent("UNOFFICIAL");
+    expect(banner).toHaveClass("classification-banner--unofficial");
+  });
+
+  it("renders no classification banner when the deployment declares none", async () => {
+    // The default beforeEach status payload omits the field entirely (the
+    // pre-feature wire shape); the band stays empty rather than rendering an
+    // unmarked strip.
+    render(<App />);
+    await screen.findByText(/pipeline composer/i);
+    expect(screen.queryByTestId("classification-banner")).toBeNull();
+  });
+
   it("uses role=status, not role=alert, for the composer-unavailable banner", async () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: false,

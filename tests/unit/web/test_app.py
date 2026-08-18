@@ -559,6 +559,30 @@ class TestSystemStatusEndpoint:
         assert response.status_code == 200
         assert response.json()["composer_timeout_seconds"] == 300.0
 
+    def test_classification_banner_defaults_to_null(self, tmp_path) -> None:
+        """An undeclared deployment renders no protective-marking banner."""
+        app = create_app(_settings(tmp_path))
+        response = TestClient(app).get("/api/system/status")
+        assert response.status_code == 200
+        assert response.json()["classification_banner"] is None
+
+    def test_reports_the_declared_classification_banner(self, tmp_path) -> None:
+        """The operator-declared marking reaches the SPA via the status payload."""
+        app = create_app(_settings(tmp_path, classification_banner="unofficial"))
+        response = TestClient(app).get("/api/system/status")
+        assert response.status_code == 200
+        assert response.json()["classification_banner"] == "unofficial"
+
+    def test_classification_banner_vocabulary_is_closed(self, tmp_path) -> None:
+        """Only the two non-classification PSPF markings are declarable.
+
+        A typo'd or unsupported marking (e.g. "protected") must fail settings
+        load rather than silently render an unstyled banner claiming a
+        protection level the deployment does not implement.
+        """
+        with pytest.raises(ValidationError):
+            _settings(tmp_path, classification_banner="protected")
+
     def test_reports_the_deployed_frontend_build_identity(self, tmp_path) -> None:
         """Deploy-cache coherence beacon: stale tabs must self-announce.
 

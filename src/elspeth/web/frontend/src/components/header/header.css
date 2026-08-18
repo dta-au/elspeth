@@ -11,7 +11,8 @@
    --------------------------------------------------------------------------- */
 /* The band along the top is RESERVED for the app-level overlay strips
    (.app-notice-center in styles/shared.css, .run-outcome-notice-overlay in
-   execution.css), which are fixed at top: 0 and one --size-control tall.
+   execution.css, and .classification-banner below), which are fixed at
+   top: 0 and one --size-control tall.
 
    Why reserve instead of letting them overlay (elspeth-1c4687ff67 follow-up):
    those strips were taken out of flow so a notice's arrival would stop
@@ -41,10 +42,43 @@
   padding-top: var(--size-control);
 }
 
-/* The shared-inspect route renders neither the header nor either overlay strip
-   (App.tsx short-circuits before both), so there is nothing to reserve for. */
+/* The shared-inspect route renders neither the header nor any overlay strip
+   (App.tsx short-circuits before them all), so there is nothing to reserve
+   for. */
 .app-root--shared-inspect {
   padding-top: 0;
+}
+
+/* Protective-marking strip (ClassificationBanner.tsx): occupies the reserved
+   band rather than adding height anywhere. Fixed like its band-mates but with
+   NO z-index, so the notice/run-outcome strips (--z-overlay, opaque grounds)
+   paint over it while mounted — the marking is ambient deployment identity,
+   never urgent, and always loses that contest. Background comes from the
+   theme-invariant classification tokens (tokens.css); mono + caps + tracking
+   is the audit/forensic register the wordmark owns. */
+.classification-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--size-control);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-classification-text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  letter-spacing: var(--letter-spacing-caps);
+  text-transform: uppercase;
+}
+
+.classification-banner--unofficial {
+  background: var(--color-classification-unofficial-bg);
+}
+
+.classification-banner--official {
+  background: var(--color-classification-official-bg);
 }
 
 .alert-banner {

@@ -1801,6 +1801,10 @@ def _create_app(
             # The served SPA bundle's identity (deploy-cache coherence
             # beacon); null when no built dist is present.
             "frontend_build": app.state.frontend_build,
+            # Operator-declared protective marking ("unofficial" | "official"
+            # | null); the SPA renders it as the classification banner in the
+            # reserved overlay band.
+            "classification_banner": settings.classification_banner,
         }
 
     # --- Prometheus metrics scrape endpoint ---

@@ -25,6 +25,7 @@ import {
   type AppNotice,
 } from "./components/common/AppNoticeCenter";
 import { ShortcutsHelp } from "./components/common/ShortcutsHelp";
+import { ClassificationBanner } from "./components/common/ClassificationBanner";
 import { DefaultModeChangedBanner } from "./components/common/DefaultModeChangedBanner";
 import { ChatPanel } from "./components/chat/ChatPanel";
 import { CatalogDrawer } from "./components/catalog/CatalogDrawer";
@@ -695,6 +696,8 @@ function App() {
     );
   }
 
+  const classificationBanner = systemStatus?.classification_banner ?? null;
+
   return (
     <AuthGuard>
       <div className="app-root">
@@ -707,6 +710,12 @@ function App() {
         </a>
         <h1 className="sr-only">ELSPETH Pipeline Composer</h1>
 
+        {/* Rendered BEFORE the notice strips so they (fixed, --z-overlay,
+            opaque) paint over the marking while mounted — the reserved band
+            has one urgent tenant at a time and the marking always yields. */}
+        {classificationBanner !== null ? (
+          <ClassificationBanner level={classificationBanner} />
+        ) : null}
         <AppNoticeCenter notices={appNotices} />
         {/* Terminal-run toast (elspeth-3a7b7c7b37). Deliberately NOT a new
             AppNoticeKind: the notice center's priority queue collapses to
