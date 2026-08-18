@@ -389,10 +389,12 @@ async def test_tutorial_reaches_same_commit_as_staged_with_its_fixed_lesson(pari
     # Same commit as staged: the positive matrix proves live-staged ≅ reference for
     # this fixture, so tutorial ≅ reference proves tutorial ≅ staged transitively.
     assert_isomorphic(committed, reference, left="tutorial:linear_transform", right="reference")
-    # Its fixed lesson: the sole planner call ran on the tutorial surface/profile.
-    assert len(manifests) == 1, "guided-staged makes exactly one planner call (finish outputs)"
-    assert manifests[0].surface.value == "tutorial_profile"
-    assert manifests[0].profile == "tutorial"
+    # Its fixed lesson: BOTH planner calls (pass-through entry, frozen-lesson
+    # revision) ran on the tutorial surface/profile — the rootless entry is
+    # provider-planned like every transition (elspeth-b4a286d517).
+    assert len(manifests) == 2, "tutorial walk plans the entry and the revision through the provider"
+    assert all(manifest.surface.value == "tutorial_profile" for manifest in manifests)
+    assert all(manifest.profile == "tutorial" for manifest in manifests)
 
 
 # --------------------------------------------------------------------------- #

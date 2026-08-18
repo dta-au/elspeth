@@ -1247,7 +1247,7 @@ class TestStep2IntraStep:
 
     @pytest.mark.parametrize(
         ("profile", "expected_surface"),
-        (("live", "guided_staged"),),
+        (("live", "guided_staged"), ("tutorial", "tutorial_profile")),
     )
     @pytest.mark.parametrize(
         ("provider_outcome", "expected_status"),
@@ -1269,18 +1269,12 @@ class TestStep2IntraStep:
         import elspeth.web.composer.pipeline_planner as planner_module
 
         session_id = _create_session(composer_test_client)
-        # A ROOT INTENT keeps the step-2→3 entry on the provider planner path:
-        # a rootless walk now server-synthesizes the starting sketch without a
-        # provider call (see test_rootless_step_3_entry_synthesizes_the_sketch),
-        # which would make this provider-outcome matrix unreachable.
-        started = composer_test_client.post(
-            f"/api/sessions/{session_id}/guided/start",
-            json={
-                "operation_id": str(uuid4()),
-                "intent": "Build a pipeline that annotates each row before saving.",
-            },
-        )
-        assert started.status_code == 200, started.json()
+        if profile == "tutorial":
+            started = composer_test_client.post(
+                f"/api/sessions/{session_id}/guided/start",
+                json={"profile": "tutorial", "operation_id": str(uuid4())},
+            )
+            assert started.status_code == 200, started.json()
         self._drive_to_step_2_single_select(composer_test_client, session_id)
         _respond(composer_test_client, session_id, chosen=["json"])
         _respond(
@@ -1388,16 +1382,6 @@ class TestStep2IntraStep:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         session_id = _create_session(composer_test_client)
-        # Root intent keeps the step-2→3 entry on the provider planner path
-        # (rootless walks now server-synthesize the sketch without a call).
-        started = composer_test_client.post(
-            f"/api/sessions/{session_id}/guided/start",
-            json={
-                "operation_id": str(uuid4()),
-                "intent": "Build a pipeline that annotates each row before saving.",
-            },
-        )
-        assert started.status_code == 200, started.json()
         self._drive_to_step_2_single_select(composer_test_client, session_id)
         _respond(composer_test_client, session_id, chosen=["json"])
         _respond(
