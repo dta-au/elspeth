@@ -3153,12 +3153,13 @@ async def maybe_resolve_step_2_sink_chat(
     iteration_cap = max_discovery_iters if max_discovery_iters is not None else _DEFAULT_MAX_DISCOVERY_ITERS
     tool_call_cap = max_tool_calls_per_turn if max_tool_calls_per_turn is not None else _DEFAULT_MAX_TOOL_CALLS_PER_TURN
 
-    # NO Anthropic prompt-cache marker here (deliberate skip, not an oversight):
-    # the step_2 sink skill is ~915 tokens, below Anthropic's 1024-token cache
-    # floor, so a cache_control marker on it would be an inert no-op. Marking the
-    # tool array / a cumulative prefix would cache something, but the win is
-    # marginal at this size and the discovery-loop tool churn complicates the
-    # breakpoint — deferred. Revisit if the step_2 skill grows past the floor.
+    # NO Anthropic prompt-cache marker here (known gap, not a policy): the
+    # original skip rationale — step_2 sink skill ~915 tokens, under Anthropic's
+    # 1024-token cache floor — was falsified when the ~14 KB sink digest joined
+    # this message on the discovery-enabled path, so step-2 turns now pay full
+    # prompt price on every call. Marking this surface (and whether the tool
+    # array can hold a stable breakpoint despite discovery-loop tool churn) is
+    # owned by elspeth-d35b15f87e.
     field_aliases: Mapping[str, str] | None = _context_field_aliases(context_block)
     if current_sink is not None:
         field_aliases = _sink_field_aliases(current_sink, field_aliases=field_aliases)
