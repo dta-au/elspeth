@@ -228,7 +228,9 @@ def _llm_config(provider: str, *, source: bool) -> dict[str, object]:
             api_key="matrix-key",
         )
     elif provider == "openrouter":
-        config.update(model="openai/gpt-4o", api_key="matrix-key")
+        # Same canary criteria as the ADR-009 probe_configs: a stable BASE id
+        # in litellm's OpenRouter catalog slice (gpt-4o is EOL upstream).
+        config.update(model="openai/gpt-5", api_key="matrix-key")
     elif provider == "bedrock":
         config["model"] = "bedrock/anthropic.claude-3-haiku"
     elif provider == "gateway":
