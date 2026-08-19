@@ -519,7 +519,7 @@ export function ChatInput({
           maxLength={maxLength}
           readOnly={readOnly}
           aria-label="Message input"
-          aria-describedby={hintId}
+          aria-describedby={readOnly ? undefined : hintId}
           rows={rows}
           className="chat-input-textarea"
         />
@@ -659,10 +659,19 @@ export function ChatInput({
             wraps it onto its own full-width line (same visual position as
             the old sibling arrangement), and under the narrow-pane container
             query it joins the wrapped Upload/More line to fill what was
-            ~344px of dead gutter beside a lone 44px Upload button. */}
-        <div id={hintId} className="chat-input-hint">
-          Shift+Enter for new line
-        </div>
+            ~344px of dead gutter beside a lone 44px Upload button.
+            Not rendered read-only (the tutorial's frozen prompt): the
+            textarea takes no typed input there, so the hint is a false
+            affordance — and the positioned placement assumes the
+            Upload/More/Send cluster beneath it, which read-only mode
+            reduces to Send alone, leaving the hint's text hanging over the
+            textarea's content. The describedby reference above goes with
+            it. */}
+        {!readOnly && (
+          <div id={hintId} className="chat-input-hint">
+            Shift+Enter for new line
+          </div>
+        )}
       </div>
     </div>
   );

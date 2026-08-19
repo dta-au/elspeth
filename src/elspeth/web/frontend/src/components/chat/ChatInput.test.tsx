@@ -1218,6 +1218,29 @@ describe("ChatInput keyboard hint in the composition row (elspeth-1b7227936c)", 
     expect(row!.lastElementChild).toBe(hint);
   });
 
+  it("omits the hint in read-only mode, where Shift+Enter is a false affordance", () => {
+    // A read-only textarea (the tutorial's frozen prompt is the shipped case)
+    // accepts no typed input, so "Shift+Enter for new line" describes a
+    // keyboard action that does nothing. Rendering it anyway also overlapped
+    // the frozen prompt: the positioned hint assumes the Upload/More/Send
+    // cluster (~180px) beneath it, but read-only mode renders only the 68px
+    // Send button, so the hint's text hung ~50px over the textarea.
+    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
+    render(
+      <ChatInput
+        onSend={() => undefined}
+        disabled={false}
+        inputRef={inputRef}
+        readOnly
+      />,
+    );
+    expect(screen.queryByText(/shift\+enter for new line/i)).toBeNull();
+    // No hint element means no describedby target — the reference must go
+    // with it, or AT chases a dangling id.
+    const textarea = screen.getByLabelText(/message input/i);
+    expect(textarea.getAttribute("aria-describedby")).toBeNull();
+  });
+
   it("seats the hint above the buttons inside the textarea's height at ordinary pane widths", () => {
     // Operator request 2026-08-16: the composer region ends flush with the
     // textarea. The hint used to be a full-width flex line of its own BELOW
