@@ -40,6 +40,17 @@ export function HeaderVersionSelector(): JSX.Element | null {
 
   const currentVersion = compositionState?.version ?? null;
 
+  // Adjacent predecessor by version number, from the FULL fetched list —
+  // never the filtered one, or every row after a hidden snapshot would be
+  // classified against the wrong neighbour. With >50 versions the window's
+  // oldest row has no predecessor and isSnapshotOnly honestly returns false.
+  const findPredecessor = (
+    version: CompositionStateVersion,
+  ): CompositionStateVersion | undefined =>
+    stateVersions.find(
+      (candidate) => candidate.version === version.version - 1,
+    );
+
   const sortedVersions: CompositionStateVersion[] = [];
   if (currentVersion !== null) {
     const currentEntry = stateVersions.find(
@@ -57,6 +68,12 @@ export function HeaderVersionSelector(): JSX.Element | null {
     }
     stateVersions
       .filter((version) => version.version !== currentVersion)
+      // Snapshot-only rows offer nothing a user can decide on, so they are
+      // hidden. Only on POSITIVE evidence: any row the projection cannot
+      // prove unchanged stays visible. Version numbers keep honest gaps —
+      // they must agree with the chat revert message and the audit trail.
+      // The current version is exempt above: it anchors the trigger.
+      .filter((version) => !isSnapshotOnly(version, findPredecessor(version)))
       .sort((left, right) => right.version - left.version)
       .forEach((version) => sortedVersions.push(version));
   }
@@ -247,13 +264,12 @@ export function HeaderVersionSelector(): JSX.Element | null {
               const isFocused = focusedIndex === index;
               const nodeCount =
                 version.nodes?.length ?? version.node_count ?? 0;
-              // Adjacent predecessor by version number, from the fetched
-              // list: with >50 versions the window's oldest row has no
-              // predecessor and the discriminator honestly returns false.
-              const previousVersion = stateVersions.find(
-                (candidate) => candidate.version === version.version - 1,
+              // Only the current row can reach here snapshot-only — the
+              // filter above hides every other one.
+              const snapshotOnly = isSnapshotOnly(
+                version,
+                findPredecessor(version),
               );
-              const snapshotOnly = isSnapshotOnly(version, previousVersion);
               // "no VISIBLE change", not "no pipeline change": isSnapshotOnly
               // compares the redacted wire projection, so the strongest
               // honest claim is about what this surface can see. Do not

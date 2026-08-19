@@ -199,10 +199,107 @@ describe("HeaderVersionSelector", () => {
     expect(within(option).getByText("Applied: upsert_edge")).toBeInTheDocument();
   });
 
-  it("marks snapshot-only rows, keeps them revertable", () => {
-    const revertToVersion = vi.fn();
+  // Snapshot-only rows carry nothing a user can decide on ("no visible
+  // change"), so they are hidden from the history list entirely. Version
+  // numbers stay REAL — they must keep agreeing with the chat revert
+  // message and the audit trail — so the list shows honest gaps.
+  it("hides snapshot-only rows from the history list", () => {
     // v2 content-identical to v1 — a bookkeeping snapshot; v3 differs.
     const v1 = makeVersion({ id: "st-1", version: 1, nodes: [makeNode("a")] });
+    const v2 = makeVersion({ id: "st-2", version: 2, nodes: [makeNode("a")] });
+    const v3 = makeVersion({
+      id: "st-3",
+      version: 3,
+      nodes: [makeNode("a"), makeNode("b")],
+    });
+    useSessionStore.setState({ stateVersions: [v1, v2, v3] } as never);
+    render(<HeaderVersionSelector />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /composition history/i }),
+    );
+
+    expect(
+      screen.queryByRole("option", { name: /^version 2/i }),
+    ).not.toBeInTheDocument();
+    // Classification runs against the FULL fetched list: v3 is judged
+    // relative to its true predecessor v2 even though v2 is hidden.
+    expect(
+      screen.getByRole("option", { name: /^version 3 \(current\) — edited$/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: /^version 1 — session created$/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the current version visible and labeled when it is itself snapshot-only", () => {
+    const v1 = makeVersion({ id: "st-1", version: 1, nodes: [makeNode("a")] });
+    const v2 = makeVersion({
+      id: "st-2",
+      version: 2,
+      nodes: [makeNode("a"), makeNode("b")],
+    });
+    // v3 (current) content-identical to v2: the current row is the anchor
+    // the trigger displays, so it stays visible with its honest label.
+    const v3 = makeVersion({
+      id: "st-3",
+      version: 3,
+      nodes: [makeNode("a"), makeNode("b")],
+    });
+    useSessionStore.setState({ stateVersions: [v1, v2, v3] } as never);
+    render(<HeaderVersionSelector />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /composition history/i }),
+    );
+
+    const current = screen.getByRole("option", {
+      name: /^version 3 \(current\) — no visible change$/i,
+    });
+    expect(current.className).toContain("version-selector-item--snapshot");
+    expect(
+      within(current).getByText("no visible change"),
+    ).toBeInTheDocument();
+    // The stronger claim is not made anywhere on the row: the predicate
+    // compares a redacted projection and cannot prove the pipeline itself
+    // was unchanged.
+    expect(current.textContent).not.toContain("no pipeline change");
+    expect(current.getAttribute("aria-label")).not.toContain(
+      "no pipeline change",
+    );
+    // v2 differs from v1 and stays visible.
+    expect(
+      screen.getByRole("option", { name: /^version 2 — edited$/i }),
+    ).toBeInTheDocument();
+  });
+
+  // Hiding happens only on POSITIVE evidence of "no visible change".
+  // A row whose predecessor is outside the fetched pagination window
+  // cannot be classified and must stay visible.
+  it("keeps a row visible when its predecessor is outside the fetched window", () => {
+    const v2 = makeVersion({ id: "st-2", version: 2, nodes: [makeNode("a")] });
+    const v3 = makeVersion({
+      id: "st-3",
+      version: 3,
+      nodes: [makeNode("a"), makeNode("b")],
+    });
+    // v1 is not in the fetched list — the window edge.
+    useSessionStore.setState({ stateVersions: [v2, v3] } as never);
+    render(<HeaderVersionSelector />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /composition history/i }),
+    );
+
+    expect(
+      screen.getByRole("option", { name: /^version 2 — edited$/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("reverts to a visible version across a hidden snapshot-only gap", () => {
+    const revertToVersion = vi.fn();
+    const v1 = makeVersion({ id: "st-1", version: 1, nodes: [makeNode("a")] });
+    // v2 hidden (identical to v1); v3 differs.
     const v2 = makeVersion({ id: "st-2", version: 2, nodes: [makeNode("a")] });
     const v3 = makeVersion({
       id: "st-3",
@@ -218,31 +315,15 @@ describe("HeaderVersionSelector", () => {
     fireEvent.click(
       screen.getByRole("button", { name: /composition history/i }),
     );
-
-    const option = screen.getByRole("option", {
-      name: /^version 2 — no visible change$/i,
-    });
-    expect(option.className).toContain("version-selector-item--snapshot");
-    expect(
-      within(option).getByText("no visible change"),
-    ).toBeInTheDocument();
-    // The stronger claim is not made anywhere on the row: the predicate
-    // compares a redacted projection and cannot prove the pipeline itself
-    // was unchanged.
-    expect(option.textContent).not.toContain("no pipeline change");
-    expect(option.getAttribute("aria-label")).not.toContain(
-      "no pipeline change",
+    fireEvent.click(
+      screen.getByRole("option", { name: /^version 1 — session created$/i }),
     );
-    // Non-snapshot siblings must NOT carry the class.
-    const edited = screen.getByRole("option", {
-      name: /^version 3 \(current\) — edited$/i,
-    });
-    expect(edited.className).not.toContain("version-selector-item--snapshot");
-
-    fireEvent.click(option);
-    fireEvent.click(screen.getByRole("button", { name: /revert to version 2/i }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /revert to version 1/i }),
+    );
     fireEvent.click(screen.getByRole("button", { name: /^revert$/i }));
-    expect(revertToVersion).toHaveBeenCalledWith("st-2");
+
+    expect(revertToVersion).toHaveBeenCalledWith("st-1");
   });
 
   // elspeth-83eb51334f: focus leaving the selector subtree closes the
