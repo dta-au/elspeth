@@ -690,6 +690,19 @@
     margin-top: var(--space-sm);
   }
 
+  /* Flip the overflow popover's anchor with the trigger. The base rule pins
+     the menu's RIGHT edge to the trigger and grows leftward, which is correct
+     while "…" sits at the right end of the single control row. Here the
+     trigger has wrapped to the pane's LEFT edge, so growing leftward threw a
+     14rem menu to x=-112 at the shipped 360px pane — the file-manager and
+     secrets items rendered half off the viewport, their visible sliver lying
+     over the textarea. Anchor left and grow rightward instead; 14rem clears
+     the 360px pane with room to spare. */
+  .chat-input-more-menu {
+    right: auto;
+    left: 0;
+  }
+
   /* The hint rejoins the flow and fills the attachment row's gutter
      (elspeth-1b7227936c): in guided mode Upload has no More sibling, so
      without the hint the wrapped row was one 44px button and ~344px of
@@ -913,6 +926,17 @@
   .chat-input-upload-btn,
   .chat-input-more {
     margin-top: 0;
+  }
+
+  /* Same left-anchor flip as the narrow-pane container query above, for the
+     other regime that wraps the trigger to the left. This one is keyed to the
+     VIEWPORT, so it catches the wide-pane/narrow-window case the container
+     query cannot see (a 700px window puts the 44px trigger at x=56 while the
+     pane itself is 700px wide, so the container query is inactive and the
+     base right-edge anchor still threw the menu to x=-124). */
+  .chat-input-more-menu {
+    right: auto;
+    left: 0;
   }
 
   .chat-input-row .chat-input-hint {
