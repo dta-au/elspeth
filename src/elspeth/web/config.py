@@ -230,11 +230,18 @@ class WebSettings(BaseModel):
     tutorial_sample_base_url: str | None = Field(default=None)
     # Operator-declared protective marking for the deployment, rendered by the
     # SPA as a full-width banner in the reserved overlay band above the header.
-    # Closed vocabulary: the two non-classification PSPF markings. Colours are
-    # fixed by convention (Purview PSPF label colours: UNOFFICIAL green,
-    # OFFICIAL grey), not themed — see --color-classification-* in the
-    # frontend token sheet. None (the default) renders no banner.
-    classification_banner: Literal["unofficial", "official"] | None = Field(default=None)
+    # Closed vocabulary: the PSPF markings up to PROTECTED, plus the CABINET
+    # caveat ("official_sensitive" covers every OFFICIAL: Sensitive IMM
+    # variant — the banner carries the classification, not the IMM). Colours
+    # follow the traditional PSPF colour code (UNOFFICIAL green, OFFICIAL
+    # grey, OFFICIAL: Sensitive yellow, PROTECTED and its CABINET caveat
+    # blue), not themed — see --color-classification-* in the frontend token
+    # sheet. None (the default) renders no banner. SECRET and above are
+    # deliberately absent: declaring a marking this deployment model cannot
+    # honour would be a lie, not a label.
+    classification_banner: Literal["unofficial", "official", "official_sensitive", "protected", "protected_cabinet"] | None = Field(
+        default=None
+    )
     composer_model: str = "gpt-5.5"
     # Reasoning-effort hints for the composer plane (elspeth-dc459d438e).
     # All composer roles run reasoning-capable models; these knobs bound the

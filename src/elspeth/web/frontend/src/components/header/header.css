@@ -70,7 +70,9 @@
   font-size: var(--font-size-sm);
   font-weight: 700;
   letter-spacing: var(--letter-spacing-caps);
-  text-transform: uppercase;
+  /* No text-transform: the component emits each marking in its standard
+     PSPF form ("OFFICIAL: Sensitive", "PROTECTED//CABINET") and an
+     uppercase transform would rewrite it into a non-standard rendering. */
 }
 
 .classification-banner--unofficial {
@@ -79,6 +81,23 @@
 
 .classification-banner--official {
   background: var(--color-classification-official-bg);
+}
+
+/* Yellow is the one ground the shared white ink fails on; the marking text
+   flips to the dark ink (11.6:1, pinned in colorContrast.test.ts). */
+.classification-banner--official-sensitive {
+  background: var(--color-classification-official-sensitive-bg);
+  color: var(--color-classification-text-dark);
+}
+
+.classification-banner--protected {
+  background: var(--color-classification-protected-bg);
+}
+
+/* The CABINET caveat changes the marking TEXT, not the classification
+   colour — it shares PROTECTED's blue ground. */
+.classification-banner--protected-cabinet {
+  background: var(--color-classification-protected-bg);
 }
 
 .alert-banner {

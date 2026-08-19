@@ -117,14 +117,21 @@
   /* ── Classification banner — protective-marking colours ──────────────────
      Operator-declared deployment marking (WebSettings.classification_banner),
      rendered as the full-width strip in the reserved overlay band. These are
-     FIXED conventional colours (Purview PSPF label colours: UNOFFICIAL green,
-     OFFICIAL grey), deliberately theme-invariant — a protective marking must
-     not restyle with the viewer's theme — so the light block defines no
-     overrides. White marking text: 5.13:1 on the green, 7.17:1 on the grey
-     (both pinned in colorContrast.test.ts). */
-  --color-classification-unofficial-bg: #2e7d32;
-  --color-classification-official-bg:   #54585d;
-  --color-classification-text:          #ffffff;
+     FIXED conventional colours following the traditional PSPF colour code
+     (UNOFFICIAL green, OFFICIAL grey, OFFICIAL: Sensitive yellow, PROTECTED
+     blue — the CABINET caveat keeps PROTECTED's blue because a caveat
+     changes the marking TEXT, not the classification colour). Deliberately
+     theme-invariant — a protective marking must not restyle with the
+     viewer's theme — so the light block defines no overrides. Marking text
+     is white except on the yellow ground, which needs the dark ink: 5.13:1
+     on green, 7.17:1 on grey, 6.87:1 on blue, 11.6:1 dark-on-yellow (all
+     pinned in colorContrast.test.ts). */
+  --color-classification-unofficial-bg:         #2e7d32;
+  --color-classification-official-bg:           #54585d;
+  --color-classification-official-sensitive-bg: #ffcd00;
+  --color-classification-protected-bg:          #0057b8;
+  --color-classification-text:                  #ffffff;
+  --color-classification-text-dark:             #1a1a1a;
 
   /* ── Semantic colours — DTA/GOLD dark theme ──────────────────────────────── */
   --color-success:           #63d487;

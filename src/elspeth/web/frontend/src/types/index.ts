@@ -1190,9 +1190,16 @@ export interface SystemStatus {
   /**
    * Operator-declared protective marking for the deployment
    * (ELSPETH_WEB__CLASSIFICATION_BANNER), rendered by ClassificationBanner
-   * in the reserved overlay band. Null/absent renders no banner.
+   * in the reserved overlay band. Null/absent renders no banner. Mirrors
+   * the closed WebSettings vocabulary (web/config.py).
    */
-  classification_banner?: "unofficial" | "official" | null;
+  classification_banner?:
+    | "unofficial"
+    | "official"
+    | "official_sensitive"
+    | "protected"
+    | "protected_cabinet"
+    | null;
 }
 
 export type PluginPolicyReadinessRowId =

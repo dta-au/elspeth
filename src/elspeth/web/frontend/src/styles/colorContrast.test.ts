@@ -149,16 +149,31 @@ describe("light theme colour contrast", () => {
     expect(contrastRatio(mutedText, background)).toBeGreaterThanOrEqual(4.5);
   });
 
-  it("keeps classification-banner marking text at WCAG AA on both fixed grounds", () => {
+  it("keeps classification-banner marking text at WCAG AA on every fixed ground", () => {
     // The classification tokens are deliberately theme-invariant (a
     // protective marking must not restyle with the viewer's theme), so only
-    // the :root definitions exist and one pin covers both themes.
+    // the :root definitions exist and one pin covers both themes. The white
+    // ink covers every ground except OFFICIAL: Sensitive yellow, which
+    // pairs with the dark ink (header.css flips it per-modifier).
     const markingText = extractRootToken("--color-classification-text");
-    const unofficial = extractRootToken("--color-classification-unofficial-bg");
-    const official = extractRootToken("--color-classification-official-bg");
+    const darkMarkingText = extractRootToken("--color-classification-text-dark");
+    const whiteInkGrounds = [
+      "--color-classification-unofficial-bg",
+      "--color-classification-official-bg",
+      "--color-classification-protected-bg",
+    ];
 
-    expect(contrastRatio(markingText, unofficial)).toBeGreaterThanOrEqual(4.5);
-    expect(contrastRatio(markingText, official)).toBeGreaterThanOrEqual(4.5);
+    for (const ground of whiteInkGrounds) {
+      expect(
+        contrastRatio(markingText, extractRootToken(ground)),
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(
+      contrastRatio(
+        darkMarkingText,
+        extractRootToken("--color-classification-official-sensitive-bg"),
+      ),
+    ).toBeGreaterThanOrEqual(4.5);
   });
 
   it("keeps the dark theme focus ring distinct from gate badges", () => {

@@ -566,22 +566,26 @@ class TestSystemStatusEndpoint:
         assert response.status_code == 200
         assert response.json()["classification_banner"] is None
 
-    def test_reports_the_declared_classification_banner(self, tmp_path) -> None:
-        """The operator-declared marking reaches the SPA via the status payload."""
-        app = create_app(_settings(tmp_path, classification_banner="unofficial"))
+    @pytest.mark.parametrize(
+        "marking",
+        ["unofficial", "official", "official_sensitive", "protected", "protected_cabinet"],
+    )
+    def test_reports_the_declared_classification_banner(self, tmp_path, marking: str) -> None:
+        """Every marking in the closed vocabulary reaches the SPA verbatim."""
+        app = create_app(_settings(tmp_path, classification_banner=marking))
         response = TestClient(app).get("/api/system/status")
         assert response.status_code == 200
-        assert response.json()["classification_banner"] == "unofficial"
+        assert response.json()["classification_banner"] == marking
 
     def test_classification_banner_vocabulary_is_closed(self, tmp_path) -> None:
-        """Only the two non-classification PSPF markings are declarable.
+        """Markings above PROTECTED (and typos) are not declarable.
 
-        A typo'd or unsupported marking (e.g. "protected") must fail settings
-        load rather than silently render an unstyled banner claiming a
-        protection level the deployment does not implement.
+        An unsupported marking (e.g. "secret") must fail settings load rather
+        than silently render an unstyled banner claiming a protection level
+        the deployment does not implement.
         """
         with pytest.raises(ValidationError):
-            _settings(tmp_path, classification_banner="protected")
+            _settings(tmp_path, classification_banner="secret")
 
     def test_reports_the_deployed_frontend_build_identity(self, tmp_path) -> None:
         """Deploy-cache coherence beacon: stale tabs must self-announce.
