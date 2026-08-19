@@ -32,10 +32,14 @@ is a working document under the normal delivery posture.
   envelope for payload-bearing keys) AND in `_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS`,
   then regenerate `redaction_policy_snapshot.json` via
   `scripts/cicd/bootstrap_redaction_snapshot.py --write` — never by hand. Know
-  the two carve-outs: (a) declarative entries with `handles_no_sensitive_data=True`
+  the three dispositions: (a) declarative entries with `handles_no_sensitive_data=True`
   have EMPTY `known_response_keys` — the shared-list edit never reaches them and
   the new key aggregates as `REDACTED_UNKNOWN_RESPONSE_FIELD` (value-free, safe,
-  +1 telemetry event — the pre-existing `affected_nodes` pattern); (b)
+  +1 telemetry event — the pre-existing `affected_nodes` pattern); (b) declarative
+  entries with `handles_no_sensitive_data=False` and NON-EMPTY
+  `known_response_keys` (the `set_metadata` / `set_output` / `upsert_node`
+  class) DO inherit the shared-list key: each such entry's snapshot hash moves,
+  and that churn is what feeds disposition (c); (c)
   `check_redaction_direction.py` can verdict a pure strengthening as `weaken`
   via its conservative same-count rule when an entry's hash moves only by
   gaining a non-sensitive key — that needs the `policy-weaken-justified` label
