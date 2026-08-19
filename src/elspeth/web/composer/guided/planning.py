@@ -332,6 +332,9 @@ class GuidedRevisionBindingResult:
     rejection_code: Literal["guided_amend_contract_violation"] | None
     violations: tuple[Mapping[str, JsonValue], ...] = ()
 
+    def __post_init__(self) -> None:
+        freeze_fields(self, "violations")
+
 
 def guided_revision_execution_hash(state: CompositionState) -> str:
     """Hash revision-responsive pipeline semantics only.

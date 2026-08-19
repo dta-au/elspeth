@@ -3583,8 +3583,9 @@ def test_amend_binder_surfaces_every_seeded_violation_with_its_own_facts() -> No
     )
 
     assert result.rejection_code == "guided_amend_contract_violation"
+    # Records are deep-frozen at rest (freeze_guards): nested lists surface as tuples.
     assert result.violations == (
-        {"violation": "protected_fields_changed", "node_id": "amount_gate", "protected_keys": ["condition"]},
+        {"violation": "protected_fields_changed", "node_id": "amount_gate", "protected_keys": ("condition",)},
         {"violation": "node_type_changed", "node_id": "summarize_standard"},
     )
 
