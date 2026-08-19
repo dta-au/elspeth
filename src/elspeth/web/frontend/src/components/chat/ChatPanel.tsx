@@ -10,6 +10,7 @@ import {
 } from "react";
 import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useBlobStore } from "@/stores/blobStore";
 import {
   deriveInlineSourceRowCount,
@@ -51,6 +52,7 @@ import { clientWireBlockerMessages, humaniseValidationMessage, makePhraseFor } f
 import {
   AcknowledgementLiveRegion,
   AcknowledgementStack,
+  isPendingAcknowledgement,
   useHasPendingGuidedInterpretations,
   usePendingAcknowledgements,
 } from "./AcknowledgementStack";
@@ -725,6 +727,8 @@ export function ChatPanel({
     (s) => s.composerTimeoutUnavailable,
   );
   const guidedSelfHealNotice = useSessionStore((s) => s.guidedSelfHealNotice);
+  const guidedApprovalNotice = useSessionStore((s) => s.guidedApprovalNotice);
+  const approveWiring = useSessionStore((s) => s.approveWiring);
   const isProposalRevisionComposer =
     guidedSession?.step === "step_3_transforms" &&
     guidedNextTurn?.type === "propose_pipeline";
@@ -801,6 +805,25 @@ export function ChatPanel({
       (message) => humaniseValidationMessage(message, phraseFor).headline,
     );
   }, [compositionState]);
+  // "Approve wiring": the same two blockers the wire stage names, but read
+  // FRESH at the moment the store asks — the review_wiring transition that
+  // approval runs first can itself create acknowledgement cards and move the
+  // persisted composition, so the memoised values above (captured before the
+  // dispatch) would miss exactly the cases this must stop on. Reuses the same
+  // sources those memos use, never a second definition of "pending".
+  const wireApprovalClientBlockers = useCallback(() => {
+    const sessionId = activeSessionId ?? "";
+    const pending = Object.values(
+      useInterpretationEventsStore.getState().pendingBySession[sessionId] ?? {},
+    ).filter(isPendingAcknowledgement);
+    const liveComposition = useSessionStore.getState().compositionState;
+    return {
+      pendingAcknowledgements: pending.length,
+      validationIssues: clientWireBlockerMessages(
+        liveComposition?.validation_errors ?? [],
+      ).length,
+    };
+  }, [activeSessionId]);
   // Guided chat abort plumbing (elspeth-fb4464cdf0): the same
   // AbortController + client-timeout treatment freeform gets from
   // useComposer.runWithTimeout, scoped to the guided step composer. Stored on
@@ -2498,6 +2521,26 @@ export function ChatPanel({
                     : undefined
                 }
                 wireValidationIssues={wireValidationIssues}
+                // Withheld in tutorial mode at the source too: the tutorial
+                // walks the learner through the wire stage deliberately.
+                onApproveWiring={
+                  isTutorial
+                    ? undefined
+                    : (binding) => {
+                        void approveWiring(
+                          {
+                            chosen: ["review_wiring"],
+                            edited_values: null,
+                            custom_inputs: null,
+                            proposal_id: binding.proposal_id,
+                            draft_hash: binding.draft_hash,
+                            edit_target: null,
+                            control_signal: null,
+                          },
+                          wireApprovalClientBlockers,
+                        );
+                      }
+                }
               />
             )}
           </div>
@@ -2577,6 +2620,16 @@ export function ChatPanel({
           {guidedSelfHealNotice && (
             <p className="guided-current-decision-pending" role="status">
               {guidedSelfHealNotice}
+            </p>
+          )}
+          {/* "Approve wiring" refused to confirm unseen and left the user on
+              the wire review instead. Same polite role="status" treatment as
+              the self-heal notice above: a shortcut declining to skip a
+              warning is the feature working, not a failure — and without it
+              the landing reads as a button that did nothing. */}
+          {guidedApprovalNotice && (
+            <p className="guided-current-decision-pending" role="status">
+              {guidedApprovalNotice}
             </p>
           )}
           {/* Backend rejection surfaced NEXT TO the turn widget it rejected —

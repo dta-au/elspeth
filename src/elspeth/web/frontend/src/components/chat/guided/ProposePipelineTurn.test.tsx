@@ -744,4 +744,88 @@ describe("ProposePipelineTurn", () => {
     expect(screen.getByRole("button", { name: "Reject proposal" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Revise node-1" })).toBeEnabled();
   });
+
+  // "Approve wiring" is the shortcut past the wire review for an operator who
+  // trusts the proposal. It is NOT an onSubmit action: the server rejects a
+  // confirm_wiring from step 3 outright, so approval is a two-dispatch chain
+  // the parent owns (review_wiring, then confirm_wiring built from the wire
+  // turn that came back). The turn widget only reports the intent.
+  it("offers Approve wiring beside Review wiring and reports the intent to the parent", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const onApproveWiring = vi.fn();
+    render(
+      <ProposePipelineTurn
+        payload={payload()}
+        reviewState={activeReview()}
+        onSubmit={onSubmit}
+        onApproveWiring={onApproveWiring}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Approve wiring" }));
+
+    // It carries the exact proposal binding the chain's first dispatch must
+    // quote — the closed action shape rejects a null one.
+    expect(onApproveWiring.mock.calls).toEqual([
+      [{ proposal_id: IDS.proposal, draft_hash: "d".repeat(64) }],
+    ]);
+    // The approval never travels as a GuidedRespondAction — the closed
+    // action shape has no room for a client-only chained intent.
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("disables Approve wiring whenever a proposal blocker disables Review wiring", () => {
+    const blocked = payload();
+    blocked.blockers = [
+      {
+        code: "policy_review_required",
+        category: "policy",
+        summary: "guided.proposal.blocker.policy_review_required.v1",
+        edit_target: { kind: "node", stable_id: IDS.gate },
+      },
+    ];
+    render(
+      <ProposePipelineTurn
+        payload={blocked}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+        onApproveWiring={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Approve wiring" })).toBeDisabled();
+  });
+
+  it("withholds Approve wiring from the tutorial learner, like the other off-script affordances", () => {
+    const revision = { ...payload(), supersedes_draft_hash: "e".repeat(64) };
+    render(
+      <ProposePipelineTurn
+        payload={revision}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+        onApproveWiring={vi.fn()}
+        isTutorial
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Approve wiring" })).toBeNull();
+  });
+
+  // The parent only supplies the handler where the chain can actually run.
+  it("omits Approve wiring entirely when the parent supplies no approval handler", () => {
+    render(
+      <ProposePipelineTurn
+        payload={payload()}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Approve wiring" })).toBeNull();
+  });
 });

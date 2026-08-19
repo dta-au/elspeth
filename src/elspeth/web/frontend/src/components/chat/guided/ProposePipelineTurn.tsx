@@ -23,6 +23,20 @@ interface ProposePipelineTurnProps {
   payload: ProposePipelinePayload;
   reviewState: GuidedProposalReviewState;
   onSubmit: (body: GuidedRespondAction) => void;
+  /**
+   * Approve the wiring without opening the wire review. Deliberately NOT an
+   * `onSubmit` body: the server rejects a `confirm_wiring` from step 3
+   * outright (guided.py's closed step-3 action shape), so approval is a
+   * two-dispatch chain — review_wiring, then confirm_wiring built from the
+   * wire turn that came back, and only if that turn is clean. The parent owns
+   * that chain and the stop rule; this turn only reports the intent, carrying
+   * the proposal binding the chain's first dispatch must quote. Omitted where
+   * the parent cannot run the chain, and the button is not rendered.
+   */
+  onApproveWiring?: (binding: {
+    proposal_id: string;
+    draft_hash: string;
+  }) => void;
   disabled?: boolean;
   isTutorial?: boolean;
 }
@@ -201,6 +215,7 @@ export function ProposePipelineTurn({
   payload,
   reviewState,
   onSubmit,
+  onApproveWiring,
   disabled = false,
   isTutorial = false,
 }: ProposePipelineTurnProps): JSX.Element {
@@ -485,6 +500,24 @@ export function ProposePipelineTurn({
               } satisfies GuidedRespondAction)}
             >
               Review wiring
+            </Button>
+          )}
+          {/* The shortcut for an operator who has read the proposal above and
+              does not need the wiring detail. Same gate as Review wiring —
+              it dispatches review_wiring first — and withheld from the
+              tutorial learner alongside Reject/Revise, since the script walks
+              through the wire stage deliberately. */}
+          {onApproveWiring !== undefined && !isTutorial && (
+            <Button
+              variant="bare"
+              className="guided-turn-secondary"
+              disabled={!actionEnabled({ kind: "review_wiring" }) || payload.blockers.length > 0}
+              onClick={() => onApproveWiring({
+                proposal_id: payload.proposal_id,
+                draft_hash: payload.draft_hash,
+              })}
+            >
+              Approve wiring
             </Button>
           )}
           {!isTutorial && (

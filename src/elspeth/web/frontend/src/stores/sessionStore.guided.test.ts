@@ -4373,4 +4373,273 @@ describe("sessionStore — guided-mode fields and actions", () => {
       expect(useSessionStore.getState().guidedSelfHealNotice).toBeNull();
     });
   });
+
+  // ── approveWiring: the two-dispatch shortcut past the wire review ────────
+  //
+  // The server rejects a confirm_wiring from step 3 outright, so approving
+  // without opening the review is necessarily review_wiring THEN
+  // confirm_wiring, with the second built from the wire turn the first
+  // produced. The stop rule between them is the whole safety of the feature.
+  describe("approveWiring", () => {
+    const WIRE_TOKEN = "f".repeat(64);
+
+    function wireTurn(
+      overrides: Partial<{
+        can_confirm: boolean;
+        warnings: Array<Record<string, unknown>>;
+        blockers: Array<Record<string, unknown>>;
+      }> = {},
+    ): TurnPayload {
+      return {
+        type: "confirm_wiring",
+        step_index: 3,
+        turn_token: WIRE_TOKEN,
+        payload: {
+          proposal_id: PROPOSAL_ID,
+          draft_hash: PROPOSAL_HASH,
+          sources: [],
+          nodes: [],
+          outputs: [],
+          connections: [],
+          semantic_contracts: [],
+          warnings: [],
+          blockers: [],
+          can_confirm: true,
+          ...overrides,
+        },
+      };
+    }
+
+    function wireResponse(turn: TurnPayload): GuidedRespondResponse {
+      return {
+        guided_session: { ...sampleGuidedSession, step: "step_4_wire" },
+        next_turn: turn,
+        terminal: null,
+        composition_state: { ...sampleCompositionState, version: 2 },
+      };
+    }
+
+    const reviewBody: GuidedRespondAction = {
+      chosen: ["review_wiring"],
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+      edit_target: null,
+      control_signal: null,
+    };
+
+    const noClientBlockers = () => ({
+      pendingAcknowledgements: 0,
+      validationIssues: 0,
+    });
+
+    function seedProposalTurn(): void {
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+        guidedNextTurn: sampleProposalTurn,
+      });
+    }
+
+    it("confirms clean wiring with a confirm built from the wire turn the review produced", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond
+        .mockResolvedValueOnce(wireResponse(wireTurn()))
+        .mockResolvedValueOnce(wireResponse(wireTurn()));
+      seedProposalTurn();
+
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, noClientBlockers);
+
+      expect(outcome).toEqual({ status: "confirmed" });
+      expect(respond).toHaveBeenCalledTimes(2);
+      // The confirm carries the WIRE turn's own identity and token — never
+      // the proposal turn's stale token, which the server 409s.
+      const confirmRequest = respond.mock.calls[1]?.[1];
+      expect(confirmRequest.chosen).toEqual(["confirm_wiring"]);
+      expect(confirmRequest.proposal_id).toBe(PROPOSAL_ID);
+      expect(confirmRequest.draft_hash).toBe(PROPOSAL_HASH);
+      expect(confirmRequest.turn_token).toBe(WIRE_TOKEN);
+    });
+
+    it("does not confirm when the wiring came back with warnings, and says why", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond.mockResolvedValueOnce(
+        wireResponse(wireTurn({ warnings: [{ message: "never receives data" }] })),
+      );
+      seedProposalTurn();
+
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, noClientBlockers);
+
+      expect(outcome.status).toBe("stopped");
+      expect(respond).toHaveBeenCalledTimes(1);
+      // The user is left ON the wire review, which the first dispatch already
+      // rendered — with an explanation, not a silently dead button.
+      expect(useSessionStore.getState().guidedNextTurn?.type).toBe("confirm_wiring");
+      expect(useSessionStore.getState().guidedApprovalNotice).toContain("1 warning");
+    });
+
+    it("does not confirm when the wiring came back with blockers", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond.mockResolvedValueOnce(
+        wireResponse(wireTurn({ can_confirm: false, blockers: [{ code: "x" }] })),
+      );
+      seedProposalTurn();
+
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, noClientBlockers);
+
+      expect(outcome.status).toBe("stopped");
+      expect(respond).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not confirm when the transition surfaced a pending acknowledgement", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond.mockResolvedValueOnce(wireResponse(wireTurn()));
+      seedProposalTurn();
+
+      // Read AFTER the review dispatch: the transition itself can create the
+      // acknowledgement, so a snapshot taken before it would miss exactly the
+      // case this guards.
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, () => ({
+          pendingAcknowledgements: 1,
+          validationIssues: 0,
+        }));
+
+      expect(outcome.status).toBe("stopped");
+      expect(respond).toHaveBeenCalledTimes(1);
+    });
+
+    it("reads the client blockers only after the review dispatch has landed", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond.mockResolvedValueOnce(wireResponse(wireTurn()));
+      seedProposalTurn();
+      const callsWhenRead: number[] = [];
+
+      await useSessionStore.getState().approveWiring(reviewBody, () => {
+        callsWhenRead.push(respond.mock.calls.length);
+        return { pendingAcknowledgements: 0, validationIssues: 0 };
+      });
+
+      expect(callsWhenRead).toEqual([1]);
+    });
+
+    it("abandons the chain when the review dispatch itself did not apply", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond.mockRejectedValueOnce(new Error("network"));
+      seedProposalTurn();
+
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, noClientBlockers);
+
+      expect(outcome.status).toBe("not_applied");
+      expect(respond).toHaveBeenCalledTimes(1);
+    });
+
+    it("never confirms a turn that is not the wire review", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      // A re-plan or self-heal can legitimately land somewhere else.
+      respond.mockResolvedValueOnce(sampleRespondResponse);
+      seedProposalTurn();
+
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, noClientBlockers);
+
+      expect(outcome.status).toBe("not_applied");
+      expect(respond).toHaveBeenCalledTimes(1);
+    });
+
+    it("clears a stale approval notice when the next approval starts", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond
+        .mockResolvedValueOnce(
+          wireResponse(wireTurn({ warnings: [{ message: "advisory" }] })),
+        )
+        .mockResolvedValueOnce(wireResponse(wireTurn()))
+        .mockResolvedValueOnce(wireResponse(wireTurn()));
+      seedProposalTurn();
+
+      await useSessionStore.getState().approveWiring(reviewBody, noClientBlockers);
+      expect(useSessionStore.getState().guidedApprovalNotice).not.toBeNull();
+
+      seedProposalTurn();
+      await useSessionStore.getState().approveWiring(reviewBody, noClientBlockers);
+      expect(useSessionStore.getState().guidedApprovalNotice).toBeNull();
+    });
+
+    // The refusal describes ONE wiring. Once the user acts on the review it
+    // refused — confirming it by hand, or asking a question — the line is
+    // about a decision already taken and must not stay pinned above the next
+    // turn. Same lifecycle guidedSelfHealNotice has.
+    it("clears the approval notice when the user responds to the turn by hand", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond
+        .mockResolvedValueOnce(
+          wireResponse(wireTurn({ warnings: [{ message: "advisory" }] })),
+        )
+        .mockResolvedValueOnce(sampleRespondResponse);
+      seedProposalTurn();
+
+      await useSessionStore.getState().approveWiring(reviewBody, noClientBlockers);
+      expect(useSessionStore.getState().guidedApprovalNotice).not.toBeNull();
+
+      await useSessionStore.getState().respondGuided({
+        chosen: ["confirm_wiring"],
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: PROPOSAL_ID,
+        draft_hash: PROPOSAL_HASH,
+        edit_target: null,
+        control_signal: null,
+      });
+
+      expect(useSessionStore.getState().guidedApprovalNotice).toBeNull();
+    });
+
+    it("clears the approval notice when the user asks a question instead", async () => {
+      const { respondGuided, chatGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        wireResponse(wireTurn({ warnings: [{ message: "advisory" }] })),
+      );
+      (chatGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        sampleChatResponse,
+      );
+      seedProposalTurn();
+
+      await useSessionStore.getState().approveWiring(reviewBody, noClientBlockers);
+      expect(useSessionStore.getState().guidedApprovalNotice).not.toBeNull();
+
+      await useSessionStore.getState().chatGuided("Why is that a warning?");
+
+      expect(useSessionStore.getState().guidedApprovalNotice).toBeNull();
+    });
+
+    it("clears the approval notice when the user dismisses notices", () => {
+      useSessionStore.setState({
+        guidedApprovalNotice: "Approval stopped: the wiring came back with 1 warning.",
+      } as never);
+
+      useSessionStore.getState().clearError();
+
+      expect(useSessionStore.getState().guidedApprovalNotice).toBeNull();
+    });
+  });
 });

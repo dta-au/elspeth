@@ -55,6 +55,14 @@ interface GuidedTurnProps {
   wireValidationIssues?: string[];
   /** Exact proposal/hash-bound local review lifecycle. Required by proposal turns. */
   proposalReviewState?: GuidedProposalReviewState | null;
+  /** Approve the proposed wiring without opening the wire review — forwarded
+   * to ProposePipelineTurn, which renders no such button without it. Not an
+   * onSubmit body: the parent owns the review→confirm chain the server
+   * requires (see sessionStore.approveWiring). */
+  onApproveWiring?: (binding: {
+    proposal_id: string;
+    draft_hash: string;
+  }) => void;
 }
 
 function guidedTurnInstanceKey(turn: TurnPayload): string {
@@ -73,6 +81,7 @@ export function GuidedTurn({
   wirePendingAcknowledgements,
   wireValidationIssues,
   proposalReviewState,
+  onApproveWiring,
 }: GuidedTurnProps) {
   const guardedSubmit = (body: GuidedRespondAction) => {
     if (disabled) return;
@@ -147,6 +156,16 @@ export function GuidedTurn({
           payload={turn.payload}
           reviewState={proposalReviewState}
           onSubmit={guardedSubmit}
+          onApproveWiring={
+            onApproveWiring === undefined
+              ? undefined
+              : (binding) => {
+                  // Same gate guardedSubmit applies: a disabled turn must not
+                  // start the chain either.
+                  if (disabled) return;
+                  onApproveWiring(binding);
+                }
+          }
           disabled={disabled}
           isTutorial={isTutorial}
         />

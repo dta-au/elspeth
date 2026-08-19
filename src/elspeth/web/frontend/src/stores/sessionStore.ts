@@ -35,6 +35,12 @@ import {
 import { useBlobStore } from "./blobStore";
 import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
+// Pure leaf (no React, no store) — see the constraint recorded in its header.
+import {
+  approvalStopReason,
+  type WiringApprovalClientBlockers,
+  type WiringApprovalOutcome,
+} from "@/components/chat/guided/wiringApproval";
 import { usePreferencesStore } from "./preferencesStore";
 import {
   acquireGuidedRetry,
@@ -907,6 +913,7 @@ function clearedGuidedState(): Pick<
   | "guidedChatPending"
   | "guidedResponsePending"
   | "guidedSelfHealNotice"
+  | "guidedApprovalNotice"
 > {
   // Every caller is a full guided-context reset (initialisation or session
   // navigation), so no in-flight respond retains ownership of the cleared
@@ -920,6 +927,7 @@ function clearedGuidedState(): Pick<
     guidedChatPending: false,
     guidedResponsePending: false,
     guidedSelfHealNotice: null,
+    guidedApprovalNotice: null,
   };
 }
 
@@ -1235,6 +1243,16 @@ interface SessionState {
    * and by clearError().
    */
   guidedSelfHealNotice: string | null;
+  /**
+   * Why a one-click "Approve wiring" stopped at the wire review instead of
+   * confirming (see `approveWiring`). Kept SEPARATE from `error` for the same
+   * reason `guidedSelfHealNotice` is: a refused shortcut is not a failure —
+   * ChatPanel renders it role="status" (polite). Null whenever the last
+   * approval confirmed or none has run. Same lifecycle as its sibling above:
+   * cleared at the start of the next guided respond/chat attempt and by
+   * clearError().
+   */
+  guidedApprovalNotice: string | null;
   // Guided-mode actions
   startGuided: (sessionId: string) => Promise<void>;
   seedGuided: (
@@ -1242,6 +1260,32 @@ interface SessionState {
     profileKind: "tutorial",
   ) => Promise<void>;
   respondGuided: (body: GuidedRespondAction) => Promise<GuidedRespondOutcome>;
+  /**
+   * Approve the proposed wiring without opening the wire review.
+   *
+   * Necessarily TWO dispatches: the server's step-3 action shape rejects a
+   * `confirm_wiring` outright (guided.py), and the wire verdict this must
+   * respect — `can_confirm`, `blockers`, `warnings` — is only computed
+   * server-side DURING the review_wiring transition. So this dispatches
+   * review_wiring, reads the wire turn that came back, and confirms only if
+   * `approvalStopReason` clears it. Both dispatches go through the ordinary
+   * `respondGuided`, so ownership, retry custody and audit are exactly what a
+   * user clicking through fast produces — this adds no new protocol action.
+   *
+   * `clientBlockers` is a CALLBACK, not a snapshot: the transition itself can
+   * create the pending acknowledgements that must stop the approval, so it is
+   * read after the review dispatch lands, never before. It stays a callback
+   * (rather than the store reading the events itself) because the single
+   * `isPendingAcknowledgement` predicate lives with the cards in components/,
+   * and duplicating it here is exactly the drift its docstring forbids.
+   *
+   * On a stop the user is left on the wire review the first dispatch already
+   * rendered, with `guidedApprovalNotice` explaining why.
+   */
+  approveWiring: (
+    reviewBody: GuidedRespondAction,
+    clientBlockers: () => WiringApprovalClientBlockers,
+  ) => Promise<WiringApprovalOutcome>;
   /**
    * Apply a GuidedRespondResponse to the store: atomically replace the 4 wire
    * fields, await the B1/D12 interpretation-event refresh, and clear the C-3
@@ -2841,11 +2885,15 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     const proposalRetryAction = proposalRetryActionForBody(body);
     // Clear any stale self-heal notice at the start of the next attempt, per
     // its documented lifecycle (the resync notice describes the PREVIOUS
-    // desync, not this one).
+    // desync, not this one). The approval notice has the same lifecycle: it
+    // describes the wiring a refused shortcut left the user on, so acting on
+    // that turn by hand retires it. approveWiring sets it only AFTER its own
+    // review dispatch returns, so clearing here never races it.
     guidedResponsePendingOwnerGeneration = publicationGeneration;
     set({
       guidedResponsePending: true,
       guidedSelfHealNotice: null,
+      guidedApprovalNotice: null,
       ...(proposalBinding === null
         ? {}
         : {
@@ -3319,6 +3367,58 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
+  async approveWiring(
+    reviewBody: GuidedRespondAction,
+    clientBlockers: () => WiringApprovalClientBlockers,
+  ): Promise<WiringApprovalOutcome> {
+    // Clear the previous refusal before the new attempt: the old reason
+    // described the PREVIOUS wiring, exactly as respondGuided treats its own
+    // self-heal notice.
+    set({ guidedApprovalNotice: null });
+
+    const reviewOutcome = await get().respondGuided(reviewBody);
+    if (reviewOutcome.status !== "applied") {
+      // respondGuided has already published whatever the user needs to see
+      // (rejection banner, stale settle, pending message).
+      return { status: "not_applied" };
+    }
+
+    // Judge the turn the server actually emitted. A review_wiring that landed
+    // anywhere else — a self-heal resync, a re-plan — is not something this
+    // shortcut may confirm, and silence is the correct outcome: the user is
+    // looking at whatever did arrive.
+    const wireTurn = get().guidedNextTurn;
+    if (wireTurn === null || wireTurn.type !== "confirm_wiring") {
+      return { status: "not_applied" };
+    }
+    const wiring = wireTurn.payload;
+
+    // Read the client-side blockers HERE, not before the dispatch: the
+    // transition can itself create the acknowledgement cards that must stop
+    // the approval.
+    const stopReason = approvalStopReason(wiring, clientBlockers());
+    if (stopReason !== null) {
+      set({ guidedApprovalNotice: stopReason });
+      return { status: "stopped", reason: stopReason };
+    }
+
+    // The confirm is an ordinary respond: it picks up the wire turn's own
+    // turn_token from the store, so it can never carry the proposal turn's
+    // stale one.
+    const confirmOutcome = await get().respondGuided({
+      chosen: ["confirm_wiring"],
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: wiring.proposal_id,
+      draft_hash: wiring.draft_hash,
+      edit_target: null,
+      control_signal: null,
+    });
+    return confirmOutcome.status === "applied"
+      ? { status: "confirmed" }
+      : { status: "not_applied" };
+  },
+
   async applyGuidedResponse(
     sessionId: string,
     response: GuidedRespondResponse,
@@ -3461,7 +3561,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       const publicationGeneration = advanceGuidedPublicationGeneration();
       const existingRetry = findGuidedRetry("guided_start", requestedSessionId);
       if (existingRetry !== null) {
-        set({ guidedChatPending: true, guidedSelfHealNotice: null });
+        set({ guidedChatPending: true, guidedSelfHealNotice: null, guidedApprovalNotice: null });
         const reconciliation = await reconcileGuidedStartRetry(
           existingRetry,
           publicationGeneration,
@@ -3501,7 +3601,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         return;
       }
       const retry = acquisition.handle;
-      set({ guidedChatPending: true, guidedSelfHealNotice: null });
+      set({ guidedChatPending: true, guidedSelfHealNotice: null, guidedApprovalNotice: null });
       let responseReceived = false;
       try {
         const response = await api.startGuidedSession(
@@ -3663,7 +3763,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // Clear any stale self-heal notice at the start of the next attempt, per
     // its documented lifecycle — a successful advisory chat must not leave a
     // "we've refreshed — please try again" resync notice pinned above it.
-    set({ guidedChatPending: true, guidedSelfHealNotice: null });
+    set({ guidedChatPending: true, guidedSelfHealNotice: null, guidedApprovalNotice: null });
     // Mirrors sendMessage/retryMessage: the backend guided-chat route (any
     // step, not just step_2_sink — see post_guided_chat) now writes progress
     // snapshots the same way freeform compose does, so start polling here
@@ -3889,7 +3989,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   clearError() {
-    set({ error: null, errorDetails: null, guidedSelfHealNotice: null });
+    set({
+      error: null,
+      errorDetails: null,
+      guidedSelfHealNotice: null,
+      guidedApprovalNotice: null,
+    });
   },
 
   selectNode(nodeId: string | null) {

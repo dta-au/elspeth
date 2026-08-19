@@ -2403,6 +2403,30 @@ describe("ChatPanel mode discriminator", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  // A refused "Approve wiring" must say why. Without this line the shortcut
+  // lands the user on the wire review with no explanation, which reads as a
+  // button that did nothing. Polite like its self-heal sibling above: a
+  // shortcut declining to skip a warning is the feature working.
+  it("renders guidedApprovalNotice as a role=status notice, not an alert", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn(),
+      guidedApprovalNotice:
+        "Approval stopped: the wiring came back with 2 warnings. Review them below, then confirm.",
+    });
+
+    render(<ChatPanel />);
+
+    const notice = screen.getByText(
+      "Approval stopped: the wiring came back with 2 warnings. Review them below, then confirm.",
+    );
+    expect(notice).toHaveAttribute("role", "status");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("disables guided turn buttons while a guided response is pending", async () => {
     const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
     useSessionStore.setState({
