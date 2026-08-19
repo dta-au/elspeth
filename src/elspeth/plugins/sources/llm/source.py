@@ -174,9 +174,17 @@ class LLMSource(BaseSource):
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
+        """Minimal no-network config for the ADR-009 forward invariant.
+
+        Same canary criteria as ``LLMTransform.probe_config`` (see its
+        docstring): the model must be a stable BASE id in litellm's
+        OpenRouter catalog slice, which the web service also primes live
+        at boot — the two probes share the identifier deliberately so a
+        catalog change breaks both together, loudly.
+        """
         return {
             "provider": "openrouter",
-            "model": "openai/gpt-4o",
+            "model": "openai/gpt-5",
             "api_key": "probe-key",
             "prompt_template": "Return one probe response.",
             "schema": {"mode": "observed"},

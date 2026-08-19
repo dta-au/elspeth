@@ -1270,19 +1270,23 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     def probe_config(cls) -> dict[str, Any]:
         """Minimal no-network config for the ADR-009 forward invariant.
 
-        Uses ``openai/gpt-4o`` because it's a stable presence in
+        Uses ``openai/gpt-5`` because it's a stable presence in
         ``litellm.model_list``'s OpenRouter slice — the probe never
         actually makes a network call (preflight mode defers all
         external client setup), but the value-source compliance walker
         runs at construction time, so the model identifier MUST satisfy
-        the OpenRouter catalog declaration. A model that drops in/out
-        across litellm versions (e.g. ``gpt-4o-mini``) would make probes
-        flaky against the catalog snapshot.
+        the OpenRouter catalog declaration. Pick a family's BASE id: a
+        point-version or dated variant that drops in/out across litellm
+        versions (e.g. ``gpt-4o-2024-05-13``) would make probes flaky
+        against the catalog snapshot, and the web service primes this
+        catalog LIVE at boot, so a provider-retired id (``gpt-4o``,
+        EOL'd upstream 2026-09) starts failing construction in
+        deployments even while the bundled snapshot still lists it.
         """
         return {
             "provider": "openrouter",
             "api_key": "probe-key",
-            "model": "openai/gpt-4o",
+            "model": "openai/gpt-5",
             "prompt_template": "{{ row.llm_probe_text }}",
             "schema": {"mode": "observed"},
             "required_input_fields": [],
