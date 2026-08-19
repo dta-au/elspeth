@@ -48,7 +48,7 @@ returned before your next turn begins, bounded by the per-turn tool budget.
 Batch only calls whose fact is still missing: never issue the same call twice
 in one turn, and never ask for a fact the request already supplies or one an
 earlier call already answered — such a read is refused rather than answered,
-and two refusals in a round end that round's discovery. A rejection clears the
+and two refusals can end the request's discovery. A rejection clears the
 repetition window but does not un-supply anything already read: a fact stays
 supplied for the whole request, so repair through step 3's structured-repair
 reads, which carry what a re-read cannot. Where your palette also carries
