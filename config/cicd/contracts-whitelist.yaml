@@ -902,6 +902,12 @@ allowed_dict_patterns:
   # untyped external-library completion surface, not a contract this
   # codebase owns the shape of.
   - "src/elspeth/web/composer/service.py:_apply_endpoint_kwargs:kwargs"
+  # ``_apply_openrouter_usage_accounting`` pins OpenRouter's usage-accounting
+  # opt-in (elspeth-190a5c4668) on the same open-ended LiteLLM ``acompletion``
+  # kwargs dict as the two entries above, for the same reason: it is LiteLLM's
+  # untyped external-library completion surface, not a contract this codebase
+  # owns the shape of.
+  - "src/elspeth/web/composer/service.py:_apply_openrouter_usage_accounting:kwargs"
   # Blob sync helpers — return dicts for LLM-visible tool response payloads.
   # The list_composer_blobs shape is deliberately metadata-only, enforced by
   # the construction helper; bytes/previews/storage paths stay outside the

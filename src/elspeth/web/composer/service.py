@@ -701,6 +701,29 @@ def _apply_openrouter_app_identity(kwargs: dict[str, Any]) -> None:
     kwargs["extra_headers"] = headers
 
 
+def _apply_openrouter_usage_accounting(kwargs: dict[str, Any]) -> None:
+    """Pin OpenRouter's usage-accounting opt-in on the request, explicitly.
+
+    The audit's provider cost (``response_usage.cost``) and in-band cache
+    detail (``prompt_tokens_details.cached_tokens``) exist on the response
+    only under OpenRouter's ``usage: {"include": true}`` opt-in. litellm
+    1.85.0 happens to inject that opt-in unconditionally
+    (``OpenrouterConfig.transform_request``), but that is undocumented
+    internal behaviour and the dependency range admits any 1.x — this makes
+    the opt-in an ELSPETH-owned contract rather than a litellm-version
+    accident. Survival through litellm's param shaping is pinned by
+    ``tests/unit/web/composer/test_openrouter_usage_accounting.py``.
+
+    ``usage`` is an OpenRouter-proprietary request field, so non-openrouter/
+    models are never touched. A caller-supplied ``usage`` value wins.
+    """
+    model = kwargs["model"] if "model" in kwargs else None
+    if model is None or not model.startswith(OPENROUTER_LITELLM_PREFIX):
+        return
+    if "usage" not in kwargs:
+        kwargs["usage"] = {"include": True}
+
+
 def _apply_endpoint_kwargs(kwargs: dict[str, Any], *, base_url: str | None, api_key: str | None) -> None:
     """Add ``api_base``/``api_key`` to a LiteLLM kwargs dict, role-scoped.
 
@@ -721,11 +744,15 @@ async def _litellm_acompletion(**kwargs: Any) -> Any:
 
     Brands OpenRouter-routed calls with ELSPETH's app-attribution headers (see
     :func:`_apply_openrouter_app_identity`) so the OpenRouter dashboard credits
-    composer traffic to ELSPETH rather than LiteLLM's defaults.
+    composer traffic to ELSPETH rather than LiteLLM's defaults, and pins
+    OpenRouter's usage-accounting opt-in (see
+    :func:`_apply_openrouter_usage_accounting`) so provider cost and cache
+    detail arrive in-band for the call audit.
     """
     import litellm
 
     _apply_openrouter_app_identity(kwargs)
+    _apply_openrouter_usage_accounting(kwargs)
     return await litellm.acompletion(**kwargs)
 
 
