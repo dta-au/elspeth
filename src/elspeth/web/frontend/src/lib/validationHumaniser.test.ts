@@ -41,12 +41,15 @@ describe("humaniseValidationMessage", () => {
   });
 
   it("humanises the backend transform contract shape without leaking its node id", () => {
+    // Rule C's own headline since elspeth-920bd88299 — it no longer shares
+    // "Transform contract violation" (nor an error_code) with the Rule D
+    // collision check, so this fixture exercises the second pattern.
     const message =
-      "Transform contract violation: node 'select_output_fields' (field_mapper) declares output fields " +
-      "[batch_size, customer_tier] (required) but with select_only: true the mapping will only emit " +
-      "[customer_tier]. Declared required output fields not produced by this transform: [batch_size]. " +
-      "Fix by removing the missing field(s) from the schema declaration, OR by extending `mapping` so " +
-      "the transform actually emits them, OR by setting select_only: false.";
+      "Transform output guarantee violation: node 'select_output_fields' (field_mapper) declares output " +
+      "fields [batch_size, customer_tier] (required) but with select_only: true the mapping can only " +
+      "guarantee [customer_tier]. Declared required output fields not guaranteed by this transform: " +
+      "[batch_size]. Those names are mapping TARGETS, and `schema` is this node's INPUT contract, so a " +
+      "target is usually absent from `schema.fields` altogether.";
 
     const finding = humaniseValidationMessage(
       message,
@@ -57,6 +60,23 @@ describe("humaniseValidationMessage", () => {
       "A step isn't connected correctly: \"choose the output fields\" doesn't match what the next step expects.",
     );
     expect(finding.headline).not.toContain("select_output_fields");
+    expect(finding.raw).toBe(message);
+  });
+
+  it("humanises the transform output collision shape (Rule D keeps the original headline)", () => {
+    const message =
+      "Transform contract violation: node 'rewrite' (llm) declares output fields [headline] but " +
+      "[headline] already arrive(s) on its input row. The engine rejects a transform that would " +
+      "overwrite an existing input field, so this pipeline fails on the first row.";
+
+    const finding = humaniseValidationMessage(
+      message,
+      (id) => (id === "rewrite" ? "rewrite the headline" : "unknown step"),
+    );
+
+    expect(finding.headline).toBe(
+      "A step isn't connected correctly: \"rewrite the headline\" doesn't match what the next step expects.",
+    );
     expect(finding.raw).toBe(message);
   });
 

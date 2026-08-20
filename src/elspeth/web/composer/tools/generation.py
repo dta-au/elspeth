@@ -43,6 +43,10 @@ from elspeth.web.composer.source_inspection import (
     inspect_csv_source_content,
 )
 from elspeth.web.composer.state import (
+    _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
+    _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
+    _TRANSFORM_OUTPUT_COLLISION_EXPLANATION,
+    _TRANSFORM_OUTPUT_COLLISION_FIX,
     CompositionState,
     NodeSpec,
     SourceSpec,
@@ -592,13 +596,25 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Change ONLY that edge: relax the consumer schema (mode: flexible), add the extra field names to the consumer schema fields, "
         "or insert a field_mapper with select_only: true upstream to drop them.",
     ),
+    # Rule C precedes Rule D: both headlines start "Transform ", and this pass
+    # matches in list order (see the order-sensitivity note above). The two rules
+    # carry distinct codes since elspeth-920bd88299 — one code served both, so
+    # whichever text was written last was wrong for the other rule.
+    #
+    # Both entries import their prose from ``composer.state``, which is where the
+    # rendered messages are built. That import is the ONLY thing keeping the
+    # planner's two paths in agreement: the repair turn sees this catalogue and
+    # never the message, while a tool call sees the message and never this
+    # catalogue, so a second copy here drifts silently and did.
+    (
+        r"transform_declared_output_not_guaranteed|Transform output guarantee violation:",
+        _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
+        _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
+    ),
     (
         r"transform_contract_violation|Transform contract violation:",
-        "A transform's declared output schema promises fields its own configuration cannot emit "
-        "(e.g. field_mapper with select_only: true only emits its mapping targets). "
-        "The rejection's contract facts name the node and the declared-but-unemitted field names.",
-        "Change ONLY that node: remove the missing field names from its schema declaration, extend its mapping so they are "
-        "actually produced, or set select_only: false.",
+        _TRANSFORM_OUTPUT_COLLISION_EXPLANATION,
+        _TRANSFORM_OUTPUT_COLLISION_FIX,
     ),
     (
         r"semantic_contract_violation|Semantic contract violation:|Semantic contract:",
@@ -1096,6 +1112,7 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "locked_input_extras",
     "sink_locked_extras",
     "transform_contract_violation",
+    "transform_declared_output_not_guaranteed",
     "semantic_contract_violation",
     "contract_config_invalid",
     "coalesce_schema_mode_mixed",

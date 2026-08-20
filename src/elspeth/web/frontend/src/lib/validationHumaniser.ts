@@ -39,6 +39,7 @@ import type { CompositionState } from "@/types/index";
  *   - composer authoring (web/composer/state.py):
  *     "Schema contract violation: 'producer' -> 'consumer'. …"
  *     "Transform contract violation: node 'producer' (plugin). …"
+ *     "Transform output guarantee violation: node 'producer' (plugin). …"
  *   - DAG runtime preflight (core/dag/graph.py) — the live-verified format:
  *     "Schema contract violation: edge 'producer' → 'consumer'\n  Consumer …"
  *   - edge-contract preflight (web/execution/validation.py):
@@ -48,6 +49,10 @@ import type { CompositionState } from "@/types/index";
  */
 const CONTRACT_VIOLATION_RES: readonly RegExp[] = [
   /^(?:Schema|Semantic|Transform) contract violation: (?:(?:edge|node) )?'([^']+)'(?: (?:->|→) '([^']+)')?/,
+  // Rule C's own headline since elspeth-920bd88299: it was split off
+  // "Transform contract violation" so the two rules stop sharing one
+  // error_code, and with it one set of repair advice.
+  /^Transform output guarantee violation: node '([^']+)'/,
   /^Edge contract violation between producer node '([^']+)' \(schema '[^']*'\) and consumer node '([^']+)'/,
 ];
 

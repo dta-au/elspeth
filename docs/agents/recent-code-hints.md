@@ -8,6 +8,66 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-21 — repair advice for a composer error code has TWO surfaces on
+  DISJOINT paths, and one error code must mean ONE defect** (landed with
+  elspeth-920bd88299). A validation error's remedy text reaches the LLM planner
+  two ways, and neither path can see the other:
+  - a **tool call** (`upsert_node` / `preview_pipeline`) returns the rendered
+    message from `web/composer/state.py` and never the catalogue;
+  - the one-shot planner's **repair turn** gets only
+    `tools/generation.py::_VALIDATION_ERROR_PATTERNS`, because
+    `pipeline_planner._allowlisted_candidate_feedback` projects
+    `explanation`/`suggested_fix` from the `error_code` ALONE and withholds the
+    message (a custody boundary — the message quotes authored option values; do
+    not "fix" this by widening the `detail` allowlist at :2432).
+  So rewriting one surface is invisible from the other, and 88137581b did
+  exactly that: it rewrote Rule C's message and left the catalogue on advice
+  authored a month earlier in 7015a561f. The planner alternated remedy sets
+  depending on how it had learned of the error and never converged. **Zero tests
+  pinned either text**, so the drift landed green. The fix is structural — the
+  prose lives in `state.py` constants that `generation.py` IMPORTS (the import
+  direction is forced: `generation.py` already imports private names from
+  `state.py`; `state.py` has no edge to `tools.*` at any scope, function-local
+  included). Four traps:
+  - **One code, two emitters is the deeper bug.** Rule C (declared output not
+    guaranteed) and Rule D (declared output collides with an input field) shared
+    `transform_contract_violation`, and the catalogue is keyed on the CODE — so
+    one entry was served to both, and a Rule D collision on an `llm` node got
+    field_mapper advice naming `mapping` and `select_only`. Refreshing the
+    shared entry would have made Rule D strictly worse. Rule C now carries
+    `transform_declared_output_not_guaranteed`; Rule D keeps the old code
+    because `config/cicd/runtime_rejection_parity.yaml` already binds it to
+    `validate_transform_output_field_collisions`.
+  - **`_VALIDATION_ERROR_PATTERNS` matches in LIST ORDER against raw text.** Two
+    rules whose headlines share a prefix must be ordered specific-first, and a
+    split needs a distinguishable headline — hence "Transform output guarantee
+    violation:". `frontend/src/lib/validationHumaniser.ts` matches headlines too,
+    and a non-match silently promotes the raw engineer dump to the user-facing
+    headline rather than erroring.
+  - **Do not hand-write the row-key predicate in prose.** Both obvious spellings
+    are measurably wrong: `str.isidentifier` admits `Name`/`userID`/`_id`/`a__b`
+    where `field_mapper` abstains, and "lowercase, no spaces, not a keyword"
+    REJECTS `class_`/`_1`/`if_`/`2024_total` where it does not. Rule C now asks
+    the PLUGIN instead — two canonical counterfactual configs through
+    `_probe_transform_output_schema`, reading back whether the target lands in
+    its guarantees — so the message cannot disagree with the rule it explains.
+  - **Pin TRUTH, not existence.** The remedies this replaced were, measured:
+    "drop it from the schema declaration" (names a mapping TARGET while
+    `schema.fields` holds SOURCES — the edit is ACCEPTED and the next error is
+    byte-identical), "map the missing field through" (under `select_only` the
+    name is already a target, so it is always a duplicate-target rejection),
+    `strict: true` (inert for every non-fixed-point source, and its mechanism is
+    mutually exclusive with the declare-the-source remedy — declaring the source
+    required kills a row lacking it at INPUT validation, before `process()`
+    reaches the strict branch), and declare-source-in-`fields`-plus-
+    `guaranteed_fields` (correct, but only conjoined with dropping the target's
+    own entry, and a silent no-op for a non-fixed-point source). A test that
+    asserts the message MENTIONS `guaranteed_fields` holds green through all of
+    that. Assert that applying the remedy CLEARS the error, in a topology where
+    a consumer actually requires the field — against a schema-less sink every
+    remedy looks equally good, including the ones that clear it by promising
+    nothing.
+
 - **2026-08-21 — a config-time name comparison must compare CANONICAL ROW KEYS,
   not config literals** (landed with elspeth-bb470636d1). The companion to the
   fixed-point entry below: that one fixed `field_mapper`'s GUARD, this one its

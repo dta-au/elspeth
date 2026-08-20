@@ -1369,6 +1369,70 @@ _SINK_CONFIG_ERROR_PREFIX = "Invalid configuration for sink "
 _SOURCE_CONFIG_ERROR_PREFIX = "Invalid configuration for source "
 
 
+# Repair advice for the two per-transform contract rules in
+# ``_check_schema_contracts``. ``tools.generation`` imports these for its
+# code-keyed catalogue rather than restating them, and
+# ``test_transform_contract_advice_has_exactly_one_owner`` fails if a copy
+# reappears there.
+#
+# The invariant is that the two surfaces do not CONTRADICT, not that they are
+# identical: the message additionally carries per-target advice computed from
+# the authored mapping, which a code-keyed catalogue cannot hold. So each text
+# must stand alone on the path that reads it. In particular this catalogue text
+# must never say "see the message" — the repair turn is the only reader of it
+# and receives no message. That exact shape is a known live failure: the
+# ``_WITHHELD_VALIDATION_GUIDANCE`` docstring below records
+# ``plugin_options_invalid``'s fix opening with "Apply exactly what 'detail'
+# names" when no detail was present, which sent live planners chasing a field
+# that did not exist and burned the repair budget.
+#
+# Why single ownership is load-bearing rather than tidy (elspeth-920bd88299).
+# The two surfaces reach the planner on DISJOINT paths, so a divergence is
+# invisible to whoever writes it:
+#
+# * the tool-call path (``upsert_node`` / ``preview_pipeline``) returns the
+#   rendered message below and never the catalogue text;
+# * the one-shot planner's REPAIR TURN gets only the catalogue text, because
+#   ``pipeline_planner._allowlisted_candidate_feedback`` projects
+#   ``explanation``/``suggested_fix`` from the ``error_code`` alone and withholds
+#   the message (a custody boundary — the message quotes authored option values).
+#
+# 88137581b rewrote the message here and left the catalogue on advice authored
+# in 7015a561f a month earlier, so the planner alternated remedy sets depending
+# on how it had learned of the error and could not converge. Neither surface's
+# text was pinned by any test, which is why the drift landed green.
+_TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION: Final[str] = (
+    "A field_mapper with select_only: true declares a required output field that its own mapping cannot guarantee. "
+    "The rejection's contract facts name the node and the declared-but-unguaranteed field names, which are mapping "
+    "TARGETS. Because a node's `schema` block is its INPUT contract, a target name is usually absent from "
+    "`schema.fields` altogether, so an instruction to remove it from the declaration has nothing to act on."
+)
+_TRANSFORM_DECLARED_NOT_GUARANTEED_FIX: Final[str] = (
+    "Change ONLY that node. Each name in `missing_fields` is a mapping TARGET, so first look up its SOURCE in the "
+    "`mapping` you authored — what repairs one kind of source is inert for another. If the source contains a dot it "
+    "is a nested read that `schema.guaranteed_fields` cannot name: set `strict: true`, which is node-wide and routes "
+    "any row missing ANY mapped source to on_error. Otherwise, IF you are certain the source is spelled exactly as "
+    "the upstream row keys it, declare it in `schema.fields` AND name it in `schema.guaranteed_fields` AND remove "
+    "the target's own entry from `schema.fields` — all three, since leaving the target declared makes the node "
+    "demand the emitted name as an input it never receives. If you are not certain of that spelling, do NOT guess: "
+    "a source the row is not keyed by is accepted by both of those declarations and changes nothing, returning this "
+    "same error. Stop declaring the target required instead — remove it from `schema.fields` and "
+    "`schema.guaranteed_fields`. That always applies and withdraws the guarantee honestly, so a consumer that needs "
+    "the field rejects at its own edge rather than here. Never rewrite the mapping key to a different spelling to "
+    "make it look right: that is accepted silently and drops the column."
+)
+_TRANSFORM_OUTPUT_COLLISION_EXPLANATION: Final[str] = (
+    "A transform declares an output field that already arrives on its input row. The engine rejects a transform that "
+    "would overwrite an existing input field, so the run fails on the first row. The rejection's contract facts name "
+    "the node and the colliding field names."
+)
+_TRANSFORM_OUTPUT_COLLISION_FIX: Final[str] = (
+    "Change ONLY that node's output name, or the field upstream of it: rename this transform's output to a name the "
+    "row does not already carry (for an llm transform that is `response_field`), OR rename/drop the incoming field "
+    "upstream with a field_mapper before this node."
+)
+
+
 def _is_plugin_config_probe_exception(exc: Exception, *, config_error_prefix: str) -> bool:
     """Return True only for expected draft/config failures from probe construction.
 
@@ -3288,6 +3352,129 @@ def _check_schema_contracts(
         finally:
             transform.close()
 
+    def _mapping_source_of(options: Mapping[str, Any], target: str) -> str:
+        """Return the mapping key that emits ``target``.
+
+        No shape guard, and no absent-key fallback, because neither state is
+        reachable from the one call site. Rule C reaches this only after
+        ``_probe_transform_output_schema`` returned a config, which means
+        ``FieldMapperConfig`` already parsed these same options — so ``mapping``
+        is a validated ``dict[str, str]``. And ``target`` always has an entry,
+        because under ``select_only`` the projection that produces
+        ``declared_required`` emits mapping TARGETS only, making ``missing`` a
+        subset of ``mapping.values()`` by construction (a declared non-target is
+        dropped by the projection, never carried into ``missing``).
+
+        A ``KeyError``/``AttributeError`` here is therefore a framework bug and
+        must crash loudly rather than degrade into advice that names no source.
+        """
+        mapping: Mapping[str, str] = options["mapping"]
+        return next(source for source, mapped in mapping.items() if mapped == target)
+
+    remedy_class_cache: dict[str, str] = {}
+
+    def _mapping_source_remedy_class(source: str, target: str) -> str:
+        """Memoized ``_classify_mapping_source``.
+
+        Two plugin constructions per classification, and ``validate()`` runs on
+        every composer tool call, so a many-target mapper would otherwise pay
+        for each one. The verdict depends only on the SOURCE — the target is a
+        free variable the probes carry through — so one entry per distinct
+        source serves every target it maps to.
+        """
+        if source in remedy_class_cache:
+            return remedy_class_cache[source]
+        verdict = _classify_mapping_source(source, target)
+        remedy_class_cache[source] = verdict
+        return verdict
+
+    def _classify_mapping_source(source: str, target: str) -> str:
+        """Classify what would actually repair ``source`` -> ``target``.
+
+        Asks the PLUGIN, by constructing two canonical counterfactual configs
+        and reading back whether ``target`` lands in its guarantees. The message
+        therefore cannot disagree with the rule it explains: both read the same
+        ``_output_schema_config``. A hand-written predicate here would drift —
+        the obvious spellings (``str.isidentifier``, "lowercase with no spaces")
+        are both measurably wrong, admitting ``Name``/``userID``/``_id``/``a__b``
+        where the plugin abstains and rejecting ``class_``/``_1``/``if_`` where
+        it does not (elspeth-920bd88299, and elspeth-f262a8c678 for the
+        isidentifier half).
+
+        ``declarable`` — the source is the name the row is keyed by, so
+        declaring and guaranteeing it repairs the node while KEEPING the
+        downstream promise. ``strict_only`` — a nested read, which
+        ``guaranteed_fields`` can never name. ``unguaranteeable`` — the plugin
+        deliberately abstains (it cannot tell whether the row is keyed by the
+        literal or by its normalized form), so NO declaration repairs it.
+        """
+        declared_options = {
+            "mapping": {source: target},
+            "select_only": True,
+            "schema": {"mode": "fixed", "fields": [f"{source}: any"], "guaranteed_fields": [source]},
+        }
+        constructed, config = _probe_transform_output_schema("field_mapper", declared_options)
+        if constructed and config is not None and target in (config.guaranteed_fields or ()):
+            return "declarable"
+        strict_options = {
+            "mapping": {source: target},
+            "select_only": True,
+            "strict": True,
+            "schema": {"mode": "fixed", "fields": [f"{target}: any"]},
+        }
+        constructed, config = _probe_transform_output_schema("field_mapper", strict_options)
+        if constructed and config is not None and target in (config.guaranteed_fields or ()):
+            return "strict_only"
+        return "unguaranteeable"
+
+    def _unguaranteed_target_remedies(options: Mapping[str, Any], missing: frozenset[str]) -> str:
+        """Build Rule C's repair advice, one clause per applicable source class.
+
+        Emits ONLY the remedies measured to work for the sources actually in
+        play. The rule previously offered four alternatives joined by "OR", of
+        which two were inert for the shape that fires most and one was
+        unauthorable in every shape — so a planner could apply a remedy, have
+        the mutation ACCEPTED, and get a byte-identical error back with no
+        signal that its repair had done nothing (elspeth-920bd88299).
+        """
+        # Seeded with every class so the reads below are direct indexing: this
+        # dict is built and consumed here, so a ``.get`` default would be
+        # covering for an absence this function itself rules out.
+        by_class: dict[str, list[tuple[str, str]]] = {"declarable": [], "strict_only": [], "unguaranteeable": []}
+        for target in sorted(missing):
+            source = _mapping_source_of(options, target)
+            by_class[_mapping_source_remedy_class(source, target)].append((target, source))
+
+        clauses: list[str] = [
+            "Those names are mapping TARGETS, and `schema` is this node's INPUT contract, so a target is usually "
+            "absent from `schema.fields` altogether — removing it from the declaration then changes nothing and "
+            "this same error repeats."
+        ]
+        for target, source in by_class["declarable"]:
+            clauses.append(
+                f"'{target}' is mapped from '{source}', which the row is keyed by: declare '{source}' in "
+                f"`schema.fields`, name it in `schema.guaranteed_fields`, AND remove '{target}' from "
+                f"`schema.fields` — all three, because leaving '{target}' declared makes this node demand the "
+                f"emitted name as an input field it never receives."
+            )
+        for target, source in by_class["strict_only"]:
+            clauses.append(
+                f"'{target}' is mapped from the nested read '{source}', which `schema.guaranteed_fields` cannot "
+                f"name: set `strict: true` instead. That is node-wide — it routes any row missing ANY mapped "
+                f"source to on_error rather than emitting the row without it."
+            )
+        for target, source in by_class["unguaranteeable"]:
+            clauses.append(
+                f"'{target}' is mapped from '{source}', which is not the name a row is keyed by, so this node "
+                f"cannot promise '{target}' at all — no `schema` declaration and no `strict: true` clears this. "
+                f"Do NOT rewrite the mapping key to another spelling: that is accepted silently and drops the "
+                f"column. Either stop declaring '{target}' required here (remove it from `schema.fields` and "
+                f"`schema.guaranteed_fields`, which withdraws the guarantee, so a consumer that requires it will "
+                f"reject at its own edge), or change the upstream source so it delivers '{source}' under the name "
+                f"the row is keyed by."
+            )
+        return " ".join(clauses)
+
     def _probe_transform_declared_output_fields(plugin: str, options: Mapping[str, Any]) -> frozenset[str]:
         """Read ``plugin``'s ``declared_output_fields``, closing the probe instance.
 
@@ -5106,19 +5293,18 @@ def _check_schema_contracts(
         errors.append(
             _err(
                 f"node:{node.id}",
-                f"Transform contract violation: node '{node.id}' ({node.plugin}) declares output fields "
+                f"Transform output guarantee violation: node '{node.id}' ({node.plugin}) declares output fields "
                 f"[{_format_fields(declared_required)}] (required) but with select_only: true the mapping can only "
                 f"guarantee [{_format_fields(predicted_emit)}]. "
                 f"Declared required output fields not guaranteed by this transform: [{_format_fields(missing)}]. "
-                f"A renamed field is guaranteed only when its SOURCE is guaranteed on input, so the usual fix is to "
-                f"declare each mapping source in this node's `schema.fields` AND name it in "
-                f"`schema.guaranteed_fields` (the latter must be a subset of the former). Otherwise set `strict: true` "
-                f"when every mapped source is always present, OR map the missing field through so the transform emits "
-                f"it, OR drop it from the schema declaration to stop guaranteeing it.",
+                f"{_unguaranteed_target_remedies(node.options, missing)}",
                 "high",
-                "transform_contract_violation",
-                # Self-inconsistency: producer and consumer are the same node;
-                # missing_fields are declared-but-unemitted schema field names.
+                "transform_declared_output_not_guaranteed",
+                # Self-inconsistency: producer and consumer are the same node.
+                # missing_fields are mapping TARGETS the node declares required
+                # but cannot guarantee — not names the author necessarily wrote
+                # in `schema.fields`, which is why the message resolves each one
+                # back to its mapping source before advising anything.
                 contract=SchemaContractDetail(
                     producer=node.id,
                     consumer=node.id,
@@ -5192,10 +5378,17 @@ def _check_schema_contracts(
                 f"already carry, e.g. '{sorted(collisions)[0]}_result'), OR by renaming/dropping the incoming field upstream with a "
                 f"field_mapper before this node.",
                 "high",
-                # Reuses Rule C's code: same family (a per-transform contract the
-                # node violates on its own), and the code is already carried by
-                # the planner's closed repair-feedback catalogue, so the repair
-                # turn gets enrichment instead of a bare unregistered slug.
+                # Rule C used to share this code, on the reasoning that both are
+                # per-transform contracts the node violates on its own and one
+                # catalogue entry would enrich both. It does not: the catalogue
+                # is keyed on the CODE, so a single entry was served to both, and
+                # a Rule D rejection on an `llm` node received field_mapper
+                # advice naming `mapping` and `select_only` — options that node
+                # does not have. Rule C now carries
+                # ``transform_declared_output_not_guaranteed``; this code stays
+                # here, where the runtime parity manifest already binds it to
+                # ``validate_transform_output_field_collisions``
+                # (elspeth-920bd88299).
                 "transform_contract_violation",
                 # producer and consumer are both this node: the colliding field
                 # can arrive from several arms at once (a row_union unions them),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from typing import Any, ClassVar
 
@@ -5579,9 +5580,237 @@ class TestSchemaContractValidation:
         state = state.with_output(self._make_output())
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         result = state.validate()
-        assert any("Transform contract violation" in e.message and "bogus" in e.message for e in result.errors), [
+        assert any("Transform output guarantee violation" in e.message and "bogus" in e.message for e in result.errors), [
             e.message for e in result.errors
         ]
+
+    # ---- Rule C repair advice: TRUTH pins ---------------------------------
+    #
+    # Every one of these applies the remedy the message itself names, verbatim,
+    # and asserts the outcome. Existence pins ("the message mentions
+    # guaranteed_fields") are what this rule had before elspeth-920bd88299, and
+    # they held green across a rewrite whose four remedies were, measured: two
+    # inert on the shape that fires most, one unauthorable in every shape, and
+    # one that named a field the author's declaration did not contain. A remedy
+    # a planner can apply, have ACCEPTED, and get a byte-identical error back
+    # from is the whole defect — so the assertion has to be that it clears.
+
+    def _rule_c_state(self, mapping: dict[str, str], fields: list[str], *, sink_requires: str | None = None) -> CompositionState:
+        """A minimal source -> field_mapper -> sink composition for Rule C."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1",
+                "main",
+                plugin="field_mapper",
+                options={"select_only": True, "mapping": mapping, "schema": {"mode": "fixed", "fields": fields}},
+            )
+        )
+        # The sink is what makes a withdrawn guarantee visible. Against a
+        # schema-less sink every remedy looks equally good, including the ones
+        # that clear the error by promising nothing.
+        sink_options: dict[str, Any] = {}
+        if sink_requires is not None:
+            sink_options = {"schema": {"mode": "fixed", "fields": [f"{sink_requires}: str"], "required_input_fields": [sink_requires]}}
+        state = state.with_output(OutputSpec(name="main", plugin="csv", options=sink_options, on_write_failure="discard"))
+        return state.with_edge(self._make_edge("e1", "source", "t1"))
+
+    @staticmethod
+    def _rule_c_error(result: Any) -> Any:
+        matches = [e for e in result.errors if e.error_code == "transform_declared_output_not_guaranteed"]
+        return matches[0] if matches else None
+
+    def test_rule_c_names_the_mapping_source_not_only_the_unguaranteed_target(self) -> None:
+        """The remedy must name the SOURCE, because that is what the author declared.
+
+        ``missing`` holds mapping TARGETS while ``schema.fields`` is the node's
+        INPUT contract and commonly holds SOURCES, so advice phrased against the
+        named field alone tells the author to edit a string their config does
+        not contain. That edit is accepted and changes nothing.
+        """
+        result = self._rule_c_state({"first_name": "fname"}, ["fname: str"]).validate()
+        error = self._rule_c_error(result)
+        assert error is not None, [e.error_code for e in result.errors]
+        assert "'first_name'" in error.message, error.message
+        assert "mapping TARGETS" in error.message, error.message
+
+    def test_rule_c_remedy_for_a_declarable_source_clears_and_keeps_the_guarantee(self) -> None:
+        """Following the message must clear the error AND still satisfy the sink.
+
+        The three-part edit is conjunctive on purpose: dropping the target's own
+        entry is not tidying. Leaving it declared makes the node demand the
+        EMITTED name as an input field it never receives, which trades Rule C
+        for a schema_contract_violation on the input edge.
+        """
+        before = self._rule_c_state({"first_name": "fname"}, ["fname: str"], sink_requires="fname").validate()
+        assert self._rule_c_error(before) is not None
+
+        # Exactly what the message instructs: declare the source, guarantee the
+        # source, remove the target's entry.
+        repaired = self._empty_state()
+        repaired = repaired.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
+        repaired = repaired.with_node(
+            self._make_transform(
+                "t1",
+                "t1",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "select_only": True,
+                    "mapping": {"first_name": "fname"},
+                    "schema": {"mode": "fixed", "fields": ["first_name: str"], "guaranteed_fields": ["first_name"]},
+                },
+            )
+        )
+        repaired = repaired.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": ["fname: str"], "required_input_fields": ["fname"]}},
+                on_write_failure="discard",
+            )
+        )
+        repaired = repaired.with_edge(self._make_edge("e1", "source", "t1"))
+        after = repaired.validate()
+        assert after.errors == (), [(e.error_code, e.message) for e in after.errors]
+
+    def test_rule_c_does_not_offer_a_declaration_remedy_for_an_unguaranteeable_source(self) -> None:
+        """A source the row is not keyed by has NO declaration remedy — say so.
+
+        ``Name`` passes both config gates, so the old advice was authorable,
+        accepted, and completely inert: the planner made a successful edit and
+        got the same error back with nothing to distinguish its repair from a
+        no-op. The second half of this test is the discriminator — it proves the
+        message is declining a remedy that genuinely does not work, rather than
+        merely being differently worded.
+        """
+        result = self._rule_c_state({"Name": "nm"}, ["nm: str"]).validate()
+        error = self._rule_c_error(result)
+        assert error is not None, [e.error_code for e in result.errors]
+        assert "cannot promise 'nm' at all" in error.message, error.message
+        assert "Do NOT rewrite the mapping key" in error.message, error.message
+
+        # The remedy the message withholds, applied anyway: still fires, and the
+        # message is byte-identical, which is exactly why it must not be offered.
+        state = self._empty_state()
+        state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "select_only": True,
+                    "mapping": {"Name": "nm"},
+                    "schema": {"mode": "fixed", "fields": ["Name: str", "nm: str"], "guaranteed_fields": ["Name"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output())
+        state = state.with_edge(self._make_edge("e1", "source", "t1"))
+        still = self._rule_c_error(state.validate())
+        assert still is not None, "declaring an unguaranteeable source must not clear Rule C"
+
+    def test_rule_c_offers_strict_only_for_a_nested_read_and_it_works(self) -> None:
+        """A dotted source is the one class where ``strict: true`` is the remedy.
+
+        It is offered ONLY here. For a declarable source ``strict`` and the
+        declaration remedy are mutually exclusive mechanisms — declaring the
+        source required kills a row lacking it at input validation, before the
+        strict branch in ``process()`` is ever reached — so naming both in one
+        message invites a planner to apply one and reason about the other.
+        """
+        result = self._rule_c_state({"user.name": "uname"}, ["uname: str"]).validate()
+        error = self._rule_c_error(result)
+        assert error is not None, [e.error_code for e in result.errors]
+        assert "nested read 'user.name'" in error.message, error.message
+        assert "`strict: true`" in error.message, error.message
+
+        state = self._empty_state()
+        state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "select_only": True,
+                    "strict": True,
+                    "mapping": {"user.name": "uname"},
+                    "schema": {"mode": "fixed", "fields": ["uname: str"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output())
+        state = state.with_edge(self._make_edge("e1", "source", "t1"))
+        assert self._rule_c_error(state.validate()) is None
+
+    def test_rule_c_advises_per_source_class_within_one_node(self) -> None:
+        """One node can hold all three classes at once; each gets its own clause.
+
+        A single blanket remedy is wrong for two thirds of this node.
+        """
+        result = self._rule_c_state(
+            {"first_name": "fname", "user.name": "uname", "Name": "nm"},
+            ["fname: str", "uname: str", "nm: str"],
+        ).validate()
+        error = self._rule_c_error(result)
+        assert error is not None, [e.error_code for e in result.errors]
+        assert "'fname' is mapped from 'first_name', which the row is keyed by" in error.message, error.message
+        assert "'uname' is mapped from the nested read 'user.name'" in error.message, error.message
+        assert "cannot promise 'nm' at all" in error.message, error.message
+
+    def test_rule_c_survives_a_mapping_source_that_names_no_field(self) -> None:
+        """A pathological source must yield a FINDING, never a raise.
+
+        The remedy classifier constructs counterfactual configs through
+        ``_probe_transform_output_schema``, which tolerates only
+        ``_is_plugin_config_probe_exception`` and RE-RAISES everything else. A
+        source that is a Python keyword, or that normalizes to nothing
+        (``ExternalHeaderError``), reaches a different raise site than the
+        merely-messy headers the remedies were designed around — and a raise
+        here turns a validation finding into a 500 on the composer surface.
+        """
+        for source in ("class", "!!!", "", "  ", "user..name", "1", "caf\u00e9"):
+            state = self._rule_c_state({source: "tgt"}, ["tgt: str"])
+            result = state.validate()
+            assert self._rule_c_error(result) is not None, f"no finding for source {source!r}"
+
+    def test_rule_c_message_routes_to_its_own_catalogue_entry(self) -> None:
+        """The rendered message must resolve to ITS rule's advice, not the other's.
+
+        ``_execute_explain_validation_error`` matches raw message text against
+        ``_VALIDATION_ERROR_PATTERNS`` in LIST ORDER, and the composer skill
+        routes a planner to that tool on any unclear rejection. Both rules'
+        headlines begin "Transform ", so the pair is order-sensitive: before the
+        split both messages matched one entry, which is how a Rule D collision
+        on an llm node came to be answered with field_mapper advice.
+        """
+        from elspeth.web.composer.state import (
+            _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
+            _TRANSFORM_OUTPUT_COLLISION_FIX,
+        )
+        from elspeth.web.composer.tools.generation import _VALIDATION_ERROR_PATTERNS
+
+        def first_match_fix(message: str) -> str | None:
+            for pattern, _explanation, fix in _VALIDATION_ERROR_PATTERNS:
+                if re.search(pattern, message):
+                    return fix
+            return None
+
+        rule_c = self._rule_c_error(self._rule_c_state({"first_name": "fname"}, ["fname: str"]).validate())
+        assert rule_c is not None
+        assert first_match_fix(rule_c.message) is _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX
+
+        rule_d_message = (
+            "Transform contract violation: node 'rewrite' (llm) declares output fields [headline] but "
+            "[headline] already arrive(s) on its input row."
+        )
+        assert first_match_fix(rule_d_message) is _TRANSFORM_OUTPUT_COLLISION_FIX
 
     def test_consumer_schema_required_fields_violation_fails(self) -> None:
         state = self._empty_state()

@@ -31,6 +31,10 @@ from typing import Any
 import pytest
 
 from elspeth.web.composer.state import (
+    _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
+    _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
+    _TRANSFORM_OUTPUT_COLLISION_EXPLANATION,
+    _TRANSFORM_OUTPUT_COLLISION_FIX,
     CompositionState,
     EdgeSpec,
     NodeSpec,
@@ -299,6 +303,8 @@ class TestClosedCodeCatalogueInvariants:
             "sink_contract_violation",
             "locked_input_extras",
             "sink_locked_extras",
+            "transform_contract_violation",
+            "transform_declared_output_not_guaranteed",
             "contract_config_invalid",
             "node_input_not_reachable",
             "duplicate_connection_producer",
@@ -333,6 +339,64 @@ class TestClosedCodeCatalogueInvariants:
             assert guidance is not None, f"{code} does not resolve to catalogue guidance"
             explanation, fix = guidance
             assert explanation and fix
+
+    def test_transform_contract_advice_has_exactly_one_owner(self) -> None:
+        """The catalogue must SERVE ``state``'s advice, never restate it.
+
+        These two texts reach the planner on disjoint paths — the rendered
+        message only ever on a tool call, this catalogue only ever on the
+        one-shot planner's repair turn, which projects
+        ``explanation``/``suggested_fix`` from the error_code and withholds the
+        message. So a second copy here cannot be caught by reading either path:
+        88137581b rewrote the message and left this catalogue on advice written
+        a month earlier, and the planner alternated remedy sets depending on how
+        it had learned of the error (elspeth-920bd88299).
+
+        Identity, not equality: a copied string would satisfy ``==`` on the day
+        it was copied and drift on the next edit, which is the failure being
+        pinned.
+        """
+        for code, expected in (
+            (
+                "transform_declared_output_not_guaranteed",
+                (_TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION, _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX),
+            ),
+            (
+                "transform_contract_violation",
+                (_TRANSFORM_OUTPUT_COLLISION_EXPLANATION, _TRANSFORM_OUTPUT_COLLISION_FIX),
+            ),
+        ):
+            guidance = explain_validation_code(code)
+            assert guidance is not None, code
+            explanation, fix = guidance
+            assert explanation is expected[0], f"{code} explanation is a copy, not the shared constant"
+            assert fix is expected[1], f"{code} fix is a copy, not the shared constant"
+
+    def test_the_two_transform_contract_rules_do_not_share_repair_advice(self) -> None:
+        """Rule C and Rule D are different defects and must resolve differently.
+
+        They shared one error_code until elspeth-920bd88299, and the catalogue
+        is keyed on the code — so one entry was served to both. A Rule D
+        collision on an ``llm`` node received field_mapper advice naming
+        ``mapping`` and ``select_only``, options that node does not have.
+        """
+        declared = explain_validation_code("transform_declared_output_not_guaranteed")
+        collision = explain_validation_code("transform_contract_violation")
+        assert declared is not None and collision is not None
+        assert declared != collision
+
+        # Rule D's advice must not name field_mapper-only options: it fires for
+        # any transform, most visibly an llm rewriting in place.
+        collision_text = " ".join(collision)
+        assert "select_only" not in collision_text, collision_text
+        assert "response_field" in collision_text, collision_text
+
+        # Rule C's advice must not claim the field cannot be EMITTED. It is
+        # emitted whenever the source is present; what is missing is the
+        # GUARANTEE, and conflating the two is what produced remedies telling
+        # authors to map a field the mapping already targets.
+        declared_text = " ".join(declared)
+        assert "guarantee" in declared_text, declared_text
 
     def test_row_union_topology_codes_resolve_to_topology_guidance(self) -> None:
         """The new codes must not fall through to the intrinsic entry.
