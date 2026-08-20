@@ -8,6 +8,25 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-20 — EDITING a builtin plugin: `source_file_hash` tracks content,
+  `plugin_version` does not.** Section 6 below covers ADDING a plugin; this is
+  the edit path, and the two attributes behave differently:
+  - `source_file_hash` must be recomputed for ANY content change, not just a
+    new plugin. Compute with
+    `scripts/cicd/plugin_hash.py::compute_source_file_hash`, and do it AFTER
+    `ruff format` — the pre-commit formatter rewraps lines and restales a hash
+    computed first. The computation normalises the hash line itself, so it is
+    stable once written.
+  - `plugin_version` is a STATIC declaration. All 41 builtins sit at `1.0.0`
+    and none has ever been changed in place (verified over the whole history,
+    2026-08-20) — do not invent a bump for a behaviour change, and do not read
+    an unbumped version as an oversight.
+  Two traps when verifying: (a) `computed in path.read_text()` is a SUBSTRING
+  test that passes on a mere comment — compare strictly,
+  `Cls.source_file_hash == compute_source_file_hash(path)`; (b) **no local test
+  enforces the hash at all** — a stale hash with a mutated body passed 10,213
+  tests. The gate is CI-only, so that strict comparison is the only local
+  defense, and a green scoped run says nothing about it.
 - **2026-08-20 — a construction-time normalisation in `web/composer/state.py`
   invalidates PERSISTED hashes; it is never a local change** (landed with
   elspeth-da00e1c1cb). `NodeSpec.__post_init__` is advertised as the one
@@ -40,6 +59,35 @@ is a working document under the normal delivery posture.
   payload that omits `merge`/`policy` records no epoch: accepting it lets a
   later default change re-interpret already-reviewed bytes with every hash
   still green. Quarantine, do not migrate.
+- **2026-08-20 — a REDUCTIVE transform's output `SchemaConfig` must not carry the
+  authored INPUT `fields`** (landed with elspeth-a2bf676e6f). A transform node's
+  `schema:` block is the INPUT contract — `BaseTransform._build_output_schema_config`
+  documents its argument as "the transform's input schema config (base fields)"
+  and instructs reductive subclasses to "drop input-side declarations"
+  (canonical override: `BatchStats`, elspeth-f5f798f797). `field_mapper`
+  overrode the method but still passed `cfg.schema_config.fields` through, so
+  every field it CONSUMES-but-never-emits (a renamed-away source in BOTH modes,
+  and anything outside the whitelist under `select_only`) stayed `required` on
+  the OUTPUT config. `SchemaConfig.get_effective_guaranteed_fields()` is
+  `explicit guaranteed | required declared fields`, so those names were then
+  demanded as output guarantees and the transform's own contract rejected its
+  own emitted row with `SchemaConfigModeViolation`. Composer-side this surfaced
+  as a Rule C "Transform contract violation" on a CORRECT cleanup pipeline, and
+  a renaming mapper had NO satisfiable declaration at all under `strict: false`
+  (the honest split — guarantee the sources, declare the targets — is rejected
+  at construction because `guaranteed_fields` must be a subset of `fields`).
+  Two traps when touching this area: (a) a rename target may be declared by
+  EITHER name — prefer a declaration written against the emitted (target) name,
+  else carry the source's across so the type does not degrade to `any`; (b)
+  three existing tests used "declared in `schema.fields` but not selected" as a
+  VEHICLE to trip Rule C or the post-emission check — that shape is legal now,
+  so re-point such a vehicle at an unguaranteed RENAME rather than deleting the
+  test. STILL OPEN, deliberately unbundled: `base_guaranteed` in
+  `_build_field_mapper_output_schema_config` reads the explicit
+  `guaranteed_fields` tuple only, not `get_effective_guaranteed_fields()`, so a
+  `mode: fixed` mapper with no explicit `guaranteed_fields` guarantees nothing
+  and Rule C still false-positives on a plain whitelist. Changing it moves DAG
+  contract propagation, so it needs its own sweep.
 - **2026-08-19 — `plan_pipeline` requires the session schema tracker; aid-supplied
   manifest keys are palette-retained AND escalation-exempt** (landed with
   elspeth-cb3561382e/275e05bf71/ac44757161). `plan_pipeline` takes

@@ -5548,10 +5548,19 @@ class TestSchemaContractValidation:
                 plugin="field_mapper",
                 options={
                     "select_only": True,
-                    "mapping": {"url": "url"},
-                    # Declares 'bogus' as a required output field the mapping
-                    # will never emit -> Rule C violation.
-                    "schema": {"mode": "fixed", "fields": ["url: str", "bogus: str"]},
+                    # 'bogus' IS a mapping target, so it is genuinely declared on
+                    # output — but its source is not guaranteed on input, so the
+                    # mapper cannot guarantee it -> Rule C violation. Keying the
+                    # vehicle on an unguaranteed RENAME rather than on a field
+                    # merely declared and never selected keeps this test about
+                    # what it says it is about: the probe stripping authoring
+                    # metadata so Rule C runs at all (elspeth-a2bf676e6f).
+                    "mapping": {"url": "url", "maybe_missing": "bogus"},
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": ["url: str", "bogus: str"],
+                        "guaranteed_fields": ["url"],
+                    },
                     "interpretation_requirements": [
                         {
                             "id": "drop_fields_review",
@@ -7395,16 +7404,13 @@ class TestSchemaContractValidation:
         assert "mode: flexible" in msg  # operator-actionable: relax sink schema
         assert "field_mapper" in msg and "select_only: true" in msg  # operator-actionable: drop extras upstream
 
-    def test_v2_field_mapper_select_only_with_inconsistent_declared_output(self) -> None:
-        """Rule C: field_mapper declares an output field its mapping won't emit.
+    def _make_select_only_cleanup_state(self, *, sink_fields: list[str]) -> CompositionState:
+        """batch_stats -> field_mapper(select_only) -> json sink.
 
-        Reproduces /tmp/elspeth_eval/2026-05-03/s3/msg2.json. The composer
-        previously accepted this YAML; the engine crashed at the schema
-        config mode contract with SchemaConfigModeViolation (``missing
-        required fields ['batch_size']``). The runtime check expects the
-        emitted row to satisfy the declared output schema, but with
-        ``select_only: true`` the actual emit is exactly ``mapping.values()``
-        — which excludes ``batch_size``.
+        The mapper declares ``batch_size`` in its authored ``schema.fields``
+        (the INPUT contract — batch_stats really does emit it) and deliberately
+        omits it from the whitelist. ``sink_fields`` decides whether anything
+        downstream still needs the dropped field.
         """
         state = self._empty_state()
         state = state.with_source(
@@ -7488,7 +7494,7 @@ class TestSchemaContractValidation:
                     "path": "outputs/ticket_totals_by_tier.json",
                     "schema": {
                         "mode": "fixed",
-                        "fields": ["customer_tier: str", "count: int", "sum: float"],
+                        "fields": sink_fields,
                     },
                     "format": "json",
                     "indent": 2,
@@ -7499,18 +7505,39 @@ class TestSchemaContractValidation:
             )
         )
 
+        return state
+
+    def test_select_only_may_drop_a_declared_input_field_nothing_downstream_needs(self) -> None:
+        """Cleanup is what select_only is FOR, so the composer must accept it.
+
+        Regression: elspeth-a2bf676e6f. ``schema.fields`` on a transform is the
+        INPUT contract (``BaseTransform._build_output_schema_config``: "the
+        transform's input schema config"), so naming ``batch_size`` there and
+        leaving it out of the whitelist is an honest "save only these fields"
+        gesture — note the node's own ``required_fields`` already excludes it.
+        This previously produced a Rule C rejection of a correct pipeline, and
+        was the shape that made a renaming mapper unsatisfiable and stalled the
+        composer (elspeth-92fa1fe86e).
+        """
+        state = self._make_select_only_cleanup_state(sink_fields=["customer_tier: str", "count: int", "sum: float"])
+
         result = state.validate()
 
-        assert not result.is_valid, "Composer must reject field_mapper whose declared output won't be emitted."
-        rule_c_errors = [
-            e
-            for e in result.errors
-            if e.component == "node:select_output_fields" and "Transform contract violation" in e.message and "batch_size" in e.message
-        ]
-        assert rule_c_errors, f"Expected Rule C self-consistency rejection naming batch_size, got: {[e.message for e in result.errors]}"
-        msg = rule_c_errors[0].message
-        assert "select_only: true" in msg
-        assert "Declared required output fields not produced by this transform: [batch_size]" in msg
+        assert result.is_valid, [e.message for e in result.errors]
+
+    def test_select_only_drop_still_rejected_when_a_consumer_requires_the_field(self) -> None:
+        """Dropping a field something downstream needs is still caught.
+
+        The safety net the old Rule C rejection provided is not lost — it moves
+        to where the requirement actually lives, so the message names the
+        consumer instead of accusing the mapper of a self-inconsistency.
+        """
+        state = self._make_select_only_cleanup_state(sink_fields=["customer_tier: str", "count: int", "sum: float", "batch_size: int"])
+
+        result = state.validate()
+
+        assert not result.is_valid, "A dropped field that a consumer requires must still be rejected."
+        assert any("batch_size" in e.message for e in result.errors), [e.message for e in result.errors]
 
     # ── Rule D: declared output collides with a definitely-arriving input field ──
     # elspeth-cfcd333f83. The runtime surface is TransformExecutor._run_preflight's

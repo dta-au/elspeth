@@ -5107,11 +5107,14 @@ def _check_schema_contracts(
             _err(
                 f"node:{node.id}",
                 f"Transform contract violation: node '{node.id}' ({node.plugin}) declares output fields "
-                f"[{_format_fields(declared_required)}] (required) but with select_only: true the mapping will only emit "
-                f"[{_format_fields(predicted_emit)}]. "
-                f"Declared required output fields not produced by this transform: [{_format_fields(missing)}]. "
-                f"Fix by removing the missing field(s) from the schema declaration, OR by extending "
-                f"`mapping` so the transform actually emits them, OR by setting select_only: false.",
+                f"[{_format_fields(declared_required)}] (required) but with select_only: true the mapping can only "
+                f"guarantee [{_format_fields(predicted_emit)}]. "
+                f"Declared required output fields not guaranteed by this transform: [{_format_fields(missing)}]. "
+                f"A renamed field is guaranteed only when its SOURCE is guaranteed on input, so the usual fix is to "
+                f"declare each mapping source in this node's `schema.fields` AND name it in "
+                f"`schema.guaranteed_fields` (the latter must be a subset of the former). Otherwise set `strict: true` "
+                f"when every mapped source is always present, OR map the missing field through so the transform emits "
+                f"it, OR drop it from the schema declaration to stop guaranteeing it.",
                 "high",
                 "transform_contract_violation",
                 # Self-inconsistency: producer and consumer are the same node;

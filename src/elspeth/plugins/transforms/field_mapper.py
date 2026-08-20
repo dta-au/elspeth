@@ -9,6 +9,7 @@ If the source outputs wrong types, the transform crashes immediately.
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from typing import Any
 
 from pydantic import Field, model_validator
@@ -17,7 +18,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig, declare_missing_guaranteed_fields
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
@@ -117,7 +118,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0ccde1199b11dc05"
+    source_file_hash: str | None = "sha256:3836f6650994fa12"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -258,6 +259,78 @@ class FieldMapper(BaseTransform):
             )
         ]
 
+    @classmethod
+    def _project_field_declarations_onto_output(cls, cfg: FieldMapperConfig) -> tuple[FieldDefinition, ...] | None:
+        """Re-express the AUTHORED INPUT field declarations as the EMITTED shape.
+
+        ``cfg.schema_config`` is the INPUT contract — see
+        ``BaseTransform._build_output_schema_config``, whose ``schema_config``
+        argument is documented as "the transform's input schema config (base
+        fields)". field_mapper is REDUCTIVE: ``process`` keeps only the mapping
+        targets under ``select_only``, and deletes a renamed source in BOTH
+        modes. Copying the authored declarations onto the output therefore left
+        consumed-but-never-emitted fields marked ``required`` on output;
+        ``get_effective_guaranteed_fields`` unions required declared fields in,
+        so the transform's own contract rejected its own emitted row with
+        ``SchemaConfigModeViolation`` (elspeth-a2bf676e6f). That is the
+        reductive-override obligation ``BaseTransform._build_output_schema_config``
+        documents, and the same defect ``BatchStats`` closed for aggregations
+        (elspeth-f5f798f797).
+
+        A rename moves the value unchanged, so the target INHERITS the source's
+        authored declaration instead of degrading to the ``any``-typed
+        placeholder ``declare_missing_guaranteed_fields`` would otherwise append.
+
+        Returns ``None`` for observed-style schemas, which carry no explicit
+        declarations to project.
+        """
+        fields = cfg.schema_config.fields
+        if fields is None:
+            return None
+
+        authored = {field.name: field for field in fields}
+        projected: dict[str, FieldDefinition] = {}
+
+        # Emitted targets first, so a target that collides with an unmapped
+        # field of the same name is described by the value that lands there —
+        # which for a rename is the SOURCE's value, hence the source's
+        # declaration. An author may declare either side, so a declaration
+        # written against the emitted name is the fallback when the source
+        # carries none.
+        for source, target in cfg.mapping.items():
+            if source == target:
+                declaration = authored[source] if source in authored else None
+            else:
+                source_field = authored[source] if source in authored else None
+                if source_field is not None:
+                    declaration = replace(source_field, name=target)
+                else:
+                    declaration = authored[target] if target in authored else None
+            if declaration is not None:
+                projected[target] = declaration
+
+        # The deep-copy branch forwards every unmapped column.
+        if not cfg.select_only:
+            # An unresolved original header deletes a normalized key this
+            # constructor cannot name, so we cannot say WHICH forwarded column
+            # stopped being emitted. Dropping them all is NOT the safe
+            # direction: ``fields`` feeds two opposed limbs — declared-REQUIRED
+            # names union into ``get_effective_guaranteed_fields`` (so
+            # over-declaring promises rows that may not arrive), while the
+            # declared NAMES are the fixed-mode extras allow-list in
+            # ``verify_schema_config_mode._allowed_declared_fields`` (so
+            # under-declaring rejects rows that do). Declaring the forwarded
+            # columns OPTIONAL satisfies both: the name stays admissible, the
+            # guarantee is not made.
+            unnameable_removal = any(cls._is_unresolved_original_source(source) for source in cfg.mapping)
+            renamed_away = {source for source, target in cfg.mapping.items() if source != target}
+            for field in fields:
+                if field.name in projected or field.name in renamed_away:
+                    continue
+                projected[field.name] = replace(field, required=False) if unnameable_removal else field
+
+        return tuple(projected.values())
+
     def _build_field_mapper_output_schema_config(self, cfg: FieldMapperConfig) -> SchemaConfig:
         """Build output schema config reflecting the mapped output shape.
 
@@ -311,7 +384,13 @@ class FieldMapper(BaseTransform):
             # Mapping targets are guaranteed on output but absent from the
             # authored input fields; declare them so the config satisfies the
             # guaranteed-fields-are-declared invariant (elspeth-97487736ca).
-            fields=declare_missing_guaranteed_fields(cfg.schema_config.fields, guaranteed_fields_result),
+            # The projection below is what makes those authored declarations
+            # describe the EMITTED shape rather than the consumed one
+            # (elspeth-a2bf676e6f).
+            fields=declare_missing_guaranteed_fields(
+                self._project_field_declarations_onto_output(cfg),
+                guaranteed_fields_result,
+            ),
             guaranteed_fields=guaranteed_fields_result,
             audit_fields=cfg.schema_config.audit_fields,
             required_fields=cfg.schema_config.required_fields,

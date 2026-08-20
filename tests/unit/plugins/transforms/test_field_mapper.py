@@ -691,6 +691,116 @@ class TestOutputSchemaConfig:
         assert transform._output_schema_config.guaranteed_fields is not None
         assert frozenset(transform._output_schema_config.guaranteed_fields) == frozenset({"target", "kept"})
 
+    def test_select_only_output_schema_does_not_declare_renamed_away_source(self) -> None:
+        """A renamed source is CONSUMED, not emitted, so it is not an output field.
+
+        Regression: elspeth-a2bf676e6f. ``_build_field_mapper_output_schema_config``
+        carried the AUTHORED INPUT ``fields`` straight onto the output config, so a
+        source the mapper renames away stayed declared as a required OUTPUT field it
+        provably never emits. ``get_effective_guaranteed_fields()`` then demanded it
+        and the composer's transform-contract rule rejected a correct pipeline.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"id": "id", "rating_text": "rating"},
+                "select_only": True,
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["id: int", "rating_text: str"],
+                    "guaranteed_fields": ["id", "rating_text"],
+                },
+            }
+        )
+
+        output_config = transform._output_schema_config
+        assert output_config is not None
+        declared = {field.name for field in output_config.fields or ()}
+        assert "rating_text" not in declared
+        assert frozenset(output_config.get_effective_guaranteed_fields()) == frozenset({"id", "rating"})
+
+    def test_select_only_renamed_target_keeps_the_source_declared_type(self) -> None:
+        """The rename moves a value, so the target carries the source's authored type.
+
+        Regression: elspeth-a2bf676e6f. Dropping the source declaration must not
+        downgrade the target to ``any`` — the mapper copies the value unchanged,
+        so its declared type is known.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"id": "id", "rating_text": "rating"},
+                "select_only": True,
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["id: int", "rating_text: str"],
+                    "guaranteed_fields": ["id", "rating_text"],
+                },
+            }
+        )
+
+        output_config = transform._output_schema_config
+        assert output_config is not None
+        by_name = {field.name: field for field in output_config.fields or ()}
+        assert by_name["rating"].field_type == "str"
+
+    def test_select_only_emitted_row_satisfies_its_own_output_contract(self) -> None:
+        """The ADR-014 post-emission check passes on the row the mapper actually emits.
+
+        Regression: elspeth-a2bf676e6f. This is the end-to-end statement of the
+        defect — the transform's own output contract must accept its own row.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"id": "id", "rating_text": "rating"},
+                "select_only": True,
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["id: int", "rating_text: str"],
+                    "guaranteed_fields": ["id", "rating_text"],
+                },
+            }
+        )
+
+        result = transform.process(make_pipeline_row({"id": 1, "rating_text": "4"}), make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict() == {"id": 1, "rating": "4"}
+        _run_post_emission_check(transform, result.row)
+
+    def test_passthrough_output_schema_does_not_declare_renamed_away_source(self) -> None:
+        """Without select_only, process() still renames the source away.
+
+        Regression: elspeth-a2bf676e6f. The deep-copy branch keeps UNMAPPED
+        fields but a renamed source is deleted from the row, so its authored
+        declaration must not survive onto the output contract either.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"rating_text": "rating"},
+                "select_only": False,
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["id: int", "rating_text: str"],
+                    "guaranteed_fields": ["id", "rating_text"],
+                },
+            }
+        )
+
+        result = transform.process(make_pipeline_row({"id": 1, "rating_text": "4"}), make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict() == {"id": 1, "rating": "4"}
+        _run_post_emission_check(transform, result.row)
+
     def test_identity_mapped_original_header_abstains_passthrough_guarantees(self) -> None:
         """An identity-mapped original header renames a normalized field away.
 
@@ -714,6 +824,123 @@ class TestOutputSchemaConfig:
         guarantees = frozenset(transform._output_schema_config.guaranteed_fields or ())
         assert "amount_usd" not in guarantees
         assert "kept" not in guarantees
+
+    def test_unresolved_original_header_abstains_from_passthrough_declarations(self) -> None:
+        """The unnameable removal costs the whole passthrough declaration set.
+
+        Regression: elspeth-a2bf676e6f. ``{"Amount USD": "Amount USD"}`` deletes a
+        normalized key only ``contract.resolve_name`` can name at runtime, so the
+        constructor cannot say WHICH forwarded column stopped being emitted.
+
+        Dropping the declarations is NOT the safe direction, and an earlier
+        revision of this fix did exactly that. ``fields`` feeds two OPPOSED
+        limbs: declared-REQUIRED names union into
+        ``get_effective_guaranteed_fields`` (over-declaring promises rows that
+        may not arrive), while the declared NAMES are the fixed-mode extras
+        allow-list in ``verify_schema_config_mode`` (under-declaring rejects
+        rows that do). Declaring the forwarded columns OPTIONAL satisfies both.
+        Pinned under ``mode: fixed`` on purpose — under ``flexible`` the extras
+        limb never runs, which is how the regression hid.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"Amount USD": "Amount USD"},
+                "select_only": False,
+                "schema": {"mode": "fixed", "fields": ["amount_usd: float", "kept: str"]},
+            }
+        )
+
+        assert transform._output_schema_config is not None
+        by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
+        assert set(by_name) == {"amount_usd", "kept"}
+        assert not any(field.required for field in by_name.values())
+        assert transform._output_schema_config.get_effective_guaranteed_fields() == frozenset()
+
+        result = transform.process(make_pipeline_row({"amount_usd": 1.5, "kept": "x"}), make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        _run_post_emission_check(transform, result.row)
+
+    def test_rename_target_declared_without_its_source_keeps_that_declaration(self) -> None:
+        """An author may declare the EMITTED name instead of the consumed one.
+
+        Regression: elspeth-a2bf676e6f. The projection prefers the source's
+        declaration because a rename moves that value, but an author who
+        declared only the target still declared the emitted column — so the
+        target's own declaration is the fallback, not a discard. That fallback
+        limb had no coverage: deleting it left 10,213 tests green, while the
+        comment above it asserts the shape is supported.
+
+        Distinct from ``test_rename_collision_is_described_by_the_source_that_lands_there``,
+        where BOTH sides are declared and the source must win.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "b"},
+                "select_only": True,
+                "schema": {"mode": "flexible", "fields": ["b: str"]},
+            }
+        )
+
+        assert transform._output_schema_config is not None
+        by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
+        assert by_name["b"].field_type == "str", "the target's authored declaration must survive when the source carries none"
+
+    def test_rename_collision_is_described_by_the_source_that_lands_there(self) -> None:
+        """When a rename target is also an authored field, the SOURCE wins.
+
+        Regression: elspeth-a2bf676e6f. ``{"a": "b"}`` overwrites ``b`` with
+        ``a``'s value, so ``a``'s declaration describes the emitted column.
+        Preferring the target's authored declaration silently re-typed the
+        column and let the declared-output restamp stamp the wrong type over it.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "b"},
+                "select_only": False,
+                "schema": {"mode": "fixed", "fields": ["a: int", "b: str"], "guaranteed_fields": ["a", "b"]},
+            }
+        )
+
+        assert transform._output_schema_config is not None
+        by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
+        assert by_name["b"].field_type == "int"
+
+        result = transform.process(make_pipeline_row({"a": 1, "b": "orig"}), make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict() == {"b": 1}
+        _run_post_emission_check(transform, result.row)
+
+    def test_passthrough_keeps_unmapped_declarations_when_every_source_is_nameable(self) -> None:
+        """The abstention above is scoped to unnameable removals, not to renames.
+
+        Regression: elspeth-a2bf676e6f. With only statically-nameable sources the
+        constructor knows exactly which field is renamed away, so the surviving
+        columns keep their authored declarations.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"rating_text": "rating"},
+                "select_only": False,
+                "schema": {"mode": "flexible", "fields": ["kept: str", "rating_text: str"]},
+            }
+        )
+
+        assert transform._output_schema_config is not None
+        by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
+        assert set(by_name) == {"kept", "rating"}
+        assert by_name["rating"].field_type == "str"
 
     def test_guaranteed_fields_empty_mapping(self):
         from elspeth.plugins.transforms.field_mapper import FieldMapper
@@ -963,8 +1190,59 @@ class TestFieldMapperDeclaredOutputFieldContracts:
         assert result.row.contract.get_field("cuisine").required is True
 
     def test_restamp_does_not_mask_a_declared_field_missing_from_the_row(self, ctx: PluginContext) -> None:
-        """Restamping declared metadata must not invent an absent declared field."""
+        """Restamping declared metadata must not invent an absent declared field.
+
+        ``cuisine`` is a MAPPING TARGET here, so it is genuinely declared on the
+        output contract; the upstream row simply never carried it. Before
+        elspeth-a2bf676e6f this scenario was written with ``cuisine`` merely
+        declared in the authored INPUT ``schema.fields`` and whitelisted away by
+        the mapping — which the output contract no longer claims, so it could no
+        longer exercise the restamp. The guard being pinned is the restamp, not
+        the declaration copying, so it moves onto a field the output really does
+        promise.
+        """
         from elspeth.contracts.errors import SchemaConfigModeViolation
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DECLARED_SCHEMA,
+                "mapping": {"dish": "dish", "cuisine": "cuisine"},
+                "select_only": True,
+            }
+        )
+        row = PipelineRow(
+            {"dish": "laksa"},
+            SchemaContract(
+                mode="FIXED",
+                fields=(make_field("dish", str, required=True, source="declared"),),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert "cuisine" not in result.row.to_dict()
+
+        with pytest.raises(SchemaConfigModeViolation) as exc_info:
+            _run_post_emission_check(transform, result.row)
+
+        assert tuple(exc_info.value.payload["missing_required_fields"]) == ("cuisine",)
+        # Absence is reported as a missing guarantee, not as metadata drift:
+        # the mismatch collector only inspects fields the row actually carries.
+        assert "field_metadata_mismatches" not in exc_info.value.payload
+
+    def test_select_only_whitelist_drops_a_non_selected_field_from_the_output_contract(self, ctx: PluginContext) -> None:
+        """Cleanup is the documented purpose of select_only, so it must validate.
+
+        Regression: elspeth-a2bf676e6f. ``schema.fields`` is the INPUT contract,
+        so declaring a field there and omitting it from the whitelist is the
+        ordinary "save only these fields" gesture — not a contradiction. The
+        output contract must stop promising the dropped field, and the emitted
+        row must satisfy its own contract.
+        """
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         transform = FieldMapper(
@@ -990,15 +1268,10 @@ class TestFieldMapperDeclaredOutputFieldContracts:
 
         assert result.status == "success"
         assert isinstance(result.row, PipelineRow)
-        assert "cuisine" not in result.row.to_dict()
-
-        with pytest.raises(SchemaConfigModeViolation) as exc_info:
-            _run_post_emission_check(transform, result.row)
-
-        assert tuple(exc_info.value.payload["missing_required_fields"]) == ("cuisine",)
-        # Absence is reported as a missing guarantee, not as metadata drift:
-        # the mismatch collector only inspects fields the row actually carries.
-        assert "field_metadata_mismatches" not in exc_info.value.payload
+        assert result.row.to_dict() == {"dish": "laksa"}
+        assert transform._output_schema_config is not None
+        assert {field.name for field in transform._output_schema_config.fields or ()} == {"dish"}
+        _run_post_emission_check(transform, result.row)
 
 
 def test_select_only_assistance_requires_every_downstream_field() -> None:
