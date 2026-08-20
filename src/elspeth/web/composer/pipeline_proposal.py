@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import fields as dataclass_fields
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Self, TypedDict, cast
@@ -120,6 +121,16 @@ class OwnedCompositionStateAuthorityData(TypedDict):
     """Closed, version-free authored-state proposal authority."""
 
     authority_kind: Literal["owned_composition_state.v1"]
+    sources: dict[str, dict[str, Any]]
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    outputs: list[dict[str, Any]]
+    metadata: dict[str, Any]
+
+
+class OwnedCompositionStateSections(TypedDict):
+    """The five authored sections of an owned-state authority, minus its kind."""
+
     sources: dict[str, dict[str, Any]]
     nodes: list[dict[str, Any]]
     edges: list[dict[str, Any]]
@@ -327,12 +338,172 @@ def owned_composition_state_authority(state: CompositionState) -> OwnedCompositi
     return authority
 
 
+def _owned_composition_state_spec_entries(payload: Mapping[str, Any]) -> tuple[tuple[Any, type], ...]:
+    """Pair every authored sub-object in an authority with the spec that parses it.
+
+    The closed six-field guard above proves the five section keys exist; this
+    proves each section holds the container ``CompositionState.from_dict``
+    expects, so the callers below can read sub-objects without re-checking.
+    Source names are asserted to be exact strings here rather than left to the
+    round-trip comparison: a non-``str`` key survives that comparison intact
+    (``{1: {...}}`` is byte-equal to itself) but ``canonical_json`` refuses it,
+    so an authority carrying one hashes under ``stable_hash`` and then raises
+    from the canonicalisation path instead of at this boundary.
+    """
+    from elspeth.web.composer.state import EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+
+    sources = payload["sources"]
+    metadata = payload["metadata"]
+    if type(sources) is not dict or any(type(source_name) is not str for source_name in sources):
+        raise AuditIntegrityError("owned composition-state authority sections are malformed")
+    entries: list[tuple[Any, type]] = [(source, SourceSpec) for source in sources.values()]
+    for section_key, spec in (("nodes", NodeSpec), ("edges", EdgeSpec), ("outputs", OutputSpec)):
+        section = payload[section_key]
+        if type(section) is not list:
+            raise AuditIntegrityError("owned composition-state authority sections are malformed")
+        entries.extend((entry, spec) for entry in section)
+    entries.append((metadata, PipelineMetadata))
+    if any(type(entry) is not dict for entry, _spec in entries):
+        raise AuditIntegrityError("owned composition-state authority sections are malformed")
+    return tuple(entries)
+
+
+def _reject_undeclared_owned_composition_state_fields(payload: Mapping[str, Any]) -> None:
+    """Reject any authored key the composer state model would silently drop.
+
+    Every spec's ``from_dict`` reads exactly the names its dataclass declares —
+    pinned mechanically by ``test_spec_from_dict_reads_exactly_its_dataclass_fields``
+    — so the declared field names ARE the set of keys a restore observes, and
+    anything outside it is discarded on the way in.
+
+    This is the only integrity-relevant limb of the old byte-equality guard, and
+    it is checked separately because it is the only one whose consequence is
+    disclosure rather than fidelity. ``tool_arguments_hash`` and
+    ``private_arguments_hash`` bind the RAW payload, while
+    ``arguments_redacted_json`` is built from the RESTORED state
+    (``sessions/service.py``), so a dropped key is persisted verbatim and never
+    reaches ``redact_tool_call_arguments`` — an unreviewed egress channel, not
+    merely a lossy reload.
+    """
+    for entry, spec in _owned_composition_state_spec_entries(payload):
+        if set(entry) - {field.name for field in dataclass_fields(spec)}:
+            raise AuditIntegrityError("owned composition-state authority carries a field the composer state model does not define")
+
+
+def _authored_and_projected_pairs(
+    payload: Mapping[str, Any],
+    emitted: Mapping[str, Any],
+) -> list[tuple[Any, Any]]:
+    """Pair each authored sub-object with the projection of its restored self."""
+    emitted_sources = emitted["sources"]
+    pairs: list[tuple[Any, Any]] = [
+        (source, emitted_sources[source_name] if source_name in emitted_sources else None)
+        for source_name, source in payload["sources"].items()
+    ]
+    for section_key in ("nodes", "edges", "outputs"):
+        emitted_section = emitted[section_key]
+        for index, entry in enumerate(payload[section_key]):
+            pairs.append((entry, emitted_section[index] if index < len(emitted_section) else None))
+    pairs.append((payload["metadata"], emitted["metadata"]))
+    return pairs
+
+
+def _authority_without_written_out_nulls(
+    payload: Mapping[str, Any],
+    emitted: Mapping[str, Any],
+) -> OwnedCompositionStateSections | None:
+    """Return ``payload`` minus every written-out null, or None if it has none.
+
+    ``CompositionState.to_dict`` emits an optional field only when it is not
+    None — it never writes a null out — so an absence spelled as
+    ``"condition": null`` is a shape no serialiser version ever produced. It
+    compares unequal whether construction leaves the field None (the key
+    vanishes from the projection) or defaults it (the key comes back with a
+    value), and both forms are removed here.
+
+    Undeclared keys are rejected before this runs, so an authored null the
+    projection does not carry back verbatim is always a declared optional whose
+    absence was written out rather than omitted. Selecting on that observed
+    null, rather than on the field's NAME, is deliberate: a name-keyed rule
+    would grant the same amnesty to an unrelated transform that happens to
+    touch the same field.
+    """
+    stripped = OwnedCompositionStateSections(
+        sources={source_name: dict(source) for source_name, source in payload["sources"].items()},
+        nodes=[dict(node) for node in payload["nodes"]],
+        edges=[dict(edge) for edge in payload["edges"]],
+        outputs=[dict(output) for output in payload["outputs"]],
+        metadata=dict(payload["metadata"]),
+    )
+    found = False
+    for entry, projected in _authored_and_projected_pairs(stripped, emitted):
+        if type(projected) is not dict:
+            continue
+        for key in [key for key, value in entry.items() if value is None and (key not in projected or projected[key] is not None)]:
+            del entry[key]
+            found = True
+    return stripped if found else None
+
+
+def _round_trips_once_written_out_nulls_are_dropped(
+    payload: Mapping[str, Any],
+    emitted: Mapping[str, Any],
+) -> bool:
+    """Return whether written-out nulls are the ONLY reason the round trip failed.
+
+    Reporting the null class on the mere PRESENCE of an authored null is
+    misdirection when the payload is ALSO stale: the operator removes the null,
+    resubmits, and hits a second fatal rejection. So the nulls are stripped and
+    the round trip re-checked — the class is claimed only when the stripped
+    payload restores exactly, which makes the message's implied remedy a real
+    one.
+
+    ``emitted`` is reused as the stripped payload's projection rather than
+    restoring a second time, because dropping a written-out null cannot change
+    what ``from_dict`` builds: every strippable key is optional BY
+    CONSTRUCTION. A field the serialiser emits unconditionally comes back as an
+    explicit None in the projection and is therefore never selected for
+    stripping; what remains is read through the ``"key" in d`` idiom, for which
+    an authored None and an absent key produce the identical value.
+    """
+    stripped = _authority_without_written_out_nulls(payload, emitted)
+    return stripped is not None and emitted == {"authority_kind": OWNED_COMPOSITION_STATE_AUTHORITY, **stripped}
+
+
 def restore_owned_composition_state_authority(
     authority: Mapping[str, Any],
     *,
     version: int,
 ) -> CompositionState:
-    """Restore and exact-round-trip one private owned-state authority."""
+    """Restore and exact-round-trip one private owned-state authority.
+
+    Fail-closed on anything the current serialiser would not re-emit verbatim.
+    The three rejections are deliberately distinct, because they are materially
+    different conditions that used to share one message and one remedy:
+
+    * an undeclared field is silently DROPPED on restore, so the authored bytes
+      and the restored state disagree about content (see the helper above);
+    * an explicit null encodes an absence the serialiser writes by omission —
+      faithful, and REMOVABLE, which is why this class is claimed only when
+      removing the nulls actually makes the payload restore;
+    * anything else means the payload does not round-trip under the composer
+      state normalisation THIS build applies.
+
+    The order matters as much as the split. A payload that is both null-shaped
+    and stale must report as stale, because "remove the null" is a remedy that
+    would not work; a message the operator can act on and still fail is worse
+    than the single uninformative one this replaced.
+
+    The last class is why stale bytes stay fatal rather than being tolerated.
+    ``NodeSpec.__post_init__`` reads its coalesce defaults from
+    ``CoalesceSettings.model_fields`` precisely so composer state tracks the
+    runtime, so a payload that omits ``merge``/``policy`` carries no record of
+    which default was in force when it was authored: accepting it would let a
+    later change to the runtime default silently re-interpret already-reviewed
+    bytes with every hash binding still green. The bytes are hash-bound and must
+    never be rewritten, so an authority that predates a normalisation is
+    quarantined, not migrated (elspeth-da00e1c1cb).
+    """
     from elspeth.web.composer.state import CompositionState
 
     if type(version) is not int or version < 1:
@@ -343,13 +514,16 @@ def restore_owned_composition_state_authority(
     if detached.get("authority_kind") != OWNED_COMPOSITION_STATE_AUTHORITY:
         raise AuditIntegrityError("owned composition-state authority kind is malformed")
     state_payload = {key: value for key, value in detached.items() if key != "authority_kind"}
-    state_payload["version"] = version
+    _reject_undeclared_owned_composition_state_fields(state_payload)
     try:
-        state = CompositionState.from_dict(state_payload)
+        state = CompositionState.from_dict({**state_payload, "version": version})
     except (KeyError, TypeError, ValueError) as exc:
         raise AuditIntegrityError("owned composition-state authority payload is malformed") from exc
-    if _project_owned_composition_state(state) != detached:
-        raise AuditIntegrityError("owned composition-state authority is not an exact state round-trip")
+    emitted = _project_owned_composition_state(state)
+    if emitted != detached:
+        if _round_trips_once_written_out_nulls_are_dropped(state_payload, emitted):
+            raise AuditIntegrityError("owned composition-state authority encodes an absent optional field as an explicit null")
+        raise AuditIntegrityError("owned composition-state authority does not round-trip under the current composer state normalisation")
     return state
 
 

@@ -5506,8 +5506,24 @@ class CompositionState:
 
         Calls from_dict() on each nested Spec type. This is the only way
         to construct CompositionState from deserialised JSON (Spec AC #18).
-        The round-trip invariant holds:
-            state == CompositionState.from_dict(state.to_dict())
+
+        The round-trip is CONTENT-exact, not identity-exact, in both directions,
+        and callers that need either property must say which:
+
+        * ``from_dict(to_dict(state)) == state`` fails whenever ``state`` carries
+          a ``guided_session`` — ``to_dict`` never emits it and this never
+          restores it. It is carried on the ``composer_meta`` side channel
+          instead (``sessions/converters.py``).
+        * ``to_dict(from_dict(payload)) == payload`` fails for any payload the
+          spec constructors normalise (coalesce ``merge``/``policy`` defaults,
+          ``row_union`` list branches), for any key not declared by the spec
+          (silently dropped), and for an optional written out as an explicit
+          null (``to_dict`` encodes absence by omission).
+
+        The second direction is load-bearing for persisted authorities, whose
+        bytes are hash-bound and therefore cannot be re-normalised in place; see
+        ``pipeline_proposal.restore_owned_composition_state_authority``
+        (elspeth-da00e1c1cb).
         """
         raw_sources = d["sources"] if "sources" in d and d["sources"] is not None else {}
         if not raw_sources and "source" in d and d["source"] is not None:

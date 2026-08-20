@@ -8,6 +8,38 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-20 — a construction-time normalisation in `web/composer/state.py`
+  invalidates PERSISTED hashes; it is never a local change** (landed with
+  elspeth-da00e1c1cb). `NodeSpec.__post_init__` is advertised as the one
+  construction boundary every path routes through, so normalisations keep
+  landing there — and each one silently breaks two seams that read bytes
+  written by an OLDER build:
+  - `restore_owned_composition_state_authority` (`pipeline_proposal.py`)
+    requires `to_dict(from_dict(payload)) == payload`. A payload authored
+    before your normalisation can never satisfy it again, and it must NOT be
+    migrated: `tool_arguments_hash`, `private_arguments_hash` and
+    `draft_hash` all bind the raw bytes, so rewriting them trades one
+    integrity error for three.
+  - `composition_content_hash` hashes `to_dict()` AFTER normalisation, and
+    that value is STORED in `PresentBase.composition_content_hash`.
+    `sessions/service.py` re-derives and compares it on the fork path, so a
+    normalisation retroactively unbinds every stored base binding for the
+    shapes it touches. This is the wider blast radius, and it needs no owned
+    authority to fire.
+  `tests/unit/web/composer/test_state_serialisation_contract.py` pins both:
+  content hashes for representative authored shapes, and an AST check that
+  every spec's `from_dict` reads EXACTLY its declared dataclass fields (the
+  undeclared-field rejection uses `dataclasses.fields()` as the set of keys a
+  restore observes). If your change reddens the hash pins, that is the gate
+  working — decide what happens to already-persisted states before re-pinning.
+  Two traps: (a) an AST gate that looks for `object.__setattr__` is BLIND,
+  because house style routes field rewrites through `freeze_fields`
+  (`contracts/freeze.py`) — pin behaviour, not syntax; (b) do not "fix" the
+  restore by tolerating stale bytes. The coalesce defaults are read from
+  `CoalesceSettings.model_fields` precisely so they track the runtime, so a
+  payload that omits `merge`/`policy` records no epoch: accepting it lets a
+  later default change re-interpret already-reviewed bytes with every hash
+  still green. Quarantine, do not migrate.
 - **2026-08-19 — `plan_pipeline` requires the session schema tracker; aid-supplied
   manifest keys are palette-retained AND escalation-exempt** (landed with
   elspeth-cb3561382e/275e05bf71/ac44757161). `plan_pipeline` takes

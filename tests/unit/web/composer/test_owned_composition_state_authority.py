@@ -231,3 +231,140 @@ def test_owned_state_dispatch_keeps_private_binding_and_persists_only_review_pro
     persisted_binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
     assert persisted_binding.arguments_hash == composer_authority_hash(expected_redacted)
     assert deep_thaw(authority)["sources"]["source_1"]["options"]["blob_ref"] == _BLOB_A
+
+
+def _authority_payload() -> dict[str, Any]:
+    """Return a mutable owned-state authority payload for staleness probes."""
+    return deepcopy(owned_composition_state_authority(_state()))
+
+
+def _coalesce_node(**overrides: Any) -> dict[str, Any]:
+    node: dict[str, Any] = {
+        "id": "join_rows",
+        "node_type": "coalesce",
+        "plugin": None,
+        "input": "screened_rows",
+        "on_success": "joined_rows",
+        "on_error": None,
+        "options": {},
+        "branches": ["left", "right"],
+    }
+    node.update(overrides)
+    return node
+
+
+@pytest.mark.parametrize(
+    ("section", "mutate"),
+    [
+        ("node", lambda payload: payload["nodes"][0].update({"undeclared": "x"})),
+        ("source", lambda payload: payload["sources"]["source_1"].update({"undeclared": "x"})),
+        ("output", lambda payload: payload["outputs"][0].update({"undeclared": "x"})),
+        (
+            "edge",
+            lambda payload: payload["edges"].append(
+                {
+                    "id": "e1",
+                    "from_node": "source",
+                    "to_node": "prompt_shield_auto_1",
+                    "edge_type": "on_success",
+                    "label": None,
+                    "undeclared": "x",
+                }
+            ),
+        ),
+        ("metadata", lambda payload: payload["metadata"].update({"undeclared": "x"})),
+    ],
+)
+def test_owned_state_authority_names_a_field_the_state_model_does_not_define(
+    section: str,
+    mutate: Any,
+) -> None:
+    payload = _authority_payload()
+    mutate(payload)
+
+    with pytest.raises(AuditIntegrityError, match="carries a field the composer state model does not define"):
+        restore_owned_composition_state_authority(payload, version=1)
+
+
+def test_owned_state_authority_names_an_explicit_null_encoding_of_an_absent_field() -> None:
+    payload = _authority_payload()
+    payload["nodes"][0]["condition"] = None
+
+    with pytest.raises(AuditIntegrityError, match="encodes an absent optional field as an explicit null"):
+        restore_owned_composition_state_authority(payload, version=1)
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        pytest.param(_coalesce_node(), id="coalesce_without_merge_or_policy"),
+        pytest.param(
+            _coalesce_node(id="union_rows", node_type="row_union", merge="union", policy="require_all"),
+            id="row_union_with_list_branches",
+        ),
+    ],
+)
+def test_owned_state_authority_names_normalisation_drift_for_a_pre_normalisation_payload(node: dict[str, Any]) -> None:
+    payload = _authority_payload()
+    payload["nodes"].append(node)
+
+    with pytest.raises(
+        AuditIntegrityError,
+        match="does not round-trip under the current composer state normalisation",
+    ):
+        restore_owned_composition_state_authority(payload, version=1)
+
+
+@pytest.mark.parametrize(
+    "branches",
+    [pytest.param([1, 2], id="int_branch_aliases"), pytest.param([], id="empty_branch_list")],
+)
+def test_owned_state_authority_still_rejects_non_authored_row_union_branch_shapes(branches: list[Any]) -> None:
+    payload = _authority_payload()
+    payload["nodes"].append(_coalesce_node(id="union_rows", node_type="row_union", branches=branches))
+
+    with pytest.raises(AuditIntegrityError, match="owned composition-state"):
+        restore_owned_composition_state_authority(payload, version=1)
+
+
+def test_owned_state_authority_reports_drift_when_removing_the_null_would_not_help() -> None:
+    """A payload that is BOTH null-shaped and stale must report as stale.
+
+    ``merge``/``policy`` written out as null is a written-out absence, but
+    removing it leaves a coalesce that still predates the runtime-default
+    normalisation. Naming the null here would hand the operator a remedy that
+    resubmits into a second fatal rejection.
+    """
+    payload = _authority_payload()
+    payload["nodes"].append(_coalesce_node(merge=None, policy=None))
+
+    with pytest.raises(
+        AuditIntegrityError,
+        match="does not round-trip under the current composer state normalisation",
+    ):
+        restore_owned_composition_state_authority(payload, version=1)
+
+
+def test_owned_state_authority_reports_drift_when_a_null_and_a_stale_node_are_both_present() -> None:
+    """The null class is claimed for the payload, not for one sub-object.
+
+    A removable null on one node alongside an unrelated stale node is still a
+    quarantine-class payload; the null is not the reason it cannot restore.
+    """
+    payload = _authority_payload()
+    payload["nodes"][0]["condition"] = None
+    payload["nodes"].append(_coalesce_node())
+
+    with pytest.raises(
+        AuditIntegrityError,
+        match="does not round-trip under the current composer state normalisation",
+    ):
+        restore_owned_composition_state_authority(payload, version=1)
+
+
+def test_owned_state_authority_rejects_a_source_name_that_is_not_an_exact_string() -> None:
+    payload = _authority_payload()
+    payload["sources"][1] = payload["sources"].pop("source_1")
+
+    with pytest.raises(AuditIntegrityError, match="owned composition-state authority sections are malformed"):
+        restore_owned_composition_state_authority(payload, version=1)
