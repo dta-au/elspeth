@@ -8,6 +8,34 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-21 — "does this config literal name a row key?" is
+  `normalize_field_name(x) == x`, NEVER `x.isidentifier()`** (landed with
+  elspeth-f262a8c678). Sources key a row by the NORMALIZED header, and
+  `normalize_field_name` lowercases and keyword-suffixes as well as scrubbing
+  punctuation. So `'B'`, `'Name'`, `'userID'`, `'ID'` and `'class'` are all
+  perfectly good identifiers that no row is ever keyed by — they reach a
+  transform only through `contract.resolve_name`, exactly like the visibly
+  messy `'First Name'`. An `isidentifier()` proxy therefore recognises ONE of
+  the two halves of "original header" and silently mis-files the other, which
+  is how `field_mapper` came to guarantee a column its own `process` deletes
+  (`SchemaConfigModeViolation: missing required fields ['name']` on a correct
+  rename, plus a `DeclaredOutputFieldsViolation` when the deleted normalized
+  name is another entry's target). The predicate is normalization's FIXED
+  POINTS; `value_transform._row_key_aliases` had already learned this and is
+  the handling to copy — answer `ExternalHeaderError` (a literal that
+  normalizes to nothing names no field, so it is not a row key) and let a bare
+  `ValueError` propagate, or the exception class a bad config key raises at
+  construction changes. Two traps when auditing this class: (a) a corpus scan
+  finds nothing, because a case-variant source is a pure blind spot — zero
+  in-tree configs use one, which is precisely why no test caught it; test the
+  predicate against `SchemaContract.resolve_name` rather than against
+  `normalize_field_name` again, or the assertion restates the implementation;
+  (b) the fix moves BUILD-TIME verdicts, and the direction is not the obvious
+  one — a wider "unresolved" set makes `field_mapper` ABSTAIN more, which
+  through `schema_validation.py`'s `if not vote.fields and not
+  vote.participated` clears graphs it used to reject. Measure with a
+  HEAD-vs-patched `ExecutionGraph` matrix and check the moved cells against
+  the class that already abstains, not against zero.
 - **2026-08-20 — EDITING a builtin plugin: `source_file_hash` tracks content,
   `plugin_version` does not.** Section 6 below covers ADDING a plugin; this is
   the edit path, and the two attributes behave differently:

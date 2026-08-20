@@ -25,6 +25,32 @@ from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.sentinels import MISSING
 from elspeth.plugins.infrastructure.utils import get_nested_field
+from elspeth.plugins.sources.field_normalization import ExternalHeaderError, normalize_field_name
+
+
+def _names_a_row_key(name: str) -> bool:
+    """Whether ``name`` is the key a row actually carries that field under.
+
+    Sources derive a row key from the original header with
+    ``normalize_field_name``, so the literals that name a row key directly are
+    exactly that function's FIXED POINTS. ``str.isidentifier`` is not that
+    test and was the defect (elspeth-f262a8c678): normalization also
+    LOWERCASES and keyword-suffixes, so ``'B'``, ``'Name'``, ``'userID'`` and
+    ``'class'`` are all identifiers that no row is ever keyed by — they reach
+    ``process`` only through ``contract.resolve_name``, exactly like
+    ``'First Name'``.
+
+    A literal that normalizes to nothing names no field at all: the source
+    boundary rejects such a header, so no contract can carry one. That mirrors
+    ``value_transform._row_key_aliases``, whose handling this matches
+    deliberately — ``ExternalHeaderError`` is answered, a bare ``ValueError``
+    from an algorithm bug propagates, so the error class a bad mapping key
+    raises at construction is unchanged.
+    """
+    try:
+        return normalize_field_name(name) == name
+    except ExternalHeaderError:
+        return False
 
 
 class FieldMapperConfig(TransformDataConfig):
@@ -118,7 +144,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3836f6650994fa12"
+    source_file_hash: str | None = "sha256:64e9a4a54e36e825"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -179,11 +205,14 @@ class FieldMapper(BaseTransform):
         # A source is REMOVED only under the exact condition process() removes
         # it: not select_only, no dot (a dotted source is a nested read that
         # leaves its root field in place), and renamed to a different target.
-        # An unresolved original header ("First Name") removes a normalized
-        # name that only `contract.resolve_name` knows at runtime, so it cannot
-        # be named here — the whole declaration abstains rather than
-        # under-state the removal set, which is the only direction that could
-        # produce a FALSE build-time rejection of a working rename pipeline.
+        # An unresolved original header removes a normalized name that only
+        # `contract.resolve_name` knows at runtime, so it cannot be named
+        # here — the whole declaration abstains rather than under-state the
+        # removal set, which is the only direction that could produce a FALSE
+        # build-time rejection of a working rename pipeline. That class is
+        # every non-fixed-point of `normalize_field_name`, not just the
+        # visibly messy "First Name": a case variant like "Name" or "userID"
+        # deletes `name` / `userid` just as unnameably (elspeth-f262a8c678).
         # Identity mappings are NOT exempt: {"First Name": "First Name"}
         # still deletes the normalized key and writes the literal header key,
         # so the removal is equally unnameable here.
@@ -212,13 +241,24 @@ class FieldMapper(BaseTransform):
 
     @staticmethod
     def _is_static_normalized_source(source: str) -> bool:
-        """Return True when constructor-time contract math can use source."""
-        return "." not in source and source.isidentifier()
+        """Return True when constructor-time contract math can use source.
+
+        Only a normalization fixed point names a row key this constructor can
+        state; see ``_names_a_row_key``. Dotted sources are nested reads, not
+        row keys, so they are excluded here and in the complement below.
+        """
+        return "." not in source and _names_a_row_key(source)
 
     @staticmethod
     def _is_unresolved_original_source(source: str) -> bool:
-        """Return True when source may be an original header resolved only at runtime."""
-        return "." not in source and not source.isidentifier()
+        """Return True when source may be an original header resolved only at runtime.
+
+        The exact complement of ``_is_static_normalized_source`` over
+        non-dotted sources: a literal that is not the row's own key reaches
+        ``process`` through ``contract.resolve_name``, so which normalized name
+        it deletes is unknowable until a row arrives.
+        """
+        return "." not in source and not _names_a_row_key(source)
 
     @classmethod
     def _mapping_target_is_guaranteed(

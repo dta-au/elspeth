@@ -1283,3 +1283,169 @@ def test_select_only_assistance_requires_every_downstream_field() -> None:
     rendered = " ".join(assistance.composer_hints)
 
     assert "every field required by the downstream sink" in rendered
+
+
+class TestFieldMapperOriginalHeaderClassification:
+    """Which mapping sources name a row key, and which only resolve at runtime.
+
+    Regression: elspeth-f262a8c678. ``_is_unresolved_original_source`` used
+    ``not source.isidentifier()`` as its proxy for "an original header resolved
+    only at runtime". ``normalize_field_name`` LOWERCASES and keyword-suffixes,
+    so every case-variant header ('B', 'Name', 'userID', 'class') is an
+    identifier that no row is keyed by — the proxy caught only the visibly
+    messy 'First Name' class. Four declarations consume the predicate, and each
+    one then described a field the transform does not emit.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        """Create minimal plugin context."""
+        return make_context()
+
+    @pytest.mark.parametrize(
+        ("source", "names_a_row_key"),
+        [
+            ("name", True),
+            ("first_name", True),
+            ("field2", True),
+            ("café", True),
+            ("B", False),
+            ("Name", False),
+            ("userID", False),
+            ("ID", False),
+            ("class", False),
+            ("Ünicode", False),
+            ("First Name", False),
+            ("2fast", False),
+            ("!!!", False),
+            ("", False),
+        ],
+        ids=repr,
+    )
+    def test_only_normalization_fixed_points_name_a_row_key(self, source: str, names_a_row_key: bool) -> None:
+        """The guard tests normalization's fixed points, not Python's identifier alphabet."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        assert FieldMapper._is_static_normalized_source(source) is names_a_row_key
+        assert FieldMapper._is_unresolved_original_source(source) is not names_a_row_key
+
+    @pytest.mark.parametrize("source", ["meta.name", "meta.Name", "Meta.name", "a.b.c"])
+    def test_dotted_sources_are_neither_row_key_nor_original_header(self, source: str) -> None:
+        """A dotted source is a nested read, so neither predicate claims it."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        assert FieldMapper._is_static_normalized_source(source) is False
+        assert FieldMapper._is_unresolved_original_source(source) is False
+
+    @pytest.mark.parametrize(
+        "header",
+        ["name", "first_name", "field2", "B", "Name", "userID", "ID", "class", "First Name", "2fast"],
+        ids=repr,
+    )
+    def test_static_classification_agrees_with_the_runtime_resolver(self, header: str) -> None:
+        """The predicate answers the question ``process`` actually asks of a row.
+
+        ``process`` deletes ``row.contract.resolve_name(source)``, so a source
+        is statically nameable exactly when the resolver returns the literal
+        unchanged. Cross-checking against the resolver — rather than against
+        ``normalize_field_name`` again — keeps this from restating the
+        implementation.
+        """
+        from elspeth.plugins.sources.field_normalization import normalize_field_name
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        contract = SchemaContract(
+            mode="FLEXIBLE",
+            fields=(make_field(normalize_field_name(header), str, original_name=header, required=True, source="declared"),),
+            locked=True,
+        )
+
+        assert FieldMapper._is_static_normalized_source(header) is (contract.resolve_name(header) == header)
+
+    def test_case_variant_source_does_not_promise_the_name_it_deletes(self, ctx: PluginContext) -> None:
+        """A case-variant rename abstains instead of guaranteeing a deleted column.
+
+        At HEAD the guard called 'Name' statically nameable, so the output
+        config kept 'name' as a passthrough guarantee while ``process``
+        deleted it — the transform's own post-emission check then rejected its
+        own row.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": {"mode": "flexible", "fields": ["name: str", "keep: str"], "guaranteed_fields": ["name", "keep"]},
+                "mapping": {"Name": "full_name"},
+                "select_only": False,
+                "strict": True,
+            }
+        )
+        row = PipelineRow(
+            {"name": "Ada", "keep": "kept"},
+            SchemaContract(
+                mode="FLEXIBLE",
+                fields=(
+                    make_field("name", str, original_name="Name", required=True, source="declared"),
+                    make_field("keep", str, original_name="keep", required=True, source="declared"),
+                ),
+                locked=True,
+            ),
+        )
+
+        assert transform._output_schema_config is not None
+        assert "name" not in (transform._output_schema_config.guaranteed_fields or ())
+        assert transform.forwards_input_fields is False
+        assert transform.removed_input_fields == frozenset()
+        assert transform.declared_output_fields == frozenset()
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert result.row.to_dict() == {"full_name": "Ada", "keep": "kept"}
+        _run_post_emission_check(transform, result.row)
+
+    @pytest.mark.parametrize("case_variant_source", ["Name", "userID", "ID", "class"], ids=repr)
+    def test_case_variant_sources_declare_exactly_like_the_messy_header_class(self, case_variant_source: str) -> None:
+        """The fix makes the two halves of "original header" agree.
+
+        'First Name' already abstained at HEAD. A case variant resolves through
+        the same ``contract.resolve_name`` path, so every declaration it drives
+        must match — that equivalence is the whole content of the fix.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        def declarations(source: str) -> tuple[object, ...]:
+            transform = FieldMapper(
+                {
+                    "schema": {"mode": "flexible", "fields": ["name: str", "keep: str"], "guaranteed_fields": ["name", "keep"]},
+                    "mapping": {source: "mapped"},
+                    "select_only": False,
+                    "strict": True,
+                }
+            )
+            assert transform._output_schema_config is not None
+            return (
+                transform.forwards_input_fields,
+                transform.removed_input_fields,
+                transform.declared_output_fields,
+                transform._output_schema_config.guaranteed_fields,
+            )
+
+        assert declarations(case_variant_source) == declarations("First Name")
+
+    @pytest.mark.parametrize("source", ["", "!!!", "   "], ids=repr)
+    def test_an_empty_normalizing_mapping_key_still_constructs(self, source: str) -> None:
+        """``normalize_field_name`` raising must not change the construction contract.
+
+        It raises ``ExternalHeaderError`` for a key that normalizes to nothing.
+        The guard answers it the way ``value_transform._row_key_aliases`` does —
+        such a literal names no field, so it is an unresolved original header —
+        rather than letting a new exception class escape ``__init__``.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": {"mode": "observed"}, "mapping": {source: "mapped"}})
+
+        assert FieldMapper._is_unresolved_original_source(source) is True
+        assert transform.forwards_input_fields is False
