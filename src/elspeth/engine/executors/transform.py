@@ -358,12 +358,25 @@ class TransformExecutor:
         # All transforms are system-owned and must inherit BaseTransform.
         # AttributeError here means a transform violates the interface contract.
         if not transform._on_start_called:
-            lifecycle_violation = PluginContractViolation(
+            # Tier 1, deliberately, and NOT a PluginContractViolation. Every
+            # other check in this preflight is a function of THE ROW, so
+            # routing it per-row through on_error is honest. This one is a
+            # function of THE RUN: on_start() either ran for this transform or
+            # it did not, identically for every row. Routed, it would quarantine
+            # the entire dataset and report PARTIAL — telling the operator their
+            # data was bad when the engine never started the plugin
+            # (elspeth-181db83da7 review). ADR-008 §Alternative 3 rejects
+            # exactly that disposition. OrchestrationInvariantError is how this
+            # file reports every other engine-state invariant (see the node_id
+            # guards above); being TIER_1-registered, it is re-raised by
+            # ``RowProcessor._execute_transform_with_retry`` before any
+            # conversion, and run finalization stamps the undecided tokens
+            # ABANDONED per ADR-038.
+            raise OrchestrationInvariantError(
                 f"Transform '{transform.name}' was called before on_start(). "
                 f"This is an engine lifecycle bug — on_start() must be called "
                 f"before any process() invocation."
             )
-            raise lifecycle_violation
 
         # --- FIELD COLLISION ENFORCEMENT (pre-execution) ---
         # Centralized check: if this transform declares output fields,
@@ -566,8 +579,6 @@ class TransformExecutor:
         *,
         result: TransformResult,
         transform: TransformProtocol,
-        token: TokenInfo,
-        run_id: str,
         input_hash: str,
         duration_ms: float,
     ) -> None:
@@ -575,13 +586,15 @@ class TransformExecutor:
 
         Wraps stable_hash calls to convert canonicalization errors to
         PluginContractViolation: stable_hash calls canonical_json, which
-        rejects NaN, Infinity, and non-serializable types. Per CLAUDE.md:
-        plugin bugs must crash with clear error messages.
+        rejects NaN, Infinity, and non-serializable types.
 
-        ``token``/``run_id`` are carried so the canonicalization violation can
-        terminalize the token like every other contract violation in this
-        executor (elspeth-82d4c5146c) — the crash is correct, the silent
-        pending token is not.
+        That violation is Tier 2 and therefore ROUTED, not fatal: the processor
+        converts it to a transform error and the ``on_error`` destination owns
+        the token's terminal outcome (elspeth-181db83da7). This method records
+        nothing itself. It used to terminalize the token here, which was
+        correct only while the violation still crashed the run
+        (elspeth-82d4c5146c); ``token`` and ``run_id`` existed solely to feed
+        that call and are gone with it.
         """
         result.input_hash = input_hash
         try:
@@ -850,8 +863,6 @@ class TransformExecutor:
                 self._populate_result_audit_fields(
                     result=result,
                     transform=transform,
-                    token=token,
-                    run_id=ctx.run_id,
                     input_hash=input_hash,
                     duration_ms=duration_ms,
                 )

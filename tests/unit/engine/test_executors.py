@@ -1714,12 +1714,17 @@ class TestTransformExecutor:
 
     # --- Invariant guard tests (elspeth-8c9b58a679) ---
 
-    def test_on_start_not_called_raises_plugin_contract_violation(self) -> None:
-        """Lifecycle guard: executing a transform before on_start() raises PluginContractViolation.
+    def test_on_start_not_called_raises_orchestration_invariant_not_a_routable_violation(self) -> None:
+        """The lifecycle guard is a RUN-scoped fault and must stay fatal.
 
-        Tier 2, so the executor raises but records no terminal token outcome —
-        the processor routes the violation through on_error and the routing
-        path owns the token's fate (elspeth-181db83da7).
+        Every other preflight check is a function of the row, so routing it
+        per-row through ``on_error`` is honest. This one is a function of the
+        run: ``on_start()`` either ran for this transform or it did not,
+        identically for every row. As a Tier-2 ``PluginContractViolation`` it
+        became routable with elspeth-181db83da7, which quarantined the whole
+        dataset and reported PARTIAL — the disposition ADR-008 §Alternative 3
+        rejects. It is an ``OrchestrationInvariantError`` (TIER_1-registered)
+        so the run crashes instead.
         """
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
@@ -1728,9 +1733,13 @@ class TestTransformExecutor:
         token = _make_token(token_id="tok_lifecycle")
         ctx = make_context()
 
-        with pytest.raises(PluginContractViolation, match="before on_start"):
+        with pytest.raises(OrchestrationInvariantError, match="before on_start") as exc_info:
             executor.execute_transform(transform, token, ctx)
 
+        # The tier is the load-bearing property, not the class name: it is what
+        # makes the processor re-raise instead of converting.
+        assert isinstance(exc_info.value, TIER_1_ERRORS)
+        assert not isinstance(exc_info.value, PluginContractViolation)
         factory.data_flow.record_token_outcome.assert_not_called()
 
     def test_on_error_none_raises_orchestration_invariant_error(self) -> None:
@@ -1797,6 +1806,14 @@ class TestTransformExecutor:
 
         assert exc_info.value.passes_through_input is False
         assert exc_info.value.can_drop_rows is can_drop_rows
+        # This class is Tier 2 and therefore ROUTED, so the on_error
+        # destination — not the executor — writes the token's terminal outcome
+        # (elspeth-181db83da7). The executor keeps it out of
+        # ``_record_terminal_contract_failure`` via a dedicated ``except``
+        # ahead of the recording clause. Folding that clause back into the
+        # tuple below it is caught by mypy (the recording method's annotation
+        # excludes this class), but NOT by any assertion — until this one.
+        factory.data_flow.record_token_outcome.assert_not_called()
 
 
 # =============================================================================

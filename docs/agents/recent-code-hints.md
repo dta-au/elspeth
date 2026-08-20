@@ -47,9 +47,15 @@ is a working document under the normal delivery posture.
   finalization — nowhere near the code you changed). When you restore a path
   that was previously dead, grep for what was recording on its behalf. And
   verify BOTH destinations: a named `on_error` sink terminalizes through
-  sink-effect finalization, `discard` through traversal, and only the named-sink
-  half raises on a duplicate — so a green run with a named sink says nothing
-  about whether `discard` now writes zero outcomes instead of one.
+  sink-effect finalization, `discard` through traversal, so a green run of one
+  says nothing about the other. (An earlier revision of this entry claimed only
+  the named-sink half raises on a duplicate. That was inferred, never measured,
+  and it is FALSE: `ix_token_outcomes_terminal_unique`
+  (`core/landscape/schema.py:677`) is keyed on `token_id` alone under
+  `completed == 1`, with no sink discrimination, so either path raises on a
+  double write. The duplicate direction is therefore self-detecting on both —
+  it is the ZERO-write direction that has no automatic detection anywhere, and
+  that is what you must check by hand.)
 
 - **2026-08-21 — "does this config literal name a row key?" is
   `normalize_field_name(x) == x`, NEVER `x.isidentifier()`** (landed with

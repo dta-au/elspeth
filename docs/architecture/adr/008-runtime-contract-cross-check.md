@@ -47,6 +47,25 @@ Add a per-row runtime cross-check to `TransformExecutor.execute_transform`:
 
 Without the registration: a transform with `on_error="quarantine_sink"` would catch the violation via the executor's `except Exception:` block, route the row to the error sink, and continue. The Landscape would record a row-level FAILED state, the quarantine sink would accept the evidence, and the mis-annotation would survive to corrupt the next row. With the registration: the executor's `except TIER_1_ERRORS: raise` fires first, the `NodeStateGuard.__exit__` auto-completes the state as FAILED with the full structured context, and the exception propagates out of `execute_transform` so the orchestrator sees the crash.
 
+> **Correction 2026-08-21 (elspeth-181db83da7).** The paragraph above was
+> accurate about the PURPOSE of registration and wrong about the mechanism, in
+> a way that hid a live defect for months. The executor's `except Exception:`
+> block records FAILED and **re-raises**; it has never routed anything. Only
+> the `result.status == "error"` branch routes, and that branch is reached by a
+> transform RETURNING an error, never by one raising. So an unregistered
+> violation was not "absorbed by `on_error`" — it escaped every catch site and
+> aborted the run, with `on_error` never firing and the row counted as neither
+> succeeded nor failed. The routing this ADR describes now genuinely exists,
+> implemented in `RowProcessor._convert_contract_violation_to_error_result`.
+>
+> Two limits on the wording, for anyone citing this section as authority:
+> **(1)** the claim generalises only over the `PluginContractViolation`
+> hierarchy. `DeclarationContractViolation` is a SIBLING of it, not a child, so
+> non-registration there (e.g. `UnexpectedEmptyEmissionViolation`) does NOT
+> imply routing — those still abort. **(2)** it holds at the TRANSFORM seam
+> only. The sink and aggregation-flush seams record and re-raise regardless of
+> tier; whether `AggregationSettings.on_error` means anything is open.
+
 ### Audit-recording path
 
 `NodeStateGuard.__exit__` (L2 engine) now populates the new `ExecutionError.context` field (L0 contract) from `PluginContractViolation.to_audit_dict()` when the raised exception is a `PluginContractViolation` or subclass. The `isinstance` check is a Tier-2/Tier-1 boundary discriminator — not defensive programming — and it benefits every `PluginContractViolation` subclass that defines `to_audit_dict()`, not just the pass-through case. The full 9-key structured payload (transform, transform_node_id, run_id, row_id, token_id, static_contract, runtime_observed, divergence_set, exception_type) reaches the Landscape and is queryable via `json_extract(error_data, '$.context.<key>')`.

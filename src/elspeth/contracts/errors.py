@@ -1517,15 +1517,25 @@ class PluginContractViolation(AuditEvidenceBase, RuntimeError):
     """Raised when a plugin violates its contract with the framework.
 
     This indicates a bug in a plugin (Source, Transform, Gate, Sink) that must
-    be fixed. Unlike user data errors (which are quarantined), plugin bugs
-    MUST crash the pipeline per CLAUDE.md's "plugin bugs must crash" rule.
+    be fixed. It is nonetheless TIER 2 — a row-level failure, as the marker
+    above says. At the transform seam the engine ROUTES it through the node's
+    ``on_error`` destination and counts the row as failed, rather than aborting
+    the run (elspeth-181db83da7); registering a subclass in ``TIER_1_ERRORS`` is
+    what opts it back out of that, per ADR-008 §"TIER_1 registration is
+    load-bearing". Seams other than the transform executor — sinks, the
+    aggregation flush — still abort; that asymmetry is tracked, not designed.
+
+    This docstring previously read "plugin bugs MUST crash the pipeline per
+    CLAUDE.md's 'plugin bugs must crash' rule", citing a CLAUDE.md section that
+    no longer exists, and contradicted its own tier marker six lines above.
 
     Examples of conditions that trigger this:
     - Transform emits non-canonical data (NaN, Infinity, non-serializable types)
     - Plugin returns wrong type from method
     - Plugin violates interface contract
 
-    Recovery: Fix the plugin. These errors indicate bugs in plugin code.
+    Recovery: Fix the plugin. These errors indicate bugs in plugin code — a
+    routed row records the bug as evidence, it does not excuse it.
 
     Base class accepts a positional message, matching RuntimeError. Subclasses
     add structured fields and override to_audit_dict() to contribute them to
