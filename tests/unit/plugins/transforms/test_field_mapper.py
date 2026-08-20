@@ -1292,9 +1292,16 @@ class TestFieldMapperOriginalHeaderClassification:
     ``not source.isidentifier()`` as its proxy for "an original header resolved
     only at runtime". ``normalize_field_name`` LOWERCASES and keyword-suffixes,
     so every case-variant header ('B', 'Name', 'userID', 'class') is an
-    identifier that no row is keyed by — the proxy caught only the visibly
-    messy 'First Name' class. Four declarations consume the predicate, and each
-    one then described a field the transform does not emit.
+    identifier that a normalized header never yields — the proxy caught only
+    the visibly messy 'First Name' class. Four declarations consume the
+    predicate, and each one then described a field the transform does not emit.
+
+    The parametrize column reads ``names_a_row_key`` for symmetry with the
+    helper, but what it pins is "is a normalization fixed point". A row CAN be
+    keyed 'B' — headerless ``columns`` and a source's ``field_mapping`` values
+    are identifier-checked but never lowercased — so False here means "may not
+    name a row key", which is what makes abstention the only safe answer, not
+    "no row is keyed by this" (elspeth-bb470636d1).
     """
 
     @pytest.fixture
@@ -1449,3 +1456,217 @@ class TestFieldMapperOriginalHeaderClassification:
 
         assert FieldMapper._is_unresolved_original_source(source) is True
         assert transform.forwards_input_fields is False
+
+
+class TestFieldMapperOverlapNormalization:
+    """The overlap rule reads the row key ``process`` deletes (elspeth-bb470636d1).
+
+    ``_reject_overlapping_rename_graphs`` compared LITERAL config strings while
+    ``process`` deletes a renamed source by a key it picks at runtime, so a
+    case-variant source slipped a rename chain past construction and then lost
+    data exactly like the literal chain that is rejected.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        """Create minimal plugin context."""
+        return make_context()
+
+    @pytest.mark.parametrize(
+        ("literal_chain", "aliased_chain"),
+        [
+            ({"a": "b", "b": "c"}, {"a": "b", "B": "c"}),
+            ({"a": "b", "b": "c"}, {"A": "b", "b": "c"}),
+            ({"b": "c", "a": "b"}, {"b": "c", "a": "B"}),
+            ({"a": "b", "b": "a"}, {"a": "b", "B": "a"}),
+            ({"a": "class_", "class_": "c"}, {"a": "class_", "class": "c"}),
+            ({"a": "first_name", "first_name": "c"}, {"a": "first_name", "First Name": "c"}),
+        ],
+        ids=repr,
+    )
+    def test_an_aliased_chain_is_rejected_like_its_literal_twin(
+        self,
+        literal_chain: dict[str, str],
+        aliased_chain: dict[str, str],
+    ) -> None:
+        """Two chains that behave identically at runtime must be judged identically.
+
+        The aliased half is the defect: it reached ``process`` and deleted the
+        normalized key another entry had just written.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        for mapping in (literal_chain, aliased_chain):
+            with pytest.raises(PluginConfigError, match="overlapping rename"):
+                FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": mapping})
+
+    @pytest.mark.parametrize(
+        "mapping",
+        [
+            {"A": "a"},
+            {"Name": "name"},
+            {"First Name": "first_name"},
+            {"class": "class_"},
+            {"A": "a", "b": "c"},
+        ],
+        ids=repr,
+    )
+    def test_a_canonical_identity_mapping_is_not_an_overlap(self, mapping: dict[str, str]) -> None:
+        """An original header mapped onto its own row key is a no-op, not a chain.
+
+        ``process`` deletes the normalized key and writes the same value back
+        under the same name. Judging identity on the LITERAL strings would call
+        every one of these a rename onto a live source and reject a working
+        config at construction.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": mapping})
+
+        assert transform._mapping == mapping
+
+    @pytest.mark.parametrize(
+        "mapping",
+        [
+            {"meta.source": "a", "meta_source": "b"},
+            {"meta.source": "x", "y": "meta_source"},
+            {"a.b": "x", "y": "a_b"},
+        ],
+        ids=repr,
+    )
+    def test_a_dotted_source_is_not_normalized_into_a_false_overlap(self, mapping: dict[str, str]) -> None:
+        """A dotted source is a nested read, so it is keyed by its literal text.
+
+        ``normalize_field_name('meta.source')`` is ``'meta_source'``, so
+        canonicalising a dotted name would make the nested read answer to a
+        sibling's plain field name and reject a config ``process`` runs
+        correctly — the second case is the one that discriminates, since it puts
+        that invented key on the TARGET side where membership is tested.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": mapping})
+
+        assert transform._mapping == mapping
+
+    def test_a_dotted_source_still_overlaps_on_its_literal_target(self) -> None:
+        """The nested read writes a key a later entry then deletes — still a chain."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        with pytest.raises(PluginConfigError, match="overlapping rename"):
+            FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": {"meta.name": "x", "x": "y"}})
+
+    @pytest.mark.parametrize(
+        "mapping",
+        [
+            {"": "mapped", "kept": "moved"},
+            {"!!!": "mapped", "kept": "moved"},
+            {"   ": "mapped", "kept": "moved"},
+            {"!!!": "mapped", "a": "???"},
+            {"": "mapped", "a": "   "},
+        ],
+        ids=repr,
+    )
+    def test_a_key_that_normalizes_to_nothing_is_its_own_overlap_key(self, mapping: dict[str, str]) -> None:
+        """Such a literal names no field, so it can alias nothing and constructs.
+
+        It must also keep its OWN identity rather than collapsing onto a shared
+        empty key: the last two cases put an unnormalizable literal on the target
+        side, where a collapsed key would match an unrelated source and reject a
+        config that names no common field at all.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": mapping})
+
+        assert transform._mapping == mapping
+
+    @pytest.mark.parametrize(
+        "header",
+        ["name", "first_name", "field2", "B", "Name", "userID", "ID", "class", "First Name", "2fast"],
+        ids=repr,
+    )
+    def test_the_overlap_key_agrees_with_the_runtime_resolver(self, header: str) -> None:
+        """The key the rule compares is the key ``process`` asks the row for.
+
+        Cross-checked against ``SchemaContract.resolve_name`` rather than against
+        ``normalize_field_name`` again, so the assertion cannot restate the
+        implementation.
+        """
+        from elspeth.plugins.sources.field_normalization import normalize_field_name
+        from elspeth.plugins.transforms.field_mapper import _canonical_row_key
+
+        contract = SchemaContract(
+            mode="FLEXIBLE",
+            fields=(make_field(normalize_field_name(header), str, original_name=header, required=True, source="declared"),),
+            locked=True,
+        )
+
+        assert _canonical_row_key(header) == contract.resolve_name(header)
+
+    def test_a_non_canonical_target_colliding_with_a_source_is_rejected(self) -> None:
+        """A target is canonicalised too, and the over-rejection is deliberate.
+
+        ``{'a': 'B', 'b': 'c'}`` is measurably lossless — two keys in, two keys
+        out, in either order. It is rejected anyway because no contract exists at
+        construction to say whether the row keys that field under ``'B'`` or
+        under ``'b'``, and the ``'b'`` reading is ``{'a': 'B', 'B': 'c'}``, which
+        destroys a value through ``process``'s literal ``source in output``
+        branch. Fail closed.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        with pytest.raises(PluginConfigError, match="overlapping rename"):
+            FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": {"a": "B", "b": "c"}})
+
+    @pytest.mark.parametrize("mapping", [{"B": "b", "b": "y"}, {"b": "B", "B": "y"}], ids=repr)
+    def test_a_literal_source_that_is_itself_a_row_key_still_overlaps(self, mapping: dict[str, str]) -> None:
+        """A row can carry ``'B'`` and ``'b'`` as two DISTINCT keys, so this is a real chain.
+
+        A source's ``field_mapping`` values bypass ``normalize_field_name``
+        (``resolve_field_names`` validates them with ``isidentifier()`` alone)
+        and headerless ``columns`` are taken as already-clean identifiers, so
+        neither is ever lowercased. Judging ``{'B': 'b'}`` a canonical no-op
+        therefore waves through a two-field rename chain that destroys one value
+        — measured: ``{'B': '1', 'b': '2'}`` emits ``{'y': '2'}``, and the
+        reversed spelling emits ``{'y': '1'}`` from the same input. The LITERAL
+        comparison is what catches it, which is why canonicalising cannot
+        replace it.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        with pytest.raises(PluginConfigError, match="overlapping rename"):
+            FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": mapping})
+
+    def test_an_accepted_canonical_identity_is_safe_at_runtime(self, ctx: PluginContext) -> None:
+        """The relief this rule grants must be exercised, not merely constructed.
+
+        ``{'A': 'a'}`` is accepted because ``process`` deletes the normalized key
+        and writes the same value straight back. Asserting only that the config
+        constructs would pin the EXISTENCE of the relief and say nothing about
+        its safety, so run the row through and check arity and values.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": {"A": "a"}})
+        row = PipelineRow(
+            {"a": "charlie", "z": "delta"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(
+                    make_field("a", str, original_name="A", required=False, source="inferred"),
+                    make_field("z", str, original_name="z", required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert result.row.to_dict() == {"a": "charlie", "z": "delta"}

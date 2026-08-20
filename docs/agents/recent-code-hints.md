@@ -8,6 +8,53 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-21 — a config-time name comparison must compare CANONICAL ROW KEYS,
+  not config literals** (landed with elspeth-bb470636d1). The companion to the
+  fixed-point entry below: that one fixed `field_mapper`'s GUARD, this one its
+  config VALIDATOR, and either alone leaves the other's shape reachable.
+  `_reject_overlapping_rename_graphs` rejected rename chains with
+  `target in set(self.mapping)` — literal strings — while `process` deletes the
+  renamed source by a key it picks at RUNTIME (the literal when it is already in
+  the output dict, else `contract.resolve_name(source)`) and writes
+  `output[target]` under the LITERAL target. So `{"a":"b","b":"c"}` was rejected
+  while `{"a":"b","B":"c"}` was ACCEPTED and then destroyed the same value.
+  The key is `_canonical_row_key`: `normalize_field_name`, except that a DOTTED
+  name (a nested read, never a row key) and a name that normalizes to nothing
+  (`ExternalHeaderError` — it names no field, so it can alias nothing) are keyed
+  by themselves. Two traps:
+  - The canonical key ADDS a rejection limb; it must NOT replace the literal
+    one, and canonicalising the identity guard on its own is a REGRESSION that a
+    green suite will not show you. A row can carry `'B'` and `'b'` as two
+    DISTINCT keys — a source's `field_mapping` values bypass
+    `normalize_field_name` (`resolve_field_names` validates them with
+    `isidentifier()` alone) and headerless `columns` are taken as already-clean
+    identifiers, so neither is ever lowercased. So "a row key is always a
+    normalization fixed point" is FALSE, `{"B": "b"}` can be a real rename of a
+    real distinct field, and a canonical identity guard waves
+    `{"B": "b", "b": "y"}` through to destroy one value (measured: `{'B':'1',
+    'b':'2'}` emits `{'y':'2'}`; the reversed spelling emits `{'y':'1'}`). Reject
+    on EITHER limb. Conversely the canonical limb needs a CANONICAL identity
+    guard, or `{"A": "a"}` — a verified no-op — is newly rejected at build time.
+  - Pin the ACCEPTED shapes by running `process()`, not by asserting the config
+    constructed. `assert transform._mapping == mapping` pins the EXISTENCE of a
+    relief and says nothing about its safety; that gap is exactly what let the
+    identity-guard regression above pass 125 green tests.
+  - A "no false overlap" test only DISCRIMINATES when the invented key lands on
+    the TARGET side, because membership is tested on targets.
+    `{"meta.source": "a", "meta_source": "b"}` passes with OR without the
+    dotted-name branch and proves nothing; `{"meta.source": "x", "y": "meta_source"}`
+    is the shape that fails. Same for the unnormalizable branch: put the odd
+    literal on the target (`{"!!!": "mapped", "a": "???"}`). Mutation-test every
+    branch of the key function AND every limb of the rule that calls it — two
+    branches survived the first mutation round here, and the identity-guard
+    regression was caught only by an adversarial reviewer, not by any mutation
+    of the code as written.
+  The class is NARROWED, not closed: `resolve_name` is an `original_name` index
+  lookup, not a call to `normalize_field_name`, so a source whose `field_mapping`
+  moves a header off its normalized form (`{"Weird Header": "b"}`) still resolves
+  to a key no config literal predicts, and no contract exists at construction to
+  ask.
+
 - **2026-08-21 — a caught exception's TIER is the discriminator, and the cheapest
   way to say so is a NARROWED PARAMETER TYPE** (landed with
   elspeth-181db83da7). Four traps:

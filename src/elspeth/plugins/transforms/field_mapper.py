@@ -31,14 +31,23 @@ from elspeth.plugins.sources.field_normalization import ExternalHeaderError, nor
 def _names_a_row_key(name: str) -> bool:
     """Whether ``name`` is the key a row actually carries that field under.
 
-    Sources derive a row key from the original header with
-    ``normalize_field_name``, so the literals that name a row key directly are
-    exactly that function's FIXED POINTS. ``str.isidentifier`` is not that
-    test and was the defect (elspeth-f262a8c678): normalization also
-    LOWERCASES and keyword-suffixes, so ``'B'``, ``'Name'``, ``'userID'`` and
-    ``'class'`` are all identifiers that no row is ever keyed by — they reach
-    ``process`` only through ``contract.resolve_name``, exactly like
-    ``'First Name'``.
+    A header-reading source derives a row key with ``normalize_field_name``, so
+    the literals that reliably name a row key are that function's FIXED POINTS.
+    ``str.isidentifier`` is not that test and was the defect
+    (elspeth-f262a8c678): normalization also LOWERCASES and keyword-suffixes,
+    so ``'B'``, ``'Name'``, ``'userID'`` and ``'class'`` are identifiers that a
+    normalized header never yields — they reach ``process`` through
+    ``contract.resolve_name``, exactly like ``'First Name'``.
+
+    This is a MAY-NOT predicate, not a proof of absence, and the name overstates
+    it. A non-fixed-point CAN be a row key in its own right: headerless
+    ``columns`` are used as authored and a source's ``field_mapping`` values are
+    identifier-checked but never lowercased (``resolve_field_names``), so a row
+    really can carry ``'B'``. Construction cannot tell the two readings apart,
+    so a non-fixed-point is treated as unnameable and the declaration ABSTAINS —
+    safe under either reading, which a positive claim would not be.
+    ``_canonical_row_key`` fails closed on the same ambiguity for the overlap
+    rule (elspeth-bb470636d1).
 
     A literal that normalizes to nothing names no field at all: the source
     boundary rejects such a header, so no contract can carry one. That mirrors
@@ -51,6 +60,64 @@ def _names_a_row_key(name: str) -> bool:
         return normalize_field_name(name) == name
     except ExternalHeaderError:
         return False
+
+
+def _canonical_row_key(name: str) -> str:
+    """The row key a mapping literal collapses to when ``process`` uses it.
+
+    Config validation and ``process`` name fields in two different spaces, and
+    that disagreement was the defect (elspeth-bb470636d1). ``process`` starts
+    from ``row.to_dict()``, whose keys are the NORMALIZED names, then deletes a
+    renamed source by whichever of two keys the row answers to — the literal
+    when it is already in the output dict, else ``contract.resolve_name`` —
+    while writing ``output[target]`` under the LITERAL target. Comparing config
+    literals therefore cannot see that ``'B'`` and ``'b'`` are one field.
+
+    This key ADDS a rejection limb; it does not replace the literal one, and
+    canonicalising the identity guard alone would be a REGRESSION. A row can
+    carry ``'B'`` and ``'b'`` as two distinct keys: a source's ``field_mapping``
+    values bypass ``normalize_field_name`` (``resolve_field_names`` validates
+    them with ``isidentifier()`` only) and headerless ``columns`` are taken as
+    already-clean identifiers. So a literal ``'B'`` source may name a row key in
+    its own right, and ``{'B': 'b', 'b': 'y'}`` is a real two-field rename chain
+    that destroys one value — a canonical identity guard would wave it through
+    as a no-op. Reject on EITHER limb: literals as before, canonical keys as
+    well.
+
+    The canonical limb rejects a non-canonical target that collides with another
+    source's key (``{'a': 'B', 'b': 'c'}``) even though that shape is MEASURABLY
+    lossless — two keys in, two keys out, in either order. It has to: with no
+    contract at construction there is no way to know whether the row keys that
+    field under ``'B'`` or under ``'b'``, and the ``'b'`` reading is
+    ``{'a': 'B', 'B': 'c'}``, which does destroy a value. Fail closed.
+
+    Two literals are keyed by themselves rather than normalized. A DOTTED name
+    is a nested read, never a row key, and ``normalize_field_name`` would fold
+    its dot into an underscore and invent an overlap with an unrelated sibling.
+    A name that normalizes to nothing raises ``ExternalHeaderError`` and names
+    no field at all, so it can alias nothing; answering that error the way
+    ``_names_a_row_key`` does keeps a bad mapping key raising the same class it
+    always has, and returning the literal keeps two such keys distinct. The two
+    helpers differ only in their error branch, and must: ``_names_a_row_key``
+    asks whether a literal IS a row key, so an unnormalizable name is False,
+    while this asks which key it stands for, which is itself.
+
+    LIMIT — this narrows the class, it does not close it. ``resolve_name`` is an
+    ``original_name`` index lookup, not a call to ``normalize_field_name``, so a
+    source whose ``field_mapping`` renames a header off its normalized form
+    still resolves to a key no config literal predicts — raw header
+    ``'Weird Header'`` under ``field_mapping: {'weird_header': 'b'}`` yields the
+    row key ``'b'`` (``field_mapping`` is keyed by the EFFECTIVE name, not the
+    raw one), while ``normalize_field_name('Weird Header')`` is
+    ``'weird_header'``. Only a contract present at construction could see that,
+    and none is.
+    """
+    if "." in name:
+        return name
+    try:
+        return normalize_field_name(name)
+    except ExternalHeaderError:
+        return name
 
 
 class FieldMapperConfig(TransformDataConfig):
@@ -107,23 +174,39 @@ class FieldMapperConfig(TransformDataConfig):
         target fields to carry metadata from a different source while also
         existing as source fields themselves, which is ambiguous without a more
         expressive contract model.
+
+        Rejects on EITHER of two readings of the mapping, because ``process``
+        picks between exactly those two names when it deletes a renamed source:
+        the config LITERALS, and the ``_canonical_row_key`` values. The literal
+        limb is the one that has always been here — a literal like ``'B'`` can be
+        a row key in its own right, so it must keep being compared as written.
+        The canonical limb is what makes ``{'a': 'b', 'B': 'c'}`` the same rename
+        chain as ``{'a': 'b', 'b': 'c'}``, rejected identically, when ``'B'``
+        resolves to ``'b'`` instead (elspeth-bb470636d1).
         """
         if not self.mapping:
             return self
 
         sources = set(self.mapping)
+        source_keys = {_canonical_row_key(source) for source in self.mapping}
         overlaps: dict[str, list[str]] = {}
         for source, target in self.mapping.items():
-            if source != target and target in sources:
-                if target not in overlaps:
-                    overlaps[target] = []
-                overlaps[target].append(source)
+            target_key = _canonical_row_key(target)
+            literal_overlap = source != target and target in sources
+            canonical_overlap = _canonical_row_key(source) != target_key and target_key in source_keys
+            if literal_overlap or canonical_overlap:
+                described = target if literal_overlap or target_key == target else f"{target} (row key {target_key!r})"
+                if described not in overlaps:
+                    overlaps[described] = []
+                overlaps[described].append(source)
 
         if overlaps:
             details = ", ".join(f"{target!r} is both target for {srcs} and source" for target, srcs in sorted(overlaps.items()))
             raise ValueError(
                 "Mapping contains an overlapping rename graph: "
-                f"{details}. Targets that are also sources are order-dependent and can cause silent data loss."
+                f"{details}. Targets that are also sources are order-dependent and can cause silent data loss. "
+                "Names are compared both as written and as the row keys they normalize to, so a source and a target "
+                "that normalize alike — a case variant, a keyword, a digit-prefixed header — count as one name."
             )
 
         return self
@@ -144,7 +227,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:64e9a4a54e36e825"
+    source_file_hash: str | None = "sha256:06d6c7747f672853"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
