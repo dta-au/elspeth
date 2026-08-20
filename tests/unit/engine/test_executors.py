@@ -749,13 +749,19 @@ class TestTransformExecutor:
 
         transform.process.assert_not_called()
 
-    def test_input_validation_contract_violation_records_terminal_token_outcome(self) -> None:
-        """Input-validation crashes must leave a FAILED terminal outcome (elspeth-82d4c5146c).
+    def test_input_validation_contract_violation_leaves_the_outcome_to_the_router(self) -> None:
+        """A Tier-2 input-validation failure is the ROUTER's token to terminalize.
 
-        The run still crashes — PluginContractViolation propagates — but the
-        audit trail must describe the token's fate. Without this recording the
-        run accounting reports failed=0, pending=1, closure='open' for a token
-        that provably failed.
+        The violation still propagates out of the executor, but it no longer
+        ends the run: ``RowProcessor._convert_contract_violation_to_error_result``
+        converts it into a routable transform error, and the token's single
+        ``token_outcomes`` row is written wherever ``on_error`` sends it
+        (elspeth-181db83da7). The executor pre-recorded FAILURE/UNROUTED here
+        while the violation was still terminal (elspeth-82d4c5146c); doing so
+        now is a second write for the same token, which the audit store
+        rejects. Tier-1 violations DO still crash and still record — see
+        ``test_declared_input_fields_violation_precedes_generic_input_validation``
+        directly below, which is the paired control.
         """
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
@@ -773,12 +779,7 @@ class TestTransformExecutor:
         with pytest.raises(PluginContractViolation, match="input validation failed"):
             executor.execute_transform(transform, token, ctx)
 
-        factory.data_flow.record_token_outcome.assert_called_once()
-        kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
-        assert kwargs["ref"].token_id == "tok_input_violation"
-        assert kwargs["outcome"] == TerminalOutcome.FAILURE
-        assert kwargs["path"] == TerminalPath.UNROUTED
-        assert kwargs["context"]["exception_type"] == "PluginContractViolation"
+        factory.data_flow.record_token_outcome.assert_not_called()
 
     def test_declared_input_fields_violation_precedes_generic_input_validation(self) -> None:
         """Missing declared fields surface as ADR-013 violations before schema validation."""
@@ -1027,10 +1028,10 @@ class TestTransformExecutor:
         assert kwargs["state_id"] == "state_001"
         assert kwargs["error"].exception_type == "PluginContractViolation"
 
-        factory.data_flow.record_token_outcome.assert_called_once()
-        outcome_kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
-        assert outcome_kwargs["outcome"] == TerminalOutcome.FAILURE
-        assert outcome_kwargs["path"] == TerminalPath.UNROUTED
+        # The node state is the executor's to fail; the TOKEN outcome is not.
+        # This Tier-2 violation reaches the transform's on_error, so the
+        # routing path writes its single terminal row (elspeth-181db83da7).
+        factory.data_flow.record_token_outcome.assert_not_called()
 
     def test_output_schema_validation_rejects_coercible_wrong_runtime_type_before_completed(self) -> None:
         """Transform output validation must reject coercible schema-wrong values before audit completion."""
@@ -1376,8 +1377,12 @@ class TestTransformExecutor:
         """Transform with declared_output_fields that collide with input raises PluginContractViolation.
 
         The executor checks declared_output_fields against input row keys BEFORE
-        calling transform.process(). Collisions crash the pipeline (not graceful error)
-        because field collision is a pipeline configuration bug, not a data issue.
+        calling transform.process(), so no provider call is wasted on a row that
+        cannot be emitted. The violation is Tier 2: it propagates out of the
+        executor, but the collision is a per-row fact and the processor routes
+        it through the transform's on_error rather than aborting the run
+        (elspeth-181db83da7). The terminal token_outcome therefore belongs to
+        the routing path, not here.
         """
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
@@ -1391,14 +1396,8 @@ class TestTransformExecutor:
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
             executor.execute_transform(transform, token, ctx)
 
-        factory.data_flow.record_token_outcome.assert_called_once()
-        kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
-        # The outcome must be attributed to the token that actually failed: an
-        # outcome recorded against the wrong token reports a phantom failure
-        # AND leaves the real one pending, which outcome/path alone cannot catch.
-        assert kwargs["ref"].token_id == "tok_collision"
-        assert kwargs["outcome"] == TerminalOutcome.FAILURE
-        assert kwargs["path"] == TerminalPath.UNROUTED
+        transform.process.assert_not_called()
+        factory.data_flow.record_token_outcome.assert_not_called()
 
     def test_empty_declared_output_fields_skips_collision_check(self) -> None:
         """Transform with empty declared_output_fields passes through without collision check.
@@ -1716,7 +1715,12 @@ class TestTransformExecutor:
     # --- Invariant guard tests (elspeth-8c9b58a679) ---
 
     def test_on_start_not_called_raises_plugin_contract_violation(self) -> None:
-        """Lifecycle guard: executing a transform before on_start() raises PluginContractViolation."""
+        """Lifecycle guard: executing a transform before on_start() raises PluginContractViolation.
+
+        Tier 2, so the executor raises but records no terminal token outcome —
+        the processor routes the violation through on_error and the routing
+        path owns the token's fate (elspeth-181db83da7).
+        """
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
         transform = _make_transform()
@@ -1727,13 +1731,7 @@ class TestTransformExecutor:
         with pytest.raises(PluginContractViolation, match="before on_start"):
             executor.execute_transform(transform, token, ctx)
 
-        factory.data_flow.record_token_outcome.assert_called_once()
-        kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
-        # See the collision test above: outcome/path alone cannot detect an
-        # outcome recorded against the wrong token.
-        assert kwargs["ref"].token_id == "tok_lifecycle"
-        assert kwargs["outcome"] == TerminalOutcome.FAILURE
-        assert kwargs["path"] == TerminalPath.UNROUTED
+        factory.data_flow.record_token_outcome.assert_not_called()
 
     def test_on_error_none_raises_orchestration_invariant_error(self) -> None:
         """on_error=None invariant: last-line defense if config layer regresses."""
@@ -4989,17 +4987,13 @@ class TestTransformExecutorTerminality:
         assert kwargs["status"] == NodeStateStatus.FAILED
         assert kwargs["error"].phase == "transform_execution"
 
-        # ...and the token's fate must be recorded, not just its node state
-        # (elspeth-82d4c5146c): a FAILED node_state with no terminal outcome is
-        # exactly the "a token state is plainly failed but tokens.failed=0"
-        # contradiction. Unlike an aggregation flush, a row-level transform
-        # violation is not retryable by journal resume — the row's fate is
-        # decided here, so a terminal record is the honest one.
-        factory.data_flow.record_token_outcome.assert_called_once()
-        outcome_kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
-        assert outcome_kwargs["ref"].token_id == token.token_id
-        assert outcome_kwargs["outcome"] == TerminalOutcome.FAILURE
-        assert outcome_kwargs["path"] == TerminalPath.UNROUTED
+        # ...while the token's fate is decided one layer up. A canonicalization
+        # violation is Tier 2, so the processor converts it into a routable
+        # transform error and the on_error destination writes the token's single
+        # terminal outcome (elspeth-181db83da7). Recording FAILURE/UNROUTED here
+        # as well — which is what elspeth-82d4c5146c added while the violation
+        # still aborted the run — is a duplicate the audit store rejects.
+        factory.data_flow.record_token_outcome.assert_not_called()
 
     def test_contract_evolution_failure_marks_state_failed(self) -> None:
         """Contract evolution failure → state FAILED, not COMPLETED-then-crash.

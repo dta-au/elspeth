@@ -48,6 +48,8 @@ from elspeth.contracts.errors import (
     FrameworkBugError,
     MaxRetriesExceeded,
     OrchestrationInvariantError,
+    PluginContractViolation,
+    SinkTransactionalInvariantError,
     SourceGuaranteedFieldsViolation,
 )
 from elspeth.contracts.results import FailureInfo, GateResult
@@ -7076,6 +7078,94 @@ class TestExecuteTransformNoRetry:
         record_event.assert_called_once()
         assert record_event.call_args.kwargs["state_id"] == "state-attempt-0"
 
+    def test_tier_2_contract_violation_returns_row_scoped_error(self) -> None:
+        """A Tier-2 PluginContractViolation is routed, not propagated.
+
+        Regression for elspeth-181db83da7. ADR-008 §"TIER_1 registration is
+        load-bearing" states the registration is what stops ``on_error`` from
+        absorbing a violation — so the deliberately UNREGISTERED base class
+        must reach ``on_error``. It used to escape every conversion clause
+        here and abort the whole run with a raw traceback, leaving the row
+        uncounted and the error sink unwritten.
+        """
+        _, _factory, processor = self._setup()
+        transform = _make_mock_transform(node_id="t1", on_error="discard")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+
+        violation = PluginContractViolation("transform emitted a colliding field")
+        stamp_node_state_id(violation, "state-123")
+        with patch.object(
+            processor._transform_executor,
+            "execute_transform",
+            side_effect=violation,
+        ):
+            result, _out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert error_sink == "discard"
+        assert result.reason is not None
+        assert result.reason["reason"] == "contract_violation"
+
+    def test_tier_2_contract_violation_reaches_named_error_sink(self) -> None:
+        """The routed violation diverts to the configured sink, not to discard."""
+        _, factory, processor = self._setup()
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+
+        transform = _make_mock_transform(node_id="t1", on_error="quarantine")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context(state_id="stale-previous-state")
+
+        violation = PluginContractViolation("input validation failed")
+        stamp_node_state_id(violation, "state-attempt-0")
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=violation),
+            patch.object(factory.execution, "record_routing_event") as record_event,
+        ):
+            result, _out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
+        assert result.status == "error"
+        assert error_sink == "quarantine"
+        record_event.assert_called_once()
+        assert record_event.call_args.kwargs["state_id"] == "state-attempt-0"
+
+    def test_tier_1_contract_violation_subclass_still_propagates(self) -> None:
+        """The Tier-1 registration must survive the Tier-2 conversion clause.
+
+        ``SinkTransactionalInvariantError`` inherits ``PluginContractViolation``
+        but is ``@tier_1_error``-registered precisely so it "must crash, never
+        be absorbed by on_error". A conversion keyed on the class rather than
+        on tier membership would route it to a quarantine sink — the exact
+        failure ADR-008 says the registry exists to prevent.
+        """
+        _, _factory, processor = self._setup()
+        transform = _make_mock_transform(node_id="t1", on_error="quarantine")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+
+        with (
+            patch.object(
+                processor._transform_executor,
+                "execute_transform",
+                side_effect=SinkTransactionalInvariantError("commit boundary diverged"),
+            ),
+            pytest.raises(SinkTransactionalInvariantError),
+        ):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
 
 # =============================================================================
 # _execute_transform_with_retry: With retry manager
@@ -7648,6 +7738,90 @@ class TestExecuteTransformWithRetry:
         error = json.loads(states[0].error_json)
         assert error["type"] == "RuntimeError"
         assert error["phase"] == "retry_pre_attempt_shutdown"
+
+    def test_tier_2_contract_violation_is_routed_without_retrying(self) -> None:
+        """The RetryManager branch needs the same Tier-2 conversion.
+
+        Regression for elspeth-181db83da7. ``is_retryable`` rejects a
+        PluginContractViolation, so tenacity re-raises the ORIGINAL exception
+        rather than wrapping it in MaxRetriesExceeded — it slipped past both
+        clauses guarding this call and aborted the run. A contract violation
+        is deterministic, so it must be converted after exactly one attempt.
+        """
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=3,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error="quarantine")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+        attempts: list[int] = []
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempts.append(kwargs["attempt"])
+            violation = PluginContractViolation("would overwrite existing input fields {'notes'}")
+            stamp_node_state_id(violation, f"state-attempt-{kwargs['attempt']}")
+            raise violation
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            patch.object(factory.execution, "record_routing_event") as record_event,
+        ):
+            result, _out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
+        assert attempts == [0], "a deterministic contract violation must not be retried"
+        assert result.status == "error"
+        assert result.retryable is False
+        assert error_sink == "quarantine"
+        record_event.assert_called_once()
+        assert record_event.call_args.kwargs["state_id"] == "state-attempt-0"
+
+    def test_tier_1_contract_violation_subclass_still_propagates_with_retry(self) -> None:
+        """Tier-1 registration outranks the Tier-2 conversion on this branch too."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        transform = _make_mock_transform(node_id="t1", on_error="quarantine")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+
+        with (
+            patch.object(
+                processor._transform_executor,
+                "execute_transform",
+                side_effect=SinkTransactionalInvariantError("commit boundary diverged"),
+            ),
+            pytest.raises(SinkTransactionalInvariantError),
+        ):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
 
 
 # =============================================================================

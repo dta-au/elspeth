@@ -123,12 +123,17 @@ def _build_retry_exhaustion_pipeline(
     *,
     on_error: str,
     error_sink: CollectSink | None = None,
-) -> tuple[ListSource, AlwaysFailTransform, dict[str, CollectSink], ExecutionGraph, ElspethSettings, PipelineConfig]:
-    """Build the production graph/config pair for retry-exhaustion routing."""
+    transform: BaseTransform | None = None,
+) -> tuple[ListSource, Any, dict[str, CollectSink], ExecutionGraph, ElspethSettings, PipelineConfig]:
+    """Build the production graph/config pair for retry-exhaustion routing.
+
+    ``transform`` swaps in a different failing transform on the same wiring;
+    it defaults to the retryable ``AlwaysFailTransform``.
+    """
     source_name = "retry_source"
     source_connection = "retry_source_out"
     source = ListSource([{"id": 7, "amount": "250.00"}], name="retry_source_plugin", on_success=source_connection)
-    transform = AlwaysFailTransform({})
+    transform = transform if transform is not None else AlwaysFailTransform({})
     transform.on_success = "output"
     transform.on_error = on_error
     transform_settings = TransformSettings(
@@ -223,6 +228,96 @@ def test_retry_exhaustion_routes_original_row_once_with_linked_audit_evidence(tm
         "error": "Permanent failure attempt 2",
         "attempts": 2,
     }
+
+
+class CollidingOutputTransform(BaseTransform):
+    """Transform whose declared output field is already present on the row.
+
+    The executor's preflight rejects the collision before ``process()`` runs,
+    raising a bare (Tier-2) ``PluginContractViolation``.
+    """
+
+    name = "colliding_output_transform"
+    determinism = Determinism.DETERMINISTIC
+    input_schema = PluginSchema
+    output_schema = PluginSchema
+    plugin_version = "1.0.0"
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        from elspeth.contracts.schema import SchemaConfig
+
+        super().__init__({"schema": {"mode": "observed"}, **config})
+        self.declared_output_fields = frozenset({"amount"})
+        self._output_schema_config = self._build_output_schema_config(SchemaConfig(mode="observed"))
+        self.process_count = 0
+
+    def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
+        self.process_count += 1
+        return TransformResult.success(row, success_reason={"action": "never reached"})
+
+
+def test_tier_2_contract_violation_routes_to_named_error_sink(tmp_path: Any) -> None:
+    """The operator-visible half of elspeth-181db83da7, end to end.
+
+    A field collision detected in preflight used to raise past every catch
+    site: the run aborted with a raw traceback, ``on_error`` never fired, and
+    the row was reported as neither succeeded nor failed. All three symptoms
+    are asserted here — the row reaches its configured sink, the run reports it
+    as failed, and ``Orchestrator.run`` returns a result instead of raising.
+
+    Retry is configured (``max_attempts=2``) deliberately: a contract violation
+    is deterministic in the row, so it must be converted after ONE attempt
+    rather than burning the retry budget on an outcome that cannot change.
+    """
+    db = make_landscape_db()
+    payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+    _source, transform, sinks, graph, settings, config = _build_retry_exhaustion_pipeline(
+        on_error="quarantine",
+        transform=CollidingOutputTransform({}),
+    )
+
+    result = Orchestrator(db).run(
+        config,
+        graph=graph,
+        settings=settings,
+        payload_store=payload_store,
+        openrouter_catalog_sha256="0" * 64,
+        openrouter_catalog_source="bundled",
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.rows_processed == 1
+    assert result.rows_failed == 1
+    assert transform.process_count == 0, "preflight must reject before the plugin body runs"
+    assert sinks["output"].results == []
+    assert sinks["quarantine"].results == [{"id": 7, "amount": "250.00"}]
+
+    with db.engine.connect() as conn:
+        [outcome] = conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.run_id == result.run_id)).all()
+        states = conn.execute(
+            select(node_states_table)
+            .where(node_states_table.c.run_id == result.run_id)
+            .where(node_states_table.c.node_id == transform.node_id)
+            .order_by(node_states_table.c.attempt)
+        ).all()
+        [transform_error] = conn.execute(select(transform_errors_table).where(transform_errors_table.c.run_id == result.run_id)).all()
+        [routing_event] = conn.execute(select(routing_events_table).where(routing_events_table.c.run_id == result.run_id)).all()
+
+    assert (outcome.outcome, outcome.path, outcome.sink_name, outcome.completed) == (
+        TerminalOutcome.FAILURE.value,
+        TerminalPath.ON_ERROR_ROUTED.value,
+        "quarantine",
+        1,
+    )
+    assert [state.attempt for state in states] == [0], "a deterministic violation must not be retried"
+    assert [state.status for state in states] == ["failed"]
+    assert routing_event.state_id == states[-1].state_id
+    assert routing_event.mode == "divert"
+    assert transform_error.token_id == outcome.token_id
+    assert transform_error.destination == "quarantine"
+    error_details = json.loads(transform_error.error_details_json)
+    assert error_details["reason"] == "contract_violation"
+    assert "would overwrite existing input fields" in error_details["error"]
 
 
 def test_retry_exhaustion_discard_preserves_audited_discard_semantics(tmp_path: Any) -> None:

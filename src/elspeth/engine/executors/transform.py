@@ -225,21 +225,44 @@ class TransformExecutor:
         transform: TransformProtocol,
         token: TokenInfo,
         run_id: str,
-        violation: (
-            DeclarationContractViolation
-            | AggregateDeclarationContractViolation
-            | PassThroughContractViolation
-            | ZeroEmissionSuccessContractViolation
-            | PluginContractViolation
-        ),
+        violation: DeclarationContractViolation | AggregateDeclarationContractViolation,
     ) -> None:
-        """Persist the matching FAILED token_outcome for contract-violation failures.
+        """Persist the matching FAILED token_outcome for a run-ending violation.
 
-        Covers both the declaration-contract hierarchy and the bare
-        ``PluginContractViolation`` raised by schema validation and the
-        lifecycle/collision guards (elspeth-82d4c5146c): the run still
-        crashes, but the token's fate must be described in token_outcomes or
-        run accounting reports a pending token on a finished run.
+        The declaration-contract hierarchy is Tier 1 (elspeth-82d4c5146c): the
+        run crashes, so nothing downstream will ever describe the token's fate
+        and run accounting would otherwise report a pending token on a finished
+        run. This method writes that missing terminal record.
+
+        THE PARAMETER TYPE IS THE GATE, and the question it answers is "does
+        this violation END THE RUN?" — not "is it Tier 1?". The two are close
+        but not the same, so do not simplify this to a tier test.
+
+        What must NOT reach here is a violation that gets ROUTED.
+        ``RowProcessor._convert_contract_violation_to_error_result`` converts
+        every non-Tier-1 ``PluginContractViolation`` into a routable transform
+        error, the token continues to the transform's ``on_error`` destination,
+        and the routing path that terminalizes it there owns its single
+        ``token_outcomes`` row. Pre-recording FAILURE/UNROUTED as well is a
+        second write for the same token, which the partial unique index on
+        ``token_outcomes`` rejects (elspeth-181db83da7).
+
+        The annotation admits ``UnexpectedEmptyEmissionViolation``, which is
+        Tier 2 — and that is CORRECT, because nothing routes it:
+        ``DeclarationContractViolation`` is a SIBLING of
+        ``PluginContractViolation`` (both descend from ``AuditEvidenceBase``,
+        neither from the other), so the processor's clause never matches it and
+        it still aborts the run. It therefore still needs the record. If
+        elspeth-409ba268c6 makes that class routable, this annotation must
+        narrow with it.
+
+        Narrowing the annotation rather than testing at runtime keeps the rule
+        where a reader and mypy both meet it — at the call site. The five sites
+        raising a bare ``PluginContractViolation`` simply do not call this, and
+        the post-emission handler splits its ``except`` so the routable Tier-2
+        ``ZeroEmissionSuccessContractViolation`` takes the same no-record path.
+        ``PassThroughContractViolation`` is admitted through its
+        ``DeclarationContractViolation`` base.
         """
         if self._data_flow is None:
             raise OrchestrationInvariantError(
@@ -340,12 +363,6 @@ class TransformExecutor:
                 f"This is an engine lifecycle bug — on_start() must be called "
                 f"before any process() invocation."
             )
-            self._record_terminal_contract_failure(
-                transform=transform,
-                token=token,
-                run_id=run_id,
-                violation=lifecycle_violation,
-            )
             raise lifecycle_violation
 
         # --- FIELD COLLISION ENFORCEMENT (pre-execution) ---
@@ -365,12 +382,6 @@ class TransformExecutor:
                     f"Transform '{transform.name}' would overwrite existing input fields "
                     f"{collisions}. This is a pipeline configuration error — the transform's "
                     f"output fields collide with fields already present in the row."
-                )
-                self._record_terminal_contract_failure(
-                    transform=transform,
-                    token=token,
-                    run_id=run_id,
-                    violation=collision_violation,
                 )
                 raise collision_violation
 
@@ -416,12 +427,6 @@ class TransformExecutor:
         except ValidationError as e:
             input_violation = PluginContractViolation(
                 f"Transform '{transform.name}' input validation failed: {e}. This indicates an upstream transform/source schema bug."
-            )
-            self._record_terminal_contract_failure(
-                transform=transform,
-                token=token,
-                run_id=run_id,
-                violation=input_violation,
             )
             raise input_violation from e
 
@@ -529,11 +534,14 @@ class TransformExecutor:
                     used_success_empty=used_success_empty,
                 ),
             )
+        except ZeroEmissionSuccessContractViolation:
+            # Tier 2: routed by the processor, so the on_error destination —
+            # not this executor — writes the token's terminal outcome.
+            raise
         except (
             DeclarationContractViolation,
             AggregateDeclarationContractViolation,
             PassThroughContractViolation,
-            ZeroEmissionSuccessContractViolation,
         ) as violation:
             self._record_terminal_contract_failure(
                 transform=transform,
@@ -550,12 +558,6 @@ class TransformExecutor:
                 output_violation = PluginContractViolation(
                     f"Transform '{transform.name}' output validation failed for emitted row {idx}: {e}. "
                     "This indicates a transform schema bug."
-                )
-                self._record_terminal_contract_failure(
-                    transform=transform,
-                    token=token,
-                    run_id=run_id,
-                    violation=output_violation,
                 )
                 raise output_violation from e
 
@@ -594,12 +596,6 @@ class TransformExecutor:
                 f"Transform '{transform.name}' emitted non-canonical data: {e}. "
                 f"Ensure output contains only JSON-serializable types. "
                 f"Use None instead of NaN for missing values."
-            )
-            self._record_terminal_contract_failure(
-                transform=transform,
-                token=token,
-                run_id=run_id,
-                violation=canonicalization_violation,
             )
             raise canonicalization_violation from e
         result.duration_ms = duration_ms

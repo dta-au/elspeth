@@ -1,10 +1,18 @@
 """Terminal token outcomes for schema-validation contract violations (elspeth-82d4c5146c).
 
-A bare PluginContractViolation raised by input-schema validation crashes the
-run — that is correct and stays. But the audit trail must still describe the
-token's fate: without a terminal outcome the run accounting reports a pending
-token on a finished run (failed=0, closure='open'), a contradiction the audit
-evidence should never contain.
+Every token must reach exactly one terminal outcome. Without one, run
+accounting reports a pending token on a finished run (failed=0,
+closure='open'); with two, the audit store rejects the second write. Both are
+contradictions the audit evidence should never contain.
+
+WHO writes that outcome moved with elspeth-181db83da7 and now follows the tier
+of the violation. A bare ``PluginContractViolation`` is Tier 2, so the
+processor converts it into a routable transform error and the ``on_error``
+destination terminalizes the token — the run finishes rather than crashing, and
+the executor records nothing. A Tier-1 subclass (the declaration-contract
+hierarchy) still crashes the run, so the executor still records FAILURE/UNROUTED
+itself. Sink-boundary violations are a separate surface and keep the crashing
+shape. The tests below are split along exactly that line.
 
 SCOPE BOUNDARY, learned the hard way: this applies to ROW-LEVEL violations,
 whose fate is decided where they raise. It does NOT extend to the aggregation
@@ -66,8 +74,36 @@ def _assert_failed_token_outcome(db: LandscapeDB) -> None:
     assert outcome_rows[0].path == TerminalPath.UNROUTED.value
 
 
-def test_transform_input_validation_violation_records_terminal_outcome() -> None:
-    """The g11/g08/g04 battery shape: transform input validation crashes the run."""
+def _assert_routed_token_outcome(db: LandscapeDB) -> None:
+    """A Tier-2 violation ends as exactly one on_error-routed FAILURE outcome.
+
+    ``_assert_failed_token_outcome``'s FAILED/UNROUTED shape belonged to the era
+    when the executor pre-recorded the outcome and the run then aborted. Since
+    elspeth-181db83da7 the processor converts the violation into a routable
+    transform error, so the run finishes and the routing path writes the token's
+    single outcome. The count assertion is the point: one row, never two, never
+    zero.
+    """
+    with db.connection() as conn:
+        run_rows = conn.execute(select(runs_table)).fetchall()
+        assert len(run_rows) == 1
+        run_row = run_rows[0]
+        token_rows = conn.execute(select(tokens_table).where(tokens_table.c.run_id == run_row.run_id)).fetchall()
+        outcome_rows = conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.run_id == run_row.run_id)).fetchall()
+
+    assert len(token_rows) == 1
+    assert len(outcome_rows) == 1
+    assert outcome_rows[0].token_id == token_rows[0].token_id
+    assert outcome_rows[0].outcome == TerminalOutcome.FAILURE.value
+    # These fixtures leave on_error at its "discard" default, so the router
+    # terminalizes the row on the discard path rather than diverting it to a
+    # named sink. The value is asserted so a silent change of destination
+    # cannot pass as "still exactly one outcome".
+    assert outcome_rows[0].path == TerminalPath.QUARANTINED_AT_SOURCE.value
+
+
+def test_transform_input_validation_violation_routes_and_terminalizes_once() -> None:
+    """The g11/g08/g04 battery shape: transform input validation routes the row."""
     db = LandscapeDB.in_memory()
     payload_store = MockPayloadStore()
 
@@ -82,11 +118,10 @@ def test_transform_input_validation_violation_records_terminal_outcome() -> None
         sinks={"default": as_sink(sink)},
     )
 
-    with pytest.raises(PluginContractViolation, match="input validation failed"):
-        Orchestrator(db).run(config, graph=graph, payload_store=payload_store)
+    Orchestrator(db).run(config, graph=graph, payload_store=payload_store)
 
     assert sink.results == []
-    _assert_failed_token_outcome(db)
+    _assert_routed_token_outcome(db)
 
 
 class _BatchInputValidationFailer(BaseTransform):
@@ -336,7 +371,13 @@ def test_transform_canonicalization_violation_records_terminal_outcome() -> None
     ``token_outcomes`` or whether run accounting agrees — precisely the blind
     spot that let a wrong position ship elsewhere on this ticket. This drives it
     through ``Orchestrator.run`` and the same accounting derivation the web run
-    view uses, which additionally RAISES on duplicate completed outcomes.
+    view uses.
+
+    It is the load-bearing test for BOTH halves of the ownership move in
+    elspeth-181db83da7: the accounting derivation raises on a duplicate
+    terminal outcome (so it catches the executor pre-recording one the router
+    also writes), and ``pending == 0`` catches the opposite failure of moving
+    ownership to a path that writes none at all.
     """
     db = LandscapeDB.in_memory()
     payload_store = MockPayloadStore()
@@ -349,11 +390,10 @@ def test_transform_canonicalization_violation_records_terminal_outcome() -> None
         sinks={"default": as_sink(sink)},
     )
 
-    with pytest.raises(PluginContractViolation, match="non-canonical data"):
-        Orchestrator(db).run(config, graph=graph, payload_store=payload_store)
+    Orchestrator(db).run(config, graph=graph, payload_store=payload_store)
 
     assert sink.results == []
-    _assert_failed_token_outcome(db)
+    _assert_routed_token_outcome(db)
 
     with db.connection() as conn:
         run_id = str(conn.execute(select(runs_table)).fetchall()[0].run_id)

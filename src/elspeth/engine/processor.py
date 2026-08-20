@@ -19,6 +19,7 @@ from hashlib import sha256
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import (
     AggregationMemberAction,
     PayloadNotFoundError,
@@ -1974,6 +1975,68 @@ class RowProcessor:
             on_error,
         )
 
+    def _convert_contract_violation_to_error_result(
+        self,
+        exc: PluginContractViolation,
+        transform: Any,
+        token: TokenInfo,
+        ctx: Any,
+        *,
+        state_id: str | None = None,
+    ) -> tuple[TransformResult, TokenInfo, str | None]:
+        """Convert a Tier-2 plugin contract violation into a routable transform error.
+
+        ``PluginContractViolation`` is Tier 2 by declaration: a row-level plugin
+        bug the engine can record as a FAILED node state, not framework or
+        audit corruption. ADR-008 §"TIER_1 registration is load-bearing" makes
+        that concrete — registering a subclass in ``TIER_1_ERRORS`` is what
+        stops ``on_error`` from absorbing it, so an UNREGISTERED violation must
+        reach ``on_error``. Both call sites therefore re-raise
+        ``TIER_1_ERRORS`` first; only what survives that check arrives here.
+
+        Before elspeth-181db83da7 no clause matched the base class at all, so
+        every Tier-2 violation raised anywhere inside ``execute_transform`` —
+        preflight collision and input-schema checks alike, and equally from a
+        plugin's own ``process()`` — escaped this seam and aborted the run: the
+        operator saw a raw traceback, the configured error sink was never
+        written, and the row was not even counted as failed.
+
+        ``retryable=False``: a contract violation is deterministic in the row,
+        so re-running the same input reproduces it. ``state_id`` defaults to
+        the stamp ``NodeStateGuard.__exit__`` places on the exception (it
+        stamps on every exception path, auto-fail included); the RetryManager
+        branch passes the tracked last-failed attempt instead, matching the
+        shutdown and retry-exhaustion conversions beside it.
+        """
+        on_error = transform.on_error
+        # on_error is always set (required by TransformSettings) — Tier 1 invariant
+        if on_error is None:
+            raise OrchestrationInvariantError(
+                f"Transform '{transform.name}' has on_error=None — this should be impossible since TransformSettings requires on_error"
+            )
+
+        error_details: TransformErrorReason = {
+            "reason": "contract_violation",
+            "error": scrub_text_for_audit(str(exc)),
+        }
+        record_transform_error_with_routing(
+            ctx=ctx,
+            execution=self._execution,
+            error_edge_ids=self._error_edge_ids,
+            state_id=state_id if state_id is not None else stamped_node_state_id(exc),
+            token=token,
+            transform=transform,
+            row=token.row_data,
+            error_details=error_details,
+            on_error=on_error,
+        )
+
+        return (
+            TransformResult.error(error_details, retryable=False),
+            token,
+            on_error,
+        )
+
     def _record_pre_attempt_shutdown_state(
         self,
         *,
@@ -2079,6 +2142,10 @@ class RowProcessor:
                     reason="transient_error_no_retry",
                     state_id=stamped_node_state_id(e),
                 )
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except PluginContractViolation as e:
+                return self._convert_contract_violation_to_error_result(e, transform, token, ctx)
 
         # Track attempt number for audit; track the last failed attempt's
         # node-state id so a shutdown InterruptedError raised INSIDE the
@@ -2155,6 +2222,19 @@ class RowProcessor:
                 state_id=state_tracker["last_failed_state_id"],
                 retryable=False,
                 attempts=e.attempts,
+            )
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except PluginContractViolation as e:
+            # ``is_retryable`` rejects a contract violation, so tenacity
+            # re-raises the ORIGINAL exception here rather than wrapping it in
+            # MaxRetriesExceeded — this clause is the only conversion it meets.
+            return self._convert_contract_violation_to_error_result(
+                e,
+                transform,
+                token,
+                ctx,
+                state_id=state_tracker["last_failed_state_id"],
             )
 
     def _record_source_node_state(

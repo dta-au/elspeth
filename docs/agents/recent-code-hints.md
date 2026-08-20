@@ -8,6 +8,49 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-21 — a caught exception's TIER is the discriminator, and the cheapest
+  way to say so is a NARROWED PARAMETER TYPE** (landed with
+  elspeth-181db83da7). Four traps:
+  - `except SomePluginContractViolation` is the WRONG key for "may this be
+    routed to `on_error`?". Registration in `TIER_1_ERRORS` is what forbids
+    routing (ADR-008 §"TIER_1 registration is load-bearing"), and the registry
+    cuts ACROSS the class tree in both directions: `SinkTransactionalInvariantError`
+    is a REGISTERED `PluginContractViolation` (so it must keep crashing even
+    though its base is Tier 2), while `UnexpectedEmptyEmissionViolation` is the
+    one UNREGISTERED member of the otherwise-Tier-1 `DeclarationContractViolation`
+    hierarchy. Always `except contract_errors.TIER_1_ERRORS: raise` FIRST — as a
+    live module attribute, never a from-import, since the tuple is materialized
+    per access (errors.py:1738).
+  - The two violation hierarchies are SIBLINGS, not parent and child, and this
+    is easy to get backwards from the names alone:
+    `DeclarationContractViolation` (declaration_contracts.py) is
+    `(AuditEvidenceBase, RuntimeError)` — `issubclass(DeclarationContractViolation,
+    PluginContractViolation)` is FALSE. So a change scoped to one hierarchy does
+    not reach the other, and `PassThroughContractViolation` /
+    `DeclaredOutputFieldsViolation` / `UnexpectedEmptyEmissionViolation` are all
+    outside a `PluginContractViolation`-keyed blast radius entirely.
+  - Writing that check as `isinstance(exc, contract_errors.TIER_1_ERRORS)` is
+    correct but EXPENSIVE: every `isinstance` in the tree is individually
+    judge-gated by `trust_tier.tier_model`, and files carry per-file
+    `max_hits` ceilings (`engine/executors/transform.py` is 2). One added
+    check tips the ceiling and needs an operator signature. When the tier is
+    statically known at the call site — and it usually is, because most sites
+    construct the violation they raise — narrow the CALLEE's parameter
+    annotation to the Tier-1 union instead and let mypy enforce it. Same rule,
+    zero new suppressions, and the reader meets it where the decision is made.
+  Third trap, the one that actually bit: a COMPENSATING record can outlive the
+  defect it compensated for. `_record_terminal_contract_failure` pre-wrote a
+  FAILURE/UNROUTED `token_outcomes` row because the run was about to abort
+  (elspeth-82d4c5146c); once the violation became routable, the routing path
+  wrote the real outcome and the pre-write became a duplicate the audit store
+  rejects (`LandscapeRecordError ... IntegrityError`, raised from sink-effect
+  finalization — nowhere near the code you changed). When you restore a path
+  that was previously dead, grep for what was recording on its behalf. And
+  verify BOTH destinations: a named `on_error` sink terminalizes through
+  sink-effect finalization, `discard` through traversal, and only the named-sink
+  half raises on a duplicate — so a green run with a named sink says nothing
+  about whether `discard` now writes zero outcomes instead of one.
+
 - **2026-08-21 — "does this config literal name a row key?" is
   `normalize_field_name(x) == x`, NEVER `x.isidentifier()`** (landed with
   elspeth-f262a8c678). Sources key a row by the NORMALIZED header, and
