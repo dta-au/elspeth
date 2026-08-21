@@ -156,6 +156,39 @@ class TestTokenInfo:
         assert updated.resume_attempt_offset == 3
         assert updated.resume_checkpoint_id == "ck-abc"
 
+    def test_lineage_path_defaults_empty_and_survives_with_updated_data(self) -> None:
+        contract = _make_contract()
+        path = (LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),)
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=PipelineRow({"field": "v"}, contract),
+            branch_name="path_a",
+            fork_group_id="fg-1",
+            lineage_path=path,
+        )
+        assert token.lineage_path == path
+        updated = token.with_updated_data(PipelineRow({"field": "w"}, contract))
+        assert updated.lineage_path == path
+        bare = TokenInfo(row_id="row-1", token_id="tok-2", row_data=PipelineRow({"field": "v"}, contract))
+        assert bare.lineage_path == ()
+
+    @pytest.mark.parametrize(
+        "bad_path",
+        [
+            pytest.param([LineageFrame(kind=FrameKind.FORK, group_id="g", member_key="m")], id="list-not-tuple"),
+            pytest.param((("fork", "g", "m"),), id="raw-tuple-entry"),
+        ],
+    )
+    def test_lineage_path_rejects_untyped_values(self, bad_path: object) -> None:
+        with pytest.raises(TypeError):
+            TokenInfo(
+                row_id="row-1",
+                token_id="tok-1",
+                row_data=PipelineRow({"field": "v"}, _make_contract()),
+                lineage_path=bad_path,  # type: ignore[arg-type]
+            )
+
 
 # The four lineage fields, each paired with a named reader. The field NAME is
 # still needed as a keyword-argument key (a data-container use), but reading the

@@ -130,6 +130,7 @@ class TokenInfo:
     - fork_group_id: Groups all children from a fork operation
     - join_group_id: Groups all tokens merged in a coalesce operation
     - expand_group_id: Groups all children from an expand operation
+    - lineage_path: typed frame stack (unified lineage spec §4.1); tri-fields above are retired at WS1b
 
     Resume state (resume_attempt_offset, resume_checkpoint_id): carried on the token —
     not WorkItem — because SinkExecutor buffers TokenInfos across WorkItem boundaries,
@@ -145,6 +146,12 @@ class TokenInfo:
     fork_group_id: str | None = None
     join_group_id: str | None = None
     expand_group_id: str | None = None
+    lineage_path: tuple[LineageFrame, ...] = ()  # Outermost first (spec §4.1). WS1a prep:
+    # rides BESIDE the stored branch_name/fork_group_id/join_group_id/expand_group_id,
+    # which keep today's destructive semantics and remain the read path. WS1b deletes
+    # the stored fields and re-exposes them as read-only properties over this path
+    # (innermost_fork_frame / innermost_expand_frame). Do NOT read this field from
+    # production code during WS1a — that would be a dual-representation read.
     resume_attempt_offset: int = 0  # Added to every node_states.attempt written while
     # re-driving THIS token on resume, so its records coexist with the append-only run-1
     # records under UniqueConstraint(token_id, node_id, attempt). Value is the prior run's
@@ -182,6 +189,13 @@ class TokenInfo:
                     raise TypeError(f"TokenInfo.{_field_name} must be str or None, got {type(_value).__name__}: {_value!r}")
                 if not _value:
                     raise ValueError(f"TokenInfo.{_field_name} must be None or non-empty string, got {_value!r}")
+        if type(self.lineage_path) is not tuple:
+            raise TypeError(
+                f"TokenInfo.lineage_path must be tuple[LineageFrame, ...], got {type(self.lineage_path).__name__}: {self.lineage_path!r}"
+            )
+        for frame in self.lineage_path:
+            if type(frame) is not LineageFrame:
+                raise TypeError(f"TokenInfo.lineage_path entries must be LineageFrame, got {type(frame).__name__}: {frame!r}")
         # One-way resume invariant: a positive resume_attempt_offset only ever originates
         # from a resume re-drive (processor.resume_incomplete_token), which always stamps
         # the checkpoint id. The implication is one-directional — offset 0 is ambiguous
@@ -198,7 +212,7 @@ class TokenInfo:
 
         This method ensures that when row_data is updated after a transform,
         all identity and lineage metadata (branch_name, fork_group_id,
-        join_group_id, expand_group_id) are preserved.
+        join_group_id, expand_group_id, lineage_path) are preserved.
 
         Critically, resume_attempt_offset and resume_checkpoint_id are also
         preserved via dataclasses.replace — this is the propagation mechanism that
