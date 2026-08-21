@@ -819,14 +819,23 @@ exist in the corpus or `examples/` — the whole worklist is below.
   `quality_screen` gate inside the control branch routes `'false'` to the
   `screened_out` sink — a path from opener to sink before the closer, rejected flat by
   rule 4. NO mechanical migration exists: the example's pedagogical point is the
-  prohibited shape. Present the maintainer the two candidate redesigns: (a) screen
-  BEFORE the fork (simplest; loses mid-branch screening pedagogy), (b) screen-as-loss —
-  route the screened rows via `on_error`/loss semantics into the settlement channel so
-  the union roster settles the member as lost (rule 9 makes the closer a legal
-  in-region `on_error` target). The (a)-vs-(b) pedagogy choice is STILL OPEN
-  (maintainer call — the one open question this plan carries); implement the chosen
-  one in WS2 Task 7's commit and update `examples/AGENTS.md` run notes if the
-  example's observable output changes.
+  prohibited shape. **RULED (maintainer, 2026-08-22, on joint arch+systems advice):
+  TWO variants.** (i) `settings_screened.yaml` is rewritten as screen-BEFORE-fork on
+  `baseline_quality >= 60` — a SOURCE-known predicate, so pre-group screening is the
+  correct engineering, the `screened_out` sink stays (it sits outside the region), the
+  treatment arm is never forked/billed for screened tickets, and the run goes
+  SUCCESS/exit 0. (ii) NEW `settings_screened_at_settlement.yaml` demonstrates
+  fail-closed group settlement with a predicate genuinely unknowable pre-fork — the
+  in-branch screen keys on the computed `score` (post-`tag_control`) and routes the
+  screened row to discard so the settle-member seam stages the member loss and the
+  `require_all` union fails that ticket's pair closed. Its README states the costs
+  plainly: the sibling arm is billed then terminated `scope_group_failed`, the run is
+  PARTIAL/exit 1 by design, and screened rows are recovered from the audit trail
+  (`group_losses` + landscape queries), not a sink. Both variants' README output-count
+  prose (routed counts, disposition names) is rewritten as part of the migration; the
+  comparison statistics section survives verbatim in both (same 5 survivors, same
+  numbers). Implement both in WS2 Task 7's commit and update `examples/AGENTS.md` run
+  notes.
 
 - [ ] **RC-5 (trigger: WS2, before the Task 6/Task 7 rejections land; owner: WS2
   plan) — casualty-grep
@@ -910,11 +919,13 @@ bundle is staged, STOP and surface to the maintainer before any WS1 slice (§S4)
 
 ## Open Questions
 
-1. **`settings_screened.yaml` replacement (RC-4):** option (a) screen-before-fork vs
-   (b) screen-as-loss — human pedagogy call, needed by WS2 Task 7's commit (the slice
-   that lands §7 rule 4).
+None — the campaign's decisions are all closed.
 
 Resolved since the 2026-08-21 draft (2026-08-22 synthesis round — do not reopen):
+**`settings_screened.yaml` replacement RULED 2026-08-22: two variants (see RC-4)** —
+screen-before-fork for the source-known `baseline_quality` predicate, plus a new
+`settings_screened_at_settlement.yaml` demonstrating screen-as-loss on the computed
+score;
 `fork-multiple-terminals-partial-failure` is pure fan-out, LEGAL, FROZEN (spec rev 3.2;
 RC-2); the three new audit tables enter the portable export at the WS1b flip (§S1);
 sibling task citations are now concrete (WS1a Task 8a, WS1b Task 7, WS2 Tasks 6/7);

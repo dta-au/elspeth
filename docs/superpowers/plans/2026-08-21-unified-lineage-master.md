@@ -63,9 +63,12 @@ satisfiability refusal. MCP keeps path-derived legacy wire names (ruling 21);
 
 ## Open items
 
-1. **Maintainer pedagogy call (only open decision):**
-   `examples/row_union_ab_experiment/settings_screened.yaml` replacement — screen
-   before the fork, or screen-as-loss via settlement. Owed by the WS2 rule-4 slice
-   (protocols RC-4 / WS2 OQ1).
+1. ~~Screened-example pedagogy~~ **RULED 2026-08-22 (joint arch+systems advice,
+   maintainer approved): TWO variants** — `settings_screened.yaml` becomes
+   screen-before-fork (source-known `baseline_quality` predicate; SUCCESS run; sink
+   kept), plus new `settings_screened_at_settlement.yaml` demonstrating screen-as-loss
+   on the computed `score` through the settlement channel (PARTIAL by design; honest
+   cost README). Implemented in WS2 Task 7 Step 5b; full ruling in protocols RC-4.
+   **No open decisions remain.**
 2. Execution-time reconciliation (not decisions): the WS3+WS4 integration item's
    builder/PipelineConfig spellings — marked inline in WS4/WS5-6.

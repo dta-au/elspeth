@@ -2538,4 +2538,4 @@ The 2026-08-22 synthesis ratified the four decisions previously listed under Ope
 
 ## Open Questions
 
-None — the campaign's one open item (`row_union_ab_experiment` pedagogy) is owned by the protocols/WS2 plans.
+None — the campaign's last open item (`row_union_ab_experiment` pedagogy) was RULED 2026-08-22 (two variants; see protocols RC-4). No open decisions remain anywhere in the plan set.
