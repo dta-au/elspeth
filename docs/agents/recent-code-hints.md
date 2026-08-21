@@ -22,25 +22,47 @@ is a working document under the normal delivery posture.
     row" is FALSE here. It is a CONTRACT check — the reference escapes the set
     the DAG checks against upstream guarantees and
     `verify_declared_required_fields` re-checks per row.
-  - **The naive `fields - declared` diff is wrong and no corpus finds it.**
-    `extract_jinja2_field_usage('{{ row["Original Header"] }}')` returns the RAW
-    LITERAL, while `validate_field_names` requires every `required_input_fields`
-    entry to be a non-keyword identifier — so the literal is UNDECLARABLE and
-    the rejection's only "repair" is `required_input_fields: []`, which
-    withdraws the contract for every other field too. `PipelineRow.__getitem__`
-    resolves through `contract.resolve_name`, which accepts the original OR the
-    normalized spelling, so that template is correct code. `undeclared_row_fields`
-    (`core/templates.py`) now single-owns the comparison: DROP a field with no
-    declarable form, and cover on EITHER the literal or the canonical row key.
-  - **The canonical limb's POLARITY is the reverse of `field_mapper`'s** (the
-    2026-08-21 entry below). There the canonical key ADDS rejections and fails
-    closed; here coverage is a reason to stay SILENT, so it REMOVES them. The
-    `{'B','b'}`-distinct-keys hazard therefore yields a false NEGATIVE, which is
-    the correct direction for a NEW rule. Do not "fix" it back to fail-closed.
+  - **Coverage is EXACT, and a `normalize_field_name` bridge is UNSOUND in the
+    obvious direction.** `SchemaContract.find_name` matches a field's
+    `normalized_name` OR its `original_name` — two EXACT spellings, and config
+    time knows NEITHER. So `{{ row.Name }}` against a declared `name` resolves
+    only if the producer's header happened to be `Name`: the same YAML renders
+    or fails 100% of rows on a capitalization no validator sees. Measured, with
+    `required_input_fields: ["a_b"]` against a row whose one column is `a_b`,
+    TWELVE declarable spellings (`A_B`, `a__b`, `A_B_`, `row["a b"]`, ...) are
+    accepted and only ONE renders — and `a__b` is a plain typo of the declared
+    name, the very class the rule exists for. The first version bridged all of
+    them through `normalize_field_name` and silenced the lot. The ONE sound
+    inference runs the other way: a literal that is not a legal declaration
+    entry (`"Original Header"`, `"class"`) can never BE a `normalized_name`, so
+    it can only be an `original_name` and its canonical form IS the row key.
+    Bridge those, and REPORT them when that canonical name is not declared —
+    dropping them unconditionally was a false negative that accepted a
+    declaration omitting the field entirely. Drop only a literal with no
+    declarable form at all (`"!!!"`), because there is nothing to ask for.
+    `undeclared_row_fields` / `declarable_field_name` /
+    `describe_undeclared_row_fields` (`plugins/sources/field_normalization.py`)
+    single-own this. They live beside `normalize_field_name` DELIBERATELY: the
+    first version put them in `core/templates.py` and drew the third-ever `L1:
+    Upward import` finding in the tree.
+  - **Leading a rejection with "declare what you read" HANDS THE PLANNER A
+    REPAIR THAT BREAKS THE RUN.** `verify_declared_required_fields` is a plain
+    set difference over ROW KEYS with no dual-name limb, so declaring a read
+    name the producer does not guarantee is ACCEPTED at config time and then
+    raises `DeclaredRequiredInputFieldsViolation` on EVERY row. Measured for
+    both `{{ row.Name }}` + `["name"]` and a `field_mapper` rename that leaves
+    a stale `original_name`. The remedy text must LEAD with rewrite-the-
+    reference (always applies) and qualify add-the-name as correct only when
+    the producer guarantees that exact spelling. The message must also name the
+    DECLARABLE form of a bracket literal — `'Original Header' (declare as
+    'original_header')` — or the repair it advertises is rejected on
+    application, which is the same defect this change removed from the sibling
+    declared-fields validator's suggested value.
   - **Do NOT attempt guard analysis.** Measured through the real
     `PromptTemplate`: `{% if row.x is defined %}`, `{{ row.x | default('') }}`,
     `{% if 'x' in row %}` and `{{ row.get('x','') }}` RENDER when the column is
-    absent, while `{% if row.x %}`, `{{ row.x if row.x else '' }}`,
+    absent (and `PipelineRow.__contains__`'s own docstring blesses the third),
+    while `{% if row.x %}`, `{{ row.x if row.x else '' }}`,
     `{{ row.x or 'n/a' }}` and `{{ '' if row.x is none else row.x }}` RAISE —
     one token apart. A genuinely optional guarded read is the one shape this
     rule has no honest repair for; ZERO exist in the tree (the one that looks
@@ -56,6 +78,12 @@ is a working document under the normal delivery posture.
     deliberate and test-pinned so a draft never crashes validation. Stage 2
     preflight does reject, but only via `preview_pipeline`, and codelessly
     (`error_code=None`, matched by 0 of the 115 `_VALIDATION_ERROR_PATTERNS`).
+  - **`extract_jinja2_field_usage` has no scope tracking**, so a template that
+    REBINDS the name `row` — a macro parameter named `row`, `{% for row in
+    row.cases %}` — donates the local's attribute reads to the row-field set
+    and is rejected with no satisfiable declaration. Pre-existing (the
+    multi-query limb has it too), not introduced here, and no in-tree template
+    does it.
   Two sibling facts for anyone testing near this: use `schema: {"mode":
   "observed"}` in a fixture — a `mode: fixed` block makes
   `_reject_fixed_schema_omitting_consumed_fields` reject EVERY case including

@@ -8,7 +8,7 @@ and pool configuration (flat fields assembled into PoolConfig).
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from jinja2 import TemplateSyntaxError
 from pydantic import Field, field_validator, model_validator
@@ -35,31 +35,28 @@ _PROMPT_GLOBAL_NAMES: frozenset[str] = frozenset(create_sandboxed_environment().
 _MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
 
 
-def _declarable_suggestion(name: str) -> str | None:
-    """The ``required_input_fields`` entry that covers a template row field.
-
-    Returns the name itself when it is already declarable, else the canonical
-    row key it resolves to at render, else None when it has no declarable form.
-    The counterpart of ``undeclared_row_fields``' coverage limbs: whatever this
-    suggests, that check must then accept.
-    """
-    from elspeth.contracts.identifiers import validate_field_name
-    from elspeth.plugins.sources.field_normalization import ExternalHeaderError, normalize_field_name
-
-    def declarable(candidate: str) -> bool:
-        try:
-            validate_field_name(candidate, "required_input_fields entry", strip=True)
-        except ValueError:
-            return False
-        return True
-
-    if declarable(name):
-        return name.strip()
-    try:
-        canonical = normalize_field_name(name)
-    except ExternalHeaderError:
-        return None
-    return canonical if declarable(canonical) else None
+# Single-owned by the plugin layer and imported by the composer rule, so the
+# tool-call surface and the planner's repair turn cannot serve different
+# remedies for one error code (elspeth-920bd88299).
+#
+# Rewrite-the-reference leads DELIBERATELY. Declaring the read name is correct
+# only when the producer guarantees that exact spelling, and config time cannot
+# tell: ``SchemaContract.find_name`` matches a field's ``normalized_name`` OR
+# its ``original_name``, so ``{{ row.Name }}`` may resolve against a header
+# ``Name`` while the row key is ``name`` — and ``verify_declared_required_fields``
+# is a plain set difference over row keys with NO dual-name limb. Measured:
+# declaring the read name there is ACCEPTED at config time and then raises
+# DeclaredRequiredInputFieldsViolation on EVERY row. Leading with it would hand
+# the planner a repair that clears this error and breaks the run.
+_UNDECLARED_ROW_FIELDS_REMEDY: Final[str] = (
+    "Rewrite each reference to a field the node already declares — that always applies, and a "
+    "spelling the declaration does not carry works at best by accident of the producer's original "
+    "header. Add a name to options.required_input_fields ONLY if the upstream producer guarantees "
+    "that exact name (declare the parenthesised form where one is shown; the bracket literal itself "
+    "is not a legal declaration entry). Declaring a name the producer does not guarantee is accepted "
+    "here and then fails every row at run time. Do not empty required_input_fields to silence this: "
+    "[] withdraws the contract for every field the node reads, including the unconditional ones."
+)
 
 
 class LLMConfig(TransformDataConfig):
@@ -354,8 +351,10 @@ class LLMConfig(TransformDataConfig):
                 # (``SchemaContract.resolve_name`` accepts either spelling),
                 # and drop a name with no declarable form at all
                 # (elspeth-a9ba80cb0b).
+                from elspeth.plugins.sources.field_normalization import declarable_field_name
+
                 suggested_fields = sorted(
-                    {entry for entry in (_declarable_suggestion(name) for name in required_fields) if entry is not None}
+                    {entry for entry in (declarable_field_name(name) for name in required_fields) if entry is not None}
                 )
                 required_fields_json = json.dumps(suggested_fields)
                 raise ValueError(
@@ -474,7 +473,8 @@ class LLMConfig(TransformDataConfig):
         primacy over a plain binding error (after-validators run in
         definition order).
         """
-        from elspeth.core.templates import extract_jinja2_field_usage, undeclared_row_fields
+        from elspeth.core.templates import extract_jinja2_field_usage
+        from elspeth.plugins.sources.field_normalization import describe_undeclared_row_fields, undeclared_row_fields
 
         env = create_sandboxed_environment()
 
@@ -501,7 +501,7 @@ class LLMConfig(TransformDataConfig):
                     self.required_input_fields,
                 )
                 if undeclared:
-                    fields = ", ".join(f"'{name}'" for name in undeclared)
+                    fields = describe_undeclared_row_fields(undeclared)
                     declared_names = ", ".join(f"'{name}'" for name in sorted(self.required_input_fields))
                     raise ValueError(
                         f"LLM prompt_template reads {fields} under 'row', which "
@@ -511,8 +511,7 @@ class LLMConfig(TransformDataConfig):
                         "row. A reference outside it is required by nothing, so no producer is obliged to "
                         "supply it, and a row that arrives without it fails the whole node at render with "
                         "'Undefined variable' — an unattributed template error rather than a named contract "
-                        "violation. Add each name to options.required_input_fields, or rewrite the "
-                        "reference to a field it already declares."
+                        f"violation. {_UNDECLARED_ROW_FIELDS_REMEDY}"
                     )
             return self
 

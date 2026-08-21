@@ -53,8 +53,9 @@ from elspeth.core.config import (
     validate_sink_name,
 )
 from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
-from elspeth.core.templates import extract_jinja2_field_usage, undeclared_row_fields
+from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import create_sandboxed_environment, find_runtime_unbound_variables
+from elspeth.plugins.sources.field_normalization import describe_undeclared_row_fields, undeclared_row_fields
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
@@ -1439,13 +1440,27 @@ _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION: Final[str] = (
     "with 'Undefined variable' — an unattributed template error rather than a named contract violation. The rejection "
     "names the node, the fields read, and the fields declared."
 )
+# The FIX text leads with rewrite-the-reference DELIBERATELY, and the ordering
+# is the finding, not a style choice. Declaring the read name is correct only
+# when the producer guarantees that exact spelling, and neither authoring layer
+# can tell: ``SchemaContract.find_name`` matches a field's ``normalized_name``
+# OR its ``original_name``, so ``{{ row.Name }}`` may resolve against a header
+# ``Name`` while the row key is ``name``, and a ``field_mapper`` rename leaves
+# an ``original_name`` no declaration can carry. ``verify_declared_required_fields``
+# is a plain set difference over row keys with NO dual-name limb — measured,
+# declaring the read name in either shape is ACCEPTED at config time and then
+# raises ``DeclaredRequiredInputFieldsViolation`` on EVERY row. Leading with it
+# would hand the planner a repair that clears this error and breaks the run.
 _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX: Final[str] = (
-    "Change ONLY that node, and pick by which name is right. If the template's spelling is the field you mean, add "
-    "each name it reads to options.required_input_fields (patch_node_options with the full list — it replaces, it "
-    "does not merge). If the DECLARED name is the field the producer actually guarantees, rewrite the template "
-    "reference to that name instead; changing the declaration to match a template typo moves the failure rather than "
-    "clearing it. Do not answer this by emptying required_input_fields: [] opts the node out of the contract for "
-    "every field, including the ones it reads unconditionally."
+    "Change ONLY that node. Rewrite each reference to a field the node already declares — that always applies, and a "
+    "spelling the declaration does not carry works at best by accident of the producer's original header, so "
+    "'correcting' the declaration to match a template typo moves the failure rather than clearing it. Add a name to "
+    "options.required_input_fields ONLY if the upstream producer guarantees that exact name: declaring one it does "
+    "not guarantee is accepted here and then fails every row at run time with a declared-required-fields violation. "
+    'Where the rejection shows a parenthesised form, declare THAT — a bracket literal such as row["Original Header"] '
+    "is not a legal declaration entry and is rejected on application. Send the full list when you patch: "
+    "patch_node_options replaces the option's value, it does not append. Do not answer this by emptying "
+    "required_input_fields: [] withdraws the contract for every field the node reads, including the unconditional ones."
 )
 
 
@@ -2756,7 +2771,7 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[Validat
         if declared_names:
             undeclared = undeclared_row_fields(usage.fields, declared_names)
             if undeclared:
-                fields = ", ".join(f"'{name}'" for name in undeclared)
+                fields = describe_undeclared_row_fields(undeclared)
                 declared_display = ", ".join(f"'{name}'" for name in sorted(declared_names))
                 errors.append(
                     ValidationEntry(
@@ -2767,9 +2782,8 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[Validat
                             "required_input_fields is the node's input contract: it is what edge validation checks "
                             "against the upstream producer's guarantees and what the engine verifies on every row, "
                             "so a reference outside it is required by nothing and a row arriving without the field "
-                            "fails the whole node at render with 'Undefined variable'. Add each name it reads to "
-                            "options.required_input_fields (send the full list — the patch replaces the option's "
-                            "value, it does not append), or rewrite the reference to a field it already declares."
+                            f"fails the whole node at render with 'Undefined variable'. "
+                            f"{_PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX}"
                         ),
                         severity="high",
                         error_code="prompt_template_undeclared_row_fields",

@@ -2049,24 +2049,86 @@ class TestTemplateVariableBindings:
             PromptTemplate("Rate: {{ row.case_study }}").render({"case_study_1": "x"})
 
     def test_single_prompt_original_header_literal_accepted_against_normalized_declaration(self) -> None:
-        """``row["Original Header"]`` resolves through ``SchemaContract.resolve_name``.
+        """``row["Original Header"]`` resolves through ``SchemaContract.find_name``.
 
         The literal is not a declarable name at all (``validate_field_names``
-        requires an identifier), so a literal-only comparison would emit a
-        rejection whose only "repair" is abandoning the contract wholesale.
+        requires an identifier), so it can only be an ``original_name`` and the
+        row key it stands for is its canonical form. Declaring that key covers
+        it — and is the ONLY thing that does.
         """
         template = 'Rate: {{ row["Original Header"] }}'
         assert self._single(template, required_input_fields=["original_header"]).prompt_template == template
 
-    def test_single_prompt_case_variant_reference_accepted(self) -> None:
-        """``{{ row.Name }}`` and a declared ``name`` are one field under the canonical key."""
-        template = "Hello {{ row.Name }}"
-        assert self._single(template, required_input_fields=["name"]).prompt_template == template
+    def test_single_prompt_uncovered_original_header_literal_rejected_naming_the_declarable_form(self) -> None:
+        """A bracket literal is not exempt — it is bridged, then checked.
+
+        Dropping it outright accepted a declaration that omitted the field
+        entirely and then raised at render for every row, while the sibling
+        declared-fields validator was already naming the right key. The message
+        must name that key: the literal itself is rejected on application.
+        """
+        with pytest.raises(ValidationError, match="required_input_fields does not declare") as exc_info:
+            self._single('Rate: {{ row["Original Header"] }}', required_input_fields=["something_else"])
+        assert "declare as 'original_header'" in str(exc_info.value)
+
+    def test_single_prompt_case_variant_reference_rejected(self) -> None:
+        """``{{ row.Name }}`` against a declared ``name`` resolves only by accident.
+
+        ``SchemaContract.find_name`` is an exact match on ``normalized_name`` OR
+        ``original_name``, and config time knows neither: the same YAML renders
+        or fails 100% of rows depending on a CSV header's capitalization that no
+        validator ever sees. An earlier version bridged this through
+        ``normalize_field_name`` and so also silenced plain typos of the
+        declared name (``a__b`` for ``a_b``) — the very class this check exists
+        for. The surviving advice is the message's first remedy: rewrite the
+        reference to ``row.name``.
+        """
+        with pytest.raises(ValidationError, match="required_input_fields does not declare") as exc_info:
+            self._single("Hello {{ row.Name }}", required_input_fields=["name"])
+        assert "'Name'" in str(exc_info.value)
 
     def test_single_prompt_keyword_literal_accepted(self) -> None:
-        """``row["class"]`` cannot be declared — ``class`` is a Python keyword."""
+        """``row["class"]`` cannot be declared — ``class`` is a Python keyword — so
+        it is bridged to the key it resolves to."""
         template = 'Rate: {{ row["class"] }}'
         assert self._single(template, required_input_fields=["class_"]).prompt_template == template
+
+    def test_remedy_ordering_leads_with_rewrite_not_declare(self) -> None:
+        """The ordering is a finding, not a style choice.
+
+        ``verify_declared_required_fields`` is a plain set difference over row
+        keys with NO dual-name limb, so declaring a read name the producer does
+        not guarantee is ACCEPTED here and then raises
+        ``DeclaredRequiredInputFieldsViolation`` on every row. Leading with
+        "add the name" would hand the planner a repair that clears this error
+        and breaks the run.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            self._single("Hello {{ row.Name }}", required_input_fields=["name"])
+        message = str(exc_info.value)
+        assert message.index("Rewrite each reference") < message.index("Add a name to options.required_input_fields")
+        assert "ONLY if the upstream producer guarantees that exact name" in message
+        assert "fails every row at run time" in message
+
+    def test_declaring_an_unguaranteed_read_name_is_accepted_here_and_fails_at_run_time(self) -> None:
+        """Pins the fact the remedy ordering rests on, so it cannot drift silently."""
+        from elspeth.contracts.errors import DeclaredRequiredInputFieldsViolation
+        from elspeth.engine.executors.declared_required_fields import verify_declared_required_fields
+
+        # Config time accepts the "just declare what you read" repair...
+        self._single("Hello {{ row.Name }}", required_input_fields=["Name"])
+
+        # ...and the engine then rejects every row whose key is the normalized name.
+        with pytest.raises(DeclaredRequiredInputFieldsViolation):
+            verify_declared_required_fields(
+                declared_input_fields=frozenset({"Name"}),
+                effective_input_fields=frozenset({"name"}),
+                plugin_name="llm",
+                node_id="n1",
+                run_id="r1",
+                row_id="row1",
+                token_id="t1",
+            )
 
     def test_single_prompt_declaration_opt_out_suppresses_the_check(self) -> None:
         """``required_input_fields: []`` is the documented opt-out and must keep working."""

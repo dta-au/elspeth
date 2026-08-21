@@ -69,7 +69,6 @@ __all__ = [
     "extract_jinja2_fields",
     "extract_jinja2_fields_with_details",
     "extract_jinja2_fields_with_names",
-    "undeclared_row_fields",
 ]
 
 DYNAMIC_ROW_FIELD = "<dynamic-row-field>"
@@ -1920,75 +1919,3 @@ def extract_jinja2_fields_with_names(
             }
 
     return result
-
-
-def undeclared_row_fields(row_fields: Iterable[str], declared_fields: Iterable[str]) -> tuple[str, ...]:
-    """Row fields a template reads that a required-fields declaration cannot cover.
-
-    The config-time half of the ``required_input_fields`` contract: a caller
-    passes the concrete row fields its template reads (from
-    ``extract_jinja2_field_usage``) and the names the node declared, and gets
-    back the sorted shortfall it may honestly report. Shared by
-    ``LLMConfig._validate_template_variable_bindings`` and the composer's
-    ``_validate_prompt_template_variable_bindings`` so the two authoring
-    surfaces cannot drift (elspeth-a9ba80cb0b).
-
-    A field is covered when it matches a declared name under EITHER limb:
-
-    * the LITERAL name, as authored; or
-    * the CANONICAL row key — ``normalize_field_name`` — so ``{{ row.Name }}``
-      declared as ``name`` is covered. Template literals and declaration
-      literals name fields in two different spaces and comparing only literals
-      was the defect (the same disagreement recorded for ``field_mapper`` in
-      elspeth-bb470636d1).
-
-    Note the POLARITY, which is the reverse of ``field_mapper``'s overlap rule
-    and must not be "fixed" back: there the canonical limb ADDS rejections, so
-    it fails closed; here coverage is a reason to stay SILENT, so the canonical
-    limb REMOVES them. A row that carries ``'B'`` and ``'b'`` as two genuinely
-    distinct keys therefore yields a false NEGATIVE — this rule under-reports
-    rather than inventing a rejection no declaration can satisfy.
-
-    A field that could never appear in a declaration is dropped, not reported.
-    ``required_input_fields`` entries must pass ``validate_field_name`` — a
-    non-identifier or a Python keyword is rejected there — while a bracket read
-    returns its literal verbatim, so ``{{ row["Original Header"] }}`` and
-    ``{{ row["class"] }}`` name fields no declaration can express. They resolve
-    at render through ``SchemaContract.resolve_name``, which accepts the
-    original OR the normalized spelling, so they are legitimate authoring, not
-    a defect. Reporting them would emit a rejection whose only "repair" is to
-    abandon the contract wholesale.
-
-    Dynamic accesses (``row[expr]``) never reach here: callers fail closed on
-    them separately, with their own opt-out.
-    """
-    from elspeth.contracts.identifiers import validate_field_name
-    from elspeth.plugins.sources.field_normalization import ExternalHeaderError, normalize_field_name
-
-    def canonical(name: str) -> str | None:
-        try:
-            return normalize_field_name(name)
-        except ExternalHeaderError:
-            return None
-
-    def declarable(name: str) -> bool:
-        try:
-            validate_field_name(name, "required_input_fields entry", strip=True)
-        except ValueError:
-            return False
-        return True
-
-    declared_literals = {name.strip() for name in declared_fields}
-    declared_canonical = {key for key in (canonical(name) for name in declared_literals) if key is not None}
-
-    undeclared: set[str] = set()
-    for field in row_fields:
-        if not declarable(field):
-            continue
-        if field.strip() in declared_literals:
-            continue
-        field_key = canonical(field)
-        if field_key is not None and field_key in declared_canonical:
-            continue
-        undeclared.add(field)
-    return tuple(sorted(undeclared))

@@ -3703,17 +3703,26 @@ class TestPromptTemplateUndeclaredRowFields:
         )
         assert not self._errors(state)
 
-    def test_original_header_literal_is_not_reported(self) -> None:
+    def test_original_header_literal_is_covered_by_its_canonical_key(self) -> None:
         """``row["Original Header"]`` is not a declarable name at all.
 
-        It resolves at render through ``SchemaContract.resolve_name``, so
-        reporting it would emit a rejection whose only "repair" is emptying the
-        declaration for every other field too.
+        It can therefore only be an ``original_name``, and the row key it
+        resolves to is its canonical form — the one sound bridge, and it runs
+        only in this direction.
         """
         assert not self._errors(self._state('Rate: {{ row["Original Header"] }}', required_input_fields=["original_header"]))
 
-    def test_case_variant_reference_is_not_reported(self) -> None:
-        assert not self._errors(self._state("Hello {{ row.Name }}", required_input_fields=["name"]))
+    def test_uncovered_original_header_literal_is_reported_with_its_declarable_form(self) -> None:
+        errors = self._errors(self._state('Rate: {{ row["Original Header"] }}', required_input_fields=["something_else"]))
+        assert errors
+        assert "declare as 'original_header'" in errors[0].message
+
+    def test_case_variant_reference_is_reported(self) -> None:
+        """``{{ row.Name }}`` against a declared ``name`` resolves only by accident
+        of the producer's header, which no validator can see."""
+        errors = self._errors(self._state("Hello {{ row.Name }}", required_input_fields=["name"]))
+        assert errors
+        assert "'Name'" in errors[0].message
 
     def test_interpretation_placeholder_does_not_silence_the_rule(self) -> None:
         """Unmasked, ``{{interpretation:...}}`` is a TemplateSyntaxError that would
@@ -3765,6 +3774,32 @@ class TestPromptTemplateUndeclaredRowFields:
         """
         assert not self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study"]))
         assert not self._errors(self._state("Rate: {{ row.case_study_1 }}", required_input_fields=["case_study_1"]))
+
+    def test_advice_leads_with_rewrite_and_qualifies_declaring(self) -> None:
+        """Declaring a read name the producer does not guarantee is accepted at
+        config time and then fails every row (``verify_declared_required_fields``
+        is a plain set difference with no dual-name limb), so the ordering of
+        the two remedies is load-bearing."""
+        from elspeth.web.composer.state import _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX as fix
+
+        assert fix.index("Rewrite each reference") < fix.index("Add a name to options.required_input_fields")
+        assert "ONLY if the upstream producer guarantees that exact name" in fix
+        assert "fails every row at run time" in fix
+        assert "patch_node_options replaces the option's value, it does not append" in fix
+
+    def test_both_authoring_surfaces_carry_the_same_substantive_advice(self) -> None:
+        """The plugin message and the composer message reach authors on disjoint
+        paths and cannot be byte-identical — one names YAML, the other names
+        composer tools. Their CLAIMS must still agree, or the same defect gets
+        opposite guidance depending on how it was found (elspeth-920bd88299)."""
+        from elspeth.plugins.transforms.llm.base import _UNDECLARED_ROW_FIELDS_REMEDY as plugin_fix
+        from elspeth.web.composer.state import _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX as composer_fix
+
+        for text in (plugin_fix, composer_fix):
+            assert text.index("Rewrite each reference") < text.index("Add a name to options.required_input_fields")
+            assert "ONLY if the upstream producer guarantees that exact name" in text
+            assert "fails every row at run time" in text
+            assert "withdraws the contract for every field" in text
 
 
 class TestMultiQueryTemplateVariableBindings:

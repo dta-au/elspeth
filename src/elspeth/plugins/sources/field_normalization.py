@@ -18,7 +18,7 @@ from __future__ import annotations
 import keyword
 import re
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -508,3 +508,104 @@ def check_declared_fields_reachable(
 
     if problems:
         raise ValueError("\n".join(problems))
+
+
+def declarable_field_name(name: str) -> str | None:
+    """The ``required_input_fields`` entry that covers a template row field.
+
+    ``validate_field_name`` restricts a declaration entry to a non-keyword
+    Python identifier, while a bracket read returns its literal verbatim — so
+    ``{{ row["Original Header"] }}`` reads a name no declaration can carry.
+    Returns the name itself when it is already declarable, else the canonical
+    row key it resolves to at render, else None when it has no declarable form
+    at all (``"!!!"`` normalizes to nothing and so names no field).
+
+    Whatever this returns, ``undeclared_row_fields`` must then accept: the two
+    are the repair and the check for one contract, and they disagreed once
+    already (elspeth-a9ba80cb0b).
+    """
+    from elspeth.contracts.identifiers import validate_field_name
+
+    def declarable(candidate: str) -> bool:
+        try:
+            validate_field_name(candidate, "required_input_fields entry", strip=True)
+        except ValueError:
+            return False
+        return True
+
+    if declarable(name):
+        return name.strip()
+    try:
+        canonical = normalize_field_name(name)
+    except ExternalHeaderError:
+        return None
+    return canonical if declarable(canonical) else None
+
+
+def undeclared_row_fields(row_fields: Iterable[str], declared_fields: Iterable[str]) -> tuple[str, ...]:
+    """Row fields a template reads that a required-fields declaration does not cover.
+
+    The config-time half of the ``required_input_fields`` contract: a caller
+    passes the concrete row fields its template reads (from
+    ``extract_jinja2_field_usage``) and the names the node declared, and gets
+    back the sorted shortfall it may honestly report. Shared by
+    ``LLMConfig._validate_template_variable_bindings`` and the composer's
+    ``_validate_prompt_template_variable_bindings`` so the two authoring
+    surfaces cannot drift (elspeth-a9ba80cb0b).
+
+    Coverage is EXACT, because render-time resolution is. ``PipelineRow``
+    resolves through ``SchemaContract.find_name``, which matches a field's
+    ``normalized_name`` or its ``original_name`` — two exact spellings, and
+    config time knows NEITHER. So the only provable coverage is a literal
+    match against a declared name, which is a ``normalized_name`` by
+    construction.
+
+    That rules out a general "canonical key" bridge, and measurement says so
+    plainly: with ``required_input_fields: ["a_b"]`` against a row whose one
+    column is ``a_b``, twelve declarable spellings (``A_B``, ``a__b``,
+    ``A_B_``, ...) render only if the producer's ``original_name`` happens to
+    match, and otherwise raise on every row. ``{{ row.a__b }}`` is a plain
+    typo of the declared name — the very class this check exists to catch.
+    Bridging by ``normalize_field_name`` would silence all twelve.
+
+    The ONE sound inference is the reverse: a literal that is not a legal
+    declaration entry can never be a ``normalized_name``, so it can only be an
+    ``original_name``, and the row key it resolves to is its canonical form.
+    Those are bridged — ``{{ row["Original Header"] }}`` is covered by a
+    declared ``original_header`` — and REPORTED when that canonical name is
+    not declared. Dropping them unconditionally was the first version's bug: it
+    accepted a declaration omitting the field entirely, which then failed at
+    render, while the sibling declared-fields validator was already telling
+    authors to declare exactly the canonical name.
+
+    A literal with no declarable form at all is dropped, not reported: there is
+    nothing to ask for.
+
+    Dynamic accesses (``row[expr]``) never reach here — callers fail closed on
+    them separately, with their own opt-out.
+    """
+    declared_literals = {name.strip() for name in declared_fields}
+
+    undeclared: set[str] = set()
+    for field in row_fields:
+        covering = declarable_field_name(field)
+        if covering is None:
+            continue
+        if covering not in declared_literals:
+            undeclared.add(field)
+    return tuple(sorted(undeclared))
+
+
+def describe_undeclared_row_fields(fields: Sequence[str]) -> str:
+    """Render an ``undeclared_row_fields`` shortfall, naming the declarable form.
+
+    A bracket literal is not a legal ``required_input_fields`` entry, so a
+    message naming only the literal advertises a repair rejected on
+    application — the same defect this change removed from the LLM
+    declared-fields validator's suggestion (elspeth-a9ba80cb0b).
+    """
+    parts: list[str] = []
+    for name in fields:
+        covering = declarable_field_name(name)
+        parts.append(f"'{name}' (declare as '{covering}')" if covering != name else f"'{name}'")
+    return ", ".join(parts)
