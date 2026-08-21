@@ -55,7 +55,11 @@ from elspeth.core.config import (
 from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import create_sandboxed_environment, find_runtime_unbound_variables
-from elspeth.plugins.sources.field_normalization import describe_undeclared_row_fields, undeclared_row_fields
+from elspeth.plugins.sources.field_normalization import (
+    describe_undeclared_row_fields,
+    normalize_field_name,
+    undeclared_row_fields,
+)
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
@@ -1409,18 +1413,26 @@ _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION: Final[str] = (
     "`schema.fields` altogether, so an instruction to remove it from the declaration has nothing to act on."
 )
 _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX: Final[str] = (
-    "Change ONLY that node. Each name in `missing_fields` is a mapping TARGET, so first look up its SOURCE in the "
-    "`mapping` you authored — what repairs one kind of source is inert for another. If the source contains a dot it "
-    "is a nested read that `schema.guaranteed_fields` cannot name: set `strict: true`, which is node-wide and routes "
-    "any row missing ANY mapped source to on_error. Otherwise, IF you are certain the source is spelled exactly as "
-    "the upstream row keys it, declare it in `schema.fields` AND name it in `schema.guaranteed_fields` AND remove "
-    "the target's own entry from `schema.fields` — all three, since leaving the target declared makes the node "
-    "demand the emitted name as an input it never receives. If you are not certain of that spelling, do NOT guess: "
-    "a source the row is not keyed by is accepted by both of those declarations and changes nothing, returning this "
-    "same error. Stop declaring the target required instead — remove it from `schema.fields` and "
-    "`schema.guaranteed_fields`. That always applies and withdraws the guarantee honestly, so a consumer that needs "
-    "the field rejects at its own edge rather than here. Never rewrite the mapping key to a different spelling to "
-    "make it look right: that is accepted silently and drops the column."
+    "Change ONLY that node, and remember `schema` is ALSO its runtime input model: under `mode: fixed` a repair "
+    "must leave every field a row actually carries declared, or the row is rejected before the mapping runs. Each "
+    "name in `missing_fields` is a mapping TARGET, so first look up its SOURCE in the `mapping` you authored — "
+    "what repairs one kind of source is inert for another. If the source contains a dot it is a nested read that "
+    "`schema.guaranteed_fields` cannot name: set `strict: true`, which is node-wide and routes any row missing ANY "
+    "mapped source to on_error, and if `schema.mode` is `fixed` set it to `flexible` in the same edit — fixed mode "
+    "rejects the nested read's top-level container field as an undeclared extra, so `strict: true` alone clears "
+    "this error and then fails every row at input validation. Otherwise, IF you are certain the source is spelled "
+    "exactly as the upstream row keys it, declare it in `schema.fields` AND name it in `schema.guaranteed_fields` "
+    "AND remove the target's own entry from `schema.fields` — all three, since leaving the target declared makes "
+    "the node demand the emitted name as an input it never receives. If you are not certain of that spelling, do "
+    "NOT guess: a source the row is not keyed by is accepted by both of those declarations and changes nothing, "
+    "returning this same error. Withdraw the guarantee instead — make the target optional by appending `?` to its "
+    "declared type in `schema.fields` (do not delete the entry: a fixed/flexible schema must keep at least one "
+    "field, so deleting the last one is rejected), drop it from `schema.guaranteed_fields` if named there, and if "
+    "`schema.mode` is `fixed` set it to `flexible` so the key the row actually arrives under passes input "
+    "validation. A consumer that needs the field then rejects at its own edge rather than here. Or repair it end "
+    "to end: rename the field upstream so the row is keyed by a normalization-stable spelling, rewrite the mapping "
+    "key to that SAME spelling, and then declare and guarantee it. Never rewrite the mapping key alone to make it "
+    "look right: that is accepted silently and drops the column."
 )
 _TRANSFORM_OUTPUT_COLLISION_EXPLANATION: Final[str] = (
     "A transform declares an output field that already arrives on its input row. The engine rejects a transform that "
@@ -3519,12 +3531,24 @@ def _check_schema_contracts(
         """Build Rule C's repair advice, one clause per applicable source class.
 
         Emits ONLY the remedies measured to work for the sources actually in
-        play. The rule previously offered four alternatives joined by "OR", of
+        play — measured through EXECUTION, not just through this validator.
+        The rule previously offered four alternatives joined by "OR", of
         which two were inert for the shape that fires most and one was
         unauthorable in every shape — so a planner could apply a remedy, have
         the mutation ACCEPTED, and get a byte-identical error back with no
-        signal that its repair had done nothing (elspeth-920bd88299).
+        signal that its repair had done nothing (elspeth-920bd88299). The
+        successor defect was subtler: a remedy that cleared THIS validator but
+        left a node whose fixed-mode INPUT model rejected the very field the
+        mapping reads, so every row died in ``_run_preflight`` before
+        ``process()`` — which is why the fixed-mode clauses below also
+        instruct the ``schema.mode: flexible`` switch.
         """
+        # Direct indexing on the same grounds as ``_mapping_source_of``: this
+        # function runs only after ``_probe_transform_output_schema`` returned
+        # a config, so ``FieldMapperConfig`` (whose ``schema`` and ``mode``
+        # are required, defaultless fields) already parsed these options.
+        schema_is_fixed = options["schema"]["mode"] == "fixed"
+
         # Seeded with every class so the reads below are direct indexing: this
         # dict is built and consumed here, so a ``.get`` default would be
         # covering for an absence this function itself rules out.
@@ -3546,20 +3570,44 @@ def _check_schema_contracts(
                 f"emitted name as an input field it never receives."
             )
         for target, source in by_class["strict_only"]:
+            container = source.split(".", 1)[0]
+            fixed_mode_leg = (
+                f" Set `schema.mode: flexible` in the same edit: `schema` is also this node's runtime input "
+                f"model, and fixed mode rejects the top-level '{container}' field the nested read consumes as an "
+                f"undeclared extra — with `strict: true` alone this error clears and every row then fails input "
+                f"validation before the mapping runs."
+                if schema_is_fixed
+                else ""
+            )
             clauses.append(
                 f"'{target}' is mapped from the nested read '{source}', which `schema.guaranteed_fields` cannot "
                 f"name: set `strict: true` instead. That is node-wide — it routes any row missing ANY mapped "
-                f"source to on_error rather than emitting the row without it."
+                f"source to on_error rather than emitting the row without it.{fixed_mode_leg}"
             )
         for target, source in by_class["unguaranteeable"]:
+            fixed_mode_leg = (
+                ", and set `schema.mode: flexible` so the key the row actually arrives under passes this node's input validation"
+                if schema_is_fixed
+                else ""
+            )
+            try:
+                stable_spelling = f"'{normalize_field_name(source)}'"
+            except ValueError:
+                # ``ExternalHeaderError``/``ValueError`` for a literal with no
+                # normalized form at all (``'!!!'``) — there is no spelling to
+                # name, but the shape of the repair is still statable.
+                stable_spelling = "a normalization-stable spelling"
             clauses.append(
                 f"'{target}' is mapped from '{source}', which is not the name a row is keyed by, so this node "
                 f"cannot promise '{target}' at all — no `schema` declaration and no `strict: true` clears this. "
-                f"Do NOT rewrite the mapping key to another spelling: that is accepted silently and drops the "
-                f"column. Either stop declaring '{target}' required here (remove it from `schema.fields` and "
-                f"`schema.guaranteed_fields`, which withdraws the guarantee, so a consumer that requires it will "
-                f"reject at its own edge), or change the upstream source so it delivers '{source}' under the name "
-                f"the row is keyed by."
+                f"Do NOT rewrite the mapping key to another spelling on its own: that is accepted silently and "
+                f"drops the column. Either withdraw the guarantee — make '{target}' optional by appending `?` to "
+                f"its declared type in `schema.fields` (do not delete the entry: a fixed/flexible schema must "
+                f"keep at least one field, so deleting the last one is rejected), drop '{target}' from "
+                f"`schema.guaranteed_fields` if named there{fixed_mode_leg} — after which a consumer that "
+                f"requires '{target}' rejects at its own edge; or repair it end to end — rename the field "
+                f"upstream so the row is keyed by {stable_spelling}, rewrite the mapping key to that SAME "
+                f"spelling, and then declare and guarantee it like any row-keyed source."
             )
         return " ".join(clauses)
 

@@ -8,6 +8,27 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-21 — repair advice must be executed, not just re-validated: a
+  transform's `schema` block is BOTH the composer contract and the runtime
+  INPUT model.** Rule C's remedies each cleared `validate()` and were pinned
+  there — and two of them left a node whose fixed-mode pydantic input model
+  (`extra_forbidden`, checked in `_run_preflight` BEFORE `process()`) rejected
+  the very field the mapping reads: the nested read's top-level container
+  (`user` for `user.name`), or the normalized key (`name`) a row actually
+  arrives under for a non-fixed-point mapping source (`Name`). A third remedy
+  ("remove the target from `schema.fields`") hit `FieldMapperConfig`'s
+  at-least-one-field invariant in the single-field shape, and "make upstream
+  guarantee the literal" can NEVER clear because
+  `_mapping_target_is_guaranteed` abstains for every non-fixed-point source,
+  strict or not. Measured repairs: nested read → `strict: true` **plus**
+  `schema.mode: flexible`; non-fixed-point source → target optional
+  (`name: type?`) **plus** `schema.mode: flexible`, or upstream rename to the
+  stable spelling **plus** rewriting the mapping key to that same spelling.
+  Truth-pin advice by running it through the executor-shaped chain
+  (`input_schema.model_validate(strict=True)` → `process()` →
+  `verify_schema_config_mode`), not only through `validate()` — see
+  `_run_field_mapper_as_the_executor_would` in
+  `tests/unit/web/composer/test_state.py`.
 - **2026-08-21 — a config-time DECLARATION check compares two name spaces, and
   the shortfall may be UNDECLARABLE** (landed with elspeth-a9ba80cb0b). A
   single-prompt `llm` node could declare `required_input_fields: ["case_study_1"]`

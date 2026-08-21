@@ -5804,6 +5804,45 @@ class TestSchemaContractValidation:
         matches = [e for e in result.errors if e.error_code == "transform_declared_output_not_guaranteed"]
         return matches[0] if matches else None
 
+    @staticmethod
+    def _run_field_mapper_as_the_executor_would(options: dict[str, Any], row: Any) -> Any:
+        """Execute a field_mapper config through the executor-shaped chain.
+
+        Mirrors ``TransformExecutor``: preflight ``input_schema.model_validate``
+        (strict), then ``process()``, then the ADR-014 post-emission
+        ``verify_schema_config_mode``. Rule C's remedies are advice about a
+        RUNTIME contract, so a remedy that only clears composer validation is
+        untested — that is exactly the defect class these pins exist for
+        (docs/agents/recent-code-hints.md, "a repair that breaks the run").
+
+        Raises whatever the first failing stage raises; returns the
+        TransformResult on success (post-emission check included).
+        """
+        from elspeth.contracts.schema_contract import PipelineRow
+        from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.testing import make_pipeline_row
+        from tests.fixtures.factories import make_context
+
+        transform = get_shared_plugin_manager().create_transform("field_mapper", options)
+        try:
+            pipeline_row = row if isinstance(row, PipelineRow) else make_pipeline_row(row)
+            transform.input_schema.model_validate(pipeline_row.to_dict(), strict=True)
+            result = transform.process(pipeline_row, make_context())
+            if result.status == "success":
+                verify_schema_config_mode(
+                    output_schema_config=transform._output_schema_config,
+                    emitted_rows=(result.row,),
+                    plugin_name=transform.name,
+                    node_id="t1",
+                    run_id="run-1",
+                    row_id="row-1",
+                    token_id="token-1",
+                )
+            return result
+        finally:
+            transform.close()
+
     def test_rule_c_names_the_mapping_source_not_only_the_unguaranteed_target(self) -> None:
         """The remedy must name the SOURCE, because that is what the author declared.
 
@@ -5873,6 +5912,21 @@ class TestSchemaContractValidation:
         assert error is not None, [e.error_code for e in result.errors]
         assert "cannot promise 'nm' at all" in error.message, error.message
         assert "Do NOT rewrite the mapping key" in error.message, error.message
+        # The withdraw arm must be executable in the single-field shape: a
+        # deletion instruction empties `schema.fields`, which FieldMapperConfig
+        # rejects (fixed/flexible require at least one field), so the message
+        # must instruct the optional marker instead — and the mode switch, so
+        # the key the row actually arrives under passes input validation.
+        assert "appending `?`" in error.message, error.message
+        assert "must keep at least one field" in error.message, error.message
+        assert "`schema.mode: flexible`" in error.message, error.message
+        # The upstream arm must be completable: naming the stable spelling and
+        # the mapping-key rewrite that goes WITH the upstream rename. Without
+        # both, upstream can guarantee the literal 'Name' forever and this rule
+        # still fires, because a non-fixed-point source always abstains.
+        assert "'name'" in error.message, error.message
+        assert "SAME spelling" in error.message, error.message
+        assert "remove it from `schema.fields`" not in error.message, error.message
 
         # The remedy the message withholds, applied anyway: still fires, and the
         # message is byte-identical, which is exactly why it must not be offered.
@@ -5896,6 +5950,59 @@ class TestSchemaContractValidation:
         still = self._rule_c_error(state.validate())
         assert still is not None, "declaring an unguaranteeable source must not clear Rule C"
 
+    def test_rule_c_unguaranteeable_escape_is_executable_and_deletion_is_not(self) -> None:
+        """The withdraw arm applied verbatim must construct, validate, AND run.
+
+        Both remedies previously offered for a single-field non-fixed-point
+        mapper were dead ends: deleting the target's entry left
+        ``schema.fields`` empty (PluginConfigError), and guaranteeing the
+        literal upstream never clears because the plugin abstains for every
+        non-fixed-point source, strict or not. The escape that works is the
+        optional marker plus the flexible-mode switch; this applies it exactly
+        as the message words it and proves each stage.
+        """
+        # Composer layer: the escape clears Rule C.
+        escaped_flexible = self._empty_state()
+        escaped_flexible = escaped_flexible.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
+        escaped_flexible = escaped_flexible.with_node(
+            self._make_transform(
+                "t1",
+                "t1",
+                "main",
+                plugin="field_mapper",
+                options={"select_only": True, "mapping": {"Name": "nm"}, "schema": {"mode": "flexible", "fields": ["nm: str?"]}},
+            )
+        )
+        escaped_flexible = escaped_flexible.with_output(self._make_output())
+        escaped_flexible = escaped_flexible.with_edge(self._make_edge("e1", "source", "t1"))
+        assert self._rule_c_error(escaped_flexible.validate()) is None
+
+        # Executor layer: the row a normalizing source actually produces for a
+        # CSV header 'Name' is keyed 'name' with original_name lineage — the
+        # escape admits it and the mapping resolves through that lineage.
+        from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+        from elspeth.testing import make_field
+
+        options = {"select_only": True, "mapping": {"Name": "nm"}, "schema": {"mode": "flexible", "fields": ["nm: str?"]}}
+        row = PipelineRow(
+            {"name": "Ada"},
+            SchemaContract(mode="OBSERVED", fields=(make_field("name", str, original_name="Name"),), locked=True),
+        )
+        result = self._run_field_mapper_as_the_executor_would(options, row)
+        assert result.status == "success", result
+        assert result.row.to_dict() == {"nm": "Ada"}
+
+        # The remedy the message must NOT offer: deleting the only entry is
+        # rejected at construction, so a planner applying it cannot even get
+        # back to validation.
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        with pytest.raises(ValueError, match="at least one field"):
+            get_shared_plugin_manager().create_transform(
+                "field_mapper",
+                {"select_only": True, "mapping": {"Name": "nm"}, "schema": {"mode": "fixed", "fields": []}},
+            )
+
     def test_rule_c_offers_strict_only_for_a_nested_read_and_it_works(self) -> None:
         """A dotted source is the one class where ``strict: true`` is the remedy.
 
@@ -5904,12 +6011,21 @@ class TestSchemaContractValidation:
         source required kills a row lacking it at input validation, before the
         strict branch in ``process()`` is ever reached — so naming both in one
         message invites a planner to apply one and reason about the other.
+
+        For a fixed-mode schema the message must ALSO instruct the mode switch:
+        ``schema`` is simultaneously the node's runtime INPUT model, and fixed
+        mode rejects the nested read's top-level container as an undeclared
+        extra (``extra_forbidden``) in ``_run_preflight`` — so ``strict: true``
+        alone clears composer validation while every row still dies before
+        ``process()``. The execution legs below are the proof for both halves.
         """
         result = self._rule_c_state({"user.name": "uname"}, ["uname: str"]).validate()
         error = self._rule_c_error(result)
         assert error is not None, [e.error_code for e in result.errors]
         assert "nested read 'user.name'" in error.message, error.message
         assert "`strict: true`" in error.message, error.message
+        assert "`schema.mode: flexible`" in error.message, error.message
+        assert "'user'" in error.message, error.message
 
         state = self._empty_state()
         state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
@@ -5923,13 +6039,52 @@ class TestSchemaContractValidation:
                     "select_only": True,
                     "strict": True,
                     "mapping": {"user.name": "uname"},
-                    "schema": {"mode": "fixed", "fields": ["uname: str"]},
+                    "schema": {"mode": "flexible", "fields": ["uname: str"]},
                 },
             )
         )
         state = state.with_output(self._make_output())
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         assert self._rule_c_error(state.validate()) is None
+
+    def test_rule_c_nested_read_remedy_is_executable_and_the_old_one_was_not(self) -> None:
+        """The advised config must survive the executor, not just the composer.
+
+        The first half runs the full advice — ``strict: true`` AND
+        ``schema.mode: flexible`` — through the executor-shaped chain and
+        requires the mapped value to come out. The second half is the
+        discriminator: the advice as previously worded (``strict: true`` with
+        the fixed-mode declaration untouched) passes composer validation and
+        then fails preflight input validation on the very field the mapping
+        reads, which is why the message now names the mode switch.
+        """
+        import pydantic
+
+        advised = {
+            "select_only": True,
+            "strict": True,
+            "mapping": {"user.name": "uname"},
+            "schema": {"mode": "flexible", "fields": ["uname: str"]},
+        }
+        result = self._run_field_mapper_as_the_executor_would(advised, {"user": {"name": "Ada"}})
+        assert result.status == "success", result
+        assert result.row.to_dict() == {"uname": "Ada"}
+
+        # A row without the container must route via the strict branch in
+        # process() (recoverable, on_error) — not die in preflight, which
+        # raises PluginContractViolation and aborts the whole run.
+        routed = self._run_field_mapper_as_the_executor_would(advised, {"other": 1})
+        assert routed.status == "error", routed
+        assert routed.reason["reason"] == "missing_field"
+
+        old_advice = {
+            "select_only": True,
+            "strict": True,
+            "mapping": {"user.name": "uname"},
+            "schema": {"mode": "fixed", "fields": ["uname: str"]},
+        }
+        with pytest.raises(pydantic.ValidationError, match="user"):
+            self._run_field_mapper_as_the_executor_would(old_advice, {"user": {"name": "Ada"}})
 
     def test_rule_c_advises_per_source_class_within_one_node(self) -> None:
         """One node can hold all three classes at once; each gets its own clause.
