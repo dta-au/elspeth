@@ -838,6 +838,9 @@ class CoalesceExecutor:
                 raise OrchestrationInvariantError(
                     "CoalesceExecutor.data_flow is None but token outcome recording requires DataFlowRepository"
                 )
+            # DIRECT terminal write — bypasses RowProcessor._notify_barrier_of_lost_branch:
+            # a held sibling fails here with NO branch loss staged for any enclosing
+            # barrier. Retired into the WS3 settle-member seam (barrier-scopes spec §6.1 item 1).
             self._data_flow.record_token_outcome(
                 ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
                 outcome=TerminalOutcome.FAILURE,
@@ -1051,6 +1054,9 @@ class CoalesceExecutor:
                 raise OrchestrationInvariantError(
                     "CoalesceExecutor.data_flow is None but token outcome recording requires DataFlowRepository"
                 )
+            # DIRECT terminal write — bypasses RowProcessor._notify_barrier_of_lost_branch:
+            # a held sibling fails here with NO branch loss staged for any enclosing
+            # barrier. Retired into the WS3 settle-member seam (barrier-scopes spec §6.1 item 1).
             self._data_flow.record_token_outcome(
                 ref=TokenRef(token_id=entry.token.token_id, run_id=self._run_id),
                 outcome=TerminalOutcome.FAILURE,
@@ -1251,6 +1257,9 @@ class CoalesceExecutor:
                     raise OrchestrationInvariantError(
                         "CoalesceExecutor.data_flow is None but token outcome recording requires DataFlowRepository"
                     ) from merge_exc
+                # DIRECT terminal write — bypasses RowProcessor._notify_barrier_of_lost_branch:
+                # a held sibling fails here with NO branch loss staged for any enclosing
+                # barrier. Retired into the WS3 settle-member seam (barrier-scopes spec §6.1 item 1).
                 self._data_flow.record_token_outcome(
                     ref=TokenRef(token_id=entry.token.token_id, run_id=self._run_id),
                     outcome=TerminalOutcome.FAILURE,

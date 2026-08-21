@@ -1639,6 +1639,15 @@ class RowProcessor:
 
             # Expansion atomically recorded every parent's terminal disposition;
             # emit the matching telemetry and construct the triggering RowResult.
+            #
+            # ASYMMETRY (verified 2026-08-21): this non-empty flush path notifies NO
+            # barrier — the buffered tokens' (TRANSIENT, BATCH_CONSUMED) and
+            # (FAILURE, QUARANTINED_AT_SOURCE) terminals were recorded inside
+            # expand_token with no _notify_barrier_of_lost_branch call, while the
+            # EMPTY-emission path (_route_empty_emission_results) notifies for every
+            # buffered token. Inside a fork branch, a coalesce roster is blind to
+            # these losses; ruling 25 (barrier-scopes spec §7 rule 6) bans aggregators
+            # in bound regions and the WS3 settle-member seam retires this path.
             for i, token in enumerate(fctx.buffered_tokens):
                 if i in quarantined_index_set:
                     outcome = TerminalOutcome.FAILURE
