@@ -3775,6 +3775,20 @@ class TestPromptTemplateUndeclaredRowFields:
         assert not self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study"]))
         assert not self._errors(self._state("Rate: {{ row.case_study_1 }}", required_input_fields=["case_study_1"]))
 
+    def test_a_malformed_declaration_is_the_type_rule_business_not_a_silent_bypass(self) -> None:
+        """A declaration the composer cannot read must not read as "no declaration".
+
+        ``declared_names`` filters non-strings, so ``[5, 6]`` collapses to empty
+        and this rule stays silent — correct only because ``contract_config_invalid``
+        owns the type rejection. Measured, not assumed; a mixed list still yields
+        the shortfall for the names that ARE readable.
+        """
+        for declared in ([5, 6], "case_study_1", {}):
+            codes = {e.error_code for e in self._state("Rate: {{ row.case_study }}", required_input_fields=declared).validate().errors}
+            assert "contract_config_invalid" in codes, f"{declared!r} is not rejected by the type rule"
+
+        assert self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study_1", 5]))
+
     def test_advice_leads_with_rewrite_and_qualifies_declaring(self) -> None:
         """Declaring a read name the producer does not guarantee is accepted at
         config time and then fails every row (``verify_declared_required_fields``

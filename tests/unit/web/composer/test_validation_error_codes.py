@@ -364,10 +364,25 @@ class TestClosedCodeCatalogueInvariants:
         assert guidance != explain_validation_code("prompt_template_unbound_variables")
         assert guidance != explain_validation_code("query_template_unbound_row_fields")
 
+        # Neither sibling's vocabulary: a single-prompt node has no per-query
+        # ``input_fields`` and no ``row.source_row``.
+        assert "input_fields" not in fix.replace("options.required_input_fields", "").replace("required_input_fields", "")
+        assert "source_row" not in fix
+
         # The advice must not steer the planner to the one repair that clears
         # this error by withdrawing the contract for every OTHER field too.
-        assert "input_fields" not in fix.replace("required_input_fields", "")
-        assert "source_row" not in fix
+        assert "withdraws the contract for every field" in fix
+
+        # Rewrite-the-reference must LEAD. ``verify_declared_required_fields``
+        # is a plain set difference over row keys with no dual-name limb, so
+        # declaring a read name the producer does not guarantee is accepted at
+        # config time and then raises on every row — leading with it would hand
+        # the planner a repair that clears this error and breaks the run
+        # (elspeth-a9ba80cb0b). This is the claim the catalogue must carry, not
+        # a property of whatever string happened to be written first.
+        assert fix.index("Rewrite each reference") < fix.index("Add a name to options.required_input_fields")
+        assert "ONLY if the upstream producer guarantees that exact name" in fix
+        assert "fails every row at run time" in fix
 
     def test_transform_contract_advice_has_exactly_one_owner(self) -> None:
         """The catalogue must SERVE ``state``'s advice, never restate it.
