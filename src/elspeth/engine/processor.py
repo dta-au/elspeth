@@ -3139,7 +3139,7 @@ class RowProcessor:
         the branch was lost.
 
         Dispatches to the coalesce arm, then the row_union arm, so an
-        early-exit path names no barrier kind directly. It is not a single seam:
+        early-exit path names no barrier kind directly. It is NOT a single seam:
         verified 2026-08-21, these terminal dispositions never reach
         this method —
 

@@ -16,7 +16,7 @@ honest representation.
 
 The reproduced symptom (pinned by
 `tests/integration/audit/test_contract_violation_token_outcomes.py::test_aggregation_count_flush_violation_abandons_tokens_at_finalization`
-— renamed from `..._strands_tokens_permanently` when the abandoned-path fix landed):
+— renamed when the abandoned-path fix landed; the rename history lives in that test module's docstring):
 a count-triggered aggregation flush raises `PluginContractViolation` from
 input-schema validation (`engine/executors/aggregation.py::_validate_batch_inputs`)
 while the source is still `loading`. The run crashes and finalizes FAILED;
