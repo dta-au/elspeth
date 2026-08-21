@@ -35,9 +35,11 @@ pathspec only, never `git add -A`**.
 **Standing rules (non-negotiable):**
 - Shared checkout on `release/0.7.2`. Subagents cannot use worktrees. Never bypass
   hooks except the documented `--no-verify`-with-reconciliation grant.
-- Slice boundaries (marked in each plan): full `pytest tests/` (`-n 12`), trust-tier
-  corpus **count** diff vs baseline (COUNT findings, never tail; add nothing), the
-  wardline gate command from AGENTS.md. Push after each green slice.
+- Slice boundaries (marked in each plan): run protocols §S2 **in full — all 7 steps**
+  (headline gates: full `pytest tests/` `-n 12`, trust-tier corpus diff vs baseline —
+  identical counts AND identities, COUNT findings, never tail, add nothing — and the
+  wardline gate command from AGENTS.md; plus §S2's parity/pin/oracle steps as
+  written). Push after each green slice.
 - Mutation tasks run `-n 0`. Cap per-subagent pytest parallelism when running
   subagents concurrently.
 - **WS1 CHECKPOINT is a STOP gate:** frozen-oracle diff clean + deltas only in the

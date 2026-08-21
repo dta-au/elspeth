@@ -1,0 +1,33 @@
+{
+  "verdict": "APPROVED",
+  "summary": "0 blocking issues; W1 fixed in the prompt on 2026-08-22, W2 accepted as a deliberately conservative reading. Reality-focused review (simplified mode): the dispatch prompt is a faithful, self-contained compression of the master plan; every referenced artifact and section exists.",
+  "plan_file": "docs/superpowers/plans/2026-08-21-unified-lineage-implementation-prompt.md",
+  "reviewed_at": "2026-08-22",
+  "mode": "simplified (reality focus); the underlying plan set already carries a 14-agent draft/review provenance with two cross-plan verification rounds, so the full 4-reviewer fan-out was not repeated for a 60-line dispatch prompt",
+  "verified": [
+    "All referenced files exist: master, spec (rev 3.2, rulings 1-28, zero open decisions confirmed in master and ws1b headers), protocols, WS0-WS5/6 plans, scout-inputs dir, docs/agents/recent-code-hints.md, AGENTS.md",
+    "Execution order matches the master sequencer exactly, including Task 8a -> protocols Task 3 freeze -> WS1b Phase B dependency and the WS4 Tasks 11-12 gate on WS3",
+    "Section references resolve: spec §4.1a exists; protocols §S1-§S5 exist; RC-5 casualty-grep exists in protocols",
+    "Standing rules match AGENTS.md and project doctrine: pathspec-only staging, -n 12 / -n 0, no worktrees for subagents, judge-key custody [O1], no bundle staging mid-campaign, fail-closed corpus baseline elspeth-13f0cc04fb, wardline gate from AGENTS.md (the --fail-on-inert form)",
+    "Checkbox-state resume instruction is executable: all workstream plans carry per-step checkboxes"
+  ],
+  "blocking_issues": [],
+  "warnings": [
+    {
+      "id": "W1",
+      "issue": "The slice-boundary bullet restates only 3 of §S2's 7 steps (full suite, trust-tier count, wardline). Steps 4-7 (runtime-rejection parity, composer three-pin, serialisation hash pins, oracle-freeze compare) are omitted, and the trust-tier acceptance is counts AND identities, not counts alone. The workstream plans cite §S2 at each boundary, so a compliant session recovers, but the prompt's summary could anchor a session on the subset.",
+      "resolution": "Reword the bullet to: run protocols §S2 in full (all 7 steps) at every slice boundary; the three named gates are the headline, not the checklist."
+    },
+    {
+      "id": "W2",
+      "issue": "Prompt escalates an RC-5 new-casualty hit to STOP-and-surface; protocols RC-5 says adjudicate-before-the-rejection-lands. Stricter than source, not contradictory (adjudication is maintainer-facing anyway).",
+      "resolution": "None required; accept the conservative reading or align the wording."
+    }
+  ],
+  "reviewer_summaries": {
+    "reality": {"status": "PASS", "blocking": 0},
+    "architecture": {"status": "PASS (order fidelity vs master)", "blocking": 0},
+    "quality": {"status": "PASS with W1", "blocking": 0},
+    "systems": {"status": "PASS (STOP gates preserved)", "blocking": 0}
+  }
+}
