@@ -1407,14 +1407,15 @@ def _llm_with_template(template: str, *, input_stream: str = "llm_in", on_succes
     ``CompositionState.validate`` — earlier in the funnel than coverage — so
     that shape can no longer reach a coverage decision at all. Dynamic
     ``row[<expr>]`` access is the surviving route to an empty provable field
-    set. Without this assertion a later tightening of the binding guard would
+    set; it stays clean under the rule's second limb too, because these
+    fixtures declare no ``required_input_fields`` (elspeth-a9ba80cb0b). The
+    rule returns a TUPLE of entries, so the clean verdict is empty, not None. Without this assertion a later tightening of the binding guard would
     leave the provability cases silently vacuous: they call
     ``control_coverage_findings`` directly and would keep passing on a shape
     production forbids.
     """
-    assert (
-        _validate_prompt_template_variable_bindings(_node("probe", "llm", input_stream, on_success, options={"prompt_template": template}))
-        is None
+    assert not _validate_prompt_template_variable_bindings(
+        _node("probe", "llm", input_stream, on_success, options={"prompt_template": template})
     ), f"fixture template is rejected before coverage runs: {template!r}"
     return _node(
         "judge",
