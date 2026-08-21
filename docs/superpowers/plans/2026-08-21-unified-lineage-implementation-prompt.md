@@ -35,7 +35,9 @@ pathspec only, never `git add -A`**.
 **Standing rules (non-negotiable):**
 - Shared checkout on `release/0.7.2`. Subagents cannot use worktrees. Never bypass
   hooks except the documented `--no-verify`-with-reconciliation grant.
-- Slice boundaries (marked in each plan): run protocols §S2 **in full — all 7 steps**
+- Slice boundaries (marked in each plan): run
+  `docs/superpowers/plans/2026-08-21-unified-lineage-protocols.md` §S2 **in full — all
+  7 steps**
   (headline gates: full `pytest tests/` `-n 12`, trust-tier corpus diff vs baseline —
   identical counts AND identities, COUNT findings, never tail, add nothing — and the
   wardline gate command from AGENTS.md; plus §S2's parity/pin/oracle steps as
