@@ -3126,18 +3126,40 @@ class RowProcessor:
         *,
         notify_in_memory: bool = True,
     ) -> list[RowResult]:
-        """Notify whichever barrier owns this fork branch that it was lost.
+        """Notify the barrier (if any) bound to this token's fork branch that
+        the branch was lost.
 
-        THE single seam every early-exit path calls. Loss is discovered in
-        many places (retry exhaustion, filter drop, quarantine, error
-        routing, gate routing, gate discard, batch-flush drop), and each one
-        used to name the coalesce notifier directly — so adding a second
-        barrier kind silently left every one of those paths unnotified and
-        its held siblings waiting for the end-of-source sweep. Dispatching
-        here means a future barrier kind is wired by editing one method.
+        Dispatches to the coalesce arm, then the row_union arm, so an
+        early-exit path names no barrier kind directly. It is not a single seam:
+        verified 2026-08-21, these terminal dispositions never reach
+        this method —
 
-        A branch belongs to at most ONE barrier — enforced at build time and
-        re-checked in this constructor — so at most one arm yields results.
+        1. (TRANSIENT, BATCH_CONSUMED) for every non-representative buffered
+           token of a transform-mode aggregation flush, recorded atomically
+           inside expand_token by _route_transform_results. That is the
+           NORMAL SUCCESS path: an aggregation inside a fork branch consumes
+           branch tokens no coalesce roster ever hears about.
+        2. (FAILURE, QUARANTINED_AT_SOURCE) inside a NON-EMPTY aggregation
+           flush (same method). The EMPTY-emission path notifies per
+           buffered token via _route_empty_emission_results; the non-empty
+           path does not.
+        3. Held-sibling failures the CoalesceExecutor writes directly via
+           record_token_outcome(FAILURE, UNROUTED) — three sites in
+           engine/coalesce_executor.py.
+
+        Any design assuming "every terminal disposition notifies the
+        barrier" is wrong in the direction that wedges a run. The unified
+        settle-member seam retires this method and the bypasses above
+        (docs/superpowers/specs/2026-08-21-barrier-scopes-full-nesting-spec.md
+        §6.1).
+
+        Arm exclusivity: a fork branch joins at most one of
+        coalesce/row_union (pairwise checks in RowProcessor.__init__), so at
+        most one arm stages a loss for the FORK identity — but a token can
+        simultaneously be a fork branch AND an expand child, so "one group
+        per token" is false and an arm keyed on expand membership would
+        legitimately co-fire with a fork arm. Do not extend this dispatcher
+        on a one-arm assumption.
         """
         results = self._notify_coalesce_of_lost_branch(
             current_token,
