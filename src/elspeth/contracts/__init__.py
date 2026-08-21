@@ -165,6 +165,7 @@ from elspeth.contracts.enums import (
     DerivedAuditCharacteristics,
     Determinism,
     ExportStatus,
+    FrameKind,
     NodeStateStatus,
     NodeType,
     OutputMode,
@@ -244,7 +245,7 @@ from elspeth.contracts.header_modes import (
     resolve_headers,
 )
 from elspeth.contracts.identifiers import validate_field_name, validate_field_names
-from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.identity import LineageFrame, TokenInfo
 from elspeth.contracts.node_state_context import (
     AggregationFlushContext,
     GateEvaluationContext,
@@ -481,6 +482,7 @@ __all__ = [  # Grouped by category for readability
     "DerivedAuditCharacteristics",
     "Determinism",
     "ExportStatus",
+    "FrameKind",
     "NodeStateStatus",
     "NodeType",
     "OutputMode",
@@ -495,6 +497,7 @@ __all__ = [  # Grouped by category for readability
     "TriggerType",
     "error_edge_label",
     # identity
+    "LineageFrame",
     "TokenInfo",
     # identifiers
     "validate_field_name",

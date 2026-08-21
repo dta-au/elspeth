@@ -5,10 +5,118 @@ These types answer: "How do we refer to things?"
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.freeze import require_int
 from elspeth.contracts.schema_contract import PipelineRow
+
+
+@dataclass(frozen=True, slots=True)
+class LineageFrame:
+    """One (kind, group_id, member_key) lineage-path entry (spec §4.1).
+
+    Frames are minted only by the opening primitives inside TokenManager /
+    DataFlowTokenRepository — never asserted by failing code — which is what
+    makes the §6.2 loss guard self-authenticating.
+    """
+
+    kind: FrameKind
+    group_id: str
+    member_key: str
+
+    def __post_init__(self) -> None:
+        if type(self.kind) is not FrameKind:
+            raise TypeError(f"LineageFrame.kind must be FrameKind, got {type(self.kind).__name__}: {self.kind!r}")
+        for field_name, value in (("group_id", self.group_id), ("member_key", self.member_key)):
+            if not isinstance(value, str):
+                raise TypeError(f"LineageFrame.{field_name} must be str, got {type(value).__name__}: {value!r}")
+            if not value:
+                raise ValueError(f"LineageFrame.{field_name} must not be empty")
+
+
+def lineage_path_to_json(path: tuple[LineageFrame, ...]) -> str:
+    """Serialize a lineage path (outermost first) for the scheduler journal."""
+    return json.dumps([[frame.kind.value, frame.group_id, frame.member_key] for frame in path], allow_nan=False)
+
+
+def lineage_path_from_json(raw: str) -> tuple[LineageFrame, ...]:
+    """Inverse of lineage_path_to_json. Raises ValueError on corrupt input."""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Corrupt lineage_path JSON: {exc}") from exc
+    if type(payload) is not list:
+        raise ValueError(f"Corrupt lineage_path JSON: expected array, got {type(payload).__name__}")
+    frames: list[LineageFrame] = []
+    for entry in payload:
+        if type(entry) is not list or len(entry) != 3:
+            raise ValueError(f"Corrupt lineage_path frame: expected [kind, group_id, member_key], got {entry!r}")
+        kind_raw, group_id, member_key = entry
+        try:
+            kind = FrameKind(kind_raw)
+        except ValueError as exc:
+            raise ValueError(f"Corrupt lineage_path frame kind: {kind_raw!r}") from exc
+        frames.append(LineageFrame(kind=kind, group_id=group_id, member_key=member_key))
+    return tuple(frames)
+
+
+def innermost_fork_frame(path: tuple[LineageFrame, ...]) -> LineageFrame | None:
+    """The innermost FORK frame — WS1b's branch_name/fork_group_id accessor source."""
+    for frame in reversed(path):
+        if frame.kind is FrameKind.FORK:
+            return frame
+    return None
+
+
+def innermost_expand_frame(path: tuple[LineageFrame, ...]) -> LineageFrame | None:
+    """The innermost EXPAND frame — WS1b's expand_group_id accessor source."""
+    for frame in reversed(path):
+        if frame.kind is FrameKind.EXPAND:
+            return frame
+    return None
+
+
+def path_branch_name(path: tuple[LineageFrame, ...]) -> str | None:
+    """Derived branch_name (§4.1a): the innermost FORK frame's member_key.
+
+    WS1b re-exposes TokenInfo.branch_name as a property over exactly this
+    function; WS3's loss attribution and WS4's wire fields import it too.
+    """
+    frame = innermost_fork_frame(path)
+    return None if frame is None else frame.member_key
+
+
+def path_fork_group_id(path: tuple[LineageFrame, ...]) -> str | None:
+    """Derived fork_group_id (§4.1a): the innermost FORK frame's group_id."""
+    frame = innermost_fork_frame(path)
+    return None if frame is None else frame.group_id
+
+
+def path_expand_group_id(path: tuple[LineageFrame, ...]) -> str | None:
+    """Derived expand_group_id (§4.1a): the innermost EXPAND frame's group_id."""
+    frame = innermost_expand_frame(path)
+    return None if frame is None else frame.group_id
+
+
+def pop_closer_frame(path: tuple[LineageFrame, ...], *, kind: FrameKind, group_id: str) -> tuple[LineageFrame, ...]:
+    """Strict pop (spec rulings 24/28): remove exactly the closer's own frame.
+
+    The closer names the frame it is entitled to pop (kind + group_id).
+    Anything else — an empty path, a different innermost kind, a different
+    group — is lineage corruption, never a recoverable state. Both strict-pop
+    layers (engine coalesce_tokens and the durable Tier-1 twin) route through
+    this one function so the refusal semantics cannot drift.
+    """
+    if not path or path[-1].kind is not kind or path[-1].group_id != group_id:
+        innermost = path[-1] if path else None
+        raise OrchestrationInvariantError(
+            f"pop_closer_frame: path has no matching innermost {kind.name} frame for group {group_id!r} "
+            f"(innermost={innermost!r}); a closer pops exactly its own frame (spec rulings 24/28)"
+        )
+    return path[:-1]
 
 
 @dataclass(frozen=True, slots=True)

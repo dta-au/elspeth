@@ -553,3 +553,13 @@ def error_edge_label(producer_id: str) -> str:
         producer_id: Stable transform or config-gate name for error-route labels.
     """
     return f"__error_{producer_id}__"
+
+
+# Lineage-frame kinds (unified lineage spec rev 3.2, §4.1). Closed vocabulary:
+# a FORK group is opened by a fork gate (member_key = declared branch name); an
+# EXPAND group by a multi-row transform activation (member_key = member
+# token_id). A new kind requires a spec amendment — the frames table and
+# group_records both carry a CHECK over this enum.
+class FrameKind(StrEnum):
+    FORK = "fork"
+    EXPAND = "expand"

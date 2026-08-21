@@ -7,7 +7,20 @@ from typing import Any
 
 import pytest
 
-from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import (
+    LineageFrame,
+    TokenInfo,
+    innermost_expand_frame,
+    innermost_fork_frame,
+    lineage_path_from_json,
+    lineage_path_to_json,
+    path_branch_name,
+    path_expand_group_id,
+    path_fork_group_id,
+    pop_closer_frame,
+)
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.testing import make_field
 
@@ -248,6 +261,109 @@ class TestTokenInfoResumeOffsetInvariant:
         t = TokenInfo(**self._kwargs(resume_attempt_offset=0, resume_checkpoint_id="ck-1"))
         assert t.resume_attempt_offset == 0
         assert t.resume_checkpoint_id == "ck-1"
+
+
+class TestLineageFrame:
+    def test_frame_construction_and_freeze(self) -> None:
+        frame = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a")
+        assert frame.kind is FrameKind.FORK
+        with pytest.raises(FrozenInstanceError):
+            frame.group_id = "other"  # type: ignore[misc]
+
+    @pytest.mark.parametrize(
+        ("kind", "group_id", "member_key"),
+        [
+            pytest.param("fork", "fg-1", "path_a", id="kind-is-a-bare-string"),
+            pytest.param(FrameKind.FORK, "", "path_a", id="empty-group-id"),
+            pytest.param(FrameKind.EXPAND, "eg-1", "", id="empty-member-key"),
+            pytest.param(FrameKind.EXPAND, None, "m", id="none-group-id"),
+        ],
+    )
+    def test_frame_rejects_bad_fields(self, kind: object, group_id: object, member_key: object) -> None:
+        with pytest.raises((TypeError, ValueError)):
+            LineageFrame(kind=kind, group_id=group_id, member_key=member_key)  # type: ignore[arg-type]
+
+    def test_json_round_trip_outermost_first(self) -> None:
+        path = (
+            LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-9"),
+            LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),
+        )
+        assert lineage_path_from_json(lineage_path_to_json(path)) == path
+        assert lineage_path_from_json(lineage_path_to_json(())) == ()
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("not json", id="not-json"),
+            pytest.param('{"a": 1}', id="not-a-list"),
+            pytest.param('[["fork", "fg-1"]]', id="two-element-frame"),
+            pytest.param('[["merge", "g", "m"]]', id="unknown-kind"),
+        ],
+    )
+    def test_json_rejects_corrupt_payloads(self, raw: str) -> None:
+        with pytest.raises(ValueError):
+            lineage_path_from_json(raw)
+
+    def test_innermost_helpers_pick_the_innermost_of_each_kind(self) -> None:
+        outer_fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-outer", member_key="a")
+        expand = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1")
+        inner_fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-inner", member_key="b")
+        path = (outer_fork, expand, inner_fork)
+        assert innermost_fork_frame(path) is inner_fork
+        assert innermost_expand_frame(path) is expand
+        assert innermost_fork_frame(()) is None
+        assert innermost_expand_frame((outer_fork,)) is None
+
+    def test_path_wrappers_derive_the_retiring_stored_fields(self) -> None:
+        outer_fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-outer", member_key="a")
+        expand = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1")
+        inner_fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-inner", member_key="b")
+        path = (outer_fork, expand, inner_fork)
+        assert path_branch_name(path) == "b"
+        assert path_fork_group_id(path) == "fg-inner"
+        assert path_expand_group_id(path) == "eg-1"
+        assert path_branch_name(()) is None
+        assert path_fork_group_id(()) is None
+        assert path_expand_group_id((outer_fork,)) is None
+
+
+class TestPopCloserFrame:
+    def test_pops_exactly_the_matching_innermost_frame(self) -> None:
+        outer = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1")
+        inner = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="a")
+        assert pop_closer_frame((outer, inner), kind=FrameKind.FORK, group_id="fg-1") == (outer,)
+        assert pop_closer_frame((outer,), kind=FrameKind.EXPAND, group_id="eg-1") == ()
+
+    @pytest.mark.parametrize(
+        ("path", "kind", "group_id"),
+        [
+            pytest.param((), FrameKind.FORK, "fg-1", id="empty-path"),
+            pytest.param(
+                (LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="t"),),
+                FrameKind.FORK,
+                "eg-1",
+                id="wrong-kind",
+            ),
+            pytest.param(
+                (LineageFrame(kind=FrameKind.FORK, group_id="fg-2", member_key="a"),),
+                FrameKind.FORK,
+                "fg-1",
+                id="wrong-group",
+            ),
+            pytest.param(
+                (
+                    LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="a"),
+                    LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="t"),
+                ),
+                FrameKind.FORK,
+                "fg-1",
+                id="matching-frame-buried-not-innermost",
+            ),
+        ],
+    )
+    def test_refuses_any_non_matching_innermost_frame(self, path: tuple[LineageFrame, ...], kind: FrameKind, group_id: str) -> None:
+        with pytest.raises(OrchestrationInvariantError, match="innermost"):
+            pop_closer_frame(path, kind=kind, group_id=group_id)
 
 
 class TestTokenInfoExtraFields:
