@@ -5777,7 +5777,14 @@ class TestSchemaContractValidation:
     # a planner can apply, have ACCEPTED, and get a byte-identical error back
     # from is the whole defect — so the assertion has to be that it clears.
 
-    def _rule_c_state(self, mapping: dict[str, str], fields: list[str], *, sink_requires: str | None = None) -> CompositionState:
+    def _rule_c_state(
+        self,
+        mapping: dict[str, str],
+        fields: list[str],
+        *,
+        sink_requires: str | None = None,
+        select_only: Any = True,
+    ) -> CompositionState:
         """A minimal source -> field_mapper -> sink composition for Rule C."""
         state = self._empty_state()
         state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
@@ -5787,7 +5794,7 @@ class TestSchemaContractValidation:
                 "t1",
                 "main",
                 plugin="field_mapper",
-                options={"select_only": True, "mapping": mapping, "schema": {"mode": "fixed", "fields": fields}},
+                options={"select_only": select_only, "mapping": mapping, "schema": {"mode": "fixed", "fields": fields}},
             )
         )
         # The sink is what makes a withdrawn guarantee visible. Against a
@@ -5842,6 +5849,55 @@ class TestSchemaContractValidation:
             return result
         finally:
             transform.close()
+
+    def test_rule_c_select_only_gate_agrees_with_the_plugins_parse(self) -> None:
+        """The applicability gate must test the PARSED boolean, not raw-JSON truthiness.
+
+        ``FieldMapperConfig`` reads ``"false"``/``"False"``/``"no"``/``"off"``/
+        ``"0"`` as False while ``bool()`` reads every non-empty string as True.
+        With the drifted gate, a mapper whose parsed ``select_only`` is False
+        was adjudicated under Rule C's select_only-only jurisdiction and the
+        message asserted "with select_only: true" about a configuration the
+        node does not have (elspeth-fc3cd7a86c). The shape below makes the
+        drift observable: 'Name' is a non-fixed-point mapping source, so the
+        select_only=False output declaration abstains from naming the
+        passthrough set and the emit comparison comes up non-empty for ANY
+        value that slips the gate.
+
+        Pinned as value-by-value PARITY with the config class itself — the
+        single owner of the semantics — rather than as a five-string
+        blocklist, so the gate cannot drift from the plugin's parse again in
+        either direction. An unparseable value must fall to the config-parse
+        rules, never to Rule C.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
+
+        mapping = {"Name": "b"}
+        fields = ["b: str", "c: str"]
+        pydantic_false_but_python_truthy = ["false", "False", "no", "off", "0"]  # the drift class
+        pydantic_true_spellings = ["true", "True", "yes", "on", "1", 1, 1.0]  # must keep firing
+        pydantic_false_numerics = [0, 0.0]
+        rejected_at_parse = ["banana", "", None, [], {}]  # config rules' to report, not Rule C's
+        values: list[Any] = [
+            True,
+            False,
+            *pydantic_false_but_python_truthy,
+            *pydantic_true_spellings,
+            *pydantic_false_numerics,
+            *rejected_at_parse,
+        ]
+        for value in values:
+            try:
+                expected = FieldMapperConfig.from_dict(
+                    {"mapping": mapping, "select_only": value, "schema": {"mode": "fixed", "fields": fields}},
+                    plugin_name="field_mapper",
+                ).select_only
+            except PluginConfigError:
+                expected = False
+            result = self._rule_c_state(mapping, fields, select_only=value).validate()
+            fired = self._rule_c_error(result) is not None
+            assert fired is expected, (value, fired, expected, [e.message for e in result.errors])
 
     def test_rule_c_names_the_mapping_source_not_only_the_unguaranteed_target(self) -> None:
         """The remedy must name the SOURCE, because that is what the author declared.

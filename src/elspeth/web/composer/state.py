@@ -60,6 +60,7 @@ from elspeth.plugins.sources.field_normalization import (
     normalize_field_name,
     undeclared_row_fields,
 )
+from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
@@ -3042,11 +3043,13 @@ def _sink_locked_input_set(output: OutputSpec) -> frozenset[str] | None:
     tier=3,
     source="NodeSpecs carrying composer/LLM/user-authored options re-read from session state",
     source_param="nodes",
-    suppresses=("R1",),
+    suppresses=(),
     invariant=(
-        "optional node option flags (e.g. select_only) default at the read site; malformed "
-        "node config surfaces as blocking ValidationEntry results, never a raise (genuine "
-        "engine defects crash through via the config-probe re-raise guards)"
+        "node options are never read raw: optional flags (e.g. select_only) reach rule "
+        "logic only through the plugin's own config parse, which owns their defaults "
+        "(elspeth-fc3cd7a86c); malformed node config surfaces as blocking ValidationEntry "
+        "results, never a raise (genuine engine defects crash through via the config-probe "
+        "re-raise guards)"
     ),
 )
 def _check_schema_contracts(
@@ -3451,6 +3454,23 @@ def _check_schema_contracts(
             return True, transform._output_schema_config
         finally:
             transform.close()
+
+    def _probe_field_mapper_config(options: Mapping[str, Any]) -> FieldMapperConfig | None:
+        """Parse ``options`` through the plugin's own config class, or abstain.
+
+        Returns None for an expected draft/config failure — the config-parse
+        rules own reporting those. Genuine engine defects crash through,
+        matching ``_probe_transform_output_schema``'s tolerance exactly.
+        """
+        try:
+            return FieldMapperConfig.from_dict(
+                prepare_validation_probe_options(options),
+                plugin_name="field_mapper",
+            )
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+            return None
 
     def _mapping_source_of(options: Mapping[str, Any], target: str) -> str:
         """Return the mapping key that emits ``target``.
@@ -5406,13 +5426,21 @@ def _check_schema_contracts(
             continue
         if node.id in parse_failed_producers:
             continue
-        # Read select_only directly from the raw options so the plugin gate
-        # short-circuits before construction and stays free of access to
-        # private plugin instance attributes from outside the plugin layer.
-        # The semantics match ``FieldMapperConfig.select_only``: bool with
-        # default False; any non-false-y option value triggers the reductive
-        # emit semantics that make Rule C applicable.
-        if not bool(node.options.get("select_only", False)):
+        # Gate on the PLUGIN'S parse of select_only, not on raw-JSON
+        # truthiness. The two disagree on exactly the pydantic-False strings
+        # ("false"/"False"/"no"/"off"/"0"): ``bool()`` reads every non-empty
+        # string as True, and the drifted gate adjudicated a mapper whose
+        # parsed select_only is False under this rule's select_only-only
+        # jurisdiction, asserting "with select_only: true" about a
+        # configuration the node does not have (elspeth-fc3cd7a86c).
+        # Constructing the CONFIG asks the single owner of that semantics
+        # while still short-circuiting before plugin construction and
+        # touching no private plugin instance attributes. An unparseable
+        # config is the config-parse rules' to report, never Rule C's.
+        node_cfg = _probe_field_mapper_config(node.options)
+        if node_cfg is None:
+            continue
+        if not node_cfg.select_only:
             # Without select_only, field_mapper preserves input fields by
             # default and falls into the additive/loose-bound regime that we
             # cannot adjudicate without knowing the upstream emit set.
