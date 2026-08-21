@@ -86,6 +86,31 @@ class BranchLossSpec:
 
 
 @dataclass(frozen=True)
+class GroupLossSpec:
+    """Durable group-loss record riding a lossy disposition (spec §6.2, rev 3.2).
+
+    The unified replacement for ``BranchLossSpec``: one loss names one member
+    of one group at one closer. Natural key = (run_id, closer_name, group_id,
+    member_key) — group-scoped, so the rev-2 ledger key collision is
+    structurally impossible. ``token_id`` is recorded for lineage-corruption
+    detection (same-key different-token raises Tier-1). ``reason`` stays
+    within the categorical branch-loss vocabulary — bare shared tokens, never
+    prose. ``recorded_by`` deliberately does NOT ride the spec: the staging
+    repository verb stamps the lease owner it already holds (WS3).
+
+    WS1a defines the type; WS3 lands the writer, the frame-authenticated
+    guard, and the ``BranchLossSpec`` retirement. Until then nothing
+    constructs this outside tests.
+    """
+
+    closer_name: str
+    group_id: str
+    member_key: str
+    token_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class BarrierTerminalOutcomeSpec:
     """One token terminal written atomically with barrier completion."""
 
