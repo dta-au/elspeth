@@ -24,7 +24,21 @@ class WorkItemNavigation(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class WorkItem:
-    """Item in the work queue for DAG processing."""
+    """Item in the work queue for DAG processing.
+
+    TRAP — do not express group/scope bindings as WorkItem fields. The
+    coalesce_*/row_union_* pairs below are the CURSOR ADDRESS of the barrier
+    this item is currently travelling to, not a lineage membership: group
+    membership rides TokenInfo (fork/expand lineage), and the group→closer
+    binding is a build-time property of the graph (the barrier-scopes spec's
+    binding registry, spec §3). The mutual-exclusion check in __post_init__
+    therefore constrains only the cursor — one item cannot be blocked at two
+    barriers — it does NOT mean a token belongs to at most one group: a token
+    can be a fork branch AND an expand child at once. A new barrier kind
+    (e.g. the collector) gets a cursor pair here only if work items actually
+    block at it; its binding lives in the builder registry, never on this
+    dataclass.
+    """
 
     token: TokenInfo
     current_node_id: NodeID | None
