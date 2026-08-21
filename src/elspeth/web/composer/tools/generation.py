@@ -43,6 +43,8 @@ from elspeth.web.composer.source_inspection import (
     inspect_csv_source_content,
 )
 from elspeth.web.composer.state import (
+    _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
+    _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
     _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
     _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
     _TRANSFORM_OUTPUT_COLLISION_EXPLANATION,
@@ -1041,6 +1043,18 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Bind each missing name in that query's input_fields (template variable → row column), rename the reference to a "
         "variable the query already binds, or use '{{ row.source_row.<column> }}' for direct access to the source row.",
     ),
+    # Ordered AFTER the two unbound-name entries deliberately: this code's
+    # headline is "reads ... under 'row'", which neither of their patterns
+    # matches, and matching runs in LIST ORDER against raw text. Serves the
+    # state.py constants rather than a copy — the tool-call surface returns
+    # the message and never this catalogue, the planner's repair turn gets
+    # this catalogue and never the message, so a second copy drifts silently
+    # (elspeth-920bd88299).
+    (
+        r"prompt_template_undeclared_row_fields|required_input_fields does not declare",
+        _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
+        _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
+    ),
     # Plugin-unavailability family. Exact-code patterns only (``re.escape``, no
     # alternation): these codes are short and generic, and a loose pattern here
     # would shadow an unrelated entry above. They sit LAST so every message-shaped
@@ -1153,6 +1167,11 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # A multi-query template referencing row.<name> outside that query's
     # input_fields + {source_row} fails that query at render for every row.
     "query_template_unbound_row_fields",
+    # ── Single-prompt declaration guard (elspeth-a9ba80cb0b) ──────────────
+    # A single-prompt template reading row.<field> outside a declared,
+    # non-empty required_input_fields: the reference escapes the node's
+    # input contract, so nothing obliges a producer to supply the field.
+    "prompt_template_undeclared_row_fields",
     # ── Pre-application semantic rejections (tutorial op 1152d7e3 closure) ──
     # Previously codeless _failure_result sites: the planner saw only the
     # 'validation_error' placeholder while the actionable message was redacted.

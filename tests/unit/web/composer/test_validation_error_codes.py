@@ -31,6 +31,8 @@ from typing import Any
 import pytest
 
 from elspeth.web.composer.state import (
+    _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
+    _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
     _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
     _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
     _TRANSFORM_OUTPUT_COLLISION_EXPLANATION,
@@ -340,6 +342,33 @@ class TestClosedCodeCatalogueInvariants:
             explanation, fix = guidance
             assert explanation and fix
 
+    def test_prompt_template_undeclared_row_fields_resolves_to_its_own_guidance(self) -> None:
+        """The single-prompt declaration guard must not fall through to either sibling.
+
+        ``prompt_template_unbound_variables`` advises "rewrite each name as
+        '{{ row.<field> }}'" — circular here, because the reference already IS
+        ``row.<field>``; the defect is that the DECLARATION does not cover it.
+        ``query_template_unbound_row_fields`` advises ``input_fields`` and
+        ``row.source_row``, neither of which a single-prompt node has
+        (elspeth-a9ba80cb0b).
+        """
+        assert "prompt_template_undeclared_row_fields" in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code("prompt_template_undeclared_row_fields")
+        assert guidance is not None, "prompt_template_undeclared_row_fields does not resolve to catalogue guidance"
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "required_input_fields" in explanation
+        assert "required_input_fields" in fix
+
+        assert guidance != explain_validation_code("prompt_template_unbound_variables")
+        assert guidance != explain_validation_code("query_template_unbound_row_fields")
+
+        # The advice must not steer the planner to the one repair that clears
+        # this error by withdrawing the contract for every OTHER field too.
+        assert "input_fields" not in fix.replace("required_input_fields", "")
+        assert "source_row" not in fix
+
     def test_transform_contract_advice_has_exactly_one_owner(self) -> None:
         """The catalogue must SERVE ``state``'s advice, never restate it.
 
@@ -364,6 +393,10 @@ class TestClosedCodeCatalogueInvariants:
             (
                 "transform_contract_violation",
                 (_TRANSFORM_OUTPUT_COLLISION_EXPLANATION, _TRANSFORM_OUTPUT_COLLISION_FIX),
+            ),
+            (
+                "prompt_template_undeclared_row_fields",
+                (_PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION, _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX),
             ),
         ):
             guidance = explain_validation_code(code)

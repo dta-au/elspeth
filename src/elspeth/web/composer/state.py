@@ -53,7 +53,7 @@ from elspeth.core.config import (
     validate_sink_name,
 )
 from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
-from elspeth.core.templates import extract_jinja2_field_usage
+from elspeth.core.templates import extract_jinja2_field_usage, undeclared_row_fields
 from elspeth.plugins.infrastructure.templates import create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
@@ -1431,6 +1431,22 @@ _TRANSFORM_OUTPUT_COLLISION_FIX: Final[str] = (
     "row does not already carry (for an llm transform that is `response_field`), OR rename/drop the incoming field "
     "upstream with a field_mapper before this node."
 )
+_PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION: Final[str] = (
+    "A single-prompt llm node's prompt_template reads row fields its own options.required_input_fields does not "
+    "declare. That declaration IS the node's input contract: it is what edge validation checks against the upstream "
+    "producer's guarantees and what the engine verifies on every row. A reference outside it is required by nothing, "
+    "so no producer is obliged to supply the field, and a row that arrives without it fails the whole node at render "
+    "with 'Undefined variable' — an unattributed template error rather than a named contract violation. The rejection "
+    "names the node, the fields read, and the fields declared."
+)
+_PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX: Final[str] = (
+    "Change ONLY that node, and pick by which name is right. If the template's spelling is the field you mean, add "
+    "each name it reads to options.required_input_fields (patch_node_options with the full list — it replaces, it "
+    "does not merge). If the DECLARED name is the field the producer actually guarantees, rewrite the template "
+    "reference to that name instead; changing the declaration to match a template typo moves the failure rather than "
+    "clearing it. Do not answer this by emptying required_input_fields: [] opts the node out of the contract for "
+    "every field, including the ones it reads unconditionally."
+)
 
 
 def _is_plugin_config_probe_exception(exc: Exception, *, config_error_prefix: str) -> bool:
@@ -2652,56 +2668,114 @@ _PROMPT_TEMPLATE_GLOBAL_NAMES: frozenset[str] = frozenset(create_sandboxed_envir
     source_param="node",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns a high-severity ValidationEntry only when a string prompt_template parses "
-        "and may load top-level names neither supplied by the render context nor definitely "
-        "assigned locally; absent, mistyped, or unparseable templates yield None (sibling "
-        "rules report those) and never raise"
+        "emits high-severity ValidationEntries only when a string prompt_template parses, and only "
+        "for top-level names neither supplied by the render context nor definitely assigned locally, "
+        "and for row fields outside a declared non-empty required_input_fields; absent, mistyped, or "
+        "unparseable templates and non-list/empty declarations yield () (sibling rules report those) "
+        "and never raise"
     ),
 )
-def _validate_prompt_template_variable_bindings(node: NodeSpec) -> ValidationEntry | None:
-    """Reject prompt templates whose names may be unbound on a render path.
+def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[ValidationEntry, ...]:
+    """Reject single-prompt templates a render path cannot satisfy.
 
-    ``PromptTemplate.render`` supplies exactly ``row`` and ``lookup`` under
-    ``StrictUndefined``, so a bare ``{{ text }}`` raises ``TemplateError:
-    Undefined variable`` at runtime — the model receives none of the row's
-    data, and prompt-shield field-scope reasoning sees an empty protected set
-    (R2-F17 compounding finding). ``{{interpretation:<term>}}`` placeholders
-    are masked before parsing: they are resolved to operator-accepted text
-    upstream of rendering and are not Jinja2 variables.
+    Two independent defects, each with its own error code because the
+    catalogue is keyed on the code and one code must mean one defect:
 
-    Returns None when prompt_template is absent, not a string, or fails to
-    parse (other layers own those shapes), and for multi-query nodes: with
+    * ``prompt_template_unbound_variables`` — ``PromptTemplate.render``
+      supplies exactly ``row`` and ``lookup`` under ``StrictUndefined``, so a
+      bare ``{{ text }}`` raises ``TemplateError: Undefined variable`` at
+      runtime; the model receives none of the row's data and prompt-shield
+      field-scope reasoning sees an empty protected set (R2-F17 compounding
+      finding).
+    * ``prompt_template_undeclared_row_fields`` — a ``row.<field>`` reference
+      outside a declared, non-empty ``required_input_fields``
+      (elspeth-a9ba80cb0b). The composer twin of the single-prompt limb of
+      ``LLMConfig._validate_template_variable_bindings``, and required rather
+      than redundant: the composer's plugin probes DO construct the node and
+      DO see that rejection, then swallow it through
+      ``_is_config_probe_exception`` so a draft pipeline never crashes
+      validation. That abstention is deliberate and test-pinned, so the rule
+      has to be restated here to reach Stage 1 at all. Both surfaces serve the
+      SAME repair advice — the message here and
+      ``_PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX``, which
+      ``tools/generation.py`` imports rather than copies.
+
+    This is a contract check, not a proof of failure: ``row`` is bound to the
+    whole row, so an undeclared reference raises only when that column is in
+    fact absent — which is precisely what the declaration exists to rule out.
+    ``undeclared_row_fields`` owns the comparison, matching a declaration
+    under either the literal or the canonical row key and dropping bracket
+    literals no declaration could express.
+
+    ``{{interpretation:<term>}}`` placeholders are masked before parsing: they
+    are resolved to operator-accepted text upstream of rendering and are not
+    Jinja2 variables — unmasked they are a ``TemplateSyntaxError``, which
+    would silence BOTH limbs on every interpretation-carrying node.
+
+    Returns () when prompt_template is absent, not a string, or fails to parse
+    (other layers own those shapes), and for multi-query nodes: with
     ``queries`` present, each query's ``input_fields`` maps template variables
     to row columns directly (``build_template_context`` in multi_query.py), so
     bare names are the documented idiom there — the same ``queries is None``
     scoping as ``LLMConfig._validate_required_input_fields_appear_in_template``.
     """
     if node.options.get("queries") is not None:
-        return None
+        return ()
     template = node.options.get("prompt_template")
     if not isinstance(template, str):
-        return None
+        return ()
     masked = INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)
     try:
         ast = create_sandboxed_environment().parse(masked)
+        usage = extract_jinja2_field_usage(masked)
     except TemplateSyntaxError:
-        return None
+        return ()
+
+    errors: list[ValidationEntry] = []
     unbound = sorted(find_runtime_unbound_variables(ast) - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
-    if not unbound:
-        return None
-    names = ", ".join(f"'{name}'" for name in unbound)
-    return ValidationEntry(
-        component=f"node:{node.id}",
-        message=(
-            f"prompt_template references {names}, which the prompt render context does not define — "
-            "row data is only available as 'row.<field>' and lookup data as 'lookup.<key>', so "
-            "rendering fails with 'Undefined variable' at runtime and none of the row's data "
-            "reaches the model. Rewrite each name as '{{ row.<field> }}' (matching an upstream "
-            "schema field) or '{{ lookup.<key> }}', or remove the reference."
-        ),
-        severity="high",
-        error_code="prompt_template_unbound_variables",
-    )
+    if unbound:
+        names = ", ".join(f"'{name}'" for name in unbound)
+        errors.append(
+            ValidationEntry(
+                component=f"node:{node.id}",
+                message=(
+                    f"prompt_template references {names}, which the prompt render context does not define — "
+                    "row data is only available as 'row.<field>' and lookup data as 'lookup.<key>', so "
+                    "rendering fails with 'Undefined variable' at runtime and none of the row's data "
+                    "reaches the model. Rewrite each name as '{{ row.<field> }}' (matching an upstream "
+                    "schema field) or '{{ lookup.<key> }}', or remove the reference."
+                ),
+                severity="high",
+                error_code="prompt_template_unbound_variables",
+            )
+        )
+
+    declared = node.options.get("required_input_fields")
+    if isinstance(declared, Sequence) and not isinstance(declared, (str, bytes)):
+        declared_names = tuple(name for name in declared if isinstance(name, str))
+        if declared_names:
+            undeclared = undeclared_row_fields(usage.fields, declared_names)
+            if undeclared:
+                fields = ", ".join(f"'{name}'" for name in undeclared)
+                declared_display = ", ".join(f"'{name}'" for name in sorted(declared_names))
+                errors.append(
+                    ValidationEntry(
+                        component=f"node:{node.id}",
+                        message=(
+                            f"prompt_template reads {fields} under 'row', which this node's "
+                            f"options.required_input_fields does not declare — it declares {declared_display}. "
+                            "required_input_fields is the node's input contract: it is what edge validation checks "
+                            "against the upstream producer's guarantees and what the engine verifies on every row, "
+                            "so a reference outside it is required by nothing and a row arriving without the field "
+                            "fails the whole node at render with 'Undefined variable'. Add each name it reads to "
+                            "options.required_input_fields (send the full list — the patch replaces the option's "
+                            "value, it does not append), or rewrite the reference to a field it already declares."
+                        ),
+                        severity="high",
+                        error_code="prompt_template_undeclared_row_fields",
+                    )
+                )
+    return tuple(errors)
 
 
 # The one name build_template_context injects beside the query's own
@@ -5905,9 +5979,7 @@ class CompositionState:
                 errors.append(abuse_contact_error)
             errors.extend(_validate_web_scrape_http_identity_not_placeholder(node))
 
-            prompt_binding_error = _validate_prompt_template_variable_bindings(node)
-            if prompt_binding_error is not None:
-                errors.append(prompt_binding_error)
+            errors.extend(_validate_prompt_template_variable_bindings(node))
             errors.extend(_validate_multi_query_template_variable_bindings(node))
 
             # ``timeout_seconds`` is a top-level structural-barrier field.

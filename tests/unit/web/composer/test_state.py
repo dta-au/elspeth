@@ -3634,6 +3634,139 @@ class TestPromptTemplateUnboundVariables:
         assert not self._unbound_errors(state)
 
 
+class TestPromptTemplateUndeclaredRowFields:
+    """A single-prompt llm node may declare one row field and reference another.
+
+    Both authoring layers accepted that before elspeth-a9ba80cb0b: the edge
+    contract is satisfied by the DECLARATION, so a producer guaranteeing the
+    declared field passes, and every row then raised ``UndefinedError`` at
+    render. The composer must carry this rule itself — its plugin probes do
+    construct the node and do see the plugin's rejection, then swallow it
+    through ``_is_config_probe_exception`` so a draft never crashes validation.
+    """
+
+    def _state(self, prompt_template: str, **options: object) -> CompositionState:
+        node = NodeSpec(
+            id="classify",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="classified",
+            on_error="discard",
+            options={"prompt_template": prompt_template, "model": "test-model", **options},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _errors(self, state: CompositionState) -> list[ValidationEntry]:
+        return [e for e in state.validate().errors if e.error_code == "prompt_template_undeclared_row_fields"]
+
+    def test_rejects_reference_outside_the_declaration(self) -> None:
+        errors = self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study_1"]))
+        assert errors, "expected prompt_template_undeclared_row_fields"
+        entry = errors[0]
+        assert entry.component == "node:classify"
+        assert entry.severity == "high"
+        assert "'case_study'" in entry.message
+        assert "'case_study_1'" in entry.message
+
+    def test_accepts_a_declared_reference(self) -> None:
+        assert not self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study"]))
+
+    def test_accepts_a_declaration_wider_than_the_template(self) -> None:
+        assert not self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study", "audit_id"]))
+
+    def test_empty_declaration_is_the_documented_opt_out(self) -> None:
+        assert not self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=[]))
+
+    def test_absent_declaration_is_the_sibling_validators_business(self) -> None:
+        assert not self._errors(self._state("Rate: {{ row.case_study }}"))
+
+    def test_multi_query_nodes_are_out_of_scope(self) -> None:
+        """Multi-query binds ``row`` per query from ``input_fields``; its own rule owns that."""
+        state = self._state(
+            "Rate: {{ row.case_study }}",
+            required_input_fields=["case_study_1"],
+            queries={"q1": {"input_fields": {"case_study": "case_study_1"}}},
+        )
+        assert not self._errors(state)
+
+    def test_original_header_literal_is_not_reported(self) -> None:
+        """``row["Original Header"]`` is not a declarable name at all.
+
+        It resolves at render through ``SchemaContract.resolve_name``, so
+        reporting it would emit a rejection whose only "repair" is emptying the
+        declaration for every other field too.
+        """
+        assert not self._errors(self._state('Rate: {{ row["Original Header"] }}', required_input_fields=["original_header"]))
+
+    def test_case_variant_reference_is_not_reported(self) -> None:
+        assert not self._errors(self._state("Hello {{ row.Name }}", required_input_fields=["name"]))
+
+    def test_interpretation_placeholder_does_not_silence_the_rule(self) -> None:
+        """Unmasked, ``{{interpretation:...}}`` is a TemplateSyntaxError that would
+        abstain BOTH limbs on every interpretation-carrying node."""
+        errors = self._errors(
+            self._state("Rate how {{interpretation:cool}} {{ row.case_study }} is.", required_input_fields=["case_study_1"])
+        )
+        assert errors
+        assert "'case_study'" in errors[0].message
+
+    def test_both_limbs_can_fire_on_one_node(self) -> None:
+        """A bare name and an undeclared row field are separate defects with separate codes."""
+        codes = {
+            e.error_code for e in self._state("{{ text }} {{ row.case_study }}", required_input_fields=["case_study_1"]).validate().errors
+        }
+        assert "prompt_template_unbound_variables" in codes
+        assert "prompt_template_undeclared_row_fields" in codes
+
+    def test_message_routes_to_its_own_catalogue_entry(self) -> None:
+        """``_VALIDATION_ERROR_PATTERNS`` matches in LIST ORDER against raw text.
+
+        The two prompt_template codes are neighbours in that list and the
+        unbound-variables pattern also matches the phrase "prompt render
+        context does not define", so a message reusing that natural phrasing
+        would be served the wrong repair — advice telling the planner to
+        "rewrite each name as row.<field>" when the reference already IS
+        row.<field>, which sends it in a circle.
+        """
+        from elspeth.web.composer.state import (
+            _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
+        )
+        from elspeth.web.composer.tools.generation import _VALIDATION_ERROR_PATTERNS
+
+        def first_match_fix(message: str) -> str | None:
+            for pattern, _explanation, fix in _VALIDATION_ERROR_PATTERNS:
+                if re.search(pattern, message):
+                    return fix
+            return None
+
+        errors = self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study_1"]))
+        assert errors
+        assert first_match_fix(errors[0].message) is _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX
+
+    def test_named_repair_clears_the_error(self) -> None:
+        """Pin TRUTH, not existence: applying the advice must actually clear it.
+
+        Both named remedies are exercised — declaring the field the template
+        reads, and rewriting the reference to the field already declared.
+        """
+        assert not self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study"]))
+        assert not self._errors(self._state("Rate: {{ row.case_study_1 }}", required_input_fields=["case_study_1"]))
+
+
 class TestMultiQueryTemplateVariableBindings:
     """Multi-query LLM templates render with ``row`` bound to the query's
     synthetic context (``build_template_context``: input_fields variables plus

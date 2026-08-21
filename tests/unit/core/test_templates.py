@@ -1070,3 +1070,82 @@ class TestExtractJinja2FieldsWithDetails:
 
         result = extract_jinja2_fields_with_details('{% set k = "ssn" %}{{ row[k] }}')
         assert result == {DYNAMIC_ROW_FIELD: ["item_dynamic"]}
+
+
+class TestUndeclaredRowFields:
+    """``undeclared_row_fields`` is the shared config-time coverage predicate.
+
+    Both authoring surfaces call it (``LLMConfig`` and the composer's
+    ``_validate_prompt_template_variable_bindings``), so a defect here is a
+    defect in both at once (elspeth-a9ba80cb0b).
+    """
+
+    def _u(self, fields: set[str], declared: list[str]) -> tuple[str, ...]:
+        from elspeth.core.templates import undeclared_row_fields
+
+        return undeclared_row_fields(fields, declared)
+
+    def test_reports_a_field_the_declaration_does_not_cover(self) -> None:
+        assert self._u({"case_study"}, ["case_study_1"]) == ("case_study",)
+
+    def test_literal_match_covers(self) -> None:
+        assert self._u({"case_study"}, ["case_study"]) == ()
+
+    def test_wider_declaration_covers(self) -> None:
+        assert self._u({"case_study"}, ["case_study", "audit_id"]) == ()
+
+    def test_reports_only_the_shortfall_sorted(self) -> None:
+        assert self._u({"zeta", "alpha", "a"}, ["a"]) == ("alpha", "zeta")
+
+    def test_canonical_limb_covers_a_case_variant(self) -> None:
+        """``{{ row.Name }}`` and a declared ``name`` are one field.
+
+        Declaration literals and template literals name fields in two different
+        spaces; comparing only literals was the defect this limb repairs. Note
+        the POLARITY is the reverse of ``field_mapper``'s overlap rule, where
+        the canonical limb ADDS rejections: coverage here is a reason to stay
+        silent, so this limb REMOVES them and the rule under-reports rather
+        than inventing a rejection no declaration can satisfy.
+        """
+        assert self._u({"Name"}, ["name"]) == ()
+        assert self._u({"name"}, ["Name"]) == ()
+
+    def test_canonical_limb_does_not_cover_a_genuinely_different_field(self) -> None:
+        """The limb must not collapse unrelated names — it is a spelling bridge, not a wildcard."""
+        assert self._u({"case_study"}, ["case_study_1"]) == ("case_study",)
+        assert self._u({"first_name"}, ["firstname"]) == ("first_name",)
+
+    def test_undeclarable_bracket_literal_is_dropped(self) -> None:
+        """``row["Original Header"]`` cannot appear in ``required_input_fields`` at all.
+
+        ``validate_field_names`` requires an identifier, so reporting it would
+        emit a rejection whose only "repair" is emptying the declaration for
+        every other field too. It resolves at render through
+        ``SchemaContract.resolve_name``, which accepts either spelling.
+        """
+        assert self._u({"Original Header"}, ["original_header"]) == ()
+        assert self._u({"Original Header"}, ["something_else"]) == ()
+
+    def test_python_keyword_literal_is_dropped(self) -> None:
+        assert self._u({"class"}, ["class_"]) == ()
+        assert self._u({"class"}, ["unrelated"]) == ()
+
+    def test_dotted_literal_is_dropped(self) -> None:
+        assert self._u({"meta.prompt"}, ["meta_prompt"]) == ()
+
+    def test_declarable_underscore_is_still_reported(self) -> None:
+        """``_`` IS a legal declaration entry, so its shortfall is repairable and honest.
+
+        It normalizes to nothing, so only the literal limb can cover it — the
+        canonical limb must not swallow it into silence.
+        """
+        assert self._u({"_"}, ["x"]) == ("_",)
+        assert self._u({"_"}, ["_"]) == ()
+
+    def test_undeclarable_declaration_entries_cover_nothing(self) -> None:
+        """A declaration the config layer would reject cannot silence a real shortfall."""
+        assert self._u({"a"}, ["Original Header"]) == ("a",)
+
+    def test_empty_inputs(self) -> None:
+        assert self._u(set(), ["a"]) == ()
+        assert self._u({"a"}, []) == ("a",)

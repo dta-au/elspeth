@@ -8,6 +8,61 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-21 — a config-time DECLARATION check compares two name spaces, and
+  the shortfall may be UNDECLARABLE** (landed with elspeth-a9ba80cb0b). A
+  single-prompt `llm` node could declare `required_input_fields: ["case_study_1"]`
+  while its template read `{{ row.case_study }}`: presence was checked,
+  agreement never was, and the edge contract was satisfied by the DECLARATION,
+  so every row raised `UndefinedError` at render. Multi-query already had this
+  check; the single-prompt branch did not. Five traps, all measured:
+  - **Do NOT copy the multi-query message.** A query renders a SYNTHETIC context
+    (`input_fields` + `source_row`), so an unbound `row.<name>` provably raises.
+    Single-prompt binds `row` to the WHOLE row, so an undeclared reference
+    raises only when that column is in fact absent. The claim "fails for every
+    row" is FALSE here. It is a CONTRACT check — the reference escapes the set
+    the DAG checks against upstream guarantees and
+    `verify_declared_required_fields` re-checks per row.
+  - **The naive `fields - declared` diff is wrong and no corpus finds it.**
+    `extract_jinja2_field_usage('{{ row["Original Header"] }}')` returns the RAW
+    LITERAL, while `validate_field_names` requires every `required_input_fields`
+    entry to be a non-keyword identifier — so the literal is UNDECLARABLE and
+    the rejection's only "repair" is `required_input_fields: []`, which
+    withdraws the contract for every other field too. `PipelineRow.__getitem__`
+    resolves through `contract.resolve_name`, which accepts the original OR the
+    normalized spelling, so that template is correct code. `undeclared_row_fields`
+    (`core/templates.py`) now single-owns the comparison: DROP a field with no
+    declarable form, and cover on EITHER the literal or the canonical row key.
+  - **The canonical limb's POLARITY is the reverse of `field_mapper`'s** (the
+    2026-08-21 entry below). There the canonical key ADDS rejections and fails
+    closed; here coverage is a reason to stay SILENT, so it REMOVES them. The
+    `{'B','b'}`-distinct-keys hazard therefore yields a false NEGATIVE, which is
+    the correct direction for a NEW rule. Do not "fix" it back to fail-closed.
+  - **Do NOT attempt guard analysis.** Measured through the real
+    `PromptTemplate`: `{% if row.x is defined %}`, `{{ row.x | default('') }}`,
+    `{% if 'x' in row %}` and `{{ row.get('x','') }}` RENDER when the column is
+    absent, while `{% if row.x %}`, `{{ row.x if row.x else '' }}`,
+    `{{ row.x or 'n/a' }}` and `{{ '' if row.x is none else row.x }}` RAISE —
+    one token apart. A genuinely optional guarded read is the one shape this
+    rule has no honest repair for; ZERO exist in the tree (the one that looks
+    like a guard, `examples/chroma_rag_qa`'s `{% if row.sci__rag_context %}`,
+    is a FAKE guard that raises and whose declaration is load-bearing). A
+    hand-rolled analyser over that surface is unvalidatable by corpus
+    agreement, because the shapes are not in the tree.
+  - **The composer twin is REQUIRED, not redundant.** Measured: the composer's
+    probes DO construct the node and DO see the plugin's rejection — three
+    times inside one `validate()` (`_semantic_validator._instantiate_consumer`,
+    `_probe_transform_declared_inputs`, `_probe_transform_declared_output_fields`)
+    — and every one swallows it through `_is_config_probe_exception`, which is
+    deliberate and test-pinned so a draft never crashes validation. Stage 2
+    preflight does reject, but only via `preview_pipeline`, and codelessly
+    (`error_code=None`, matched by 0 of the 115 `_VALIDATION_ERROR_PATTERNS`).
+  Two sibling facts for anyone testing near this: use `schema: {"mode":
+  "observed"}` in a fixture — a `mode: fixed` block makes
+  `_reject_fixed_schema_omitting_consumed_fields` reject EVERY case including
+  the correct one, so the test passes for the wrong reason. And pydantic
+  compiles `model_validator`s at class-build time, so reassigning one post-hoc
+  to instrument it is a SILENT no-op — hook `model_validate` instead.
+
 - **2026-08-21 — repair advice for a composer error code has TWO surfaces on
   DISJOINT paths, and one error code must mean ONE defect** (landed with
   elspeth-920bd88299). A validation error's remedy text reaches the LLM planner

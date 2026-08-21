@@ -1211,12 +1211,17 @@ class TestRequiredInputFieldsAppearInTemplate:
         assert sorted(config.required_input_fields or []) == ["content", "url"]
 
     def test_declared_fields_with_partial_row_interpolation_accepted(self) -> None:
-        """Validator fires only on the empty-row-refs case, not on partial overlap.
+        """Validator fires only on the empty-row-refs case, not on a superset declaration.
 
-        Partial mismatch (declared fields not all interpolated, or extra row refs
-        not declared) is a softer signal; rejecting it would break legitimate
-        cases like "declared a field for downstream cleanup but not used in this
-        specific prompt body." The reciprocity guidance lives in the skill prompt.
+        A declaration WIDER than the template is legitimate — "declared a field
+        for downstream cleanup but not interpolated in this prompt body" is a
+        real presence assertion, and this validator must not reject it.
+
+        The converse is NOT symmetric and this docstring used to claim it was:
+        extra row refs the declaration does not cover are rejected by
+        ``_validate_template_variable_bindings`` (elspeth-a9ba80cb0b). A
+        reference outside the declaration escapes the node's input contract
+        entirely, so nothing obliges a producer to supply it.
         """
         config = LLMConfig(
             provider="openrouter",
@@ -1986,6 +1991,117 @@ class TestTemplateVariableBindings:
         binding error."""
         with pytest.raises(ValidationError, match="dynamic row field access"):
             self._single("Secret: {{ row.get(k) }}", required_input_fields=["text"])
+
+    # ── Single-prompt declaration agreement (elspeth-a9ba80cb0b) ────────
+
+    def test_single_prompt_row_field_outside_declaration_rejected(self) -> None:
+        """The reported defect: declare one field, reference another.
+
+        Both were accepted before, the edge contract was satisfied by the
+        DECLARATION, and every row then raised ``UndefinedError`` at render.
+        """
+        with pytest.raises(ValidationError, match="required_input_fields does not declare") as exc_info:
+            self._single("Rate: {{ row.case_study }}", required_input_fields=["case_study_1"])
+        message = str(exc_info.value)
+        assert "'case_study'" in message
+        assert "'case_study_1'" in message
+
+    def test_single_prompt_declared_reference_accepted(self) -> None:
+        template = "Rate: {{ row.case_study }}"
+        assert self._single(template, required_input_fields=["case_study"]).prompt_template == template
+
+    def test_single_prompt_wider_declaration_accepted(self) -> None:
+        """A declaration wider than the template is a presence assertion, not a defect."""
+        template = "Rate: {{ row.case_study }}"
+        assert self._single(template, required_input_fields=["case_study", "audit_id"]).prompt_template == template
+
+    def test_single_prompt_partially_declared_rejected(self) -> None:
+        """Reads two fields, declares one — the shortfall names only the undeclared field."""
+        with pytest.raises(ValidationError, match="required_input_fields does not declare") as exc_info:
+            self._single("{{ row.a }} {{ row.b }}", required_input_fields=["a"])
+        message = str(exc_info.value)
+        assert "reads 'b' under 'row'" in message
+        assert "reads 'a'" not in message and "'a', 'b'" not in message, "the declared field is not part of the shortfall"
+
+    def test_single_prompt_conditional_reference_is_not_a_guard(self) -> None:
+        """``{% if row.b %}`` forces ``__bool__`` on StrictUndefined and RAISES.
+
+        Measured, not assumed — it reads like an optional guard and is not one,
+        so it must be reported like any other unconditional read. (``is defined``
+        and ``| default()`` genuinely do tolerate absence; no in-tree template
+        pairs either with a non-empty declaration, and this rule deliberately
+        does not attempt guard analysis to tell them apart.)
+        """
+        with pytest.raises(ValidationError, match="required_input_fields does not declare"):
+            self._single("{% if row.b %}{{ row.b }}{% endif %}", required_input_fields=["a"])
+
+    def test_single_prompt_undeclared_reference_raises_at_render_today(self) -> None:
+        """Pins the runtime consequence the rejection claims, so the message cannot drift.
+
+        Without this the message's "fails the whole node at render" is an
+        unverified assertion, and an ``| default()``-style change to the
+        sandbox would silently make it false.
+        """
+        from elspeth.plugins.infrastructure.templates import TemplateError
+        from elspeth.plugins.transforms.llm.templates import PromptTemplate
+
+        with pytest.raises(TemplateError, match="Undefined variable"):
+            PromptTemplate("Rate: {{ row.case_study }}").render({"case_study_1": "x"})
+
+    def test_single_prompt_original_header_literal_accepted_against_normalized_declaration(self) -> None:
+        """``row["Original Header"]`` resolves through ``SchemaContract.resolve_name``.
+
+        The literal is not a declarable name at all (``validate_field_names``
+        requires an identifier), so a literal-only comparison would emit a
+        rejection whose only "repair" is abandoning the contract wholesale.
+        """
+        template = 'Rate: {{ row["Original Header"] }}'
+        assert self._single(template, required_input_fields=["original_header"]).prompt_template == template
+
+    def test_single_prompt_case_variant_reference_accepted(self) -> None:
+        """``{{ row.Name }}`` and a declared ``name`` are one field under the canonical key."""
+        template = "Hello {{ row.Name }}"
+        assert self._single(template, required_input_fields=["name"]).prompt_template == template
+
+    def test_single_prompt_keyword_literal_accepted(self) -> None:
+        """``row["class"]`` cannot be declared — ``class`` is a Python keyword."""
+        template = 'Rate: {{ row["class"] }}'
+        assert self._single(template, required_input_fields=["class_"]).prompt_template == template
+
+    def test_single_prompt_declaration_opt_out_suppresses_the_check(self) -> None:
+        """``required_input_fields: []`` is the documented opt-out and must keep working."""
+        template = "Rate: {{ row.case_study }}"
+        assert self._single(template, required_input_fields=[]).prompt_template == template
+
+    def test_single_prompt_undeclared_check_does_not_fire_without_a_declaration(self) -> None:
+        """``None`` belongs to the sibling declared-validator, which owns the better message."""
+        with pytest.raises(ValidationError, match="is not declared") as exc_info:
+            self._single("Rate: {{ row.case_study }}", required_input_fields=None)
+        assert "does not declare" not in str(exc_info.value)
+
+    def test_undeclared_check_yields_to_the_dynamic_access_validator(self) -> None:
+        """Dynamic access is defined first and keeps its own opt-out guidance."""
+        with pytest.raises(ValidationError, match="dynamic row field access"):
+            self._single("Rate: {{ row[k] }} {{ row.case_study }}", required_input_fields=["case_study_1"])
+
+    def test_declared_validator_suggests_a_value_the_binding_check_then_accepts(self) -> None:
+        """Applying the suggested remedy must CLEAR the error, not return a new one.
+
+        The undeclared-fields message emits its suggestion verbatim; before this
+        it emitted raw bracket literals that ``validate_field_names`` rejects on
+        application, so the planner's only repair was itself invalid.
+        """
+        import json
+        import re
+
+        template = 'A {{ row["Original Header"] }} B {{ row.text }} C {{ row["!!!"] }}'
+        with pytest.raises(ValidationError) as exc_info:
+            self._single(template, required_input_fields=None)
+        suggestion = re.search(r"options\.required_input_fields: (\[[^\]]*\])  # Require", str(exc_info.value))
+        assert suggestion is not None, "no machine-applicable suggestion in the message"
+        suggested = json.loads(suggestion.group(1))
+
+        assert self._single(template, required_input_fields=suggested).required_input_fields == suggested
 
     # ── Multi-query mode ────────────────────────────────────────────────
 

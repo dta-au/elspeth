@@ -35,6 +35,33 @@ _PROMPT_GLOBAL_NAMES: frozenset[str] = frozenset(create_sandboxed_environment().
 _MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
 
 
+def _declarable_suggestion(name: str) -> str | None:
+    """The ``required_input_fields`` entry that covers a template row field.
+
+    Returns the name itself when it is already declarable, else the canonical
+    row key it resolves to at render, else None when it has no declarable form.
+    The counterpart of ``undeclared_row_fields``' coverage limbs: whatever this
+    suggests, that check must then accept.
+    """
+    from elspeth.contracts.identifiers import validate_field_name
+    from elspeth.plugins.sources.field_normalization import ExternalHeaderError, normalize_field_name
+
+    def declarable(candidate: str) -> bool:
+        try:
+            validate_field_name(candidate, "required_input_fields entry", strip=True)
+        except ValueError:
+            return False
+        return True
+
+    if declarable(name):
+        return name.strip()
+    try:
+        canonical = normalize_field_name(name)
+    except ExternalHeaderError:
+        return None
+    return canonical if declarable(canonical) else None
+
+
 class LLMConfig(TransformDataConfig):
     """Configuration for LLM transforms.
 
@@ -318,7 +345,19 @@ class LLMConfig(TransformDataConfig):
 
             if extracted:
                 required_fields = sorted(extracted)
-                required_fields_json = json.dumps(required_fields)
+                # The suggested value must be one ``validate_field_names`` will
+                # accept. A bracket read returns its literal verbatim, so
+                # ``{{ row["Original Header"] }}`` extracts a name no
+                # declaration can carry; suggesting it hands the planner a
+                # repair that is rejected on application. Offer the canonical
+                # row key such a literal resolves to at render
+                # (``SchemaContract.resolve_name`` accepts either spelling),
+                # and drop a name with no declarable form at all
+                # (elspeth-a9ba80cb0b).
+                suggested_fields = sorted(
+                    {entry for entry in (_declarable_suggestion(name) for name in required_fields) if entry is not None}
+                )
+                required_fields_json = json.dumps(suggested_fields)
                 raise ValueError(
                     f"LLM prompt_template references row fields {required_fields} but "
                     f"options.required_input_fields is not declared.\n\n"
@@ -398,7 +437,28 @@ class LLMConfig(TransformDataConfig):
           legacy positional ``{{ input_N }}`` idiom, which is a bare name);
         * in multi-query mode, a ``row.<name>`` reference outside that
           query's ``input_fields`` keys + ``{source_row}`` raises
-          ``Undefined variable`` when that query renders.
+          ``Undefined variable`` when that query renders;
+        * in single-prompt mode, a ``row.<name>`` reference outside
+          ``required_input_fields`` (elspeth-a9ba80cb0b). This limb is a
+          CONTRACT check, not a proof of failure, and its wording must not
+          borrow the multi-query branch's. A query renders a synthetic context,
+          so an unbound name provably raises; single-prompt binds ``row`` to
+          the WHOLE row, so an undeclared reference raises only when that
+          column happens to be absent — which is exactly what the declaration
+          exists to rule out. ``required_input_fields`` is the audited set the
+          DAG checks against upstream guarantees and
+          ``verify_declared_required_fields`` re-checks per row, so a reference
+          outside it escapes both. Skipped when the declaration is ``None``
+          (the sibling validator above already rejects that with row
+          references present) and when it is ``[]``, the documented opt-out.
+          ``undeclared_row_fields`` owns the comparison; it drops undeclarable
+          bracket literals and matches case variants, so the only remedy this
+          limb ever names — declare the name, or rewrite the reference — always
+          clears it. A genuinely OPTIONAL read guarded by ``is defined`` /
+          ``| default()`` is the one shape with no honest repair here; none
+          exists in the tree, and guard analysis is deliberately not attempted
+          (``{% if row.x %}`` raises where ``{% if row.x is defined %}`` does
+          not, one token apart).
 
         Each query's effective template is its ``template`` override when
         present, else the node-level ``prompt_template``; a node-level
@@ -414,7 +474,7 @@ class LLMConfig(TransformDataConfig):
         primacy over a plain binding error (after-validators run in
         definition order).
         """
-        from elspeth.core.templates import extract_jinja2_field_usage
+        from elspeth.core.templates import extract_jinja2_field_usage, undeclared_row_fields
 
         env = create_sandboxed_environment()
 
@@ -435,6 +495,25 @@ class LLMConfig(TransformDataConfig):
                     "the row's data reaches the model. Rewrite each name as '{{ row.<field> }}' or "
                     "'{{ lookup.<key> }}', or remove the reference."
                 )
+            if self.required_input_fields:
+                undeclared = undeclared_row_fields(
+                    extract_jinja2_field_usage(self.prompt_template).fields,
+                    self.required_input_fields,
+                )
+                if undeclared:
+                    fields = ", ".join(f"'{name}'" for name in undeclared)
+                    declared_names = ", ".join(f"'{name}'" for name in sorted(self.required_input_fields))
+                    raise ValueError(
+                        f"LLM prompt_template reads {fields} under 'row', which "
+                        f"options.required_input_fields does not declare — it declares {declared_names}. "
+                        "required_input_fields IS this node's input contract: it is what the DAG checks "
+                        "against the upstream producer's guarantees and what the engine verifies on every "
+                        "row. A reference outside it is required by nothing, so no producer is obliged to "
+                        "supply it, and a row that arrives without it fails the whole node at render with "
+                        "'Undefined variable' — an unattributed template error rather than a named contract "
+                        "violation. Add each name to options.required_input_fields, or rewrite the "
+                        "reference to a field it already declares."
+                    )
             return self
 
         node_template_specs: list[str] = []
