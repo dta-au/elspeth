@@ -34,6 +34,7 @@ from elspeth.contracts.data import PluginSchema as _PermissiveSchema
 from elspeth.contracts.declaration_contracts import _attach_contract_name_from_dispatcher
 from elspeth.contracts.enums import (
     BatchStatus,
+    FrameKind,
     NodeStateStatus,
     RoutingMode,
     RunStatus,
@@ -52,6 +53,7 @@ from elspeth.contracts.errors import (
     SinkTransactionalInvariantError,
     SourceGuaranteedFieldsViolation,
 )
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import FailureInfo, GateResult
 from elspeth.contracts.routing import RoutingAction
 from elspeth.contracts.schema import SchemaConfig
@@ -150,12 +152,24 @@ def _persist_token_for_scheduler(
             data=token.row_data.to_dict(),
         )
     if factory.query.get_token(token.token_id) is None:
+        resolved_fork_group_id = token.fork_group_id or (f"test-fork:{token.row_id}" if token.branch_name is not None else None)
+        # A fabricated branch token models a fork child — mint the matching
+        # FORK lineage frame via the create_token(..., lineage_frames=) seam
+        # so coalesce_tokens' durable strict pop (spec rulings 24/28) has a
+        # frame to pop. Never weaken the pop to accommodate a raw-seeded
+        # fixture; fix the fixture instead.
+        lineage_frames = (
+            (LineageFrame(kind=FrameKind.FORK, group_id=resolved_fork_group_id, member_key=token.branch_name),)
+            if token.branch_name is not None and resolved_fork_group_id is not None
+            else ()
+        )
         factory.data_flow.create_token(
             token.row_id,
             token_id=token.token_id,
             branch_name=token.branch_name,
-            fork_group_id=token.fork_group_id or (f"test-fork:{token.row_id}" if token.branch_name is not None else None),
+            fork_group_id=resolved_fork_group_id,
             join_group_id=token.join_group_id,
+            lineage_frames=lineage_frames,
         )
 
 

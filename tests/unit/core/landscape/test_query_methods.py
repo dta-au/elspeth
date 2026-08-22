@@ -634,11 +634,18 @@ class TestGetTokenParents:
 
     def test_returns_parents_after_coalesce(self):
         _, factory = _setup_full()
-        # Create a second token to coalesce with
-        factory.data_flow.create_token("row-1", token_id="tok-2")
+        # coalesce_tokens' durable strict pop (spec rulings 24/28) requires an
+        # innermost shared FORK lineage frame on every parent, so the coalesce
+        # partners here are real fork_token children rather than two
+        # independently-created tokens.
+        children, _fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id="tok-1", run_id="run-1"),
+            row_id="row-1",
+            branches=["path-a", "path-b"],
+        )
 
         merged = factory.data_flow.coalesce_tokens(
-            parent_refs=[TokenRef(token_id="tok-1", run_id="run-1"), TokenRef(token_id="tok-2", run_id="run-1")],
+            parent_refs=[TokenRef(token_id=c.token_id, run_id="run-1") for c in children],
             row_id="row-1",
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
@@ -648,8 +655,8 @@ class TestGetTokenParents:
 
         assert len(parents) == 2
         parent_ids = [p.parent_token_id for p in parents]
-        assert "tok-1" in parent_ids
-        assert "tok-2" in parent_ids
+        assert children[0].token_id in parent_ids
+        assert children[1].token_id in parent_ids
         # Ordered by ordinal
         assert parents[0].ordinal == 0
         assert parents[1].ordinal == 1
@@ -1249,20 +1256,31 @@ class TestGetAllTokenParentsForRun:
 
     def test_returns_parents_from_coalesce(self):
         _, factory = _setup_full()
-        factory.data_flow.create_token("row-1", token_id="tok-2")
+        # coalesce_tokens' durable strict pop (spec rulings 24/28) requires an
+        # innermost shared FORK lineage frame on every parent, so the coalesce
+        # partners here are real fork_token children rather than two
+        # independently-created tokens.
+        children, _fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id="tok-1", run_id="run-1"),
+            row_id="row-1",
+            branches=["path-a", "path-b"],
+        )
 
         merged = factory.data_flow.coalesce_tokens(
-            parent_refs=[TokenRef(token_id="tok-1", run_id="run-1"), TokenRef(token_id="tok-2", run_id="run-1")],
+            parent_refs=[TokenRef(token_id=c.token_id, run_id="run-1") for c in children],
             row_id="row-1",
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
         )
 
-        parents = factory.query.get_all_token_parents_for_run("run-1")
+        # get_all_token_parents_for_run returns every token_parents row in the
+        # run — including the fork's own child->tok-1 rows — so scope the
+        # assertion to the coalesce's own merged-token parent rows.
+        parents = [p for p in factory.query.get_all_token_parents_for_run("run-1") if p.token_id == merged.token_id]
 
         assert len(parents) == 2
         parent_token_ids = {p.parent_token_id for p in parents}
-        assert parent_token_ids == {"tok-1", "tok-2"}
+        assert parent_token_ids == {children[0].token_id, children[1].token_id}
         for p in parents:
             assert p.token_id == merged.token_id
 

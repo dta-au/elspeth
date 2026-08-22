@@ -3,19 +3,29 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts import AggregationParentDisposition, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import batches_table, node_states_table, token_outcomes_table, token_parents_table, tokens_table
+from elspeth.core.landscape.schema import (
+    batches_table,
+    group_records_table,
+    node_states_table,
+    token_lineage_frames_table,
+    token_outcomes_table,
+    token_parents_table,
+    tokens_table,
+)
 from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run, register_test_node
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -461,13 +471,31 @@ class TestForkToken:
             assert len(conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.token_id == token.token_id)).all()) == 1
 
 
+def _make_coalesce_parents(factory: RecorderFactory, row_id: str, branches: list[str], *, group_id: str = "coalesce-fork-grp"):
+    """Crafted sibling parents sharing one FORK lineage frame (the shape a real
+    fork_token would have produced), via the create_token(..., lineage_frames=)
+    seam — coalesce_tokens' durable strict pop requires an innermost shared
+    FORK frame to pop (spec rulings 24/28); never weaken the pop to accommodate
+    a fixture that models something a real fork never produces.
+    """
+    return [
+        factory.data_flow.create_token(
+            row_id,
+            branch_name=branch,
+            fork_group_id=group_id,
+            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id=group_id, member_key=branch),),
+        )
+        for branch in branches
+    ]
+
+
 class TestCoalesceTokens:
     """Tests for DataFlowRepository.coalesce_tokens."""
 
     def test_creates_merged_token(self):
         _db, factory = _setup()
-        row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
+        row, _root = _make_row(factory, row_index=0)
+        token_a, token_b = _make_coalesce_parents(factory, row.row_id, ["a", "b"])
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-1"), TokenRef(token_id=token_b.token_id, run_id="run-1")],
             row_id=row.row_id,
@@ -479,8 +507,8 @@ class TestCoalesceTokens:
 
     def test_merged_token_has_join_group_id(self):
         _db, factory = _setup()
-        row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
+        row, _root = _make_row(factory, row_index=0)
+        token_a, token_b = _make_coalesce_parents(factory, row.row_id, ["a", "b"])
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-1"), TokenRef(token_id=token_b.token_id, run_id="run-1")],
             row_id=row.row_id,
@@ -491,9 +519,8 @@ class TestCoalesceTokens:
 
     def test_coalesce_three_tokens(self):
         _db, factory = _setup()
-        row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
-        token_c = factory.data_flow.create_token(row.row_id)
+        row, _root = _make_row(factory, row_index=0)
+        token_a, token_b, token_c = _make_coalesce_parents(factory, row.row_id, ["a", "b", "c"])
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[
                 TokenRef(token_id=token_a.token_id, run_id="run-1"),
@@ -509,8 +536,8 @@ class TestCoalesceTokens:
 
     def test_coalesce_with_step_in_pipeline(self):
         _db, factory = _setup()
-        row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
+        row, _root = _make_row(factory, row_index=0)
+        token_a, token_b = _make_coalesce_parents(factory, row.row_id, ["a", "b"])
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-1"), TokenRef(token_id=token_b.token_id, run_id="run-1")],
             row_id=row.row_id,
@@ -2062,8 +2089,7 @@ class TestCrossRunContaminationPrevention:
             source_row_index=0,
             ingest_sequence=0,
         )
-        token_a = factory.data_flow.create_token(row_a.row_id)
-        token_b = factory.data_flow.create_token(row_a.row_id)
+        token_a, token_b = _make_coalesce_parents(factory, row_a.row_id, ["a", "b"], group_id="coalesce-fork-grp-cross-run")
 
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-A"), TokenRef(token_id=token_b.token_id, run_id="run-A")],
@@ -2128,8 +2154,8 @@ class TestTokenRunIdConsistency:
     def test_coalesced_token_has_run_id(self):
         """Coalesced token must inherit run_id from parents."""
         _db, factory = _setup(run_id="run-1")
-        row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
+        row, _root = _make_row(factory, row_index=0)
+        token_a, token_b = _make_coalesce_parents(factory, row.row_id, ["a", "b"])
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-1"), TokenRef(token_id=token_b.token_id, run_id="run-1")],
             row_id=row.row_id,
@@ -2282,3 +2308,126 @@ class TestTokenRunIdConsistency:
                     started_at=now(),
                 )
             )
+
+
+def _frames_for(db: LandscapeDB, token_id: str, run_id: str = "run-1") -> list[tuple[int, str, str, str]]:
+    with db.engine.connect() as conn:
+        rows = conn.execute(
+            select(
+                token_lineage_frames_table.c.depth,
+                token_lineage_frames_table.c.kind,
+                token_lineage_frames_table.c.group_id,
+                token_lineage_frames_table.c.member_key,
+            )
+            .where(token_lineage_frames_table.c.token_id == token_id)
+            .where(token_lineage_frames_table.c.run_id == run_id)
+            .order_by(token_lineage_frames_table.c.depth)
+        ).fetchall()
+    return [(int(r.depth), str(r.kind), str(r.group_id), str(r.member_key)) for r in rows]
+
+
+def _group_record(db: LandscapeDB, group_id: str, run_id: str = "run-1"):
+    with db.engine.connect() as conn:
+        return conn.execute(
+            select(group_records_table).where(group_records_table.c.run_id == run_id).where(group_records_table.c.group_id == group_id)
+        ).one_or_none()
+
+
+class TestUnifiedLineageWriters:
+    def test_fork_writes_child_frames_and_group_record(self) -> None:
+        db, factory = _setup()
+        _row, parent = _make_row(factory)
+        children, fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=parent.token_id, run_id="run-1"),
+            row_id=parent.row_id,
+            branches=["a", "b"],
+            step_in_pipeline=1,
+        )
+        for child, branch in zip(children, ["a", "b"], strict=True):
+            assert _frames_for(db, child.token_id) == [(0, "fork", fork_group_id, branch)]
+        record = _group_record(db, fork_group_id)
+        assert record is not None
+        assert (record.kind, record.opener_token_id, record.member_count) == ("fork", parent.token_id, 2)
+
+    def test_expand_child_frames_stack_on_parent_frames(self) -> None:
+        db, factory = _setup()
+        _row, root = _make_row(factory)
+        (branch_child, _other), fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=root.token_id, run_id="run-1"),
+            row_id=root.row_id,
+            branches=["a", "b"],
+            step_in_pipeline=1,
+        )
+        children, expand_group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=branch_child.token_id, run_id="run-1"),
+            row_id=root.row_id,
+            child_payloads=[{"v": 1}, {"v": 2}],
+            output_contract=_MINIMAL_CONTRACT,
+            step_in_pipeline=2,
+        )
+        for child in children:
+            assert _frames_for(db, child.token_id) == [
+                (0, "fork", fork_group_id, "a"),
+                (1, "expand", expand_group_id, child.token_id),
+            ]
+        record = _group_record(db, expand_group_id)
+        assert record is not None
+        assert (record.kind, record.opener_token_id, record.member_count) == ("expand", branch_child.token_id, 2)
+
+    def test_fork_replay_does_not_double_mint(self) -> None:
+        db, factory = _setup()
+        _row, parent = _make_row(factory)
+        ref = TokenRef(token_id=parent.token_id, run_id="run-1")
+        _children, fork_group_id = factory.data_flow.fork_token(
+            parent_ref=ref, row_id=parent.row_id, branches=["a", "b"], step_in_pipeline=1
+        )
+        replayed, replay_group = factory.data_flow.fork_token(parent_ref=ref, row_id=parent.row_id, branches=["a", "b"], step_in_pipeline=1)
+        assert replay_group == fork_group_id
+        with db.engine.connect() as conn:
+            count = conn.execute(select(func.count()).select_from(group_records_table)).scalar()
+        assert count == 1
+        assert _frames_for(db, replayed[0].token_id) == [(0, "fork", fork_group_id, "a")]
+
+    def test_coalesce_pops_the_shared_fork_frame(self) -> None:
+        db, factory = _setup()
+        _row, parent = _make_row(factory)
+        children, _fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=parent.token_id, run_id="run-1"),
+            row_id=parent.row_id,
+            branches=["a", "b"],
+            step_in_pipeline=1,
+        )
+        merged = factory.data_flow.coalesce_tokens(
+            parent_refs=[TokenRef(token_id=c.token_id, run_id="run-1") for c in children],
+            row_id=parent.row_id,
+            merged_payload={"v": 1},
+            merged_contract=_MINIMAL_CONTRACT,
+            coalesce_node_id="agg-0",
+            step_in_pipeline=2,
+        )
+        assert _frames_for(db, merged.token_id) == []  # depth-1 fork popped to empty path
+
+    def test_coalesce_refuses_parents_without_fork_frames(self) -> None:
+        _db, factory = _setup()
+        row_a, tok_a = _make_row(factory, row_index=0)
+        tok_b = factory.data_flow.create_token(row_a.row_id)
+        with pytest.raises(AuditIntegrityError, match="innermost FORK"):
+            factory.data_flow.coalesce_tokens(
+                parent_refs=[TokenRef(token_id=tok_a.token_id, run_id="run-1"), TokenRef(token_id=tok_b.token_id, run_id="run-1")],
+                row_id=row_a.row_id,
+                merged_payload={"v": 1},
+                merged_contract=_MINIMAL_CONTRACT,
+                coalesce_node_id="agg-0",
+                step_in_pipeline=2,
+            )
+
+    def test_create_token_lineage_frames_seam_for_crafted_tokens(self) -> None:
+        db, factory = _setup()
+        row, _tok = _make_row(factory)
+        crafted = factory.data_flow.create_token(
+            row.row_id,
+            branch_name="a",
+            fork_group_id="fg-crafted",
+            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fg-crafted", member_key="a"),),
+        )
+        assert _frames_for(db, crafted.token_id) == [(0, "fork", "fg-crafted", "a")]

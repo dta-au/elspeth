@@ -25,8 +25,9 @@ from sqlalchemy.engine import Connection, RowMapping
 from elspeth.contracts import AggregationParentDisposition, CoalesceParentCompletion, Row, Token
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
-from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame, pop_closer_frame
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.checkpoint.serialization import checkpoint_dumps
@@ -45,8 +46,10 @@ from elspeth.core.landscape.schema import (
     batches_table,
     coalesce_effect_members_table,
     coalesce_effects_table,
+    group_records_table,
     node_states_table,
     rows_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
     tokens_table,
@@ -83,6 +86,37 @@ class RowTokenRepository:
         self._payload_store = payload_store
         self._outcomes = outcomes
         self._node_states = node_states
+
+    @staticmethod
+    def _load_lineage_frames(conn: Connection, *, token_id: str, run_id: str) -> tuple[LineageFrame, ...]:
+        """The token's durable lineage frames, outermost first, as typed frames."""
+        rows = conn.execute(
+            select(
+                token_lineage_frames_table.c.kind,
+                token_lineage_frames_table.c.group_id,
+                token_lineage_frames_table.c.member_key,
+            )
+            .where(token_lineage_frames_table.c.token_id == token_id)
+            .where(token_lineage_frames_table.c.run_id == run_id)
+            .order_by(token_lineage_frames_table.c.depth)
+        ).fetchall()
+        return tuple(LineageFrame(kind=FrameKind(row.kind), group_id=str(row.group_id), member_key=str(row.member_key)) for row in rows)
+
+    @staticmethod
+    def _insert_lineage_frames(conn: Connection, *, token_id: str, run_id: str, frames: Sequence[LineageFrame]) -> None:
+        for depth, frame in enumerate(frames):
+            result = conn.execute(
+                token_lineage_frames_table.insert().values(
+                    token_id=token_id,
+                    run_id=run_id,
+                    depth=depth,
+                    kind=frame.kind.value,
+                    group_id=frame.group_id,
+                    member_key=frame.member_key,
+                )
+            )
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"lineage frame INSERT affected zero rows (token_id={token_id}, depth={depth})")
 
     def _prepare_source_row_record(
         self,
@@ -332,6 +366,7 @@ class RowTokenRepository:
         branch_name: str | None = None,
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
+        lineage_frames: Sequence[LineageFrame] = (),
     ) -> Token:
         """Create a token (row instance in DAG path).
 
@@ -345,6 +380,9 @@ class RowTokenRepository:
             branch_name: Optional branch name (for forked tokens)
             fork_group_id: Optional fork group (links siblings)
             join_group_id: Optional join group (links merged tokens)
+            lineage_frames: Crafted-token seam for tests and recovery tooling —
+                production forks/expands write frames via their own
+                transactions (fork_token / expand_token / coalesce_tokens).
 
         Returns:
             Token model
@@ -387,17 +425,35 @@ class RowTokenRepository:
             run_id=run_id,
         )
 
-        self._ops.execute_insert(
-            tokens_table.insert().values(
-                token_id=token.token_id,
-                row_id=token.row_id,
-                run_id=run_id,
-                fork_group_id=token.fork_group_id,
-                join_group_id=token.join_group_id,
-                branch_name=token.branch_name,
-                created_at=token.created_at,
+        frames = tuple(lineage_frames)
+        if frames:
+            with self._db.write_connection() as conn:
+                result = conn.execute(
+                    tokens_table.insert().values(
+                        token_id=token.token_id,
+                        row_id=token.row_id,
+                        run_id=run_id,
+                        fork_group_id=token.fork_group_id,
+                        join_group_id=token.join_group_id,
+                        branch_name=token.branch_name,
+                        created_at=token.created_at,
+                    )
+                )
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(f"create_token: token INSERT affected zero rows (token_id={token.token_id})")
+                self._insert_lineage_frames(conn, token_id=token.token_id, run_id=run_id, frames=frames)
+        else:
+            self._ops.execute_insert(
+                tokens_table.insert().values(
+                    token_id=token.token_id,
+                    row_id=token.row_id,
+                    run_id=run_id,
+                    fork_group_id=token.fork_group_id,
+                    join_group_id=token.join_group_id,
+                    branch_name=token.branch_name,
+                    created_at=token.created_at,
+                )
             )
-        )
 
         return token
 
@@ -472,6 +528,7 @@ class RowTokenRepository:
                 )
 
             fork_group_id = generate_id()
+            parent_frames = self._load_lineage_frames(conn, token_id=parent_ref.token_id, run_id=parent_ref.run_id)
             children = []
             # 1. Create child tokens
             for ordinal, branch_name in enumerate(branches):
@@ -509,6 +566,13 @@ class RowTokenRepository:
                         f"fork_token: token_parent INSERT affected zero rows (child={child_id}, parent={parent_ref.token_id})"
                     )
 
+                self._insert_lineage_frames(
+                    conn,
+                    token_id=child_id,
+                    run_id=parent_ref.run_id,
+                    frames=[*parent_frames, LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name)],
+                )
+
                 children.append(
                     Token(
                         token_id=child_id,
@@ -520,6 +584,21 @@ class RowTokenRepository:
                         run_id=parent_ref.run_id,
                     )
                 )
+
+            # Mint the durable group record for the fork opener (spec §4.3
+            # canon: group_records mints for BOTH FORK and EXPAND openers).
+            result = conn.execute(
+                group_records_table.insert().values(
+                    run_id=parent_ref.run_id,
+                    group_id=fork_group_id,
+                    kind=FrameKind.FORK.value,
+                    opener_token_id=parent_ref.token_id,
+                    member_count=len(branches),
+                    created_at=now(),
+                )
+            )
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"fork_token: group_records INSERT affected zero rows (group_id={fork_group_id})")
 
             # 2. Record parent FORKED outcome in SAME transaction (atomic)
             outcome_id = f"out_{generate_id()[:12]}"
@@ -785,6 +864,32 @@ class RowTokenRepository:
                     expected_token_data_ref=expected_token_data_ref,
                 )
 
+            parent_paths = [self._load_lineage_frames(conn, token_id=ref.token_id, run_id=run_id) for ref in parent_refs]
+            anchor = parent_paths[0]
+            if not anchor or anchor[-1].kind is not FrameKind.FORK:
+                raise AuditIntegrityError(
+                    f"coalesce_tokens: parent token {parent_refs[0].token_id!r} has no innermost FORK lineage frame "
+                    f"to pop (frames={anchor!r}); a closer pops exactly its own frame (spec rulings 24/28)"
+                )
+            shared_group_id = anchor[-1].group_id
+            remaining_paths: set[tuple[LineageFrame, ...]] = set()
+            for ref, path in zip(parent_refs, parent_paths, strict=True):
+                try:
+                    remaining_paths.add(pop_closer_frame(path, kind=FrameKind.FORK, group_id=shared_group_id))
+                except OrchestrationInvariantError as exc:
+                    # pop_closer_frame refuses empty paths, non-FORK innermost
+                    # frames, and cross-group parents in one place; this layer
+                    # re-raises as the Tier-1 audit error it owes.
+                    raise AuditIntegrityError(
+                        f"coalesce_tokens: durable strict pop refused for parent token {ref.token_id!r}: {exc}"
+                    ) from exc
+            if len(remaining_paths) != 1:
+                raise AuditIntegrityError(
+                    "coalesce_tokens: parents do not share their remaining lineage path after the pop; "
+                    f"distinct remaining paths={len(remaining_paths)}"
+                )
+            merged_frames = remaining_paths.pop()
+
             join_group_id = generate_id()
             token_id = generate_id()
             effect_id = generate_id()
@@ -802,6 +907,7 @@ class RowTokenRepository:
             )
             if result.rowcount == 0:
                 raise AuditIntegrityError(f"coalesce_tokens: merged token INSERT affected zero rows (token_id={token_id})")
+            self._insert_lineage_frames(conn, token_id=token_id, run_id=run_id, frames=merged_frames)
 
             # Record all parent relationships
             for ordinal, ref in enumerate(parent_refs):
@@ -1323,6 +1429,8 @@ class RowTokenRepository:
                     f"expand_token: parent token {parent_ref.token_id!r} already has a terminal outcome ({existing_terminal.path!r})"
                 )
 
+            parent_frames = self._load_lineage_frames(conn, token_id=parent_ref.token_id, run_id=parent_ref.run_id)
+
             stored_refs = [self._payload_store.store(payload_bytes) for payload_bytes in child_payload_bytes]
             if stored_refs != child_data_refs:
                 raise AuditIntegrityError(
@@ -1402,6 +1510,13 @@ class RowTokenRepository:
                         f"expand_token: token_parent INSERT affected zero rows (child={child_id}, parent={parent_ref.token_id})"
                     )
 
+                self._insert_lineage_frames(
+                    conn,
+                    token_id=child_id,
+                    run_id=parent_ref.run_id,
+                    frames=[*parent_frames, LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=child_id)],
+                )
+
                 children.append(
                     Token(
                         token_id=child_id,
@@ -1413,6 +1528,22 @@ class RowTokenRepository:
                         token_data_ref=payload_ref,
                     )
                 )
+
+            # Mint the durable group record for the expand opener (spec §4.3
+            # canon: BATCH_CONSUMED flushes included — one row per aggregation
+            # flush is accepted audit enrichment).
+            result = conn.execute(
+                group_records_table.insert().values(
+                    run_id=parent_ref.run_id,
+                    group_id=expand_group_id,
+                    kind=FrameKind.EXPAND.value,
+                    opener_token_id=parent_ref.token_id,
+                    member_count=len(child_data_refs),
+                    created_at=now(),
+                )
+            )
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"expand_token: group_records INSERT affected zero rows (group_id={expand_group_id})")
 
             # Record the explicit parent disposition in the SAME transaction.
             # No successful expansion path may leave a reprocessable parent.

@@ -41,6 +41,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.engine import CoalesceParentCompletion
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape.data_flow import (
@@ -318,6 +319,7 @@ class DataFlowRepository:
         branch_name: str | None = None,
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
+        lineage_frames: Sequence[LineageFrame] = (),
     ) -> Token:
         """Create a token (row instance in DAG path)."""
         return self.tokens.create_token(
@@ -326,6 +328,7 @@ class DataFlowRepository:
             branch_name=branch_name,
             fork_group_id=fork_group_id,
             join_group_id=join_group_id,
+            lineage_frames=lineage_frames,
         )
 
     def fork_token(

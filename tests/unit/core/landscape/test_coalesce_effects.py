@@ -11,8 +11,9 @@ from sqlalchemy.exc import IntegrityError
 from elspeth.contracts import NodeStateStatus, NodeType
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.engine import CoalesceParentCompletion
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape.schema import (
     coalesce_effect_members_table,
@@ -46,7 +47,20 @@ def _setup():
         ingest_sequence=0,
         data={"source": True},
     )
-    parents = [setup.data_flow.create_token(row.row_id) for _ in range(2)]
+    # Crafted siblings sharing one FORK lineage frame (the shape a real
+    # fork_token would have produced), via the create_token(..., lineage_frames=)
+    # seam — coalesce_tokens' durable strict pop requires an innermost shared
+    # FORK frame to pop (spec rulings 24/28). Never weaken the pop to
+    # accommodate a fixture that models something a real fork never produces.
+    parents = [
+        setup.data_flow.create_token(
+            row.row_id,
+            branch_name=branch,
+            fork_group_id="coalesce-effects-fork-grp",
+            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="coalesce-effects-fork-grp", member_key=branch),),
+        )
+        for branch in ("a", "b")
+    ]
     refs = tuple(TokenRef(token_id=token.token_id, run_id=setup.run_id) for token in parents)
     completions: list[CoalesceParentCompletion] = []
     for ordinal, ref in enumerate(refs):

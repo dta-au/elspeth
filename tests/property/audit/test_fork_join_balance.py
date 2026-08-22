@@ -31,7 +31,8 @@ from sqlalchemy import text
 
 from elspeth.contracts import CoalesceName, GateName, RoutingAction, RoutingMode, SinkName
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, Determinism, NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, Determinism, FrameKind, NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.run_result import RunResult
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.checkpoint.serialization import checkpoint_loads
@@ -991,9 +992,23 @@ class TestForkRecoveryInvariant:
             locked=True,
         )
 
-        # Create two branch tokens to coalesce
-        token_a = factory.data_flow.create_token(row_id=row.row_id)
-        token_b = factory.data_flow.create_token(row_id=row.row_id)
+        # Create two branch tokens to coalesce. coalesce_tokens' durable strict
+        # pop (spec rulings 24/28) requires an innermost shared FORK lineage
+        # frame on every parent — crafted here via the
+        # create_token(..., lineage_frames=) seam to model the shape a real
+        # fork_token would have produced.
+        token_a = factory.data_flow.create_token(
+            row_id=row.row_id,
+            branch_name="a",
+            fork_group_id="fork-join-balance-grp",
+            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-grp", member_key="a"),),
+        )
+        token_b = factory.data_flow.create_token(
+            row_id=row.row_id,
+            branch_name="b",
+            fork_group_id="fork-join-balance-grp",
+            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-grp", member_key="b"),),
+        )
 
         # Merged payload includes a datetime to verify type fidelity.
         # canonical_json would stringify datetime; checkpoint_dumps preserves it.
@@ -4118,8 +4133,21 @@ class TestForkRecoveryInvariant:
         assert expand_child.token_data_ref is not None, "expand child must carry token_data_ref"
 
         # ── (2) COALESCE path: merged token_data_ref envelope carries the full domain ──
-        token_x = factory.data_flow.create_token(row_id=row.row_id)
-        token_y = factory.data_flow.create_token(row_id=row.row_id)
+        # coalesce_tokens' durable strict pop (spec rulings 24/28) requires an
+        # innermost shared FORK lineage frame on every parent — crafted here via
+        # the create_token(..., lineage_frames=) seam.
+        token_x = factory.data_flow.create_token(
+            row_id=row.row_id,
+            branch_name="x",
+            fork_group_id="fork-join-balance-domain-grp",
+            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-domain-grp", member_key="x"),),
+        )
+        token_y = factory.data_flow.create_token(
+            row_id=row.row_id,
+            branch_name="y",
+            fork_group_id="fork-join-balance-domain-grp",
+            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-domain-grp", member_key="y"),),
+        )
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[
                 TokenRef(token_id=token_x.token_id, run_id=run.run_id),
