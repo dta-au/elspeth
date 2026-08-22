@@ -53,19 +53,61 @@ def test_expected_branches_json_stays_deleted() -> None:
 
 
 def _modules_inserting_into(table_attr: str) -> set[str]:
+    """Scan for writes to a table by name, catching both attribute and functional forms.
+
+    Detects:
+    - Attribute form: token_lineage_frames_table.insert()
+    - Functional form: insert(token_lineage_frames_table)
+    - Simple aliases: _frames = token_lineage_frames_table; _frames.insert()
+
+    Out of scope: raw SQL via text() or connectable.execute(text(...)) —
+    those are not AST-detectable without a type-inference pass.
+    """
     hits: set[str] = set()
     for path in SRC_ROOT.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        # First pass: collect straight-line aliases (Name → table_attr) at module scope
+        # and within functions. Only one hop: _frames = token_lineage_frames_table.
+        aliases_to_table: set[str] = set()
         for node in ast.walk(tree):
-            # matches <table_attr>.insert() — attribute chain ending in the table name then .insert
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == table_attr
+            ):
+                target_name = node.targets[0].id
+                aliases_to_table.add(target_name)
+
+        # Second pass: find insert() calls on the table or its aliases
+        for node in ast.walk(tree):
+            is_match = False
+
+            # Attribute form: <table_or_alias>.insert()
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "insert"
                 and isinstance(node.func.value, (ast.Name, ast.Attribute))
-                and (getattr(node.func.value, "id", None) == table_attr or getattr(node.func.value, "attr", None) == table_attr)
             ):
+                receiver_name = getattr(node.func.value, "id", None) or getattr(node.func.value, "attr", None)
+                if receiver_name == table_attr or receiver_name in aliases_to_table:
+                    is_match = True
+
+            # Functional form: insert(token_lineage_frames_table)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "insert":
+                for arg in node.args:
+                    arg_name = getattr(arg, "id", None)
+                    if arg_name == table_attr or arg_name in aliases_to_table:
+                        is_match = True
+                        break
+
+            if is_match:
                 hits.add(str(path.relative_to(SRC_ROOT)))
+                break  # One hit per module is enough
+
     return hits
 
 
