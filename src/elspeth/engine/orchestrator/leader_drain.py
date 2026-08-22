@@ -413,13 +413,13 @@ class LeaderDrainCoordinator:
 
 # §D step-3 convergence valve: each iteration adopts every intake-pending
 # barrier row and force-resolves every flushable barrier, so legal pipelines
-# converge in a handful of rounds (one per barrier "layer" in the DAG).
-# Default-anchor documentation only — the ACTUAL bound used at runtime is
-# PipelineConfig.escalation_fixpoint_bound, derived per build from the real
-# bound-region nesting depth by
+# converge in a handful of rounds (one per barrier "layer" in the DAG). The
+# bound used at runtime is PipelineConfig.escalation_fixpoint_bound, derived
+# per build from the real bound-region nesting depth by
 # elspeth.core.dag.bound_regions.derive_escalation_fixpoint_bound (spec
-# §6.3): a bare constant would collide with an override-deep unwind.
-MAX_END_OF_INPUT_FLUSH_ITERATIONS = 1_000
+# §6.3; that docstring also carries the superseded-constant history) — no
+# bare constant lives here, since one would collide with an override-deep
+# unwind.
 
 
 def run_end_of_input_barrier_flush(

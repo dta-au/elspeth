@@ -197,35 +197,77 @@ def _build_nested_fork_in_fork(*, max_bound_region_depth: int) -> ExecutionGraph
     )
 
 
-def _build_partially_overlapping_regions() -> None:
-    """Two bound regions whose spans cross: open1 < open2 < close1 < close2.
+def _build_settings_driven_partial_overlap() -> None:
+    """Genuinely CROSSING bound regions, authorable through settings alone
+    (review round 1, F1 — the direct settings-level counterpart of
+    `_build_partially_overlapping_regions` below).
 
-    Measured, not assumed: a settings-driven attempt at this shape (an outer
-    fork/coalesce with an inner fork nested in one branch, where the inner
-    gate's OTHER branch is wired as a direct branch of the OUTER coalesce —
-    the natural way to make the inner region's closer trail the outer
-    coalesce) still builds successfully and resolves to properly NESTED
-    regions, never a crossing one. Two structural reasons, both load-bearing:
-    ``build_group_binding_registry``'s "first bound branch wins" interim
-    filters each gate's ``member_roster`` down to the branches that resolve
-    to ONE closer, so a branch feeding the "wrong" closer is silently
-    dropped from that gate's binding rather than creating an ambiguous
-    frame source; and region membership is computed by graph reachability
-    (forward/backward reach between opener and closer), which the
-    registry's roster filtering does not gate — the inner region's span
-    still lands entirely inside the outer region's reachability-derived
-    members, because the "crossing" edge (the inner gate's direct branch
-    into the outer coalesce) does not change which NODES lie on the path
-    between either opener/closer pair, only which edges do. So a genuine
-    partial-overlap graph does not appear to be constructible through the
-    settings surface at all — well short of "the builder's existing guards
-    fire first", the topology-normalizing effect of branch-roster
-    resolution keeps every settings-driven fork/coalesce shape well-nested
-    by construction. This helper instead exercises the region check
-    directly against the `add_edge`/`GroupBinding` surface — the same
-    surface `build_group_binding_registry` and the builder's node/edge
-    construction ultimately produce — so the well-nestedness guard itself
-    stays covered even though no known config can reach it.
+        source -> g2 fork [m, n]
+          branch m -> g1 fork [a, b]
+            branch a -> ta -> a_out
+            branch b -> tb -> b_out
+          branch n -> tn -> n_out
+        c2 (closes g2) branches {m: a_out, n: n_out} -> connection "c2"
+        c1 (closes g1) branches {a: c2,    b: b_out} -> sink out
+
+    c2's 'm' branch is wired to listen on "a_out" — a connection produced
+    INSIDE g1's region (downstream of g1) — while its 'n' branch listens on
+    "n_out", produced OUTSIDE g1's region; c1 then consumes c2's own output
+    for its 'a' branch. So open(g2) < open(g1) < close(c2) < close(c1): a
+    textbook crossing where neither span contains the other.
+
+    No earlier builder guard rejects this: the row_union chain-descent guard
+    (`_trace_branch_endpoints`, row_union-only) does not apply to coalesce
+    branches, and the general coalesce-side well-nestedness walk (spec rule
+    4) is Task 7's, not yet built. It also survives Task 6 rule 2: both
+    forks are fully bound to exactly one closer each, and both rosters match
+    their closer's branches exactly (`g2.fork_to == c2.branches == {m, n}`;
+    `g1.fork_to == c1.branches == {a, b}`) — so this `compute_bound_regions`
+    check is the ONLY thing rejecting the shape today, and stays the only
+    thing rejecting it after Task 6 lands.
+    """
+    source = _BoundRegionMockSource()
+    ta = _BoundRegionTransform(name="ta", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    tb = _BoundRegionTransform(name="tb", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    tn = _BoundRegionTransform(name="tn", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=ta,  # type: ignore[arg-type]
+                settings=TransformSettings(name="ta", plugin=ta.name, input="a", on_success="a_out", on_error="discard", options={}),
+            ),
+            WiredTransform(
+                plugin=tb,  # type: ignore[arg-type]
+                settings=TransformSettings(name="tb", plugin=tb.name, input="b", on_success="b_out", on_error="discard", options={}),
+            ),
+            WiredTransform(
+                plugin=tn,  # type: ignore[arg-type]
+                settings=TransformSettings(name="tn", plugin=tn.name, input="n", on_success="n_out", on_error="discard", options={}),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(name="g2", input="source_out", condition="'all'", routes={"all": "fork"}, fork_to=["m", "n"]),
+            GateSettings(name="g1", input="m", condition="'all'", routes={"all": "fork"}, fork_to=["a", "b"]),
+        ],
+        coalesce_settings=[
+            CoalesceSettings(name="c2", branches={"m": "a_out", "n": "n_out"}, policy="require_all", merge="union"),
+            CoalesceSettings(name="c1", branches={"a": "c2", "b": "b_out"}, policy="require_all", merge="union", on_success="out"),
+        ],
+    )
+
+
+def _build_partially_overlapping_regions() -> None:
+    """Direct pin of the well-nestedness predicate over the raw
+    `add_edge`/`GroupBinding` surface — the same surface
+    `build_group_binding_registry` and the builder's node/edge construction
+    ultimately produce. `_build_settings_driven_partial_overlap` above is the
+    real-world-authorable companion; this one stays as the cheapest possible
+    pin on the predicate itself, independent of any settings-layer wiring.
     """
     graph = ExecutionGraph()
     for node_id, node_type, plugin_name in [
@@ -289,7 +331,14 @@ class TestRegionMembership:
 
 
 class TestWellNestedness:
+    def test_partial_overlap_rejected_via_settings(self) -> None:
+        # The real-world case: a genuinely crossing pair of bound regions,
+        # authorable through settings alone (review round 1, F1).
+        with pytest.raises(GraphValidationError, match="partially overlap"):
+            _build_settings_driven_partial_overlap()
+
     def test_partial_overlap_rejected(self) -> None:
+        # The direct predicate pin over the raw add_edge/GroupBinding surface.
         with pytest.raises(GraphValidationError, match="partially overlap"):
             _build_partially_overlapping_regions()
 

@@ -5,6 +5,14 @@ between its opener and its closer. Membership walks SUCCESS-PATH edges
 only — RoutingMode.DIVERT edges (on_error, __quarantine__, __failsink__)
 are failure semantics, not region topology (pinned decision 1 in the WS2
 plan; §7 rule 9 treats in-region on_error as legal).
+
+`BoundRegion.member_node_ids` is a "between" set (forward reach ∩ backward
+reach, minus the opener/closer themselves) — it is NOT yet a verified SESE
+interior. A member may still have an inbound non-DIVERT edge originating
+outside the region, or an outbound edge that bypasses the closer; ruling
+those out is spec §7 rule 4, scoped to Task 7. Consumers reading
+`member_node_ids` before that lands must not assume single-entry/single-exit
+has been proven.
 """
 
 from __future__ import annotations
@@ -138,11 +146,10 @@ def compute_bound_regions(
     if too_deep:
         worst = max(too_deep, key=lambda r: r.depth)
         raise GraphValidationError(
-            f"Bound-region nesting depth {worst.depth} exceeds the supported maximum {max_depth} "
-            f"(innermost closer: '{worst.binding.closer_name}'). The supported guarantee is "
-            f"{max_depth} layers (spec §6.3); deeper nesting is model-correct but unsupported — "
-            f"per-token audit churn scales with depth. Set max_bound_region_depth in settings to "
-            f"accept the churn knowingly.",
+            f"Bound-region nesting depth {worst.depth} exceeds the configured maximum {max_depth} "
+            f"(innermost closer: '{worst.binding.closer_name}'). Deeper nesting is model-correct but "
+            f"unsupported beyond 5 layers (spec §6.3) — per-token audit churn scales with depth. Raise "
+            f"max_bound_region_depth in settings to accept the churn knowingly.",
             component_id=worst.binding.closer_name,
             component_type=worst.binding.closer_kind,
         )

@@ -2033,20 +2033,21 @@ sites:
     must fully contain one another or be disjoint (spec §7 rule 3): close t'
   ordinal: 0
   disposition: abstains
-  note: Stage 1's existing narrower guards (row_union_nested_fork_invalid, row_union_downstream_group_invalid)
-    reject a subset; full region computation is runtime-only; deliberate — Stage 1 must not be stricter
-    than the runtime and the general shapes require the built graph.
-- key: e65b68f997683769
+  note: Stage 1 does not compute bound regions at all (review round 1, F1/OQ1) — the row_union-specific
+    guards (row_union_nested_fork_invalid, row_union_downstream_group_invalid) reject a narrower, unrelated
+    subset. Full region computation, including well-nestedness, is runtime-only; deliberate abstention.
+    A settings-authorable crossing topology exists (test_bound_regions.py::test_partial_overlap_rejected_via_settings)
+    and is not rejected by any earlier guard, including Task 6's rule 2.
+- key: 7d4730baa674943d
   path: src/elspeth/core/dag/bound_regions.py
   qualname: compute_bound_regions
   exception: GraphValidationError
-  message: 'Bound-region nesting depth {} exceeds the supported maximum {} (innermost closer: ''{}'').
-    The supported guarantee is {} layers (spec §6.3); deeper nesting is mod'
+  message: 'Bound-region nesting depth {} exceeds the configured maximum {} (innermost closer: ''{}'').
+    Deeper nesting is model-correct but unsupported beyond 5 layers (spec '
   ordinal: 0
   disposition: abstains
-  note: Stage 1's existing narrower guards (row_union_nested_fork_invalid, row_union_downstream_group_invalid)
-    reject a subset; full region computation is runtime-only; deliberate — Stage 1 must not be stricter
-    than the runtime and the general shapes require the built graph.
+  note: Stage 1 does not compute bound regions and cannot know the observed nesting depth; the cap is
+    a built-graph property — deliberate abstention.
 - key: 6557fc89e6b5c8de
   path: src/elspeth/core/dag/builder.py
   qualname: _parse_contract_schema_config
