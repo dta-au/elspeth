@@ -161,11 +161,8 @@ class TokenWorkItem:
     pending_path: str | None = None
     pending_error_hash: str | None = None
     pending_error_message: str | None = None
-    branch_name: str | None = None
-    fork_group_id: str | None = None
     join_group_id: str | None = None
-    expand_group_id: str | None = None
-    # Epoch 34: typed lineage path (outermost first); column form is lineage_path_json.
+    # Epoch 35: typed lineage path (outermost first); column form is lineage_path_json.
     lineage_path: tuple[LineageFrame, ...] = ()
     coalesce_node_id: str | None = None
     coalesce_name: str | None = None
@@ -216,11 +213,8 @@ class BarrierEmission:
     queue_key: str | None = None
     barrier_key: str | None = None
     on_success_sink: str | None = None
-    branch_name: str | None = None
-    fork_group_id: str | None = None
     join_group_id: str | None = None
-    expand_group_id: str | None = None
-    # Epoch 34: typed lineage path (outermost first); column form is lineage_path_json.
+    # Epoch 35: typed lineage path (outermost first); column form is lineage_path_json.
     lineage_path: tuple[LineageFrame, ...] = ()
     coalesce_node_id: str | None = None
     coalesce_name: str | None = None

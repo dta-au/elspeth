@@ -34,7 +34,9 @@ from hypothesis import strategies as st
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.contracts.union_merge import merge_union_contracts
@@ -176,7 +178,7 @@ def make_token(
         token_id=token_id,
         row_id=row_id,
         row_data=pipeline_row,
-        branch_name=branch_name,
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=f"fg-{row_id}", member_key=branch_name),),
     )
 
 
@@ -1070,7 +1072,12 @@ def make_renamed_token(
         locked=True,
     )
     row = PipelineRow({normalized: value for normalized, (_, value) in fields.items()}, contract)
-    return TokenInfo(token_id=token_id, row_id=row_id, row_data=row, branch_name=branch_name)
+    return TokenInfo(
+        token_id=token_id,
+        row_id=row_id,
+        row_data=row,
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=f"fg-{row_id}", member_key=branch_name),),
+    )
 
 
 # Small alphabet forces frequent cross-branch original_name collisions —

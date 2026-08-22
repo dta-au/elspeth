@@ -32,6 +32,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.identity import path_expand_group_id
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape import LandscapeDB
@@ -264,15 +265,18 @@ class TestTokenOutcomeContractProperties:
             )
         db.close()
 
-    def test_forked_requires_fork_group_id(self) -> None:
-        """Property: (TRANSIENT, FORK_PARENT) without fork_group_id raises ValueError."""
+    def test_forked_forbids_every_discriminator_field(self) -> None:
+        """Property: (TRANSIENT, FORK_PARENT) forbids sink_name/batch_id/error_hash.
+
+        D2 flip: fork_group_id is retired from token_outcomes — the roster of
+        record moved to token_lineage_frames + group_records.
+        """
         db, factory, run_id, token_id = self._setup()
-        with pytest.raises(ValueError, match=r"\(TRANSIENT, FORK_PARENT\) outcome requires fork_group_id"):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token_id, run_id=run_id),
-                outcome=TerminalOutcome.TRANSIENT,
-                path=TerminalPath.FORK_PARENT,
-            )
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token_id, run_id=run_id),
+            outcome=TerminalOutcome.TRANSIENT,
+            path=TerminalPath.FORK_PARENT,
+        )
         db.close()
 
     def test_failed_requires_error_hash(self) -> None:
@@ -308,27 +312,33 @@ class TestTokenOutcomeContractProperties:
             )
         db.close()
 
-    def test_coalesced_requires_join_group_id(self) -> None:
-        """Property: (SUCCESS, COALESCED) without join_group_id raises ValueError."""
+    def test_coalesced_accepts_only_sink_name(self) -> None:
+        """Property: (SUCCESS, COALESCED) accepts sink_name and no other discriminator.
+
+        D2 flip: join_group_id is retired from token_outcomes — it lives only
+        on the merged TOKEN (ruling 20), not the per-parent outcome record.
+        """
         db, factory, run_id, token_id = self._setup()
-        with pytest.raises(ValueError, match=r"\(SUCCESS, COALESCED\) outcome requires join_group_id"):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token_id, run_id=run_id),
-                outcome=TerminalOutcome.SUCCESS,
-                path=TerminalPath.COALESCED,
-                sink_name="default",
-            )
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token_id, run_id=run_id),
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.COALESCED,
+            sink_name="default",
+        )
         db.close()
 
-    def test_expanded_requires_expand_group_id(self) -> None:
-        """Property: (TRANSIENT, EXPAND_PARENT) without expand_group_id raises ValueError."""
+    def test_expanded_forbids_every_discriminator_field(self) -> None:
+        """Property: (TRANSIENT, EXPAND_PARENT) forbids sink_name/batch_id/error_hash.
+
+        D2 flip: expand_group_id is retired from token_outcomes — the roster
+        of record moved to token_lineage_frames + group_records.
+        """
         db, factory, run_id, token_id = self._setup()
-        with pytest.raises(ValueError, match=r"\(TRANSIENT, EXPAND_PARENT\) outcome requires expand_group_id"):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token_id, run_id=run_id),
-                outcome=TerminalOutcome.TRANSIENT,
-                path=TerminalPath.EXPAND_PARENT,
-            )
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token_id, run_id=run_id),
+            outcome=TerminalOutcome.TRANSIENT,
+            path=TerminalPath.EXPAND_PARENT,
+        )
         db.close()
 
     def test_buffered_requires_batch_id(self) -> None:
@@ -695,7 +705,7 @@ class TestReferentialIntegrityProperties:
             assert expand_group_id is not None
             for child in children:
                 assert child.row_id == row.row_id
-                assert child.expand_group_id == expand_group_id
+                assert path_expand_group_id(child.lineage_path) == expand_group_id
 
 
 # =============================================================================

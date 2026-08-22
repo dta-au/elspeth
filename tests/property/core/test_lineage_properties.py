@@ -32,7 +32,9 @@ from unittest.mock import create_autospec
 import pytest
 from hypothesis import given, settings
 
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.lineage import LineageResult, explain
 from elspeth.core.landscape.query_repository import QueryRepository
@@ -44,9 +46,8 @@ class _TokenRecord:
     token_id: str
     row_id: str
     run_id: str
-    fork_group_id: str | None = None
     join_group_id: str | None = None
-    expand_group_id: str | None = None
+    lineage_path: tuple[LineageFrame, ...] = ()
 
 
 @dataclass(slots=True)
@@ -332,7 +333,7 @@ class TestExplainTierOneTrustProperties:
             token_id=token_id,
             row_id="row_123",
             run_id=run_id,
-            fork_group_id="some-fork-group",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="some-fork-group", member_key="a"),),
         )
         query.get_token_for_run.return_value = token
 

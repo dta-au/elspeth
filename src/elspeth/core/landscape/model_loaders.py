@@ -58,6 +58,7 @@ from elspeth.contracts.enums import (
     TriggerType,
 )
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import SchedulerEvent, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.sink_effects import (
     AuditExportFormat,
@@ -220,19 +221,21 @@ class RowLoader:
 class TokenLoader:
     """Loader for Token records."""
 
-    def load(self, row: SARow[Any]) -> Token:
+    def load(self, row: SARow[Any], *, lineage_path: tuple[LineageFrame, ...] = ()) -> Token:
         """Load Token from database row.
 
-        No enum conversion needed - all fields are primitives.
+        No enum conversion needed - all fields are primitives. ``lineage_path``
+        is NOT a column on this row — the caller batch-loads it from
+        ``token_lineage_frames`` (``load_lineage_paths``) when it actually needs
+        the path (explain, sink-effect lineage); callers that don't need it
+        pass nothing and get ``()``.
         """
         return Token(
             token_id=row.token_id,
             row_id=row.row_id,
             created_at=row.created_at,
-            fork_group_id=row.fork_group_id,
             join_group_id=row.join_group_id,
-            expand_group_id=row.expand_group_id,
-            branch_name=row.branch_name,
+            lineage_path=lineage_path,
             step_in_pipeline=row.step_in_pipeline,
             run_id=row.run_id,
             # Epoch-11 column (tokens.token_data_ref): per-token payload ref for
@@ -585,9 +588,6 @@ class TokenOutcomeLoader:
                 completed,
                 sink_name=row.sink_name,
                 batch_id=row.batch_id,
-                fork_group_id=row.fork_group_id,
-                join_group_id=row.join_group_id,
-                expand_group_id=row.expand_group_id,
                 error_hash=row.error_hash,
             )
         except ValueError as exc:
@@ -603,12 +603,8 @@ class TokenOutcomeLoader:
             recorded_at=row.recorded_at,
             sink_name=row.sink_name,
             batch_id=row.batch_id,
-            fork_group_id=row.fork_group_id,
-            join_group_id=row.join_group_id,
-            expand_group_id=row.expand_group_id,
             error_hash=row.error_hash,
             context_json=row.context_json,
-            expected_branches_json=row.expected_branches_json,
         )
 
 

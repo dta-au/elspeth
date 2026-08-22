@@ -226,8 +226,6 @@ class TestCoalesceTimeoutInvariance:
             row_id="row-1",
             token_id="tok-branch-a",
             row_data=make_row({"amount": 1}),
-            branch_name="a",
-            fork_group_id="fg-row-1",
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-row-1", member_key="a"),),
         )
         mono_at_tb = clock.monotonic()

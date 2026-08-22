@@ -23,8 +23,9 @@ from elspeth.contracts.audit import (
     TokenOutcome,
     TokenParent,
 )
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.core.landscape.lineage import LineageIntegrityValidator, LineageResult, explain
 
 # ---------------------------------------------------------------------------
@@ -169,17 +170,30 @@ def _make_token(
     fork_group_id: str | None = None,
     join_group_id: str | None = None,
     expand_group_id: str | None = None,
+    member_key: str = "member",
 ) -> Token:
+    """Build a Token. fork_group_id/expand_group_id are convenience params that
+    build a one-frame lineage_path (WS1b flip: they are no longer stored Token
+    fields — ruling 21). At most one of fork_group_id/expand_group_id may be set;
+    join_group_id is the orthogonal merge-event axis (ruling 20) and may coexist
+    with either, though production writers never do so (a coalesced token's
+    lineage_path is always popped empty)."""
     from datetime import UTC, datetime
+
+    assert fork_group_id is None or expand_group_id is None, "at most one of fork_group_id/expand_group_id"
+    lineage_path: tuple[LineageFrame, ...] = ()
+    if fork_group_id is not None:
+        lineage_path = (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=member_key),)
+    elif expand_group_id is not None:
+        lineage_path = (LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=member_key),)
 
     return Token(
         token_id=token_id,
         row_id=row_id,
         created_at=datetime(2026, 1, 15, tzinfo=UTC),
         run_id=run_id,
-        fork_group_id=fork_group_id,
         join_group_id=join_group_id,
-        expand_group_id=expand_group_id,
+        lineage_path=lineage_path,
     )
 
 
@@ -499,35 +513,36 @@ class TestExplainParentIntegrity:
             row_lineage=_make_row_lineage(),
             token_parents=[],
         )
-        with pytest.raises(AuditIntegrityError, match=r"join_group_id.*no parent"):
+        with pytest.raises(AuditIntegrityError, match=r"join_group_id set.*0 parent relationships"):
             explain(factory.query, factory.data_flow, "run-1", token_id="tok-1")
 
     def test_expand_token_without_parents_raises(self) -> None:
-        """Token with expand_group_id but no parents is audit corruption."""
+        """Token with an innermost EXPAND lineage frame but no parents is audit corruption."""
         token = _make_token(expand_group_id="eg-1")
         factory = _make_factory(
             token=token,
             row_lineage=_make_row_lineage(),
             token_parents=[],
         )
-        with pytest.raises(AuditIntegrityError, match=r"expand_group_id.*no parent"):
+        with pytest.raises(AuditIntegrityError, match=r"innermost expand lineage frame.*0 parent relationships"):
             explain(factory.query, factory.data_flow, "run-1", token_id="tok-1")
 
     def test_parents_without_any_group_id_raises(self) -> None:
-        """Token with parent records but no group ID is audit corruption.
+        """Token with parent records but no lineage operation is audit corruption.
 
-        Exercises lineage.py lines 217-222: if parents exist but no
-        fork/join/expand group_id is set, the parent relationships have
-        no lineage operation to belong to.
+        Exercises LineageIntegrityValidator._validate_parent_link_shape's
+        kind=None branch: if parents exist but the token carries neither a
+        join_group_id nor a lineage_path, the parent relationships have no
+        lineage operation (join/fork/expand) to belong to.
         """
-        token = _make_token()  # All group IDs are None
+        token = _make_token()  # No join_group_id, no lineage_path
         parent_ref = TokenParent(token_id="tok-1", parent_token_id="parent-1", ordinal=0)
         factory = _make_factory(
             token=token,
             row_lineage=_make_row_lineage(),
             token_parents=[parent_ref],
         )
-        with pytest.raises(AuditIntegrityError, match=r"parent relationships.*but no group ID"):
+        with pytest.raises(AuditIntegrityError, match=r"parent relationships.*but no lineage operation"):
             explain(factory.query, factory.data_flow, "run-1", token_id="tok-1")
 
 
@@ -601,49 +616,33 @@ class TestLineageResult:
 
 
 class TestExplainGroupIdValidation:
-    """Kill mutants on lineage.py lines 195-196.
+    """Group-id validation surface after the WS1b unified-lineage flip.
 
-    ZeroIterationForLoop: the entire group ID validation for-loop can be
-    deleted without any test failing. These tests prove the loop is
-    exercised and catches corrupted empty-string group IDs.
+    Pre-flip, fork_group_id/join_group_id/expand_group_id were three
+    independent nullable string columns on Token, each individually validated
+    against an empty string by an explicit for-loop in this query-composition
+    layer (lineage.py). That loop, and the "at most one group ID set"
+    exclusivity check, are gone: fork/expand group identity now lives inside
+    ``lineage_path``'s LineageFrame entries (ruling 21), and empty-string
+    group_id is rejected at LineageFrame construction itself — see
+    ``tests/unit/contracts/test_identity.py::TestLineageFrame::test_frame_rejects_bad_fields``,
+    which is the layer that now owns that invariant (a Token literally cannot
+    be built with an empty fork/expand group id — LineageFrame refuses it
+    before Token ever sees the value). Empty-string join_group_id is a
+    write-time check on ``DataFlowRepository.create_token`` (ruling 20: a
+    merge-event carrier with no LineageFrame constructor of its own) — see
+    ``tests/unit/core/landscape/test_token_recording.py::TestCreateToken::test_rejects_empty_string_join_group_id``.
 
-    Comparison mutations on ``gval == ""``: ``is ""``, ``< ""``,
-    ``is not None → is None`` all survive without these tests.
+    "Two group IDs set" is retired outright, not relocated: join_group_id and
+    lineage_path are now orthogonal axes (ruling 20), and a coalesced token's
+    lineage_path is always popped empty by the strict-pop discipline (rulings
+    24/28), so "join_group_id set AND a non-empty lineage_path" is unreachable
+    from any production writer — there is no invariant left to pin here.
     """
 
-    def test_empty_fork_group_id_raises(self) -> None:
-        """Token with fork_group_id='' is audit corruption — must raise."""
-        token = _make_token(fork_group_id="")
-        factory = _make_factory(
-            token=token,
-            row_lineage=_make_row_lineage(),
-        )
-        with pytest.raises(AuditIntegrityError, match=r"empty.*fork_group_id"):
-            explain(factory.query, factory.data_flow, "run-1", token_id="tok-1")
-
-    def test_empty_join_group_id_raises(self) -> None:
-        """Token with join_group_id='' is audit corruption — must raise."""
-        token = _make_token(join_group_id="")
-        factory = _make_factory(
-            token=token,
-            row_lineage=_make_row_lineage(),
-        )
-        with pytest.raises(AuditIntegrityError, match=r"empty.*join_group_id"):
-            explain(factory.query, factory.data_flow, "run-1", token_id="tok-1")
-
-    def test_empty_expand_group_id_raises(self) -> None:
-        """Token with expand_group_id='' is audit corruption — must raise."""
-        token = _make_token(expand_group_id="")
-        factory = _make_factory(
-            token=token,
-            row_lineage=_make_row_lineage(),
-        )
-        with pytest.raises(AuditIntegrityError, match=r"empty.*expand_group_id"):
-            explain(factory.query, factory.data_flow, "run-1", token_id="tok-1")
-
     def test_none_group_ids_accepted(self) -> None:
-        """Token with all group IDs as None is valid (no fork/join/expand)."""
-        token = _make_token()  # All group IDs default to None
+        """Token with no join_group_id and an empty lineage_path is valid (no fork/join/expand)."""
+        token = _make_token()  # join_group_id=None, lineage_path=()
         factory = _make_factory(
             token=token,
             row_lineage=_make_row_lineage(),
@@ -651,20 +650,6 @@ class TestExplainGroupIdValidation:
         result = explain(factory.query, factory.data_flow, "run-1", token_id="tok-1")
         assert result is not None
         assert result.token.token_id == "tok-1"
-
-    def test_two_group_ids_set_raises(self) -> None:
-        """Token with both fork_group_id and join_group_id set is corruption.
-
-        Kill mutant: ``len(set_groups) > 1`` → ``len(set_groups) > 2``.
-        With ``> 2``, exactly 2 group IDs set would slip through without raising.
-        """
-        token = _make_token(fork_group_id="fg-1", join_group_id="jg-1")
-        factory = _make_factory(
-            token=token,
-            row_lineage=_make_row_lineage(),
-        )
-        with pytest.raises(AuditIntegrityError, match=r"multiple group IDs"):
-            explain(factory.query, factory.data_flow, "run-1", token_id="tok-1")
 
 
 # ===========================================================================

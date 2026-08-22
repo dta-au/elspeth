@@ -119,17 +119,40 @@ def pop_closer_frame(path: tuple[LineageFrame, ...], *, kind: FrameKind, group_i
     return path[:-1]
 
 
+def pop_fork_frame(path: tuple[LineageFrame, ...], *, group_id: str) -> tuple[LineageFrame, ...]:
+    """Remove the FORK frame identified by group_id, wherever it sits (ruling 27).
+
+    Unlike pop_closer_frame's strict-innermost pop (rulings 24/28, where a
+    closer's own frame IS the innermost frame by construction — coalesce and
+    fork are strictly LIFO-nested), a row_union release closes only the
+    branch-selection scope. A row-multiplying transform inside the branch
+    (e.g. an expand) may have stacked an EXPAND frame on top of the branch's
+    FORK frame before the token reached the union — elspeth-a5b86149d4,
+    tests/integration/pipeline/test_row_union_branch_cardinality.py. FORK and
+    EXPAND scopes do not close in LIFO order with respect to each other: the
+    row_union closes the branch scope here, the expand's own multiplicity
+    scope closes elsewhere (or never explicitly closes). So this removes the
+    named FORK frame from wherever it sits in the path and preserves every
+    other frame in order — discarding a surviving EXPAND frame on release
+    would fabricate lineage, since the expand genuinely happened.
+    """
+    for index in range(len(path) - 1, -1, -1):
+        frame = path[index]
+        if frame.kind is FrameKind.FORK and frame.group_id == group_id:
+            return path[:index] + path[index + 1 :]
+    raise OrchestrationInvariantError(f"pop_fork_frame: no FORK frame for group {group_id!r} in path {path!r} (ruling 27 pop)")
+
+
 @dataclass(frozen=True, slots=True)
 class TokenInfo:
     """Identity and data for a token flowing through the DAG.
 
-    Tokens track row instances through forks/joins:
-    - row_id: Stable source row identity
-    - token_id: Instance of row in a specific DAG path
-    - branch_name: Which fork path this token is on (if forked)
-    - fork_group_id: Groups all children from a fork operation
-    - expand_group_id: Groups all children from an expand operation
-    - lineage_path: typed frame stack (unified lineage spec §4.1); tri-fields above are retired at WS1b
+    Lineage is ONE field — the lineage path (spec §4.1): a stack of typed frames,
+    outermost first. branch_name / fork_group_id / expand_group_id are DERIVED
+    accessors over the path (ruling 21: the only read path for the legacy names;
+    any stored-field resurrection is a defect). join_group_id is a merge EVENT,
+    not a membership — it left TokenInfo (ruling 20) and rides RowResult /
+    PendingOutcome / TokenWorkItem carriers.
 
     Resume state (resume_attempt_offset, resume_checkpoint_id): carried on the token —
     not WorkItem — because SinkExecutor buffers TokenInfos across WorkItem boundaries,
@@ -141,15 +164,7 @@ class TokenInfo:
     row_id: str
     token_id: str
     row_data: PipelineRow  # CHANGED from dict[str, Any]
-    branch_name: str | None = None
-    fork_group_id: str | None = None
-    expand_group_id: str | None = None
-    lineage_path: tuple[LineageFrame, ...] = ()  # Outermost first (spec §4.1). WS1a prep:
-    # rides BESIDE the stored branch_name/fork_group_id/expand_group_id,
-    # which keep today's destructive semantics and remain the read path. WS1b deletes
-    # the stored fields and re-exposes them as read-only properties over this path
-    # (innermost_fork_frame / innermost_expand_frame). Do NOT read this field from
-    # production code during WS1a — that would be a dual-representation read.
+    lineage_path: tuple[LineageFrame, ...] = ()  # Outermost first (spec §4.1).
     resume_attempt_offset: int = 0  # Added to every node_states.attempt written while
     # re-driving THIS token on resume, so its records coexist with the append-only run-1
     # records under UniqueConstraint(token_id, node_id, attempt). Value is the prior run's
@@ -176,16 +191,6 @@ class TokenInfo:
             raise TypeError(f"TokenInfo.token_id must be str, got {type(self.token_id).__name__}: {self.token_id!r}")
         if not self.token_id:
             raise ValueError("TokenInfo.token_id must not be empty")
-        for _field_name, _value in (
-            ("branch_name", self.branch_name),
-            ("fork_group_id", self.fork_group_id),
-            ("expand_group_id", self.expand_group_id),
-        ):
-            if _value is not None:
-                if not isinstance(_value, str):
-                    raise TypeError(f"TokenInfo.{_field_name} must be str or None, got {type(_value).__name__}: {_value!r}")
-                if not _value:
-                    raise ValueError(f"TokenInfo.{_field_name} must be None or non-empty string, got {_value!r}")
         if type(self.lineage_path) is not tuple:
             raise TypeError(
                 f"TokenInfo.lineage_path must be tuple[LineageFrame, ...], got {type(self.lineage_path).__name__}: {self.lineage_path!r}"
@@ -204,12 +209,24 @@ class TokenInfo:
                 f"resume_checkpoint_id (a positive offset only arises from a resume re-drive), got None"
             )
 
+    @property
+    def branch_name(self) -> str | None:
+        return path_branch_name(self.lineage_path)
+
+    @property
+    def fork_group_id(self) -> str | None:
+        return path_fork_group_id(self.lineage_path)
+
+    @property
+    def expand_group_id(self) -> str | None:
+        return path_expand_group_id(self.lineage_path)
+
     def with_updated_data(self, new_data: PipelineRow) -> TokenInfo:
-        """Return a new TokenInfo with updated row_data, preserving all lineage fields.
+        """Return a new TokenInfo with updated row_data, preserving lineage_path.
 
         This method ensures that when row_data is updated after a transform,
-        all identity and lineage metadata (branch_name, fork_group_id,
-        expand_group_id, lineage_path) are preserved.
+        all identity and lineage metadata (lineage_path, and the derived
+        branch_name/fork_group_id/expand_group_id accessors over it) are preserved.
 
         Critically, resume_attempt_offset and resume_checkpoint_id are also
         preserved via dataclasses.replace — this is the propagation mechanism that

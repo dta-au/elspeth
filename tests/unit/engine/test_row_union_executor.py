@@ -18,8 +18,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from elspeth.contracts import TokenInfo
-from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome
+from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import RowUnionSettings
@@ -53,9 +54,11 @@ def _make_token(
     token_id: str = "tok_1",
     branch_name: str = "branch_a",
     data: dict[str, Any] | None = None,
+    fork_group_id: str = "fg-row-union-test",
 ) -> TokenInfo:
     row_data = make_row(data if data is not None else {"amount": 100}, contract=_make_contract())
-    return TokenInfo(row_id=row_id, token_id=token_id, row_data=row_data, branch_name=branch_name)
+    lineage_path = (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name),)
+    return TokenInfo(row_id=row_id, token_id=token_id, row_data=row_data, lineage_path=lineage_path)
 
 
 def _make_settings(
@@ -130,11 +133,12 @@ class TestAcceptHoldAndRelease:
         outcome = executor.accept(tok_a, "variant_union")
         assert outcome.held is False
         assert outcome.failure_reason is None
-        # Declared order [branch_a, branch_b], not arrival order [b, a] —
-        # and the SAME TokenInfo objects, identity preserved, no merge.
-        assert outcome.released_tokens == (tok_a, tok_b)
-        assert outcome.released_tokens[0] is tok_a
-        assert outcome.released_tokens[1] is tok_b
+        # Declared order [branch_a, branch_b], not arrival order [b, a].
+        # Ruling 27: release pops the shared innermost FORK frame off each
+        # released token, so these are NEW TokenInfo objects (same token_id,
+        # popped lineage_path), not the original tok_a/tok_b instances.
+        assert [t.token_id for t in outcome.released_tokens] == [tok_a.token_id, tok_b.token_id]
+        assert all(t.lineage_path == () for t in outcome.released_tokens)
         assert outcome.row_union_name == "variant_union"
 
     def test_release_completes_node_states_without_terminal_outcomes(self) -> None:
@@ -533,7 +537,8 @@ class TestRestoreFromJournal:
             )
         )
 
-        assert outcome.released_tokens == (tok_a, tok_b)
+        assert [t.token_id for t in outcome.released_tokens] == [tok_a.token_id, tok_b.token_id]
+        assert all(t.lineage_path == () for t in outcome.released_tokens)
         execution.complete_node_state.assert_called_once()
         assert execution.complete_node_state.call_args.kwargs["state_id"] == "state-b"
 
@@ -556,7 +561,8 @@ class TestRestoreFromJournal:
         assert outcomes == ()
         sibling = _make_token(token_id="tok_b", branch_name="branch_b")
         released = executor.accept(sibling, "variant_union")
-        assert released.released_tokens == (restored, sibling)
+        assert [t.token_id for t in released.released_tokens] == [restored.token_id, sibling.token_id]
+        assert all(t.lineage_path == () for t in released.released_tokens)
         completed_state_ids = [call.kwargs["state_id"] for call in execution.complete_node_state.call_args_list]
         assert completed_state_ids[0] == "state-restored"
         assert len(completed_state_ids) == 2
@@ -575,7 +581,8 @@ class TestRestoreFromJournal:
         )
 
         assert len(outcomes) == 1
-        assert outcomes[0].released_tokens == (tok_a, tok_b)
+        assert [t.token_id for t in outcomes[0].released_tokens] == [tok_a.token_id, tok_b.token_id]
+        assert all(t.lineage_path == () for t in outcomes[0].released_tokens)
         assert [call.kwargs["state_id"] for call in execution.complete_node_state.call_args_list] == ["state-a", "state-b"]
 
     def test_restored_entry_at_released_key_fails_as_late_arrival_instead_of_reopening(self) -> None:

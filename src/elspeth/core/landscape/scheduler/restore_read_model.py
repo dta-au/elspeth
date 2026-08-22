@@ -24,8 +24,10 @@ from elspeth.contracts import (
     TokenOutcome,
 )
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import BatchStatus, OutputMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import BatchStatus, FrameKind, OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids
@@ -40,6 +42,7 @@ from elspeth.core.landscape.schema import (
     coalesce_effect_members_table,
     coalesce_effects_table,
     node_states_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
     token_work_items_table,
@@ -60,6 +63,50 @@ class BarrierRestoreReadModel:
     ) -> None:
         self._ops = ops
         self._token_outcome_loader = token_outcome_loader
+
+    def _load_lineage_paths(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[LineageFrame, ...]]:
+        """Batch-load lineage paths from token_lineage_frames (outermost first)."""
+        ordered_token_ids = tuple(dict.fromkeys(token_ids))
+        paths: dict[str, list[tuple[int, LineageFrame]]] = {token_id: [] for token_id in ordered_token_ids}
+        for offset in range(0, len(ordered_token_ids), _TOKEN_ID_CHUNK_SIZE):
+            chunk = ordered_token_ids[offset : offset + _TOKEN_ID_CHUNK_SIZE]
+            rows = self._ops.execute_fetchall(
+                select(
+                    token_lineage_frames_table.c.token_id,
+                    token_lineage_frames_table.c.depth,
+                    token_lineage_frames_table.c.kind,
+                    token_lineage_frames_table.c.group_id,
+                    token_lineage_frames_table.c.member_key,
+                )
+                .where(token_lineage_frames_table.c.run_id == run_id)
+                .where(token_lineage_frames_table.c.token_id.in_(chunk))
+            )
+            for row in rows:
+                paths[str(row.token_id)].append(
+                    (int(row.depth), LineageFrame(kind=FrameKind(row.kind), group_id=str(row.group_id), member_key=str(row.member_key)))
+                )
+        result: dict[str, tuple[LineageFrame, ...]] = {}
+        for token_id, entries in paths.items():
+            entries.sort(key=lambda entry: entry[0])
+            depths = [depth for depth, _frame in entries]
+            if depths != list(range(len(depths))):
+                raise AuditIntegrityError(f"token_lineage_frames for token {token_id!r} (run {run_id!r}) has non-dense depths {depths}")
+            result[token_id] = tuple(frame for _depth, frame in entries)
+        return result
+
+    def verify_lineage_journal_consistency(self, run_id: str, items: Sequence[TokenWorkItem]) -> None:
+        """Codec-vs-table bidirectional check (spec §4.3): each journal row's
+        decoded lineage_path must equal the token's token_lineage_frames rows
+        exactly (both directions — a frames row absent from the codec path
+        and a codec frame absent from the table are BOTH AuditIntegrityError).
+        """
+        table_paths = self._load_lineage_paths(run_id, [item.token_id for item in items])
+        for item in items:
+            if item.lineage_path != table_paths[item.token_id]:
+                raise AuditIntegrityError(
+                    f"lineage journal/table divergence for token {item.token_id!r} (run {run_id!r}): "
+                    f"journal={item.lineage_path!r} table={table_paths[item.token_id]!r}"
+                )
 
     def list_live_buffered_outcomes(self, ref: TokenRef) -> list[TokenOutcome]:
         """All live BUFFERED outcomes for one token.
@@ -327,7 +374,6 @@ class BarrierRestoreReadModel:
                         token_outcomes_table.c.token_id,
                         token_outcomes_table.c.outcome,
                         token_outcomes_table.c.path,
-                        token_outcomes_table.c.join_group_id,
                     )
                     .where(token_outcomes_table.c.run_id == run_id)
                     .where(token_outcomes_table.c.token_id.in_(chunk))
@@ -341,11 +387,10 @@ class BarrierRestoreReadModel:
             raise AuditIntegrityError(f"Coalesce residual effect {effect.effect_id!r} has duplicate terminal parent outcomes")
         for member_id in member_ids:
             outcome = terminals[member_id]
-            if not (
-                outcome.outcome == TerminalOutcome.SUCCESS.value
-                and outcome.path == TerminalPath.COALESCED.value
-                and outcome.join_group_id == effect.result_join_group_id
-            ):
+            # member-outcome join binding retired with the outcome column;
+            # the result-token binding (tokens.join_group_id + composite FK)
+            # is the durable anchor, checked below.
+            if not (outcome.outcome == TerminalOutcome.SUCCESS.value and outcome.path == TerminalPath.COALESCED.value):
                 raise AuditIntegrityError(f"Coalesce residual effect {effect.effect_id!r} has divergent parent outcomes")
 
         token = self._ops.execute_fetchone(
@@ -546,11 +591,14 @@ class BarrierRestoreReadModel:
                         f"Committed aggregation residual batch {batch_id!r} member {member_id!r} has a divergent terminal outcome"
                     )
 
+            # expand_group_id retired from tokens (D2 flip): a child of THIS
+            # expansion is identified by its own token_lineage_frames row
+            # (kind='expand', group_id=batch_row.expansion_group_id) instead
+            # of the deleted tokens.expand_group_id column.
             child_rows = self._ops.execute_fetchall(
                 select(
                     tokens_table.c.token_id,
                     tokens_table.c.row_id,
-                    tokens_table.c.expand_group_id,
                     tokens_table.c.token_data_ref,
                     tokens_table.c.step_in_pipeline,
                     token_parents_table.c.parent_token_id,
@@ -563,10 +611,17 @@ class BarrierRestoreReadModel:
                             tokens_table.c.token_id == token_parents_table.c.token_id,
                             tokens_table.c.run_id == token_parents_table.c.run_id,
                         ),
+                    ).join(
+                        token_lineage_frames_table,
+                        and_(
+                            tokens_table.c.token_id == token_lineage_frames_table.c.token_id,
+                            tokens_table.c.run_id == token_lineage_frames_table.c.run_id,
+                        ),
                     )
                 )
                 .where(tokens_table.c.run_id == run_id)
-                .where(tokens_table.c.expand_group_id == batch_row.expansion_group_id)
+                .where(token_lineage_frames_table.c.kind == FrameKind.EXPAND.value)
+                .where(token_lineage_frames_table.c.group_id == batch_row.expansion_group_id)
                 .order_by(token_parents_table.c.ordinal)
             )
             if not child_rows or tuple(int(row.ordinal) for row in child_rows) != tuple(range(len(child_rows))):
@@ -577,12 +632,7 @@ class BarrierRestoreReadModel:
 
             children: list[CommittedAggregationChild] = []
             for row in child_rows:
-                if (
-                    type(row.token_data_ref) is not str
-                    or not row.token_data_ref
-                    or type(row.step_in_pipeline) is not int
-                    or row.expand_group_id != batch_row.expansion_group_id
-                ):
+                if type(row.token_data_ref) is not str or not row.token_data_ref or type(row.step_in_pipeline) is not int:
                     raise AuditIntegrityError(f"Committed aggregation residual batch {batch_id!r} has an incomplete child receipt")
                 child_has_outcome = self._ops.execute_fetchone(
                     select(token_outcomes_table.c.outcome_id)
@@ -604,7 +654,7 @@ class BarrierRestoreReadModel:
                     CommittedAggregationChild(
                         token_id=str(row.token_id),
                         row_id=str(row.row_id),
-                        expand_group_id=str(row.expand_group_id),
+                        expand_group_id=str(batch_row.expansion_group_id),
                         token_data_ref=row.token_data_ref,
                         step_in_pipeline=row.step_in_pipeline,
                         parent_token_id=str(row.parent_token_id),

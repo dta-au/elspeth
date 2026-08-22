@@ -67,10 +67,7 @@ class ScheduledWorkFields:
     queue_key: str | None
     barrier_key: str | None
     on_success_sink: str | None
-    branch_name: str | None
-    fork_group_id: str | None
     join_group_id: str | None
-    expand_group_id: str | None
     lineage_path: tuple[LineageFrame, ...]
     coalesce_node_id: str | None
     coalesce_name: str | None
@@ -108,10 +105,7 @@ class SchedulerWorkCodec:
             queue_key=self.queue_key_for_item(item),
             barrier_key=self.barrier_key_for_item(item),
             on_success_sink=item.on_success_sink,
-            branch_name=token.branch_name,
-            fork_group_id=token.fork_group_id,
             join_group_id=item.join_group_id,
-            expand_group_id=token.expand_group_id,
             lineage_path=token.lineage_path,
             coalesce_node_id=str(item.coalesce_node_id) if item.coalesce_node_id is not None else None,
             coalesce_name=str(item.coalesce_name) if item.coalesce_name is not None else None,
@@ -131,10 +125,7 @@ class SchedulerWorkCodec:
             queue_key=fields.queue_key,
             barrier_key=fields.barrier_key,
             on_success_sink=fields.on_success_sink,
-            branch_name=fields.branch_name,
-            fork_group_id=fields.fork_group_id,
             join_group_id=fields.join_group_id,
-            expand_group_id=fields.expand_group_id,
             lineage_path=fields.lineage_path,
             coalesce_node_id=fields.coalesce_node_id,
             coalesce_name=fields.coalesce_name,
@@ -148,9 +139,6 @@ class SchedulerWorkCodec:
             row_id=scheduled.row_id,
             token_id=scheduled.token_id,
             row_data=self.deserialize_row_payload(scheduled.row_payload_json),
-            branch_name=scheduled.branch_name,
-            fork_group_id=scheduled.fork_group_id,
-            expand_group_id=scheduled.expand_group_id,
             lineage_path=scheduled.lineage_path,
         )
         return self.create_work_item(

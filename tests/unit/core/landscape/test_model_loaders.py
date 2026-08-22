@@ -47,6 +47,7 @@ from elspeth.contracts.enums import (
     CallType,
     Determinism,
     ExportStatus,
+    FrameKind,
     NodeStateStatus,
     NodeType,
     ReproducibilityGrade,
@@ -57,6 +58,7 @@ from elspeth.contracts.enums import (
     TriggerType,
 )
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame, path_branch_name, path_fork_group_id
 from elspeth.core.landscape.execution.node_states import NodeStateRepository
 from elspeth.core.landscape.model_loaders import (
     ArtifactLoader,
@@ -468,10 +470,7 @@ class TestTokenLoader:
             "row_id": "row-1",
             "run_id": "run-1",
             "created_at": NOW,
-            "fork_group_id": None,
             "join_group_id": None,
-            "expand_group_id": None,
-            "branch_name": None,
             "step_in_pipeline": None,
             # Epoch-11 column: real select(tokens_table) rows always carry it.
             "token_data_ref": None,
@@ -488,23 +487,24 @@ class TestTokenLoader:
         assert result.token_id == "tok-1"
         assert result.row_id == "row-1"
         assert result.run_id == "run-1"
-        assert result.fork_group_id is None
         assert result.join_group_id is None
+        # lineage_path is NOT a tokens-table column (WS1b flip): the loader
+        # defaults it to () and the caller batch-loads the real path
+        # separately when it needs it.
+        assert result.lineage_path == ()
 
     def test_valid_load_with_all_optional_fields(self) -> None:
         sa_row = self._make_token_row(
-            fork_group_id="fg-1",
             join_group_id="jg-1",
-            expand_group_id="eg-1",
-            branch_name="path_a",
             step_in_pipeline=3,
         )
         loader = TokenLoader()
-        result = loader.load(sa_row)
-        assert result.fork_group_id == "fg-1"
+        lineage_path = (LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),)
+        result = loader.load(sa_row, lineage_path=lineage_path)
         assert result.join_group_id == "jg-1"
-        assert result.expand_group_id == "eg-1"
-        assert result.branch_name == "path_a"
+        assert result.lineage_path == lineage_path
+        assert path_fork_group_id(result.lineage_path) == "fg-1"
+        assert path_branch_name(result.lineage_path) == "path_a"
         assert result.step_in_pipeline == 3
 
     def test_load_populates_token_data_ref(self) -> None:
@@ -1402,12 +1402,8 @@ class TestTokenOutcomeLoaderTwoAxis:
             "recorded_at": NOW,
             "sink_name": "output",
             "batch_id": None,
-            "fork_group_id": None,
-            "join_group_id": None,
-            "expand_group_id": None,
             "error_hash": None,
             "context_json": None,
-            "expected_branches_json": None,
         }
         defaults.update(overrides)
         return _make_sa_row(**defaults)
@@ -1417,9 +1413,6 @@ class TestTokenOutcomeLoaderTwoAxis:
         values = {
             "sink_name": "output",
             "batch_id": "batch-1",
-            "fork_group_id": "fork-1",
-            "join_group_id": "join-1",
-            "expand_group_id": "expand-1",
             "error_hash": "e" * 64,
         }
         fields: dict[str, str] = {}
@@ -1438,9 +1431,6 @@ class TestTokenOutcomeLoaderTwoAxis:
             "completed": 1 if outcome is not None else 0,
             "sink_name": None,
             "batch_id": None,
-            "fork_group_id": None,
-            "join_group_id": None,
-            "expand_group_id": None,
             "error_hash": None,
         }
         row_overrides.update(self._valid_fields(pair))
@@ -1559,19 +1549,19 @@ class TestTokenOutcomeLoaderTwoAxis:
             TokenOutcomeLoader().load(sa_row)
 
     def test_valid_load_with_optional_context_fields(self) -> None:
+        # fork_group_id/expected_branches_json retired from token_outcomes (D2
+        # flip): the roster of record moved to token_lineage_frames +
+        # group_records, not this loader's row.
         sa_row = self._row_for_pair(
             (TerminalOutcome.TRANSIENT, TerminalPath.FORK_PARENT),
             context_json='{"paths": ["a", "b"]}',
-            expected_branches_json='["path_a", "path_b"]',
         )
 
         result = TokenOutcomeLoader().load(sa_row)
 
         assert result.outcome == TerminalOutcome.TRANSIENT
         assert result.path == TerminalPath.FORK_PARENT
-        assert result.fork_group_id == "fork-1"
         assert result.context_json == '{"paths": ["a", "b"]}'
-        assert result.expected_branches_json == '["path_a", "path_b"]'
 
 
 # ---------------------------------------------------------------------------

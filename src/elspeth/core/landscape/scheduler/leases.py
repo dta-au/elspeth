@@ -80,7 +80,8 @@ def _incomplete_pending_sink_bundle_error(*, run_id: str, work_item_id: str) -> 
         f"Scheduler claim_pending_sink refused run_id={run_id!r} work_item_id={work_item_id!r}: "
         "PENDING_SINK row does not carry a complete durable sink bundle. Required: non-empty row payload and sink name; "
         "a legal pending_outcome/pending_path sink pair; no pending_error_hash/pending_error_message for successful paths; "
-        "both pending_error_hash and pending_error_message for ON_ERROR_ROUTED; and join_group_id for COALESCED."
+        "both pending_error_hash and pending_error_message for ON_ERROR_ROUTED; "
+        "and join_group_id for COALESCED (the kept merge-event column)."
     )
 
 

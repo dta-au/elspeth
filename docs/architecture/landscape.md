@@ -174,9 +174,15 @@ run-scoped per-token read resolves through one index instead of choosing
 between two single-column candidates the planner cannot separate. Epoch 34
 adds the unified-lineage groundwork tables (`token_lineage_frames`,
 `group_records`, `group_losses`) and `token_work_items.lineage_path_json`.
+Epoch 35 flips lineage onto that groundwork: the tri-column
+`fork_group_id`/`expand_group_id`/`branch_name` discriminators are retired
+from `tokens`, `token_outcomes`, and `token_work_items` (plus
+`token_outcomes.expected_branches_json`), and `token_lineage_frames` /
+`lineage_path_json` become the sole lineage truth. `join_group_id` stays — it
+is a merge-event identity, not a lineage-path field.
 
 ELSPETH is pre-1.0. An older Landscape database is archived or exported as
-required and recreated at epoch 34; startup and read-only inspection do not
+required and recreated at epoch 35; startup and read-only inspection do not
 transform a predecessor store in place.
 
 ### Multi-source ingestion (ADR-025)

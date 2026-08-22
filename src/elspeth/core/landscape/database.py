@@ -285,7 +285,9 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("run_web_plugin_policy", "plugin_code_identities_json"),
     ("run_web_plugin_policy", "binding_generation_fingerprint"),
     ("run_web_plugin_policy", "decision_codes_json"),
-    ("tokens", "expand_group_id"),
+    # Epoch 35 flip: lineage lives on token_lineage_frames + group_records now.
+    ("token_lineage_frames", "member_key"),
+    ("group_records", "member_count"),
     # Added for run ownership — prevents cross-run contamination of token-linked records
     ("tokens", "run_id"),
     # Token ancestry belongs to exactly one run; both endpoints are composite-FK scoped.
@@ -296,8 +298,6 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("runs", "source_schema_json"),
     # Field resolution audit trail - captures original→final header mapping
     ("runs", "source_field_resolution_json"),
-    # Fork/expand branch contract - enables recovery validation
-    ("token_outcomes", "expected_branches_json"),
     # Transform success reason audit trail - captures why transform succeeded
     ("node_states", "success_reason_json"),
     # Operation call linkage - enables source/sink call tracking
@@ -391,10 +391,8 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("token_work_items", "pending_path"),
     ("token_work_items", "pending_error_hash"),
     ("token_work_items", "pending_error_message"),
-    ("token_work_items", "branch_name"),
-    ("token_work_items", "fork_group_id"),
     ("token_work_items", "join_group_id"),
-    ("token_work_items", "expand_group_id"),
+    ("token_work_items", "lineage_path_json"),
     ("token_work_items", "coalesce_node_id"),
     ("token_work_items", "coalesce_name"),
     # Epoch 30: row_union barrier attribution, the sibling of coalesce_name.

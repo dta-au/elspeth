@@ -13,6 +13,7 @@ from elspeth.contracts import Determinism, NodeType, PipelineRow
 from elspeth.contracts.audit import NodeStateCompleted
 from elspeth.contracts.errors import AuditIntegrityError, CoalesceCollisionError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.identity import path_branch_name
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.config import CoalesceSettings, GateSettings
 from elspeth.core.landscape.database import LandscapeDB
@@ -499,9 +500,11 @@ def _find_merged_token_id(db: LandscapeDB, run_id: str) -> str:
     """Return the token_id of the single merged token produced by a coalesce in this run.
 
     A merged token is the join-group output — it has `join_group_id` set and
-    no `branch_name` (branch_name is set on the consumed parent tokens, not the
-    merged output). For tests with a single source row and one coalesce point,
-    exactly one such token must exist.
+    no FORK frame in its lineage_path (branch_name, the innermost FORK frame's
+    member_key, is set on the consumed parent tokens, not the merged output —
+    coalesce_tokens' strict pop removes the shared FORK frame at merge time).
+    For tests with a single source row and one coalesce point, exactly one
+    such token must exist.
     """
     with db.connection() as conn:
         rows = conn.execute(
@@ -511,7 +514,12 @@ def _find_merged_token_id(db: LandscapeDB, run_id: str) -> str:
                 FROM tokens
                 WHERE run_id = :run_id
                   AND join_group_id IS NOT NULL
-                  AND branch_name IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM token_lineage_frames
+                      WHERE token_lineage_frames.token_id = tokens.token_id
+                        AND token_lineage_frames.run_id = tokens.run_id
+                        AND token_lineage_frames.kind = 'fork'
+                  )
                 """
             ),
             {"run_id": run_id},
@@ -665,7 +673,7 @@ class TestUnionMergeFieldProvenance:
         # via token_parents with join_group_id set — this is the lineage hop
         # auditors follow from a sink row back to the coalesce point.
         assert len(merged_lineage.parent_tokens) == 2, f"expected 2 parent tokens for merged token, got {len(merged_lineage.parent_tokens)}"
-        parent_branch_names = {p.branch_name for p in merged_lineage.parent_tokens}
+        parent_branch_names = {path_branch_name(p.lineage_path) for p in merged_lineage.parent_tokens}
         assert parent_branch_names == {"path_a", "path_b"}
 
         # Hop into each parent: their coalesce node_state carries the

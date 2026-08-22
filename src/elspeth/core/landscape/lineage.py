@@ -68,56 +68,45 @@ class LineageIntegrityValidator:
                 f"the child token's recorded run."
             )
         parents = query.get_token_parents(token.token_id)
-        group_ids = self._group_ids_for(token)
-        self._validate_group_ids(token.token_id, group_ids)
-        self._validate_parent_link_shape(token.token_id, group_ids, parents)
+        kind = self._lineage_kind_for(token)
+        self._validate_parent_link_shape(token.token_id, kind, parents)
         return self._hydrate_parent_tokens(query, token.token_id, run_id, parents)
 
     @staticmethod
-    def _group_ids_for(token: Token) -> dict[str, str | None]:
-        return {
-            "fork": token.fork_group_id,
-            "join": token.join_group_id,
-            "expand": token.expand_group_id,
-        }
-
-    @staticmethod
-    def _validate_group_ids(token_id: str, group_ids: dict[str, str | None]) -> None:
-        # Empty-string group IDs are audit corruption (UUIDs are never empty).
-        for gtype, gval in group_ids.items():
-            if gval is not None and gval == "":
-                raise AuditIntegrityError(
-                    f"Audit integrity violation: token '{token_id}' has empty {gtype}_group_id. "
-                    f"Group IDs must be non-empty UUIDs or NULL. This indicates database corruption."
-                )
-
-        set_groups = [k for k, v in group_ids.items() if v is not None]
-        if len(set_groups) > 1:
-            raise AuditIntegrityError(
-                f"Audit integrity violation: token '{token_id}' has multiple group IDs set: "
-                f"{set_groups}. A token can belong to exactly one lineage operation."
-            )
+    def _lineage_kind_for(token: Token) -> str | None:
+        """The operation that minted this token: 'join' (merge event), the innermost
+        frame's kind, or None for a source-row token."""
+        if token.join_group_id is not None:
+            return "join"
+        if token.lineage_path:
+            return token.lineage_path[-1].kind.value
+        return None
 
     @staticmethod
     def _validate_parent_link_shape(
         token_id: str,
-        group_ids: dict[str, str | None],
+        kind: str | None,
         parents: list[TokenParent],
     ) -> None:
-        set_groups = [k for k, v in group_ids.items() if v is not None]
-        if set_groups and not parents:
-            group_type = set_groups[0]
-            group_id = group_ids[group_type]
-            raise AuditIntegrityError(
-                f"Audit integrity violation: token '{token_id}' has {group_type}_group_id='{group_id}' "
-                f"but no parent relationships in token_parents table. Tokens with group IDs must have "
-                f"parent lineage recorded. This indicates missing {group_type} metadata or audit corruption."
-            )
-        if parents and not set_groups:
+        if kind == "join":
+            if len(parents) < 2:
+                raise AuditIntegrityError(
+                    f"Audit integrity violation: token '{token_id}' has join_group_id set (a merge event) "
+                    f"but has {len(parents)} parent relationships in token_parents table; a join requires "
+                    f"at least 2. This indicates missing join metadata or audit corruption."
+                )
+        elif kind in ("fork", "expand"):
+            if len(parents) != 1:
+                raise AuditIntegrityError(
+                    f"Audit integrity violation: token '{token_id}' has an innermost {kind} lineage frame "
+                    f"but has {len(parents)} parent relationships in token_parents table; a {kind} child "
+                    f"requires exactly 1. This indicates missing {kind} metadata or audit corruption."
+                )
+        elif parents:
             parent_ids = [p.parent_token_id for p in parents]
             raise AuditIntegrityError(
                 f"Audit integrity violation: token '{token_id}' has parent relationships "
-                f"{parent_ids} but no group ID (fork/join/expand) is set. Parent tokens must "
+                f"{parent_ids} but no lineage operation (join/fork/expand) minted it. Parent tokens must "
                 f"be associated with a lineage operation."
             )
 

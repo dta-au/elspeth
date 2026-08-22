@@ -2117,7 +2117,6 @@ class TestGetAllTokenOutcomesForRun:
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
-            fork_group_id="fg-1",
         )
 
         outcomes = factory.query.get_all_token_outcomes_for_run("run-1")

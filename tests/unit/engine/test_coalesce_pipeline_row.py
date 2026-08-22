@@ -7,7 +7,9 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import TokenInfo
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import CoalesceSettings
@@ -203,15 +205,13 @@ class TestCoalesceExecutorPipelineRow:
             row_id="row_001",
             token_id="token_a",
             row_data=make_row({"amount": 100, "branch_a_field": "a"}, contract=contract_a),
-            branch_name="branch_a",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_a"),),
         )
         token_b = TokenInfo(
             row_id="row_001",
             token_id="token_b",
             row_data=make_row({"amount": 100, "branch_b_field": "b"}, contract=contract_b),
-            branch_name="branch_b",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_b"),),
         )
 
         # Accept both tokens
@@ -270,16 +270,14 @@ class TestCoalesceExecutorPipelineRow:
             row_id="row_001",
             token_id="token_a",
             row_data=make_row({"amount": 100}, contract=contract),
-            branch_name="branch_a",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_a"),),
         )
 
         token_b = TokenInfo(
             row_id="row_001",
             token_id="token_b",
             row_data=_BadPipelineRow(),
-            branch_name="branch_b",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_b"),),
         )
 
         # Accept first token
@@ -348,15 +346,13 @@ class TestCoalesceExecutorPipelineRow:
             row_id="row_001",
             token_id="token_a",
             row_data=make_row({"value": 100}, contract=contract_a),
-            branch_name="branch_a",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_a"),),
         )
         token_b = TokenInfo(
             row_id="row_001",
             token_id="token_b",
             row_data=make_row({"value": "text"}, contract=contract_b),
-            branch_name="branch_b",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_b"),),
         )
 
         executor.accept(token_a, "merge_point")
@@ -407,8 +403,7 @@ class TestCoalesceExecutorPipelineRow:
             row_id="row_001",
             token_id="token_a",
             row_data=make_row({"amount": 100}, contract=contract),
-            branch_name="branch_a",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_a"),),
         )
 
         # Accept first token - should merge immediately with "first" policy
@@ -451,15 +446,13 @@ class TestCoalesceExecutorPipelineRow:
             row_id="row_001",
             token_id="token_a",
             row_data=make_row({"amount": 100, "a_only": "a"}, contract=contract),
-            branch_name="branch_a",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_a"),),
         )
         token_b = TokenInfo(
             row_id="row_001",
             token_id="token_b",
             row_data=make_row({"amount": 200, "b_only": "b"}, contract=contract),
-            branch_name="branch_b",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_b"),),
         )
 
         executor.accept(token_a, "merge_point")

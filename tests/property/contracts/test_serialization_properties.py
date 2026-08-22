@@ -25,10 +25,10 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from elspeth.contracts import TransformErrorReason
-from elspeth.contracts.enums import RoutingKind, RoutingMode
+from elspeth.contracts.enums import FrameKind, RoutingKind, RoutingMode
 from elspeth.contracts.errors import ConfigGateReason, TransformSuccessReason
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.identity import LineageFrame, TokenInfo
 from elspeth.contracts.results import TransformResult
 from elspeth.contracts.routing import RoutingAction
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -70,6 +70,8 @@ def _token_to_dict(token: TokenInfo) -> dict[str, Any]:
         "row_id": token.row_id,
         "token_id": token.token_id,
         "row_data": token.row_data.to_dict() if isinstance(token.row_data, PipelineRow) else token.row_data,
+        # Derived from lineage_path (ruling 21) — read via the properties,
+        # never independently constructed.
         "branch_name": token.branch_name,
         "fork_group_id": token.fork_group_id,
         "expand_group_id": token.expand_group_id,
@@ -80,16 +82,28 @@ def _token_to_dict(token: TokenInfo) -> dict[str, Any]:
 # Strategies for serialization testing
 # =============================================================================
 
-# Branch names for TokenInfo
-token_branch_names = st.one_of(
-    st.none(),
-    st.text(min_size=1, max_size=20, alphabet="abcdefghijklmnopqrstuvwxyz_"),
-)
+# WS1b flip: branch_name/fork_group_id are no longer independent TokenInfo
+# constructor kwargs — both are derived from the SAME innermost FORK frame
+# (ruling 21), so they can no longer vary independently. expand_group_id
+# comes from a separate, optionally-nested-inside-the-fork EXPAND frame.
+# These strategies generate a lineage_path exercising both axes together.
+_non_empty_branch_names = st.text(min_size=1, max_size=20, alphabet="abcdefghijklmnopqrstuvwxyz_")
+_non_empty_group_ids = id_strings
 
-# Group IDs for TokenInfo
-token_group_ids = st.one_of(
+_optional_fork_frame = st.one_of(
     st.none(),
-    id_strings,
+    st.tuples(_non_empty_group_ids, _non_empty_branch_names).map(
+        lambda pair: LineageFrame(kind=FrameKind.FORK, group_id=pair[0], member_key=pair[1])
+    ),
+)
+_optional_expand_frame = st.one_of(
+    st.none(),
+    st.tuples(_non_empty_group_ids, _non_empty_branch_names).map(
+        lambda pair: LineageFrame(kind=FrameKind.EXPAND, group_id=pair[0], member_key=pair[1])
+    ),
+)
+lineage_paths = st.tuples(_optional_fork_frame, _optional_expand_frame).map(
+    lambda pair: tuple(frame for frame in pair if frame is not None)
 )
 
 # Non-empty ID strings (required fields)
@@ -207,9 +221,7 @@ class TestTokenInfoConstructionProperties:
         row_id=non_empty_ids,
         token_id=non_empty_ids,
         data=row_data,
-        branch_name=token_branch_names,
-        fork_group_id=token_group_ids,
-        expand_group_id=token_group_ids,
+        path=lineage_paths,
     )
     @settings(max_examples=100)
     def test_token_info_preserves_optional_fields(
@@ -217,22 +229,22 @@ class TestTokenInfoConstructionProperties:
         row_id: str,
         token_id: str,
         data: dict[str, Any],
-        branch_name: str | None,
-        fork_group_id: str | None,
-        expand_group_id: str | None,
+        path: tuple[LineageFrame, ...],
     ) -> None:
-        """Property: TokenInfo preserves all optional fields."""
+        """Property: TokenInfo preserves lineage_path, and its derived optional
+        fields (ruling 21) read back the innermost FORK/EXPAND frame."""
         token = TokenInfo(
             row_id=row_id,
             token_id=token_id,
             row_data=_wrap_dict_as_pipeline_row(data),
-            branch_name=branch_name,
-            fork_group_id=fork_group_id,
-            expand_group_id=expand_group_id,
+            lineage_path=path,
         )
-        assert token.branch_name == branch_name
-        assert token.fork_group_id == fork_group_id
-        assert token.expand_group_id == expand_group_id
+        assert token.lineage_path == path
+        fork_frame = next((frame for frame in path if frame.kind is FrameKind.FORK), None)
+        expand_frame = next((frame for frame in path if frame.kind is FrameKind.EXPAND), None)
+        assert token.branch_name == (fork_frame.member_key if fork_frame is not None else None)
+        assert token.fork_group_id == (fork_frame.group_id if fork_frame is not None else None)
+        assert token.expand_group_id == (expand_frame.group_id if expand_frame is not None else None)
 
 
 class TestTokenInfoJsonSerializationProperties:
@@ -286,9 +298,7 @@ class TestTokenInfoJsonSerializationProperties:
         row_id=non_empty_ids,
         token_id=non_empty_ids,
         data=row_data,
-        branch_name=token_branch_names,
-        fork_group_id=token_group_ids,
-        expand_group_id=token_group_ids,
+        path=lineage_paths,
     )
     @settings(max_examples=100)
     def test_token_info_json_round_trip_preserves_optional_fields(
@@ -296,26 +306,23 @@ class TestTokenInfoJsonSerializationProperties:
         row_id: str,
         token_id: str,
         data: dict[str, Any],
-        branch_name: str | None,
-        fork_group_id: str | None,
-        expand_group_id: str | None,
+        path: tuple[LineageFrame, ...],
     ) -> None:
-        """Property: TokenInfo JSON round-trip preserves optional fields."""
+        """Property: TokenInfo JSON round-trip preserves the derived optional
+        fields (ruling 21: read from lineage_path, not independently set)."""
         token = TokenInfo(
             row_id=row_id,
             token_id=token_id,
             row_data=_wrap_dict_as_pipeline_row(data),
-            branch_name=branch_name,
-            fork_group_id=fork_group_id,
-            expand_group_id=expand_group_id,
+            lineage_path=path,
         )
 
         serialized = json.dumps(_token_to_dict(token))
         parsed = json.loads(serialized)
 
-        assert parsed["branch_name"] == branch_name
-        assert parsed["fork_group_id"] == fork_group_id
-        assert parsed["expand_group_id"] == expand_group_id
+        assert parsed["branch_name"] == token.branch_name
+        assert parsed["fork_group_id"] == token.fork_group_id
+        assert parsed["expand_group_id"] == token.expand_group_id
 
 
 # =============================================================================

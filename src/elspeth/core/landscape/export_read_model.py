@@ -13,7 +13,9 @@ from sqlalchemy.engine import Connection, Engine
 
 from elspeth.contracts import RunStatus, SecretResolution
 from elspeth.contracts.audit_export import AuditExportTerminalWitness
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.core.landscape.model_loaders import (
     ArtifactLoader,
@@ -44,6 +46,8 @@ from elspeth.core.landscape.schema import (
     batches_table,
     calls_table,
     edges_table,
+    group_losses_table,
+    group_records_table,
     node_states_table,
     nodes_table,
     operations_table,
@@ -58,6 +62,7 @@ from elspeth.core.landscape.schema import (
     sink_effect_members_table,
     sink_effect_streams_table,
     sink_effects_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
     tokens_table,
@@ -270,6 +275,51 @@ class ConnectionBoundExportReadModel:
             ).fetchall()
             result.extend(self._token_loader.load(row) for row in rows)
         return result
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: list[str]) -> dict[str, tuple[LineageFrame, ...]]:
+        """Batch-load lineage paths from token_lineage_frames (outermost first).
+
+        Every requested token_id is a key; tokens with no frames rows map to ().
+        """
+        paths: dict[str, list[tuple[int, LineageFrame]]] = {token_id: [] for token_id in token_ids}
+        for chunk in _chunks(token_ids):
+            rows = self._connection.execute(
+                select(
+                    token_lineage_frames_table.c.token_id,
+                    token_lineage_frames_table.c.depth,
+                    token_lineage_frames_table.c.kind,
+                    token_lineage_frames_table.c.group_id,
+                    token_lineage_frames_table.c.member_key,
+                )
+                .where(token_lineage_frames_table.c.run_id == run_id)
+                .where(token_lineage_frames_table.c.token_id.in_(chunk))
+            ).fetchall()
+            for row in rows:
+                paths[str(row.token_id)].append(
+                    (int(row.depth), LineageFrame(kind=FrameKind(row.kind), group_id=str(row.group_id), member_key=str(row.member_key)))
+                )
+        result: dict[str, tuple[LineageFrame, ...]] = {}
+        for token_id, entries in paths.items():
+            entries.sort(key=lambda entry: entry[0])
+            depths = [depth for depth, _frame in entries]
+            if depths != list(range(len(depths))):
+                raise AuditIntegrityError(f"token_lineage_frames for token {token_id!r} (run {run_id!r}) has non-dense depths {depths}")
+            result[token_id] = tuple(frame for _depth, frame in entries)
+        return result
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        return list(
+            self._connection.execute(
+                select(group_records_table).where(group_records_table.c.run_id == run_id).order_by(group_records_table.c.group_id)
+            ).fetchall()
+        )
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        return list(
+            self._connection.execute(
+                select(group_losses_table).where(group_losses_table.c.run_id == run_id).order_by(group_losses_table.c.loss_id)
+            ).fetchall()
+        )
 
     def get_token_parents_for_tokens(self, token_ids: list[str]) -> list[Any]:
         result: list[Any] = []

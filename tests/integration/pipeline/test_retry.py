@@ -559,7 +559,6 @@ class TestRetryAuditTrail:
             token_id=token.token_id,
             row_id=row.row_id,
             row_data=pipeline_row,
-            branch_name=None,
         )
 
     def test_each_retry_attempt_recorded_as_separate_node_state(

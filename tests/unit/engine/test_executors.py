@@ -73,6 +73,7 @@ from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.contracts.enums import (
     AggregationMemberAction,
     BatchStatus,
+    FrameKind,
     NodeStateStatus,
     OutputMode,
     RoutingKind,
@@ -94,6 +95,7 @@ from elspeth.contracts.errors import (
     ZeroEmissionSuccessContractViolation,
 )
 from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import ArtifactDescriptor, GateResult
 from elspeth.contracts.routing import RouteDestination, RoutingAction
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
@@ -265,11 +267,11 @@ def _blocked_item(
     ingest_sequence: int = 0,
     attempt: int = 0,
     branch_name: str | None = None,
-    fork_group_id: str | None = None,
+    fork_group_id: str = "fg-executors-test",
     join_group_id: str | None = None,
-    expand_group_id: str | None = None,
 ) -> TokenWorkItem:
     """Build a BLOCKED journal row as list_blocked_barrier_items returns them."""
+    lineage_path = () if branch_name is None else (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name),)
     return TokenWorkItem(
         work_item_id=f"wi-{token_id}",
         run_id="test-run",
@@ -285,10 +287,8 @@ def _blocked_item(
         created_at=_JOURNAL_T0,
         updated_at=_JOURNAL_T0,
         barrier_key=f"aggregation:{node_id}",
-        branch_name=branch_name,
-        fork_group_id=fork_group_id,
+        lineage_path=lineage_path,
         join_group_id=join_group_id,
-        expand_group_id=expand_group_id,
         barrier_blocked_at=blocked_at,
     )
 

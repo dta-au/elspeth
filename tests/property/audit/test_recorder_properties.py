@@ -649,12 +649,14 @@ class TestTokenOutcomeProperties:
             (TerminalOutcome.FAILURE, TerminalPath.ON_ERROR_ROUTED, "sink_name", {}),
             # Missing error_hash when sink_name is provided.
             (TerminalOutcome.FAILURE, TerminalPath.ON_ERROR_ROUTED, "error_hash", {"sink_name": "failsink"}),
-            (TerminalOutcome.TRANSIENT, TerminalPath.FORK_PARENT, "fork_group_id", {}),
+            # (TRANSIENT, FORK_PARENT)/(SUCCESS, COALESCED)/(TRANSIENT, EXPAND_PARENT)
+            # retired from this required-field matrix (D2 flip): fork_group_id/
+            # join_group_id/expand_group_id are no longer token_outcomes fields at
+            # all — they forbid every discriminator instead of requiring one. See
+            # test_record_outcome_accepts_required_fields below.
             (TerminalOutcome.FAILURE, TerminalPath.UNROUTED, "error_hash", {}),
             (TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE, "error_hash", {}),
             (TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED, "batch_id", {}),
-            (TerminalOutcome.SUCCESS, TerminalPath.COALESCED, "join_group_id", {}),
-            (TerminalOutcome.TRANSIENT, TerminalPath.EXPAND_PARENT, "expand_group_id", {}),
             (None, TerminalPath.BUFFERED, "batch_id", {}),
         ],
     )
@@ -710,7 +712,7 @@ class TestTokenOutcomeProperties:
                     "error_hash": stable_hash({"reason": "on_error"}),
                 },
             ),
-            (TerminalOutcome.TRANSIENT, TerminalPath.FORK_PARENT, {"fork_group_id": "fork_group_1"}),
+            (TerminalOutcome.TRANSIENT, TerminalPath.FORK_PARENT, {}),
             (TerminalOutcome.FAILURE, TerminalPath.UNROUTED, {"error_hash": stable_hash({"reason": "failure"})}),
             (TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE, {"error_hash": stable_hash({"reason": "validation"})}),
             (
@@ -720,9 +722,9 @@ class TestTokenOutcomeProperties:
             ),
             (TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED, {"batch_id": "batch_1"}),
             (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED, {}),
-            (TerminalOutcome.SUCCESS, TerminalPath.COALESCED, {"join_group_id": "join_group_1"}),
-            (TerminalOutcome.SUCCESS, TerminalPath.COALESCED, {"sink_name": "default", "join_group_id": "join_group_1"}),
-            (TerminalOutcome.TRANSIENT, TerminalPath.EXPAND_PARENT, {"expand_group_id": "expand_group_1"}),
+            (TerminalOutcome.SUCCESS, TerminalPath.COALESCED, {}),
+            (TerminalOutcome.SUCCESS, TerminalPath.COALESCED, {"sink_name": "default"}),
+            (TerminalOutcome.TRANSIENT, TerminalPath.EXPAND_PARENT, {}),
             (None, TerminalPath.BUFFERED, {"batch_id": "batch_2"}),
         ],
     )

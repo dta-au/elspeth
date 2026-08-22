@@ -21,7 +21,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, CoalescePendingScalars
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
@@ -63,12 +65,14 @@ def _blocked_item(
     blocked_at: datetime | None,
     payload: str | None = None,
     branch_name: str | None = None,
+    fork_group_id: str = "fg-journal-test",
     coalesce_name: str | None = None,
     barrier_key: str | None = None,
     node_id: str = "node-1",
     attempt: int = 0,
 ) -> TokenWorkItem:
     """Build a BLOCKED journal row as list_blocked_barrier_items returns them."""
+    lineage_path = () if branch_name is None else (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name),)
     return TokenWorkItem(
         work_item_id=f"wi-{token_id}",
         run_id="run_1",
@@ -84,10 +88,8 @@ def _blocked_item(
         created_at=_JOURNAL_T0,
         updated_at=_JOURNAL_T0,
         barrier_key=barrier_key if barrier_key is not None else (coalesce_name or node_id),
-        branch_name=branch_name,
-        fork_group_id=None,
+        lineage_path=lineage_path,
         join_group_id=None,
-        expand_group_id=None,
         coalesce_node_id=node_id if coalesce_name is not None else None,
         coalesce_name=coalesce_name,
         barrier_blocked_at=blocked_at,

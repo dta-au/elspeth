@@ -12,7 +12,7 @@ def test_current_cutover_requires_live_epoch_contract_and_forbids_downgrade_repa
 
     assert "0.7.2 blob cleanup, guided decline, and aggregation recovery" in current_cutover
     assert f"session epoch {SESSION_SCHEMA_EPOCH}" in current_cutover
-    assert "Landscape epoch 34" in current_cutover
+    assert "Landscape epoch 35" in current_cutover
     assert f"0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to {SESSION_SCHEMA_EPOCH}" in current_cutover
     assert "0.7.1 advances the session store from epoch 26 through epoch 35" in current_cutover
     assert "blob-deletion" in current_cutover

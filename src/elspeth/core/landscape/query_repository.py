@@ -12,6 +12,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import and_, select
+from sqlalchemy.engine import Row as SARow
 
 from elspeth.contracts import (
     Call,
@@ -24,7 +25,9 @@ from elspeth.contracts import (
     TokenOutcome,
     TokenParent,
 )
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.core.landscape._database_ops import ReadOnlyDatabaseOps
@@ -47,6 +50,7 @@ from elspeth.core.landscape.schema import (
     rows_table,
     scheduler_events_table,
     sink_effect_members_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
     tokens_table,
@@ -261,6 +265,38 @@ class QueryRepository:
             logger.debug("Payload purged, returning PURGED state", content_hash=exc.content_hash)
             return RowDataResult(state=RowDataState.PURGED, data=None)
 
+    def _load_lineage_paths(self, token_ids: Sequence[str]) -> dict[str, tuple[LineageFrame, ...]]:
+        """Batch-load lineage paths from token_lineage_frames, keyed by token_id.
+
+        Deliberately NOT run-scoped: a token_id is globally unique to exactly
+        one run, and this backs query methods (``get_tokens_by_ids``) that are
+        themselves intentionally unscoped by run. Tokens with no frames rows
+        map to (). Depth gaps or duplicate depths are audit corruption.
+        """
+        ordered_token_ids = tuple(dict.fromkeys(token_ids))
+        paths: dict[str, list[tuple[int, LineageFrame]]] = {token_id: [] for token_id in ordered_token_ids}
+        for offset in range(0, len(ordered_token_ids), self._QUERY_CHUNK_SIZE):
+            chunk = ordered_token_ids[offset : offset + self._QUERY_CHUNK_SIZE]
+            query = select(
+                token_lineage_frames_table.c.token_id,
+                token_lineage_frames_table.c.depth,
+                token_lineage_frames_table.c.kind,
+                token_lineage_frames_table.c.group_id,
+                token_lineage_frames_table.c.member_key,
+            ).where(token_lineage_frames_table.c.token_id.in_(chunk))
+            for row in self._ops.execute_fetchall(query):
+                paths[str(row.token_id)].append(
+                    (int(row.depth), LineageFrame(kind=FrameKind(row.kind), group_id=str(row.group_id), member_key=str(row.member_key)))
+                )
+        result: dict[str, tuple[LineageFrame, ...]] = {}
+        for token_id, entries in paths.items():
+            entries.sort(key=lambda entry: entry[0])
+            depths = [depth for depth, _frame in entries]
+            if depths != list(range(len(depths))):
+                raise AuditIntegrityError(f"token_lineage_frames for token {token_id!r} has non-dense depths {depths} — audit corruption")
+            result[token_id] = tuple(frame for _depth, frame in entries)
+        return result
+
     def get_token(self, token_id: str) -> Token | None:
         """Get a token by ID.
 
@@ -274,7 +310,8 @@ class QueryRepository:
         r = self._ops.execute_fetchone(query)
         if r is None:
             return None
-        return self._token_loader.load(r)
+        lineage_path = self._load_lineage_paths([token_id]).get(token_id, ())
+        return self._token_loader.load(r, lineage_path=lineage_path)
 
     def get_token_for_run(self, run_id: str, token_id: str) -> Token | None:
         """Get a token by ID, scoped to a run."""
@@ -282,7 +319,8 @@ class QueryRepository:
         r = self._ops.execute_fetchone(query)
         if r is None:
             return None
-        return self._token_loader.load(r)
+        lineage_path = self._load_lineage_paths([token_id]).get(token_id, ())
+        return self._token_loader.load(r, lineage_path=lineage_path)
 
     def get_tokens_by_ids(self, token_ids: Sequence[str]) -> list[Token]:
         """Get tokens by ID with one chunked batch query per input chunk.
@@ -296,13 +334,17 @@ class QueryRepository:
             return []
 
         ordered_token_ids = tuple(dict.fromkeys(token_ids))
-        tokens_by_id: dict[str, Token] = {}
+        rows_by_id: dict[str, SARow[Any]] = {}
         for offset in range(0, len(ordered_token_ids), self._QUERY_CHUNK_SIZE):
             chunk = ordered_token_ids[offset : offset + self._QUERY_CHUNK_SIZE]
             query = select(tokens_table).where(tokens_table.c.token_id.in_(chunk))
             for row in self._ops.execute_fetchall(query):
-                tokens_by_id[row.token_id] = self._token_loader.load(row)
+                rows_by_id[row.token_id] = row
 
+        lineage_paths = self._load_lineage_paths(list(rows_by_id.keys()))
+        tokens_by_id = {
+            token_id: self._token_loader.load(row, lineage_path=lineage_paths.get(token_id, ())) for token_id, row in rows_by_id.items()
+        }
         return [tokens_by_id[token_id] for token_id in ordered_token_ids if token_id in tokens_by_id]
 
     def get_token_parents(self, token_id: str) -> list[TokenParent]:

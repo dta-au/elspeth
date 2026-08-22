@@ -7,7 +7,7 @@ from elspeth.testing import make_pipeline_row
 
 
 def _token() -> TokenInfo:
-    return TokenInfo(row_id="r1", token_id="t1", row_data=make_pipeline_row({}), branch_name=None)
+    return TokenInfo(row_id="r1", token_id="t1", row_data=make_pipeline_row({}))
 
 
 def _sink_name_for(path: TerminalPath) -> str | None:

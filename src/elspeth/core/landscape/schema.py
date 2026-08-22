@@ -321,7 +321,16 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        unified loss ledger — written from WS3), and
 #        token_work_items.lineage_path_json (journal-riding lineage path).
 #        Pre-1.0 delete-and-recreate boundary; no migration.
-SQLITE_SCHEMA_EPOCH = 34
+#   35 → Unified lineage flip (WS1b Phase B): tri-column lineage retirement —
+#        tokens.{fork_group_id,expand_group_id,branch_name},
+#        token_outcomes.{fork_group_id,join_group_id,expand_group_id}, and
+#        token_work_items.{branch_name,fork_group_id,expand_group_id} are
+#        deleted; token_outcomes.expected_branches_json is deleted (D2);
+#        lineage_path_json (token_work_items) and token_lineage_frames are the
+#        sole lineage truth. join_group_id stays on tokens/token_work_items
+#        (merge-event identity, D1). Pre-1.0 delete-and-recreate boundary; no
+#        migration.
+SQLITE_SCHEMA_EPOCH = 35
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -615,10 +624,7 @@ tokens_table = Table(
     Column("token_id", String(64), primary_key=True),
     Column("row_id", String(64), ForeignKey("rows.row_id"), nullable=False),
     Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),  # Run ownership for cross-run contamination prevention
-    Column("fork_group_id", String(64)),
-    Column("join_group_id", String(64)),
-    Column("expand_group_id", String(32), nullable=True, index=True),  # For deaggregation
-    Column("branch_name", String(64)),
+    Column("join_group_id", String(64)),  # merge event — anchors the coalesce_effects composite FK
     Column("step_in_pipeline", Integer),  # Step where this token was created (fork/coalesce/expand)
     # Payload-store ref for a token whose row_data differs from its source row:
     # expand/deaggregation children (independently-transformed data) AND post-coalesce
@@ -667,14 +673,9 @@ token_outcomes_table = Table(
     # Outcome-specific fields (nullable based on (outcome, path) pair)
     Column("sink_name", String(128)),
     Column("batch_id", String(64)),
-    Column("fork_group_id", String(64)),
-    Column("join_group_id", String(64)),
-    Column("expand_group_id", String(64)),
     Column("error_hash", String(64)),
     # Optional extended context
     Column("context_json", Text),
-    # Branch contract for FORKED/EXPANDED outcomes (enables recovery validation)
-    Column("expected_branches_json", Text),
     # Composite FK: batch outcomes must point at a batch from the same run.
     ForeignKeyConstraint(["batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
 )
@@ -729,14 +730,10 @@ token_work_items_table = Table(
     Column("pending_path", String(64)),
     Column("pending_error_hash", String(64)),
     Column("pending_error_message", Text),
-    Column("branch_name", String(128)),
-    Column("fork_group_id", String(128)),
     Column("join_group_id", String(128)),
-    Column("expand_group_id", String(128)),
-    # Epoch 34: the token's typed lineage path (outermost first), serialized by
+    # Epoch 35: the token's typed lineage path (outermost first), serialized by
     # contracts.identity.lineage_path_to_json. The journal is authoritative for
-    # resume, so the path must ride the row exactly like the (retiring)
-    # tri-columns above it; WS1b deletes those and this column stays.
+    # resume — this is the sole lineage write path.
     Column("lineage_path_json", Text, nullable=False),
     Column("coalesce_node_id", String(NODE_ID_COLUMN_LENGTH)),
     Column("coalesce_name", String(128)),

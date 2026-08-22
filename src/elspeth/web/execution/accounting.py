@@ -235,11 +235,11 @@ def load_run_accounting_map_from_db(
         # evidence-presence) tuples — so validation cost scales with shape
         # variety, not row count.
         violations_by_run: dict[str, list[str]] = {run_id: [] for run_id in present_run_ids}
+        # fork_group_id/join_group_id/expand_group_id retired from
+        # token_outcomes (D2 flip): _TERMINAL_PAIR_FIELD_CONSTRAINTS now only
+        # names sink_name/batch_id/error_hash as discriminator fields.
         _evidence_presence_columns = {
             "batch_id": token_outcomes_table.c.batch_id.isnot(None).label("has_batch_id"),
-            "fork_group_id": token_outcomes_table.c.fork_group_id.isnot(None).label("has_fork_group_id"),
-            "join_group_id": token_outcomes_table.c.join_group_id.isnot(None).label("has_join_group_id"),
-            "expand_group_id": token_outcomes_table.c.expand_group_id.isnot(None).label("has_expand_group_id"),
             "error_hash": token_outcomes_table.c.error_hash.isnot(None).label("has_error_hash"),
         }
         shape_stmt = (
@@ -266,9 +266,6 @@ def load_run_accounting_map_from_db(
             evidence_present = {
                 "sink_name": shape.sink_name is not None,
                 "batch_id": bool(shape.has_batch_id),
-                "fork_group_id": bool(shape.has_fork_group_id),
-                "join_group_id": bool(shape.has_join_group_id),
-                "expand_group_id": bool(shape.has_expand_group_id),
                 "error_hash": bool(shape.has_error_hash),
             }
             violation = _outcome_shape_violation(

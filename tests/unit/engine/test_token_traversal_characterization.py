@@ -42,8 +42,9 @@ from types import SimpleNamespace
 import pytest
 
 from elspeth.contracts import FailureInfo, RowResult, TokenInfo, TransformResult
-from elspeth.contracts.enums import RoutingMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, RoutingMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import MaxRetriesExceeded, OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import GateResult
 from elspeth.contracts.routing import RoutingAction
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID
@@ -113,7 +114,7 @@ class TestProcessSingleTokenOrchestration:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         result, _child_items = processor._process_single_token(
@@ -657,7 +658,7 @@ class TestHandleTransformNode:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         _persist_token_for_scheduler(factory, token)
         ctx = make_context(landscape=factory.plugin_audit_writer())
@@ -797,7 +798,7 @@ class TestHandleTransformErrorStatus:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         _persist_token_for_scheduler(factory, token)
         # The observed battery-round-7 payload: 138 chars of dict repr.
@@ -854,7 +855,7 @@ class TestHandleTransformErrorStatus:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         _persist_token_for_scheduler(factory, token)
         battery_reason = {

@@ -64,12 +64,18 @@ class _CreatedToken:
         fork_group_id: str | None = None,
         expand_group_id: str | None = None,
         join_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] | None = None,
     ) -> None:
         self.token_id = token_id
-        self.branch_name = branch_name
-        self.fork_group_id = fork_group_id
-        self.expand_group_id = expand_group_id
         self.join_group_id = join_group_id
+        if lineage_path is not None:
+            self.lineage_path = lineage_path
+        elif branch_name is not None:
+            self.lineage_path = (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id or "fg-test", member_key=branch_name),)
+        elif expand_group_id is not None:
+            self.lineage_path = (LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=token_id),)
+        else:
+            self.lineage_path = ()
 
 
 class _RecorderDouble:
@@ -249,14 +255,12 @@ class TestTokenManagerCoalesceTokens:
             row_id="row_001",
             token_id="token_a",
             row_data=parent_row_a,
-            fork_group_id="fg_001",
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg_001", member_key="a"),),
         )
         parent_b = TokenInfo(
             row_id="row_001",
             token_id="token_b",
             row_data=parent_row_b,
-            fork_group_id="fg_001",
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg_001", member_key="b"),),
         )
 
@@ -348,9 +352,10 @@ class TestTokenInfoWithUpdatedData:
             row_id="row_001",
             token_id="token_001",
             row_data=original_row,
-            branch_name="my_branch",
-            fork_group_id="fork_001",
-            expand_group_id="expand_001",
+            lineage_path=(
+                LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="my_branch"),
+                LineageFrame(kind=FrameKind.EXPAND, group_id="expand_001", member_key="token_001"),
+            ),
         )
 
         new_row = make_row({"amount": 200}, contract=contract)

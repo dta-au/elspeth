@@ -131,7 +131,12 @@ def get_token_parent_ids(db: LandscapeDB, token_id: str) -> list[str]:
 
 
 def verify_fork_children_have_parents(db: LandscapeDB, run_id: str) -> int:
-    """Count fork children missing parent links."""
+    """Count fork children missing parent links.
+
+    WS1b flip: fork_group_id is retired from the tokens table — a token's
+    FORK membership now lives in token_lineage_frames (kind='fork'), the
+    innermost frame per token.
+    """
     with db.connection() as conn:
         result = conn.execute(
             text("""
@@ -140,7 +145,10 @@ def verify_fork_children_have_parents(db: LandscapeDB, run_id: str) -> int:
                 JOIN rows r ON r.row_id = t.row_id
                 LEFT JOIN token_parents p ON p.token_id = t.token_id
                 WHERE r.run_id = :run_id
-                  AND t.fork_group_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM token_lineage_frames f
+                      WHERE f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
+                  )
                   AND p.token_id IS NULL
             """),
             {"run_id": run_id},
@@ -391,14 +399,15 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
             merged_contract=_MINIMAL_CONTRACT,
         )
 
-        # Record COALESCED outcome for each sibling (requires join_group_id per contract)
+        # Record COALESCED outcome for each sibling. D2 flip: join_group_id is
+        # retired from token_outcomes — it lives only on the merged TOKEN
+        # (ruling 20), not the per-parent outcome record.
         for sib_id in sibling_ids:
             self.factory.data_flow.record_token_outcome(
                 ref=TokenRef(token_id=sib_id, run_id=self.run.run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.COALESCED,
                 sink_name="default",
-                join_group_id=merged.join_group_id,
             )
             self.model_tokens[sib_id].state = TokenState.COALESCED
 

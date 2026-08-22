@@ -35,9 +35,6 @@ _NOW = datetime(2026, 5, 6, tzinfo=UTC)
 _SYNTHETIC_EVIDENCE: dict[str, str] = {
     "sink_name": "sink-out",
     "batch_id": "batch-1",
-    "fork_group_id": "fork-1",
-    "join_group_id": "join-1",
-    "expand_group_id": "expand-1",
     "error_hash": "e" * 16,
 }
 
@@ -90,10 +87,7 @@ def _insert_tokens(db: LandscapeDB, *, run_id: str, row_id: str, token_ids: list
                     "token_id": token_id,
                     "row_id": row_id,
                     "run_id": run_id,
-                    "fork_group_id": None,
                     "join_group_id": None,
-                    "expand_group_id": None,
-                    "branch_name": None,
                     "step_in_pipeline": 0,
                     "created_at": _NOW,
                 }
@@ -126,7 +120,6 @@ def _insert_completed_outcomes(
                     "completed": 1,
                     "recorded_at": _NOW,
                     "context_json": None,
-                    "expected_branches_json": None,
                     **fields,
                 }
                 for token_id in token_ids
@@ -166,7 +159,6 @@ def _insert_outcome(
                 completed=completed,
                 recorded_at=_NOW,
                 context_json=None,
-                expected_branches_json=None,
                 **fields,
             )
         )

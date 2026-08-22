@@ -2,7 +2,7 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.7.2 blob cleanup, guided decline, and aggregation recovery (session epoch 47 and Landscape epoch 34)
+## Current Cutover: 0.7.2 blob cleanup, guided decline, and aggregation recovery (session epoch 47 and Landscape epoch 35)
 
 0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to 47. Epoch 36 ensures a committed
 blob deletion whose tombstone unlink or directory fsync fails remains retryable
@@ -80,12 +80,20 @@ Epoch 32 adds normalized aggregation result receipts so any committed successful
 batch can resume after process death without plugin replay: transform outputs
 resume expansion, passthrough outputs retain their input token identities, and
 empty outputs finish their member outcomes at the atomic scheduler barrier.
+Epoch 33 gives token outcomes a composite (run_id, token_id) access path. Epoch
+34 adds the unified-lineage groundwork tables (`token_lineage_frames`,
+`group_records`, `group_losses`) and `token_work_items.lineage_path_json`.
+Epoch 35 flips lineage onto that groundwork: the tri-column
+`fork_group_id`/`expand_group_id`/`branch_name` discriminators are retired
+from `tokens`, `token_outcomes`, and `token_work_items` (plus
+`token_outcomes.expected_branches_json`), and `token_lineage_frames`/
+`lineage_path_json` become the sole lineage truth. `join_group_id` stays.
 
 Archive and recreate the session database, its sidecars, and every stale
 Landscape database under the service-stop procedure below. Every predecessor
-session epoch is a recreate boundary, including epoch 37. Landscape epoch 34
-is the current release boundary, so a Landscape database left at epoch 33 is
-stale and must be recreated in the same service-stop window. Any stale PostgreSQL session shape is recreated by
+session epoch is a recreate boundary, including epoch 37. Landscape epoch 35
+is the current release boundary, so a Landscape database left at epoch 34 or
+below is stale and must be recreated in the same service-stop window. Any stale PostgreSQL session shape is recreated by
 the schema owner; the runtime role remains DML-only.
 
 Validate-only startup and doctor must leave stale databases unchanged. Do not

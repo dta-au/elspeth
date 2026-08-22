@@ -48,16 +48,14 @@ def _setup():
         data={"source": True},
     )
     # Crafted siblings sharing one FORK lineage frame (the shape a real
-    # fork_token would have produced), via the create_token(..., lineage_frames=)
+    # fork_token would have produced), via the create_token(..., lineage_path=)
     # seam — coalesce_tokens' durable strict pop requires an innermost shared
     # FORK frame to pop (spec rulings 24/28). Never weaken the pop to
     # accommodate a fixture that models something a real fork never produces.
     parents = [
         setup.data_flow.create_token(
             row.row_id,
-            branch_name=branch,
-            fork_group_id="coalesce-effects-fork-grp",
-            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="coalesce-effects-fork-grp", member_key=branch),),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="coalesce-effects-fork-grp", member_key=branch),),
         )
         for branch in ("a", "b")
     ]
@@ -141,16 +139,17 @@ def test_finalization_atomically_completes_states_outcomes_and_effect() -> None:
                 token_outcomes_table.c.token_id,
                 token_outcomes_table.c.outcome,
                 token_outcomes_table.c.path,
-                token_outcomes_table.c.join_group_id,
             ).order_by(token_outcomes_table.c.token_id)
         ).all()
 
     assert effect["status"] == "completed"
     assert effect["completed_at"] is not None
     assert {state.status for state in states} == {NodeStateStatus.COMPLETED.value}
-    assert outcomes == sorted(
-        [(ref.token_id, TerminalOutcome.SUCCESS.value, TerminalPath.COALESCED.value, merged.join_group_id) for ref in refs]
-    )
+    # D2 flip: join_group_id is retired from token_outcomes — the (SUCCESS,
+    # COALESCED) pair forbids every discriminator field now. join_group_id
+    # lives only on the merged TOKEN (ruling 20), checked separately below.
+    assert outcomes == sorted([(ref.token_id, TerminalOutcome.SUCCESS.value, TerminalPath.COALESCED.value) for ref in refs])
+    assert merged.join_group_id is not None
 
 
 def test_failed_finalization_rolls_back_all_terminal_evidence_and_retries(monkeypatch: pytest.MonkeyPatch) -> None:

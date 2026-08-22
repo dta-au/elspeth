@@ -7,8 +7,9 @@ from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.lineage import explain
 from elspeth.core.landscape.schema import token_parents_table
@@ -177,11 +178,10 @@ def test_explain_rejects_persisted_group_id_without_parent_relationship() -> Non
     token = setup.data_flow.create_token(
         row.row_id,
         token_id="token-orphan-group",
-        branch_name="left",
-        fork_group_id="fork-without-parent",
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-without-parent", member_key="left"),),
     )
 
-    with pytest.raises(AuditIntegrityError, match="but no parent relationships"):
+    with pytest.raises(AuditIntegrityError, match="has 0 parent relationships"):
         explain(setup.query, setup.data_flow, setup.run_id, token_id=token.token_id)
 
 
@@ -203,7 +203,7 @@ def test_explain_rejects_parent_relationship_without_group_id_from_corruption() 
             )
         )
 
-    with pytest.raises(AuditIntegrityError, match="but no group ID"):
+    with pytest.raises(AuditIntegrityError, match="but no lineage operation"):
         explain(setup.query, setup.data_flow, setup.run_id, token_id=child.token_id)
 
 
@@ -223,8 +223,7 @@ def test_explain_rejects_cross_run_parent_relationship_from_corruption() -> None
     child = setup.data_flow.create_token(
         row.row_id,
         token_id="token-cross-run-child",
-        branch_name="left",
-        fork_group_id="fork-cross-run",
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-cross-run", member_key="left"),),
     )
     _other_row, other_parent = _create_row_token(
         setup,

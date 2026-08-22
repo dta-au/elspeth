@@ -14,7 +14,7 @@ from __future__ import annotations
 import inspect
 from collections import defaultdict as collections_defaultdict
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, ClassVar, cast
 from unittest.mock import patch
@@ -123,10 +123,7 @@ _TOKEN = Token(
     row_id="row-1",
     created_at=_DT,
     run_id="run-1",
-    fork_group_id=None,
     join_group_id=None,
-    expand_group_id=None,
-    branch_name=None,
     step_in_pipeline=0,
 )
 
@@ -502,6 +499,9 @@ class _QueryRecorder:
     node_states: list[Any]
     routing_events: list[Any]
     state_calls: list[Any]
+    lineage_paths: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    group_records: list[Any] = field(default_factory=list)
+    group_losses: list[Any] = field(default_factory=list)
 
     def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]:
         for offset in range(0, len(self.rows), batch_size):
@@ -510,6 +510,15 @@ class _QueryRecorder:
     def get_tokens_for_rows(self, run_id: str, row_ids: Sequence[str]) -> list[Any]:
         wanted = set(row_ids)
         return [token for token in self.tokens if token.row_id in wanted]
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[Any, ...]]:
+        return {token_id: self.lineage_paths.get(token_id, ()) for token_id in token_ids}
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        return self.group_records
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        return self.group_losses
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         wanted = set(token_ids)
@@ -599,6 +608,15 @@ class _ExportReadModelRecorder:
 
     def get_tokens_for_rows(self, run_id: str, row_ids: Sequence[str]) -> list[Any]:
         return self._query.get_tokens_for_rows(run_id, row_ids)
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[Any, ...]]:
+        return self._query.get_lineage_paths_for_tokens(run_id, token_ids)
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        return self._query.get_group_records_for_run(run_id)
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        return self._query.get_group_losses_for_run(run_id)
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         return self._query.get_token_parents_for_tokens(token_ids)
@@ -1057,6 +1075,9 @@ class _SpyReadModel:
             "get_sink_effect_attempts_for_run",
             "iter_rows_for_run",
             "get_tokens_for_rows",
+            "get_lineage_paths_for_tokens",
+            "get_group_records_for_run",
+            "get_group_losses_for_run",
             "get_token_parents_for_tokens",
             "get_token_outcomes_for_tokens",
             "get_scheduler_events_for_tokens",
@@ -1153,6 +1174,18 @@ class _SpyReadModel:
     def get_tokens_for_rows(self, run_id: str, row_ids: Sequence[str]) -> list[Any]:
         self._record("get_tokens_for_rows")
         return self._inner.get_tokens_for_rows(run_id, row_ids)
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[Any, ...]]:
+        self._record("get_lineage_paths_for_tokens")
+        return self._inner.get_lineage_paths_for_tokens(run_id, token_ids)
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_group_records_for_run")
+        return self._inner.get_group_records_for_run(run_id)
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_group_losses_for_run")
+        return self._inner.get_group_losses_for_run(run_id)
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         self._record("get_token_parents_for_tokens")
@@ -1634,7 +1667,6 @@ class TestTokenOutcomeRecords:
         assert o["recorded_at"] == _DT2.isoformat()
         assert o["sink_name"] == "output"
         assert o["batch_id"] is None
-        assert o["fork_group_id"] is None
         assert o["error_hash"] is None
 
     def test_token_outcome_follows_token_parent(self) -> None:
@@ -2322,9 +2354,9 @@ class TestTimestampPreservation:
             type_records = [r for r in records if r["record_type"] == record_type]
             assert len(type_records) >= 1, f"No {record_type} records found"
             for rec in type_records:
-                for field in fields:
-                    assert rec[field] is not None, f"{record_type}.{field} is None — timestamp not preserved"
-                    assert isinstance(rec[field], str), f"{record_type}.{field} is {type(rec[field])}, expected str"
+                for field_name in fields:
+                    assert rec[field_name] is not None, f"{record_type}.{field_name} is None — timestamp not preserved"
+                    assert isinstance(rec[field_name], str), f"{record_type}.{field_name} is {type(rec[field_name])}, expected str"
 
 
 class TestFullPipelineExport:
@@ -2398,10 +2430,7 @@ class TestFullPipelineExport:
             row_id="row-2",
             created_at=_DT2,
             run_id="run-1",
-            fork_group_id=None,
             join_group_id=None,
-            expand_group_id=None,
-            branch_name=None,
             step_in_pipeline=0,
         )
         kwargs: dict[str, Any] = {

@@ -771,15 +771,15 @@ class TestInterruptAndResume:
 
         from sqlalchemy import select
 
+        from elspeth.contracts.identity import lineage_path_from_json, path_branch_name, path_fork_group_id
         from elspeth.core.landscape.schema import token_outcomes_table, token_work_items_table
 
         with landscape_db.connection() as conn:
-            pre_resume_work = (
+            pre_resume_work_rows = (
                 conn.execute(
                     select(
                         token_work_items_table.c.status,
-                        token_work_items_table.c.branch_name,
-                        token_work_items_table.c.fork_group_id,
+                        token_work_items_table.c.lineage_path_json,
                         token_work_items_table.c.barrier_key,
                         token_work_items_table.c.coalesce_name,
                     ).where(token_work_items_table.c.run_id == run_id)
@@ -787,6 +787,16 @@ class TestInterruptAndResume:
                 .mappings()
                 .all()
             )
+        pre_resume_work = [
+            {
+                "status": row["status"],
+                "branch_name": path_branch_name(lineage_path_from_json(row["lineage_path_json"])),
+                "fork_group_id": path_fork_group_id(lineage_path_from_json(row["lineage_path_json"])),
+                "barrier_key": row["barrier_key"],
+                "coalesce_name": row["coalesce_name"],
+            }
+            for row in pre_resume_work_rows
+        ]
         blocked_work = [row for row in pre_resume_work if row["status"] == "blocked"]
         assert blocked_work
         coalesce_blocked_work = [row for row in blocked_work if row["barrier_key"] == "merge_paths"]

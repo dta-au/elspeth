@@ -291,9 +291,7 @@ class TestListTokensLineagePath:
         row = factory.data_flow.create_row(run_id, "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
         factory.data_flow.create_token(
             row.row_id,
-            branch_name="path_a",
-            fork_group_id="fg-1",
-            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
         )
 
         records = list_tokens(db, factory, run_id=run_id, row_id=None, limit=50)

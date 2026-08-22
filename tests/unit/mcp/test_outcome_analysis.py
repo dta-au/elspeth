@@ -92,15 +92,11 @@ def test_outcome_analysis_fork_and_join_counts_read_lineage_frames_and_tokens() 
     # this as ONE fork operation, not two rows.
     branch_a = setup.data_flow.create_token(
         row.row_id,
-        branch_name="path_a",
-        fork_group_id="fg-1",
-        lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
     )
     branch_b = setup.data_flow.create_token(
         row.row_id,
-        branch_name="path_b",
-        fork_group_id="fg-1",
-        lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_b"),),
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_b"),),
     )
     for token in (branch_a, branch_b):
         setup.data_flow.record_token_outcome(
@@ -113,9 +109,7 @@ def test_outcome_analysis_fork_and_join_counts_read_lineage_frames_and_tokens() 
     # A second, unrelated fork group — DISTINCT must count it separately (total 2).
     branch_c = setup.data_flow.create_token(
         row.row_id,
-        branch_name="path_c",
-        fork_group_id="fg-2",
-        lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fg-2", member_key="path_c"),),
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-2", member_key="path_c"),),
     )
     setup.data_flow.record_token_outcome(
         ref=TokenRef(token_id=branch_c.token_id, run_id=setup.run_id),

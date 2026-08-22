@@ -19,6 +19,8 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+from elspeth.contracts.identity import path_expand_group_id
+
 if TYPE_CHECKING:
     from elspeth.core.landscape.database import LandscapeDB
 
@@ -323,13 +325,13 @@ class TestDeaggregationAuditTrail:
         # Get all rows and their tokens
         rows = factory.query.get_rows(run_id)
 
+        # get_tokens() doesn't populate lineage_path (it's not a tokens_table
+        # column, and most callers don't need it) — batch-load it explicitly.
+        all_tokens = [token for row in rows for token in factory.query.get_tokens(row.row_id)]
+        lineage_paths = factory.data_flow.load_lineage_paths(run_id, [token.token_id for token in all_tokens])
+
         # Count tokens with expand_group_id
-        tokens_with_expand_group = 0
-        for row in rows:
-            tokens = factory.query.get_tokens(row.row_id)
-            for token in tokens:
-                if token.expand_group_id is not None:
-                    tokens_with_expand_group += 1
+        tokens_with_expand_group = sum(1 for token in all_tokens if path_expand_group_id(lineage_paths.get(token.token_id, ())) is not None)
 
         # 6 expanded tokens should have expand_group_id
         assert tokens_with_expand_group == 6, f"Expected 6 tokens with expand_group_id, got {tokens_with_expand_group}"

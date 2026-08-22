@@ -24,7 +24,9 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierScalars
 from elspeth.contracts.contract_records import ContractAuditRecord
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError, OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import NodeID
@@ -1635,16 +1637,21 @@ def test_get_unprocessed_rows_excludes_diverted_rows(
 # empty-string identity could produce valid-looking but meaningless audit work.
 # Mirrors TokenInfo.__post_init__ (contracts/identity.py) — see tests/unit/
 # contracts/test_identity.py for the sibling pattern.
+#
+# WS1b flip (ruling 21): branch_name/fork_group_id/expand_group_id are no
+# longer stored fields (or even derived accessors) on IncompleteTokenSpec —
+# the type carries lineage_path directly and reconstruct_token_row builds
+# TokenInfo from it, so the empty-string guard those fields had moved to
+# LineageFrame.__post_init__ (see tests/unit/contracts/test_identity.py's
+# LineageFrame construction tests). join_group_id and token_data_ref are the
+# only remaining optional-string identity fields here.
 
 
 def _valid_incomplete_token_spec_kwargs() -> dict[str, Any]:
     return {
         "token_id": "tok-1",
         "row_id": "row-1",
-        "branch_name": None,
-        "fork_group_id": None,
         "join_group_id": None,
-        "expand_group_id": None,
         "lineage_path": (),
         "token_data_ref": None,
         "step_in_pipeline": 1,
@@ -1656,6 +1663,14 @@ def test_incomplete_token_spec_accepts_valid_identity() -> None:
     spec = IncompleteTokenSpec(**_valid_incomplete_token_spec_kwargs())
     assert spec.token_id == "tok-1"
     assert spec.row_id == "row-1"
+
+
+def test_incomplete_token_spec_accepts_a_populated_lineage_path() -> None:
+    path = (LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),)
+    kwargs = _valid_incomplete_token_spec_kwargs()
+    kwargs["lineage_path"] = path
+    spec = IncompleteTokenSpec(**kwargs)
+    assert spec.lineage_path == path
 
 
 @pytest.mark.parametrize("field", ["token_id", "row_id"])
@@ -1674,7 +1689,7 @@ def test_incomplete_token_spec_rejects_non_str_identity(field: str) -> None:
         IncompleteTokenSpec(**kwargs)
 
 
-@pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id", "token_data_ref"])
+@pytest.mark.parametrize("field", ["join_group_id", "token_data_ref"])
 def test_incomplete_token_spec_rejects_empty_optional_string(field: str) -> None:
     # NULL is the legitimate "not applicable" value for these columns; an empty
     # string is anomalous. token_data_ref in particular is used as a payload-store
@@ -1689,10 +1704,7 @@ def test_incomplete_token_spec_rejects_empty_optional_string(field: str) -> None
 @pytest.mark.parametrize(
     ("field", "read_field"),
     (
-        pytest.param("branch_name", lambda spec: spec.branch_name, id="branch_name"),
-        pytest.param("fork_group_id", lambda spec: spec.fork_group_id, id="fork_group_id"),
         pytest.param("join_group_id", lambda spec: spec.join_group_id, id="join_group_id"),
-        pytest.param("expand_group_id", lambda spec: spec.expand_group_id, id="expand_group_id"),
         pytest.param("token_data_ref", lambda spec: spec.token_data_ref, id="token_data_ref"),
     ),
 )

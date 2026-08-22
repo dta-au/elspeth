@@ -22,7 +22,7 @@ recognizable siblings; the merge machinery is deliberately absent.
 
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import structlog
@@ -31,6 +31,7 @@ from elspeth.contracts import TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError, RowUnionFailureReason
+from elspeth.contracts.identity import innermost_fork_frame, pop_fork_frame
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.config import RowUnionSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -335,7 +336,7 @@ class RowUnionExecutor:
                     duration_ms=(now - entry.arrival_time) * 1000,
                 )
 
-        released = tuple(by_branch[branch_name].token for branch_name in settings.branches)
+        released = self._pop_released_group(tuple(by_branch[branch_name].token for branch_name in settings.branches))
         self._mark_completed(key, _CLOSED_BY_RELEASE)
         return RowUnionOutcome(
             held=False,
@@ -436,6 +437,36 @@ class RowUnionExecutor:
     # Release / failure
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _pop_released_group(released: Sequence[TokenInfo]) -> tuple[TokenInfo, ...]:
+        """Pop the shared FORK frame off every released token (ruling 27).
+
+        A row_union release ends the branches' fork identity: the released
+        tokens continue downstream sharing the union's post-fork lineage, not
+        the popped branch frame. Every released token must carry the SAME
+        FORK frame — but not necessarily as the innermost/last frame. A
+        row-multiplying transform inside a branch (e.g. an expand) stacks an
+        EXPAND frame on top of the branch's FORK frame before the token
+        reaches the union (elspeth-a5b86149d4;
+        tests/integration/pipeline/test_row_union_branch_cardinality.py), so
+        this locates each token's FORK frame via innermost_fork_frame and
+        pops exactly that frame via pop_fork_frame, leaving any surviving
+        EXPAND frame in place — discarding it would fabricate lineage.
+        """
+        release_group_ids: set[str] = set()
+        for token in released:
+            frame = innermost_fork_frame(token.lineage_path)
+            if frame is None:
+                raise OrchestrationInvariantError(f"row_union release: token {token.token_id!r} has no FORK frame to pop (ruling 27 pop)")
+            release_group_ids.add(frame.group_id)
+        if len(release_group_ids) != 1:
+            raise OrchestrationInvariantError(
+                f"row_union release: released tokens do not share one FORK group "
+                f"(got {sorted(release_group_ids)!r}) — ruling 27 pop requires it"
+            )
+        (fork_group_id,) = release_group_ids
+        return tuple(replace(token, lineage_path=pop_fork_frame(token.lineage_path, group_id=fork_group_id)) for token in released)
+
     def _execute_release(
         self,
         *,
@@ -465,10 +496,11 @@ class RowUnionExecutor:
         del self._pending[key]
         self._mark_completed(key, _CLOSED_BY_RELEASE)
 
+        popped = self._pop_released_group(released)
         return RowUnionOutcome(
             held=False,
-            released_tokens=tuple(released),
-            consumed_tokens=tuple(released),
+            released_tokens=popped,
+            consumed_tokens=popped,
             row_union_name=settings.name,
         )
 

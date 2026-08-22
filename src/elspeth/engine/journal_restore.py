@@ -33,6 +33,7 @@ import structlog
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, CoalescePendingScalars
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -172,14 +173,16 @@ class CoalesceJournalRestorer:
                     f"{resume_checkpoint_id!r}) has NULL barrier_blocked_at — journal "
                     "corruption (every BLOCKED row is stamped at mark_blocked time)."
                 )
-            if not item.branch_name:
+            innermost = item.lineage_path[-1] if item.lineage_path else None
+            if innermost is None or innermost.kind is not FrameKind.FORK:
                 raise AuditIntegrityError(
                     f"BLOCKED journal row for token {item.token_id!r} at coalesce "
                     f"{item.coalesce_name!r} (run {self._run_id!r}, resume checkpoint "
-                    f"{resume_checkpoint_id!r}) has no branch_name — only forked branch "
+                    f"{resume_checkpoint_id!r}) has no innermost FORK frame — only forked branch "
                     "tokens block at a coalesce barrier; journal corruption."
                 )
-            if item.branch_name not in self._settings[item.coalesce_name].branches:
+            branch_name = innermost.member_key
+            if branch_name not in self._settings[item.coalesce_name].branches:
                 # The live accept() path rejects unknown branches; restore must
                 # apply the same allowlist (elspeth-a840cb774a) — a rogue branch
                 # inflates quorum/best_effort arrival counts while contributing
@@ -187,7 +190,7 @@ class CoalesceJournalRestorer:
                 raise AuditIntegrityError(
                     f"BLOCKED journal row for token {item.token_id!r} at coalesce "
                     f"{item.coalesce_name!r} (run {self._run_id!r}, resume checkpoint "
-                    f"{resume_checkpoint_id!r}) claims branch '{item.branch_name}' which is "
+                    f"{resume_checkpoint_id!r}) claims branch '{branch_name}' which is "
                     f"not in the configured branches {sorted(self._settings[item.coalesce_name].branches)} — "
                     "journal corruption."
                 )
@@ -220,16 +223,16 @@ class CoalesceJournalRestorer:
             if key not in grouped:
                 grouped[key] = {}
             branch_items = grouped[key]
-            if item.branch_name in branch_items:
+            if branch_name in branch_items:
                 raise AuditIntegrityError(
                     f"BLOCKED journal rows for tokens "
-                    f"{branch_items[item.branch_name].token_id!r} and {item.token_id!r} "
-                    f"both claim branch '{item.branch_name}' at coalesce "
+                    f"{branch_items[branch_name].token_id!r} and {item.token_id!r} "
+                    f"both claim branch '{branch_name}' at coalesce "
                     f"{item.coalesce_name!r} for row {item.row_id!r} (run {self._run_id!r}, "
                     f"resume checkpoint {resume_checkpoint_id!r}) — accept() crashes on a "
                     "duplicate arrival, so this is journal corruption."
                 )
-            branch_items[item.branch_name] = item
+            branch_items[branch_name] = item
             blocked_at_by_token[item.token_id] = item.barrier_blocked_at
 
         monotonic_now = self._clock.monotonic()

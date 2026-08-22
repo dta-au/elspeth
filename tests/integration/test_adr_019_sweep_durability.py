@@ -75,7 +75,6 @@ def _plant_orphan_fork_parent(
         ref=TokenRef(token_id=token.token_id, run_id=run_id),
         outcome=TerminalOutcome.TRANSIENT,
         path=TerminalPath.FORK_PARENT,
-        fork_group_id=f"fg_durability_{row_index}",
     )
     if complete_row_for_resume:
         sibling = factory.data_flow.create_token(row_id=row.row_id)

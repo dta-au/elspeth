@@ -33,8 +33,9 @@ import pytest
 
 from elspeth.contracts import TokenInfo, TransformProtocol
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath, TriggerType
+from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import RowResult
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -76,9 +77,11 @@ def _blocked_row(
     token_id: str = "tok-1",
     row_id: str = "row-1",
     branch_name: str | None = None,
+    fork_group_id: str = "fg-barrier-coordination-test",
     adopted_epoch: int | None = None,
     blocked_at: datetime | None = _NOW,
 ) -> TokenWorkItem:
+    lineage_path = () if branch_name is None else (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name),)
     return TokenWorkItem(
         work_item_id=f"wi-{token_id}",
         run_id="run-1",
@@ -96,7 +99,7 @@ def _blocked_row(
         barrier_key=barrier_key,
         barrier_blocked_at=blocked_at,
         barrier_adopted_epoch=adopted_epoch,
-        branch_name=branch_name,
+        lineage_path=lineage_path,
         coalesce_name=barrier_key if barrier_key == str(_COALESCE) else None,
         row_union_name=barrier_key if barrier_key == "variant_union" else None,
     )
@@ -468,6 +471,77 @@ class TestRowUnionLossReplay:
         ]
         assert [item.kind for item in outcome.dispositions] == [BarrierIntakeDispositionKind.TERMINAL]
         assert [result.token.token_id for result in outcome.results] == ["held-token"]
+
+
+class TestLineageJournalConsistencyWiring:
+    """Spec §4.3 codec-vs-table bidirectional check must run at restore entry,
+    before any executor restore call mutates state (Task 11 Step 8)."""
+
+    def test_restore_from_journal_calls_the_bidirectional_lineage_check(self) -> None:
+        row = _blocked_row(barrier_key="variant_union")
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        scheduler.list_coalesce_branch_losses.return_value = []
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.has_completed_row_for_node.return_value = False
+        reads.has_branch_loss_for_group.return_value = False
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=Mock(spec=CoalesceExecutor),
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        reads.verify_lineage_journal_consistency.assert_called_once_with("run-1", [row])
+
+    def test_restore_from_journal_fails_closed_on_lineage_divergence_before_any_mutation(self) -> None:
+        row = _blocked_row(barrier_key="variant_union")
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.verify_lineage_journal_consistency.side_effect = AuditIntegrityError(
+            "lineage journal/table divergence for token 'tok-1' (run 'run-1')"
+        )
+        row_union = Mock(spec=RowUnionExecutor)
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=Mock(spec=CoalesceExecutor),
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        with pytest.raises(AuditIntegrityError, match="lineage journal/table divergence"):
+            coordinator.restore_from_journal(
+                BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+            )
+
+        row_union.restore_from_journal.assert_not_called()
 
 
 class TestRowUnionRecovery:

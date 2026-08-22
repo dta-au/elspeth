@@ -2576,10 +2576,7 @@ class RowProcessor:
             queue_key=fields.queue_key,
             barrier_key=fields.barrier_key,
             on_success_sink=fields.on_success_sink,
-            branch_name=fields.branch_name,
-            fork_group_id=fields.fork_group_id,
             join_group_id=fields.join_group_id,
-            expand_group_id=fields.expand_group_id,
             lineage_path=fields.lineage_path,
             coalesce_node_id=fields.coalesce_node_id,
             coalesce_name=fields.coalesce_name,
@@ -2933,9 +2930,6 @@ class RowProcessor:
             row_id=spec.row_id,
             token_id=spec.token_id,
             row_data=row_data,
-            branch_name=spec.branch_name,
-            fork_group_id=spec.fork_group_id,
-            expand_group_id=spec.expand_group_id,
             lineage_path=spec.lineage_path,
             resume_attempt_offset=spec.max_attempt + 1,
             resume_checkpoint_id=resume_checkpoint_id,
@@ -3110,12 +3104,15 @@ class RowProcessor:
         before the in-memory notify, including on followers; the leader
         replays it during barrier intake.
 
-        Released tokens deliberately retain their branch_name, so any
-        terminal divert DOWNSTREAM of the union (gate-to-sink route, drop,
-        error) re-enters this helper. A group that already released is not a
-        pre-barrier loss — staging one would persist a false
-        coalesce_branch_losses record on a healthy run. A genuine pre-barrier
-        loss can never coincide with a released group (release requires every
+        A terminal divert DOWNSTREAM of the union (gate-to-sink route, drop,
+        error) can re-enter this helper on the diverting token's OWN branch
+        identity (unrelated to whether the union already released — ruling 27
+        pops the FORK frame only off the RELEASED tokens the union itself
+        returns, never off a live token still traversing downstream of it). A
+        group that already released is not a pre-barrier loss — staging one
+        would persist a false coalesce_branch_losses record on a healthy run.
+        A genuine pre-barrier loss can never coincide with a released group
+        (release requires every
         branch to arrive), so the guard changes no legitimate loss.
         """
         if current_token.branch_name is None:
@@ -3181,6 +3178,12 @@ class RowProcessor:
         status-COMPLETED node state at the union node. A release always
         commits its COMPLETED states before the released tokens route
         downstream, so the durable read is race-free.
+
+        Staleness hazard (ruling 27): once a group releases, its tokens'
+        innermost FORK frame is POPPED (RowUnionExecutor._pop_released_group).
+        A caller holding a pre-release in-memory token whose frame has since
+        been popped durably can no longer use that frame to authenticate a
+        §6.2 group loss for THIS union — check release status here first.
         """
         if self._row_union_executor is not None and self._row_union_executor.is_group_released(str(row_union_name), row_id):
             return True
@@ -3617,10 +3620,7 @@ class RowProcessor:
             node_id=None,
             step_index=self._scheduler_step_index(None),
             ingest_sequence=self._data_flow.resolve_row_ingest_sequence(token.row_id),
-            branch_name=token.branch_name,
-            fork_group_id=token.fork_group_id,
             join_group_id=result.join_group_id,
-            expand_group_id=token.expand_group_id,
             lineage_path=token.lineage_path,
         )
 
@@ -3656,8 +3656,10 @@ class RowProcessor:
                         token_data_ref=child.token_data_ref,
                         receipt_name=f"aggregation batch {residual.batch_id!r}",
                     ),
-                    branch_name=parent_item.branch_name,
-                    expand_group_id=child.expand_group_id,
+                    lineage_path=(
+                        *parent_item.lineage_path,
+                        LineageFrame(kind=FrameKind.EXPAND, group_id=child.expand_group_id, member_key=child.token_id),
+                    ),
                 )
             )
 
@@ -4169,7 +4171,10 @@ class RowProcessor:
         Continuations start at the node AFTER the barrier, with no row_union
         fields: the barrier is passed (the executor already completed each
         member's node state there), so the group must not re-enter it —
-        released tokens still carry ``branch_name``.
+        ``released_tokens`` arrive with their innermost FORK frame already
+        popped (ruling 27, ``RowUnionExecutor._pop_released_group``), so
+        ``branch_name`` on a released token reflects an OUTER frame (or None),
+        never the branch this union just closed.
 
         The cursor must ADVANCE rather than sit on the union node. Unlike
         coalesce — whose merged output is a fresh ``token_id`` — a row_union

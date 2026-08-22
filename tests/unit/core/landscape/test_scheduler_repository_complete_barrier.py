@@ -24,8 +24,9 @@ from sqlalchemy import insert, select
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import BarrierEmission, BarrierTerminalOutcomeSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
@@ -801,7 +802,7 @@ def test_complete_barrier_ready_emissions_claim_in_declared_tuple_order() -> Non
                 node_id="normalize",
                 step_index=2,
                 ingest_sequence=0,
-                branch_name="control",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-variant-union", member_key="control"),),
             ),
             BarrierEmission(
                 token_id="token-b",
@@ -810,7 +811,7 @@ def test_complete_barrier_ready_emissions_claim_in_declared_tuple_order() -> Non
                 node_id="normalize",
                 step_index=2,
                 ingest_sequence=0,
-                branch_name="treatment",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-variant-union", member_key="treatment"),),
             ),
         ],
         now=NOW,

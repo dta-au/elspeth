@@ -37,7 +37,14 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_identity, resolve_sink_effect_members
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import artifacts_table, node_states_table, operations_table, token_outcomes_table, tokens_table
+from elspeth.core.landscape.schema import (
+    artifacts_table,
+    node_states_table,
+    operations_table,
+    token_lineage_frames_table,
+    token_outcomes_table,
+    tokens_table,
+)
 
 pytestmark = pytest.mark.testcontainer
 
@@ -198,7 +205,13 @@ def test_postgres_batch_expansion_claims_batch_once_under_contention(
 
     assert sorted(results) == ["committed", "rejected"]
     with first_db.read_only_connection() as conn:
-        children = conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.expand_group_id.is_not(None))).all()
+        children = conn.execute(
+            select(tokens_table.c.token_id).where(
+                tokens_table.c.token_id.in_(
+                    select(token_lineage_frames_table.c.token_id).where(token_lineage_frames_table.c.kind == "expand")
+                )
+            )
+        ).all()
         outcomes = conn.execute(
             select(token_outcomes_table.c.path, token_outcomes_table.c.batch_id).where(
                 token_outcomes_table.c.batch_id == batch.batch_id,

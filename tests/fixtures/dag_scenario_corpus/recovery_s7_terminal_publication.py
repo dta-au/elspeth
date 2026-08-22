@@ -14,11 +14,14 @@ from typing import Literal
 
 from sqlalchemy import select
 
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame, path_branch_name, path_expand_group_id, path_fork_group_id
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import (
     node_states_table,
     rows_table,
     sink_effect_attempts_table,
+    token_lineage_frames_table,
     token_parents_table,
     tokens_table,
 )
@@ -142,25 +145,45 @@ def _lineage_snapshot(
                 select(rows_table.c.row_id).where(rows_table.c.run_id == run_id).order_by(rows_table.c.row_id)
             ).scalars()
         )
+        lineage_frame_rows = tuple(
+            conn.execute(
+                select(
+                    token_lineage_frames_table.c.token_id,
+                    token_lineage_frames_table.c.kind,
+                    token_lineage_frames_table.c.group_id,
+                    token_lineage_frames_table.c.member_key,
+                )
+                .where(token_lineage_frames_table.c.run_id == run_id)
+                .order_by(token_lineage_frames_table.c.token_id, token_lineage_frames_table.c.depth)
+            ).mappings()
+        )
+        lineage_paths_by_token: dict[str, list[LineageFrame]] = {}
+        for row in lineage_frame_rows:
+            lineage_paths_by_token.setdefault(_required_text(row["token_id"], field="lineage frame token_id"), []).append(
+                LineageFrame(
+                    kind=FrameKind(row["kind"]),
+                    group_id=_required_text(row["group_id"], field="lineage frame group_id"),
+                    member_key=_required_text(row["member_key"], field="lineage frame member_key"),
+                )
+            )
         token_rows = tuple(
             S7TokenIdentity(
                 token_id=_required_text(row["token_id"], field="token_id"),
                 row_id=_required_text(row["row_id"], field="token row_id"),
                 step_in_pipeline=(None if row["step_in_pipeline"] is None else int(row["step_in_pipeline"])),
-                branch_name=_optional_text(row["branch_name"]),
-                fork_group_id=_optional_text(row["fork_group_id"]),
+                branch_name=path_branch_name(tuple(lineage_paths_by_token.get(_required_text(row["token_id"], field="token_id"), []))),
+                fork_group_id=path_fork_group_id(tuple(lineage_paths_by_token.get(_required_text(row["token_id"], field="token_id"), []))),
                 join_group_id=_optional_text(row["join_group_id"]),
-                expand_group_id=_optional_text(row["expand_group_id"]),
+                expand_group_id=path_expand_group_id(
+                    tuple(lineage_paths_by_token.get(_required_text(row["token_id"], field="token_id"), []))
+                ),
             )
             for row in conn.execute(
                 select(
                     tokens_table.c.token_id,
                     tokens_table.c.row_id,
                     tokens_table.c.step_in_pipeline,
-                    tokens_table.c.branch_name,
-                    tokens_table.c.fork_group_id,
                     tokens_table.c.join_group_id,
-                    tokens_table.c.expand_group_id,
                 )
                 .where(tokens_table.c.run_id == run_id)
                 .order_by(tokens_table.c.token_id)

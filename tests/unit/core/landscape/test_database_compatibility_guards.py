@@ -385,10 +385,8 @@ class TestSchemaCompatibilityGuards:
             "pending_path",
             "pending_error_hash",
             "pending_error_message",
-            "branch_name",
-            "fork_group_id",
             "join_group_id",
-            "expand_group_id",
+            "lineage_path_json",
             "coalesce_node_id",
             "coalesce_name",
             "attempt",
@@ -467,7 +465,7 @@ class TestSchemaCompatibilityGuards:
             instance._validate_schema()
 
         msg = str(exc_info.value)
-        assert "token_work_items.branch_name" in msg
+        assert "token_work_items.lineage_path_json" in msg
         assert "Landscape database schema is outdated" in msg
         assert "Pre-1.0 schemas are not migrated in place" in msg
         instance.close()

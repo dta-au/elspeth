@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypedDict
 
 from elspeth.contracts.freeze import freeze_fields, require_int
+from elspeth.contracts.identity import LineageFrame
 
 if TYPE_CHECKING:
     pass  # Placeholder for future type-only imports
@@ -253,10 +254,8 @@ class Token:
     row_id: str
     created_at: datetime
     run_id: str
-    fork_group_id: str | None = None
-    join_group_id: str | None = None
-    expand_group_id: str | None = None  # For deaggregation grouping
-    branch_name: str | None = None
+    join_group_id: str | None = None  # merge event — the KEPT tokens column
+    lineage_path: tuple[LineageFrame, ...] = ()  # loaded from token_lineage_frames
     step_in_pipeline: int | None = None  # Step where token was created (fork/coalesce/expand)
     token_data_ref: str | None = None  # Content-addressable ref for per-token payload (expand/coalesce writers)
 
@@ -1396,12 +1395,8 @@ class TokenOutcome:
     # Outcome-specific fields (nullable based on (outcome, path) pair)
     sink_name: str | None = None
     batch_id: str | None = None
-    fork_group_id: str | None = None
-    join_group_id: str | None = None
-    expand_group_id: str | None = None
     error_hash: str | None = None
     context_json: str | None = None
-    expected_branches_json: str | None = None  # Branch contract for FORK_PARENT/EXPAND_PARENT
 
     def __post_init__(self) -> None:
         """Validate two-axis invariants — Tier 1 crash on invalid combinations."""
@@ -1457,9 +1452,6 @@ class TerminalPairFieldConstraints:
 _DISCRIMINATOR_FIELDS = (
     "sink_name",
     "batch_id",
-    "fork_group_id",
-    "join_group_id",
-    "expand_group_id",
     "error_hash",
 )
 
@@ -1494,9 +1486,11 @@ _TERMINAL_PAIR_FIELD_CONSTRAINTS: dict[
     (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED): TerminalPairFieldConstraints(
         forbidden=_DISCRIMINATOR_FIELDS,
     ),
+    # join_group_id retired from token_outcomes (D2): the merge-event identity
+    # lives only on the result token's tokens.join_group_id column (kept). A
+    # COALESCED outcome carries no discriminator beyond sink_name.
     (TerminalOutcome.SUCCESS, TerminalPath.COALESCED): TerminalPairFieldConstraints(
-        required=("join_group_id",),
-        forbidden=_forbid_except("sink_name", "join_group_id"),
+        forbidden=_forbid_except("sink_name"),
     ),
     (TerminalOutcome.FAILURE, TerminalPath.UNROUTED): TerminalPairFieldConstraints(
         required=("error_hash",),
@@ -1515,13 +1509,17 @@ _TERMINAL_PAIR_FIELD_CONSTRAINTS: dict[
         exact={"sink_name": DISCARD_SINK_NAME},
         forbidden=_forbid_except("sink_name", "error_hash"),
     ),
+    # fork_group_id/expand_group_id retired from token_outcomes (D2): the
+    # roster of record is now the children's persisted token_lineage_frames
+    # rows plus group_records (WS1a Task 4), never a stored discriminator
+    # column here — see the Task 10 replay predicates (_reconcile_fork_replay
+    # / _reconcile_expansion_replay), which derive the group id from the
+    # children's frames instead of reading it back off this outcome.
     (TerminalOutcome.TRANSIENT, TerminalPath.FORK_PARENT): TerminalPairFieldConstraints(
-        required=("fork_group_id",),
-        forbidden=_forbid_except("fork_group_id"),
+        forbidden=_DISCRIMINATOR_FIELDS,
     ),
     (TerminalOutcome.TRANSIENT, TerminalPath.EXPAND_PARENT): TerminalPairFieldConstraints(
-        required=("expand_group_id",),
-        forbidden=_forbid_except("expand_group_id"),
+        forbidden=_DISCRIMINATOR_FIELDS,
     ),
     (TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED): TerminalPairFieldConstraints(
         required=("batch_id",),
@@ -1548,9 +1546,6 @@ def validate_token_outcome_persisted_fields(
     *,
     sink_name: str | None,
     batch_id: str | None,
-    fork_group_id: str | None,
-    join_group_id: str | None,
-    expand_group_id: str | None,
     error_hash: str | None,
 ) -> None:
     """Validate ADR-019 persisted discriminator fields for a token outcome."""
@@ -1575,9 +1570,6 @@ def validate_token_outcome_persisted_fields(
     field_values = {
         "sink_name": sink_name,
         "batch_id": batch_id,
-        "fork_group_id": fork_group_id,
-        "join_group_id": join_group_id,
-        "expand_group_id": expand_group_id,
         "error_hash": error_hash,
     }
     for field_name in constraints.required:

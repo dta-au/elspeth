@@ -38,7 +38,13 @@ from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import CheckpointSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import aggregation_results_table, batches_table, coalesce_effects_table, tokens_table
+from elspeth.core.landscape.schema import (
+    aggregation_results_table,
+    batches_table,
+    coalesce_effects_table,
+    token_lineage_frames_table,
+    tokens_table,
+)
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.clock import MockClock
 from elspeth.engine.executors.aggregation import AggregationExecutor
@@ -156,7 +162,14 @@ def test_postgres_recovers_committed_aggregation_result_without_plugin_replay(
             conn.execute(
                 select(tokens_table.c.token_id)
                 .where(tokens_table.c.run_id == batch.run_id)
-                .where(tokens_table.c.expand_group_id.isnot(None))
+                .where(
+                    tokens_table.c.token_id.in_(
+                        select(token_lineage_frames_table.c.token_id).where(
+                            token_lineage_frames_table.c.run_id == batch.run_id,
+                            token_lineage_frames_table.c.kind == "expand",
+                        )
+                    )
+                )
             ).all()
             == []
         )

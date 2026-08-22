@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.sink_effects import (
     AuditExportFormat,
     AuditExportSignedManifestInput,
@@ -37,9 +39,8 @@ class _Token:
     token_id: str
     row_id: str
     run_id: str
-    fork_group_id: str | None = None
     join_group_id: str | None = None
-    expand_group_id: str | None = None
+    lineage_path: tuple[LineageFrame, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -205,7 +206,7 @@ def test_relation_child_mismatch_and_claimed_lineage_without_parent_fail_closed(
         resolve_sink_effect_members(mismatched, (_candidate("child"),))
 
     missing_relation = _LineageSource(
-        tokens=(_Token("child", "row-0", "run-1", fork_group_id="fork-1"),),
+        tokens=(_Token("child", "row-0", "run-1", lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="a"),)),),
         rows=(row,),
         parents=(),
     )

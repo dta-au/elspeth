@@ -8,11 +8,14 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame, path_branch_name
 from elspeth.core.landscape.schema import (
     node_states_table,
     rows_table,
     sink_effect_attempts_table,
     sink_effects_table,
+    token_lineage_frames_table,
     token_parents_table,
     tokens_table,
 )
@@ -120,7 +123,6 @@ def _capture_interrupted_s6_state(
                 select(
                     tokens_table.c.token_id,
                     tokens_table.c.row_id,
-                    tokens_table.c.branch_name,
                     tokens_table.c.join_group_id,
                 )
                 .where(tokens_table.c.run_id == context.run_id)
@@ -215,7 +217,26 @@ def _capture_interrupted_s6_state(
         raise AssertionError(f"S6 pending-sink recovery cannot identify one three-parent merged token: {parent_links!r}")
     merged_token_id = merged_candidates[0]
     merged_token = next(token for token in tokens if str(token["token_id"]) == merged_token_id)
-    if merged_token["branch_name"] is not None or merged_token["join_group_id"] is None:
+    with context.database.connection() as conn:
+        merged_token_frames = tuple(
+            conn.execute(
+                select(
+                    token_lineage_frames_table.c.kind,
+                    token_lineage_frames_table.c.group_id,
+                    token_lineage_frames_table.c.member_key,
+                )
+                .where(
+                    token_lineage_frames_table.c.run_id == context.run_id,
+                    token_lineage_frames_table.c.token_id == merged_token_id,
+                )
+                .order_by(token_lineage_frames_table.c.depth)
+            ).mappings()
+        )
+    merged_token_lineage_path = tuple(
+        LineageFrame(kind=FrameKind(row["kind"]), group_id=str(row["group_id"]), member_key=str(row["member_key"]))
+        for row in merged_token_frames
+    )
+    if path_branch_name(merged_token_lineage_path) is not None or merged_token["join_group_id"] is None:
         raise AssertionError("S6 pending-sink merged token lacks its exact join identity")
     if context.interrupted_effect.member_token_ids != (merged_token_id,):
         raise AssertionError("S6 pending-sink effect must contain only the completed coalesce token")

@@ -21,8 +21,9 @@ import pytest
 
 from elspeth.contracts import PendingOutcome, RowResult, TokenInfo
 from elspeth.contracts.audit import Batch
-from elspeth.contracts.enums import BatchStatus, TerminalOutcome, TerminalPath, TriggerType
+from elspeth.contracts.enums import BatchStatus, FrameKind, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.types import NodeID
 from elspeth.core.landscape.execution_repository import ExecutionRepository
@@ -692,7 +693,12 @@ class TestCheckAggregationTimeouts:
 
     def test_downstream_completed_branch_fallback_in_timeout(self) -> None:
         """COMPLETED work item with unknown branch routes to sink_name from result."""
-        token = TokenInfo(row_id="row-1", token_id="tok-1", row_data=make_row({}), branch_name="unknown")
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-aggregation-test", member_key="unknown"),),
+        )
         work_item = _make_work_item(token=token)
         completed = _make_result(TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, token=token, sink_name="output")
 
@@ -758,7 +764,12 @@ class TestCheckAggregationTimeouts:
 
     def test_completed_result_branch_fallback_in_timeout(self) -> None:
         """Completed result with branch not in pending routes to sink_name from result."""
-        token = TokenInfo(row_id="row-1", token_id="tok-1", row_data=make_row({}), branch_name="missing_sink")
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-aggregation-test", member_key="missing_sink"),),
+        )
         completed = _make_result(TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, token=token, sink_name="output")
 
         agg_transform = _make_batch_transform(node_id="agg-1")
@@ -969,7 +980,12 @@ class TestFlushRemainingAggregationBuffers:
 
     def test_branch_routing_for_completed_tokens(self) -> None:
         """Completed tokens route via result.sink_name, not branch_name."""
-        token = TokenInfo(row_id="row-1", token_id="tok-1", row_data=make_row({}), branch_name="path_a")
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-aggregation-test", member_key="path_a"),),
+        )
         completed = _make_result(TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, token=token, sink_name="output")
 
         agg_transform = _make_batch_transform(node_id="agg-1")
@@ -1022,7 +1038,12 @@ class TestFlushRemainingAggregationBuffers:
 
     def test_downstream_completed_branch_fallback_in_flush(self) -> None:
         """COMPLETED work item with unknown branch routes to sink_name from result."""
-        token = TokenInfo(row_id="row-1", token_id="tok-1", row_data=make_row({}), branch_name="unknown")
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-aggregation-test", member_key="unknown"),),
+        )
         work_item = _make_work_item(token=token)
         completed = _make_result(TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, token=token, sink_name="output")
 
@@ -1138,7 +1159,12 @@ class TestFlushRemainingAggregationBuffers:
 
     def test_completed_result_branch_fallback_to_sink_name(self) -> None:
         """Completed result with branch not in pending routes to sink_name from result."""
-        token = TokenInfo(row_id="row-1", token_id="tok-1", row_data=make_row({}), branch_name="missing")
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-aggregation-test", member_key="missing"),),
+        )
         completed = _make_result(TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, token=token, sink_name="output")
 
         agg_transform = _make_batch_transform(node_id="agg-1")
@@ -1164,7 +1190,12 @@ class TestFlushRemainingAggregationBuffers:
 
     def test_branch_routing_falls_back_to_sink_name(self) -> None:
         """Branch name not in pending_tokens routes to sink_name from result."""
-        token = TokenInfo(row_id="row-1", token_id="tok-1", row_data=make_row({}), branch_name="nonexistent")
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-aggregation-test", member_key="nonexistent"),),
+        )
         completed = _make_result(TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, token=token, sink_name="output")
 
         agg_transform = _make_batch_transform(node_id="agg-1")

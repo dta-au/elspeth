@@ -11,12 +11,15 @@ from pathlib import Path
 from sqlalchemy import select
 
 from elspeth.contracts import RunStatus
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame, path_branch_name
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import (
     artifacts_table,
     rows_table,
     sink_effect_attempts_table,
     sink_effects_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
     tokens_table,
@@ -122,7 +125,6 @@ def _capture_interrupted_state(
                 select(
                     tokens_table.c.token_id,
                     tokens_table.c.row_id,
-                    tokens_table.c.branch_name,
                     rows_table.c.ingest_sequence,
                 )
                 .join(
@@ -131,6 +133,18 @@ def _capture_interrupted_state(
                 )
                 .where(tokens_table.c.run_id == context.run_id)
                 .order_by(rows_table.c.ingest_sequence, tokens_table.c.token_id)
+            ).mappings()
+        )
+        lineage_frame_rows = tuple(
+            conn.execute(
+                select(
+                    token_lineage_frames_table.c.token_id,
+                    token_lineage_frames_table.c.kind,
+                    token_lineage_frames_table.c.group_id,
+                    token_lineage_frames_table.c.member_key,
+                )
+                .where(token_lineage_frames_table.c.run_id == context.run_id)
+                .order_by(token_lineage_frames_table.c.token_id, token_lineage_frames_table.c.depth)
             ).mappings()
         )
         parent_rows = tuple(
@@ -205,12 +219,17 @@ def _capture_interrupted_state(
         if token_id in parents_by_token:
             raise AssertionError(f"partial-terminal fork child {token_id!r} has multiple parents")
         parents_by_token[token_id] = (str(row["parent_token_id"]), int(row["ordinal"]))
+    frames_by_token: dict[str, list[LineageFrame]] = {}
+    for row in lineage_frame_rows:
+        frames_by_token.setdefault(str(row["token_id"]), []).append(
+            LineageFrame(kind=FrameKind(row["kind"]), group_id=str(row["group_id"]), member_key=str(row["member_key"]))
+        )
     lineage = tuple(
         PartialTerminalTokenLineage(
             token_id=str(row["token_id"]),
             row_id=str(row["row_id"]),
             ingest_sequence=int(row["ingest_sequence"]),
-            branch_name=None if row["branch_name"] is None else str(row["branch_name"]),
+            branch_name=path_branch_name(tuple(frames_by_token.get(str(row["token_id"]), []))),
             parent_token_id=parents_by_token.get(str(row["token_id"]), (None, None))[0],
             parent_ordinal=parents_by_token.get(str(row["token_id"]), (None, None))[1],
         )

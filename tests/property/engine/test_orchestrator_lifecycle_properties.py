@@ -25,6 +25,8 @@ from hypothesis import find, given, settings
 from hypothesis import strategies as st
 
 from elspeth.contracts import PendingOutcome, RunStatus, TerminalOutcome, TerminalPath, TokenInfo
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import RowResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.engine.orchestrator.outcomes import accumulate_row_outcomes
@@ -154,13 +156,20 @@ def completed_row_counter_shapes(draw: st.DrawFn) -> dict[str, int]:
 
 
 def _make_token(*, branch_name: str | None = None) -> TokenInfo:
-    """Create a minimal TokenInfo for testing."""
+    """Create a minimal TokenInfo for testing.
+
+    ``branch_name`` is a read-only property derived from the innermost FORK
+    frame in ``lineage_path`` — passing it here builds that frame.
+    """
     row = PipelineRow({"field": "value"}, _TEST_CONTRACT)
+    lineage_path: tuple[LineageFrame, ...] = ()
+    if branch_name is not None:
+        lineage_path = (LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key=branch_name),)
     return TokenInfo(
         row_id="row-1",
         token_id="tok-1",
         row_data=row,
-        branch_name=branch_name,
+        lineage_path=lineage_path,
     )
 
 

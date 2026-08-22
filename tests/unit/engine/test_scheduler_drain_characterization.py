@@ -833,7 +833,7 @@ def test_expansion_restart_reuses_children_and_delivers_each_once() -> None:
                     row_id=child.row_id,
                     token_id=child.token_id,
                     row_data=PipelineRow(payload, _CONTRACT),
-                    expand_group_id=child.expand_group_id,
+                    lineage_path=child.lineage_path,
                 ),
                 current_node_id=NodeID(NODE_ID),
             )

@@ -53,7 +53,13 @@ from elspeth.contracts.errors import (
     SinkTransactionalInvariantError,
     SourceGuaranteedFieldsViolation,
 )
-from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.identity import (
+    LineageFrame,
+    lineage_path_from_json,
+    path_branch_name,
+    path_expand_group_id,
+    path_fork_group_id,
+)
 from elspeth.contracts.results import FailureInfo, GateResult
 from elspeth.contracts.routing import RoutingAction
 from elspeth.contracts.schema import SchemaConfig
@@ -152,33 +158,30 @@ def _persist_token_for_scheduler(
             data=token.row_data.to_dict(),
         )
     if factory.query.get_token(token.token_id) is None:
-        resolved_fork_group_id = token.fork_group_id or (f"test-fork:{token.row_id}" if token.branch_name is not None else None)
         # A fabricated branch token models a fork child — mint the matching
-        # lineage frame(s) durably via the create_token(..., lineage_frames=)
+        # lineage frame(s) durably via the create_token(..., lineage_path=)
         # seam so coalesce_tokens' durable strict pop (spec rulings 24/28) has
         # a frame to pop. Never weaken the pop to accommodate a raw-seeded
         # fixture; fix the fixture instead.
         #
         # Prefer the token's OWN lineage_path when the fixture set one — that
         # is the real (possibly multi-frame) in-memory path threaded straight
-        # through, per the create_token seam contract (WS1a Task 8). Fall
-        # back to a synthetic single-FORK reconstruction from branch_name for
-        # older fixtures that never populated lineage_path.
-        lineage_frames = (
+        # through, per the create_token seam contract. Fall back to a
+        # synthetic single-FORK reconstruction from branch_name for older
+        # fixtures that never populated lineage_path.
+        lineage_path = (
             token.lineage_path
             if token.lineage_path
             else (
-                (LineageFrame(kind=FrameKind.FORK, group_id=resolved_fork_group_id, member_key=token.branch_name),)
-                if token.branch_name is not None and resolved_fork_group_id is not None
+                (LineageFrame(kind=FrameKind.FORK, group_id=f"test-fork:{token.row_id}", member_key=token.branch_name),)
+                if token.branch_name is not None
                 else ()
             )
         )
         factory.data_flow.create_token(
             token.row_id,
             token_id=token.token_id,
-            branch_name=token.branch_name,
-            fork_group_id=resolved_fork_group_id,
-            lineage_frames=lineage_frames,
+            lineage_path=lineage_path,
         )
 
 
@@ -219,9 +222,6 @@ def _persist_blocked_scheduler_work(
         lease_owner="test-harness",
         lease_seconds=60,
         now=now,
-        branch_name=token.branch_name,
-        fork_group_id=token.fork_group_id,
-        expand_group_id=token.expand_group_id,
         lineage_path=token.lineage_path,
         coalesce_name=coalesce_name,
     )
@@ -1294,8 +1294,12 @@ class TestGetGateDestinations:
         """GateOutcome with discarded=False reports fork paths."""
         _, factory = _make_factory()
         processor = _make_processor(factory)
-        child_a = make_token_info(data={"value": 1}, branch_name="path_a")
-        child_b = make_token_info(data={"value": 2}, branch_name="path_b")
+        child_a = make_token_info(
+            data={"value": 1}, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),)
+        )
+        child_b = make_token_info(
+            data={"value": 2}, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_b", member_key="path_b"),)
+        )
         outcome = GateOutcome(
             result=GateResult(row={"value": 1}, action=RoutingAction.fork_to_paths(["path_a", "path_b"])),
             updated_token=make_token_info(data={"value": 1}),
@@ -3637,7 +3641,7 @@ class TestProcessRowGateBranching:
             row_id="row-1",
             token_id="token-branch-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         processor = _make_processor(
@@ -3728,13 +3732,13 @@ class TestProcessRowGateBranching:
                 row_id=token.row_id,
                 token_id="token-fork-a",
                 row_data=token.row_data,
-                branch_name="sink_a",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-sink_a", member_key="sink_a"),),
             )
             child_b = TokenInfo(
                 row_id=token.row_id,
                 token_id="token-fork-b",
                 row_data=token.row_data,
-                branch_name="sink_b",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-sink_b", member_key="sink_b"),),
             )
             _persist_token_for_scheduler(factory, child_a)
             _persist_token_for_scheduler(factory, child_b)
@@ -5153,9 +5157,10 @@ class TestDurableSchedulerResumeDrain:
             row_id=row.row_id,
             token_id="token-direct-branch",
             row_data=source_payload,
-            branch_name="direct",
-            fork_group_id="fork-1",
-            expand_group_id="expand-1",
+            lineage_path=(
+                LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="direct"),
+                LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="direct"),
+            ),
         )
         factory.data_flow.create_token(row.row_id, token_id=token.token_id)
         factory.scheduler.enqueue_ready(
@@ -5168,9 +5173,7 @@ class TestDurableSchedulerResumeDrain:
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
             available_at=datetime.now(UTC),
             on_success_sink="source_sink",
-            branch_name=token.branch_name,
-            fork_group_id=token.fork_group_id,
-            expand_group_id=token.expand_group_id,
+            lineage_path=token.lineage_path,
         )
 
         processor = _make_processor(
@@ -5568,8 +5571,7 @@ class TestDurableSchedulerResumeDrain:
             row_id=row.row_id,
             token_id="token-held-branch",
             row_data=source_payload,
-            branch_name="path_a",
-            fork_group_id="fork-2",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-2", member_key="path_a"),),
         )
         factory.data_flow.create_token(row.row_id, token_id=token.token_id)
         factory.scheduler.enqueue_ready(
@@ -5581,8 +5583,7 @@ class TestDurableSchedulerResumeDrain:
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
             available_at=datetime.now(UTC),
-            branch_name=token.branch_name,
-            fork_group_id=token.fork_group_id,
+            lineage_path=token.lineage_path,
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
         )
@@ -5666,7 +5667,9 @@ class TestDurableSchedulerResumeDrain:
             node_id=str(coalesce_node),
             schema_config=_DYNAMIC_SCHEMA,
         )
-        factory.data_flow.create_token(row.row_id, token_id="token-held-a", branch_name="path_a", fork_group_id="fork-1")
+        factory.data_flow.create_token(
+            row.row_id, token_id="token-held-a", lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),)
+        )
         factory.scheduler.enqueue_ready(
             run_id="test-run",
             token_id="token-held-a",
@@ -5676,8 +5679,7 @@ class TestDurableSchedulerResumeDrain:
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
             available_at=datetime.now(UTC),
-            branch_name="path_a",
-            fork_group_id="fork-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
         )
@@ -7421,7 +7423,9 @@ class TestExecuteTransformWithRetry:
         )
         processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
         transform = _make_mock_transform(node_id="t1", on_error=on_error)
-        token = make_token_info(data={"value": 42}, branch_name="path_a")
+        token = make_token_info(
+            data={"value": 42}, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),)
+        )
         _persist_token_for_scheduler(factory, token)
 
         def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
@@ -7885,7 +7889,6 @@ class TestMaybeCoalesceToken:
             row_id=token.row_id,
             token_id=token.token_id,
             row_data=token.row_data,
-            branch_name=None,
         )
 
         handled, _result = processor._maybe_coalesce_token(
@@ -7912,7 +7915,7 @@ class TestMaybeCoalesceToken:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         handled, _result = processor._maybe_coalesce_token(
@@ -7940,7 +7943,7 @@ class TestMaybeCoalesceToken:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         handled, result = processor._maybe_coalesce_token(
@@ -7966,7 +7969,7 @@ class TestMaybeCoalesceToken:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.accept.return_value = CoalesceOutcome(
@@ -8027,7 +8030,7 @@ class TestMaybeCoalesceToken:
             row_id=row.row_id,
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.accept.return_value = CoalesceOutcome(
@@ -8091,7 +8094,7 @@ class TestMaybeCoalesceToken:
             row_id=row.row_id,
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.accept.return_value = CoalesceOutcome(
@@ -8142,7 +8145,7 @@ class TestMaybeCoalesceToken:
             row_id=row.row_id,
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.accept.return_value = CoalesceOutcome(
@@ -8204,7 +8207,7 @@ class TestMaybeCoalesceToken:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         ctx = make_context(landscape=factory.plugin_audit_writer())
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
@@ -8253,7 +8256,9 @@ class TestCompleteCoalesceMerge:
         )
         # One held branch, BLOCKED at the coalesce barrier through the
         # production verbs (enqueue -> claim -> mark_blocked).
-        factory.data_flow.create_token(row.row_id, token_id="token-held-a", branch_name="path_a", fork_group_id="fork-1")
+        factory.data_flow.create_token(
+            row.row_id, token_id="token-held-a", lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),)
+        )
         now = datetime.now(UTC)
         factory.scheduler.enqueue_ready(
             run_id="test-run",
@@ -8264,8 +8269,7 @@ class TestCompleteCoalesceMerge:
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
             available_at=now,
-            branch_name="path_a",
-            fork_group_id="fork-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
         )
@@ -8282,8 +8286,7 @@ class TestCompleteCoalesceMerge:
             row_id=row.row_id,
             token_id="token-held-a",
             row_data=payload,
-            branch_name="path_a",
-            fork_group_id="fork-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
         )
         merged_token = make_token_info(row_id=row.row_id, token_id="merged-1", data={"value": 7})
         factory.data_flow.create_token(row.row_id, token_id="merged-1", join_group_id="join-1")
@@ -8374,10 +8377,7 @@ class TestResumeIncompleteToken:
         spec = IncompleteTokenSpec(
             token_id="token-expanded-child",
             row_id="row-1",
-            branch_name="path_a",
-            fork_group_id=None,
             join_group_id=None,
-            expand_group_id="expand-1",
             lineage_path=(
                 LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),
                 LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="token-expanded-child"),
@@ -8423,7 +8423,12 @@ class TestNotifyCoalesceOfLostBranch:
             node_step_map={NodeID("coalesce::merge"): 5},
             coalesce_on_success_map={CoalesceName("merge"): "output"},
         )
-        token = make_token_info(row_id="row-1", token_id="token-1", data={"value": 1}, branch_name="path_a")
+        token = make_token_info(
+            row_id="row-1",
+            token_id="token-1",
+            data={"value": 1},
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
+        )
         fctx = _FlushContext(
             node_id=NodeID("aggregate-1"),
             transform=_make_mock_transform(node_id="aggregate-1", name="batch-transform"),
@@ -8502,7 +8507,7 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         results = processor._notify_coalesce_of_lost_branch(
@@ -8522,7 +8527,6 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name=None,
         )
 
         results = processor._notify_coalesce_of_lost_branch(
@@ -8546,7 +8550,7 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="unmapped_branch",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-unmapped_branch", member_key="unmapped_branch"),),
         )
 
         results = processor._notify_coalesce_of_lost_branch(
@@ -8586,7 +8590,7 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         results = processor._notify_coalesce_of_lost_branch(
@@ -8624,7 +8628,7 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         results = processor._notify_coalesce_of_lost_branch(
@@ -8661,7 +8665,7 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         with pytest.raises(OrchestrationInvariantError, match="Coalesce 'merge' not in on_success map"):
@@ -8719,7 +8723,7 @@ class TestNotifyCoalesceOfLostBranch:
             row_id=row.row_id,
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         results = processor._notify_coalesce_of_lost_branch(
@@ -8953,7 +8957,11 @@ class TestTelemetryEmission:
 class TestRowUnionBranchLossTelemetry:
     def test_follower_stages_durable_loss_without_executor(self) -> None:
         _, factory = _make_factory()
-        lost_token = make_token_info(row_id="row-1", token_id="lost-token", branch_name="control")
+        lost_token = make_token_info(
+            row_id="row-1",
+            token_id="lost-token",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
+        )
         processor = _make_processor(
             factory,
             row_union_executor=None,
@@ -8971,8 +8979,16 @@ class TestRowUnionBranchLossTelemetry:
 
     def test_failed_siblings_emit_token_completed_after_audit(self) -> None:
         _, factory = _make_factory()
-        held_sibling = make_token_info(row_id="row-1", token_id="held-token", branch_name="treatment")
-        lost_token = make_token_info(row_id="row-1", token_id="lost-token", branch_name="control")
+        held_sibling = make_token_info(
+            row_id="row-1",
+            token_id="held-token",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-treatment", member_key="treatment"),),
+        )
+        lost_token = make_token_info(
+            row_id="row-1",
+            token_id="lost-token",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
+        )
         row_union_executor = create_autospec(RowUnionExecutor, instance=True)
         row_union_executor.is_group_released.return_value = False
         row_union_executor.notify_branch_lost.return_value = RowUnionOutcome(
@@ -9005,7 +9021,11 @@ class TestRowUnionBranchLossTelemetry:
         # downstream of the union re-enters the loss path; a released group
         # must not stage a durable pre-barrier loss record.
         _, factory = _make_factory()
-        released_token = make_token_info(row_id="row-1", token_id="released-token", branch_name="control")
+        released_token = make_token_info(
+            row_id="row-1",
+            token_id="released-token",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
+        )
         row_union_executor = create_autospec(RowUnionExecutor, instance=True)
         row_union_executor.is_group_released.return_value = True
         processor = _make_processor(
@@ -9034,7 +9054,11 @@ class TestRowUnionBranchLossTelemetry:
         factory.data_flow.create_token("row-1", token_id="released-token")
         state = factory.execution.begin_node_state("released-token", str(union_node), "test-run", 1, {"a": 1})
         factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"a": 1}, duration_ms=1.0)
-        released_token = make_token_info(row_id="row-1", token_id="released-token", branch_name="control")
+        released_token = make_token_info(
+            row_id="row-1",
+            token_id="released-token",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
+        )
 
         assert processor._notify_row_union_of_lost_branch(released_token, "routed_to_sink") == []
 
@@ -9060,7 +9084,11 @@ class TestRowUnionBranchLossTelemetry:
             error=ExecutionError(exception="row_union_timeout", exception_type="RowUnionFailureReason"),
             duration_ms=1.0,
         )
-        lost_token = make_token_info(row_id="row-1", token_id="failed-token", branch_name="control")
+        lost_token = make_token_info(
+            row_id="row-1",
+            token_id="failed-token",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
+        )
 
         assert processor._notify_row_union_of_lost_branch(lost_token, "error_routed") == []
 
@@ -9286,7 +9314,7 @@ class TestCoalesceTraversalInvariant:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         with pytest.raises(OrchestrationInvariantError, match="downstream of coalesce"):
             processor._process_single_token(
@@ -9328,7 +9356,7 @@ class TestCoalesceTraversalInvariant:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         # Should not raise — at coalesce node, not past it.
         # ADR-030 §B (slice 5): without coalesce_executor (follower mode),
@@ -9363,7 +9391,11 @@ class TestRowUnionTraversalInvariant:
             row_union_node_ids={RowUnionName("variant_union"): row_union_node},
             structural_node_ids=frozenset({source_node, row_union_node, downstream_node}),
         )
-        token = make_token_info(row_id="row-1", token_id="tok-1", branch_name="variant_a")
+        token = make_token_info(
+            row_id="row-1",
+            token_id="tok-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-variant_a", member_key="variant_a"),),
+        )
         _persist_token_for_scheduler(factory, token)
 
         with pytest.raises(OrchestrationInvariantError, match="downstream of row_union"):
@@ -9475,7 +9507,7 @@ class TestGateSinkRoutingNotifiesCoalesce:
             row_id="row-1",
             token_id="tok-branch-a",
             row_data=make_row({"value": 42}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         # Mock gate executor to return a sink routing outcome
@@ -9576,7 +9608,7 @@ class TestGateSinkRoutingNotifiesCoalesce:
             row_id="row-1",
             token_id="tok-branch-a",
             row_data=make_row({"value": 42}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         sink_outcome = GateOutcome(
@@ -9655,7 +9687,6 @@ class TestGateSinkRoutingNotifiesCoalesce:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 42}),
-            branch_name=None,
         )
 
         sink_outcome = GateOutcome(
@@ -9725,7 +9756,6 @@ class TestGateSinkRoutingNotifiesCoalesce:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 42}),
-            branch_name=None,
         )
         discard_outcome = GateOutcome(
             result=GateResult(
@@ -9852,7 +9882,7 @@ class TestGateJumpPastCoalesceInvariant:
                 row_id="row-1",
                 token_id="tok-1",
                 data={"value": 42},
-                branch_name="branch_a",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-branch_a", member_key="branch_a"),),
             )
             processor._process_single_token(
                 token=token,
@@ -9898,7 +9928,11 @@ class TestGateJumpPastCoalesceInvariant:
         def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None):
             return GateOutcome(result=gate_result, updated_token=token, next_node_id=past_row_union_node)
 
-        token = make_token_info(row_id="row-1", token_id="tok-1", branch_name="variant_a")
+        token = make_token_info(
+            row_id="row-1",
+            token_id="tok-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-variant_a", member_key="variant_a"),),
+        )
         _persist_token_for_scheduler(factory, token)
 
         with (
@@ -10012,7 +10046,7 @@ class TestGateJumpPastCoalesceInvariant:
                 row_id="row-1",
                 token_id="tok-1",
                 data={"value": 42},
-                branch_name="branch_a",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-branch_a", member_key="branch_a"),),
             )
             # Should NOT raise — jump target is before coalesce
             result, _child_items = processor._process_single_token(
@@ -10266,9 +10300,10 @@ class TestReadyEmissionEnqueueParity:
                 row_id="row-1",
                 token_id="token-merged-1",
                 row_data=make_pipeline_row({"value": 42}),
-                branch_name="path_a",
-                fork_group_id="fork-1",
-                expand_group_id="expand-1",
+                lineage_path=(
+                    LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),
+                    LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="path_a"),
+                ),
             )
             _persist_token_for_scheduler(factory, token)
             item = WorkItem(
@@ -10283,9 +10318,10 @@ class TestReadyEmissionEnqueueParity:
                 row_id="row-1",
                 token_id="token-merged-1",
                 row_data=make_pipeline_row({"value": 42}),
-                branch_name="path_a",
-                fork_group_id="fork-1",
-                expand_group_id="expand-1",
+                lineage_path=(
+                    LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),
+                    LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="path_a"),
+                ),
             )
             _persist_token_for_scheduler(factory, token)
             item = WorkItem(
@@ -10300,7 +10336,7 @@ class TestReadyEmissionEnqueueParity:
                 row_id="row-1",
                 token_id="token-merged-1",
                 row_data=make_pipeline_row({"value": 42}),
-                expand_group_id="expand-1",
+                lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="token-merged-1"),),
             )
             _persist_token_for_scheduler(factory, token)
             item = WorkItem(
@@ -10350,10 +10386,7 @@ class TestReadyEmissionEnqueueParity:
             queue_key=emission.queue_key,
             barrier_key=emission.barrier_key,
             on_success_sink=emission.on_success_sink,
-            branch_name=emission.branch_name,
-            fork_group_id=emission.fork_group_id,
             join_group_id=emission.join_group_id,
-            expand_group_id=emission.expand_group_id,
             lineage_path=emission.lineage_path,
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
@@ -10364,8 +10397,8 @@ class TestReadyEmissionEnqueueParity:
         # Pin the projected column count: adding a journal column to ONE of
         # the two builders (or to the mapper) must force this pin to be
         # revisited rather than silently desync the reconciliation contract.
-        # Epoch 34 adds lineage_path_json (30 -> 31).
-        assert len(values_from_emission) == 31
+        # Epoch 35 flip: tri-column lineage retirement (31 -> 28).
+        assert len(values_from_emission) == 28
 
         # Spot-check the per-flavor derived keys so a failure localizes.
         if flavor == "coalesce_cursor":
@@ -10373,8 +10406,9 @@ class TestReadyEmissionEnqueueParity:
             assert values_from_emission["barrier_key"] == "merge"
             assert values_from_emission["coalesce_node_id"] == str(coalesce_node)
             assert values_from_emission["coalesce_name"] == "merge"
-            assert values_from_emission["branch_name"] == "path_a"
-            assert values_from_emission["fork_group_id"] == "fork-1"
+            emitted_path = lineage_path_from_json(values_from_emission["lineage_path_json"])
+            assert path_branch_name(emitted_path) == "path_a"
+            assert path_fork_group_id(emitted_path) == "fork-1"
             assert values_from_emission["row_union_name"] is None
         elif flavor == "row_union_cursor":
             # A barrier-bound item never derives a structural queue key, and
@@ -10384,8 +10418,9 @@ class TestReadyEmissionEnqueueParity:
             assert values_from_emission["row_union_name"] == "variants"
             assert values_from_emission["coalesce_node_id"] is None
             assert values_from_emission["coalesce_name"] is None
-            assert values_from_emission["branch_name"] == "path_a"
-            assert values_from_emission["fork_group_id"] == "fork-1"
+            emitted_path = lineage_path_from_json(values_from_emission["lineage_path_json"])
+            assert path_branch_name(emitted_path) == "path_a"
+            assert path_fork_group_id(emitted_path) == "fork-1"
         else:
             assert values_from_emission["queue_key"] == str(continue_node)
             assert values_from_emission["barrier_key"] is None
@@ -10393,7 +10428,7 @@ class TestReadyEmissionEnqueueParity:
             assert values_from_emission["coalesce_name"] is None
             assert values_from_emission["row_union_name"] is None
             assert values_from_emission["join_group_id"] == "join-1"
-        assert values_from_emission["expand_group_id"] == "expand-1"
+        assert path_expand_group_id(lineage_path_from_json(values_from_emission["lineage_path_json"])) == "expand-1"
         assert values_from_emission["step_index"] == 2
 
         # And the live reconciliation accepted the enqueue against the same

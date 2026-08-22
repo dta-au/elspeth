@@ -921,6 +921,10 @@ class BarrierRecoveryCoordinator:
                 "A deposed leader's unfenced intake wrote a second acceptance — refusing silent latest-wins."
             )
         items = self._scheduler.list_blocked_barrier_items(run_id=self._run_id)
+        # Spec §4.3 codec-vs-table bidirectional check: each journal row's
+        # decoded lineage_path must equal its token_lineage_frames rows
+        # exactly, before any executor restore call mutates state.
+        self._barrier_restore_reads.verify_lineage_journal_consistency(self._run_id, items)
         scalars = restore.barrier_scalars if restore.barrier_scalars is not None else BarrierScalars(aggregation={}, coalesce={})
 
         # ---- Partition (design D1) ----------------------------------------

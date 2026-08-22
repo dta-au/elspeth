@@ -16,8 +16,9 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import PendingOutcome, TokenInfo
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.engine.orchestrator.outcomes import (
     accumulate_row_outcomes,
@@ -240,7 +241,12 @@ class TestAccumulateTerminalPairsCompleted:
         """COMPLETED routing uses result.sink_name, not token.branch_name."""
         counters = _make_counters()
         pending: dict[str, list[tuple[TokenInfo, PendingOutcome | None]]] = {"output": [], "branch_a": []}
-        token = TokenInfo(row_id="row-1", token_id="tok-1", row_data=make_row({}), branch_name="branch_a")
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-outcomes-test", member_key="branch_a"),),
+        )
         results = [_make_result(TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, token=token, sink_name="output")]
 
         accumulate_row_outcomes(results, counters, pending)
@@ -252,7 +258,12 @@ class TestAccumulateTerminalPairsCompleted:
         """COMPLETED token with branch_name not in sinks uses result.sink_name."""
         counters = _make_counters()
         pending = _make_pending()
-        token = TokenInfo(row_id="row-1", token_id="tok-1", row_data=make_row({}), branch_name="nonexistent")
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-outcomes-test", member_key="nonexistent"),),
+        )
         results = [_make_result(TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, token=token, sink_name="output")]
 
         accumulate_row_outcomes(results, counters, pending)

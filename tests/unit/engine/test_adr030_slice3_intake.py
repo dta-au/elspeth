@@ -32,8 +32,9 @@ import pytest
 from sqlalchemy import select
 
 from elspeth.contracts import TokenInfo, TransformResult
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath, TriggerType
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import AggregationSettings
@@ -193,7 +194,12 @@ class TestLateArrivalRelease:
     """§H 478 / §E.3a — late branches are journal-released by the intake."""
 
     def test_late_arrival_is_released_with_late_arrival_context(self) -> None:
-        late_token = TokenInfo(row_id="row-1", token_id="tok-late", row_data=make_row({}), branch_name="path_b")
+        late_token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-late",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_b"),),
+        )
         coalesce = Mock(spec=CoalesceExecutor)
         coalesce.accept.return_value = CoalesceOutcome(
             held=False,
@@ -260,7 +266,12 @@ class TestBranchLossHandOff:
     def test_loss_record_rides_the_failing_branch_disposition(self) -> None:
         """A failing branch's durable loss commits with its mark_failed, and the
         require_all must-fail consequence surfaces in the SAME drain step."""
-        held_token = TokenInfo(row_id="row-1", token_id="tok-held", row_data=make_row({}), branch_name="path_a")
+        held_token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-held",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_a"),),
+        )
         coalesce = Mock(spec=CoalesceExecutor)
         # The in-claim notify (retained at N=1) fails the group immediately.
         coalesce.notify_branch_lost.return_value = CoalesceOutcome(
@@ -278,7 +289,12 @@ class TestBranchLossHandOff:
         )
 
         # Branch B's claim ends in a lossy FAILURE disposition.
-        losing_token = TokenInfo(row_id="row-1", token_id="tok-lost", row_data=make_row({}), branch_name="path_b")
+        losing_token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-lost",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_b"),),
+        )
         sibling_results = processor._notify_coalesce_of_lost_branch(losing_token, "quarantined:boom", [])
         assert len(sibling_results) == 1  # must-fail within the same drain step
         assert sibling_results[0].token.token_id == "tok-held"
@@ -334,7 +350,12 @@ class TestBranchLossHandOff:
         bootstrap = self._forked_processor(factory, Mock(spec=CoalesceExecutor))
         # Durable image left by the dead leader: branch A held+adopted at the
         # coalesce, branch B's loss recorded with its disposition.
-        held_token = TokenInfo(row_id="row-1", token_id="tok-held", row_data=make_row({}), branch_name="path_a")
+        held_token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-held",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_a"),),
+        )
         _persist_blocked_scheduler_work(
             factory, bootstrap, held_token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=True
         )
@@ -351,7 +372,12 @@ class TestBranchLossHandOff:
             attempt=0,
             resume_checkpoint_id=None,
         )
-        losing_token = TokenInfo(row_id="row-1", token_id="tok-lost", row_data=make_row({}), branch_name="path_b")
+        losing_token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-lost",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_b"),),
+        )
         from tests.unit.engine.test_processor import _persist_token_for_scheduler
 
         _persist_token_for_scheduler(factory, losing_token, ingest_sequence=0)

@@ -1,9 +1,12 @@
-"""In-memory lineage-path push/pop pins (WS1a prep; spec §4.1a differential).
+"""In-memory lineage-path push/pop pins (WS1b flip; spec §4.1a).
 
-These tests pin BOTH truths during the prep phase: lineage_path is the
-corrected (preservative) representation, while the stored tri-fields keep
-today's destructive semantics until the WS1b flip. If a stored-field
-assertion here reddens, a prep slice has leaked the flip early — stop.
+branch_name/fork_group_id/expand_group_id are DERIVED, read-only accessors
+over TokenInfo.lineage_path (ruling 21) — non-destructive: an expand nested
+inside a fork branch still reports the outer branch identity even though the
+innermost frame is the EXPAND. A row_union release is the one sanctioned
+divergence (ruling 27): it pops the shared innermost FORK frame off every
+released token, so a released token whose ONLY frame was that FORK frame
+reports all-None accessors afterward.
 """
 
 from __future__ import annotations
@@ -44,18 +47,18 @@ def _root(manager: TokenManager, run_id: str) -> TokenInfo:
 
 
 class TestForkPush:
-    def test_fork_children_stack_a_fork_frame_and_keep_destructive_stored_fields(self) -> None:
+    def test_fork_children_stack_a_fork_frame(self) -> None:
         manager, run_id = _manager()
         root = _root(manager, run_id)
         children, fork_group_id = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
         for child, branch in zip(children, ["a", "b"], strict=True):
             assert child.lineage_path == (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch),)
-            assert child.branch_name == branch  # stored field: unchanged semantics
+            assert child.branch_name == branch
             assert child.fork_group_id == fork_group_id
 
 
 class TestExpandPush:
-    def test_expand_inside_fork_branch_stacks_and_stored_fields_stay_destructive(self) -> None:
+    def test_expand_inside_fork_branch_stacks_and_accessors_read_the_full_path(self) -> None:
         manager, run_id = _manager()
         root = _root(manager, run_id)
         (child_a, _child_b), fork_group_id = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
@@ -71,10 +74,13 @@ class TestExpandPush:
                 LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key="a"),
                 LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=grandchild.token_id),
             )
-            # §4.1a row 2 pinned at PREP: destructive stored semantics until WS1b —
-            # expand_token drops fork_group_id, inherits branch_name in memory only.
+            # WS1b flip: branch_name/fork_group_id/expand_group_id are derived
+            # accessors over the WHOLE path (ruling 21) — non-destructive, unlike
+            # the pre-flip stored tri-fields. An expand nested inside a fork
+            # branch retains the outer FORK frame's branch identity even though
+            # the innermost frame is the EXPAND.
             assert grandchild.branch_name == "a"
-            assert grandchild.fork_group_id is None
+            assert grandchild.fork_group_id == fork_group_id
             assert grandchild.expand_group_id == expand_group_id
 
 
@@ -162,3 +168,79 @@ class TestJoinCarriers:
                 sink_name="out",
                 join_group_id="jg-1",
             )
+
+
+class TestRowUnionReleasePop:
+    """Ruling 27: a row_union release pops the shared FORK frame off every
+    released token — the one sanctioned divergence from "accessors read the
+    whole path" (deliberately excluded from WS1a's prep pins; landed here at
+    the WS1b flip). Exercises RowUnionExecutor._pop_released_group directly
+    — the shared mechanism both the live accept() and restore_from_journal()
+    release paths route through — rather than the full accept/release
+    machinery, which test_row_union_executor.py already covers end to end.
+
+    The popped FORK frame need not be the innermost/last frame: a
+    row-multiplying transform inside a branch (e.g. an expand) stacks an
+    EXPAND frame on top of the branch's FORK frame before the token reaches
+    the union (elspeth-a5b86149d4;
+    tests/integration/pipeline/test_row_union_branch_cardinality.py) — that
+    shape must pop the FORK frame and preserve the EXPAND frame, not raise."""
+
+    def test_released_token_with_only_the_fork_frame_has_all_none_accessors(self) -> None:
+        from elspeth.engine.row_union_executor import RowUnionExecutor
+
+        manager, run_id = _manager()
+        root = _root(manager, run_id)
+        children, fork_group_id = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
+        for child in children:
+            assert child.lineage_path == (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=child.branch_name),)
+
+        released = RowUnionExecutor._pop_released_group(list(children))
+
+        assert len(released) == 2
+        for token in released:
+            assert token.lineage_path == ()
+            assert token.branch_name is None
+            assert token.fork_group_id is None
+            assert token.expand_group_id is None
+            # token identity is preserved — only lineage_path changes.
+        assert [t.token_id for t in released] == [c.token_id for c in children]
+
+    def test_refuses_a_group_with_no_fork_frame_anywhere(self) -> None:
+        from elspeth.engine.row_union_executor import RowUnionExecutor
+
+        manager, run_id = _manager()
+        root = _root(manager, run_id)
+        grandchildren, _eg = manager.expand_token(root, [{"v": 1}], _CONTRACT, NodeID("gate-0"), run_id)
+        with pytest.raises(OrchestrationInvariantError, match="no FORK frame"):
+            RowUnionExecutor._pop_released_group(list(grandchildren))
+
+    def test_pops_the_fork_frame_from_beneath_a_surviving_expand_frame(self) -> None:
+        """A branch member that passed through a mid-branch expand has
+        (FORK, EXPAND) lineage on arrival. Release pops the FORK frame from
+        underneath the EXPAND frame — the expand genuinely happened, so its
+        frame must survive the union closing the branch scope above it."""
+        from elspeth.engine.row_union_executor import RowUnionExecutor
+
+        manager, run_id = _manager()
+        root = _root(manager, run_id)
+        (control, treatment), fork_group_id = manager.fork_token(root, ["control", "treatment"], NodeID("gate-0"), run_id)
+        (treatment_child,), expand_group_id = manager.expand_token(treatment, [{"v": 1}], _CONTRACT, NodeID("gate-0"), run_id)
+        assert treatment_child.lineage_path == (
+            LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key="treatment"),
+            LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=treatment_child.token_id),
+        )
+
+        released = RowUnionExecutor._pop_released_group([control, treatment_child])
+
+        assert len(released) == 2
+        popped_control, popped_treatment = released
+        assert popped_control.lineage_path == ()
+        assert popped_control.branch_name is None
+        assert popped_treatment.lineage_path == (
+            LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=treatment_child.token_id),
+        )
+        assert popped_treatment.branch_name is None
+        assert popped_treatment.fork_group_id is None
+        assert popped_treatment.expand_group_id == expand_group_id
+        assert [t.token_id for t in released] == [control.token_id, treatment_child.token_id]

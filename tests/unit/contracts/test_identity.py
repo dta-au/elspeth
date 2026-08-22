@@ -1,8 +1,6 @@
 """Tests for identity contracts."""
 
-from collections.abc import Callable, Mapping
 from dataclasses import FrozenInstanceError
-from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -55,7 +53,7 @@ class TestTokenInfo:
         assert token.branch_name is None
 
     def test_token_info_with_branch(self) -> None:
-        """Can create TokenInfo with branch_name."""
+        """branch_name is derived (ruling 21) from the innermost FORK frame in lineage_path."""
         contract = _make_contract()
         pipeline_row = PipelineRow({}, contract)
 
@@ -63,7 +61,7 @@ class TestTokenInfo:
             row_id="row-123",
             token_id="tok-456",
             row_data=pipeline_row,
-            branch_name="sentiment",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="sentiment"),),
         )
 
         assert token.branch_name == "sentiment"
@@ -101,8 +99,11 @@ class TestTokenInfo:
         pipeline_row = PipelineRow({}, contract)
 
         token = TokenInfo(row_id="r", token_id="t", row_data=pipeline_row)
+        # branch_name is a derived, read-only property (ruling 21) — not a
+        # dataclass field — so its own frozen-enforcement coverage lives at
+        # the lineage_path field below, not a direct property assignment.
         with pytest.raises(FrozenInstanceError):
-            token.branch_name = "sentiment"  # type: ignore[misc]  # testing frozen enforcement
+            token.lineage_path = ()  # type: ignore[misc]  # testing frozen enforcement
         with pytest.raises(FrozenInstanceError):
             token.row_id = "new_row_id"  # type: ignore[misc]  # testing frozen enforcement
 
@@ -116,9 +117,10 @@ class TestTokenInfo:
             row_id="row-1",
             token_id="tok-1",
             row_data=original_row,
-            branch_name="path_a",
-            fork_group_id="fork-123",
-            expand_group_id="expand-789",
+            lineage_path=(
+                LineageFrame(kind=FrameKind.FORK, group_id="fork-123", member_key="path_a"),
+                LineageFrame(kind=FrameKind.EXPAND, group_id="expand-789", member_key="tok-child"),
+            ),
         )
 
         updated = original.with_updated_data(updated_row)
@@ -161,8 +163,6 @@ class TestTokenInfo:
             row_id="row-1",
             token_id="tok-1",
             row_data=PipelineRow({"field": "v"}, contract),
-            branch_name="path_a",
-            fork_group_id="fg-1",
             lineage_path=path,
         )
         assert token.lineage_path == path
@@ -195,57 +195,16 @@ class TestTokenInfo:
         assert "join_group_id" not in {f.name for f in dataclasses.fields(TokenInfo)}
 
 
-# The three remaining lineage fields, each paired with a named reader. The field NAME is
-# still needed as a keyword-argument key (a data-container use), but reading the
-# value back off the constructed TokenInfo is a real attribute on an owned
-# dataclass and is accessed directly (ADR-032).
-_LINEAGE_FIELD_READERS: Mapping[str, Callable[[TokenInfo], str | None]] = MappingProxyType(
-    {
-        "branch_name": lambda token: token.branch_name,
-        "fork_group_id": lambda token: token.fork_group_id,
-        "expand_group_id": lambda token: token.expand_group_id,
-    }
-)
-
-
-class TestTokenInfoLineageFieldGuards:
-    """Empty-string lineage fields corrupt coalesce keys — must be rejected."""
-
-    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "expand_group_id"])
-    def test_rejects_empty_string_lineage_field(self, field: str) -> None:
-        contract = _make_contract()
-        kwargs: dict[str, Any] = {
-            "row_id": "r1",
-            "token_id": "t1",
-            "row_data": PipelineRow({"x": 1}, contract=contract),
-        }
-        kwargs[field] = ""
-        with pytest.raises(ValueError, match=f"TokenInfo.{field} must be None or non-empty string"):
-            TokenInfo(**kwargs)
-
-    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "expand_group_id"])
-    def test_accepts_none_lineage_field(self, field: str) -> None:
-        contract = _make_contract()
-        kwargs: dict[str, Any] = {
-            "row_id": "r1",
-            "token_id": "t1",
-            "row_data": PipelineRow({"x": 1}, contract=contract),
-        }
-        kwargs[field] = None
-        t = TokenInfo(**kwargs)
-        assert _LINEAGE_FIELD_READERS[field](t) is None
-
-    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "expand_group_id"])
-    def test_accepts_non_empty_lineage_field(self, field: str) -> None:
-        contract = _make_contract()
-        kwargs: dict[str, Any] = {
-            "row_id": "r1",
-            "token_id": "t1",
-            "row_data": PipelineRow({"x": 1}, contract=contract),
-        }
-        kwargs[field] = "valid_value"
-        t = TokenInfo(**kwargs)
-        assert _LINEAGE_FIELD_READERS[field](t) == "valid_value"
+# TestTokenInfoLineageFieldGuards (empty-string branch_name/fork_group_id/
+# expand_group_id rejected at TokenInfo construction) is retired by the WS1b
+# flip: those three are no longer TokenInfo constructor kwargs at all — they
+# are derived, read-only properties over lineage_path (ruling 21). A
+# TokenInfo literally cannot be built with an empty member_key/group_id
+# anymore: LineageFrame.__post_init__ refuses it before TokenInfo ever sees
+# the value — see TestLineageFrame::test_frame_rejects_bad_fields below.
+# TestTokenInfo::test_token_info_with_branch and
+# ::test_with_updated_data_preserves_lineage cover the None/non-empty
+# derived-property reads that remain meaningful at this layer.
 
 
 class TestTokenInfoResumeOffsetInvariant:

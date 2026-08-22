@@ -143,7 +143,7 @@ class WorkItemFactory:
                     raise OrchestrationInvariantError(
                         f"Token '{token.token_id}' targets barrier "
                         f"'{coalesce_name or row_union_name}' but branch_name is None. "
-                        "Fork children must have branch_name set."
+                        "Fork children must carry an innermost FORK frame."
                     )
                 return self.create(
                     token=token,

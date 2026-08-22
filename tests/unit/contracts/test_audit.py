@@ -983,8 +983,10 @@ class TestTokenOutcome:
         assert outcome.path == TerminalPath.GATE_ROUTED
         assert outcome.sink_name == "quarantine_sink"
 
-    def test_token_outcome_forked_with_fork_group(self) -> None:
-        """FORK_PARENT path includes fork_group_id for lineage tracking."""
+    def test_token_outcome_forked_has_no_fork_group_field(self) -> None:
+        """FORK_PARENT path carries no roster field (D2 flip: fork_group_id
+        retired from token_outcomes — the roster of record moved to
+        token_lineage_frames + group_records)."""
         outcome = TokenOutcome(
             outcome_id="out-1",
             run_id="run-1",
@@ -993,11 +995,12 @@ class TestTokenOutcome:
             path=TerminalPath.FORK_PARENT,
             completed=True,
             recorded_at=datetime.now(UTC),
-            fork_group_id="fork-456",
         )
+        import dataclasses
+
         assert outcome.outcome == TerminalOutcome.TRANSIENT
         assert outcome.path == TerminalPath.FORK_PARENT
-        assert outcome.fork_group_id == "fork-456"
+        assert "fork_group_id" not in {f.name for f in dataclasses.fields(outcome)}
 
     def test_token_outcome_error_with_hash(self) -> None:
         """QUARANTINED_AT_SOURCE outcomes can have error_hash."""
@@ -1174,9 +1177,6 @@ class TestTokenOutcomeTwoAxis:
             False,
             sink_name=None,
             batch_id=None,
-            fork_group_id=None,
-            join_group_id=None,
-            expand_group_id=None,
             error_hash=None,
         )
 
@@ -1191,9 +1191,6 @@ class TestTokenOutcomeTwoAxis:
                 False,
                 sink_name=None,
                 batch_id="batch_001",
-                fork_group_id=None,
-                join_group_id=None,
-                expand_group_id=None,
                 error_hash=None,
             )
 
@@ -1206,9 +1203,6 @@ class TestTokenOutcomeTwoAxis:
             True,
             sink_name="primary",
             batch_id=None,
-            fork_group_id=None,
-            join_group_id=None,
-            expand_group_id=None,
             error_hash=None,
         )
 
@@ -1222,9 +1216,6 @@ class TestTokenOutcomeTwoAxis:
                 True,
                 sink_name=None,
                 batch_id=None,
-                fork_group_id=None,
-                join_group_id=None,
-                expand_group_id=None,
                 error_hash=None,
             )
 

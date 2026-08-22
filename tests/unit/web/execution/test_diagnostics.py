@@ -540,9 +540,7 @@ def test_diagnostics_projects_lineage_frames(tmp_path) -> None:
         token = factory.data_flow.create_token(
             row.row_id,
             token_id="token-fork-0",
-            branch_name="path_a",
-            fork_group_id="fg-1",
-            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
         )
         factory.data_flow.record_token_outcome(
             TokenRef(token_id=token.token_id, run_id=web_run_id),

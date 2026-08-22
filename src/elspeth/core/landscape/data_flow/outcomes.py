@@ -234,9 +234,6 @@ class TokenOutcomeRepository:
         *,
         sink_name: str | None,
         batch_id: str | None,
-        fork_group_id: str | None,
-        join_group_id: str | None,
-        expand_group_id: str | None,
         error_hash: str | None,
     ) -> None:
         """Validate discriminator fields for the (outcome, path) pair.
@@ -255,9 +252,6 @@ class TokenOutcomeRepository:
         field_values = {
             "sink_name": sink_name,
             "batch_id": batch_id,
-            "fork_group_id": fork_group_id,
-            "join_group_id": join_group_id,
-            "expand_group_id": expand_group_id,
             "error_hash": error_hash,
         }
         pair_label = f"({outcome.name if outcome else 'NULL'}, {path.name})"
@@ -440,9 +434,6 @@ class TokenOutcomeRepository:
         sink_node_id: str | None = None,
         artifact_id: str | None = None,
         batch_id: str | None = None,
-        fork_group_id: str | None = None,
-        join_group_id: str | None = None,
-        expand_group_id: str | None = None,
         error_hash: str | None = None,
         context: Mapping[str, object] | None = None,
         conn: Connection | None = None,
@@ -467,9 +458,6 @@ class TokenOutcomeRepository:
             artifact_id: Forward-compatible Phase 4 witness keyword for
                 failsink-paired outcomes. Accepted but not written in Phase 1.
             batch_id: For BATCH_CONSUMED / BUFFERED (REQUIRED)
-            fork_group_id: For FORK_PARENT (REQUIRED)
-            join_group_id: For COALESCED (REQUIRED)
-            expand_group_id: For EXPAND_PARENT (REQUIRED)
             error_hash: Error witness for failure/transient error paths
             context: Optional additional context (stored as JSON)
 
@@ -486,9 +474,6 @@ class TokenOutcomeRepository:
             path,
             sink_name=sink_name,
             batch_id=batch_id,
-            fork_group_id=fork_group_id,
-            join_group_id=join_group_id,
-            expand_group_id=expand_group_id,
             error_hash=error_hash,
         )
         # Canonicalization recursively normalizes caller-controlled data and
@@ -532,9 +517,6 @@ class TokenOutcomeRepository:
                 recorded_at=now(),
                 sink_name=sink_name,
                 batch_id=batch_id,
-                fork_group_id=fork_group_id,
-                join_group_id=join_group_id,
-                expand_group_id=expand_group_id,
                 error_hash=error_hash,
                 context_json=context_json,
             )
@@ -682,12 +664,8 @@ class TokenOutcomeRepository:
                 token_outcomes_table.c.recorded_at,
                 token_outcomes_table.c.sink_name,
                 token_outcomes_table.c.batch_id,
-                token_outcomes_table.c.fork_group_id,
-                token_outcomes_table.c.join_group_id,
-                token_outcomes_table.c.expand_group_id,
                 token_outcomes_table.c.error_hash,
                 token_outcomes_table.c.context_json,
-                token_outcomes_table.c.expected_branches_json,
             )
             .join(
                 tokens_table,
@@ -726,9 +704,6 @@ def record_buffered_outcome_guarded(
         TerminalPath.BUFFERED,
         sink_name=None,
         batch_id=batch_id,
-        fork_group_id=None,
-        join_group_id=None,
-        expand_group_id=None,
         error_hash=None,
     )
     context_json = canonical_json(context) if context is not None else None
@@ -771,9 +746,6 @@ def record_terminal_outcome_guarded(
         path,
         sink_name=None,
         batch_id=None,
-        fork_group_id=None,
-        join_group_id=None,
-        expand_group_id=None,
         error_hash=error_hash,
     )
     outcome_id = f"out_{generate_id()[:12]}"

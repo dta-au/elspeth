@@ -257,10 +257,7 @@ class IncompleteTokenSpec:
 
     token_id: str
     row_id: str
-    branch_name: str | None
-    fork_group_id: str | None
     join_group_id: str | None
-    expand_group_id: str | None
     lineage_path: tuple[LineageFrame, ...]
     token_data_ref: str | None
     step_in_pipeline: int | None
@@ -277,10 +274,7 @@ class IncompleteTokenSpec:
             if not identity_value:
                 raise ValueError(f"IncompleteTokenSpec.{field_name} must not be empty")
         for field_name, optional_identity_value in (
-            ("branch_name", self.branch_name),
-            ("fork_group_id", self.fork_group_id),
             ("join_group_id", self.join_group_id),
-            ("expand_group_id", self.expand_group_id),
             ("token_data_ref", self.token_data_ref),
         ):
             if optional_identity_value is not None:
@@ -728,10 +722,7 @@ class RecoveryManager:
                 select(
                     tokens_table.c.token_id,
                     tokens_table.c.row_id,
-                    tokens_table.c.branch_name,
-                    tokens_table.c.fork_group_id,
                     tokens_table.c.join_group_id,
-                    tokens_table.c.expand_group_id,
                     tokens_table.c.token_data_ref,
                     tokens_table.c.step_in_pipeline,
                     max_attempt_sq.label("max_attempt"),
@@ -771,10 +762,7 @@ class RecoveryManager:
                 IncompleteTokenSpec(
                     token_id=row.token_id,
                     row_id=row.row_id,
-                    branch_name=row.branch_name,
-                    fork_group_id=row.fork_group_id,
                     join_group_id=row.join_group_id,
-                    expand_group_id=row.expand_group_id,
                     lineage_path=(
                         tuple(frame for _depth, frame in sorted(frames_by_token[row.token_id])) if row.token_id in frames_by_token else ()
                     ),

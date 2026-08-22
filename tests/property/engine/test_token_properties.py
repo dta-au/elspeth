@@ -32,7 +32,9 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from elspeth.contracts import TokenInfo
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.engine.tokens import TokenManager
@@ -54,14 +56,13 @@ def _wrap_dict_as_pipeline_row(data: dict[str, Any]) -> PipelineRow:
 @dataclass(frozen=True)
 class _ForkedToken:
     token_id: str
-    branch_name: str
-    fork_group_id: str
+    lineage_path: tuple[LineageFrame, ...]
 
 
 @dataclass(frozen=True)
 class _ExpandedToken:
     token_id: str
-    expand_group_id: str
+    lineage_path: tuple[LineageFrame, ...]
 
 
 class _RecordingTokenRepository:
@@ -75,14 +76,28 @@ class _RecordingTokenRepository:
     def fork_token(self, **_: Any) -> tuple[list[_ForkedToken], str]:
         assert self._branches is not None
         children = [
-            _ForkedToken(token_id=f"child_{i}", branch_name=branch, fork_group_id="fork_1") for i, branch in enumerate(self._branches)
+            _ForkedToken(
+                token_id=f"child_{i}",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_1", member_key=branch),),
+            )
+            for i, branch in enumerate(self._branches)
         ]
         return children, "fork_1"
 
-    def expand_token(self, **_: Any) -> tuple[list[_ExpandedToken], str]:
+    def expand_token(self, **kwargs: Any) -> tuple[list[_ExpandedToken], str]:
         assert self._expand_count is not None
         self.expand_called = True
-        children = [_ExpandedToken(token_id=f"expanded_{i}", expand_group_id="expand_1") for i in range(self._expand_count)]
+        # Mirror data_flow.expand_token: children carry the parent's lineage
+        # frames PLUS a new innermost EXPAND frame (non-destructive nesting —
+        # ruling 21's branch_name inheritance depends on this).
+        parent_lineage_path: tuple[LineageFrame, ...] = kwargs.get("parent_lineage_path") or ()
+        children = [
+            _ExpandedToken(
+                token_id=f"expanded_{i}",
+                lineage_path=(*parent_lineage_path, LineageFrame(kind=FrameKind.EXPAND, group_id="expand_1", member_key=f"expanded_{i}")),
+            )
+            for i in range(self._expand_count)
+        ]
         return children, "expand_1"
 
 
@@ -602,7 +617,7 @@ class TestExpandParentPreservationProperties:
             row_id="row_1",
             token_id="parent_1",
             row_data=_wrap_dict_as_pipeline_row(row_data),
-            branch_name="test_branch",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_1", member_key="test_branch"),),
         )
 
         children, _expand_group_id = manager.expand_token(

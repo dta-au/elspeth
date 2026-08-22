@@ -23,13 +23,14 @@ import pytest
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.barrier_scalars import CoalescePendingScalars
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
-from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     CoalesceCollisionError,
     OrchestrationInvariantError,
 )
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
@@ -177,9 +178,10 @@ def _make_contract(
 def _make_token(
     row_id: str = "row_1",
     token_id: str = "tok_1",
-    branch_name: str = "branch_a",
+    branch_name: str | None = "branch_a",
     data: dict[str, Any] | None = None,
     contract: SchemaContract | None = None,
+    fork_group_id: str = "fg-coalesce-test",
 ) -> TokenInfo:
     """Build a TokenInfo suitable for coalesce testing."""
     if data is None:
@@ -187,11 +189,12 @@ def _make_token(
     if contract is None:
         contract = _make_contract(mode="FLEXIBLE")
     row_data = make_row(data, contract=contract)
+    lineage_path = () if branch_name is None else (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name),)
     return TokenInfo(
         row_id=row_id,
         token_id=token_id,
         row_data=row_data,
-        branch_name=branch_name,
+        lineage_path=lineage_path,
     )
 
 
@@ -339,6 +342,10 @@ def _blocked_item(
     expand_group_id: str | None = None,
 ) -> TokenWorkItem:
     """Build a BLOCKED journal row as list_blocked_barrier_items returns them."""
+    if not branch_name:
+        lineage_path: tuple[LineageFrame, ...] = ()
+    else:
+        lineage_path = (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id or "fg-journal-test", member_key=branch_name),)
     return TokenWorkItem(
         work_item_id=f"wi-{token_id}",
         run_id="run_1",
@@ -354,10 +361,8 @@ def _blocked_item(
         created_at=_JOURNAL_T0,
         updated_at=_JOURNAL_T0,
         barrier_key=coalesce_name,
-        branch_name=branch_name,
-        fork_group_id=fork_group_id,
         join_group_id=join_group_id,
-        expand_group_id=expand_group_id,
+        lineage_path=lineage_path,
         coalesce_node_id=node_id,
         coalesce_name=coalesce_name,
         barrier_blocked_at=blocked_at,
@@ -568,7 +573,6 @@ class TestAcceptBasics:
             row_id="row_1",
             token_id="tok_1",
             row_data=make_row({"amount": 1}),
-            branch_name=None,
         )
         with pytest.raises(OrchestrationInvariantError, match="no branch_name"):
             executor.accept(token, "merge")
@@ -1910,7 +1914,12 @@ class TestContractHandling:
         bad_row = MagicMock(spec=PipelineRow)
         bad_row.contract = None
         bad_row.to_dict.return_value = {"amount": 2}
-        t2 = TokenInfo(row_id="row_1", token_id="t2", row_data=bad_row, branch_name="b")
+        t2 = TokenInfo(
+            row_id="row_1",
+            token_id="t2",
+            row_data=bad_row,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-coalesce-test", member_key="b"),),
+        )
         executor.accept(t1, "merge")
         with pytest.raises(OrchestrationInvariantError, match="has no contract"):
             executor.accept(t2, "merge")
@@ -3279,7 +3288,7 @@ class TestRestoreFromJournal:
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
 
-        with pytest.raises(AuditIntegrityError, match="branch_name"):
+        with pytest.raises(AuditIntegrityError, match="no innermost FORK frame"):
             executor.restore_from_journal(
                 items=[_blocked_item(token_id="t1", row_id="row_1", branch_name=bad_branch, blocked_at=_JOURNAL_T0)],
                 scalars={},

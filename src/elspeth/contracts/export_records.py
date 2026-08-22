@@ -189,11 +189,37 @@ class TokenExportRecord(TypedDict):
     token_id: str
     row_id: str
     step_in_pipeline: int | None
-    branch_name: str | None
-    fork_group_id: str | None
-    join_group_id: str | None
-    expand_group_id: str | None
+    lineage_path: list[list[str]]  # [[kind, group_id, member_key], ...] outermost first
+    join_group_id: str | None  # merge event (tokens.join_group_id — kept column)
     created_at: str
+
+
+class GroupRecordExportRecord(TypedDict):
+    """Roster record for one lineage-opening operation (fork/expand), spec §4.3."""
+
+    record_type: Literal["group_record"]
+    run_id: str
+    group_id: str
+    kind: str
+    opener_token_id: str
+    member_count: int
+    created_at: str
+
+
+class GroupLossExportRecord(TypedDict):
+    """One member-loss entry in the unified group-loss ledger (spec §6.2, WS3)."""
+
+    record_type: Literal["group_loss"]
+    loss_id: str
+    run_id: str
+    closer_name: str
+    group_id: str
+    member_key: str
+    token_id: str
+    reason: str
+    recorded_by: str
+    recorded_at: str
+    adopted_epoch: int | None
 
 
 class TokenParentExportRecord(TypedDict):
@@ -215,12 +241,8 @@ class TokenOutcomeExportRecord(TypedDict):
     recorded_at: str
     sink_name: str | None
     batch_id: str | None
-    fork_group_id: str | None
-    join_group_id: str | None
-    expand_group_id: str | None
     error_hash: str | None
     context_json: str | None
-    expected_branches_json: str | None
 
 
 class SchedulerEventExportRecord(TypedDict):
@@ -437,6 +459,8 @@ ExportRecord = (
     | TokenExportRecord
     | TokenParentExportRecord
     | TokenOutcomeExportRecord
+    | GroupRecordExportRecord
+    | GroupLossExportRecord
     | SchedulerEventExportRecord
     | NodeStateExportRecord
     | RoutingEventExportRecord

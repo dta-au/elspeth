@@ -17,8 +17,10 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Landscape epoch 34: unified-lineage groundwork tables (token_lineage_frames,
     # group_records, group_losses) plus token_work_items.lineage_path_json; the
     # 0.7.2 release docs and CHANGELOG already state the 34 boundary.
+    # Epoch 35: WS1b flip — branch_name/fork_group_id/expand_group_id and
+    # token_outcomes.expected_branches_json retired as stored columns.
     assert SESSION_SCHEMA_EPOCH == 47
-    assert SQLITE_SCHEMA_EPOCH == 34
+    assert SQLITE_SCHEMA_EPOCH == 35
 
 
 def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:

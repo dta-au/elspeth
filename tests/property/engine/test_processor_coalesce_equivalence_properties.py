@@ -12,6 +12,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from elspeth.contracts import NodeType, TokenInfo
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.engine.processor import DAGTraversalContext, RowProcessor
@@ -138,11 +140,14 @@ class TestCoalesceTriggerEquivalence:
             coalesce_executor=executor if has_executor else None,
         )
 
+        lineage_path: tuple[LineageFrame, ...] = ()
+        if has_branch:
+            lineage_path = (LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),)
         token = TokenInfo(
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({"v": 1}),
-            branch_name="path_a" if has_branch else None,
+            lineage_path=lineage_path,
         )
 
         handled, result = processor._maybe_coalesce_token(

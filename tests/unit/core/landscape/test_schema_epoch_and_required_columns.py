@@ -1,4 +1,4 @@
-"""Schema epoch + required-shape + provenance-write guards (epoch 34)."""
+"""Schema epoch + required-shape + provenance-write guards (epoch 35)."""
 
 from __future__ import annotations
 
@@ -36,8 +36,9 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import make_recorder_with_run
 
 
-def test_epoch_is_thirty_four() -> None:
-    assert SQLITE_SCHEMA_EPOCH == 34
+def test_epoch_is_thirty_five() -> None:
+    # WS1b Phase B: unified-lineage flip (tri-column retirement).
+    assert SQLITE_SCHEMA_EPOCH == 35
 
 
 def test_unified_lineage_tables_exist_with_exact_keys() -> None:

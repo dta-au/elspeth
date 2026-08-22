@@ -533,7 +533,40 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "4bfe774eeb61ef5fb6db5b66568abe8191fa98ff8ab
 # changed the resumed flush's durable completion writes. The
 # terminal-equivalence oracle passes before the byte pin and the digest
 # reproduced across runs; every other declaration is byte-identical.
-EXPECTED_CASE_REGISTRY_SHA256 = "8bc80f100ee4ded43251b94a272e99009ff2c928657135abbd2bbf4e234f7ba0"
+# Rotated 2026-08-22 for the unified-lineage WS1b flip, ruling 27 (row_union
+# release pops the FORK frame — possibly non-innermost, e.g. a fork branch
+# with a mid-branch expand — rather than requiring it be the literal
+# innermost frame; RowUnionExecutor._pop_released_group and the new
+# contracts.identity.pop_fork_frame). The row-union-interleave oracle_freeze
+# snapshot (the one scenario ruling 27 is sanctioned to touch) regenerated
+# byte-identical to what was stored — its REGENERATED_WS1 invariant_subset
+# does not observe the popped frame's position — so no oracle_freeze file
+# moved and no ruling-27 line needed manifest adjudication.
+# Rotated again, same date, for decision D3 (group_records/group_losses enter
+# the portable+durable export surface at this flip) and the tri-field
+# retirement (TokenExportRecord drops branch_name/fork_group_id/
+# expand_group_id for lineage_path). A/B-verified via a standalone regen
+# probe across all 25 affected run-workflow cases plus the one
+# recovery-workflow SummaryRunExpectation case (checkpoint-deterministic-
+# resume/reopen-resume): every RunExpectation.projection field other than
+# audit_records (rows/tokens/node_states/routes/terminal_dispositions/
+# scheduler_work/batches/expansions/validation_errors/transform_errors) and
+# every SemanticRunExpectation.projection_sha256/projection_counts pin
+# compared byte-identical old vs freshly-recomputed — zero stable-field
+# drift. The only per-case deltas are: one new group_record entry appended to
+# audit_record_counts (group_losses stayed empty — no losses recorded in any
+# of these scenarios), and, for the 4 exact-kind cases whose full projection
+# embeds the portable export manifest record, that record's own material
+# record_count field growing by exactly the added group_record count (all
+# four: 3/1/1/3 added -> record_count +3/+1/+1/+3, verified arithmetically).
+# checkpoint-deterministic-resume/reopen-resume's resumed_full_projection_sha256
+# moved for the same reason (durable history now includes the group_record
+# rows); its own fresh-vs-resumed terminal-equivalence assertion passes
+# before the hash comparison, and its oracle_freeze snapshot (FROZEN class,
+# untouched, not the sanctioned row-union-interleave exception) now compares
+# byte-identical to the live surface after only this manifest field moved —
+# confirming the divergence was the stale pin, not a resume/replay defect.
+EXPECTED_CASE_REGISTRY_SHA256 = "2ece01445d96144b14a8960e33ac3ceba0d290ba23b780296298c384c6381de6"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

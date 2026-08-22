@@ -47,6 +47,8 @@ from elspeth.core.landscape.schema import (
     batches_table,
     calls_table,
     edges_table,
+    group_losses_table,
+    group_records_table,
     node_states_table,
     nodes_table,
     operations_table,
@@ -59,6 +61,7 @@ from elspeth.core.landscape.schema import (
     sink_effect_members_table,
     sink_effect_streams_table,
     sink_effects_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
     token_work_items_table,
@@ -886,6 +889,28 @@ def _stable_audit_records(
     return tuple(sorted(audit, key=lambda record: record.key))
 
 
+def _frame_list(record: Mapping[str, Any]) -> list[list[str]]:
+    """A token export record's raw lineage_path (WS1b flip: sole lineage truth)."""
+    frames = record.get("lineage_path")
+    return frames if isinstance(frames, list) else []
+
+
+def _branch_of(record: Mapping[str, Any]) -> str | None:
+    """Derived branch_name (ruling 21): the innermost FORK frame's member_key."""
+    for kind, _group, member in reversed(_frame_list(record)):
+        if kind == "fork":
+            return member
+    return None
+
+
+def _expand_group_of(record: Mapping[str, Any]) -> str | None:
+    """Derived expand_group_id (ruling 21): the innermost EXPAND frame's group_id."""
+    for kind, group, _member in reversed(_frame_list(record)):
+        if kind == "expand":
+            return group
+    return None
+
+
 def _stable_projection(records: list[dict[str, Any]], *, source: str = "projection") -> StableRunProjection:
     """Normalize one public durable/export view without retaining run-local IDs."""
 
@@ -922,7 +947,7 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
     for row_id, token_records in token_records_by_row.items():
         base_signatures = [
             (
-                record.get("branch_name"),
+                _branch_of(record),
                 record.get("step_in_pipeline"),
             )
             for record in token_records
@@ -930,7 +955,7 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
         if len(base_signatures) == len(set(base_signatures)):
             token_records.sort(
                 key=lambda record: (
-                    str(record.get("branch_name") or ""),
+                    str(_branch_of(record) or ""),
                     int(record.get("step_in_pipeline") or 0),
                 )
             )
@@ -941,14 +966,14 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
                 row_key: str = rows_by_id[row_id],
             ) -> tuple[object, ...]:
                 links = parents_by_token.get(str(record["token_id"]), ())
-                if record.get("expand_group_id") is None:
+                if _expand_group_of(record) is None:
                     expansion_ordinal = -1
                 elif len(links) == 1:
                     expansion_ordinal = links[0][0]
                 else:
                     raise AssertionError(f"DAG corpus expanded token lacks one stable parent ordinal for row {row_key!r}")
                 return (
-                    str(record.get("branch_name") or ""),
+                    str(_branch_of(record) or ""),
                     int(record.get("step_in_pipeline") or 0),
                     expansion_ordinal,
                 )
@@ -968,7 +993,7 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
             key=stable_key,
             row_key=rows_by_id[str(record["row_id"])],
             parents=ordered_parents_by_token.get(str(record["token_id"]), ()),
-            branch_name=str(record["branch_name"]) if record.get("branch_name") is not None else None,
+            branch_name=_branch_of(record),
         )
         for record in (record for record in records if record.get("record_type") == "token")
         for stable_key in (token_keys[str(record["token_id"])],)
@@ -1108,8 +1133,6 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
             or record.get("sink_name") is not None
             or not isinstance(batch_id, str)
             or batch_id not in batch_key_by_id
-            or record.get("expand_group_id") is not None
-            or record.get("expected_branches_json") is not None
             or record.get("error_hash") is not None
         ):
             raise AssertionError("DAG corpus non-terminal outcome is not an exact batch BUFFERED record")
@@ -1126,35 +1149,42 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
         )
 
     token_records_by_id = {str(record["token_id"]): record for record in records if record.get("record_type") == "token"}
+    # expand_group_id/expected_branches_json retired from token_outcomes (D2
+    # flip): the roster of record moved to the children's own EXPAND frames
+    # plus the group_records member_count (never a stored outcome column).
+    group_records_by_group_id = {
+        str(g["group_id"]): g for g in records if g.get("record_type") == "group_record" and g.get("kind") == "expand"
+    }
     expansions: list[StableExpansionProjection] = []
     for outcome in (record for record in records if record.get("record_type") == "token_outcome"):
         if outcome.get("path") != "expand_parent" or not bool(outcome.get("completed")):
             continue
         parent_token_id = str(outcome["token_id"])
-        expand_group_id = outcome.get("expand_group_id")
-        expected_raw = outcome.get("expected_branches_json")
-        if not isinstance(expand_group_id, str) or not expand_group_id or not isinstance(expected_raw, str):
-            raise AssertionError("DAG corpus expand_parent outcome lacks durable group and expected count")
-        try:
-            expected = json.loads(expected_raw)
-        except json.JSONDecodeError as exc:
-            raise AssertionError("DAG corpus expand_parent expected count must be valid JSON") from exc
-        if not isinstance(expected, dict) or isinstance(expected.get("count"), bool) or not isinstance(expected.get("count"), int):
-            raise AssertionError("DAG corpus expand_parent expected count must be an integer object field")
         children: list[StableExpansionChildProjection] = []
+        expand_group_id: str | None = None
         for child_id, child_record in token_records_by_id.items():
-            if child_record.get("expand_group_id") != expand_group_id:
-                continue
             links = sorted(parents_by_token[child_id])
             if len(links) != 1 or links[0][1] != parent_token_id:
-                raise AssertionError("DAG corpus expanded child lacks exact durable parent linkage")
+                continue
+            child_group_id = _expand_group_of(child_record)
+            if child_group_id is None:
+                raise AssertionError("DAG corpus expanded child lacks an innermost EXPAND frame")
+            if expand_group_id is None:
+                expand_group_id = child_group_id
+            elif expand_group_id != child_group_id:
+                raise AssertionError("DAG corpus expanded children disagree on their EXPAND group")
             children.append(StableExpansionChildProjection(ordinal=links[0][0], token_key=token_keys[child_id]))
+        if expand_group_id is None:
+            raise AssertionError("DAG corpus expand_parent outcome has no durable children with an EXPAND frame")
+        group_record = group_records_by_group_id.get(expand_group_id)
+        if group_record is None or int(group_record["member_count"]) != len(children):
+            raise AssertionError("DAG corpus expand_parent outcome lacks a matching group_records member_count")
         parent_key = token_keys[parent_token_id]
         expansions.append(
             StableExpansionProjection(
                 key=f"expand|{parent_key}",
                 parent_token_key=parent_key,
-                expected_child_count=int(expected["count"]),
+                expected_child_count=int(group_record["member_count"]),
                 children=tuple(sorted(children, key=lambda child: child.ordinal)),
             )
         )
@@ -1982,7 +2012,7 @@ _DURABLE_EXPORT_PARITY_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]
     (
         "token",
         ("token_id",),
-        ("row_id", "step_in_pipeline", "branch_name", "fork_group_id", "join_group_id", "expand_group_id"),
+        ("row_id", "step_in_pipeline", "lineage_path", "join_group_id"),
     ),
     ("token_parent", ("token_id", "parent_token_id"), ("ordinal",)),
     (
@@ -2001,8 +2031,6 @@ _DURABLE_EXPORT_PARITY_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]
             "completed",
             "sink_name",
             "batch_id",
-            "expand_group_id",
-            "expected_branches_json",
             "error_hash",
         ),
     ),
@@ -2050,6 +2078,16 @@ _DURABLE_EXPORT_PARITY_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]
         "transform_error",
         ("error_id",),
         ("token_id", "transform_id", "row_hash", "row_data_json", "error_details_json", "destination"),
+    ),
+    (
+        "group_record",
+        ("group_id",),
+        ("kind", "opener_token_id", "member_count"),
+    ),
+    (
+        "group_loss",
+        ("loss_id",),
+        ("closer_name", "group_id", "member_key", "token_id", "reason", "recorded_by", "adopted_epoch"),
     ),
 )
 
@@ -2437,15 +2475,32 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
             "token_id",
             "row_id",
             "step_in_pipeline",
-            "branch_name",
-            "fork_group_id",
             "join_group_id",
-            "expand_group_id",
         )
-        records.extend(
-            project("token", row, token_fields)
-            for row in fetch(tokens_table, token_fields, tokens_table.c.row_id, tokens_table.c.created_at, tokens_table.c.token_id)
-        )
+        # branch_name/fork_group_id/expand_group_id retired from the tokens
+        # table (WS1b flip): lineage_path is now the sole lineage truth,
+        # loaded separately from token_lineage_frames (kind, group_id,
+        # member_key ordered by depth — outermost first), matching the
+        # exporter's own [[kind, group_id, member_key], ...] shape exactly.
+        lineage_frame_rows = connection.execute(
+            select(
+                token_lineage_frames_table.c.token_id,
+                token_lineage_frames_table.c.kind,
+                token_lineage_frames_table.c.group_id,
+                token_lineage_frames_table.c.member_key,
+            )
+            .where(token_lineage_frames_table.c.run_id == run_id)
+            .order_by(token_lineage_frames_table.c.token_id, token_lineage_frames_table.c.depth)
+        ).all()
+        lineage_paths_by_token: dict[str, list[list[str]]] = {}
+        for frame_row in lineage_frame_rows:
+            lineage_paths_by_token.setdefault(str(frame_row.token_id), []).append(
+                [frame_row.kind, frame_row.group_id, frame_row.member_key]
+            )
+        for row in fetch(tokens_table, token_fields, tokens_table.c.row_id, tokens_table.c.created_at, tokens_table.c.token_id):
+            record = project("token", row, token_fields)
+            record["lineage_path"] = lineage_paths_by_token.get(str(row["token_id"]), [])
+            records.append(record)
 
         parent_fields = ("run_id", "token_id", "parent_token_id", "ordinal")
         records.extend(
@@ -2503,8 +2558,6 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
             "completed",
             "sink_name",
             "batch_id",
-            "expand_group_id",
-            "expected_branches_json",
             "error_hash",
         )
         for row in fetch(
@@ -2617,6 +2670,33 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
                 transform_errors_table.c.created_at,
                 transform_errors_table.c.error_id,
             )
+        )
+
+        # D3: group_records/group_losses entered the portable export surface
+        # at the WS1b flip — the roster of record for every fork/expand
+        # opener (spec §4.3), plus the WS3-owned group-loss ledger. Both must
+        # be present durably for the parity check below to match the
+        # exporter's own group_record/group_loss records.
+        group_record_fields = ("run_id", "group_id", "kind", "opener_token_id", "member_count")
+        records.extend(
+            project("group_record", row, group_record_fields)
+            for row in fetch(group_records_table, group_record_fields, group_records_table.c.group_id)
+        )
+
+        group_loss_fields = (
+            "run_id",
+            "loss_id",
+            "closer_name",
+            "group_id",
+            "member_key",
+            "token_id",
+            "reason",
+            "recorded_by",
+            "adopted_epoch",
+        )
+        records.extend(
+            project("group_loss", row, group_loss_fields)
+            for row in fetch(group_losses_table, group_loss_fields, group_losses_table.c.loss_id)
         )
 
     records.append(
@@ -3059,7 +3139,7 @@ def _expansion_identity_snapshot(
     with db.connection() as conn:
         parent_rows = tuple(
             conn.execute(
-                select(token_outcomes_table.c.token_id, token_outcomes_table.c.expand_group_id)
+                select(token_outcomes_table.c.token_id)
                 .join(tokens_table, tokens_table.c.token_id == token_outcomes_table.c.token_id)
                 .join(rows_table, rows_table.c.row_id == tokens_table.c.row_id)
                 .where(token_outcomes_table.c.run_id == run_id)
@@ -3069,7 +3149,20 @@ def _expansion_identity_snapshot(
             ).mappings()
         )
         parent_ids = tuple(str(row["token_id"]) for row in parent_rows)
-        group_ids = tuple(str(row["expand_group_id"]) for row in parent_rows)
+        # expand_group_id retired from token_outcomes/tokens (D2 flip): the
+        # group an EXPAND_PARENT opened is looked up from group_records by
+        # opener_token_id, and its children are identified by their own
+        # token_lineage_frames row (kind='expand', group_id=<group>).
+        group_id_by_opener = {
+            str(row["opener_token_id"]): str(row["group_id"])
+            for row in conn.execute(
+                select(group_records_table.c.opener_token_id, group_records_table.c.group_id)
+                .where(group_records_table.c.run_id == run_id)
+                .where(group_records_table.c.kind == "expand")
+                .where(group_records_table.c.opener_token_id.in_(parent_ids))
+            ).mappings()
+        }
+        group_ids = tuple(group_id_by_opener[pid] for pid in parent_ids)
         child_ids: list[str] = []
         for parent_id, group_id in zip(parent_ids, group_ids, strict=True):
             child_ids.extend(
@@ -3077,9 +3170,15 @@ def _expansion_identity_snapshot(
                 for value in conn.execute(
                     select(token_parents_table.c.token_id)
                     .join(tokens_table, tokens_table.c.token_id == token_parents_table.c.token_id)
+                    .join(
+                        token_lineage_frames_table,
+                        (token_lineage_frames_table.c.token_id == tokens_table.c.token_id)
+                        & (token_lineage_frames_table.c.run_id == tokens_table.c.run_id),
+                    )
                     .where(token_parents_table.c.run_id == run_id)
                     .where(token_parents_table.c.parent_token_id == parent_id)
-                    .where(tokens_table.c.expand_group_id == group_id)
+                    .where(token_lineage_frames_table.c.kind == "expand")
+                    .where(token_lineage_frames_table.c.group_id == group_id)
                     .order_by(token_parents_table.c.ordinal)
                 ).scalars()
             )

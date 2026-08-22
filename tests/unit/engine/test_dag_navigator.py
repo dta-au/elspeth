@@ -17,7 +17,9 @@ from unittest.mock import Mock
 import pytest
 
 from elspeth.contracts import TransformProtocol
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
 from elspeth.engine.dag_navigator import DAGNavigator
@@ -28,6 +30,14 @@ from elspeth.testing import make_token_info
 # =============================================================================
 # Helpers
 # =============================================================================
+
+
+def _forked_token_info(*, data: dict[str, object], branch_name: str, fork_group_id: str = "fg-dag-navigator-test"):
+    """make_token_info() for a token that landed inside a fork branch (WS1b flip)."""
+    return make_token_info(
+        data=data,
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name),),
+    )
 
 
 def _make_mock_transform(
@@ -413,7 +423,7 @@ class TestCreateContinuationWorkItem:
         """With coalesce name from a gate node, routes to branch first node."""
         gate = GateSettings(name="fork_gate", input="in", condition="True", routes={"true": "out", "false": "err"})
         gate_node = NodeID("gate-1")
-        token = make_token_info(data={"v": 1}, branch_name="path_a")
+        token = _forked_token_info(data={"v": 1}, branch_name="path_a")
         coalesce_node = NodeID("coalesce::merge")
         nav = _make_nav(
             node_to_plugin={gate_node: gate},
@@ -595,7 +605,7 @@ class TestBranchTransformRouting:
             branch_first_node={"path_a": branch_t1},  # Transform branch
         )
 
-        token = make_token_info(data={"v": 1}, branch_name="path_a")
+        token = _forked_token_info(data={"v": 1}, branch_name="path_a")
         item = WorkItemFactory(nav).create_continuation(
             token=token,
             current_node_id=gate_node,
@@ -628,7 +638,7 @@ class TestBranchTransformRouting:
             branch_first_node={"path_a": coalesce_node},  # Identity branch
         )
 
-        token = make_token_info(data={"v": 1}, branch_name="path_a")
+        token = _forked_token_info(data={"v": 1}, branch_name="path_a")
         item = WorkItemFactory(nav).create_continuation(
             token=token,
             current_node_id=gate_node,
@@ -665,7 +675,7 @@ class TestBranchTransformRouting:
             branch_first_node={"path_a": branch_t1},
         )
 
-        token = make_token_info(data={"v": 1}, branch_name="path_a")
+        token = _forked_token_info(data={"v": 1}, branch_name="path_a")
 
         # First: fork creates work item at branch start
         item1 = WorkItemFactory(nav).create_continuation(
@@ -733,7 +743,7 @@ class TestContinuationCoalesceNonForkRegression:
         )
 
         # Expanded child token inherits branch_name from parent
-        child_token = make_token_info(data={"v": 1}, branch_name="path_a")
+        child_token = _forked_token_info(data={"v": 1}, branch_name="path_a")
 
         # Deaggregation continuation: current_node_id is the deagg transform (NOT the gate)
         item = WorkItemFactory(nav).create_continuation(
@@ -776,7 +786,7 @@ class TestContinuationCoalesceNonForkRegression:
         )
 
         # Token from aggregation flush (passthrough or transform mode)
-        flush_token = make_token_info(data={"v": 1}, branch_name="path_a")
+        flush_token = _forked_token_info(data={"v": 1}, branch_name="path_a")
 
         # Aggregation flush continuation: current_node_id is the agg transform
         item = WorkItemFactory(nav).create_continuation(
@@ -814,7 +824,7 @@ class TestContinuationCoalesceNonForkRegression:
             branch_first_node={"path_a": NodeID("branch-t1")},
         )
 
-        fork_child = make_token_info(data={"v": 1}, branch_name="path_a")
+        fork_child = _forked_token_info(data={"v": 1}, branch_name="path_a")
         item = WorkItemFactory(nav).create_continuation(
             token=fork_child,
             current_node_id=gate_node,
@@ -837,7 +847,7 @@ class TestContinuationCoalesceNonForkRegression:
 
         with pytest.raises(OrchestrationInvariantError, match="structural"):
             WorkItemFactory(nav).create_continuation(
-                token=make_token_info(data={"v": 1}, branch_name="path_a"),
+                token=_forked_token_info(data={"v": 1}, branch_name="path_a"),
                 current_node_id=coalesce_node,
                 coalesce_name=CoalesceName("merge"),
             )
@@ -854,7 +864,7 @@ class TestContinuationCoalesceNonForkRegression:
 
         with pytest.raises(OrchestrationInvariantError, match="ghost"):
             WorkItemFactory(nav).create_continuation(
-                token=make_token_info(data={"v": 1}, branch_name="path_a"),
+                token=_forked_token_info(data={"v": 1}, branch_name="path_a"),
                 current_node_id=NodeID("ghost"),
                 coalesce_name=CoalesceName("merge"),
             )
@@ -883,7 +893,7 @@ class TestContinuationCoalesceNonForkRegression:
             branch_first_node={"path_a": branch_t1},
         )
 
-        child_token = make_token_info(data={"v": 1}, branch_name="path_a")
+        child_token = _forked_token_info(data={"v": 1}, branch_name="path_a")
         item = WorkItemFactory(nav).create_continuation(
             token=child_token,
             current_node_id=branch_t1,

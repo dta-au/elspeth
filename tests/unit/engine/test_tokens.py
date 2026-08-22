@@ -8,8 +8,9 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import SourceRow
-from elspeth.contracts.enums import NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.testing import make_field
@@ -1097,7 +1098,7 @@ class TestExpandTokenStrictZip:
                 row_id=parent.row_id,
                 run_id=setup.run_id,
                 created_at=datetime.now(UTC),
-                expand_group_id="eg-1",
+                lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key=f"fake-child-{i}"),),
             )
             for i in range(2)  # Recorder returns 2 children
         ]

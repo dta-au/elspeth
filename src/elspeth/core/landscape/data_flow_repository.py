@@ -316,19 +316,15 @@ class DataFlowRepository:
         row_id: str,
         *,
         token_id: str | None = None,
-        branch_name: str | None = None,
-        fork_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         join_group_id: str | None = None,
-        lineage_frames: Sequence[LineageFrame] = (),
     ) -> Token:
         """Create a token (row instance in DAG path)."""
         return self.tokens.create_token(
             row_id,
             token_id=token_id,
-            branch_name=branch_name,
-            fork_group_id=fork_group_id,
+            lineage_path=lineage_path,
             join_group_id=join_group_id,
-            lineage_frames=lineage_frames,
         )
 
     def fork_token(
@@ -338,9 +334,12 @@ class DataFlowRepository:
         branches: list[str],
         *,
         step_in_pipeline: int | None = None,
+        parent_lineage_path: tuple[LineageFrame, ...] | None = None,
     ) -> tuple[list[Token], str]:
         """Fork a token to multiple branches."""
-        return self.tokens.fork_token(parent_ref, row_id, branches, step_in_pipeline=step_in_pipeline)
+        return self.tokens.fork_token(
+            parent_ref, row_id, branches, step_in_pipeline=step_in_pipeline, parent_lineage_path=parent_lineage_path
+        )
 
     def load_lineage_paths(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[LineageFrame, ...]]:
         """Batch-load durable lineage paths for many tokens in one query."""
@@ -356,6 +355,7 @@ class DataFlowRepository:
         parent_state_ids: Sequence[str] | None = None,
         merged_contract: SchemaContract,
         step_in_pipeline: int | None = None,
+        parent_lineage_paths: Mapping[str, tuple[LineageFrame, ...]] | None = None,
     ) -> Token:
         """Coalesce multiple tokens into one (join operation)."""
         return self.tokens.coalesce_tokens(
@@ -366,6 +366,7 @@ class DataFlowRepository:
             parent_state_ids=parent_state_ids,
             merged_contract=merged_contract,
             step_in_pipeline=step_in_pipeline,
+            parent_lineage_paths=parent_lineage_paths,
         )
 
     def finalize_coalesce_effect(
@@ -388,6 +389,7 @@ class DataFlowRepository:
         parent_path: TerminalPath = TerminalPath.EXPAND_PARENT,
         parent_batch_id: str | None = None,
         aggregation_parent_dispositions: Sequence[AggregationParentDisposition] = (),
+        parent_lineage_path: tuple[LineageFrame, ...] | None = None,
     ) -> tuple[list[Token], str]:
         """Expand a token into multiple child tokens (deaggregation)."""
         return self.tokens.expand_token(
@@ -399,11 +401,20 @@ class DataFlowRepository:
             parent_path=parent_path,
             parent_batch_id=parent_batch_id,
             aggregation_parent_dispositions=aggregation_parent_dispositions,
+            parent_lineage_path=parent_lineage_path,
         )
 
     def record_empty_expansion(self, parent_ref: TokenRef) -> str:
         """Mint the durable member_count=0 group record for a zero-row expansion."""
         return self.tokens.record_empty_expansion(parent_ref)
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        """All group_records rows for a run (export surface)."""
+        return self.tokens.get_group_records_for_run(run_id)
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        """All group_losses rows for a run (export surface, WS3 writes the ledger)."""
+        return self.tokens.get_group_losses_for_run(run_id)
 
     # ── Token outcome recording (TokenOutcomeRepository) ───────────────────
 
@@ -418,9 +429,6 @@ class DataFlowRepository:
         *,
         sink_name: str | None,
         batch_id: str | None,
-        fork_group_id: str | None,
-        join_group_id: str | None,
-        expand_group_id: str | None,
         error_hash: str | None,
     ) -> None:
         """Validate discriminator fields for the (outcome, path) pair."""
@@ -429,9 +437,6 @@ class DataFlowRepository:
             path,
             sink_name=sink_name,
             batch_id=batch_id,
-            fork_group_id=fork_group_id,
-            join_group_id=join_group_id,
-            expand_group_id=expand_group_id,
             error_hash=error_hash,
         )
 
@@ -465,9 +470,6 @@ class DataFlowRepository:
         sink_node_id: str | None = None,
         artifact_id: str | None = None,
         batch_id: str | None = None,
-        fork_group_id: str | None = None,
-        join_group_id: str | None = None,
-        expand_group_id: str | None = None,
         error_hash: str | None = None,
         context: Mapping[str, object] | None = None,
         conn: Connection | None = None,
@@ -481,9 +483,6 @@ class DataFlowRepository:
             sink_node_id=sink_node_id,
             artifact_id=artifact_id,
             batch_id=batch_id,
-            fork_group_id=fork_group_id,
-            join_group_id=join_group_id,
-            expand_group_id=expand_group_id,
             error_hash=error_hash,
             context=context,
             conn=conn,

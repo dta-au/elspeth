@@ -25,6 +25,7 @@ from elspeth.contracts import (
     SourceRow,
 )
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 
 if TYPE_CHECKING:
@@ -400,7 +401,7 @@ def make_token_info(
     row_id: str = "row-1",
     token_id: str | None = None,
     data: dict[str, Any] | None = None,
-    branch_name: str | None = None,
+    lineage_path: tuple[LineageFrame, ...] = (),
 ) -> TokenInfo:
     """Build a TokenInfo for plugin context."""
     from elspeth.engine.tokens import TokenInfo
@@ -409,7 +410,7 @@ def make_token_info(
         row_id=row_id,
         token_id=token_id or f"token-{row_id}",
         row_data=make_row(data or {}),
-        branch_name=branch_name,
+        lineage_path=lineage_path,
     )
 
 

@@ -2,13 +2,15 @@
 
 Use this runbook when a run has durable sink debt, an effect lease expired, or
 an external call may have completed without its response reaching ELSPETH. It
-applies to Landscape schema epoch 34 and the `sink-effect-v1` protocol. A
+applies to Landscape schema epoch 35 and the `sink-effect-v1` protocol. A
 Landscape store still at epoch 31 or below predates aggregation result
 receipts, any store below epoch 33 predates the composite token-outcome
-access path, and any store below epoch 34 predates the unified-lineage
-groundwork tables; all are pre-1.0 recreate boundaries: recreate it (see
-[Staging Session DB Recreation](staging-session-db-recreation.md)) rather than
-running recovery against a stale schema.
+access path, any store below epoch 34 predates the unified-lineage
+groundwork tables, and any store below epoch 35 predates the unified-lineage
+flip (tri-column lineage retirement — `token_lineage_frames`/`lineage_path_json`
+are the sole lineage truth); all are pre-1.0 recreate boundaries: recreate it
+(see [Staging Session DB Recreation](staging-session-db-recreation.md)) rather
+than running recovery against a stale schema.
 
 Sink-effect recovery is fail closed. Do not edit Landscape rows, delete target
 objects, or repeat a sink request by hand. Those actions destroy the evidence

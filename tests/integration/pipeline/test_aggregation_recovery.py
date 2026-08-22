@@ -56,6 +56,7 @@ from elspeth.core.landscape.schema import (
     batch_members_table,
     batches_table,
     sink_effects_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     token_work_items_table,
     tokens_table,
@@ -646,7 +647,13 @@ class TestFlushOutputJournalDurability:
             expanded_children = conn.execute(
                 select(tokens_table.c.token_id, tokens_table.c.token_data_ref)
                 .where(tokens_table.c.run_id == run_id)
-                .where(tokens_table.c.expand_group_id.isnot(None))
+                .where(
+                    tokens_table.c.token_id.in_(
+                        select(token_lineage_frames_table.c.token_id)
+                        .where(token_lineage_frames_table.c.run_id == run_id)
+                        .where(token_lineage_frames_table.c.kind == "expand")
+                    )
+                )
             ).all()
             continuations = conn.execute(
                 select(token_work_items_table.c.token_id)
@@ -722,7 +729,14 @@ class TestFlushOutputJournalDurability:
         with db.connection() as conn:
             run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().one())
             assert conn.execute(select(batches_table.c.status)).scalar_one() == "completed"
-            assert conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.expand_group_id.isnot(None))).all() == []
+            assert (
+                conn.execute(
+                    select(token_lineage_frames_table.c.token_id)
+                    .where(token_lineage_frames_table.c.run_id == run_id)
+                    .where(token_lineage_frames_table.c.kind == "expand")
+                ).all()
+                == []
+            )
 
         recovery = RecoveryManager(db, checkpoint_mgr)
         resume_point = recovery.get_resume_point(run_id, graph)

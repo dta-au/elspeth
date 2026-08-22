@@ -18,6 +18,7 @@ from elspeth.contracts.audit_export import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
@@ -50,9 +51,8 @@ class _Token(Protocol):
     token_id: str
     row_id: str
     run_id: str
-    fork_group_id: str | None
     join_group_id: str | None
-    expand_group_id: str | None
+    lineage_path: tuple[LineageFrame, ...]
 
 
 class _Row(Protocol):
@@ -166,7 +166,7 @@ class _BoundedLineageResolver:
             raise _audit_error(f"fan-in exceeds {MAX_LINEAGE_PARENTS}")
         if any(parent.token_id != token.token_id for parent in parents):
             raise _audit_error(f"token {token.token_id!r} has a relation child mismatch")
-        if not parents and any(value is not None for value in (token.fork_group_id, token.join_group_id, token.expand_group_id)):
+        if not parents and (token.join_group_id is not None or token.lineage_path):
             raise _audit_error(f"token {token.token_id!r} claims lineage metadata without a parent relation")
         ordinals = [parent.ordinal for parent in parents]
         if any(type(ordinal) is not int or ordinal < 0 for ordinal in ordinals):

@@ -158,8 +158,6 @@ def _branch_token(branch: str, *, token_id: str | None = None, row_id: str = "ro
         row_id=row_id,
         token_id=token_id or f"tok-branch-{branch}",
         row_data=make_row({f"field_{branch}": 1}),
-        branch_name=branch,
-        fork_group_id=fork_group_id,
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch),),
     )
 

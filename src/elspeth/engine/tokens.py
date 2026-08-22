@@ -17,7 +17,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.identity import LineageFrame, pop_closer_frame
+from elspeth.contracts.identity import pop_closer_frame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -284,6 +284,7 @@ class TokenManager:
             row_id=parent_token.row_id,
             branches=branches,
             step_in_pipeline=step,
+            parent_lineage_path=parent_token.lineage_path,
         )
 
         # CRITICAL: Use deepcopy to prevent nested mutable objects from being
@@ -295,26 +296,21 @@ class TokenManager:
         # so attempt=0 is correct and they must not inherit the parent's resume offset.
         child_infos: list[TokenInfo] = []
         for child in children:
-            if child.branch_name is None:
-                # The durable writer always inserts branch_name for every fork
-                # child (data_flow.fork_token); a None here is audit
-                # corruption, not a config shape. Narrowing explicitly (rather
-                # than trusting the type) also satisfies LineageFrame's own
-                # fail-closed str-only member_key.
+            innermost = child.lineage_path[-1] if child.lineage_path else None
+            if innermost is None or innermost.kind is not FrameKind.FORK:
+                # The durable writer always stacks a FORK frame for every fork
+                # child (data_flow.fork_token); a missing one here is audit
+                # corruption, not a config shape.
                 raise OrchestrationInvariantError(
-                    f"fork_token: child token {child.token_id!r} minted with branch_name=None — every fork child must carry its branch name"
+                    f"fork_token: child token {child.token_id!r} minted without an innermost FORK frame "
+                    f"— every fork child must carry its branch name (lineage_path={child.lineage_path!r})"
                 )
             child_infos.append(
                 TokenInfo(
                     row_id=parent_token.row_id,
                     token_id=child.token_id,
                     row_data=copy.deepcopy(data),
-                    branch_name=child.branch_name,
-                    fork_group_id=child.fork_group_id,
-                    lineage_path=(
-                        *parent_token.lineage_path,
-                        LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=child.branch_name),
-                    ),
+                    lineage_path=child.lineage_path,
                 )
             )
         return child_infos, fork_group_id
@@ -379,6 +375,7 @@ class TokenManager:
             merged_payload=merged_data.to_dict(),
             merged_contract=merged_data.contract,
             step_in_pipeline=step,
+            parent_lineage_paths={p.token_id: p.lineage_path for p in parents},
         )
         if parent_completions:
             self._data_flow.finalize_coalesce_effect(
@@ -467,6 +464,7 @@ class TokenManager:
             parent_path=parent_path,
             parent_batch_id=parent_batch_id,
             aggregation_parent_dispositions=aggregation_parent_dispositions,
+            parent_lineage_path=parent_token.lineage_path,
         )
 
         # Use output_contract (post-transform schema) for all expanded children
@@ -486,12 +484,10 @@ class TokenManager:
                 token_id=db_child.token_id,
                 # Create PipelineRow with output contract
                 row_data=PipelineRow(copy.deepcopy(row_data), output_contract),
-                branch_name=parent_token.branch_name,  # Inherit branch
-                expand_group_id=db_child.expand_group_id,
-                lineage_path=(
-                    *parent_token.lineage_path,
-                    LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=db_child.token_id),
-                ),
+                # branch_name is inherited automatically: it derives from the
+                # innermost FORK frame anywhere in lineage_path, and expand
+                # only ever APPENDS an EXPAND frame, never touching it.
+                lineage_path=db_child.lineage_path,
             )
             for db_child, row_data in zip(db_children, expanded_rows, strict=True)
         ]

@@ -633,6 +633,19 @@ are insufficient when the claim references audit-table sequencing.
 
 ## Related Decisions
 
+- **Amended by:** unified-lineage spec, WS1b Phase B flip (2026-08-22) — the
+  `token_outcomes` discriminator columns `fork_group_id`, `join_group_id`, and
+  `expand_group_id` (plus `expected_branches_json`) are retired. `(TRANSIENT,
+  FORK_PARENT)` and `(TRANSIENT, EXPAND_PARENT)` now forbid every discriminator
+  field; the fork/expand roster of record moves to the children's persisted
+  `token_lineage_frames` rows plus `group_records` (WS1a Task 4), verified by
+  the replay predicates in `core/landscape/data_flow/tokens.py`
+  (`_reconcile_fork_replay` / `_reconcile_expansion_replay`), not a stored
+  outcome column. `(SUCCESS, COALESCED)` no longer requires `join_group_id` at
+  the outcome level — the merge-event identity lives solely on the *result
+  token's* `tokens.join_group_id` column, which is kept. The "Implementation
+  Notes" table below is the ORIGINAL 2026-05-04 design and is left unchanged
+  as historical record; this note is the current contract.
 - **Amended by:** ADR-038 (2026-08-06) — adds the second non-terminal path,
   `(NULL, ABANDONED)`, written by run finalization for tokens on
   non-resumable dead runs; the terminal mapping table above is unchanged.

@@ -232,9 +232,6 @@ def _make_token_outcome(
     completed: bool = True,
     sink_name: str | None = None,
     batch_id: str | None = None,
-    fork_group_id: str | None = None,
-    join_group_id: str | None = None,
-    expand_group_id: str | None = None,
     error_hash: str | None = None,
 ) -> TokenOutcome:
     return TokenOutcome(
@@ -247,9 +244,6 @@ def _make_token_outcome(
         recorded_at=datetime.now(UTC),
         sink_name=sink_name,
         batch_id=batch_id,
-        fork_group_id=fork_group_id,
-        join_group_id=join_group_id,
-        expand_group_id=expand_group_id,
         error_hash=error_hash,
     )
 
@@ -2045,14 +2039,12 @@ class TestResumeFinalizesAsFailed:
                 token_id="tok-fork-parent",
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.FORK_PARENT,
-                fork_group_id="fork-1",
             ),
             _make_token_outcome(
                 run_id=run_id,
                 token_id="tok-expand-parent",
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.EXPAND_PARENT,
-                expand_group_id="expand-1",
             ),
             _make_token_outcome(
                 run_id=run_id,
@@ -2067,7 +2059,6 @@ class TestResumeFinalizesAsFailed:
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.COALESCED,
                 sink_name="default",
-                join_group_id="join-1",
             ),
             _make_token_outcome(
                 run_id=run_id,

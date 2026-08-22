@@ -750,7 +750,6 @@ class SinkExecutor:
             replacing_target=True,
             primary_effect_id=None,
         )
-        token_by_id = {token.token_id: token for token in tokens}
         finalization_members = tuple(
             SinkEffectFinalizationMember(
                 ordinal=member.ordinal,

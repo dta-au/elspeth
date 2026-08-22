@@ -27,6 +27,7 @@ from elspeth.core.landscape.schema import (
     node_states_table,
     routing_events_table,
     rows_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
     tokens_table,
@@ -2346,14 +2347,17 @@ def test_linear_sink_boundary_recovery_reopens_and_resumes_without_reminting(
                     select(
                         tokens_table.c.token_id,
                         tokens_table.c.row_id,
-                        tokens_table.c.fork_group_id,
                         tokens_table.c.join_group_id,
-                        tokens_table.c.expand_group_id,
-                        tokens_table.c.branch_name,
                     )
                     .where(tokens_table.c.run_id == context.run_id)
                     .order_by(tokens_table.c.token_id)
                 ).mappings()
+            )
+            lineage_frame_token_ids = frozenset(
+                str(token_id)
+                for token_id in conn.execute(
+                    select(token_lineage_frames_table.c.token_id).where(token_lineage_frames_table.c.run_id == context.run_id)
+                ).scalars()
             )
             parent_links = tuple(
                 conn.execute(
@@ -2392,9 +2396,11 @@ def test_linear_sink_boundary_recovery_reopens_and_resumes_without_reminting(
         assert len(row_ids) == 3
         assert tuple(str(token["token_id"]) for token in token_lineage) == context.token_ids
         assert {str(token["row_id"]) for token in token_lineage} == set(row_ids)
-        assert all(
-            token[key] is None for token in token_lineage for key in ("fork_group_id", "join_group_id", "expand_group_id", "branch_name")
-        )
+        # A linear pipeline (no fork/join/expand) means every token carries
+        # no join_group_id and no token_lineage_frames rows (WS1b flip:
+        # lineage_path is the sole lineage truth, ruling 21).
+        assert all(token["join_group_id"] is None for token in token_lineage)
+        assert lineage_frame_token_ids.isdisjoint(str(token["token_id"]) for token in token_lineage)
         assert parent_links == ()
         assert routes == ()
         assert outcomes == ()
