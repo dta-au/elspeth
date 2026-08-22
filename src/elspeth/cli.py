@@ -1365,6 +1365,7 @@ def _orchestrator_context(
         coalesce_settings=(list(config.coalesce) if config.coalesce else []),
         sink_effect_modes=effective_sink_effect_modes,
         sink_effect_admission=sink_effect_admission,
+        escalation_fixpoint_bound=graph.escalation_fixpoint_bound,
     )
 
     # EventBus + formatters. Programmatic dependency execution uses the
@@ -3476,6 +3477,7 @@ def join(
             coalesce_settings=(list(settings_config.coalesce) if settings_config.coalesce else []),
             sink_effect_modes=execution_sink_modes,
             sink_effect_admission=sink_effect_admission,
+            escalation_fixpoint_bound=execution_graph.escalation_fixpoint_bound,
         )
 
         follower_proc = build_follower_processor(

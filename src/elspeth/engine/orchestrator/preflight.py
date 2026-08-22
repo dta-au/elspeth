@@ -658,6 +658,7 @@ def assemble_and_validate_pipeline_config(
         coalesce_settings=(list(settings.coalesce) if settings.coalesce else []),
         sink_effect_modes=execution_modes,
         sink_effect_admission=sink_effect_admission,
+        escalation_fixpoint_bound=graph.escalation_fixpoint_bound,
     )
 
     validate_pipeline_route_targets(

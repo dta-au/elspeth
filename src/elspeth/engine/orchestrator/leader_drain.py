@@ -414,6 +414,11 @@ class LeaderDrainCoordinator:
 # §D step-3 convergence valve: each iteration adopts every intake-pending
 # barrier row and force-resolves every flushable barrier, so legal pipelines
 # converge in a handful of rounds (one per barrier "layer" in the DAG).
+# Default-anchor documentation only — the ACTUAL bound used at runtime is
+# PipelineConfig.escalation_fixpoint_bound, derived per build from the real
+# bound-region nesting depth by
+# elspeth.core.dag.bound_regions.derive_escalation_fixpoint_bound (spec
+# §6.3): a bare constant would collide with an override-deep unwind.
 MAX_END_OF_INPUT_FLUSH_ITERATIONS = 1_000
 
 
@@ -461,7 +466,8 @@ def run_end_of_input_barrier_flush(
             f"unquiesced work: {summary}."
         )
 
-    for _ in range(MAX_END_OF_INPUT_FLUSH_ITERATIONS):
+    flush_iteration_bound = config.escalation_fixpoint_bound
+    for _ in range(flush_iteration_bound):
         # §E.2 intake: adopt anything deposited by the final drains (and, on
         # the takeover path, inherited intake-pending rows), release late
         # arrivals (§E.3a), replay durable branch losses (§E.5) — all before
@@ -513,6 +519,6 @@ def run_end_of_input_barrier_flush(
 
     raise OrchestrationInvariantError(
         f"End-of-input barrier flush for run '{processor.run_id}' did not converge within "
-        f"{MAX_END_OF_INPUT_FLUSH_ITERATIONS} intake/flush rounds; durable BLOCKED barrier holds remain. "
+        f"{flush_iteration_bound} intake/flush rounds; durable BLOCKED barrier holds remain. "
         "Possible barrier cycle or a flush that re-deposits its own inputs."
     )

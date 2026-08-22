@@ -30,6 +30,7 @@ from elspeth.contracts.types import (
     SinkName,
 )
 from elspeth.core.canonical import canonical_json
+from elspeth.core.dag.bound_regions import compute_bound_regions, derive_escalation_fixpoint_bound
 from elspeth.core.dag.coalesce_merge import merge_coalesce_schema
 from elspeth.core.dag.group_bindings import build_group_binding_registry
 from elspeth.core.dag.guarantees import walk_effective_guarantee_vote
@@ -1670,6 +1671,13 @@ def build_execution_graph(
         transform_ids_by_name=transform_ids_by_name,
     )
     graph.set_group_bindings(registry)
+
+    # ===== BOUND-REGION COMPUTATION (spec §7 rule 3, §6.3 depth cap) =====
+    regions = compute_bound_regions(graph, registry, max_depth=max_bound_region_depth)
+    graph.set_bound_regions(regions)
+    max_observed_depth = max((r.depth for r in regions), default=0)
+    graph.set_max_bound_region_depth(max_observed_depth)
+    graph.set_escalation_fixpoint_bound(derive_escalation_fixpoint_bound(max_observed_depth))
 
     # Step maps and node sequence support node_id-based processor traversal.
     graph.set_pipeline_nodes(pipeline_nodes)

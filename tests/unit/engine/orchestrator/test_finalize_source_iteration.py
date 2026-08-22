@@ -76,6 +76,7 @@ class _ConfigDouble:
     def __init__(self) -> None:
         self.aggregation_settings: dict[str, Any] = {}
         self.sinks: dict[str, Any] = {}
+        self.escalation_fixpoint_bound = 1_000
 
 
 class _ProcessorDouble:

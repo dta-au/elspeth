@@ -2025,6 +2025,28 @@ sites:
   disposition: mirrored
   counterpart:
   - output_name_invalid
+- key: 3fcda2c6fcf99a89
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: compute_bound_regions
+  exception: GraphValidationError
+  message: 'Bound regions ''{}'' (opener ''{}'') and ''{}'' (opener ''{}'') partially overlap. Bound regions
+    must fully contain one another or be disjoint (spec §7 rule 3): close t'
+  ordinal: 0
+  disposition: abstains
+  note: Stage 1's existing narrower guards (row_union_nested_fork_invalid, row_union_downstream_group_invalid)
+    reject a subset; full region computation is runtime-only; deliberate — Stage 1 must not be stricter
+    than the runtime and the general shapes require the built graph.
+- key: e65b68f997683769
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: compute_bound_regions
+  exception: GraphValidationError
+  message: 'Bound-region nesting depth {} exceeds the supported maximum {} (innermost closer: ''{}'').
+    The supported guarantee is {} layers (spec §6.3); deeper nesting is mod'
+  ordinal: 0
+  disposition: abstains
+  note: Stage 1's existing narrower guards (row_union_nested_fork_invalid, row_union_downstream_group_invalid)
+    reject a subset; full region computation is runtime-only; deliberate — Stage 1 must not be stricter
+    than the runtime and the general shapes require the built graph.
 - key: 6557fc89e6b5c8de
   path: src/elspeth/core/dag/builder.py
   qualname: _parse_contract_schema_config

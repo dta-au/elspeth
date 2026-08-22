@@ -39,6 +39,7 @@ from elspeth.contracts.types import (
     SinkName,
 )
 from elspeth.core.dag import coalesce_warnings, guarantees, row_union_warnings, schema_validation
+from elspeth.core.dag.bound_regions import BoundRegion
 from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.dag.guarantees import EffectiveGuaranteeVote as _EffectiveGuaranteeVote
 from elspeth.core.dag.models import (
@@ -101,6 +102,9 @@ class ExecutionGraph:
         self._node_step_map: dict[NodeID, int] = {}  # node_id -> audit step (source=0)
         self._validation_warnings: tuple[GraphValidationWarning, ...] = ()
         self._group_bindings: GroupBindingRegistry = GroupBindingRegistry(bindings=())
+        self._bound_regions: tuple[BoundRegion, ...] = ()
+        self._max_bound_region_depth = 0
+        self._escalation_fixpoint_bound = 1_000
         self._build_metadata_frozen = False
 
     @property
@@ -872,6 +876,27 @@ class ExecutionGraph:
         self._assert_build_metadata_mutable()
         self._group_bindings = registry
 
+    def set_bound_regions(self, regions: Sequence[BoundRegion]) -> None:
+        """Set the computed SESE bound regions of this build (spec §7 rule 3)."""
+        self._assert_build_metadata_mutable()
+        self._bound_regions = tuple(regions)
+
+    def set_max_bound_region_depth(self, depth: int) -> None:
+        """Set the max OBSERVED bound-region nesting depth of this build.
+
+        0 when the build has no bound regions. This is NOT the configured
+        ``max_bound_region_depth`` cap passed to ``from_plugin_instances``
+        (same name by 2026-08-22 synthesis decision) — it is the deepest
+        region this specific build actually produced.
+        """
+        self._assert_build_metadata_mutable()
+        self._max_bound_region_depth = depth
+
+    def set_escalation_fixpoint_bound(self, bound: int) -> None:
+        """Set the derived EOF barrier-flush fixpoint bound (spec §6.3)."""
+        self._assert_build_metadata_mutable()
+        self._escalation_fixpoint_bound = bound
+
     def add_route_resolution_entry(self, gate_id: NodeID, label: str, dest: RouteDestination) -> None:
         """Add a single entry to the route resolution map."""
         self._assert_build_metadata_mutable()
@@ -979,6 +1004,26 @@ class ExecutionGraph:
         Empty registry (`bindings=()`) for a build with no bound group.
         """
         return self._group_bindings
+
+    def get_bound_regions(self) -> tuple[BoundRegion, ...]:
+        """Get the computed SESE bound regions of this build (spec §7 rule 3).
+
+        Empty tuple for a build with no bound group.
+        """
+        return self._bound_regions
+
+    def get_max_bound_region_depth(self) -> int:
+        """Get the max OBSERVED bound-region nesting depth of this build.
+
+        0 when no bound regions exist. NOT the configured
+        ``max_bound_region_depth`` cap — see ``set_max_bound_region_depth``.
+        """
+        return self._max_bound_region_depth
+
+    @property
+    def escalation_fixpoint_bound(self) -> int:
+        """The derived non-convergence bound for the EOF barrier-flush fixpoint (spec §6.3)."""
+        return self._escalation_fixpoint_bound
 
     def get_branch_info_map(self) -> dict[BranchName, BranchInfo]:
         """Get immutable branch routing plans keyed by branch name."""

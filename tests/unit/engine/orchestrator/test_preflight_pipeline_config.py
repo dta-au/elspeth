@@ -46,6 +46,8 @@ class _SettingsStub:
 
 
 class _GraphStub:
+    escalation_fixpoint_bound = 1_000
+
     def get_aggregation_id_map(self) -> dict[object, object]:
         return {}
 

@@ -138,3 +138,18 @@ class TestCollectorNode:
         for info in graph.get_nodes():
             if info.node_type is not NodeType.COLLECTOR:
                 assert "scope" not in info.config
+
+    def test_scope_bound_region_is_computed(self) -> None:
+        # EXPAND-kind bound region (spec §7 rule 3, §6.3): the explode ->
+        # page_stitcher scope opens and closes with nothing between them in
+        # this fixture, so membership is empty at depth 1 — the shape
+        # WS3's leader_drain fixpoint bound (graph.get_max_bound_region_depth())
+        # actually consumes.
+        graph = _build()
+        regions = graph.get_bound_regions()
+        assert len(regions) == 1
+        region = regions[0]
+        assert region.member_node_ids == frozenset()
+        assert region.depth == 1
+        assert graph.get_max_bound_region_depth() == 1
+        assert graph.escalation_fixpoint_bound == 1_000 + 8 * 1
