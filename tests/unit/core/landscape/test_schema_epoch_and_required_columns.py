@@ -1,4 +1,4 @@
-"""Schema epoch + required-shape + provenance-write guards (epoch 33)."""
+"""Schema epoch + required-shape + provenance-write guards (epoch 34)."""
 
 from __future__ import annotations
 
@@ -36,8 +36,33 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import make_recorder_with_run
 
 
-def test_epoch_is_thirty_three() -> None:
-    assert SQLITE_SCHEMA_EPOCH == 33
+def test_epoch_is_thirty_four() -> None:
+    assert SQLITE_SCHEMA_EPOCH == 34
+
+
+def test_unified_lineage_tables_exist_with_exact_keys() -> None:
+    from elspeth.core.landscape.schema import group_losses_table, group_records_table, token_lineage_frames_table
+
+    assert [c.name for c in token_lineage_frames_table.primary_key.columns] == ["token_id", "run_id", "depth"]
+    assert {c.name for c in token_lineage_frames_table.columns} == {"token_id", "run_id", "depth", "kind", "group_id", "member_key"}
+    assert [c.name for c in group_records_table.primary_key.columns] == ["run_id", "group_id"]
+    assert {c.name for c in group_records_table.columns} == {"run_id", "group_id", "kind", "opener_token_id", "member_count", "created_at"}
+    assert {c.name for c in group_losses_table.columns} == {
+        "loss_id",
+        "run_id",
+        "closer_name",
+        "group_id",
+        "member_key",
+        "token_id",
+        "reason",
+        "recorded_by",
+        "recorded_at",
+        "adopted_epoch",
+    }
+    # No defaulted getattr here — the whole-tree masquerade gate pins the exact
+    # set of dynamic-attribute sites; every table constraint carries .name.
+    natural = next(c for c in group_losses_table.constraints if c.name == "uq_group_losses_natural")
+    assert [col.name for col in natural.columns] == ["run_id", "closer_name", "group_id", "member_key"]
 
 
 def test_epoch_33_resolves_run_scoped_per_token_outcome_reads_by_index_order() -> None:
@@ -406,6 +431,7 @@ def test_token_work_items_barrier_blocked_at_defaults_to_none() -> None:
                 available_at=now,
                 created_at=now,
                 updated_at=now,
+                lineage_path_json="[]",
             )
         )
 

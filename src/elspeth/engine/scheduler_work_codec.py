@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from elspeth.contracts import TokenInfo
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import BarrierEmission, TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
@@ -69,6 +70,7 @@ class ScheduledWorkFields:
     fork_group_id: str | None
     join_group_id: str | None
     expand_group_id: str | None
+    lineage_path: tuple[LineageFrame, ...]
     coalesce_node_id: str | None
     coalesce_name: str | None
     row_union_name: str | None
@@ -109,6 +111,7 @@ class SchedulerWorkCodec:
             fork_group_id=token.fork_group_id,
             join_group_id=token.join_group_id,
             expand_group_id=token.expand_group_id,
+            lineage_path=token.lineage_path,
             coalesce_node_id=str(item.coalesce_node_id) if item.coalesce_node_id is not None else None,
             coalesce_name=str(item.coalesce_name) if item.coalesce_name is not None else None,
             row_union_name=str(item.row_union_name) if item.row_union_name is not None else None,
@@ -131,6 +134,7 @@ class SchedulerWorkCodec:
             fork_group_id=fields.fork_group_id,
             join_group_id=fields.join_group_id,
             expand_group_id=fields.expand_group_id,
+            lineage_path=fields.lineage_path,
             coalesce_node_id=fields.coalesce_node_id,
             coalesce_name=fields.coalesce_name,
             row_union_name=fields.row_union_name,
@@ -147,6 +151,7 @@ class SchedulerWorkCodec:
             fork_group_id=scheduled.fork_group_id,
             join_group_id=scheduled.join_group_id,
             expand_group_id=scheduled.expand_group_id,
+            lineage_path=scheduled.lineage_path,
         )
         return self.create_work_item(
             token=token,

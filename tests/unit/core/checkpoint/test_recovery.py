@@ -281,6 +281,7 @@ def _insert_blocked_work_item(
             barrier_blocked_at=now if barrier_key is not None else None,
             created_at=now,
             updated_at=now,
+            lineage_path_json="[]",
         )
     )
 
@@ -1644,6 +1645,7 @@ def _valid_incomplete_token_spec_kwargs() -> dict[str, Any]:
         "fork_group_id": None,
         "join_group_id": None,
         "expand_group_id": None,
+        "lineage_path": (),
         "token_data_ref": None,
         "step_in_pipeline": 1,
         "max_attempt": -1,

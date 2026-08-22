@@ -18,6 +18,8 @@ from datetime import UTC, datetime
 import pytest
 
 from elspeth.contracts import TokenInfo
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import BarrierEmission, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
@@ -141,6 +143,7 @@ def _scheduler_row_from_fields(fields: ScheduledWorkFields) -> TokenWorkItem:
         fork_group_id=fields.fork_group_id,
         join_group_id=fields.join_group_id,
         expand_group_id=fields.expand_group_id,
+        lineage_path=fields.lineage_path,
         coalesce_node_id=fields.coalesce_node_id,
         coalesce_name=fields.coalesce_name,
     )
@@ -234,6 +237,7 @@ class TestReadyEmissionParity:
             ("fork_group_id", emission.fork_group_id, fields.fork_group_id),
             ("join_group_id", emission.join_group_id, fields.join_group_id),
             ("expand_group_id", emission.expand_group_id, fields.expand_group_id),
+            ("lineage_path", emission.lineage_path, fields.lineage_path),
             ("coalesce_node_id", emission.coalesce_node_id, fields.coalesce_node_id),
             ("coalesce_name", emission.coalesce_name, fields.coalesce_name),
             ("row_union_name", emission.row_union_name, fields.row_union_name),
@@ -270,3 +274,23 @@ class TestRehydrateCursor:
         rehydrated = codec.work_item_from_scheduler(terminal_row)
 
         assert rehydrated.current_node_id is None
+
+
+_LINEAGE_PATH = (
+    LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1"),
+    LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="branch-a"),
+)
+
+
+def test_lineage_path_round_trips_through_ready_fields_and_rehydrate() -> None:
+    item = _make_item(
+        token=replace(_make_item().token, lineage_path=_LINEAGE_PATH),
+    )
+    codec = _make_codec()
+    fields = codec.ready_fields(item)
+    assert fields.lineage_path == _LINEAGE_PATH
+    emission = codec.ready_emission(item)
+    assert emission.lineage_path == _LINEAGE_PATH
+    scheduled = _scheduler_row_from_fields(fields)
+    rehydrated = codec.work_item_from_scheduler(scheduled)
+    assert rehydrated.token.lineage_path == _LINEAGE_PATH

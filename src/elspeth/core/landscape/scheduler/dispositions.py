@@ -743,6 +743,7 @@ class SchedulerDispositionRepository:
             fork_group_id=emission.fork_group_id,
             join_group_id=emission.join_group_id,
             expand_group_id=emission.expand_group_id,
+            lineage_path=emission.lineage_path,
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
             row_union_name=emission.row_union_name,

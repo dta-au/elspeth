@@ -34,7 +34,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.compiler import SQLCompiler
 
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.types import NODE_ID_MAX_LENGTH
 from elspeth.core.schema_identity import create_schema_identity_table
@@ -314,7 +314,14 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        accounting census picked the wrong one. This is a pre-1.0
 #        delete-and-recreate boundary: the index is physical schema, so a store
 #        written at epoch 32 lacks it and is not migrated.
-SQLITE_SCHEMA_EPOCH = 33
+#   34 → Unified lineage groundwork (WS1a, barrier-scopes spec rev 3.2):
+#        token_lineage_frames (typed lineage-frame stack per token, written in
+#        the token-INSERT transaction), group_records (roster record for every
+#        opening operation, empty expansions included), group_losses (the
+#        unified loss ledger — written from WS3), and
+#        token_work_items.lineage_path_json (journal-riding lineage path).
+#        Pre-1.0 delete-and-recreate boundary; no migration.
+SQLITE_SCHEMA_EPOCH = 34
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -726,6 +733,11 @@ token_work_items_table = Table(
     Column("fork_group_id", String(128)),
     Column("join_group_id", String(128)),
     Column("expand_group_id", String(128)),
+    # Epoch 34: the token's typed lineage path (outermost first), serialized by
+    # contracts.identity.lineage_path_to_json. The journal is authoritative for
+    # resume, so the path must ride the row exactly like the (retiring)
+    # tri-columns above it; WS1b deletes those and this column stays.
+    Column("lineage_path_json", Text, nullable=False),
     Column("coalesce_node_id", String(NODE_ID_COLUMN_LENGTH)),
     Column("coalesce_name", String(128)),
     Column("row_union_name", String(128)),
@@ -1061,6 +1073,74 @@ Index(
     coalesce_branch_losses_table.c.row_id,
     coalesce_branch_losses_table.c.branch_name,
     unique=True,
+)
+
+# === Unified lineage (epoch 34, barrier-scopes spec rev 3.2 §4.3) ===
+
+token_lineage_frames_table = Table(
+    "token_lineage_frames",
+    metadata,
+    Column("token_id", String(64), primary_key=True),
+    Column("run_id", String(64), primary_key=True),
+    Column("depth", Integer, primary_key=True),  # 0 = outermost
+    Column("kind", String(16), nullable=False),
+    Column("group_id", String(64), nullable=False),
+    Column("member_key", String(128), nullable=False),  # FORK: branch name; EXPAND: member token_id
+    CheckConstraint(_enum_in_check("kind", FrameKind), name="ck_token_lineage_frames_kind"),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+Index(
+    "ix_token_lineage_frames_group",
+    token_lineage_frames_table.c.run_id,
+    token_lineage_frames_table.c.group_id,
+    token_lineage_frames_table.c.member_key,
+)
+
+group_records_table = Table(
+    "group_records",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), primary_key=True),
+    Column("group_id", String(64), primary_key=True),
+    Column("kind", String(16), nullable=False),
+    Column("opener_token_id", String(64), nullable=False),
+    # member_count=0 is legal and REQUIRED for empty expansions (§4.3): it is
+    # the durable referent the require_all empty-group failure needs.
+    Column("member_count", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("member_count >= 0", name="ck_group_records_member_count_nonneg"),
+    CheckConstraint(_enum_in_check("kind", FrameKind), name="ck_group_records_kind"),
+    ForeignKeyConstraint(["opener_token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+# One token opens at most one group: every opener records a terminal parent
+# disposition (FORK_PARENT / EXPAND_PARENT / BATCH_CONSUMED / FILTER_DROPPED)
+# in the same claim, so a second open is unreachable. This uniqueness is what
+# makes the empty-expansion mint idempotent under re-driven claims.
+Index(
+    "uq_group_records_opener",
+    group_records_table.c.run_id,
+    group_records_table.c.opener_token_id,
+    unique=True,
+)
+
+group_losses_table = Table(
+    "group_losses",
+    metadata,
+    Column("loss_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("closer_name", String(128), nullable=False),
+    Column("group_id", String(64), nullable=False),
+    Column("member_key", String(128), nullable=False),
+    Column("token_id", String(64), nullable=False),
+    # Categorical vocabulary only (2026-08-08 convention; String(64) per the
+    # battery-round-7 Postgres lesson pinned in
+    # test_coalesce_branch_loss_reason_postgres.py — WS3 owes the same
+    # three-proof treatment on this column).
+    Column("reason", String(64), nullable=False),
+    Column("recorded_by", String(128), nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    Column("adopted_epoch", Integer),  # NULL = not yet replayed into leader memory (§E.5 cursor)
+    UniqueConstraint("run_id", "closer_name", "group_id", "member_key", name="uq_group_losses_natural"),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
 )
 
 

@@ -216,6 +216,7 @@ class TestSchedulerConnectionPragmaDiscipline:
                     available_at=now,
                     created_at=now,
                     updated_at=now,
+                    lineage_path_json="[]",
                 )
             )
 

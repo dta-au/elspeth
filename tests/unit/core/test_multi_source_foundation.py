@@ -2034,6 +2034,7 @@ def test_scheduler_claim_ready_tiebreaks_by_work_item_id_on_same_tick() -> None:
                 available_at=now,
                 created_at=now,
                 updated_at=now,
+                lineage_path_json="[]",
             )
         )
         conn.execute(
@@ -2051,6 +2052,7 @@ def test_scheduler_claim_ready_tiebreaks_by_work_item_id_on_same_tick() -> None:
                 available_at=now,
                 created_at=now,
                 updated_at=now,
+                lineage_path_json="[]",
             )
         )
 
@@ -2730,6 +2732,7 @@ def _scheduler_work_values(
         "available_at": now,
         "created_at": now,
         "updated_at": now,
+        "lineage_path_json": "[]",
         "coalesce_node_id": coalesce_node_id,
     }
 

@@ -7,7 +7,7 @@ retention / back-edit, and describe the tutorial as a guided workflow profile.
 It must NOT tell users to switch to freeform because guided cannot express a
 supported topology. Where schema/epoch numbers are encoded, the runbook must use
 the current values (the live ``SESSION_SCHEMA_EPOCH``, guided schema 10,
-Landscape epoch 33), not the design doc's stale 8/28.
+Landscape epoch 34), not the design doc's stale 8/28.
 """
 
 from pathlib import Path
@@ -107,12 +107,12 @@ def test_runbook_uses_plan_05_epoch_and_schema_numbers() -> None:
     # Current release values: the live session epoch, guided schema 11,
     # Landscape 30. Bound to the constant so the doc cannot drift behind a bump.
     assert f"session epoch {SESSION_SCHEMA_EPOCH}" in current_cutover
-    assert "Landscape epoch 33" in current_cutover
+    assert "Landscape epoch 34" in current_cutover
     assert "guided schema 11" in current_cutover
 
     # The recreation/rollback record reference must name the live session epoch,
     # not the stale session epoch-30 the header-bump left behind (elspeth
-    # composer-parity fix). Landscape epoch 33 is the current boundary.
+    # composer-parity fix). Landscape epoch 34 is the current boundary.
     assert f"session-epoch-{SESSION_SCHEMA_EPOCH}/Landscape-epoch-31 record" in current_cutover
     assert f"repair the epoch-{SESSION_SCHEMA_EPOCH} release forward" in current_cutover
     assert "session-epoch-30" not in current_cutover

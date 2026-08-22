@@ -8352,6 +8352,7 @@ class TestResumeIncompleteToken:
             fork_group_id=None,
             join_group_id=None,
             expand_group_id="expand-1",
+            lineage_path=(),
             token_data_ref="payload-1",
             step_in_pipeline=2,
             max_attempt=0,
@@ -10321,6 +10322,7 @@ class TestReadyEmissionEnqueueParity:
             fork_group_id=emission.fork_group_id,
             join_group_id=emission.join_group_id,
             expand_group_id=emission.expand_group_id,
+            lineage_path=emission.lineage_path,
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
             row_union_name=emission.row_union_name,
@@ -10330,7 +10332,8 @@ class TestReadyEmissionEnqueueParity:
         # Pin the projected column count: adding a journal column to ONE of
         # the two builders (or to the mapper) must force this pin to be
         # revisited rather than silently desync the reconciliation contract.
-        assert len(values_from_emission) == 30
+        # Epoch 34 adds lineage_path_json (30 -> 31).
+        assert len(values_from_emission) == 31
 
         # Spot-check the per-flavor derived keys so a failure localizes.
         if flavor == "coalesce_cursor":

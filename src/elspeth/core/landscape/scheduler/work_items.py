@@ -17,6 +17,7 @@ from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame, lineage_path_from_json, lineage_path_to_json
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.schema import nodes_table, rows_table, token_work_items_table, tokens_table
@@ -52,6 +53,10 @@ def item_from_mapping(row: RowMapping) -> TokenWorkItem:
         value = data[key]
         if type(value) is datetime and value.tzinfo is None:
             data[key] = value.replace(tzinfo=UTC)
+    try:
+        lineage_path = lineage_path_from_json(data["lineage_path_json"])
+    except ValueError as exc:
+        raise AuditIntegrityError(f"Corrupt token_work_items.lineage_path_json for work_item_id={data['work_item_id']!r}: {exc}") from exc
     return TokenWorkItem(
         work_item_id=data["work_item_id"],
         run_id=data["run_id"],
@@ -74,6 +79,7 @@ def item_from_mapping(row: RowMapping) -> TokenWorkItem:
         fork_group_id=data["fork_group_id"],
         join_group_id=data["join_group_id"],
         expand_group_id=data["expand_group_id"],
+        lineage_path=lineage_path,
         coalesce_node_id=data["coalesce_node_id"],
         coalesce_name=data["coalesce_name"],
         row_union_name=data["row_union_name"],
@@ -106,6 +112,7 @@ def ready_work_item_values(
     fork_group_id: str | None,
     join_group_id: str | None,
     expand_group_id: str | None,
+    lineage_path: tuple[LineageFrame, ...],
     coalesce_node_id: str | None,
     coalesce_name: str | None,
     row_union_name: str | None = None,
@@ -132,6 +139,7 @@ def ready_work_item_values(
         "fork_group_id": fork_group_id,
         "join_group_id": join_group_id,
         "expand_group_id": expand_group_id,
+        "lineage_path_json": lineage_path_to_json(lineage_path),
         "coalesce_node_id": coalesce_node_id,
         "coalesce_name": coalesce_name,
         "row_union_name": row_union_name,
@@ -269,6 +277,7 @@ def insert_work_item_idempotent(conn: Connection, *, values: dict[str, object], 
         "fork_group_id",
         "join_group_id",
         "expand_group_id",
+        "lineage_path_json",
         "coalesce_node_id",
         "coalesce_name",
         "row_union_name",

@@ -2538,6 +2538,7 @@ class RowProcessor:
             fork_group_id=fields.fork_group_id,
             join_group_id=fields.join_group_id,
             expand_group_id=fields.expand_group_id,
+            lineage_path=fields.lineage_path,
             coalesce_node_id=fields.coalesce_node_id,
             coalesce_name=fields.coalesce_name,
             row_union_name=fields.row_union_name,
@@ -2882,6 +2883,7 @@ class RowProcessor:
             fork_group_id=spec.fork_group_id,
             join_group_id=spec.join_group_id,
             expand_group_id=spec.expand_group_id,
+            lineage_path=spec.lineage_path,
             resume_attempt_offset=spec.max_attempt + 1,
             resume_checkpoint_id=resume_checkpoint_id,
         )
@@ -3553,6 +3555,7 @@ class RowProcessor:
             fork_group_id=token.fork_group_id,
             join_group_id=token.join_group_id,
             expand_group_id=token.expand_group_id,
+            lineage_path=token.lineage_path,
         )
 
     def _complete_committed_aggregation_residual(

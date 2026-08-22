@@ -9,6 +9,7 @@ from enum import StrEnum
 
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import freeze_fields, require_int
+from elspeth.contracts.identity import LineageFrame
 
 
 class TokenWorkStatus(StrEnum):
@@ -164,6 +165,8 @@ class TokenWorkItem:
     fork_group_id: str | None = None
     join_group_id: str | None = None
     expand_group_id: str | None = None
+    # Epoch 34: typed lineage path (outermost first); column form is lineage_path_json.
+    lineage_path: tuple[LineageFrame, ...] = ()
     coalesce_node_id: str | None = None
     coalesce_name: str | None = None
     row_union_name: str | None = None
@@ -217,6 +220,8 @@ class BarrierEmission:
     fork_group_id: str | None = None
     join_group_id: str | None = None
     expand_group_id: str | None = None
+    # Epoch 34: typed lineage path (outermost first); column form is lineage_path_json.
+    lineage_path: tuple[LineageFrame, ...] = ()
     coalesce_node_id: str | None = None
     coalesce_name: str | None = None
     row_union_name: str | None = None

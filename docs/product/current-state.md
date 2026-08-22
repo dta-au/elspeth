@@ -28,8 +28,8 @@ not remain folded into the historical 0.7.1 notes.
   planner-repair-exhaustion failure classification, and epoch-45
   operator-profiled Textract document authoring, to 0.7.2.
 - `SESSION_SCHEMA_EPOCH` is 47, guided checkpoint schema is 11, and
-  `SQLITE_SCHEMA_EPOCH` is 33. An upgrade from 0.7.1 recreates both a stale
-  session store and a Landscape store below epoch 33.
+  `SQLITE_SCHEMA_EPOCH` is 34. An upgrade from 0.7.1 recreates both a stale
+  session store and a Landscape store below epoch 34.
 - Web Composer freeform and guided authoring, Composer tools, YAML
   import/export, validation, and graph views support first-class, correlated
   `row_union` barriers for declared-order long-format processing.

@@ -17,6 +17,7 @@ from sqlalchemy.engine import Connection, RowMapping
 
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.database import Tier1Engine, begin_write
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
@@ -64,6 +65,7 @@ class SchedulerQueueRepository:
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
         expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
@@ -107,6 +109,7 @@ class SchedulerQueueRepository:
             fork_group_id=fork_group_id,
             join_group_id=join_group_id,
             expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
@@ -173,6 +176,7 @@ class SchedulerQueueRepository:
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
         expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
@@ -207,6 +211,7 @@ class SchedulerQueueRepository:
             fork_group_id=fork_group_id,
             join_group_id=join_group_id,
             expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
@@ -235,6 +240,7 @@ class SchedulerQueueRepository:
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
         expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
@@ -265,6 +271,7 @@ class SchedulerQueueRepository:
             fork_group_id=fork_group_id,
             join_group_id=join_group_id,
             expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
@@ -296,6 +303,7 @@ class SchedulerQueueRepository:
         coalesce_node_id: str | None,
         coalesce_name: str | None,
         row_union_name: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         worker_id: str | None,
     ) -> TokenWorkItem:
         with begin_write(self._engine) as conn:
@@ -320,6 +328,7 @@ class SchedulerQueueRepository:
                 fork_group_id=fork_group_id,
                 join_group_id=join_group_id,
                 expand_group_id=expand_group_id,
+                lineage_path=lineage_path,
                 coalesce_node_id=coalesce_node_id,
                 coalesce_name=coalesce_name,
                 row_union_name=row_union_name,
@@ -350,6 +359,7 @@ class SchedulerQueueRepository:
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
         expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
@@ -384,6 +394,7 @@ class SchedulerQueueRepository:
             fork_group_id=fork_group_id,
             join_group_id=join_group_id,
             expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
@@ -454,6 +465,7 @@ class SchedulerQueueRepository:
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
         expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
@@ -509,6 +521,7 @@ class SchedulerQueueRepository:
                 fork_group_id=fork_group_id,
                 join_group_id=join_group_id,
                 expand_group_id=expand_group_id,
+                lineage_path=lineage_path,
                 coalesce_node_id=coalesce_node_id,
                 coalesce_name=coalesce_name,
                 row_union_name=row_union_name,

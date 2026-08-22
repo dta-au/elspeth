@@ -32,7 +32,9 @@ def _forge_token_run(*, setup, token_id: str, forged_run_id: str) -> None:
 
 
 def test_current_epoch_preserves_token_row_run_ownership_for_sqlite_and_postgres() -> None:
-    assert SQLITE_SCHEMA_EPOCH == 33
+    # Epoch 34 (unified-lineage groundwork) does not touch the tokens/rows
+    # composite FK this test pins; bumped to track the live constant.
+    assert SQLITE_SCHEMA_EPOCH == 34
     assert (
         "tokens",
         ("row_id", "run_id"),

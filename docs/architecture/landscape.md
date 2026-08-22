@@ -171,10 +171,12 @@ scheduler can attribute a blocked work item to its declared row_union barrier.
 Epoch 31 closes `token_work_items.status` over the public scheduler status enum.
 Epoch 33 adds a composite (run_id, token_id) index to `token_outcomes` so a
 run-scoped per-token read resolves through one index instead of choosing
-between two single-column candidates the planner cannot separate.
+between two single-column candidates the planner cannot separate. Epoch 34
+adds the unified-lineage groundwork tables (`token_lineage_frames`,
+`group_records`, `group_losses`) and `token_work_items.lineage_path_json`.
 
 ELSPETH is pre-1.0. An older Landscape database is archived or exported as
-required and recreated at epoch 33; startup and read-only inspection do not
+required and recreated at epoch 34; startup and read-only inspection do not
 transform a predecessor store in place.
 
 ### Multi-source ingestion (ADR-025)

@@ -32,8 +32,10 @@ from elspeth.contracts import (
     TerminalPath,
 )
 from elspeth.contracts.barrier_scalars import BarrierScalars
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError
 from elspeth.contracts.freeze import deep_freeze, freeze_fields
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.types import NodeID
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator, IncompatibleCheckpointError
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError, CheckpointManager
@@ -48,6 +50,7 @@ from elspeth.core.landscape.schema import (
     rows_table,
     run_sources_table,
     runs_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     tokens_table,
 )
@@ -258,6 +261,7 @@ class IncompleteTokenSpec:
     fork_group_id: str | None
     join_group_id: str | None
     expand_group_id: str | None
+    lineage_path: tuple[LineageFrame, ...]
     token_data_ref: str | None
     step_in_pipeline: int | None
     max_attempt: int
@@ -739,6 +743,24 @@ class RecoveryManager:
             )
             incomplete_rows = conn.execute(incomplete_query).fetchall()
 
+            frames_by_token: dict[str, list[tuple[int, LineageFrame]]] = {}
+            frame_rows = conn.execute(
+                select(
+                    token_lineage_frames_table.c.token_id,
+                    token_lineage_frames_table.c.depth,
+                    token_lineage_frames_table.c.kind,
+                    token_lineage_frames_table.c.group_id,
+                    token_lineage_frames_table.c.member_key,
+                ).where(token_lineage_frames_table.c.run_id == run_id)
+            ).fetchall()
+            for frame_row in frame_rows:
+                frames_by_token.setdefault(frame_row.token_id, []).append(
+                    (
+                        int(frame_row.depth),
+                        LineageFrame(kind=FrameKind(frame_row.kind), group_id=frame_row.group_id, member_key=frame_row.member_key),
+                    )
+                )
+
         row_to_incomplete_tokens: dict[str, set[str]] = {}
         by_row: dict[str, list[IncompleteTokenSpec]] = {}
         for row in incomplete_rows:
@@ -753,6 +775,7 @@ class RecoveryManager:
                     fork_group_id=row.fork_group_id,
                     join_group_id=row.join_group_id,
                     expand_group_id=row.expand_group_id,
+                    lineage_path=tuple(frame for _depth, frame in sorted(frames_by_token.get(row.token_id, []))),
                     token_data_ref=row.token_data_ref,
                     step_in_pipeline=row.step_in_pipeline,
                     max_attempt=-1 if row.max_attempt is None else int(row.max_attempt),

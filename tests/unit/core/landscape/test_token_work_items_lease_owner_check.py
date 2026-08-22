@@ -54,6 +54,7 @@ def _base_row(work_item_id: str) -> dict[str, object]:
         "available_at": now,
         "created_at": now,
         "updated_at": now,
+        "lineage_path_json": "[]",
     }
 
 

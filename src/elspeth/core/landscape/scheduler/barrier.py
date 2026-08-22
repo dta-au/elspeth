@@ -18,6 +18,7 @@ from sqlalchemy.engine import Connection, RowMapping
 
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import lineage_path_to_json
 from elspeth.contracts.scheduler import (
     BarrierEmission,
     BarrierTerminalOutcomeSpec,
@@ -704,6 +705,7 @@ class BarrierJournalRepository:
             "fork_group_id": emission.fork_group_id,
             "join_group_id": emission.join_group_id,
             "expand_group_id": emission.expand_group_id,
+            "lineage_path_json": lineage_path_to_json(emission.lineage_path),
             "coalesce_node_id": emission.coalesce_node_id,
             "coalesce_name": emission.coalesce_name,
             "row_union_name": emission.row_union_name,
@@ -776,6 +778,7 @@ class BarrierJournalRepository:
             fork_group_id=emission.fork_group_id,
             join_group_id=emission.join_group_id,
             expand_group_id=emission.expand_group_id,
+            lineage_path=emission.lineage_path,
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
             row_union_name=emission.row_union_name,

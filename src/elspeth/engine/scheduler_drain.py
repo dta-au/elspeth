@@ -902,6 +902,7 @@ class SchedulerDrainCoordinator:
             fork_group_id=scheduled.fork_group_id,
             join_group_id=scheduled.join_group_id,
             expand_group_id=scheduled.expand_group_id,
+            lineage_path=scheduled.lineage_path,
             resume_attempt_offset=attempt_offset,
             resume_checkpoint_id=self._resume_checkpoint_id if attempt_offset > 0 else None,
         )
@@ -1131,6 +1132,7 @@ class SchedulerDrainCoordinator:
                 fork_group_id=fields.fork_group_id,
                 join_group_id=fields.join_group_id,
                 expand_group_id=fields.expand_group_id,
+                lineage_path=fields.lineage_path,
                 coalesce_node_id=fields.coalesce_node_id,
                 coalesce_name=fields.coalesce_name,
                 row_union_name=fields.row_union_name,
@@ -1155,6 +1157,7 @@ class SchedulerDrainCoordinator:
                 fork_group_id=fields.fork_group_id,
                 join_group_id=fields.join_group_id,
                 expand_group_id=fields.expand_group_id,
+                lineage_path=fields.lineage_path,
                 coalesce_node_id=fields.coalesce_node_id,
                 coalesce_name=fields.coalesce_name,
                 row_union_name=fields.row_union_name,

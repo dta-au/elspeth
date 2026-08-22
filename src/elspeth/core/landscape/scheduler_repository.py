@@ -29,6 +29,7 @@ from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
 )
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import (
     BarrierEmission,
     BarrierTerminalOutcomeSpec,
@@ -130,6 +131,7 @@ class TokenSchedulerRepository:
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
         expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
@@ -153,6 +155,7 @@ class TokenSchedulerRepository:
             fork_group_id=fork_group_id,
             join_group_id=join_group_id,
             expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
@@ -181,6 +184,7 @@ class TokenSchedulerRepository:
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
         expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
@@ -206,6 +210,7 @@ class TokenSchedulerRepository:
             fork_group_id=fork_group_id,
             join_group_id=join_group_id,
             expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
@@ -233,6 +238,7 @@ class TokenSchedulerRepository:
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
         expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
@@ -258,6 +264,7 @@ class TokenSchedulerRepository:
             fork_group_id=fork_group_id,
             join_group_id=join_group_id,
             expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
@@ -284,6 +291,7 @@ class TokenSchedulerRepository:
         fork_group_id: str | None = None,
         join_group_id: str | None = None,
         expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
@@ -308,6 +316,7 @@ class TokenSchedulerRepository:
             fork_group_id=fork_group_id,
             join_group_id=join_group_id,
             expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
@@ -335,6 +344,7 @@ class TokenSchedulerRepository:
         coalesce_node_id: str | None,
         coalesce_name: str | None,
         row_union_name: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
     ) -> dict[str, object]:
         """Historical test seam over :func:`ready_work_item_values`."""
         return ready_work_item_values(
@@ -354,6 +364,7 @@ class TokenSchedulerRepository:
             fork_group_id=fork_group_id,
             join_group_id=join_group_id,
             expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
