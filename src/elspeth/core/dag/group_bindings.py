@@ -196,24 +196,40 @@ def build_group_binding_registry(
     transform_ids_by_name: Mapping[str, NodeID],
 ) -> GroupBindingRegistry:
     """Assemble every bound group (FORK + EXPAND) of one build into one registry."""
-    # branch_name -> CoalesceName, derived from coalesce_plans (never
-    # assembled from a second, independently-maintained map).
+    # branch_name -> CoalesceName / RowUnionName, derived from coalesce_plans
+    # and row_union_branch_specs (never assembled from a second,
+    # independently-maintained map).
     branch_to_coalesce_name: dict[str, CoalesceName] = {
         str(branch_spec.branch_name): plan.name for plan in coalesce_plans.values() for branch_spec in plan.branches
+    }
+    branch_to_row_union_name: dict[str, RowUnionName] = {
+        str(branch_key): spec.row_union_name for branch_key, spec in row_union_branch_specs.items()
     }
 
     bindings: list[GroupBinding] = []
 
     for gate_name, (gate_node_id, fork_to) in fork_rosters.items():
+        # A gate's fork_to is not required to be homogeneous: builder.py
+        # resolves each branch independently against coalesce/row_union
+        # specs or a direct sink name, so one gate can mix a bound branch
+        # with a sink-bound one, or (same-gate only) a coalesce branch with
+        # a row_union branch. "First bound branch wins, in fork_to order" is
+        # the brief's explicit interim (Task 6 rule 2 tightens this to
+        # reject a gate spanning two closers at build time — see the
+        # PINNED interim test in test_group_bindings.py for the exact
+        # divergence this produces against the legacy graph maps until
+        # then). Whichever closer wins, member_roster is filtered to ONLY
+        # the fork_to branches that actually resolve to THAT closer — a
+        # sink-bound or other-closer-bound sibling branch must never join
+        # the roster (review round 1, finding 1 Case A).
         resolved_coalesce: CoalesceName | None = None
         resolved_row_union: RowUnionName | None = None
         for branch in fork_to:
             if branch in branch_to_coalesce_name:
                 resolved_coalesce = branch_to_coalesce_name[branch]
                 break
-            ru_spec = row_union_branch_specs.get(BranchName(branch))
-            if ru_spec is not None:
-                resolved_row_union = ru_spec.row_union_name
+            if branch in branch_to_row_union_name:
+                resolved_row_union = branch_to_row_union_name[branch]
                 break
 
         if resolved_coalesce is not None:
@@ -228,7 +244,7 @@ def build_group_binding_registry(
                     closer_kind=CloserKind.COALESCE,
                     policy=coalesce_settings.policy,
                     on_group_failure=None,
-                    member_roster=tuple(fork_to),
+                    member_roster=tuple(b for b in fork_to if branch_to_coalesce_name.get(b) == resolved_coalesce),
                 )
             )
         elif resolved_row_union is not None:
@@ -242,7 +258,7 @@ def build_group_binding_registry(
                     closer_kind=CloserKind.ROW_UNION,
                     policy="require_all",
                     on_group_failure=None,
-                    member_roster=tuple(fork_to),
+                    member_roster=tuple(b for b in fork_to if branch_to_row_union_name.get(b) == resolved_row_union),
                 )
             )
 
