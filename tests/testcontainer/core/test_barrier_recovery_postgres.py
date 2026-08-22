@@ -32,6 +32,7 @@ from tests.integration.pipeline.test_barrier_intake_dispositions import (
 
 from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
@@ -166,7 +167,7 @@ def test_postgres_recovers_committed_aggregation_result_without_plugin_replay(
                     tokens_table.c.token_id.in_(
                         select(token_lineage_frames_table.c.token_id).where(
                             token_lineage_frames_table.c.run_id == batch.run_id,
-                            token_lineage_frames_table.c.kind == "expand",
+                            token_lineage_frames_table.c.kind == FrameKind.EXPAND.value,
                         )
                     )
                 )

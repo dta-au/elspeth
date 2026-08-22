@@ -26,7 +26,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
-from elspeth.contracts.identity import LineageFrame, pop_closer_frame
+from elspeth.contracts.identity import LineageFrame, pop_closer_frame, pop_fork_frame
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import canonical_json, stable_hash
@@ -193,21 +193,22 @@ class RowTokenRepository:
         """Cross-check a parent's supplied current path against its durable mint frames.
 
         Exact equality, with ONE sanctioned divergence (ruling 27): a row_union
-        release pops the parent's innermost FORK frame, so a released token's
-        current path is its mint frames minus that frame. The release is
+        release pops the parent's FORK frame via contracts.identity.pop_fork_frame
+        — from wherever it sits in the mint path, not necessarily innermost (a
+        row-multiplying transform inside the branch, e.g. an expand, stacks an
+        EXPAND frame on top of the branch's FORK frame before the token reaches
+        the union) — so a released token's current path is its mint frames minus
+        that ONE FORK frame, symmetric with the pop itself. The release is
         journal-first, so the durable witness is the token's own row_union
         work-item row having left BLOCKED.
         """
         mint = self._load_lineage_frames(conn, token_id=parent_ref.token_id, run_id=parent_ref.run_id)
         if supplied == mint:
             return
-        if (
-            mint
-            and mint[-1].kind is FrameKind.FORK
-            and supplied == mint[:-1]
-            and self._row_union_release_witness(conn, token_id=parent_ref.token_id, run_id=parent_ref.run_id)
-        ):
-            return
+        if mint and self._row_union_release_witness(conn, token_id=parent_ref.token_id, run_id=parent_ref.run_id):
+            for frame in mint:
+                if frame.kind is FrameKind.FORK and supplied == pop_fork_frame(mint, group_id=frame.group_id):
+                    return
         raise AuditIntegrityError(
             f"parent lineage divergence for token {parent_ref.token_id!r} (run {parent_ref.run_id!r}): "
             f"supplied={supplied!r} mint={mint!r} and no completed row_union release explains the difference"

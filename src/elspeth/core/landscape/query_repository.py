@@ -310,7 +310,7 @@ class QueryRepository:
         r = self._ops.execute_fetchone(query)
         if r is None:
             return None
-        lineage_path = self._load_lineage_paths([token_id]).get(token_id, ())
+        lineage_path = self._load_lineage_paths([token_id])[token_id]
         return self._token_loader.load(r, lineage_path=lineage_path)
 
     def get_token_for_run(self, run_id: str, token_id: str) -> Token | None:
@@ -319,7 +319,7 @@ class QueryRepository:
         r = self._ops.execute_fetchone(query)
         if r is None:
             return None
-        lineage_path = self._load_lineage_paths([token_id]).get(token_id, ())
+        lineage_path = self._load_lineage_paths([token_id])[token_id]
         return self._token_loader.load(r, lineage_path=lineage_path)
 
     def get_tokens_by_ids(self, token_ids: Sequence[str]) -> list[Token]:
@@ -343,7 +343,7 @@ class QueryRepository:
 
         lineage_paths = self._load_lineage_paths(list(rows_by_id.keys()))
         tokens_by_id = {
-            token_id: self._token_loader.load(row, lineage_path=lineage_paths.get(token_id, ())) for token_id, row in rows_by_id.items()
+            token_id: self._token_loader.load(row, lineage_path=lineage_paths[token_id]) for token_id, row in rows_by_id.items()
         }
         return [tokens_by_id[token_id] for token_id in ordered_token_ids if token_id in tokens_by_id]
 

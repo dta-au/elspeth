@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import func, select, update
@@ -12,6 +13,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame, path_branch_name, path_expand_group_id, path_fork_group_id
+from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape import LandscapeDB
@@ -24,6 +26,7 @@ from elspeth.core.landscape.schema import (
     token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
+    token_work_items_table,
 )
 from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run, register_test_node
 
@@ -2512,3 +2515,117 @@ class TestUnifiedLineageWriters:
         )
         with pytest.raises(AuditIntegrityError, match="divergent empty-expansion"):
             factory.data_flow.record_empty_expansion(ref)
+
+
+def _craft_row_union_release_witness(db: LandscapeDB, *, run_id: str, row_id: str, token_id: str) -> None:
+    """Write a token_work_items row with row_union_name set and a non-BLOCKED
+    status — the durable witness _row_union_release_witness checks for
+    (ruling 27's sanctioned relief in _assert_parent_lineage). A crafted row,
+    not a real row_union run: only the witness predicate's own columns are
+    populated with real ownership (run_id/token_id/row_id); the rest are
+    inert filler satisfying NOT NULL/FK constraints."""
+    now = datetime.now(UTC)
+    with db.write_connection() as conn:
+        conn.execute(
+            token_work_items_table.insert().values(
+                work_item_id=f"wi-{token_id}",
+                run_id=run_id,
+                token_id=token_id,
+                row_id=row_id,
+                step_index=0,
+                ingest_sequence=0,
+                row_payload_json="{}",
+                status=TokenWorkStatus.TERMINAL.value,
+                lineage_path_json="[]",
+                row_union_name="merge",
+                attempt=0,
+                available_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
+class TestAssertParentLineageRuling27Relief:
+    """D8 (task-10-brief.md step 5): _assert_parent_lineage's ONE sanctioned
+    divergence from exact equality is a row_union release popping the
+    parent's FORK frame — from wherever it sits, symmetric with
+    contracts.identity.pop_fork_frame, not just when it's the innermost/last
+    frame. Fix-round-1 BLOCKING finding: the original relief only recognized
+    `mint[-1].kind is FORK` (literal last frame), which false-positives an
+    AuditIntegrityError on a healthy run for exactly the shape ruling 27
+    itself makes reachable — a fork-branch token whose branch contained a
+    mid-branch expand, released with lineage_path (FORK, EXPAND) -> (EXPAND,).
+    """
+
+    def test_refuses_popped_parent_path_without_witness(self) -> None:
+        """(a) fork children minted, path popped by hand, no union journal
+        row for the parent -> AuditIntegrityError."""
+        _db, factory = _setup()
+        row, token = _make_row(factory)
+        (child,), _fg = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            branches=["path-a"],
+        )
+        with pytest.raises(AuditIntegrityError, match="parent lineage divergence"):
+            factory.data_flow.expand_token(
+                parent_ref=TokenRef(token_id=child.token_id, run_id="run-1"),
+                row_id=row.row_id,
+                child_payloads=[{"v": 1}],
+                output_contract=_MINIMAL_CONTRACT,
+                parent_lineage_path=(),
+            )
+
+    def test_accepts_popped_parent_path_with_row_union_witness(self) -> None:
+        """(b) same, but with a crafted completed row_union work-item row for
+        the parent -> accepted; child frames = popped path + EXPAND frame."""
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        (child,), _fg = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            branches=["path-a"],
+        )
+        _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=child.token_id)
+
+        (grandchild,), expand_group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=child.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"v": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+            parent_lineage_path=(),
+        )
+        grandchild_paths = factory.data_flow.load_lineage_paths("run-1", [grandchild.token_id])
+        assert grandchild_paths[grandchild.token_id] == (
+            LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=grandchild.token_id),
+        )
+
+    def test_refuses_two_frames_short_even_with_witness(self) -> None:
+        """(c) supplied shorter by TWO frames with the witness present ->
+        still refused — the weakening admits exactly one popped FORK frame,
+        never a prefix walk."""
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        (child,), _fg = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            branches=["path-a"],
+        )
+        (grandchild,), _eg = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=child.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"v": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        # grandchild's mint frames are now (FORK, EXPAND) — 2 frames.
+        _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=grandchild.token_id)
+
+        with pytest.raises(AuditIntegrityError, match="parent lineage divergence"):
+            factory.data_flow.expand_token(
+                parent_ref=TokenRef(token_id=grandchild.token_id, run_id="run-1"),
+                row_id=row.row_id,
+                child_payloads=[{"v": 2}],
+                output_contract=_MINIMAL_CONTRACT,
+                parent_lineage_path=(),
+            )

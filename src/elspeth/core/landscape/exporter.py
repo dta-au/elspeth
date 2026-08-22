@@ -963,7 +963,7 @@ class LandscapeExporter:
                     "row_id": token.row_id,
                     "step_in_pipeline": token.step_in_pipeline,
                     "lineage_path": [
-                        [frame.kind.value, frame.group_id, frame.member_key] for frame in lineage_paths_by_token.get(token.token_id, ())
+                        [frame.kind.value, frame.group_id, frame.member_key] for frame in lineage_paths_by_token[token.token_id]
                     ],
                     "join_group_id": token.join_group_id,
                     "created_at": token.created_at.isoformat(),

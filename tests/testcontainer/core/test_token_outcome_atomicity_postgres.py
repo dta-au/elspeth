@@ -22,7 +22,7 @@ from tests.fixtures.stores import MockPayloadStore
 from elspeth.contracts import ExecutionError, NodeStateStatus, NodeType, RunStatus
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.sink_effects import (
@@ -208,7 +208,7 @@ def test_postgres_batch_expansion_claims_batch_once_under_contention(
         children = conn.execute(
             select(tokens_table.c.token_id).where(
                 tokens_table.c.token_id.in_(
-                    select(token_lineage_frames_table.c.token_id).where(token_lineage_frames_table.c.kind == "expand")
+                    select(token_lineage_frames_table.c.token_id).where(token_lineage_frames_table.c.kind == FrameKind.EXPAND.value)
                 )
             )
         ).all()

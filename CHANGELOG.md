@@ -43,7 +43,7 @@ proposal-event type so an auto-commit blocked by the settlement-boundary
 trust-mode recheck leaves a durable audit record instead of silently falling
 back to the review path.
 Landscape
-`SQLITE_SCHEMA_EPOCH` advances from 29 to 34. Epoch 30 adds the durable
+`SQLITE_SCHEMA_EPOCH` advances from 29 to 35. Epoch 30 adds the durable
 row_union barrier attribution column to scheduler work items, and epoch 31
 constrains scheduler work-item status to the public six-state vocabulary so
 removed states cannot be persisted through direct SQL. Epoch 32 atomically
@@ -57,11 +57,14 @@ run-scoped per-token read no longer has to choose between two single-column
 indexes that database statistics cannot separate. Landscape SQLITE_SCHEMA_EPOCH
 33 → 34: unified-lineage tables (token_lineage_frames, group_records,
 group_losses) and token_work_items.lineage_path_json; existing audit stores
-must be recreated. ELSPETH does not migrate
+must be recreated. Landscape SQLITE_SCHEMA_EPOCH 34 → 35: unified-lineage
+flip — tri-field lineage columns retired onto token_lineage_frames +
+lineage_path_json; token_outcomes.expected_branches_json removed; existing
+audit stores must be recreated. ELSPETH does not migrate
 either predecessor database in place before 1.0. Archive or export required
 evidence, stop the old service, recreate stale session and Landscape stores,
 then install
-0.7.2. A Landscape database below epoch 34 is not current and must be recreated.
+0.7.2. A Landscape database below epoch 35 is not current and must be recreated.
 Do not roll older code back over the recreated databases; keep the service
 drained and repair this release forward.
 

@@ -5,8 +5,12 @@ row_union is the correlated, same-row_id, N->N UNION ALL barrier
 (row_union_name, row_id) until EVERY declared branch has arrived, then
 releases the ORIGINAL tokens as one group in declared branch order. It never
 merges fields, deduplicates rows, fabricates rows, or synthesizes a wide
-intermediate row — payloads pass through untouched and token identity
-(token_id, row_id, branch_name, fork_group_id) is preserved.
+intermediate row — payloads pass through untouched and token_id/row_id are
+preserved, but the release pops each released token's FORK frame (ruling 27:
+RowUnionExecutor._pop_released_group), so branch_name/fork_group_id go None
+downstream of the union. A consumer needing the pre-union branch identity
+reads it from audit rows (token_lineage_frames / group_records), not the
+live token.
 
 v1 arrival policy is require_all only, fail-closed with no partial release:
 - a timeout fails the whole pending group;
