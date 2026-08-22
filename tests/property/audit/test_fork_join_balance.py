@@ -2083,6 +2083,9 @@ class TestForkRecoveryInvariant:
             available_at=datetime.now(UTC),
             branch_name=incomplete_branch.branch_name,
             fork_group_id=incomplete_branch.fork_group_id,
+            lineage_path=(
+                LineageFrame(kind=FrameKind.FORK, group_id=incomplete_branch.fork_group_id, member_key=incomplete_branch.branch_name),
+            ),
             coalesce_node_id=coalesce_node_id,
             coalesce_name="merge",
         )
@@ -2109,6 +2112,7 @@ class TestForkRecoveryInvariant:
             now=seed_now,
             branch_name=held_branch_name,
             fork_group_id=held_branch.fork_group_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=held_branch.fork_group_id, member_key=held_branch_name),),
             coalesce_node_id=coalesce_node_id,
             coalesce_name="merge",
         )

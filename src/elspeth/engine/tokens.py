@@ -15,8 +15,9 @@ from typing import Any
 from elspeth.contracts import AggregationParentDisposition, CoalesceParentCompletion, SourceRow, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.enums import TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame, pop_closer_frame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -292,16 +293,30 @@ class TokenManager:
         # resume_attempt_offset and resume_checkpoint_id are intentionally NOT
         # inherited here. Fork children mint new token_ids with no run-1 node_states,
         # so attempt=0 is correct and they must not inherit the parent's resume offset.
-        child_infos = [
-            TokenInfo(
-                row_id=parent_token.row_id,
-                token_id=child.token_id,
-                row_data=copy.deepcopy(data),
-                branch_name=child.branch_name,
-                fork_group_id=child.fork_group_id,
+        child_infos: list[TokenInfo] = []
+        for child in children:
+            if child.branch_name is None:
+                # The durable writer always inserts branch_name for every fork
+                # child (data_flow.fork_token); a None here is audit
+                # corruption, not a config shape. Narrowing explicitly (rather
+                # than trusting the type) also satisfies LineageFrame's own
+                # fail-closed str-only member_key.
+                raise OrchestrationInvariantError(
+                    f"fork_token: child token {child.token_id!r} minted with branch_name=None — every fork child must carry its branch name"
+                )
+            child_infos.append(
+                TokenInfo(
+                    row_id=parent_token.row_id,
+                    token_id=child.token_id,
+                    row_data=copy.deepcopy(data),
+                    branch_name=child.branch_name,
+                    fork_group_id=child.fork_group_id,
+                    lineage_path=(
+                        *parent_token.lineage_path,
+                        LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=child.branch_name),
+                    ),
+                )
             )
-            for child in children
-        ]
         return child_infos, fork_group_id
 
     def coalesce_tokens(
@@ -336,6 +351,21 @@ class TokenManager:
 
         step = self._step_resolver(node_id)
 
+        # Strict pop (rulings 24/28) via contracts.identity.pop_closer_frame: a
+        # closer pops exactly its own innermost FORK frame; §7 rule 5 (WS2)
+        # makes any other shape unbuildable, so a violation here is an
+        # engine/validation bug, not a config shape.
+        anchor = parents[0].lineage_path
+        if not anchor or anchor[-1].kind is not FrameKind.FORK:
+            raise OrchestrationInvariantError(
+                f"coalesce_tokens: parent token {parents[0].token_id!r} has no innermost FORK frame to pop (lineage_path={anchor!r})"
+            )
+        shared_group_id = anchor[-1].group_id
+        remaining_paths = {pop_closer_frame(parent.lineage_path, kind=FrameKind.FORK, group_id=shared_group_id) for parent in parents}
+        if len(remaining_paths) != 1:
+            raise OrchestrationInvariantError("coalesce_tokens: parents do not share their remaining lineage path after the pop")
+        merged_path = remaining_paths.pop()
+
         # Pass the merged row dict and its contract so the envelope is persisted
         # atomically with the coalesced token INSERT (epoch 11: token_data_ref).
         # merged_data is a PipelineRow; .to_dict() is mandated over dict(row).
@@ -366,6 +396,7 @@ class TokenManager:
             token_id=merged.token_id,
             row_data=merged_data,
             join_group_id=merged.join_group_id,
+            lineage_path=merged_path,
         )
 
     def expand_token(
@@ -453,6 +484,10 @@ class TokenManager:
                 row_data=PipelineRow(copy.deepcopy(row_data), output_contract),
                 branch_name=parent_token.branch_name,  # Inherit branch
                 expand_group_id=db_child.expand_group_id,
+                lineage_path=(
+                    *parent_token.lineage_path,
+                    LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=db_child.token_id),
+                ),
             )
             for db_child, row_data in zip(db_children, expanded_rows, strict=True)
         ]

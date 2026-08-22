@@ -154,14 +154,24 @@ def _persist_token_for_scheduler(
     if factory.query.get_token(token.token_id) is None:
         resolved_fork_group_id = token.fork_group_id or (f"test-fork:{token.row_id}" if token.branch_name is not None else None)
         # A fabricated branch token models a fork child — mint the matching
-        # FORK lineage frame via the create_token(..., lineage_frames=) seam
-        # so coalesce_tokens' durable strict pop (spec rulings 24/28) has a
-        # frame to pop. Never weaken the pop to accommodate a raw-seeded
+        # lineage frame(s) durably via the create_token(..., lineage_frames=)
+        # seam so coalesce_tokens' durable strict pop (spec rulings 24/28) has
+        # a frame to pop. Never weaken the pop to accommodate a raw-seeded
         # fixture; fix the fixture instead.
+        #
+        # Prefer the token's OWN lineage_path when the fixture set one — that
+        # is the real (possibly multi-frame) in-memory path threaded straight
+        # through, per the create_token seam contract (WS1a Task 8). Fall
+        # back to a synthetic single-FORK reconstruction from branch_name for
+        # older fixtures that never populated lineage_path.
         lineage_frames = (
-            (LineageFrame(kind=FrameKind.FORK, group_id=resolved_fork_group_id, member_key=token.branch_name),)
-            if token.branch_name is not None and resolved_fork_group_id is not None
-            else ()
+            token.lineage_path
+            if token.lineage_path
+            else (
+                (LineageFrame(kind=FrameKind.FORK, group_id=resolved_fork_group_id, member_key=token.branch_name),)
+                if token.branch_name is not None and resolved_fork_group_id is not None
+                else ()
+            )
         )
         factory.data_flow.create_token(
             token.row_id,
@@ -214,6 +224,7 @@ def _persist_blocked_scheduler_work(
         fork_group_id=token.fork_group_id,
         join_group_id=token.join_group_id,
         expand_group_id=token.expand_group_id,
+        lineage_path=token.lineage_path,
         coalesce_name=coalesce_name,
     )
     processor._scheduler.mark_blocked(

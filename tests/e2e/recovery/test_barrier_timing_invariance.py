@@ -35,7 +35,8 @@ import pytest
 from sqlalchemy import update
 
 from elspeth.contracts import TokenInfo
-from elspeth.contracts.enums import TerminalPath, TriggerType
+from elspeth.contracts.enums import FrameKind, TerminalPath, TriggerType
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import CoalesceSettings
@@ -221,7 +222,14 @@ class TestCoalesceTimeoutInvariance:
         # T_b: branch-a's BLOCKED row is deposited (live hold stashed exactly
         # as the drain would) and adopted by leader A's intake in the same
         # clock instant.
-        token_a = TokenInfo(row_id="row-1", token_id="tok-branch-a", row_data=make_row({"amount": 1}), branch_name="a")
+        token_a = TokenInfo(
+            row_id="row-1",
+            token_id="tok-branch-a",
+            row_data=make_row({"amount": 1}),
+            branch_name="a",
+            fork_group_id="fg-row-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-row-1", member_key="a"),),
+        )
         mono_at_tb = clock.monotonic()
         _persist_blocked_scheduler_work(
             factory, processor_a, token_a, node_id=COALESCE_NODE, barrier_key="merge", adopted=False, coalesce_name="merge"

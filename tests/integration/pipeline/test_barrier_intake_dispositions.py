@@ -41,7 +41,8 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import TokenInfo
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import CoalesceName, NodeID
@@ -145,12 +146,21 @@ def _coalesce_processor(
     )
 
 
-def _branch_token(branch: str, *, token_id: str | None = None, row_id: str = "row-1") -> TokenInfo:
+def _branch_token(branch: str, *, token_id: str | None = None, row_id: str = "row-1", fork_group_id: str = "fg-row-1") -> TokenInfo:
+    """Fabricate a fork-branch token carrying a REAL FORK lineage frame.
+
+    ``fork_group_id`` defaults to a fixed value so sibling branches minted by
+    separate ``_branch_token`` calls within one test share the same fork
+    group — exactly what coalesce_tokens' strict pop (rulings 24/28) expects
+    of true siblings.
+    """
     return TokenInfo(
         row_id=row_id,
         token_id=token_id or f"tok-branch-{branch}",
         row_data=make_row({f"field_{branch}": 1}),
         branch_name=branch,
+        fork_group_id=fork_group_id,
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch),),
     )
 
 

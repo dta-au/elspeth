@@ -3,7 +3,8 @@
 
 import pytest
 
-from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame, TokenInfo
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.testing import make_field, make_row, make_source_row
@@ -241,8 +242,23 @@ class TestTokenManagerCoalesceTokens:
         # Create parent tokens with PipelineRow
         parent_row_a = make_row({"amount": 100, "branch_a_field": "a"}, contract=contract)
         parent_row_b = make_row({"amount": 100, "branch_b_field": "b"}, contract=contract)
-        parent_a = TokenInfo(row_id="row_001", token_id="token_a", row_data=parent_row_a)
-        parent_b = TokenInfo(row_id="row_001", token_id="token_b", row_data=parent_row_b)
+        # Fork siblings need a real, shared innermost FORK frame so
+        # coalesce_tokens' in-memory strict pop (rulings 24/28) has a frame
+        # to pop before the mocked recorder is ever reached.
+        parent_a = TokenInfo(
+            row_id="row_001",
+            token_id="token_a",
+            row_data=parent_row_a,
+            fork_group_id="fg_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg_001", member_key="a"),),
+        )
+        parent_b = TokenInfo(
+            row_id="row_001",
+            token_id="token_b",
+            row_data=parent_row_b,
+            fork_group_id="fg_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg_001", member_key="b"),),
+        )
 
         # Merged data as PipelineRow
         merged_row = make_row(
