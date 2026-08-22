@@ -521,6 +521,53 @@ def test_diagnostics_returns_bounded_tokens_states_operations_and_artifacts(tmp_
         db.close()
 
 
+def test_diagnostics_projects_lineage_frames(tmp_path) -> None:
+    """The batch token_lineage_frames query and RunDiagnosticLineageFrame
+    projection actually run and round-trip a real frame, not just the
+    empty-lineage shape _seed_diagnostics_run's tokens carry."""
+    from elspeth.contracts.enums import FrameKind
+    from elspeth.contracts.identity import LineageFrame
+
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-lineage"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "text")
+        row = factory.data_flow.create_row(
+            web_run_id, "source", 0, {"html": "<h1>A</h1>"}, row_id="row-0", source_row_index=0, ingest_sequence=0
+        )
+        token = factory.data_flow.create_token(
+            row.row_id,
+            token_id="token-fork-0",
+            branch_name="path_a",
+            fork_group_id="fg-1",
+            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
+        )
+        factory.data_flow.record_token_outcome(
+            TokenRef(token_id=token.token_id, run_id=web_run_id),
+            TerminalOutcome.SUCCESS,
+            TerminalPath.DEFAULT_FLOW,
+            sink_name="source",
+        )
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="running",
+        )
+
+        assert [token.token_id for token in diagnostics.tokens] == ["token-fork-0"]
+        lineage = diagnostics.tokens[0].lineage
+        assert len(lineage) == 1
+        assert lineage[0].kind == "fork"
+        assert lineage[0].group_id == "fg-1"
+        assert lineage[0].member_key == "path_a"
+    finally:
+        db.close()
+
+
 def test_diagnostics_rejects_corrupt_landscape_types(tmp_path) -> None:
     db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
     try:
