@@ -31,7 +31,7 @@ class LineageFrame:
         if type(self.kind) is not FrameKind:
             raise TypeError(f"LineageFrame.kind must be FrameKind, got {type(self.kind).__name__}: {self.kind!r}")
         for field_name, value in (("group_id", self.group_id), ("member_key", self.member_key)):
-            if not isinstance(value, str):
+            if type(value) is not str:
                 raise TypeError(f"LineageFrame.{field_name} must be str, got {type(value).__name__}: {value!r}")
             if not value:
                 raise ValueError(f"LineageFrame.{field_name} must not be empty")

@@ -775,7 +775,9 @@ class RecoveryManager:
                     fork_group_id=row.fork_group_id,
                     join_group_id=row.join_group_id,
                     expand_group_id=row.expand_group_id,
-                    lineage_path=tuple(frame for _depth, frame in sorted(frames_by_token.get(row.token_id, []))),
+                    lineage_path=(
+                        tuple(frame for _depth, frame in sorted(frames_by_token[row.token_id])) if row.token_id in frames_by_token else ()
+                    ),
                     token_data_ref=row.token_data_ref,
                     step_in_pipeline=row.step_in_pipeline,
                     max_attempt=-1 if row.max_attempt is None else int(row.max_attempt),
