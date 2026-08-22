@@ -1,0 +1,175 @@
+{
+ "case_id": "one-terminal-fails",
+ "expansions": [],
+ "rows": [
+  3,
+  3,
+  3
+ ],
+ "scenario_id": "fork-multiple-terminals-partial-failure",
+ "sink_outputs": [
+  {
+   "rows": [
+    "{\"id\":1,\"value\":10}",
+    "{\"id\":2,\"value\":20}",
+    "{\"id\":3,\"value\":30}"
+   ],
+   "sink_name": "survivor"
+  }
+ ],
+ "status": "completed_with_failures",
+ "terminal_dispositions": [
+  {
+   "key": "primary:0#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "primary:0#0"
+  },
+  {
+   "error_hash": "208d0a1cd0ba594f",
+   "key": "primary:0#1",
+   "outcome": "failure",
+   "path": "sink_discarded",
+   "sink_name": "__discard__",
+   "token_key": "primary:0#1"
+  },
+  {
+   "key": "primary:0#2",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "survivor",
+   "token_key": "primary:0#2"
+  },
+  {
+   "key": "primary:1#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "primary:1#0"
+  },
+  {
+   "error_hash": "208d0a1cd0ba594f",
+   "key": "primary:1#1",
+   "outcome": "failure",
+   "path": "sink_discarded",
+   "sink_name": "__discard__",
+   "token_key": "primary:1#1"
+  },
+  {
+   "key": "primary:1#2",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "survivor",
+   "token_key": "primary:1#2"
+  },
+  {
+   "key": "primary:2#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "primary:2#0"
+  },
+  {
+   "error_hash": "208d0a1cd0ba594f",
+   "key": "primary:2#1",
+   "outcome": "failure",
+   "path": "sink_discarded",
+   "sink_name": "__discard__",
+   "token_key": "primary:2#1"
+  },
+  {
+   "key": "primary:2#2",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "survivor",
+   "token_key": "primary:2#2"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "primary:0#0",
+   "parents": [],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": "failing",
+   "key": "primary:0#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": "survivor",
+   "key": "primary:0#2",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:1#0",
+   "parents": [],
+   "row_key": "primary:1"
+  },
+  {
+   "branch_name": "failing",
+   "key": "primary:1#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:1#0"
+    }
+   ],
+   "row_key": "primary:1"
+  },
+  {
+   "branch_name": "survivor",
+   "key": "primary:1#2",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:1#0"
+    }
+   ],
+   "row_key": "primary:1"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:2#0",
+   "parents": [],
+   "row_key": "primary:2"
+  },
+  {
+   "branch_name": "failing",
+   "key": "primary:2#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:2#0"
+    }
+   ],
+   "row_key": "primary:2"
+  },
+  {
+   "branch_name": "survivor",
+   "key": "primary:2#2",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:2#0"
+    }
+   ],
+   "row_key": "primary:2"
+  }
+ ]
+}

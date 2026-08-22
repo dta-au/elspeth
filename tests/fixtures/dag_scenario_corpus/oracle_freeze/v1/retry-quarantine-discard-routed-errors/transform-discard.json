@@ -1,0 +1,30 @@
+{
+ "case_id": "transform-discard",
+ "expansions": [],
+ "rows": [
+  1,
+  0,
+  1
+ ],
+ "scenario_id": "retry-quarantine-discard-routed-errors",
+ "sink_outputs": [],
+ "status": "completed_with_failures",
+ "terminal_dispositions": [
+  {
+   "error_hash": "a2f3ed6052168a71",
+   "key": "primary:0#0",
+   "outcome": "failure",
+   "path": "quarantined_at_source",
+   "sink_name": null,
+   "token_key": "primary:0#0"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "primary:0#0",
+   "parents": [],
+   "row_key": "primary:0"
+  }
+ ]
+}

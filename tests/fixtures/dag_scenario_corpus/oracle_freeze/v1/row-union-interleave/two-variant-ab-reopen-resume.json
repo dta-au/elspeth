@@ -1,0 +1,237 @@
+{
+ "case_id": "two-variant-ab-reopen-resume",
+ "expansions": [],
+ "rows": [
+  4,
+  1,
+  0
+ ],
+ "scenario_id": "row-union-interleave",
+ "sink_outputs": [
+  {
+   "rows": [
+    "{\"baseline_count\":4,\"baseline_mean\":25,\"baseline_missing_count\":0,\"baseline_non_finite_count\":0,\"baseline_stdev\":12.909944487358056,\"baseline_total_count\":4,\"baseline_variant\":\"control\",\"batch_size\":8,\"confidence_95_high\":35.308258738155935,\"confidence_95_low\":-10.308258738155935,\"mean_delta\":12.5,\"relative_lift\":0.5,\"score_field\":\"score\",\"standard_error\":11.636866703140784,\"variant\":\"treatment\",\"variant_count\":4,\"variant_field\":\"prompt_variant\",\"variant_mean\":37.5,\"variant_missing_count\":0,\"variant_non_finite_count\":0,\"variant_stdev\":19.364916731037084,\"variant_total_count\":4,\"z_score\":1.0741723110591492}"
+   ],
+   "sink_name": "output"
+  }
+ ],
+ "status": "completed",
+ "terminal_dispositions": [
+  {
+   "key": "primary:0#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "primary:0#0"
+  },
+  {
+   "key": "primary:0#1",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "primary:0#1"
+  },
+  {
+   "key": "primary:0#2",
+   "outcome": "transient",
+   "path": "batch_consumed",
+   "sink_name": null,
+   "token_key": "primary:0#2"
+  },
+  {
+   "key": "primary:0#3",
+   "outcome": "transient",
+   "path": "batch_consumed",
+   "sink_name": null,
+   "token_key": "primary:0#3"
+  },
+  {
+   "key": "primary:1#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "primary:1#0"
+  },
+  {
+   "key": "primary:1#1",
+   "outcome": "transient",
+   "path": "batch_consumed",
+   "sink_name": null,
+   "token_key": "primary:1#1"
+  },
+  {
+   "key": "primary:1#2",
+   "outcome": "transient",
+   "path": "batch_consumed",
+   "sink_name": null,
+   "token_key": "primary:1#2"
+  },
+  {
+   "key": "primary:2#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "primary:2#0"
+  },
+  {
+   "key": "primary:2#1",
+   "outcome": "transient",
+   "path": "batch_consumed",
+   "sink_name": null,
+   "token_key": "primary:2#1"
+  },
+  {
+   "key": "primary:2#2",
+   "outcome": "transient",
+   "path": "batch_consumed",
+   "sink_name": null,
+   "token_key": "primary:2#2"
+  },
+  {
+   "key": "primary:3#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "primary:3#0"
+  },
+  {
+   "key": "primary:3#1",
+   "outcome": "transient",
+   "path": "batch_consumed",
+   "sink_name": null,
+   "token_key": "primary:3#1"
+  },
+  {
+   "key": "primary:3#2",
+   "outcome": "transient",
+   "path": "batch_consumed",
+   "sink_name": null,
+   "token_key": "primary:3#2"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "primary:0#0",
+   "parents": [],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:0#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:0#2"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": "control_branch",
+   "key": "primary:0#2",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": "treatment_branch",
+   "key": "primary:0#3",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:1#0",
+   "parents": [],
+   "row_key": "primary:1"
+  },
+  {
+   "branch_name": "control_branch",
+   "key": "primary:1#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:1#0"
+    }
+   ],
+   "row_key": "primary:1"
+  },
+  {
+   "branch_name": "treatment_branch",
+   "key": "primary:1#2",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:1#0"
+    }
+   ],
+   "row_key": "primary:1"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:2#0",
+   "parents": [],
+   "row_key": "primary:2"
+  },
+  {
+   "branch_name": "control_branch",
+   "key": "primary:2#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:2#0"
+    }
+   ],
+   "row_key": "primary:2"
+  },
+  {
+   "branch_name": "treatment_branch",
+   "key": "primary:2#2",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:2#0"
+    }
+   ],
+   "row_key": "primary:2"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:3#0",
+   "parents": [],
+   "row_key": "primary:3"
+  },
+  {
+   "branch_name": "control_branch",
+   "key": "primary:3#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:3#0"
+    }
+   ],
+   "row_key": "primary:3"
+  },
+  {
+   "branch_name": "treatment_branch",
+   "key": "primary:3#2",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:3#0"
+    }
+   ],
+   "row_key": "primary:3"
+  }
+ ]
+}

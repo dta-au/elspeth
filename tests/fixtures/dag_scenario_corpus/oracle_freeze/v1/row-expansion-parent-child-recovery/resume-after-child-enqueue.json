@@ -1,0 +1,221 @@
+{
+ "case_id": "resume-after-child-enqueue",
+ "expansions": [
+  {
+   "children": [
+    {
+     "ordinal": 0,
+     "token_key": "primary:0#1"
+    },
+    {
+     "ordinal": 1,
+     "token_key": "primary:0#2"
+    }
+   ],
+   "expected_child_count": 2,
+   "key": "expand|primary:0#0",
+   "parent_token_key": "primary:0#0"
+  },
+  {
+   "children": [
+    {
+     "ordinal": 0,
+     "token_key": "primary:1#1"
+    }
+   ],
+   "expected_child_count": 1,
+   "key": "expand|primary:1#0",
+   "parent_token_key": "primary:1#0"
+  },
+  {
+   "children": [
+    {
+     "ordinal": 0,
+     "token_key": "primary:2#1"
+    },
+    {
+     "ordinal": 1,
+     "token_key": "primary:2#2"
+    },
+    {
+     "ordinal": 2,
+     "token_key": "primary:2#3"
+    }
+   ],
+   "expected_child_count": 3,
+   "key": "expand|primary:2#0",
+   "parent_token_key": "primary:2#0"
+  }
+ ],
+ "rows": [
+  3,
+  6,
+  0
+ ],
+ "scenario_id": "row-expansion-parent-child-recovery",
+ "sink_outputs": [
+  {
+   "rows": [
+    "{\"item\":{\"qty\":2,\"sku\":\"A1\"},\"item_index\":0,\"order_id\":1}",
+    "{\"item\":{\"qty\":1,\"sku\":\"B2\"},\"item_index\":1,\"order_id\":1}",
+    "{\"item\":{\"qty\":5,\"sku\":\"C3\"},\"item_index\":0,\"order_id\":2}",
+    "{\"item\":{\"qty\":1,\"sku\":\"A1\"},\"item_index\":0,\"order_id\":3}",
+    "{\"item\":{\"qty\":3,\"sku\":\"D4\"},\"item_index\":1,\"order_id\":3}",
+    "{\"item\":{\"qty\":2,\"sku\":\"E5\"},\"item_index\":2,\"order_id\":3}"
+   ],
+   "sink_name": "output"
+  }
+ ],
+ "status": "completed",
+ "terminal_dispositions": [
+  {
+   "key": "primary:0#0",
+   "outcome": "transient",
+   "path": "expand_parent",
+   "sink_name": null,
+   "token_key": "primary:0#0"
+  },
+  {
+   "key": "primary:0#1",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "primary:0#1"
+  },
+  {
+   "key": "primary:0#2",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "primary:0#2"
+  },
+  {
+   "key": "primary:1#0",
+   "outcome": "transient",
+   "path": "expand_parent",
+   "sink_name": null,
+   "token_key": "primary:1#0"
+  },
+  {
+   "key": "primary:1#1",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "primary:1#1"
+  },
+  {
+   "key": "primary:2#0",
+   "outcome": "transient",
+   "path": "expand_parent",
+   "sink_name": null,
+   "token_key": "primary:2#0"
+  },
+  {
+   "key": "primary:2#1",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "primary:2#1"
+  },
+  {
+   "key": "primary:2#2",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "primary:2#2"
+  },
+  {
+   "key": "primary:2#3",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "primary:2#3"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "primary:0#0",
+   "parents": [],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:0#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:0#2",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:1#0",
+   "parents": [],
+   "row_key": "primary:1"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:1#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:1#0"
+    }
+   ],
+   "row_key": "primary:1"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:2#0",
+   "parents": [],
+   "row_key": "primary:2"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:2#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:2#0"
+    }
+   ],
+   "row_key": "primary:2"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:2#2",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:2#0"
+    }
+   ],
+   "row_key": "primary:2"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:2#3",
+   "parents": [
+    {
+     "ordinal": 2,
+     "parent_key": "primary:2#0"
+    }
+   ],
+   "row_key": "primary:2"
+  }
+ ]
+}

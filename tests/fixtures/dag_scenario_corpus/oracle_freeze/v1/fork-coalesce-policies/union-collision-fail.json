@@ -1,0 +1,86 @@
+{
+ "case_id": "union-collision-fail",
+ "expansions": [],
+ "rows": [
+  1,
+  0,
+  3
+ ],
+ "scenario_id": "fork-coalesce-policies",
+ "sink_outputs": [],
+ "status": "failed",
+ "terminal_dispositions": [
+  {
+   "key": "primary:0#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "primary:0#0"
+  },
+  {
+   "error_hash": "452baff1f0d86682",
+   "key": "primary:0#1",
+   "outcome": "failure",
+   "path": "unrouted",
+   "sink_name": null,
+   "token_key": "primary:0#1"
+  },
+  {
+   "error_hash": "452baff1f0d86682",
+   "key": "primary:0#2",
+   "outcome": "failure",
+   "path": "unrouted",
+   "sink_name": null,
+   "token_key": "primary:0#2"
+  },
+  {
+   "error_hash": "452baff1f0d86682",
+   "key": "primary:0#3",
+   "outcome": "failure",
+   "path": "unrouted",
+   "sink_name": null,
+   "token_key": "primary:0#3"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "primary:0#0",
+   "parents": [],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": "path_a",
+   "key": "primary:0#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": "path_b",
+   "key": "primary:0#2",
+   "parents": [
+    {
+     "ordinal": 2,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": "path_c",
+   "key": "primary:0#3",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  }
+ ]
+}
