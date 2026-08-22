@@ -342,6 +342,10 @@ class DataFlowRepository:
         """Fork a token to multiple branches."""
         return self.tokens.fork_token(parent_ref, row_id, branches, step_in_pipeline=step_in_pipeline)
 
+    def load_lineage_paths(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[LineageFrame, ...]]:
+        """Batch-load durable lineage paths for many tokens in one query."""
+        return self.tokens.load_lineage_paths(run_id, token_ids)
+
     def coalesce_tokens(
         self,
         parent_refs: list[TokenRef],

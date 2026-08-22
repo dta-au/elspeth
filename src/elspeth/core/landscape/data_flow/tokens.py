@@ -102,6 +102,50 @@ class RowTokenRepository:
         ).fetchall()
         return tuple(LineageFrame(kind=FrameKind(row.kind), group_id=str(row.group_id), member_key=str(row.member_key)) for row in rows)
 
+    _LOAD_LINEAGE_PATHS_CHUNK_SIZE = 500
+
+    def load_lineage_paths(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[LineageFrame, ...]]:
+        """Batch-load lineage paths from token_lineage_frames (outermost first).
+
+        Every requested token_id is a key; tokens with no frames rows map to ().
+        Depth gaps or duplicate depths are audit corruption (the frames are
+        written atomically with the token INSERT — WS1a Task 6).
+        """
+        token_id_list = list(token_ids)
+        paths: dict[str, list[tuple[int, LineageFrame]]] = {token_id: [] for token_id in token_id_list}
+        if token_id_list:
+            with self._db.connection() as conn:
+                for offset in range(0, len(token_id_list), self._LOAD_LINEAGE_PATHS_CHUNK_SIZE):
+                    chunk = token_id_list[offset : offset + self._LOAD_LINEAGE_PATHS_CHUNK_SIZE]
+                    rows = conn.execute(
+                        select(
+                            token_lineage_frames_table.c.token_id,
+                            token_lineage_frames_table.c.depth,
+                            token_lineage_frames_table.c.kind,
+                            token_lineage_frames_table.c.group_id,
+                            token_lineage_frames_table.c.member_key,
+                        )
+                        .where(token_lineage_frames_table.c.run_id == run_id)
+                        .where(token_lineage_frames_table.c.token_id.in_(chunk))
+                        .order_by(token_lineage_frames_table.c.token_id, token_lineage_frames_table.c.depth)
+                    ).fetchall()
+                    for row in rows:
+                        paths[str(row.token_id)].append(
+                            (
+                                int(row.depth),
+                                LineageFrame(kind=FrameKind(row.kind), group_id=str(row.group_id), member_key=str(row.member_key)),
+                            )
+                        )
+        result: dict[str, tuple[LineageFrame, ...]] = {}
+        for token_id, entries in paths.items():
+            depths = [depth for depth, _frame in entries]
+            if depths != list(range(len(depths))):
+                raise AuditIntegrityError(
+                    f"token_lineage_frames for token {token_id!r} (run {run_id!r}) has non-dense depths {depths} — audit corruption"
+                )
+            result[token_id] = tuple(frame for _depth, frame in entries)
+        return result
+
     @staticmethod
     def _insert_lineage_frames(conn: Connection, *, token_id: str, run_id: str, frames: Sequence[LineageFrame]) -> None:
         for depth, frame in enumerate(frames):
