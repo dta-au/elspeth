@@ -16,8 +16,10 @@ from pydantic import ValidationError
 from elspeth.core.config import (
     AggregationSettings,
     CoalesceSettings,
+    CollectorSettings,
     ElspethSettings,
     GateSettings,
+    ScopeSettings,
     SinkSettings,
     SourceSettings,
     TransformSettings,
@@ -147,6 +149,49 @@ class TestCrossTypeNameCollisions:
                         on_success="output",
                         on_error="discard",
                         options={"schema": {"mode": "observed"}},
+                    ),
+                ],
+            )
+
+    def test_transform_name_equals_collector_name_rejected(self) -> None:
+        """A transform (scope opener) and collector (scope closer) sharing the same name must be rejected.
+
+        Collectors drive node IDs (CollectorSettings.name docstring) exactly
+        like every other processing node, so they must join the same
+        cross-type uniqueness check — the scope binding itself tolerates the
+        shared name (opener and closer resolve independently by name), so
+        this collision is invisible to _validate_scope_bindings and only
+        this validator catches it.
+        """
+        with pytest.raises(ValidationError, match=r"both.*transform.*and.*collector|both.*collector.*and.*transform"):
+            ElspethSettings(
+                sources={"primary": _source()},
+                sinks={"output": _sink()},
+                transforms=[
+                    TransformSettings(
+                        name="shared_name",
+                        plugin="passthrough",
+                        input="src_out",
+                        on_success="pages",
+                        on_error="discard",
+                        options={"schema": {"mode": "observed"}},
+                    ),
+                ],
+                collectors=[
+                    CollectorSettings(
+                        name="shared_name",
+                        plugin="passthrough",
+                        input="pages",
+                        on_success="output",
+                        on_error="discard",
+                    ),
+                ],
+                scopes=[
+                    ScopeSettings(
+                        name="a_scope",
+                        opener="shared_name",
+                        closer="shared_name",
+                        policy="require_all",
                     ),
                 ],
             )

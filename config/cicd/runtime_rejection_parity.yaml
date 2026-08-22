@@ -300,6 +300,66 @@ sites:
   disposition: not_authorable
   note: NodeSpec has no quorum_count field (state.py:240-257) and the generator never emits one (yaml_generator.py:324-338),
     so quorum_count is always None and config.py:1079 is unreachable from composer state.
+- key: 4a0c5c7b35e438e4
+  path: src/elspeth/core/config.py
+  qualname: CollectorSettings.validate_input
+  exception: ValueError
+  message: Collector input connection must not be empty
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: 9599395e529f7491
+  path: src/elspeth/core/config.py
+  qualname: CollectorSettings.validate_name
+  exception: ValueError
+  message: 'Collector name ''{}'' is reserved. Reserved: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: b9054fc456d660d0
+  path: src/elspeth/core/config.py
+  qualname: CollectorSettings.validate_name
+  exception: ValueError
+  message: Collector name '{}' starts with '__', which is reserved for system edges
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: bc3b4e37a6e5c00f
+  path: src/elspeth/core/config.py
+  qualname: CollectorSettings.validate_name
+  exception: ValueError
+  message: Collector name must not be empty
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: 650ee306729c1490
+  path: src/elspeth/core/config.py
+  qualname: CollectorSettings.validate_on_error
+  exception: ValueError
+  message: Collector on_error must be a sink name, 'discard', or omitted
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: 96321101ced6ef42
+  path: src/elspeth/core/config.py
+  qualname: CollectorSettings.validate_on_success
+  exception: ValueError
+  message: Collector on_success must be a connection name or sink name
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
 - key: fab723472f44c429
   path: src/elspeth/core/config.py
   qualname: ConcurrencySettings
@@ -345,6 +405,16 @@ sites:
   disposition: not_authorable
   note: Pipeline section the composer never emits (depends_on / commencement_gates / collection_probes);
     Field constraint enumerated 2026-08-17.
+- key: 8dad6cd7ac40f74f
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'collectors: max_length'
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
 - key: 33d690fa7a6486f2
   path: src/elspeth/core/config.py
   qualname: ElspethSettings
@@ -372,6 +442,16 @@ sites:
   disposition: mirrored
   counterpart:
   - pipeline_collection_cap_exceeded
+- key: dc490cc2b753018a
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'max_bound_region_depth: ge, le'
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
 - key: b569d1a62f7a5963
   path: src/elspeth/core/config.py
   qualname: ElspethSettings
@@ -390,6 +470,16 @@ sites:
   disposition: mirrored
   counterpart:
   - pipeline_collection_cap_exceeded
+- key: 468ea1def5114c92
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'scopes: max_length'
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
 - key: 9b424bb0895a6737
   path: src/elspeth/core/config.py
   qualname: ElspethSettings
@@ -428,6 +518,68 @@ sites:
   note: '`default_llm_profile` and `llm_profiles` are absent from the eight keys _generate_pipeline_dict
     emits (yaml_generator.py:197-354); the web surface resolves profiles through WebSettings, not through
     authored YAML.'
+- key: 4378750707d88c67
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings._validate_scope_bindings
+  exception: ValueError
+  message: Collector '{}' is already bound — one scope per closer
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: 72f0af3ee99ed4dc
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings._validate_scope_bindings
+  exception: ValueError
+  message: 'Collector(s) {}: no scopes: entry binds them. A collector is an EXPAND-group closer and requires
+    a scope (spec §7 rule 1); an unbound collector has no group to '
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: fb66d701213c4b18
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings._validate_scope_bindings
+  exception: ValueError
+  message: 'Scope ''{}'' closer ''{}'' must name a collectors: entry. Declared collectors: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: 2f32d99f6404ccde
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings._validate_scope_bindings
+  exception: ValueError
+  message: 'Scope ''{}'' opener ''{}'' must name a transforms: entry. A scope opener is a multi-row transform
+    declared in transforms:.'
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: 7864323a5cef5f6f
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings._validate_scope_bindings
+  exception: ValueError
+  message: Scope name '{}' is declared twice
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: 2dfef6634351b7b8
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings._validate_scope_bindings
+  exception: ValueError
+  message: Transform '{}' opens two scopes — one scope per opener
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
 - key: 776463e24d99af80
   path: src/elspeth/core/config.py
   qualname: ElspethSettings.reject_legacy_source_field
@@ -455,18 +607,21 @@ sites:
   ordinal: 0
   disposition: not_authorable
   note: Same landscape.export.enabled guard (config.py:2045) that composer YAML can never turn on (yaml_generator.py:352-353).
-- key: 0f959991339a963c
+- key: e73658612a1f25df
   path: src/elspeth/core/config.py
   qualname: ElspethSettings.validate_globally_unique_node_names
   exception: ValueError
   message: Node name '{}' is used by both {} and {}. All node names must be unique across transforms,
-    gates, aggregations, coalesce nodes, row_union nodes, sources, queues
+    gates, aggregations, coalesce nodes, row_union nodes, collectors, sou
   ordinal: 0
   disposition: mirrored
   counterpart:
   - node_id_collides_with_source_or_sink
   - queue_name_collision
-  - duplicate_node_id
+  note: Carried from 0f959991339a963c (re-keyed by the WS2 Task 2 message reword adding "collectors" to
+    the enumerated node kinds). Mirrored disposition holds for every node kind the composer can author
+    today. The new collector branch itself is not yet reachable from the composer - collectors and scopes
+    are not_authorable per the sibling entries this task seeded (Task 12 re-adjudicates).
 - key: e7d99b1fec819603
   path: src/elspeth/core/config.py
   qualname: ElspethSettings.validate_queue_names
@@ -1163,6 +1318,36 @@ sites:
   disposition: mirrored
   counterpart:
   - row_union_on_success_invalid
+- key: cf03edf719ab9de0
+  path: src/elspeth/core/config.py
+  qualname: ScopeSettings.validate_endpoint_names
+  exception: ValueError
+  message: Scope opener/closer must not be empty
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: 2094deb495ec4c5f
+  path: src/elspeth/core/config.py
+  qualname: ScopeSettings.validate_name
+  exception: ValueError
+  message: 'Scope name ''{}'' is reserved. Reserved: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
+- key: 574e0aadccd944c8
+  path: src/elspeth/core/config.py
+  qualname: ScopeSettings.validate_name
+  exception: ValueError
+  message: Scope name must not be empty
+  ordinal: 0
+  disposition: not_authorable
+  note: Barrier-scopes spec surface (collectors and scopes config, WS2 Task 2) - the composer has no tool
+    to author collector or scope config yet. Task 12 adds guided/planner support for this shape and re-adjudicates
+    these entries to mirrored with the new Stage-1 codes.
 - key: b3ed458a9973fd76
   path: src/elspeth/core/config.py
   qualname: SecretsConfig.validate_keyvault_requirements

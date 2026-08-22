@@ -1286,6 +1286,147 @@ class RowUnionSettings(BaseModel):
         return _validate_connection_or_sink_name(value, field_label="row_union on_success connection name")
 
 
+class CollectorSettings(BaseModel):
+    """Configuration for a collector — the EXPAND-group closer (barrier-scopes spec §2/§3).
+
+    A collector is a barrier, not an aggregation: it buffers every member of
+    ONE bound EXPAND group and flushes on end_of_group ONLY. It reuses the
+    batch-transform plugin contract (the same plugins aggregations use) but
+    deliberately has NO trigger config — count/timeout/condition are
+    inexpressible on a closer (a timeout on a closer converts a liveness bug
+    into a silently short group; spec §5). Flush order is the opener's
+    expansion ordinal, never arrival order.
+
+    Example YAML:
+        collectors:
+          - name: page_stitcher
+            plugin: stitch_pages
+            input: pages
+            on_success: assembled_out
+            # on_error is optional: omitted (None) derives the route from
+            # structure (spec §7 rule 9) — losses settle through the scope's
+            # group machinery.
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    name: str = Field(description="Unique identifier for this collector (drives node IDs and audit records)")
+    plugin: str = Field(description="Batch-transform plugin name (same plugin contract as aggregations)")
+    input: str = Field(description="Named input connection the bound region's members arrive on")
+    on_success: str = Field(description="Connection name or sink name for the flushed group output")
+    on_error: str | None = Field(
+        default=None,
+        description=(
+            "Sink name for rows that fail batch processing, 'discard', or omitted (None): "
+            "the route derives from structure — losses settle through the scope's group "
+            "machinery (spec §7 rule 9)"
+        ),
+    )
+    options: dict[str, Any] = Field(default_factory=dict, description="Plugin-specific configuration options")
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Validate collector name is not empty or reserved."""
+        if not v or not v.strip():
+            raise ValueError("Collector name must not be empty")
+        value = v.strip()
+        _validate_max_length(value, field_label="Collector name", max_length=_MAX_NODE_NAME_LENGTH)
+        _validate_node_name_chars(value, field_label="Collector name")
+        if value in _RESERVED_EDGE_LABELS:
+            raise ValueError(f"Collector name '{value}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+        if value.startswith("__"):
+            raise ValueError(f"Collector name '{value}' starts with '__', which is reserved for system edges")
+        return value
+
+    @field_validator("input")
+    @classmethod
+    def validate_input(cls, v: str) -> str:
+        """Validate input connection name is not empty."""
+        if not v or not v.strip():
+            raise ValueError("Collector input connection must not be empty")
+        value = v.strip()
+        return _validate_connection_or_sink_name(value, field_label="Collector input connection name")
+
+    @field_validator("on_success")
+    @classmethod
+    def validate_on_success(cls, v: str) -> str:
+        """Ensure on_success is a valid connection or sink name."""
+        if not v.strip():
+            raise ValueError("Collector on_success must be a connection name or sink name")
+        value = v.strip()
+        return _validate_connection_or_sink_name(value, field_label="Collector on_success connection name")
+
+    @field_validator("on_error")
+    @classmethod
+    def validate_on_error(cls, v: str | None) -> str | None:
+        """on_error is optional: None derives the route from structure (spec §7 rule 9)."""
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("Collector on_error must be a sink name, 'discard', or omitted")
+        value = v.strip()
+        if value == "discard":
+            return value
+        return _validate_connection_or_sink_name(value, field_label="Collector on_error sink name")
+
+
+class ScopeSettings(BaseModel):
+    """A declared EXPAND-group binding: opener (multi-row transform) → closer (collector).
+
+    The scope is the build-time closer binding for a multi-row expansion
+    (barrier-scopes spec §2/§3). The opener must be a multi-row transform
+    (creates_tokens=True — builder-enforced, since config time cannot see
+    plugin attributes); the closer MUST be a collectors: entry. policy is
+    REQUIRED with no default (spec §3): the author decides whether a lost
+    member fails the group.
+
+    Example YAML:
+        scopes:
+          - name: document_pages
+            opener: pdf_explode
+            closer: page_stitcher
+            policy: require_all
+            on_group_failure: quarantine
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    name: str = Field(description="Scope identifier (scope_id in audit vocabulary)")
+    opener: str = Field(description="Multi-row transform (creates_tokens=True) that opens the group")
+    closer: str = Field(description="Collector that closes the group; MUST name a collectors: entry")
+    policy: Literal["require_all", "best_effort"] = Field(
+        description="Group arrival policy. REQUIRED — no default (spec §3). quorum/first are deferred (spec decision 15).",
+    )
+    on_group_failure: Literal["quarantine", "escalate"] = Field(
+        default="quarantine",
+        description="require_all failure handling: quarantine the group's source row, or escalate one loss to the enclosing bound group (escalate requires one — §7 rule 8).",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Validate scope name is not empty or reserved."""
+        if not v or not v.strip():
+            raise ValueError("Scope name must not be empty")
+        value = v.strip()
+        _validate_max_length(value, field_label="Scope name", max_length=_MAX_NODE_NAME_LENGTH)
+        _validate_node_name_chars(value, field_label="Scope name")
+        if value in _RESERVED_EDGE_LABELS:
+            raise ValueError(f"Scope name '{value}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+        return value
+
+    @field_validator("opener", "closer")
+    @classmethod
+    def validate_endpoint_names(cls, v: str) -> str:
+        """Scope endpoints must be non-empty node names."""
+        if not v or not v.strip():
+            raise ValueError("Scope opener/closer must not be empty")
+        value = v.strip()
+        _validate_node_name_chars(value, field_label="Scope endpoint name")
+        return value
+
+
 class QueueSettings(BaseModel):
     """Pass-through scheduling queue declared as a DAG fan-in node.
 
@@ -1966,6 +2107,31 @@ class ElspethSettings(BaseModel):
         description="row_union barrier configurations for releasing fork branches as indivisible groups",
     )
 
+    # Optional - collectors (EXPAND-group closers; barrier-scopes spec §3)
+    collectors: list[CollectorSettings] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Collector (EXPAND-group closer) configurations",
+    )
+
+    # Optional - scope bindings (opener multi-row transform → collector closer)
+    scopes: list[ScopeSettings] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Declared scope bindings pairing a multi-row transform opener with its collector closer",
+    )
+
+    # Supported bound-region nesting depth (spec §6.3 maintainer ruling): the
+    # builder rejects deeper bound nesting fail-closed. Raise this ONLY if you
+    # knowingly accept the per-insert audit churn of deeper nesting — the
+    # model stays correct at any depth; the SUPPORT guarantee is 5.
+    max_bound_region_depth: int = Field(
+        default=5,
+        ge=1,
+        le=64,
+        description="Maximum supported bound-region nesting depth (builder-enforced, spec §6.3)",
+    )
+
     # Optional - aggregations (config-driven batching)
     aggregations: list[AggregationSettings] = Field(
         default_factory=list,
@@ -2024,6 +2190,48 @@ class ElspethSettings(BaseModel):
                 raise ValueError("default_llm_profile must name a configured llm profile")
         return self
 
+    @model_validator(mode="after")
+    def _validate_scope_bindings(self) -> "ElspethSettings":
+        """Cross-check collectors: and scopes: (barrier-scopes spec §7 rule 1, parse-time half).
+
+        The builder re-verifies with plugin instances in hand (opener
+        multi-row-ness is only visible there); these are the pure
+        name-reference checks that need no instances.
+        """
+        collector_names = {c.name for c in self.collectors}
+        transform_names = {t.name for t in self.transforms}
+        seen_scope_names: set[str] = set()
+        seen_openers: set[str] = set()
+        seen_closers: set[str] = set()
+        for scope in self.scopes:
+            if scope.name in seen_scope_names:
+                raise ValueError(f"Scope name '{scope.name}' is declared twice")
+            seen_scope_names.add(scope.name)
+            if scope.closer not in collector_names:
+                raise ValueError(
+                    f"Scope '{scope.name}' closer '{scope.closer}' must name a collectors: entry. "
+                    f"Declared collectors: {sorted(collector_names) or '(none)'}"
+                )
+            if scope.opener not in transform_names:
+                raise ValueError(
+                    f"Scope '{scope.name}' opener '{scope.opener}' must name a transforms: entry. "
+                    f"A scope opener is a multi-row transform declared in transforms:."
+                )
+            if scope.closer in seen_closers:
+                raise ValueError(f"Collector '{scope.closer}' is already bound — one scope per closer")
+            seen_closers.add(scope.closer)
+            if scope.opener in seen_openers:
+                raise ValueError(f"Transform '{scope.opener}' opens two scopes — one scope per opener")
+            seen_openers.add(scope.opener)
+        unbound = collector_names - seen_closers
+        if unbound:
+            raise ValueError(
+                f"Collector(s) {sorted(unbound)}: no scopes: entry binds them. A collector is an "
+                f"EXPAND-group closer and requires a scope (spec §7 rule 1); an unbound collector "
+                f"has no group to close. Add a scopes: entry naming it as closer."
+            )
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def reject_legacy_source_field(cls, data: Any) -> Any:
@@ -2076,6 +2284,8 @@ class ElspethSettings(BaseModel):
             all_names.append((c.name, "coalesce"))
         for u in self.row_unions:
             all_names.append((u.name, "row_union"))
+        for col in self.collectors:
+            all_names.append((col.name, "collector"))
         for source_name in self.sources:
             all_names.append((source_name, "source"))
         for queue_name in self.queues:
@@ -2089,7 +2299,7 @@ class ElspethSettings(BaseModel):
                 raise ValueError(
                     f"Node name '{name}' is used by both {seen[name]} and {node_type}. "
                     f"All node names must be unique across transforms, gates, "
-                    f"aggregations, coalesce nodes, row_union nodes, sources, queues, and sinks."
+                    f"aggregations, coalesce nodes, row_union nodes, collectors, sources, queues, and sinks."
                 )
             seen[name] = node_type
         return self
