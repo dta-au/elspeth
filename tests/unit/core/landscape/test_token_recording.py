@@ -2629,3 +2629,41 @@ class TestAssertParentLineageRuling27Relief:
                 output_contract=_MINIMAL_CONTRACT,
                 parent_lineage_path=(),
             )
+
+    def test_accepts_popped_parent_path_with_buried_fork_frame(self) -> None:
+        """The motivating shape (fix-round-2 residual): a fork branch
+        containing a mid-branch expand has mint (FORK, EXPAND) — the FORK
+        frame is NOT innermost. Released with the FORK frame popped, supplied
+        is (EXPAND,), which differs from (b)'s single-(FORK,)-frame mint
+        (structurally indistinguishable from pre-fix behaviour, since
+        removing the ONLY frame is also removing the LAST frame). This pins
+        that the relief finds and pops the FORK frame from wherever it sits,
+        not just when it's already innermost."""
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        (child,), _fg = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            branches=["path-a"],
+        )
+        (grandchild,), expand_group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=child.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"v": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        # grandchild's mint frames are (FORK, EXPAND) — FORK is buried, not innermost.
+        _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=grandchild.token_id)
+
+        (great_grandchild,), inner_expand_group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=grandchild.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"v": 2}],
+            output_contract=_MINIMAL_CONTRACT,
+            parent_lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=grandchild.token_id),),
+        )
+        great_grandchild_paths = factory.data_flow.load_lineage_paths("run-1", [great_grandchild.token_id])
+        assert great_grandchild_paths[great_grandchild.token_id] == (
+            LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=grandchild.token_id),
+            LineageFrame(kind=FrameKind.EXPAND, group_id=inner_expand_group_id, member_key=great_grandchild.token_id),
+        )
