@@ -31,6 +31,29 @@ is a working document under the normal delivery posture.
   snapshots under `tests/fixtures/dag_scenario_corpus/oracle_freeze/` are
   the pre-flip oracle and must NEVER be regenerated after the freeze commit.
 
+- **2026-08-22 — WS1b Phase A lifts the read restriction for `IncompleteTokenSpec.lineage_path`
+  and `token_lineage_frames`, NOT for `TokenInfo.lineage_path`** (Tasks 4/5, branch
+  feature/unified-lineage). The entry above still holds for `TokenInfo.lineage_path` — it
+  stays write-only until the flip. Two NEW sanctioned reads landed alongside it, both
+  scoped to their own field/table, neither touching `TokenInfo.lineage_path`: (1)
+  `engine/processor.py::classify_resume_start` and `resume_incomplete_token` read
+  `IncompleteTokenSpec.lineage_path` (spec §4.1a) to select the resume-start dispatch arm —
+  PINNED order is merged (join) first, then innermost-EXPAND, then innermost-FORK, then
+  raise; the fork-child branch identity is the innermost FORK frame's `member_key`, never
+  `spec.branch_name` directly. (2) MCP read surfaces (`mcp/analyzers/queries.py::list_tokens`,
+  `mcp/analyzers/reports.py::get_outcome_analysis`'s fork/join counts) batch-load
+  `token_lineage_frames` via `DataFlowRepository.load_lineage_paths` / the newly-added
+  `DataFlowReadRepository.load_lineage_paths` forwarder (`core/landscape/factory.py`) and
+  project `branch_name`/`fork_group_id`/`expand_group_id` as DERIVED values via
+  `contracts.identity.path_branch_name`/`path_fork_group_id`/`path_expand_group_id` — never a
+  stored-column read (ruling 21, ratified 2026-08-22: the legacy wire names stay, the
+  mechanism underneath changes). `DataFlowReadRepository` (the read-only port
+  `RecorderFactory.read_only()` returns, which is what the real `elspeth-landscape` MCP
+  server actually runs on) did NOT forward `load_lineage_paths` before this — only the
+  writable `DataFlowRepository` had it. A test built against a writable `RecorderFactory`
+  stays green without the forwarder; the gap is invisible until the real read-only MCP
+  server is exercised.
+
 - **2026-08-21 — repair advice must be executed, not just re-validated: a
   transform's `schema` block is BOTH the composer contract and the runtime
   INPUT model.** Rule C's remedies each cleared `validate()` and were pinned

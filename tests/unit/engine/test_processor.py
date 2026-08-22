@@ -8378,7 +8378,10 @@ class TestResumeIncompleteToken:
             fork_group_id=None,
             join_group_id=None,
             expand_group_id="expand-1",
-            lineage_path=(),
+            lineage_path=(
+                LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),
+                LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="token-expanded-child"),
+            ),
             token_data_ref="payload-1",
             step_in_pipeline=2,
             max_attempt=0,

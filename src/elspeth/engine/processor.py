@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
+from enum import Enum
 from hashlib import sha256
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -34,6 +35,7 @@ from elspeth.contracts.audit_evidence import AuditEvidenceBase
 from elspeth.contracts.barrier_scalars import BarrierScalars, CoalescePendingScalars
 from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS
 from elspeth.contracts.freeze import deep_freeze
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName, SinkName, StepResolver
 from elspeth.engine._best_effort import best_effort
@@ -116,6 +118,7 @@ from elspeth.contracts.declaration_contracts import (
     DeclarationContractViolation,
 )
 from elspeth.contracts.enums import (
+    FrameKind,
     NodeStateStatus,
     OutputMode,
     RoutingKind,
@@ -315,6 +318,45 @@ def make_step_resolver(
         raise OrchestrationInvariantError(f"Node ID '{node_id}' missing from traversal step map")
 
     return resolve
+
+
+class ResumeStartArm(Enum):
+    """Resume-start dispatch arms (spec §4.1a — arm selection is pinned, not derived)."""
+
+    MERGED = "merged"
+    EXPAND_CHILD = "expand_child"
+    FORK_CHILD = "fork_child"
+
+
+def classify_resume_start(
+    *,
+    lineage_path: tuple[LineageFrame, ...],
+    join_group_id: str | None,
+) -> ResumeStartArm:
+    """Select the resume-start arm for one incomplete token.
+
+    ARM ORDER IS LOAD-BEARING and pinned by test_resume_start_dispatch:
+
+    1. MERGED first: join_group_id is a merge EVENT attribute; after the strict
+       pop, any frames still on the merged token's path are ENCLOSING context,
+       never the operation that minted it. Checking a frame arm first would
+       misroute a merged token under an outer EXPAND frame into the expand arm.
+    2. Innermost frame decides between EXPAND_CHILD and FORK_CHILD — the
+       path-aware replacement for "expand checked before branch dispatch"
+       (expanded children inside a fork branch keep their branch identity in
+       outer frames but are re-driven as expand children).
+    """
+    if join_group_id is not None:
+        return ResumeStartArm.MERGED
+    if lineage_path:
+        innermost = lineage_path[-1]
+        if innermost.kind is FrameKind.EXPAND:
+            return ResumeStartArm.EXPAND_CHILD
+        return ResumeStartArm.FORK_CHILD
+    raise OrchestrationInvariantError(
+        "Incomplete token has an empty lineage_path and no join_group_id — no resume-start node resolvable. "
+        "Linear tokens must be routed to process_existing_row by the resume filter (F1)."
+    )
 
 
 class RowProcessor:
@@ -2857,25 +2899,35 @@ class RowProcessor:
         the bumped attempt and stamped with provenance (ADDENDUM 4 — carried on the token,
         NOT passed as params to process_token).
 
-        Dispatch cases (expand_group_id checked first because expanded children inherit
-        their parent's branch_name; their persisted step still identifies the expand node):
+        Dispatch is delegated to classify_resume_start (spec §4.1a), whose PINNED arm order
+        is: merged (join) FIRST, then innermost-EXPAND, then innermost-FORK, then raise.
+        MERGED is checked first because join_group_id is a merge EVENT attribute — after the
+        strict pop, any frames still on a merged token's path are ENCLOSING context, never
+        the operation that minted it; checking a frame arm first would misroute a merged
+        token under an outer frame into that frame's arm. Within the frame arms, the
+        INNERMOST frame decides EXPAND vs FORK — the path-aware replacement for "expand
+        checked before branch dispatch" (expanded children inside a fork branch keep their
+        branch identity in outer frames but are re-driven as expand children).
 
-        1. expand child: expand_group_id set → re-drive from the node AFTER the expand node.
-        2. fork → sink terminal branch: branch_name in _branch_to_sink → current_node_id=None
-           (process_token's None-path routes via branch_to_sink to the terminal sink).
-        3. fork → coalesce, crashed before barrier: branch_name in _branch_to_coalesce →
-           re-run the branch from its first processing node with coalesce context.
-        4. post-coalesce merged token, crashed after barrier (B1 review finding): join_group_id
-           set AND fork_group_id None AND branch_name None →
+        1. MERGED: post-coalesce merged token, crashed after the barrier (B1 review finding).
            - Non-terminal coalesce (next node exists): process_token from node after coalesce.
            - Terminal coalesce (no next node): reconstruct the COALESCED RowResult directly,
              mirroring _maybe_coalesce_token's terminal-coalesce path (the correct routing
              mechanism is resolve_coalesce_sink; process_token(None) is NOT valid for a
              branchless merged token without on_success_sink context).
+        2. EXPAND_CHILD: innermost frame is an EXPAND frame → re-drive from the node AFTER
+           the expand node.
+        3. FORK_CHILD: innermost frame is a FORK frame → branch identity is the frame's
+           member_key.
+           - branch routes to a terminal sink: current_node_id=None (process_token's
+             None-path routes via branch_to_sink to the terminal sink).
+           - branch routes to a coalesce, crashed before the barrier: re-run the branch from
+             its first processing node with coalesce context.
 
         Raises:
-            OrchestrationInvariantError: If the token's lineage fields do not match any
-                known resume-start pattern — indicates audit/DAG inconsistency.
+            OrchestrationInvariantError: If the token's lineage_path/join_group_id do not
+                match any known resume-start arm, or if a fork-child branch routes to
+                neither a sink nor a coalesce — indicates audit/DAG inconsistency.
         """
         token = TokenInfo(
             row_id=spec.row_id,
@@ -2888,34 +2940,10 @@ class RowProcessor:
             resume_attempt_offset=spec.max_attempt + 1,
             resume_checkpoint_id=resume_checkpoint_id,
         )
-        branch = spec.branch_name
 
-        if spec.expand_group_id is not None:
-            # expand child: re-drive from the node AFTER the expand node.
-            # Expanded children inherit branch_name from fork branches, including
-            # coalesce-bound branches, so this must run before branch dispatch.
-            # expand is never terminal; an `after` of None here is an audit/DAG inconsistency
-            # that process_token's None-enforcement raises on (no branch_to_sink / on_success_sink).
-            after = self._nav.resolve_next_node(self._resolve_step_node(spec))
-            return self.process_token(token, ctx, current_node_id=after)
+        arm = classify_resume_start(lineage_path=spec.lineage_path, join_group_id=spec.join_group_id)
 
-        if branch is not None and BranchName(branch) in self._branch_to_sink:
-            # fork → sink terminal branch: straight to the sink via None-path routing.
-            return self.process_token(token, ctx, current_node_id=None)
-
-        if branch is not None and BranchName(branch) in self._branch_to_coalesce:
-            # fork → coalesce, crashed BEFORE the barrier: re-run the branch from its
-            # first node with coalesce context so _maybe_coalesce_token fires at the barrier.
-            coalesce_name = self._branch_to_coalesce[BranchName(branch)]
-            first_node = self._nav.resolve_branch_first_node(branch)
-            return self.process_token(
-                token,
-                ctx,
-                current_node_id=first_node,
-                coalesce_name=coalesce_name,
-            )
-
-        if spec.join_group_id is not None and spec.fork_group_id is None and branch is None:
+        if arm is ResumeStartArm.MERGED:
             # post-coalesce merged token, crashed AFTER the barrier (B1 review finding):
             # step_in_pipeline is the coalesce node's step. Re-drive downstream of the
             # coalesce node, or reconstruct the terminal COALESCED RowResult if the coalesce
@@ -2941,6 +2969,13 @@ class RowProcessor:
                     f"which is not a known coalesce node (known: {sorted(self._coalesce_name_by_node_id)}). "
                     f"Audit/DAG inconsistency."
                 ) from exc
+            # classify_resume_start guarantees join_group_id is not None for the MERGED arm;
+            # narrow explicitly (rather than trusting the classifier silently) for mypy.
+            if spec.join_group_id is None:
+                raise OrchestrationInvariantError(
+                    f"classify_resume_start selected MERGED for incomplete token {spec.token_id} "
+                    f"but spec.join_group_id is None — resume-start classifier invariant violation."
+                )
             return [
                 self._terminal_coalesce_row_result(
                     token,
@@ -2950,11 +2985,34 @@ class RowProcessor:
                 )
             ]
 
+        if arm is ResumeStartArm.EXPAND_CHILD:
+            # expand child: re-drive from the node AFTER the expand node.
+            # expand is never terminal; an `after` of None here is an audit/DAG inconsistency
+            # that process_token's None-enforcement raises on (no branch_to_sink / on_success_sink).
+            after = self._nav.resolve_next_node(self._resolve_step_node(spec))
+            return self.process_token(token, ctx, current_node_id=after)
+
+        # arm is ResumeStartArm.FORK_CHILD — branch identity is the innermost frame's member_key.
+        branch = spec.lineage_path[-1].member_key
+        if BranchName(branch) in self._branch_to_sink:
+            # fork → sink terminal branch: straight to the sink via None-path routing.
+            return self.process_token(token, ctx, current_node_id=None)
+
+        if BranchName(branch) in self._branch_to_coalesce:
+            # fork → coalesce, crashed BEFORE the barrier: re-run the branch from its
+            # first node with coalesce context so _maybe_coalesce_token fires at the barrier.
+            coalesce_name = self._branch_to_coalesce[BranchName(branch)]
+            first_node = self._nav.resolve_branch_first_node(branch)
+            return self.process_token(
+                token,
+                ctx,
+                current_node_id=first_node,
+                coalesce_name=coalesce_name,
+            )
+
         raise OrchestrationInvariantError(
-            f"Incomplete token {spec.token_id} has branch_name={branch!r}, "
-            f"fork_group_id={spec.fork_group_id!r}, join_group_id={spec.join_group_id!r}, "
-            f"expand_group_id={spec.expand_group_id!r} — no resume-start node resolvable. "
-            f"Audit/DAG inconsistency."
+            f"Incomplete fork-child token {spec.token_id} is on branch {branch!r} which routes to neither a "
+            f"sink nor a coalesce — no resume-start node resolvable. Audit/DAG inconsistency."
         )
 
     def _maybe_coalesce_token(

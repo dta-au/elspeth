@@ -338,25 +338,18 @@ def run_resume_processing_loop(
         # Case 2 of row replay selection, so every partial-fork/expand/coalesce
         # row IS visited by this loop and its specs are found here.
         #
-        # Lineage-field filter: get_incomplete_tokens_by_row returns ALL incomplete
+        # Lineage-path filter: get_incomplete_tokens_by_row returns ALL incomplete
         # non-delegation tokens — including linear-pipeline tokens that were interrupted
-        # mid-transform (branch_name=None, fork_group_id=None, expand_group_id=None,
-        # join_group_id=None). Those linear tokens are correctly handled by
-        # process_existing_row (whole-row restart mints a fresh token); routing them to
-        # resume_incomplete_token raises OrchestrationInvariantError (F1 regression).
-        # Only dispatch specs that are provably fork/expand/coalesce children (at least
-        # one lineage field set).
+        # mid-transform (empty lineage_path, join_group_id=None). Those linear tokens
+        # are correctly handled by process_existing_row (whole-row restart mints a fresh
+        # token); routing them to resume_incomplete_token raises OrchestrationInvariantError
+        # (F1 regression). Only dispatch specs that are provably fork/expand/coalesce
+        # children: at least one lineage frame, or a merge event (join_group_id).
         # Direct key check (not .get()) — incomplete_by_row is our pre-built index
         # (Tier-1 audit data), not an external boundary. A missing key is the normal
         # "no incomplete children for this row" case.
         fork_expand_coalesce_specs = (
-            [
-                s
-                for s in incomplete_by_row[row_id]
-                if s.branch_name is not None or s.fork_group_id is not None or s.expand_group_id is not None or s.join_group_id is not None
-            ]
-            if row_id in incomplete_by_row
-            else []
+            [s for s in incomplete_by_row[row_id] if s.lineage_path or s.join_group_id is not None] if row_id in incomplete_by_row else []
         )
 
         if fork_expand_coalesce_specs:
