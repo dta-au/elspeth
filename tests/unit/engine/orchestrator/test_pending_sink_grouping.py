@@ -159,11 +159,13 @@ class TestPendingSortKey:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             scheduler_pending_sink=True,
+            join_group_id="join-1",
         )
         generated_pending = PendingOutcome(
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             scheduler_pending_sink=False,
+            join_group_id="join-1",
         )
 
         assert _pending_sort_key((tok_scheduler, scheduler_pending)) != _pending_sort_key((tok_generated, generated_pending))

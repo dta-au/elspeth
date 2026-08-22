@@ -83,9 +83,10 @@ class TestCoalesceStrictPop:
         manager, run_id = _manager()
         root = _root(manager, run_id)
         children, _fork_group_id = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
-        merged = manager.coalesce_tokens(children, PipelineRow({"v": 1}, _CONTRACT), NodeID("gate-0"), run_id)
+        merged, join_group_id = manager.coalesce_tokens(children, PipelineRow({"v": 1}, _CONTRACT), NodeID("gate-0"), run_id)
         assert merged.lineage_path == ()
         assert merged.join_group_id is not None  # stored field until Task 10
+        assert join_group_id == merged.join_group_id
 
     def test_merge_refuses_a_parent_with_no_fork_frame(self) -> None:
         manager, run_id = _manager()
@@ -120,3 +121,41 @@ class TestMemoryDurableConsistency:
                 ).fetchall()
             durable = tuple(LineageFrame(kind=FrameKind(r.kind), group_id=r.group_id, member_key=r.member_key) for r in rows)
             assert durable == token.lineage_path
+
+
+class TestJoinCarriers:
+    def test_coalesce_tokens_returns_merged_token_and_join_group_id(self) -> None:
+        manager, run_id = _manager()
+        root = _root(manager, run_id)
+        children, _fg = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
+        merged, join_group_id = manager.coalesce_tokens(children, PipelineRow({"v": 1}, _CONTRACT), NodeID("gate-0"), run_id)
+        assert isinstance(join_group_id, str) and join_group_id
+        assert merged.join_group_id == join_group_id  # stored field agrees until Task 10 removes it
+
+    def test_row_result_requires_join_group_id_exactly_for_coalesced(self) -> None:
+        from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+        from elspeth.contracts.errors import OrchestrationInvariantError
+        from elspeth.contracts.results import RowResult
+
+        manager, run_id = _manager()
+        token = _root(manager, run_id)
+        with pytest.raises(OrchestrationInvariantError, match="join_group_id"):
+            RowResult(token=token, final_data=token.row_data, outcome=TerminalOutcome.SUCCESS, path=TerminalPath.COALESCED, sink_name="out")
+        ok = RowResult(
+            token=token,
+            final_data=token.row_data,
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.COALESCED,
+            sink_name="out",
+            join_group_id="jg-1",
+        )
+        assert ok.join_group_id == "jg-1"
+        with pytest.raises(OrchestrationInvariantError, match="join_group_id"):
+            RowResult(
+                token=token,
+                final_data=token.row_data,
+                outcome=TerminalOutcome.SUCCESS,
+                path=TerminalPath.DEFAULT_FLOW,
+                sink_name="out",
+                join_group_id="jg-1",
+            )

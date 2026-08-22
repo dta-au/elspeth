@@ -165,6 +165,7 @@ def _row_result(
         error=error,
         scheduler_pending_sink=False,
         authoritative_error_hash=None,
+        join_group_id=result_token.join_group_id if path is TerminalPath.COALESCED else None,
     )
 
 
@@ -272,7 +273,9 @@ class TestReconcileMatchesTable:
             if effect.counts_routed_destination:
                 counters.routed_destinations[_SINK] += 1
         error_hash = "a" * 64 if pair[1] in PendingOutcome._REQUIRES_ERROR_HASH_PATHS else None
-        pending = PendingOutcome(outcome=pair[0], path=pair[1], error_hash=error_hash)
+        pending = PendingOutcome(
+            outcome=pair[0], path=pair[1], error_hash=error_hash, join_group_id=("join-1" if pair[1] is TerminalPath.COALESCED else None)
+        )
 
         reconcile_sink_write_diversions(counters, sink_name=_SINK, pending_outcome=pending, diversion_count=3)
 
@@ -283,13 +286,17 @@ class TestReconcileMatchesTable:
     )
     def test_non_reconcilable_pairs_are_rejected(self, pair: tuple[TerminalOutcome | None, TerminalPath]) -> None:
         error_hash = "a" * 64 if pair[1] in PendingOutcome._REQUIRES_ERROR_HASH_PATHS else None
-        pending = PendingOutcome(outcome=pair[0], path=pair[1], error_hash=error_hash)
+        pending = PendingOutcome(
+            outcome=pair[0], path=pair[1], error_hash=error_hash, join_group_id=("join-1" if pair[1] is TerminalPath.COALESCED else None)
+        )
         with pytest.raises(OrchestrationInvariantError, match="Unexpected sink-bound pending pair"):
             reconcile_sink_write_diversions(ExecutionCounters(), sink_name=_SINK, pending_outcome=pending, diversion_count=1)
 
     @pytest.mark.parametrize("pair", _RECONCILABLE_PAIRS, ids=str)
     def test_underflow_fails_closed(self, pair: tuple[TerminalOutcome | None, TerminalPath]) -> None:
         error_hash = "a" * 64 if pair[1] in PendingOutcome._REQUIRES_ERROR_HASH_PATHS else None
-        pending = PendingOutcome(outcome=pair[0], path=pair[1], error_hash=error_hash)
+        pending = PendingOutcome(
+            outcome=pair[0], path=pair[1], error_hash=error_hash, join_group_id=("join-1" if pair[1] is TerminalPath.COALESCED else None)
+        )
         with pytest.raises(OrchestrationInvariantError, match="Cannot subtract"):
             reconcile_sink_write_diversions(ExecutionCounters(), sink_name=_SINK, pending_outcome=pending, diversion_count=1)

@@ -84,14 +84,15 @@ def _coalesce_tokens_impl(
     node_id: NodeID,
     run_id: str,
     parent_completions: list[Any],
-) -> TokenInfo:
+) -> tuple[TokenInfo, str]:
     assert len(parent_completions) == len(parents)
-    return TokenInfo(
+    merged = TokenInfo(
         row_id=parents[0].row_id,
         token_id="merged_001",
         row_data=merged_data,
         join_group_id="join_001",
     )
+    return merged, "join_001"
 
 
 def _restore_reads_from_execution_double(execution: _RecorderDouble) -> SimpleNamespace:

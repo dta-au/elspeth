@@ -58,6 +58,7 @@ def _route_to_sink(
     path: TerminalPath,
     error_hash: str | None = None,
     scheduler_pending_sink: bool = False,
+    join_group_id: str | None = None,
 ) -> None:
     """Validate sink exists in pending_tokens and append the token.
 
@@ -75,6 +76,8 @@ def _route_to_sink(
             required by PendingOutcome for failure/error paths.
         scheduler_pending_sink: Whether this exact token has a durable
             PENDING_SINK scheduler handoff to terminalize after sink durability.
+        join_group_id: Merge-event identity, required by PendingOutcome for
+            COALESCED and forbidden otherwise.
     """
     if sink_name not in pending_tokens:
         raise OrchestrationInvariantError(
@@ -88,6 +91,7 @@ def _route_to_sink(
                 path=path,
                 error_hash=error_hash,
                 scheduler_pending_sink=scheduler_pending_sink,
+                join_group_id=join_group_id,
             ),
         )
     )
@@ -276,6 +280,7 @@ def accumulate_row_outcomes(
                 path=result.path,
                 error_hash=error_hash,
                 scheduler_pending_sink=result.scheduler_pending_sink,
+                join_group_id=result.join_group_id,
             )
 
 

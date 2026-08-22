@@ -550,6 +550,8 @@ class RowResult:
             recomputing from the synthetic replay FailureInfo, so the replayed
             audit record correlates with the pre-crash one
             (filigree elspeth-d74d19f901). None for live results.
+        join_group_id: For COALESCED results, the merge-event identity of the
+            coalesce that produced this token. None for all other paths.
     """
 
     token: TokenInfo
@@ -560,6 +562,7 @@ class RowResult:
     error: FailureInfo | None = None
     scheduler_pending_sink: bool = False
     authoritative_error_hash: str | None = None
+    join_group_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.scheduler_pending_sink) is not bool:
@@ -599,6 +602,10 @@ class RowResult:
                 raise OrchestrationInvariantError("(FAILURE, ON_ERROR_ROUTED) outcome requires error to be a FailureInfo instance")
         if self.path == TerminalPath.COALESCED and self.sink_name is None:
             raise OrchestrationInvariantError("(SUCCESS, COALESCED) outcome requires sink_name to be set")
+        if self.path == TerminalPath.COALESCED and self.join_group_id is None:
+            raise OrchestrationInvariantError("(SUCCESS, COALESCED) outcome requires join_group_id to be set")
+        if self.path != TerminalPath.COALESCED and self.join_group_id is not None:
+            raise OrchestrationInvariantError(f"RowResult.join_group_id is only valid for COALESCED results, got path={self.path!r}")
 
 
 @dataclass(frozen=True, slots=True)

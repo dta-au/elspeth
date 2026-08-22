@@ -326,7 +326,7 @@ class TokenManager:
         node_id: NodeID,
         run_id: str,
         parent_completions: Sequence[CoalesceParentCompletion] = (),
-    ) -> TokenInfo:
+    ) -> tuple[TokenInfo, str]:
         """Coalesce multiple tokens into one.
 
         Args:
@@ -337,7 +337,7 @@ class TokenManager:
             run_id: Run ID for constructing TokenRefs
 
         Returns:
-            Merged TokenInfo with PipelineRow row_data
+            Tuple of (merged TokenInfo with PipelineRow row_data, join_group_id)
         """
         if not parents:
             raise OrchestrationInvariantError("coalesce_tokens requires at least one parent token")
@@ -391,13 +391,18 @@ class TokenManager:
         # node_states, so attempt=0 is correct and it must not inherit the parent
         # branches' resume offsets. (The branch tokens' coalesce node_states already
         # carry the provenance marker for the arriving tokens.)
-        return TokenInfo(
+        if merged.join_group_id is None:
+            raise OrchestrationInvariantError(
+                f"coalesce_tokens: merged token {merged.token_id!r} has no join_group_id — the durable coalesce writer always mints one"
+            )
+        merged_info = TokenInfo(
             row_id=row_id,
             token_id=merged.token_id,
             row_data=merged_data,
             join_group_id=merged.join_group_id,
             lineage_path=merged_path,
         )
+        return merged_info, merged.join_group_id
 
     def expand_token(
         self,

@@ -491,6 +491,7 @@ class TestRowResult:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             sink_name="output",
+            join_group_id="jg-1",
         )
 
         assert result.outcome == TerminalOutcome.SUCCESS

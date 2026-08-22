@@ -927,6 +927,7 @@ class SchedulerDrainCoordinator:
             else None,
             scheduler_pending_sink=True,
             authoritative_error_hash=scheduled.pending_error_hash if is_on_error_routed else None,
+            join_group_id=scheduled.join_group_id,
         )
 
     # ─────────────────────────────────────────────────────────────────────────

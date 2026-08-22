@@ -235,13 +235,14 @@ def _make_coordinator(
         if fire_calls is not None:
             fire_calls.append(dict(kwargs))
 
-    def _terminal_coalesce_row_result(token: TokenInfo, coalesce_name: CoalesceName, *, context: str) -> RowResult:
+    def _terminal_coalesce_row_result(token: TokenInfo, coalesce_name: CoalesceName, *, join_group_id: str, context: str) -> RowResult:
         return RowResult(
             token=token,
             final_data=token.row_data,
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             sink_name="merged_sink",
+            join_group_id=join_group_id,
         )
 
     resolved_nav = nav or FakeNav(transform=_batch_aware_transform())
@@ -374,7 +375,9 @@ class TestCoalesceIntakeTaxonomy:
         scheduler = RecordingScheduler(pending=[row])
         merged = _token(token_id="tok-merged", row_id="row-1")
         consumed = (_token(token_id="tok-a"), _token(token_id="tok-b"))
-        coalesce = RecordingCoalesceExecutor(CoalesceOutcome(held=False, merged_token=merged, consumed_tokens=consumed))
+        coalesce = RecordingCoalesceExecutor(
+            CoalesceOutcome(held=False, merged_token=merged, consumed_tokens=consumed, join_group_id="join-1")
+        )
         holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE))}
         fire_calls: list[dict[str, object]] = []
         coordinator = _make_coordinator(
@@ -396,7 +399,9 @@ class TestCoalesceIntakeTaxonomy:
         row = _blocked_row(barrier_key=str(_COALESCE))
         scheduler = RecordingScheduler(pending=[row])
         merged = _token(token_id="tok-merged", row_id="row-1")
-        coalesce = RecordingCoalesceExecutor(CoalesceOutcome(held=False, merged_token=merged, consumed_tokens=(_token(token_id="tok-a"),)))
+        coalesce = RecordingCoalesceExecutor(
+            CoalesceOutcome(held=False, merged_token=merged, consumed_tokens=(_token(token_id="tok-a"),), join_group_id="join-1")
+        )
         holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE))}
         fire_calls: list[dict[str, object]] = []
         coordinator = _make_coordinator(

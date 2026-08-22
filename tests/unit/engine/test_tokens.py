@@ -161,7 +161,7 @@ class TestTokenManagerCoalesce:
             _make_pipeline_row({"value": 42, "label": "A"}),
         )
 
-        merged = manager.coalesce_tokens(
+        merged, _join_group_id = manager.coalesce_tokens(
             parents=[stats_token, classifier_token],
             merged_data=_make_pipeline_row({"value": 42, "mean": 10.5, "label": "A"}),
             node_id=NodeID("coalesce_node"),
@@ -656,7 +656,7 @@ class TestTokenManagerEdgeCases:
             run_id=run_id,
         )
 
-        merged = manager.coalesce_tokens(
+        merged, _join_group_id = manager.coalesce_tokens(
             parents=children,
             merged_data=_make_pipeline_row({"value": 42, "merged": True}),
             node_id=NodeID("coalesce_node"),
@@ -756,7 +756,7 @@ class TestTokenManagerStepInPipeline:
             run_id=run_id,
         )
 
-        merged = manager.coalesce_tokens(
+        merged, _join_group_id = manager.coalesce_tokens(
             parents=children,
             merged_data=_make_pipeline_row({"value": 42, "merged": True}),
             node_id=NodeID("coalesce_node"),

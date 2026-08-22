@@ -169,6 +169,7 @@ class PendingOutcome:
     path: TerminalPath
     error_hash: str | None = None
     scheduler_pending_sink: bool = False
+    join_group_id: str | None = None
 
     def __post_init__(self) -> None:
         """Validate pair/error_hash consistency before sink side effects."""
@@ -188,6 +189,11 @@ class PendingOutcome:
             raise ValueError(f"PendingOutcome with path={self.path.name} requires non-empty error_hash")
         if self.path not in self._REQUIRES_ERROR_HASH_PATHS and self.error_hash is not None:
             raise ValueError(f"PendingOutcome with path={self.path.name} must not have error_hash")
+
+        if self.path is TerminalPath.COALESCED and self.join_group_id is None:
+            raise ValueError("PendingOutcome with path=COALESCED requires join_group_id")
+        if self.path is not TerminalPath.COALESCED and self.join_group_id is not None:
+            raise ValueError(f"PendingOutcome with path={self.path.name} must not have join_group_id")
 
 
 class RetryPolicy(TypedDict, total=False):

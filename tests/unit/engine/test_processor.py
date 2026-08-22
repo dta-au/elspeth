@@ -8035,7 +8035,9 @@ class TestMaybeCoalesceToken:
             branch_name="path_a",
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
-        coalesce.accept.return_value = CoalesceOutcome(held=False, merged_token=merged_token, consumed_tokens=(token,))
+        coalesce.accept.return_value = CoalesceOutcome(
+            held=False, merged_token=merged_token, consumed_tokens=(token,), join_group_id="join-1"
+        )
         processor = _make_processor(
             factory,
             coalesce_executor=coalesce,
@@ -8097,7 +8099,9 @@ class TestMaybeCoalesceToken:
             branch_name="path_a",
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
-        coalesce.accept.return_value = CoalesceOutcome(held=False, merged_token=merged_token, consumed_tokens=(token,))
+        coalesce.accept.return_value = CoalesceOutcome(
+            held=False, merged_token=merged_token, consumed_tokens=(token,), join_group_id="join-1"
+        )
         processor = _make_processor(
             factory,
             coalesce_executor=coalesce,
@@ -8146,7 +8150,9 @@ class TestMaybeCoalesceToken:
             branch_name="path_a",
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
-        coalesce.accept.return_value = CoalesceOutcome(held=False, merged_token=merged_token, consumed_tokens=(token,))
+        coalesce.accept.return_value = CoalesceOutcome(
+            held=False, merged_token=merged_token, consumed_tokens=(token,), join_group_id="join-1"
+        )
         processor = _make_processor(
             factory,
             coalesce_executor=coalesce,
@@ -8606,6 +8612,7 @@ class TestNotifyCoalesceOfLostBranch:
             merged_token=merged_token,
             failure_reason=None,
             consumed_tokens=(),
+            join_group_id="join-1",
         )
         processor = _make_processor(
             factory,
@@ -8642,6 +8649,7 @@ class TestNotifyCoalesceOfLostBranch:
             merged_token=merged_token,
             failure_reason=None,
             consumed_tokens=(),
+            join_group_id="join-1",
         )
         processor = _make_processor(
             factory,
@@ -8698,6 +8706,7 @@ class TestNotifyCoalesceOfLostBranch:
             merged_token=merged_token,
             failure_reason=None,
             consumed_tokens=(),
+            join_group_id="join-1",
         )
         child_items: list[WorkItem] = []
         processor = _make_processor(

@@ -266,7 +266,7 @@ class TestTokenManagerCoalesceTokens:
             contract=contract,
         )
 
-        merged_token = manager.coalesce_tokens(
+        merged_token, _join_group_id = manager.coalesce_tokens(
             parents=[parent_a, parent_b],
             merged_data=merged_row,
             node_id=NodeID("coalesce_node"),

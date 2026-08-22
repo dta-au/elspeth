@@ -400,6 +400,7 @@ class TestCheckpointInterruptedProgress:
                             outcome=TerminalOutcome.SUCCESS,
                             path=TerminalPath.COALESCED,
                             scheduler_pending_sink=False,
+                            join_group_id="join-1",
                         ),
                     ),
                     (
@@ -408,6 +409,7 @@ class TestCheckpointInterruptedProgress:
                             outcome=TerminalOutcome.SUCCESS,
                             path=TerminalPath.COALESCED,
                             scheduler_pending_sink=True,
+                            join_group_id="join-1",
                         ),
                     ),
                 ]

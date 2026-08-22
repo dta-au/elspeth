@@ -27,6 +27,7 @@ class _ProcessingResult:
     token: TokenInfo
     sink_name: str | None
     scheduler_pending_sink: bool = False
+    join_group_id: str | None = None
 
 
 def _make_result(
@@ -42,6 +43,7 @@ def _make_result(
         path=path,
         token=token or make_token_info(),
         sink_name=sink_name,
+        join_group_id="join-1" if path is TerminalPath.COALESCED else None,
     )
 
 

@@ -2762,6 +2762,7 @@ class RowProcessor:
         token: TokenInfo,
         coalesce_name: CoalesceName,
         *,
+        join_group_id: str,
         context: str,
     ) -> RowResult:
         """Build the terminal-coalesce RowResult (SUCCESS/COALESCED routed to the coalesce sink).
@@ -2781,6 +2782,7 @@ class RowProcessor:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             sink_name=sink_name,
+            join_group_id=join_group_id,
         )
 
     def process_token(
@@ -2944,6 +2946,7 @@ class RowProcessor:
                 self._terminal_coalesce_row_result(
                     token,
                     coalesce_name,
+                    join_group_id=spec.join_group_id,
                     context=f"terminal coalesce resume for incomplete token '{spec.token_id}'",
                 )
             ]
@@ -3260,6 +3263,10 @@ class RowProcessor:
             return []
 
         if outcome.merged_token is not None:
+            # CoalesceOutcome.__post_init__ requires join_group_id whenever
+            # merged_token is set — narrow the type for the callers below.
+            if outcome.join_group_id is None:
+                raise OrchestrationInvariantError("CoalesceOutcome.merged_token is set but join_group_id is None — invariant violated")
             if self._nav.resolve_next_node(coalesce_node_id) is None:
                 self._complete_coalesce_fire(
                     coalesce_name=coalesce_name,
@@ -3274,6 +3281,7 @@ class RowProcessor:
                     self._terminal_coalesce_row_result(
                         outcome.merged_token,
                         coalesce_name,
+                        join_group_id=outcome.join_group_id,
                         context=f"branch-loss notification for row '{current_token.row_id}'",
                     ),
                 ]
@@ -3283,6 +3291,7 @@ class RowProcessor:
             merged_item = self._work_items.create(
                 token=outcome.merged_token,
                 current_node_id=coalesce_node_id,
+                join_group_id=outcome.join_group_id,
             )
             self._complete_coalesce_fire(
                 coalesce_name=coalesce_name,
@@ -3824,7 +3833,9 @@ class RowProcessor:
         merged_item = None
         merged_sink_result = None
         if next_node is not None:
-            merged_item = self._work_items.create_continuation(token=token, current_node_id=node_id)
+            merged_item = self._work_items.create_continuation(
+                token=token, current_node_id=node_id, join_group_id=residual.result_join_group_id
+            )
         else:
             merged_sink_result = RowResult(
                 token=token,
@@ -3835,6 +3846,7 @@ class RowProcessor:
                     coalesce_name,
                     context="committed coalesce residual recovery",
                 ),
+                join_group_id=residual.result_join_group_id,
             )
         self._scheduler.complete_barrier(
             run_id=self._run_id,

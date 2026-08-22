@@ -666,11 +666,14 @@ class BarrierIntakeCoordinator:
         """
         if outcome.merged_token is None:  # pragma: no cover - caller checks
             raise OrchestrationInvariantError("merged_token is None in _fire_coalesce_merge")
+        if outcome.join_group_id is None:  # pragma: no cover - CoalesceOutcome invariant
+            raise OrchestrationInvariantError("join_group_id is None but merged_token is set in _fire_coalesce_merge")
         coalesce_node_id = self._coalesce_node_ids[coalesce_name]
         if self._nav.resolve_next_node(coalesce_node_id) is None:
             terminal_result = self._terminal_coalesce_row_result(
                 outcome.merged_token,
                 coalesce_name,
+                join_group_id=outcome.join_group_id,
                 context=f"intake coalesce fire for token '{outcome.merged_token.token_id}'",
             )
             self._complete_coalesce_fire(
@@ -688,6 +691,7 @@ class BarrierIntakeCoordinator:
             current_node_id=coalesce_node_id,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            join_group_id=outcome.join_group_id,
         )
         self._complete_coalesce_fire(
             coalesce_name=coalesce_name,

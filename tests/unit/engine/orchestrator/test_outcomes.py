@@ -45,6 +45,7 @@ class _FakeRowResult:
     error: Any | None = None
     scheduler_pending_sink: bool = False
     authoritative_error_hash: str | None = None
+    join_group_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class _FakeCoalesceOutcome:
     failure_reason: str | None
     coalesce_name: str | None = None
     consumed_tokens: tuple[TokenInfo, ...] = ()
+    join_group_id: str | None = None
 
 
 @dataclass
@@ -165,6 +167,7 @@ def _make_result(
         path=path,
         token=result_token,
         sink_name=sink_name,
+        join_group_id=result_token.join_group_id if path == TerminalPath.COALESCED else None,
     )
 
 
@@ -386,6 +389,7 @@ class TestAccumulateAuthoritativeErrorHash:
             error=FailureInfo(exception_type=exception_type, message=message),
             scheduler_pending_sink=True,
             authoritative_error_hash=authoritative_error_hash,
+            join_group_id=None,
         )
 
     def test_replayed_pending_sink_prefers_persisted_hash(self) -> None:
@@ -937,7 +941,7 @@ class TestReconcileSinkWriteDiversions:
         reconcile_sink_write_diversions(
             counters,
             sink_name="output",
-            pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.COALESCED),
+            pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.COALESCED, join_group_id="join-1"),
             diversion_count=1,
         )
 

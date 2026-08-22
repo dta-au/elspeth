@@ -103,6 +103,7 @@ def _make_result(
         outcome=outcome,
         path=path,
         sink_name=sink_name,
+        join_group_id=result_token.join_group_id if path == TerminalPath.COALESCED else None,
     )
 
 

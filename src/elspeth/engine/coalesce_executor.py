@@ -66,6 +66,8 @@ class CoalesceOutcome:
             §E.3a): the journal-first intake releases the token's BLOCKED row
             via ``mark_blocked_barrier_terminal`` with a ``late_arrival``
             release context instead of the standard group-failure consumption.
+        join_group_id: Merge-event identity of the coalesce, set iff
+            merged_token is set.
     """
 
     held: bool
@@ -76,6 +78,7 @@ class CoalesceOutcome:
     coalesce_name: str | None = None
     outcomes_recorded: bool = False
     late_arrival: bool = False
+    join_group_id: str | None = None
 
     def __post_init__(self) -> None:
         # Validate mutual exclusivity of states
@@ -86,6 +89,14 @@ class CoalesceOutcome:
                 raise OrchestrationInvariantError("CoalesceOutcome: held=True but failure_reason is set — mutually exclusive states")
         if self.merged_token is not None and self.failure_reason is not None:
             raise OrchestrationInvariantError("CoalesceOutcome: both merged_token and failure_reason are set — mutually exclusive states")
+        if self.merged_token is not None and self.join_group_id is None:
+            raise OrchestrationInvariantError(
+                "CoalesceOutcome: merged_token is set but join_group_id is not — every merge carries its group id"
+            )
+        if self.merged_token is None and self.join_group_id is not None:
+            raise OrchestrationInvariantError(
+                "CoalesceOutcome: join_group_id is set but merged_token is not — join_group_id requires a merge"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1182,7 +1193,7 @@ class CoalesceExecutor:
             # every consumed state/outcome and CAS the effect receipt. A crash
             # between those phases leaves an explicit replayable MATERIALIZED
             # effect rather than partial terminal evidence.
-            merged_token = self._token_manager.coalesce_tokens(
+            merged_token, join_group_id = self._token_manager.coalesce_tokens(
                 parents=list(consumed_tokens),
                 merged_data=merged_data,
                 node_id=node_id,
@@ -1215,6 +1226,7 @@ class CoalesceExecutor:
                 consumed_tokens=consumed_tokens,
                 coalesce_metadata=coalesce_metadata,
                 coalesce_name=coalesce_name,
+                join_group_id=join_group_id,
             )
         except AuditIntegrityError:
             # If the audit database is already compromised, don't write more

@@ -25,6 +25,12 @@ def _error_for(path: TerminalPath) -> FailureInfo | None:
     return None
 
 
+def _join_group_id_for(path: TerminalPath) -> str | None:
+    if path == TerminalPath.COALESCED:
+        return "jg-1"
+    return None
+
+
 class TestRowResultOutcome:
     """Tests for RowResult outcome/path pairs."""
 
@@ -50,6 +56,7 @@ class TestRowResultOutcome:
                 path=path,
                 sink_name=_sink_name_for(path),
                 error=_error_for(path),
+                join_group_id=_join_group_id_for(path),
             )
             assert result.outcome is outcome
             assert result.path is path

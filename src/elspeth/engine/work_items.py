@@ -47,6 +47,7 @@ class WorkItem:
     row_union_node_id: NodeID | None = None
     row_union_name: RowUnionName | None = None
     on_success_sink: str | None = None
+    join_group_id: str | None = None
 
     def __post_init__(self) -> None:
         has_id = self.coalesce_node_id is not None
@@ -85,6 +86,7 @@ class WorkItemFactory:
         coalesce_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
         on_success_sink: str | None = None,
+        join_group_id: str | None = None,
     ) -> WorkItem:
         """Create a cursor with validated coalesce or resolved row-union metadata.
 
@@ -118,6 +120,7 @@ class WorkItemFactory:
             row_union_node_id=row_union_node_id,
             row_union_name=row_union_name,
             on_success_sink=on_success_sink,
+            join_group_id=join_group_id,
         )
 
     def create_continuation(
@@ -128,6 +131,7 @@ class WorkItemFactory:
         coalesce_name: CoalesceName | None = None,
         row_union_name: RowUnionName | None = None,
         on_success_sink: str | None = None,
+        join_group_id: str | None = None,
     ) -> WorkItem:
         """Create a child item that continues after current node or resumes at a barrier."""
         if coalesce_name is not None or row_union_name is not None:
@@ -147,6 +151,7 @@ class WorkItemFactory:
                     coalesce_name=coalesce_name,
                     row_union_name=row_union_name,
                     on_success_sink=on_success_sink,
+                    join_group_id=join_group_id,
                 )
 
             return self.create(
@@ -155,10 +160,12 @@ class WorkItemFactory:
                 coalesce_name=coalesce_name,
                 row_union_name=row_union_name,
                 on_success_sink=on_success_sink,
+                join_group_id=join_group_id,
             )
 
         return self.create(
             token=token,
             current_node_id=self.navigation.resolve_next_node(current_node_id),
             on_success_sink=on_success_sink,
+            join_group_id=join_group_id,
         )

@@ -140,13 +140,15 @@ def _coalesce_tokens_impl(
     node_id: NodeID,
     run_id: str,
     **_kwargs: Any,
-) -> TokenInfo:
-    return TokenInfo(
+) -> tuple[TokenInfo, str]:
+    join_group_id = f"join_{uuid4().hex[:8]}"
+    merged = TokenInfo(
         row_id=parents[0].row_id,
         token_id=f"merged_{uuid4().hex[:8]}",
         row_data=merged_data,
-        join_group_id=f"join_{uuid4().hex[:8]}",
+        join_group_id=join_group_id,
     )
+    return merged, join_group_id
 
 
 def _make_contract(
@@ -481,6 +483,7 @@ class TestCoalesceOutcome:
             consumed_tokens=(token,),
             coalesce_metadata=metadata,
             coalesce_name="merge",
+            join_group_id="join-1",
         )
         assert outcome.held is False
         assert outcome.merged_token is token
@@ -489,6 +492,7 @@ class TestCoalesceOutcome:
         assert outcome.failure_reason is None
         assert outcome.coalesce_name == "merge"
         assert outcome.outcomes_recorded is False
+        assert outcome.join_group_id == "join-1"
 
     def test_failure_outcome(self):
         from elspeth.contracts.coalesce_metadata import CoalesceMetadata

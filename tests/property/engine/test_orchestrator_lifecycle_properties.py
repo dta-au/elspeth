@@ -189,9 +189,10 @@ def _make_row_result(
             from elspeth.contracts.results import FailureInfo
 
             error = FailureInfo(exception_type="TransformError", message="boom")
+    join_group_id = "join-1" if path == TerminalPath.COALESCED else None
     token = _make_token(
         branch_name=branch_name,
-        join_group_id="join-1" if path == TerminalPath.COALESCED else None,
+        join_group_id=join_group_id,
     )
     return RowResult(
         token=token,
@@ -200,6 +201,7 @@ def _make_row_result(
         path=path,
         sink_name=sink_name,
         error=error,  # type: ignore[arg-type]
+        join_group_id=join_group_id,
     )
 
 
