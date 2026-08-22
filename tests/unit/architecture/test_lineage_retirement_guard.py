@@ -99,15 +99,15 @@ def _modules_inserting_into(table_attr: str) -> set[str]:
                 and node.func.attr == "insert"
                 and isinstance(node.func.value, (ast.Name, ast.Attribute))
             ):
-                receiver_name = getattr(node.func.value, "id", None) or getattr(node.func.value, "attr", None)
+                receiver = node.func.value
+                receiver_name = receiver.id if isinstance(receiver, ast.Name) else receiver.attr
                 if receiver_name == table_attr or receiver_name in aliases_to_table:
                     is_match = True
 
             # Functional form: insert(token_lineage_frames_table)
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "insert":
                 for arg in node.args:
-                    arg_name = getattr(arg, "id", None)
-                    if arg_name == table_attr or arg_name in aliases_to_table:
+                    if isinstance(arg, ast.Name) and (arg.id == table_attr or arg.id in aliases_to_table):
                         is_match = True
                         break
 
