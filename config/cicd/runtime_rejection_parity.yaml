@@ -2764,6 +2764,51 @@ sites:
   note: _sink_id_map and the SINK nodes are populated from the same sinks mapping in one builder pass;
     this check (graph.py:414-420) re-reads the builder's own two structures and names itself a graph construction
     bug.
+- key: b93894eb48d2fba7
+  path: src/elspeth/core/dag/group_bindings.py
+  qualname: GroupBindingRegistry.__post_init__
+  exception: ValueError
+  message: Branch '{}' appears in two bound forks' rosters — branch names are one-producer connections,
+    so roster membership must be a function (binding_for's FORK resolut
+  ordinal: 0
+  disposition: structural
+  note: build_group_binding_registry only ever constructs FORK bindings from coalesce_plans/row_union_branch_specs,
+    both of which the builder's own pre-existing per-branch duplicate checks (coalesce_branch_specs /
+    row_union_branch_specs population, builder.py:564/646) already reject before a coalesce/row_union
+    can exist with an overlapping branch — this re-check is a defensive re-assertion of an invariant the
+    caller has already enforced, with no authorable path to trigger it independently.
+- key: ace86f7ac06d3b1b
+  path: src/elspeth/core/dag/group_bindings.py
+  qualname: GroupBindingRegistry.__post_init__
+  exception: ValueError
+  message: Closer(s) {} bound twice — each closer closes at most one group (spec §7 rule 1)
+  ordinal: 0
+  disposition: structural
+  note: build_group_binding_registry derives one binding per fork gate (keyed by that gate's own node_id)
+    and one per scope (keyed by CollectorSettings/ScopeSettings closer, which the builder's collector-wiring
+    loop already requires be unique per scopes_by_closer); no authorable config produces two bindings
+    naming the same closer node. Defensive re-check of an already-enforced invariant.
+- key: 950983d2ba953bc0
+  path: src/elspeth/core/dag/group_bindings.py
+  qualname: GroupBindingRegistry.__post_init__
+  exception: ValueError
+  message: Group opener(s) {} bound twice — each frame source binds at most one closer (spec §7 rule 1)
+  ordinal: 0
+  disposition: structural
+  note: fork_rosters is keyed by GateName from gate_entries (one _GateEntry per configured gate, builder-enforced
+    unique), so build_group_binding_registry can produce at most one binding per opener node_id by construction.
+    Defensive re-check of an already-enforced invariant, symmetric with the closer-duplication entry above.
+- key: 5988fb0d3e545003
+  path: src/elspeth/core/dag/group_bindings.py
+  qualname: GroupBindingRegistry.register_expand_group
+  exception: ValueError
+  message: EXPAND group '{}' already registered to opener '{}'; refusing re-registration under '{}'
+  ordinal: 0
+  disposition: structural
+  note: register_expand_group is the runtime (post-build) EXPAND-group mint-path feed (WS3's TokenManager
+    call site), not a composer/config-authoring surface at all — group ids are minted at runtime via generate_id()
+    and are unique per mint, so this guards an engine-internal identity invariant with no Stage 1/Stage
+    2 config shape that could reach it.
 - key: 0293462605a1dec5
   path: src/elspeth/core/dag/guarantees.py
   qualname: get_required_fields

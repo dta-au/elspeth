@@ -39,6 +39,7 @@ from elspeth.contracts.types import (
     SinkName,
 )
 from elspeth.core.dag import coalesce_warnings, guarantees, row_union_warnings, schema_validation
+from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.dag.guarantees import EffectiveGuaranteeVote as _EffectiveGuaranteeVote
 from elspeth.core.dag.models import (
     BranchInfo,
@@ -99,6 +100,7 @@ class ExecutionGraph:
         self._pipeline_nodes: list[NodeID] | None = None  # Ordered processing nodes (no source/sinks); None = not yet populated
         self._node_step_map: dict[NodeID, int] = {}  # node_id -> audit step (source=0)
         self._validation_warnings: tuple[GraphValidationWarning, ...] = ()
+        self._group_bindings: GroupBindingRegistry = GroupBindingRegistry(bindings=())
         self._build_metadata_frozen = False
 
     @property
@@ -858,6 +860,18 @@ class ExecutionGraph:
         self._assert_build_metadata_mutable()
         self._validation_warnings = tuple(warnings)
 
+    def set_group_bindings(self, registry: GroupBindingRegistry) -> None:
+        """Set the unified FORK/EXPAND group-binding registry (spec §3).
+
+        The registry is stored by reference, not copied: `_freeze_build_metadata`
+        only flips a mutability flag (no MappingProxyType wrapping, no deep
+        copy), and the registry's own runtime `_expand_groups` index must stay
+        mutable after the freeze for `register_expand_group` (WS3's mint-path
+        call site) to keep working.
+        """
+        self._assert_build_metadata_mutable()
+        self._group_bindings = registry
+
     def add_route_resolution_entry(self, gate_id: NodeID, label: str, dest: RouteDestination) -> None:
         """Add a single entry to the route resolution map."""
         self._assert_build_metadata_mutable()
@@ -958,6 +972,13 @@ class ExecutionGraph:
         neither this map nor the coalesce branch map route to a sink.
         """
         return dict(self._branch_to_row_union)
+
+    def get_group_bindings(self) -> GroupBindingRegistry:
+        """Get the unified FORK/EXPAND group-binding registry (spec §3).
+
+        Empty registry (`bindings=()`) for a build with no bound group.
+        """
+        return self._group_bindings
 
     def get_branch_info_map(self) -> dict[BranchName, BranchInfo]:
         """Get immutable branch routing plans keyed by branch name."""

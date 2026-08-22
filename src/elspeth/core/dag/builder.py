@@ -31,6 +31,7 @@ from elspeth.contracts.types import (
 )
 from elspeth.core.canonical import canonical_json
 from elspeth.core.dag.coalesce_merge import merge_coalesce_schema
+from elspeth.core.dag.group_bindings import build_group_binding_registry
 from elspeth.core.dag.guarantees import walk_effective_guarantee_vote
 from elspeth.core.dag.models import (
     _NODE_ID_MAX_LENGTH,
@@ -1652,6 +1653,23 @@ def build_execution_graph(
                     component_id=str(ru_spec.row_union_name),
                     component_type="row_union",
                 ) from None
+
+    # ===== UNIFIED GROUP-BINDING REGISTRY (barrier-scopes spec §3) =====
+    registry = build_group_binding_registry(
+        fork_rosters={
+            GateName(gate_entry.name): (gate_entry.node_id, tuple(gate_entry.fork_to)) for gate_entry in gate_entries if gate_entry.fork_to
+        },
+        coalesce_plans=coalesce_plans,
+        coalesce_settings_by_name={CoalesceName(c.name): c for c in (coalesce_settings or [])},
+        coalesce_ids=coalesce_ids,
+        row_union_branch_specs=row_union_branch_specs,
+        row_union_settings_by_name={RowUnionName(u.name): u for u in (row_union_settings or [])},
+        row_union_ids=row_union_ids,
+        scope_settings=tuple(scope_settings or ()),
+        collector_ids=collector_ids,
+        transform_ids_by_name=transform_ids_by_name,
+    )
+    graph.set_group_bindings(registry)
 
     # Step maps and node sequence support node_id-based processor traversal.
     graph.set_pipeline_nodes(pipeline_nodes)
