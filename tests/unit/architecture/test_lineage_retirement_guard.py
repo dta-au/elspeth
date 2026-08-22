@@ -3,6 +3,13 @@
 Whole-tree gate for the unified-lineage retirement (spec §11). A green scoped
 run elsewhere proves nothing about this file's subject — it asserts over the
 ENTIRE src tree.
+
+The write-path scan's alias collection is module-wide, not scope-aware: a local
+name bound to token_lineage_frames_table in one function is treated as an alias
+throughout that module, so an unrelated same-named local writing a different
+table can trip the guard. That error is fail-closed (a spurious failure, never
+a masked writer) — if it fires on a name collision, rename the local rather
+than weakening the scan.
 """
 
 from __future__ import annotations
