@@ -23,6 +23,7 @@ from elspeth.contracts.types import (
     AggregationName,
     BranchName,
     CoalesceName,
+    CollectorName,
     GateName,
     NodeID,
     RowUnionName,
@@ -44,9 +45,11 @@ if TYPE_CHECKING:
     from elspeth.core.config import (
         AggregationSettings,
         CoalesceSettings,
+        CollectorSettings,
         GateSettings,
         QueueSettings,
         RowUnionSettings,
+        ScopeSettings,
         SourceSettings,
     )
     from elspeth.core.dag.graph import ExecutionGraph
@@ -179,6 +182,9 @@ def build_execution_graph(
     coalesce_settings: Sequence[CoalesceSettings] | None = None,
     queues: Mapping[str, QueueSettings] | None = None,
     row_union_settings: Sequence[RowUnionSettings] | None = None,
+    collectors: Mapping[str, tuple[TransformProtocol, CollectorSettings]] | None = None,
+    scope_settings: Sequence[ScopeSettings] | None = None,
+    max_bound_region_depth: int = 5,
 ) -> ExecutionGraph:
     """Build an ExecutionGraph from plugin instances.
 
@@ -196,6 +202,8 @@ def build_execution_graph(
         raise GraphValidationError("ExecutionGraph requires at least one sink")
     if aggregations is None:
         aggregations = {}
+    if collectors is None:
+        collectors = {}
     if set(sources) != set(source_settings_map):
         raise GraphValidationError(
             f"Source plugin names and source settings names must match. plugins={sorted(sources)}, settings={sorted(source_settings_map)}"
@@ -662,6 +670,65 @@ def build_execution_graph(
 
         graph.set_row_union_id_map(row_union_ids)
 
+    # ===== BUILD COLLECTORS (EXPAND-GROUP CLOSERS; barrier-scopes spec §3) =====
+    # A collector is a barrier reusing the batch-transform plugin contract.
+    # Its scope binding rides the node config as the "scope" key — present on
+    # collector nodes ONLY, so no pre-existing node's canonical hash moves
+    # (spec §3; Task-1 corpus pins it).
+    collector_ids: dict[CollectorName, NodeID] = {}
+    scopes_by_closer: dict[str, ScopeSettings] = {s.closer: s for s in (scope_settings or ())}
+    if collectors:
+        for collector_name, (transform, collector_config) in collectors.items():
+            if not transform.is_batch_aware:
+                raise GraphValidationError(
+                    f"Collector '{collector_name}' plugin '{collector_config.plugin}' has "
+                    f"is_batch_aware=False. Collectors reuse the batch-transform plugin contract.",
+                    component_id=collector_name,
+                    component_type="collector",
+                )
+            if collector_config.name not in scopes_by_closer:
+                raise GraphValidationError(
+                    f"Collector '{collector_name}' has no scopes: entry binding it. A collector is an "
+                    f"EXPAND-group closer and requires a scope (spec §7 rule 1).",
+                    component_id=collector_name,
+                    component_type="collector",
+                )
+            scope = scopes_by_closer[collector_config.name]
+            transform_config = transform.config
+            collector_node_config: NodeConfig = {
+                "options": dict(collector_config.options),
+                "input_schema": transform_config["schema"],
+                "scope": {
+                    "name": scope.name,
+                    "opener": scope.opener,
+                    "policy": scope.policy,
+                    "on_group_failure": scope.on_group_failure,
+                },
+            }
+            col_id = node_id("collector", collector_name, collector_node_config)
+            collector_ids[CollectorName(collector_name)] = col_id
+            collector_output_schema_config = transform._output_schema_config
+            if collector_output_schema_config is None:
+                collector_output_schema_config = _parse_contract_schema_config(
+                    transform_config,
+                    owner=f"collector:{collector_name}",
+                    component_id=collector_name,
+                    component_type="collector",
+                )
+            graph.add_node(
+                col_id,
+                node_type=NodeType.COLLECTOR,
+                plugin_name=collector_config.plugin,
+                config=collector_node_config,
+                input_schema=transform.input_schema,
+                output_schema=transform.output_schema,
+                output_schema_config=collector_output_schema_config,
+                passes_through_input=transform.passes_through_input,
+                forwards_input_fields=transform.forwards_input_fields,
+                removed_input_fields=transform.removed_input_fields,
+            )
+    graph.set_collector_id_map(collector_ids)
+
     # ===== CONNECT FORK GATES - EXPLICIT DESTINATIONS ONLY =====
     # CRITICAL: No fallback behavior. All fork branches must have explicit destinations.
     # This prevents silent configuration bugs (typos, missing destinations).
@@ -815,6 +882,11 @@ def build_execution_graph(
         elif SinkName(agg_settings.on_success) not in sink_ids:
             register_producer(agg_settings.on_success, aid, "continue", f"aggregation '{agg_settings.name}'")
 
+    for collector_name, (_transform, collector_settings_entry) in collectors.items():
+        cid = collector_ids[CollectorName(collector_name)]
+        if SinkName(collector_settings_entry.on_success) not in sink_ids:
+            register_producer(collector_settings_entry.on_success, cid, "continue", f"collector '{collector_settings_entry.name}'")
+
     if coalesce_settings:
         for coalesce_config in coalesce_settings:
             if coalesce_config.on_success is None:
@@ -883,6 +955,13 @@ def build_execution_graph(
             agg_settings.input,
             aggregation_ids[AggregationName(agg_name)],
             f"aggregation '{agg_settings.name}'",
+        )
+
+    for collector_name, (_transform, collector_settings_entry) in collectors.items():
+        register_consumer(
+            collector_settings_entry.input,
+            collector_ids[CollectorName(collector_name)],
+            f"collector '{collector_settings_entry.name}'",
         )
 
     for gate_settings in gates:
@@ -1056,6 +1135,20 @@ def build_execution_graph(
                 component_type="aggregation",
             )
 
+    for collector_name, (_transform, collector_settings_entry) in collectors.items():
+        collector_on_success = collector_settings_entry.on_success
+        cid = collector_ids[CollectorName(collector_name)]
+        if SinkName(collector_on_success) in sink_ids:
+            graph.add_edge(cid, sink_ids[SinkName(collector_on_success)], label="on_success", mode=RoutingMode.MOVE)
+        elif collector_on_success not in consumers:
+            suggestions = _suggest_similar(collector_on_success, sorted(consumers.keys()))
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise GraphValidationError(
+                f"Collector '{collector_settings_entry.name}' on_success '{collector_on_success}' is neither a sink nor a known connection.{hint}",
+                component_id=collector_settings_entry.name,
+                component_type="collector",
+            )
+
     if coalesce_settings:
         for coalesce_config in coalesce_settings:
             if coalesce_config.on_success is None:
@@ -1212,6 +1305,7 @@ def build_execution_graph(
     processing_node_ids.update(config_gate_ids.values())
     processing_node_ids.update(coalesce_ids.values())
     processing_node_ids.update(row_union_ids.values())
+    processing_node_ids.update(collector_ids.values())
 
     pipeline_nodes = graph.topological_processing_order(processing_node_ids)
 

@@ -32,6 +32,7 @@ from elspeth.contracts.types import (
     AggregationName,
     BranchName,
     CoalesceName,
+    CollectorName,
     GateName,
     NodeID,
     RowUnionName,
@@ -56,9 +57,11 @@ if TYPE_CHECKING:
     from elspeth.core.config import (
         AggregationSettings,
         CoalesceSettings,
+        CollectorSettings,
         GateSettings,
         QueueSettings,
         RowUnionSettings,
+        ScopeSettings,
         SourceSettings,
     )
     from elspeth.core.dag.wiring import WiredTransform
@@ -85,6 +88,7 @@ class ExecutionGraph:
         self._transform_id_map: dict[int, NodeID] = {}
         self._config_gate_id_map: dict[GateName, NodeID] = {}  # gate_name -> node_id
         self._aggregation_id_map: dict[AggregationName, NodeID] = {}  # agg_name -> node_id
+        self._collector_id_map: dict[CollectorName, NodeID] = {}  # collector_name -> node_id
         self._coalesce_id_map: dict[CoalesceName, NodeID] = {}  # coalesce_name -> node_id
         self._branch_info: dict[BranchName, BranchInfo] = {}  # branch_name -> coalesce + gate info
         self._row_union_id_map: dict[RowUnionName, NodeID] = {}  # row_union_name -> node_id
@@ -719,6 +723,9 @@ class ExecutionGraph:
         coalesce_settings: Sequence[CoalesceSettings] | None = None,
         queues: Mapping[str, QueueSettings] | None = None,
         row_union_settings: Sequence[RowUnionSettings] | None = None,
+        collectors: Mapping[str, tuple[TransformProtocol, CollectorSettings]] | None = None,
+        scope_settings: Sequence[ScopeSettings] | None = None,
+        max_bound_region_depth: int = 5,
     ) -> ExecutionGraph:
         """Build ExecutionGraph from plugin instances.
 
@@ -743,6 +750,10 @@ class ExecutionGraph:
             coalesce_settings: Coalesce configs for fork/join patterns
             queues: Declared pass-through scheduling queues
             row_union_settings: row_union barrier configs (fork-branch UNION ALL)
+            collectors: Dict of collector_name -> (transform_instance, CollectorSettings) —
+                EXPAND-group closers (barrier-scopes spec §3)
+            scope_settings: Declared opener -> closer scope bindings
+            max_bound_region_depth: Maximum supported bound-region nesting depth
 
         Returns:
             ExecutionGraph with schemas populated
@@ -765,6 +776,9 @@ class ExecutionGraph:
             coalesce_settings=coalesce_settings,
             queues=queues,
             row_union_settings=row_union_settings,
+            collectors=collectors,
+            scope_settings=scope_settings,
+            max_bound_region_depth=max_bound_region_depth,
         )
 
     # ===== PUBLIC SETTERS (construction-time) =====
@@ -793,6 +807,11 @@ class ExecutionGraph:
         """Set the agg_name -> node_id mapping."""
         self._assert_build_metadata_mutable()
         self._aggregation_id_map = dict(mapping)
+
+    def set_collector_id_map(self, mapping: dict[CollectorName, NodeID]) -> None:
+        """Set the collector_name -> node_id mapping."""
+        self._assert_build_metadata_mutable()
+        self._collector_id_map = dict(mapping)
 
     def set_coalesce_id_map(self, mapping: dict[CoalesceName, NodeID]) -> None:
         """Set the coalesce_name -> node_id mapping."""
@@ -902,6 +921,14 @@ class ExecutionGraph:
             Dict mapping aggregation name to its graph node ID.
         """
         return dict(self._aggregation_id_map)
+
+    def get_collector_id_map(self) -> dict[CollectorName, NodeID]:
+        """Get explicit collector_name -> node_id mapping for collectors.
+
+        Returns:
+            Dict mapping collector name to its graph node ID.
+        """
+        return dict(self._collector_id_map)
 
     def get_coalesce_id_map(self) -> dict[CoalesceName, NodeID]:
         """Get explicit coalesce_name -> node_id mapping.

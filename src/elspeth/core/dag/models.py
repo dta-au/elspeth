@@ -370,15 +370,17 @@ class NodeInfo:
                 component_type=component_type,
             )
         # Offensive programming: passes_through_input is for nodes that execute
-        # a TransformProtocol plugin — TRANSFORM and AGGREGATION. Aggregations
-        # (including BatchReplicate wired under `aggregations:` in YAML) execute
-        # transform-class plugins and share the propagation semantics per
-        # ADR-007. Setting it on source/coalesce/sink/gate indicates a builder
-        # bug or misrouted attribute assignment; surface at construction.
-        if self.passes_through_input and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION):
+        # a TransformProtocol plugin — TRANSFORM, AGGREGATION, and COLLECTOR.
+        # Aggregations (including BatchReplicate wired under `aggregations:` in
+        # YAML) execute transform-class plugins and share the propagation
+        # semantics per ADR-007; a collector reuses that same batch-transform
+        # plugin contract (barrier-scopes spec §3) and shares it too. Setting
+        # it on source/coalesce/sink/gate indicates a builder bug or
+        # misrouted attribute assignment; surface at construction.
+        if self.passes_through_input and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION, NodeType.COLLECTOR):
             raise GraphValidationError(
-                f"NodeInfo.passes_through_input is only meaningful for TRANSFORM or "
-                f"AGGREGATION nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                f"NodeInfo.passes_through_input is only meaningful for TRANSFORM, "
+                f"AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )
@@ -388,10 +390,14 @@ class NodeInfo:
         # independently rather than only behind the flag catches a stray removal
         # set left on a node that forwards nothing, which would otherwise sit
         # unread until a future validator widened its scope.
-        if (self.forwards_input_fields or self.removed_input_fields) and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION):
+        if (self.forwards_input_fields or self.removed_input_fields) and self.node_type not in (
+            NodeType.TRANSFORM,
+            NodeType.AGGREGATION,
+            NodeType.COLLECTOR,
+        ):
             raise GraphValidationError(
                 f"NodeInfo.forwards_input_fields/removed_input_fields are only meaningful for "
-                f"TRANSFORM or AGGREGATION nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                f"TRANSFORM, AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )

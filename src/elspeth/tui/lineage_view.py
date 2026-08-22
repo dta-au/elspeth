@@ -70,6 +70,7 @@ _TYPE_LABELS = {
     NodeType.AGGREGATION: "Aggregation",
     NodeType.COALESCE: "Coalesce",
     NodeType.ROW_UNION: "Row union",
+    NodeType.COLLECTOR: "Collector",
     NodeType.SINK: "Sink",
 }
 _HIDDEN_EDGE_LABELS = {"continue", "default", "on_success"}

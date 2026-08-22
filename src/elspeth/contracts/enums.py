@@ -101,6 +101,7 @@ class NodeType(StrEnum):
     AGGREGATION = "aggregation"
     COALESCE = "coalesce"
     ROW_UNION = "row_union"
+    COLLECTOR = "collector"
     SINK = "sink"
 
 

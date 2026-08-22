@@ -360,6 +360,9 @@ def build_scenario(
         coalesce_settings=list(settings.coalesce) if settings.coalesce else None,
         row_union_settings=list(settings.row_unions) if settings.row_unions else None,
         queues=settings.queues,
+        collectors=bundle.collectors,
+        scope_settings=list(settings.scopes) if settings.scopes else None,
+        max_bound_region_depth=settings.max_bound_region_depth,
     )
     graph.validate()
     graph.validate_edge_compatibility()
@@ -452,16 +455,21 @@ def _semantic_run_settings(raw_settings: object) -> dict[str, object]:
     # default in every run and would rotate every pinned
     # semantic_settings_sha256 with no semantic change to the pipeline.
     # Fields listed here entered the schema after the v1 pins; drop them when
-    # they hold their type's own empty default — non-empty declarations still
-    # enter the hash. NOTE: each field's empty default has its own shape
-    # (`[]` for a list-typed catalog like row_unions, `{}` for a Mapping-typed
-    # catalog like llm_profiles, `None` for a scalar like default_llm_profile)
-    # — comparing every entry against a single literal (e.g. `== []`) would
-    # silently no-op for the others and let their pins rotate anyway.
+    # they hold their type's own empty/unset default — non-empty declarations
+    # still enter the hash. NOTE: each field's post-pin default has its own
+    # shape (`[]` for a list-typed catalog like row_unions/collectors/scopes,
+    # `{}` for a Mapping-typed catalog like llm_profiles, `None` for an
+    # optional scalar like default_llm_profile, or the field's own declared
+    # scalar default like max_bound_region_depth's `5`) — comparing every
+    # entry against a single literal (e.g. `== []`) would silently no-op for
+    # the others and let their pins rotate anyway.
     _post_pin_empty_defaults: dict[str, object] = {
         "row_unions": [],
         "llm_profiles": {},
         "default_llm_profile": None,
+        "collectors": [],
+        "scopes": [],
+        "max_bound_region_depth": 5,
     }
     for post_pin_section, empty_default in _post_pin_empty_defaults.items():
         if settings.get(post_pin_section) == empty_default:

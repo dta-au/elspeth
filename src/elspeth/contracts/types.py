@@ -31,6 +31,9 @@ GateName = NewType("GateName", str)
 AggregationName = NewType("AggregationName", str)
 """User-defined aggregation name (e.g., 'batch_processor')"""
 
+CollectorName = NewType("CollectorName", str)
+"""User-defined collector name (e.g., 'page_stitcher') — EXPAND-group closer (barrier-scopes spec §3)"""
+
 StepResolver = Callable[[NodeID], int]
 """Resolves a NodeID to its 1-indexed audit step position in the DAG.
 

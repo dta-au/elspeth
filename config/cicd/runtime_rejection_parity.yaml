@@ -2149,6 +2149,35 @@ sites:
     produced by a gate, which wires either a COPY edge (identity branch, builder.py:701) or a MOVE edge
     via the producer/consumer match (builder.py:1003). No coalesce can reach line 1251 with zero incoming
     edges.
+- key: 58865659c41d43bd
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Collector ''{}'' has no scopes: entry binding it. A collector is an EXPAND-group closer and
+    requires a scope (spec §7 rule 1).'
+  ordinal: 0
+  disposition: not_authorable
+  note: Collector nodes are not yet composer-authorable (WS2 Task 3, barrier-scopes spec §3) — the composer
+    gains collector/scope authoring in Task 12, which re-adjudicates this site.
+- key: 76cb722394803f95
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Collector '{}' on_success '{}' is neither a sink nor a known connection.{}
+  ordinal: 0
+  disposition: not_authorable
+  note: Collector nodes are not yet composer-authorable (WS2 Task 3, barrier-scopes spec §3) — the composer
+    gains collector/scope authoring in Task 12, which re-adjudicates this site.
+- key: ae7bfbe742770543
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Collector '{}' plugin '{}' has is_batch_aware=False. Collectors reuse the batch-transform plugin
+    contract.
+  ordinal: 0
+  disposition: not_authorable
+  note: Collector nodes are not yet composer-authorable (WS2 Task 3, barrier-scopes spec §3) — the composer
+    gains collector/scope authoring in Task 12, which re-adjudicates this site.
 - key: c25b40ad6a2ea42c
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph
@@ -2849,16 +2878,17 @@ sites:
   disposition: structural
   note: declared_string_input_fields is written only at builder.py:405 (transform path); add_node defaults
     it to frozenset() (graph.py:140).
-- key: 1cd37988a4cab3a7
+- key: bd2a8610f41f3793
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
   exception: GraphValidationError
-  message: NodeInfo.forwards_input_fields/removed_input_fields are only meaningful for TRANSFORM or AGGREGATION
-    nodes; node {} has type {}.
+  message: NodeInfo.forwards_input_fields/removed_input_fields are only meaningful for TRANSFORM, AGGREGATION,
+    or COLLECTOR nodes; node {} has type {}.
   ordinal: 0
   disposition: structural
-  note: forwards_input_fields / removed_input_fields are written only at builder.py:407-408 (transform)
-    and 458-459 (aggregation) — both node types the guard admits; add_node defaults them off (graph.py:142-143).
+  note: forwards_input_fields / removed_input_fields are written only at builder.py:407-408 (transform),
+    458-459 (aggregation), and the collector node construction block (builder.py, barrier-scopes spec
+    §3) — all three node types the guard admits; add_node defaults them off (graph.py:142-143).
 - key: 4d7b97c8230791d6
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
@@ -2868,16 +2898,17 @@ sites:
   disposition: structural
   note: Every node_id reaching NodeInfo comes from builder.node_id(), which emits prefix_name_hash (builder.py:232-236)
     — never empty.
-- key: 14a57e9bdacd33c5
+- key: ed073ec097a17c2a
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
   exception: GraphValidationError
-  message: NodeInfo.passes_through_input is only meaningful for TRANSFORM or AGGREGATION nodes; node {}
-    has type {}.
+  message: NodeInfo.passes_through_input is only meaningful for TRANSFORM, AGGREGATION, or COLLECTOR nodes;
+    node {} has type {}.
   ordinal: 0
   disposition: structural
-  note: passes_through_input is written only at builder.py:406 (transform) and 457 (aggregation) — both
-    admitted types; add_node defaults it False (graph.py:141).
+  note: passes_through_input is written only at builder.py:406 (transform), 457 (aggregation), and the
+    collector node construction block (builder.py, barrier-scopes spec §3) — all three admitted types;
+    add_node defaults it False (graph.py:141).
 - key: 597f6abb9f4eba13
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__

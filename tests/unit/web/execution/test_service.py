@@ -282,6 +282,7 @@ def _plugin_bundle_stub() -> SimpleNamespace:
         transforms=(),
         sinks={"primary": sink},
         aggregations={},
+        collectors={},
         sink_effect_bindings={
             "primary": SinkEffectRuntimeBinding(
                 sink_name="primary",
@@ -409,6 +410,8 @@ def _mock_pipeline_settings() -> SimpleNamespace:
         gates=[],
         coalesce=[],
         row_unions=[],
+        scopes=[],
+        max_bound_region_depth=5,
         queues={},
         landscape=SimpleNamespace(export=SimpleNamespace(enabled=False, sink=None)),
         rate_limit=RateLimitSettings(enabled=False),

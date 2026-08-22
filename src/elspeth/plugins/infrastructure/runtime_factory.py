@@ -8,7 +8,7 @@ already-instantiated primitives.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
@@ -27,7 +27,14 @@ from elspeth.engine.orchestrator.preflight import (
 )
 
 if TYPE_CHECKING:
-    from elspeth.core.config import AggregationSettings, ElspethSettings, LandscapeExportSettings, SourceSettings, TransformSettings
+    from elspeth.core.config import (
+        AggregationSettings,
+        CollectorSettings,
+        ElspethSettings,
+        LandscapeExportSettings,
+        SourceSettings,
+        TransformSettings,
+    )
     from elspeth.core.dag.wiring import WiredTransform
 
 
@@ -48,6 +55,7 @@ class PluginBundle:
     sinks: Mapping[str, SinkProtocol]
     aggregations: Mapping[str, tuple[TransformProtocol, AggregationSettings]]
     sink_effect_bindings: Mapping[str, SinkEffectRuntimeBinding]
+    collectors: Mapping[str, tuple[TransformProtocol, CollectorSettings]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         from elspeth.contracts.errors import OrchestrationInvariantError
@@ -64,7 +72,7 @@ class PluginBundle:
         for sink_name, binding in self.sink_effect_bindings.items():
             if binding.sink_name != sink_name or binding.sink is not self.sinks[sink_name]:
                 raise OrchestrationInvariantError("PluginBundle sink effect binding must retain the exact named sink instance")
-        freeze_fields(self, "sources", "source_settings_map", "transforms", "sinks", "aggregations", "sink_effect_bindings")
+        freeze_fields(self, "sources", "source_settings_map", "transforms", "sinks", "aggregations", "sink_effect_bindings", "collectors")
 
     @property
     def sink_effect_modes(self) -> Mapping[str, str]:
@@ -134,6 +142,23 @@ def instantiate_plugins_from_config(
 
             aggregations[agg_config.name] = (transform, agg_config)
 
+        collectors = {}
+        for collector_config in config.collectors:
+            transform_cls = manager.get_transform_by_name(collector_config.plugin)
+            transform = transform_cls(dict(collector_config.options))
+            transform.on_success = collector_config.on_success
+            # May be None — the derives-from-structure default (spec §7 rule 9);
+            # transforms already type on_error as str | None, and WS4's executor
+            # realizes the structural route.
+            transform.on_error = collector_config.on_error
+            if not transform.is_batch_aware:
+                raise ValueError(
+                    f"Collector '{collector_config.name}' uses transform '{collector_config.plugin}' "
+                    f"which has is_batch_aware=False. Collectors reuse the batch-transform plugin "
+                    f"contract and require batch-aware plugins."
+                )
+            collectors[collector_config.name] = (transform, collector_config)
+
         from elspeth.plugins.infrastructure.base import BaseSink
 
         sinks = {}
@@ -174,6 +199,7 @@ def instantiate_plugins_from_config(
             sinks=sinks,
             aggregations=aggregations,
             sink_effect_bindings=sink_effect_bindings,
+            collectors=collectors,
         )
 
     # Value-source compliance check. Single source of truth: every entry point
@@ -406,14 +432,18 @@ def validate_landscape_export_settings_from_raw_config(raw_config: Mapping[str, 
 
 
 def _value_source_wired_transforms(bundle: PluginBundle) -> tuple[WiredTransform, ...]:
-    """Return ordinary and aggregation-backed transforms for value-source checks."""
+    """Return ordinary, aggregation-backed, and collector-backed transforms for value-source checks."""
     from elspeth.core.dag.wiring import WiredTransform
 
     aggregation_transforms = tuple(
         WiredTransform(plugin=transform, settings=cast("TransformSettings", agg_settings))
         for transform, agg_settings in bundle.aggregations.values()
     )
-    return (*bundle.transforms, *aggregation_transforms)
+    collector_transforms = tuple(
+        WiredTransform(plugin=transform, settings=cast("TransformSettings", collector_settings))
+        for transform, collector_settings in bundle.collectors.values()
+    )
+    return (*bundle.transforms, *aggregation_transforms, *collector_transforms)
 
 
 def make_sink_factory(config: ElspethSettings) -> Callable[[str], SinkEffectRuntimeBinding]:

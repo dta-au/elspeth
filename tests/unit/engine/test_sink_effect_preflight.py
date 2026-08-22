@@ -880,6 +880,7 @@ def test_runtime_entry_points_construct_plugins_in_preflight_mode(
         sources={"source": component},
         transforms=(),
         aggregations=(),
+        collectors=(),
         sinks={
             "output": SimpleNamespace(
                 plugin="probe",
@@ -933,6 +934,7 @@ def test_runtime_factory_does_not_construct_delayed_export_sink(
         sources={"source": source_config},
         transforms=(),
         aggregations=(),
+        collectors=(),
         sinks={"pipeline": sink("pipeline"), "audit-export": sink("audit-export")},
         landscape=SimpleNamespace(export=SimpleNamespace(enabled=True, sink="audit-export", format="json")),
     )
@@ -951,6 +953,7 @@ def test_real_runtime_factory_validates_delayed_export_options_without_construct
         sources={"source": SimpleNamespace(plugin="null", options={}, on_success="discard")},
         transforms=(),
         aggregations=(),
+        collectors=(),
         sinks={
             "audit-export": SimpleNamespace(
                 plugin="json",
@@ -978,6 +981,7 @@ def test_valid_delayed_export_is_excluded_then_constructed_by_fresh_export_facto
         sources={"source": SimpleNamespace(plugin="null", options={}, on_success="discard")},
         transforms=(),
         aggregations=(),
+        collectors=(),
         sinks={
             "audit-export": SimpleNamespace(
                 plugin="json",
@@ -1100,6 +1104,7 @@ def test_real_runtime_factory_carries_adapter_resolved_mode_with_exact_sink(
         sources={"source": SimpleNamespace(plugin="source", options={}, on_success="continue")},
         transforms=(),
         aggregations=(),
+        collectors=(),
         sinks={
             "output": SimpleNamespace(
                 plugin="sink",

@@ -91,6 +91,7 @@ class _FakePluginBundle:
     transforms: tuple[object, ...] = ()
     sinks: dict[str, object] = field(default_factory=lambda: {"output": _EffectCapableSink()})
     aggregations: dict[str, object] = field(default_factory=dict)
+    collectors: dict[str, object] = field(default_factory=dict)
     sink_effect_modes: dict[str, str] = field(default_factory=lambda: {"output": "write"})
 
     @property
@@ -435,6 +436,8 @@ def _fake_config(*, with_depends_on: bool) -> SimpleNamespace:
         gates=[],
         coalesce=[],
         row_unions=[],
+        scopes=[],
+        max_bound_region_depth=5,
         queues={},
         sinks={"output": SimpleNamespace(options={})},
         landscape=SimpleNamespace(export=SimpleNamespace(enabled=False, sink=None)),

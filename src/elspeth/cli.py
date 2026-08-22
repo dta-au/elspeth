@@ -762,6 +762,9 @@ def run(
             coalesce_settings=list(config.coalesce) if config.coalesce else None,
             queues=config.queues,
             row_union_settings=list(config.row_unions) if config.row_unions else None,
+            collectors=plugins.collectors,
+            scope_settings=list(config.scopes) if config.scopes else None,
+            max_bound_region_depth=config.max_bound_region_depth,
         )
         graph.validate()
     except GraphValidationError as e:
@@ -1565,6 +1568,9 @@ def bootstrap_and_run(settings_path: Path) -> RunResult:
         queues=config.queues,
         coalesce_settings=list(config.coalesce) if config.coalesce else None,
         row_union_settings=list(config.row_unions) if config.row_unions else None,
+        collectors=plugins.collectors,
+        scope_settings=list(config.scopes) if config.scopes else None,
+        max_bound_region_depth=config.max_bound_region_depth,
     )
     graph.validate()
 
@@ -1800,6 +1806,9 @@ def validate(
             coalesce_settings=list(config.coalesce) if config.coalesce else None,
             queues=config.queues,
             row_union_settings=list(config.row_unions) if config.row_unions else None,
+            collectors=plugins.collectors,
+            scope_settings=list(config.scopes) if config.scopes else None,
+            max_bound_region_depth=config.max_bound_region_depth,
         )
         graph.validate()
     except GraphValidationError as e:
@@ -2267,6 +2276,7 @@ def _build_resume_graphs(
     gate_settings = list(settings_config.gates)
     coalesce_settings = list(settings_config.coalesce) if settings_config.coalesce else None
     row_union_settings = list(settings_config.row_unions) if settings_config.row_unions else None
+    scope_settings = list(settings_config.scopes) if settings_config.scopes else None
 
     # Both resume graphs use the ORIGINAL source topology to match the topology
     # hash and source node IDs computed during the original run. The runtime
@@ -2283,6 +2293,9 @@ def _build_resume_graphs(
         coalesce_settings=coalesce_settings,
         queues=settings_config.queues,
         row_union_settings=row_union_settings,
+        collectors=plugins.collectors,
+        scope_settings=scope_settings,
+        max_bound_region_depth=settings_config.max_bound_region_depth,
     )
     validation_graph.validate()
 
@@ -2296,6 +2309,9 @@ def _build_resume_graphs(
         coalesce_settings=coalesce_settings,
         queues=settings_config.queues,
         row_union_settings=row_union_settings,
+        collectors=plugins.collectors,
+        scope_settings=scope_settings,
+        max_bound_region_depth=settings_config.max_bound_region_depth,
     )
     execution_graph.validate()
 

@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.events import (
     PhaseAction,
     PhaseChanged,
@@ -84,6 +85,21 @@ class GraphRegistrationService:
         Returns:
             GraphArtifacts with edge_map, source_id, and all ID mappings
         """
+
+        # COLLECTOR nodes (EXPAND-group closers; barrier-scopes spec §3) can be
+        # BUILT — WS2 Task 3 lands the graph node, plugin instantiation, and
+        # scope binding — but are not yet EXECUTABLE: no audit metadata
+        # resolution, node registration, or barrier realization exists for
+        # them yet (that lands in WS4). Raise loudly and specifically here
+        # rather than letting the run fall through to the generic
+        # "no plugin instance was resolved from the graph ID maps" error
+        # `resolve_node_audit_metadata` would otherwise raise for an
+        # unresolvable node (pinned decision 5).
+        if graph.get_collector_id_map():
+            raise OrchestrationInvariantError(
+                "Graph contains collector node(s) (EXPAND-group closers, barrier-scopes spec §3); "
+                "collector execution lands in WS4 and cannot run yet."
+            )
 
         # Get execution order from graph
         execution_order = graph.topological_order()

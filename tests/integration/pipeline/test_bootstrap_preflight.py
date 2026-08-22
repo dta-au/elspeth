@@ -108,6 +108,8 @@ def _make_bootstrap_config() -> SimpleNamespace:
         gates=[],
         coalesce=[],
         row_unions=[],
+        scopes=[],
+        max_bound_region_depth=5,
         queues={},
         checkpoint=SimpleNamespace(enabled=True),
         rate_limit=SimpleNamespace(),

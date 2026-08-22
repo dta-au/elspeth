@@ -612,6 +612,9 @@ def build_runtime_graph(settings: ElspethSettings, bundle: PluginBundle) -> Exec
         coalesce_settings=(list(settings.coalesce) if settings.coalesce else None),
         queues=settings.queues,
         row_union_settings=(list(settings.row_unions) if settings.row_unions else None),
+        collectors=bundle.collectors,
+        scope_settings=(list(settings.scopes) if settings.scopes else None),
+        max_bound_region_depth=settings.max_bound_region_depth,
     )
 
 
