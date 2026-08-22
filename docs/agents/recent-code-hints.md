@@ -8,6 +8,29 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-22 — WS1a unified-lineage prep conventions (branch feature/unified-lineage).**
+  Four traps until the WS1b flip lands: (1) `TokenInfo.lineage_path` is
+  WRITE-ONLY during WS1 prep — reading it from production code before the
+  WS1b flip is a dual-representation defect; the only sanctioned reads are
+  the two strict-pop sites (engine `TokenManager.coalesce_tokens` and the
+  durable twin in `data_flow/tokens.py`), both routed through
+  `contracts.identity.pop_closer_frame`. (2) Crafted-token tests that feed
+  `coalesce_tokens` MUST build real fork lineage via
+  `create_token(..., lineage_frames=...)` (or a real `fork_token`) — the
+  durable strict pop rejects frame-less parents and the fix is ALWAYS the
+  fixture, never the pop. (3) A zero-row `success_empty()` traversal of a
+  `creates_tokens=True` transform now mints a `group_records` row
+  (member_count=0); plain filters mint nothing — count rows over that table
+  accordingly. (4) `TokenInfo` no longer carries `join_group_id` — merge
+  context rides `RowResult`/`PendingOutcome`/`WorkItem` carriers (COALESCED
+  path requires it, every other path forbids it); the `tokens` /
+  `token_work_items` COLUMNS keep it permanently. NOTE (maintainer ruling
+  2026-08-22): nested regions (fork-in-fork, expand-in-fork) are NEW
+  behaviour — today's engine rejects those topologies at build time, so no
+  frozen differential oracle exists for them; the depth-1 oracle-freeze
+  snapshots under `tests/fixtures/dag_scenario_corpus/oracle_freeze/` are
+  the pre-flip oracle and must NEVER be regenerated after the freeze commit.
+
 - **2026-08-21 — repair advice must be executed, not just re-validated: a
   transform's `schema` block is BOTH the composer contract and the runtime
   INPUT model.** Rule C's remedies each cleared `validate()` and were pinned
