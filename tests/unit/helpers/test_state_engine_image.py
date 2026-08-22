@@ -131,7 +131,7 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
 
 def test_state_engine_table_inventory_covers_every_run_owned_table() -> None:
     assert set(STATE_ENGINE_TABLES) == set(metadata.tables) - set(EXCLUDED_STATE_ENGINE_TABLES)
-    assert len(STATE_ENGINE_TABLES) == 41
+    assert len(STATE_ENGINE_TABLES) == 44
 
 
 def test_canonicalize_state_value_normalizes_temporal_enum_and_binary_values() -> None:
