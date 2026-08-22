@@ -618,10 +618,14 @@ sites:
   counterpart:
   - node_id_collides_with_source_or_sink
   - queue_name_collision
+  - duplicate_node_id
   note: Carried from 0f959991339a963c (re-keyed by the WS2 Task 2 message reword adding "collectors" to
     the enumerated node kinds). Mirrored disposition holds for every node kind the composer can author
     today. The new collector branch itself is not yet reachable from the composer - collectors and scopes
-    are not_authorable per the sibling entries this task seeded (Task 12 re-adjudicates).
+    are not_authorable per the sibling entries this task seeded (Task 12 re-adjudicates). Review round
+    1 note - duplicate_node_id was dropped from this list during the carry-forward and is restored here;
+    it is a live Stage-1 code (state.py:5969) and a genuine mirror of the same predicate for same-name
+    collisions.
 - key: e7d99b1fec819603
   path: src/elspeth/core/config.py
   qualname: ElspethSettings.validate_queue_names

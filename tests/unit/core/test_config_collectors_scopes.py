@@ -23,6 +23,17 @@ _MINIMAL = {
             "on_error": "discard",
             "options": {"field": "items", "schema": {"mode": "observed"}},
         },
+        # A second, distinct opener candidate — review round 1: needed so the
+        # closer-collision test can collide on closer alone (different opener
+        # per scope) rather than colliding on both axes at once.
+        {
+            "name": "explode2",
+            "plugin": "json_explode",
+            "input": "rows",
+            "on_success": "pages2",
+            "on_error": "discard",
+            "options": {"field": "items", "schema": {"mode": "observed"}},
+        },
     ],
 }
 
@@ -115,9 +126,34 @@ class TestElspethSettingsCrossRefs:
             load_settings_from_config_dict(doc)
 
     def test_two_scopes_cannot_share_a_closer(self) -> None:
+        # Collides on closer ONLY: distinct openers ("explode" / "explode2"),
+        # same closer ("page_stitcher") — review round 1 disambiguation.
         doc = _with_collector_scope()
-        doc["scopes"] = [doc["scopes"][0], {**doc["scopes"][0], "name": "second", "opener": "explode"}]  # type: ignore[index,list-item]
+        doc["scopes"] = [doc["scopes"][0], {**doc["scopes"][0], "name": "second", "opener": "explode2"}]  # type: ignore[index,list-item]
         with pytest.raises(ValueError, match=r"one scope per closer|already bound"):
+            load_settings_from_config_dict(doc)
+
+    def test_two_scopes_cannot_share_an_opener(self) -> None:
+        # Collides on opener ONLY: same opener ("explode"), distinct closers
+        # ("page_stitcher" / "page_stitcher2", each declared and bound by its
+        # own scope so neither trips the unbound-collector check first) —
+        # review round 1 disambiguation.
+        doc = _with_collector_scope()
+        doc["collectors"].append(  # type: ignore[union-attr]
+            {
+                "name": "page_stitcher2",
+                "plugin": "batch_stats",
+                "input": "pages",
+                "on_success": "out",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            }
+        )
+        doc["scopes"] = [  # type: ignore[index]
+            doc["scopes"][0],  # type: ignore[index]
+            {"name": "second", "opener": "explode", "closer": "page_stitcher2", "policy": "require_all"},
+        ]
+        with pytest.raises(ValueError, match="one scope per opener"):
             load_settings_from_config_dict(doc)
 
     def test_max_bound_region_depth_override(self) -> None:
