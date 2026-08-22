@@ -37,7 +37,9 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.sink_effects import SinkEffectAttemptAction, SinkEffectAttemptRequest
 from elspeth.core.landscape.lineage import explain
 from elspeth.mcp.analyzer import LandscapeAnalyzer
@@ -51,6 +53,7 @@ from elspeth.mcp.analyzers.queries import (
     list_operations,
     list_rows,
     list_runs,
+    list_tokens,
 )
 from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
 from elspeth.mcp.types import ErrorResult
@@ -276,6 +279,35 @@ def test_get_sink_effect_history_exposes_recovery_state_without_provider_bodies(
 # ===========================================================================
 # explain_token tests — via underlying explain() function
 # ===========================================================================
+
+
+class TestListTokensLineagePath:
+    """Pins list_tokens' lineage_path projection and derived legacy names (ruling 21)."""
+
+    def test_list_tokens_projects_lineage_path_and_derived_names(self) -> None:
+        setup = make_recorder_with_run(run_id="run-fork-lineage", source_node_id="src")
+        db, factory, run_id = setup.db, setup.factory, setup.run_id
+
+        row = factory.data_flow.create_row(run_id, "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_token(
+            row.row_id,
+            branch_name="path_a",
+            fork_group_id="fg-1",
+            lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
+        )
+
+        records = list_tokens(db, factory, run_id=run_id, row_id=None, limit=50)
+        fork_children = [r for r in records if r["lineage_path"]]
+        assert fork_children, "fork run must project frames"
+        for record in fork_children:
+            frame = record["lineage_path"][0]
+            assert frame["depth"] == 0
+            assert frame["kind"] == "fork"
+            # ruling 21 (ratified): legacy names stay on the wire, DERIVED from the path.
+            assert record["branch_name"] == frame["member_key"]
+            assert record["fork_group_id"] == frame["group_id"]
+            assert record["expand_group_id"] is None
+            assert "join_group_id" in record
 
 
 class TestExplainTokenLineage:

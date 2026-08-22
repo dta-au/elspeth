@@ -71,8 +71,25 @@ class RowRecord(TypedDict):
     created_at: str | None
 
 
+class LineageFrameEntry(TypedDict):
+    """One lineage-path frame (spec §4.1) as projected on an MCP read surface.
+
+    ``depth`` is the frame's position on the path, outermost first (0-indexed).
+    """
+
+    depth: int
+    kind: str
+    group_id: str
+    member_key: str
+
+
 class TokenRecord(TypedDict):
-    """A token record as returned by ``list_tokens``."""
+    """A token record as returned by ``list_tokens``.
+
+    ``branch_name``/``fork_group_id``/``expand_group_id`` are DERIVED from
+    ``lineage_path`` (ruling 21, ratified 2026-08-22) — never a stored-column
+    read. They stay on the wire for backward compatibility.
+    """
 
     token_id: str
     row_id: str
@@ -81,6 +98,7 @@ class TokenRecord(TypedDict):
     join_group_id: str | None
     step_in_pipeline: int | None
     expand_group_id: str | None
+    lineage_path: list[LineageFrameEntry]
     created_at: str | None
 
 

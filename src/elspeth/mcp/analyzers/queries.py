@@ -15,6 +15,7 @@ from typing import Any, cast
 
 from elspeth.contracts import NodeStateStatus
 from elspeth.contracts.hashing import repr_hash, stable_hash
+from elspeth.contracts.identity import path_branch_name, path_expand_group_id, path_fork_group_id
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
@@ -196,15 +197,21 @@ def list_tokens(
 
         rows = conn.execute(query).fetchall()
 
+    paths = factory.data_flow.load_lineage_paths(run_id, [row.token_id for row in rows])
+
     return [
         {
             "token_id": row.token_id,
             "row_id": row.row_id,
-            "branch_name": row.branch_name,
-            "fork_group_id": row.fork_group_id,
+            "branch_name": path_branch_name(paths[row.token_id]),
+            "fork_group_id": path_fork_group_id(paths[row.token_id]),
             "join_group_id": row.join_group_id,
             "step_in_pipeline": row.step_in_pipeline,
-            "expand_group_id": row.expand_group_id,
+            "expand_group_id": path_expand_group_id(paths[row.token_id]),
+            "lineage_path": [
+                {"depth": depth, "kind": f.kind.value, "group_id": f.group_id, "member_key": f.member_key}
+                for depth, f in enumerate(paths[row.token_id])
+            ],
             "created_at": row.created_at.isoformat() if row.created_at else None,
         }
         for row in rows

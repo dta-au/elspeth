@@ -45,7 +45,10 @@ from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from elspeth.contracts import Run, SecretResolution
+    from elspeth.contracts.identity import LineageFrame
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.landscape.run_lifecycle_repository import (
         RunSourceFieldResolutionRecord,
@@ -145,6 +148,9 @@ class DataFlowReadRepository:
 
     def get_transform_errors_for_run(self, run_id: str) -> list[Any]:
         return self._repo.get_transform_errors_for_run(run_id)
+
+    def load_lineage_paths(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[LineageFrame, ...]]:
+        return self._repo.load_lineage_paths(run_id, token_ids)
 
 
 class ExecutionReadRepository:

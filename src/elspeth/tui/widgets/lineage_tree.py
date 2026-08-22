@@ -159,9 +159,9 @@ class LineageTree:
         # Step 3: Build transform chain backwards
         # KNOWN LIMITATION: DAG pipelines with fork/coalesce are rendered as a
         # linear chain — parallel branches and merge points are not shown.
-        # All data for DAG display is available (branch_name, fork_group_id,
-        # token_parents) but not yet consumed here. For full DAG exploration,
-        # use the Landscape MCP server: elspeth-mcp → explain_token().
+        # All data for DAG display is available (lineage_path, token_parents)
+        # but not yet consumed here. For full DAG exploration, use the
+        # Landscape MCP server: elspeth-mcp → explain_token().
         transforms = self._data["transforms"]
 
         # Start with sinks as children of the last transform

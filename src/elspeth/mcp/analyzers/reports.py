@@ -668,7 +668,8 @@ def get_outcome_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id:
     """
     from sqlalchemy import func, select
 
-    from elspeth.core.landscape.schema import token_outcomes_table
+    from elspeth.contracts.enums import FrameKind
+    from elspeth.core.landscape.schema import token_lineage_frames_table, token_outcomes_table, tokens_table
 
     run = factory.run_lifecycle.get_run(run_id)
     if run is None:
@@ -703,21 +704,23 @@ def get_outcome_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id:
         )
         sink_rows = conn.execute(sink_dist).fetchall()
 
-        # Fork/join counts (outcomes with fork_group_id or join_group_id, scoped to run)
+        # Fork/join counts (spec §4.1: fork events counted over token_lineage_frames,
+        # join events counted over the surviving tokens.join_group_id column — the
+        # deleted token_outcomes fork/join columns are never read here, ruling 21).
         fork_count = (
             conn.execute(
-                select(func.count(func.distinct(token_outcomes_table.c.fork_group_id)))
-                .select_from(token_outcomes_table)
-                .where((token_outcomes_table.c.run_id == run_id) & (token_outcomes_table.c.fork_group_id.isnot(None)))
+                select(func.count(func.distinct(token_lineage_frames_table.c.group_id)))
+                .select_from(token_lineage_frames_table)
+                .where((token_lineage_frames_table.c.run_id == run_id) & (token_lineage_frames_table.c.kind == FrameKind.FORK.value))
             ).scalar()
             or 0
         )
 
         join_count = (
             conn.execute(
-                select(func.count(func.distinct(token_outcomes_table.c.join_group_id)))
-                .select_from(token_outcomes_table)
-                .where((token_outcomes_table.c.run_id == run_id) & (token_outcomes_table.c.join_group_id.isnot(None)))
+                select(func.count(func.distinct(tokens_table.c.join_group_id)))
+                .select_from(tokens_table)
+                .where((tokens_table.c.run_id == run_id) & (tokens_table.c.join_group_id.isnot(None)))
             ).scalar()
             or 0
         )
