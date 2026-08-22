@@ -128,7 +128,6 @@ class TokenInfo:
     - token_id: Instance of row in a specific DAG path
     - branch_name: Which fork path this token is on (if forked)
     - fork_group_id: Groups all children from a fork operation
-    - join_group_id: Groups all tokens merged in a coalesce operation
     - expand_group_id: Groups all children from an expand operation
     - lineage_path: typed frame stack (unified lineage spec §4.1); tri-fields above are retired at WS1b
 
@@ -144,10 +143,9 @@ class TokenInfo:
     row_data: PipelineRow  # CHANGED from dict[str, Any]
     branch_name: str | None = None
     fork_group_id: str | None = None
-    join_group_id: str | None = None
     expand_group_id: str | None = None
     lineage_path: tuple[LineageFrame, ...] = ()  # Outermost first (spec §4.1). WS1a prep:
-    # rides BESIDE the stored branch_name/fork_group_id/join_group_id/expand_group_id,
+    # rides BESIDE the stored branch_name/fork_group_id/expand_group_id,
     # which keep today's destructive semantics and remain the read path. WS1b deletes
     # the stored fields and re-exposes them as read-only properties over this path
     # (innermost_fork_frame / innermost_expand_frame). Do NOT read this field from
@@ -181,7 +179,6 @@ class TokenInfo:
         for _field_name, _value in (
             ("branch_name", self.branch_name),
             ("fork_group_id", self.fork_group_id),
-            ("join_group_id", self.join_group_id),
             ("expand_group_id", self.expand_group_id),
         ):
             if _value is not None:
@@ -212,7 +209,7 @@ class TokenInfo:
 
         This method ensures that when row_data is updated after a transform,
         all identity and lineage metadata (branch_name, fork_group_id,
-        join_group_id, expand_group_id, lineage_path) are preserved.
+        expand_group_id, lineage_path) are preserved.
 
         Critically, resume_attempt_offset and resume_checkpoint_id are also
         preserved via dataclasses.replace — this is the propagation mechanism that

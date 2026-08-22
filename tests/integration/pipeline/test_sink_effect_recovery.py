@@ -134,6 +134,7 @@ def test_fresh_pipeline_executor_reuses_interrupted_open_state_and_publishes_onc
                 sink_name="output",
                 pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in [token]},
             )
 
         recovered_factory = make_factory(db)
@@ -154,6 +155,7 @@ def test_fresh_pipeline_executor_reuses_interrupted_open_state_and_publishes_onc
             sink_name="output",
             pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in [token]},
         )
 
         assert target.publication_count == 1
@@ -493,6 +495,7 @@ def test_primary_finalizes_once_while_diverted_token_waits_for_linked_failsink(t
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge.edge_id,
+                join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
             )
 
         effects = factory.execution.sink_effects.get_effects_for_run(run.run_id)
@@ -527,6 +530,7 @@ def test_primary_finalizes_once_while_diverted_token_waits_for_linked_failsink(t
             failsink_name="failsink",
             failsink_effect_mode="write",
             failsink_edge_id=edge.edge_id,
+            join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
         )
 
         assert artifact is not None and artifact.sink_effect_id == primary_effect.effect_id
@@ -617,6 +621,7 @@ def test_recovered_two_primary_batch_preserves_per_member_failsink_provenance(tm
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge.edge_id,
+                join_group_id_by_token={t.token_id: None for t in [first_token]},
             )
 
         recovered_factory = make_factory(db)
@@ -643,6 +648,7 @@ def test_recovered_two_primary_batch_preserves_per_member_failsink_provenance(tm
             failsink_name="failsink",
             failsink_effect_mode="write",
             failsink_edge_id=edge.edge_id,
+            join_group_id_by_token={t.token_id: None for t in [first_token, second_token]},
         )
 
         effects = recovered_factory.execution.sink_effects.get_effects_for_run(run.run_id)
@@ -719,6 +725,7 @@ def test_failsink_validation_rejection_terminalizes_states_and_outcomes(tmp_path
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge.edge_id,
+                join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
             )
 
         assert failsink_target.publication_count == 0
@@ -799,6 +806,7 @@ def test_retry_with_mixed_interrupted_and_fresh_members_progresses(tmp_path: Pat
                 sink_name="output",
                 pending_outcome=pending,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens[:1]},
             )
 
         recovered_factory = make_factory(db)
@@ -819,6 +827,7 @@ def test_retry_with_mixed_interrupted_and_fresh_members_progresses(tmp_path: Pat
             sink_name="output",
             pending_outcome=pending,
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -903,6 +912,7 @@ def test_redrive_after_crash_before_reservation_recovers(
                 sink_name="output",
                 pending_outcome=pending,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # Wedge-state precondition: every token's node state is still OPEN
@@ -945,6 +955,7 @@ def test_redrive_after_crash_before_reservation_recovers(
             sink_name="output",
             pending_outcome=pending,
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -1010,6 +1021,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
             sink_name="output",
             pending_outcome=pending,
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in tokens[:2]},
         )
         assert first_counts.discard_mode == 1
 
@@ -1043,6 +1055,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
                 sink_name="output",
                 pending_outcome=pending,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens[2:]},
             )
 
         # Recover the union batch: both effects' dispositions must be applied.
@@ -1065,6 +1078,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
             pending_outcome=pending,
             effect_mode="write",
             on_token_written=lambda token: None,
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -1118,6 +1132,7 @@ def test_all_diverted_primary_finalizes_virtual_no_publication_before_discard(tm
             sink_name="output",
             pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in [token]},
         )
 
         assert artifact is not None
@@ -1169,6 +1184,7 @@ def test_reaffirmed_effect_finalizes_no_publication_without_lease_commit_or_reco
             sink_name="output",
             pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in [token]},
         )
 
         assert artifact is not None
@@ -1287,6 +1303,7 @@ def test_redrive_with_missing_node_state_witness_fails_closed(tmp_path: Path) ->
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # Corrupt the durable image: the interrupted member row survives while
@@ -1307,6 +1324,7 @@ def test_redrive_with_missing_node_state_witness_fails_closed(tmp_path: Path) ->
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
         assert target.publication_count == 0
     finally:
@@ -1355,6 +1373,7 @@ def test_durable_partition_dropping_a_requested_token_fails_closed(tmp_path: Pat
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1378,6 +1397,7 @@ def test_finalized_member_stripped_of_disposition_fails_accepted_checkpoint(tmp_
             sink_name="output",
             pending_outcome=_PENDING_SUCCESS,
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
         assert artifact is not None
 
@@ -1408,6 +1428,7 @@ def test_finalized_member_stripped_of_disposition_fails_accepted_checkpoint(tmp_
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
                 on_token_written=lambda token: None,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1448,6 +1469,7 @@ def test_durable_partition_referencing_missing_effect_fails_closed(tmp_path: Pat
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1516,6 +1538,7 @@ def test_malformed_commit_diversion_attribution_fails_closed(
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1549,6 +1572,7 @@ def test_in_memory_diversion_log_disagreeing_with_durable_partition_fails_closed
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1579,6 +1603,7 @@ def test_live_diversion_without_durable_attribution_fails_closed(tmp_path: Path)
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1607,6 +1632,7 @@ def test_live_diversion_reason_must_match_durable_attribution(tmp_path: Path) ->
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1633,6 +1659,7 @@ def test_recovered_diversion_without_durable_attribution_fails_closed(tmp_path: 
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         with db.write_connection() as conn:
@@ -1665,6 +1692,7 @@ def test_recovered_diversion_without_durable_attribution_fails_closed(tmp_path: 
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1700,6 +1728,7 @@ def test_failsink_diverting_a_linked_member_is_a_framework_bug(tmp_path: Path) -
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge_id,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1734,6 +1763,7 @@ def test_redrive_with_missing_divert_routing_event_fails_closed(tmp_path: Path) 
             failsink_name="failsink",
             failsink_effect_mode="write",
             failsink_edge_id=edge_id,
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
         assert counts.failsink_mode == 1
 
@@ -1762,6 +1792,7 @@ def test_redrive_with_missing_divert_routing_event_fails_closed(tmp_path: Path) 
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge_id,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1797,6 +1828,7 @@ def test_redrive_with_completed_failsink_primary_anchor_fails_closed(tmp_path: P
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge_id,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # Corrupt the interrupted image through the repository itself: close
@@ -1828,6 +1860,7 @@ def test_redrive_with_completed_failsink_primary_anchor_fails_closed(tmp_path: P
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge_id,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1858,6 +1891,7 @@ def test_redrive_with_completed_discard_primary_anchor_fails_closed(tmp_path: Pa
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         open_ids = factory.execution.get_open_node_state_ids(run_id, node_ids=(sink_id,), token_ids=(diverted.token_id,))
@@ -1880,6 +1914,7 @@ def test_redrive_with_completed_discard_primary_anchor_fails_closed(tmp_path: Pa
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1909,6 +1944,7 @@ def test_redrive_with_divergent_discard_outcome_fails_closed(tmp_path: Path) -> 
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # A rival recorded a discard outcome that disagrees with the durable
@@ -1933,6 +1969,7 @@ def test_redrive_with_divergent_discard_outcome_fails_closed(tmp_path: Path) -> 
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1965,6 +2002,7 @@ def test_failsink_execution_requires_name_mode_and_routing_edge(tmp_path: Path) 
                 failsink_name=None,
                 failsink_effect_mode="write",
                 failsink_edge_id=edge_id,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1993,6 +2031,7 @@ def test_on_token_written_checkpoints_every_token_exactly_once_discard_mode(tmp_
             pending_outcome=_PENDING_SUCCESS,
             effect_mode="write",
             on_token_written=lambda token: checkpointed.append(token.token_id),
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -2029,6 +2068,7 @@ def test_on_token_written_checkpoints_every_token_exactly_once_failsink_mode(tmp
             failsink_effect_mode="write",
             failsink_edge_id=edge_id,
             on_token_written=lambda token: checkpointed.append(token.token_id),
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -2066,6 +2106,7 @@ def test_primary_tokens_checkpointed_before_diverted_tokens(tmp_path: Path) -> N
             pending_outcome=_PENDING_SUCCESS,
             effect_mode="write",
             on_token_written=lambda token: checkpointed.append(token.token_id),
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert counts.discard_mode == 2
@@ -2104,6 +2145,7 @@ def test_primary_validation_rejection_terminalizes_states_and_outcomes(tmp_path:
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # The rejection happened before any effect was reserved or published.

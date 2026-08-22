@@ -71,6 +71,7 @@ def _create_work_item(
     coalesce_node_id: NodeID | None = None,
     row_union_name: RowUnionName | None = None,
     on_success_sink: str | None = None,
+    join_group_id: str | None = None,
 ) -> WorkItem:
     return WorkItem(
         token=token,
@@ -80,6 +81,7 @@ def _create_work_item(
         row_union_node_id=NodeID(f"row_union_node_{row_union_name}") if row_union_name is not None else None,
         row_union_name=row_union_name,
         on_success_sink=on_success_sink,
+        join_group_id=join_group_id,
     )
 
 
@@ -106,7 +108,6 @@ def _make_item(**overrides) -> WorkItem:
         row_data=PipelineRow({"id": 1, "name": "alpha"}, _CONTRACT),
         branch_name="branch-a",
         fork_group_id="fork-1",
-        join_group_id="join-1",
         expand_group_id="expand-1",
     )
     defaults = {
@@ -115,6 +116,7 @@ def _make_item(**overrides) -> WorkItem:
         "coalesce_node_id": NodeID("merge-node"),
         "coalesce_name": CoalesceName("merge"),
         "on_success_sink": "default-sink",
+        "join_group_id": "join-1",
     }
     defaults.update(overrides)
     return WorkItem(**defaults)
@@ -161,8 +163,11 @@ class TestReadyFieldsRoundTrip:
         assert rehydrated.token.token_id == item.token.token_id
         assert rehydrated.token.branch_name == item.token.branch_name
         assert rehydrated.token.fork_group_id == item.token.fork_group_id
-        assert rehydrated.token.join_group_id == item.token.join_group_id
         assert rehydrated.token.expand_group_id == item.token.expand_group_id
+        # join_group_id is a merge-event carrier (ruling 20): it rides the
+        # WorkItem, never TokenInfo. The round-trip proves WorkItem.join_group_id
+        # -> ScheduledWorkFields -> TokenWorkItem -> WorkItem survives intact.
+        assert rehydrated.join_group_id == item.join_group_id
         # PipelineRow has identity equality; payload parity is dict-level.
         assert rehydrated.token.row_data.to_dict() == item.token.row_data.to_dict()
         assert rehydrated.current_node_id == item.current_node_id

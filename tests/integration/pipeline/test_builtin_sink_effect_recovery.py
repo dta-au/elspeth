@@ -156,6 +156,7 @@ def _write(
         sink_name=sink_name,
         pending_outcome=_pending_success(),
         effect_mode="write",
+        join_group_id_by_token={t.token_id: None for t in tokens},
     )
 
 
@@ -253,6 +254,7 @@ def test_csv_primary_routes_one_diversion_through_linked_json_failsink(tmp_path:
                 failsink_name="quarantine",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge.edge_id,
+                join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
             )
 
         first_effects = factory.execution.sink_effects.get_effects_for_run(run_id)
@@ -292,6 +294,7 @@ def test_csv_primary_routes_one_diversion_through_linked_json_failsink(tmp_path:
             failsink_name="quarantine",
             failsink_effect_mode="write",
             failsink_edge_id=edge.edge_id,
+            join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
         )
 
         assert artifact is not None

@@ -178,7 +178,6 @@ def _persist_token_for_scheduler(
             token_id=token.token_id,
             branch_name=token.branch_name,
             fork_group_id=resolved_fork_group_id,
-            join_group_id=token.join_group_id,
             lineage_frames=lineage_frames,
         )
 
@@ -222,7 +221,6 @@ def _persist_blocked_scheduler_work(
         now=now,
         branch_name=token.branch_name,
         fork_group_id=token.fork_group_id,
-        join_group_id=token.join_group_id,
         expand_group_id=token.expand_group_id,
         lineage_path=token.lineage_path,
         coalesce_name=coalesce_name,
@@ -5157,7 +5155,6 @@ class TestDurableSchedulerResumeDrain:
             row_data=source_payload,
             branch_name="direct",
             fork_group_id="fork-1",
-            join_group_id="join-1",
             expand_group_id="expand-1",
         )
         factory.data_flow.create_token(row.row_id, token_id=token.token_id)
@@ -5173,7 +5170,6 @@ class TestDurableSchedulerResumeDrain:
             on_success_sink="source_sink",
             branch_name=token.branch_name,
             fork_group_id=token.fork_group_id,
-            join_group_id=token.join_group_id,
             expand_group_id=token.expand_group_id,
         )
 
@@ -5191,7 +5187,6 @@ class TestDurableSchedulerResumeDrain:
         assert results[0].sink_name == "branch_sink"
         assert results[0].token.branch_name == "direct"
         assert results[0].token.fork_group_id == "fork-1"
-        assert results[0].token.join_group_id == "join-1"
         assert results[0].token.expand_group_id == "expand-1"
 
     def test_durable_scheduler_failure_result_marks_work_failed(self) -> None:
@@ -10302,7 +10297,6 @@ class TestReadyEmissionEnqueueParity:
                 row_id="row-1",
                 token_id="token-merged-1",
                 row_data=make_pipeline_row({"value": 42}),
-                join_group_id="join-1",
                 expand_group_id="expand-1",
             )
             _persist_token_for_scheduler(factory, token)
@@ -10310,6 +10304,7 @@ class TestReadyEmissionEnqueueParity:
                 token=token,
                 current_node_id=continue_node,
                 on_success_sink="merged_sink",
+                join_group_id="join-1",
             )
 
         emission = processor._work_codec.ready_emission(item)

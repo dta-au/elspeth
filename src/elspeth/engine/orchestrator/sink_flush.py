@@ -254,6 +254,9 @@ class SinkFlushCoordinator:
                 group_pairs = list(group)
                 pending_outcome = group_pairs[0][1]
                 group_tokens = [token for token, _pending in group_pairs]
+                join_group_id_by_token = {
+                    token.token_id: (pending.join_group_id if pending is not None else None) for token, pending in group_pairs
+                }
                 # Only tokens with a proven durable PENDING_SINK handoff are
                 # terminalized after sink durability. Aggregation flush
                 # outputs carry that handoff since F1/D6 (the atomic barrier
@@ -291,6 +294,7 @@ class SinkFlushCoordinator:
                         step_in_pipeline=step,
                         sink_name=sink_name,
                         pending_outcome=pending_outcome,
+                        join_group_id_by_token=join_group_id_by_token,
                         effect_mode=effect_modes[sink_name],
                         failsink=failsink,
                         failsink_name=failsink_config_name,

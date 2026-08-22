@@ -118,7 +118,6 @@ class TestTokenInfo:
             row_data=original_row,
             branch_name="path_a",
             fork_group_id="fork-123",
-            join_group_id="join-456",
             expand_group_id="expand-789",
         )
 
@@ -133,7 +132,6 @@ class TestTokenInfo:
         assert updated.token_id == "tok-1"
         assert updated.branch_name == "path_a"
         assert updated.fork_group_id == "fork-123"
-        assert updated.join_group_id == "join-456"
         assert updated.expand_group_id == "expand-789"
 
     def test_with_updated_data_preserves_resume_fields(self) -> None:
@@ -189,8 +187,15 @@ class TestTokenInfo:
                 lineage_path=bad_path,  # type: ignore[arg-type]
             )
 
+    def test_token_info_has_no_join_group_id(self) -> None:
+        """§4.1 / ruling 20: a merge is an event, not a membership — the join
+        context rides RowResult/PendingOutcome/WorkItem carriers, never TokenInfo."""
+        import dataclasses
 
-# The four lineage fields, each paired with a named reader. The field NAME is
+        assert "join_group_id" not in {f.name for f in dataclasses.fields(TokenInfo)}
+
+
+# The three remaining lineage fields, each paired with a named reader. The field NAME is
 # still needed as a keyword-argument key (a data-container use), but reading the
 # value back off the constructed TokenInfo is a real attribute on an owned
 # dataclass and is accessed directly (ADR-032).
@@ -198,7 +203,6 @@ _LINEAGE_FIELD_READERS: Mapping[str, Callable[[TokenInfo], str | None]] = Mappin
     {
         "branch_name": lambda token: token.branch_name,
         "fork_group_id": lambda token: token.fork_group_id,
-        "join_group_id": lambda token: token.join_group_id,
         "expand_group_id": lambda token: token.expand_group_id,
     }
 )
@@ -207,7 +211,7 @@ _LINEAGE_FIELD_READERS: Mapping[str, Callable[[TokenInfo], str | None]] = Mappin
 class TestTokenInfoLineageFieldGuards:
     """Empty-string lineage fields corrupt coalesce keys — must be rejected."""
 
-    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id"])
+    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "expand_group_id"])
     def test_rejects_empty_string_lineage_field(self, field: str) -> None:
         contract = _make_contract()
         kwargs: dict[str, Any] = {
@@ -219,7 +223,7 @@ class TestTokenInfoLineageFieldGuards:
         with pytest.raises(ValueError, match=f"TokenInfo.{field} must be None or non-empty string"):
             TokenInfo(**kwargs)
 
-    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id"])
+    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "expand_group_id"])
     def test_accepts_none_lineage_field(self, field: str) -> None:
         contract = _make_contract()
         kwargs: dict[str, Any] = {
@@ -231,7 +235,7 @@ class TestTokenInfoLineageFieldGuards:
         t = TokenInfo(**kwargs)
         assert _LINEAGE_FIELD_READERS[field](t) is None
 
-    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id"])
+    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "expand_group_id"])
     def test_accepts_non_empty_lineage_field(self, field: str) -> None:
         contract = _make_contract()
         kwargs: dict[str, Any] = {

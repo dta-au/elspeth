@@ -185,6 +185,7 @@ def _run_failing_failsink(db: LandscapeDB) -> tuple[str, str]:
             failsink_name="failsink",
             failsink_effect_mode="write",
             failsink_edge_id=edge.edge_id,
+            join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
         )
     return str(run.run_id), str(failsink_id)
 

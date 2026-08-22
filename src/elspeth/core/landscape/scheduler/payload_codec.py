@@ -95,7 +95,6 @@ def token_from_journal_item(
         row_data=row_data,
         branch_name=item.branch_name,
         fork_group_id=item.fork_group_id,
-        join_group_id=item.join_group_id,
         expand_group_id=item.expand_group_id,
         lineage_path=item.lineage_path,
         resume_attempt_offset=attempt_offset,

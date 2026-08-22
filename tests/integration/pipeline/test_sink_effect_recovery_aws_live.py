@@ -550,6 +550,7 @@ def _write(
         sink_name=_SINK_NAME,
         pending_outcome=_pending_success(),
         effect_mode="write",
+        join_group_id_by_token={t.token_id: None for t in tokens},
     )
 
 

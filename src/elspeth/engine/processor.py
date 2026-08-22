@@ -2883,7 +2883,6 @@ class RowProcessor:
             row_data=row_data,
             branch_name=spec.branch_name,
             fork_group_id=spec.fork_group_id,
-            join_group_id=spec.join_group_id,
             expand_group_id=spec.expand_group_id,
             lineage_path=spec.lineage_path,
             resume_attempt_offset=spec.max_attempt + 1,
@@ -3562,7 +3561,7 @@ class RowProcessor:
             ingest_sequence=self._data_flow.resolve_row_ingest_sequence(token.row_id),
             branch_name=token.branch_name,
             fork_group_id=token.fork_group_id,
-            join_group_id=token.join_group_id,
+            join_group_id=result.join_group_id,
             expand_group_id=token.expand_group_id,
             lineage_path=token.lineage_path,
         )
@@ -3825,7 +3824,6 @@ class RowProcessor:
                 token_data_ref=residual.token_data_ref,
                 receipt_name=f"coalesce effect {residual.effect_id!r}",
             ),
-            join_group_id=residual.result_join_group_id,
         )
         node_id = NodeID(residual.coalesce_node_id)
         coalesce_name = CoalesceName(residual.coalesce_name)

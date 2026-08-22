@@ -117,6 +117,7 @@ class TestCSVSinkExecutorAuditChain:
                     path=TerminalPath.DEFAULT_FLOW,
                 ),
                 effect_mode="write",
+                join_group_id_by_token={token.token_id: None},
             )
         finally:
             sink.close()

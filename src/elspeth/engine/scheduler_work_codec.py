@@ -45,6 +45,7 @@ class WorkItemFactory(Protocol):
         coalesce_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
         on_success_sink: str | None = None,
+        join_group_id: str | None = None,
     ) -> WorkItem: ...
 
 
@@ -109,7 +110,7 @@ class SchedulerWorkCodec:
             on_success_sink=item.on_success_sink,
             branch_name=token.branch_name,
             fork_group_id=token.fork_group_id,
-            join_group_id=token.join_group_id,
+            join_group_id=item.join_group_id,
             expand_group_id=token.expand_group_id,
             lineage_path=token.lineage_path,
             coalesce_node_id=str(item.coalesce_node_id) if item.coalesce_node_id is not None else None,
@@ -149,7 +150,6 @@ class SchedulerWorkCodec:
             row_data=self.deserialize_row_payload(scheduled.row_payload_json),
             branch_name=scheduled.branch_name,
             fork_group_id=scheduled.fork_group_id,
-            join_group_id=scheduled.join_group_id,
             expand_group_id=scheduled.expand_group_id,
             lineage_path=scheduled.lineage_path,
         )
@@ -160,4 +160,5 @@ class SchedulerWorkCodec:
             coalesce_name=CoalesceName(scheduled.coalesce_name) if scheduled.coalesce_name is not None else None,
             row_union_name=RowUnionName(scheduled.row_union_name) if scheduled.row_union_name is not None else None,
             on_success_sink=scheduled.on_success_sink,
+            join_group_id=scheduled.join_group_id,
         )

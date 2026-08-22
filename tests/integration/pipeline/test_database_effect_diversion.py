@@ -115,6 +115,7 @@ def test_constraint_diversion_discards_durably_without_audit_error(tmp_path: Pat
             sink_name="output",
             pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
             effect_mode="append",
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -191,6 +192,7 @@ def test_constraint_diversion_recovers_attribution_after_crash_before_finalize(t
                 sink_name="output",
                 pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
                 effect_mode="append",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # Fresh process: a new sink instance has an empty live diversion log,
@@ -213,6 +215,7 @@ def test_constraint_diversion_recovers_attribution_after_crash_before_finalize(t
             sink_name="output",
             pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
             effect_mode="append",
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None

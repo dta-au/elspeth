@@ -12,7 +12,7 @@ These are pure delegation functions — no internal state — tested via mocks.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import Mock, create_autospec
@@ -95,15 +95,13 @@ def _make_result(
     sink_name: str | None = None,
 ) -> RowResult:
     result_token = token or make_token_info()
-    if path == TerminalPath.COALESCED and result_token.join_group_id is None:
-        result_token = replace(result_token, join_group_id="join-1")
     return RowResult(
         token=result_token,
         final_data=make_row({}),
         outcome=outcome,
         path=path,
         sink_name=sink_name,
-        join_group_id=result_token.join_group_id if path == TerminalPath.COALESCED else None,
+        join_group_id="join-1" if path == TerminalPath.COALESCED else None,
     )
 
 

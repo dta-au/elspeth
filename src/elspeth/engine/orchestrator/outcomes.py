@@ -258,8 +258,8 @@ def accumulate_row_outcomes(
                 if result.authoritative_error_hash is not None
                 else compute_error_hash(result.error.message, exception_type=result.error.exception_type)
             )
-        elif pair == (TerminalOutcome.SUCCESS, TerminalPath.COALESCED) and result.token.join_group_id is None:
-            raise OrchestrationInvariantError(f"(SUCCESS, COALESCED) result missing token.join_group_id. Token: {result.token}")
+        elif pair == (TerminalOutcome.SUCCESS, TerminalPath.COALESCED) and result.join_group_id is None:
+            raise OrchestrationInvariantError(f"(SUCCESS, COALESCED) result missing join_group_id. Token: {result.token}")
 
         # Counter movement comes from the shared table (elspeth-feeb4482fc);
         # the audit derive and the sink-diversion reconciler consume the SAME

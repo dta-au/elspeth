@@ -72,7 +72,6 @@ def _token_to_dict(token: TokenInfo) -> dict[str, Any]:
         "row_data": token.row_data.to_dict() if isinstance(token.row_data, PipelineRow) else token.row_data,
         "branch_name": token.branch_name,
         "fork_group_id": token.fork_group_id,
-        "join_group_id": token.join_group_id,
         "expand_group_id": token.expand_group_id,
     }
 
@@ -210,7 +209,6 @@ class TestTokenInfoConstructionProperties:
         data=row_data,
         branch_name=token_branch_names,
         fork_group_id=token_group_ids,
-        join_group_id=token_group_ids,
         expand_group_id=token_group_ids,
     )
     @settings(max_examples=100)
@@ -221,7 +219,6 @@ class TestTokenInfoConstructionProperties:
         data: dict[str, Any],
         branch_name: str | None,
         fork_group_id: str | None,
-        join_group_id: str | None,
         expand_group_id: str | None,
     ) -> None:
         """Property: TokenInfo preserves all optional fields."""
@@ -231,12 +228,10 @@ class TestTokenInfoConstructionProperties:
             row_data=_wrap_dict_as_pipeline_row(data),
             branch_name=branch_name,
             fork_group_id=fork_group_id,
-            join_group_id=join_group_id,
             expand_group_id=expand_group_id,
         )
         assert token.branch_name == branch_name
         assert token.fork_group_id == fork_group_id
-        assert token.join_group_id == join_group_id
         assert token.expand_group_id == expand_group_id
 
 
@@ -293,7 +288,6 @@ class TestTokenInfoJsonSerializationProperties:
         data=row_data,
         branch_name=token_branch_names,
         fork_group_id=token_group_ids,
-        join_group_id=token_group_ids,
         expand_group_id=token_group_ids,
     )
     @settings(max_examples=100)
@@ -304,7 +298,6 @@ class TestTokenInfoJsonSerializationProperties:
         data: dict[str, Any],
         branch_name: str | None,
         fork_group_id: str | None,
-        join_group_id: str | None,
         expand_group_id: str | None,
     ) -> None:
         """Property: TokenInfo JSON round-trip preserves optional fields."""
@@ -314,7 +307,6 @@ class TestTokenInfoJsonSerializationProperties:
             row_data=_wrap_dict_as_pipeline_row(data),
             branch_name=branch_name,
             fork_group_id=fork_group_id,
-            join_group_id=join_group_id,
             expand_group_id=expand_group_id,
         )
 
@@ -323,7 +315,6 @@ class TestTokenInfoJsonSerializationProperties:
 
         assert parsed["branch_name"] == branch_name
         assert parsed["fork_group_id"] == fork_group_id
-        assert parsed["join_group_id"] == join_group_id
         assert parsed["expand_group_id"] == expand_group_id
 
 

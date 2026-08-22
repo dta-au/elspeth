@@ -900,7 +900,6 @@ class SchedulerDrainCoordinator:
             row_data=self._scheduler.deserialize_row_payload(scheduled.row_payload_json),
             branch_name=scheduled.branch_name,
             fork_group_id=scheduled.fork_group_id,
-            join_group_id=scheduled.join_group_id,
             expand_group_id=scheduled.expand_group_id,
             lineage_path=scheduled.lineage_path,
             resume_attempt_offset=attempt_offset,

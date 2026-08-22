@@ -15,7 +15,7 @@ fail first).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -155,8 +155,6 @@ def _row_result(
     token: TokenInfo | None = None,
 ) -> Any:
     result_token = token or make_token_info()
-    if path is TerminalPath.COALESCED and result_token.join_group_id is None:
-        result_token = replace(result_token, join_group_id="join-1")
     return SimpleNamespace(
         outcome=outcome,
         path=path,
@@ -165,7 +163,7 @@ def _row_result(
         error=error,
         scheduler_pending_sink=False,
         authoritative_error_hash=None,
-        join_group_id=result_token.join_group_id if path is TerminalPath.COALESCED else None,
+        join_group_id="join-1" if path is TerminalPath.COALESCED else None,
     )
 
 

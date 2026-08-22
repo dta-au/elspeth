@@ -146,7 +146,6 @@ def _coalesce_tokens_impl(
         row_id=parents[0].row_id,
         token_id=f"merged_{uuid4().hex[:8]}",
         row_data=merged_data,
-        join_group_id=join_group_id,
     )
     return merged, join_group_id
 
@@ -644,7 +643,7 @@ class TestRequireAllPolicy:
         o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
         assert o.merged_token is not None
         assert o.merged_token.row_id == "row_1"
-        assert o.merged_token.join_group_id is not None
+        assert o.join_group_id is not None
 
     def test_consumed_tokens_list(self):
         executor, _, _, _, _ = self._setup()

@@ -153,7 +153,7 @@ def completed_row_counter_shapes(draw: st.DrawFn) -> dict[str, int]:
     }
 
 
-def _make_token(*, branch_name: str | None = None, join_group_id: str | None = None) -> TokenInfo:
+def _make_token(*, branch_name: str | None = None) -> TokenInfo:
     """Create a minimal TokenInfo for testing."""
     row = PipelineRow({"field": "value"}, _TEST_CONTRACT)
     return TokenInfo(
@@ -161,7 +161,6 @@ def _make_token(*, branch_name: str | None = None, join_group_id: str | None = N
         token_id="tok-1",
         row_data=row,
         branch_name=branch_name,
-        join_group_id=join_group_id,
     )
 
 
@@ -192,7 +191,6 @@ def _make_row_result(
     join_group_id = "join-1" if path == TerminalPath.COALESCED else None
     token = _make_token(
         branch_name=branch_name,
-        join_group_id=join_group_id,
     )
     return RowResult(
         token=token,

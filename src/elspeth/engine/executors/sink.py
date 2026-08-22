@@ -141,6 +141,7 @@ class SinkExecutor:
             step_in_pipeline=5,
             sink_name="output",
             pending_outcome=pending,
+            join_group_id_by_token={t.token_id: None for t in tokens_to_write},
             effect_mode="write",
         )
         print(diversion_counts.total)
@@ -669,6 +670,7 @@ class SinkExecutor:
         all_states: list[tuple[TokenInfo, NodeState]],
         sink_name: str,
         sink_node_id: str,
+        join_group_id_by_token: Mapping[str, str | None],
     ) -> _EffectPrimaryWrite:
         """Publish one primary batch through the durable effect coordinator."""
         if self._factory is None:
@@ -757,7 +759,7 @@ class SinkExecutor:
                 outcome=pending_outcome.outcome,
                 path=pending_outcome.path,
                 sink_name=sink_name,
-                join_group_id=(token_by_id[member.token_id].join_group_id if pending_outcome.path is TerminalPath.COALESCED else None),
+                join_group_id=(join_group_id_by_token[member.token_id] if pending_outcome.path is TerminalPath.COALESCED else None),
                 error_hash=pending_outcome.error_hash,
             )
             for member in identity.members
@@ -1270,6 +1272,7 @@ class SinkExecutor:
         *,
         sink_name: str,
         pending_outcome: PendingOutcome | None,
+        join_group_id_by_token: Mapping[str, str | None],
         effect_mode: str | None = None,
         failsink: SinkProtocol | None = None,
         failsink_name: str | None = None,
@@ -1303,6 +1306,11 @@ class SinkExecutor:
             sink_name: Name of the sink (for token_outcome recording)
             pending_outcome: PendingOutcome containing outcome and optional error_hash.
                     Required - all sink-bound tokens must have their outcome recorded.
+            join_group_id_by_token: Per-token merge-event identity (ruling 20):
+                    a merge is an event carried by PendingOutcome/RowResult, never
+                    TokenInfo, so this map is the only source for the COALESCED
+                    finalization member's join_group_id. Callers pass an
+                    all-None map for non-coalesce lanes.
             effect_mode: Validated sink-effect mode. Required for non-empty batches.
             failsink: Resolved failsink instance (or None for discard mode)
             failsink_name: Config-level name of the failsink (for outcome recording)
@@ -1369,6 +1377,7 @@ class SinkExecutor:
             all_states=all_states,
             sink_name=sink_name,
             sink_node_id=sink_node_id,
+            join_group_id_by_token=join_group_id_by_token,
         )
         diversions = effect_write.diversions
 

@@ -399,7 +399,6 @@ class TokenManager:
             row_id=row_id,
             token_id=merged.token_id,
             row_data=merged_data,
-            join_group_id=merged.join_group_id,
             lineage_path=merged_path,
         )
         return merged_info, merged.join_group_id

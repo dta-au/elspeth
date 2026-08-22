@@ -10,7 +10,7 @@ _execute_run() and _process_resumed_rows(). These tests verify that:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -160,14 +160,12 @@ def _make_result(
 ) -> _FakeRowResult:
     """Create a RowResult-shaped test value with the two-axis terminal pair."""
     result_token = token or make_token_info()
-    if path == TerminalPath.COALESCED and result_token.join_group_id is None:
-        result_token = replace(result_token, join_group_id="join-1")
     return _FakeRowResult(
         outcome=outcome,
         path=path,
         token=result_token,
         sink_name=sink_name,
-        join_group_id=result_token.join_group_id if path == TerminalPath.COALESCED else None,
+        join_group_id="join-1" if path == TerminalPath.COALESCED else None,
     )
 
 

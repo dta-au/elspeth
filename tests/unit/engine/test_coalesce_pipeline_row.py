@@ -90,7 +90,6 @@ def _coalesce_tokens_impl(
         row_id=parents[0].row_id,
         token_id="merged_001",
         row_data=merged_data,
-        join_group_id="join_001",
     )
     return merged, "join_001"
 

@@ -633,44 +633,6 @@ class TestTokenManagerEdgeCases:
 
         assert updated.expand_group_id == expand_group_id, "expand_group_id must be preserved"
 
-    def test_update_preserves_join_group_id(self) -> None:
-        from elspeth.engine.tokens import TokenManager
-
-        setup = make_recorder_with_run()
-        run_id, source_node_id = setup.run_id, setup.source_node_id
-
-        manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
-        initial = manager.create_initial_token(
-            run_id=run_id,
-            source_node_id=source_node_id,
-            row_index=0,
-            source_row=_make_source_row({"value": 42}),
-            source_row_index=0,
-            ingest_sequence=0,
-        )
-
-        children, _fork_group_id = manager.fork_token(
-            parent_token=initial,
-            branches=["a", "b"],
-            node_id=NodeID("gate_node"),
-            run_id=run_id,
-        )
-
-        merged, _join_group_id = manager.coalesce_tokens(
-            parents=children,
-            merged_data=_make_pipeline_row({"value": 42, "merged": True}),
-            node_id=NodeID("coalesce_node"),
-            run_id=run_id,
-        )
-
-        assert merged.join_group_id is not None
-
-        updated = merged.with_updated_data(
-            _make_pipeline_row({"value": 42, "merged": True, "enriched": "yes"}),
-        )
-
-        assert updated.join_group_id == merged.join_group_id, "join_group_id must be preserved"
-
     def test_multiple_rows_different_tokens(self) -> None:
         from elspeth.engine.tokens import TokenManager
 

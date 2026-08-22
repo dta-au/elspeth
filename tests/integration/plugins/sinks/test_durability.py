@@ -202,6 +202,7 @@ class TestSinkDurability:
                 pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
                 effect_mode="write",
                 on_token_written=checkpoint_callback,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # Verify: Checkpoint was NOT created
@@ -283,6 +284,7 @@ class TestSinkDurability:
                 pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
                 effect_mode="write",
                 on_token_written=failing_checkpoint_callback,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
     def test_effect_commit_called_before_checkpoint_callback(
@@ -373,6 +375,7 @@ class TestSinkDurability:
             pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
             effect_mode="write",
             on_token_written=tracking_checkpoint_callback,
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert call_order == ["commit", "checkpoint"]
