@@ -138,8 +138,12 @@ class GroupBindingRegistry:
         provenance, nothing staged (spec §2).
         """
         if frame.kind is FrameKind.FORK:
-            return self._fork_binding_by_member.get(frame.member_key)
-        return self._expand_groups.get(frame.group_id)
+            if frame.member_key in self._fork_binding_by_member:
+                return self._fork_binding_by_member[frame.member_key]
+            return None
+        if frame.group_id in self._expand_groups:
+            return self._expand_groups[frame.group_id]
+        return None
 
     def register_expand_group(self, group_id: str, *, opener_name: str) -> GroupBinding | None:
         """Associate a runtime-minted EXPAND group id with its scope binding.
@@ -151,10 +155,10 @@ class GroupBindingRegistry:
         re-registering one group under a DIFFERENT opener is an integrity
         violation (group ids are unique per mint).
         """
-        binding = self._expand_binding_by_opener.get(opener_name)
-        if binding is None:
+        if opener_name not in self._expand_binding_by_opener:
             return None
-        existing = self._expand_groups.get(group_id)
+        binding = self._expand_binding_by_opener[opener_name]
+        existing = self._expand_groups[group_id] if group_id in self._expand_groups else None
         if existing is not None:
             if existing is not binding:
                 raise ValueError(
@@ -244,7 +248,9 @@ def build_group_binding_registry(
                     closer_kind=CloserKind.COALESCE,
                     policy=coalesce_settings.policy,
                     on_group_failure=None,
-                    member_roster=tuple(b for b in fork_to if branch_to_coalesce_name.get(b) == resolved_coalesce),
+                    member_roster=tuple(
+                        b for b in fork_to if b in branch_to_coalesce_name and branch_to_coalesce_name[b] == resolved_coalesce
+                    ),
                 )
             )
         elif resolved_row_union is not None:
@@ -258,7 +264,9 @@ def build_group_binding_registry(
                     closer_kind=CloserKind.ROW_UNION,
                     policy="require_all",
                     on_group_failure=None,
-                    member_roster=tuple(b for b in fork_to if branch_to_row_union_name.get(b) == resolved_row_union),
+                    member_roster=tuple(
+                        b for b in fork_to if b in branch_to_row_union_name and branch_to_row_union_name[b] == resolved_row_union
+                    ),
                 )
             )
 
