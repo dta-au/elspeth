@@ -166,9 +166,9 @@ class SinkEffectFinalization:
                 member.path,
                 sink_name=member.sink_name,
                 batch_id=member.batch_id,
-                fork_group_id=member.fork_group_id,
+                fork_group_id=None,
                 join_group_id=member.join_group_id,
-                expand_group_id=member.expand_group_id,
+                expand_group_id=None,
                 error_hash=member.error_hash,
             )
 
@@ -310,9 +310,7 @@ class SinkEffectFinalization:
                     sink_node_id=str(effect.sink_node_id),
                     artifact_id=artifact.artifact_id,
                     batch_id=finalization_member.batch_id,
-                    fork_group_id=finalization_member.fork_group_id,
                     join_group_id=finalization_member.join_group_id,
-                    expand_group_id=finalization_member.expand_group_id,
                     error_hash=finalization_member.error_hash,
                     context=finalization_member.context,
                     conn=conn,

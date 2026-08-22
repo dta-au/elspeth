@@ -777,3 +777,13 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
     assert result.effect.primary_effect_id == primary.effect_id
     assert result.artifact.sink_effect_id == failsink.effect_id
     assert len(result.outcome_ids) == 1
+
+
+def test_sink_effect_finalization_member_carries_join_context_only() -> None:
+    import dataclasses
+
+    from elspeth.contracts.sink_effects import SinkEffectFinalizationMember
+
+    names = {f.name for f in dataclasses.fields(SinkEffectFinalizationMember)}
+    assert "join_group_id" in names  # merge event — kept (ruling 20)
+    assert {"fork_group_id", "expand_group_id"} & names == set()

@@ -569,9 +569,7 @@ class SinkEffectFinalizationMember:
     path: TerminalPath
     sink_name: str | None = None
     batch_id: str | None = None
-    fork_group_id: str | None = None
     join_group_id: str | None = None
-    expand_group_id: str | None = None
     error_hash: str | None = None
     context: Mapping[str, object] | None = None
 
