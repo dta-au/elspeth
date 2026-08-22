@@ -397,6 +397,10 @@ class DataFlowRepository:
             aggregation_parent_dispositions=aggregation_parent_dispositions,
         )
 
+    def record_empty_expansion(self, parent_ref: TokenRef) -> str:
+        """Mint the durable member_count=0 group record for a zero-row expansion."""
+        return self.tokens.record_empty_expansion(parent_ref)
+
     # ── Token outcome recording (TokenOutcomeRepository) ───────────────────
 
     def lock_token_outcome_dependencies(self, refs: Sequence[TokenRef], *, conn: Connection) -> None:

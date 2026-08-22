@@ -2431,3 +2431,27 @@ class TestUnifiedLineageWriters:
             lineage_frames=(LineageFrame(kind=FrameKind.FORK, group_id="fg-crafted", member_key="a"),),
         )
         assert _frames_for(db, crafted.token_id) == [(0, "fork", "fg-crafted", "a")]
+
+    def test_record_empty_expansion_mints_zero_member_group_idempotently(self) -> None:
+        db, factory = _setup()
+        _row, parent = _make_row(factory)
+        ref = TokenRef(token_id=parent.token_id, run_id="run-1")
+        group_id = factory.data_flow.record_empty_expansion(ref)
+        assert factory.data_flow.record_empty_expansion(ref) == group_id  # re-driven claim
+        record = _group_record(db, group_id)
+        assert record is not None
+        assert (record.kind, record.opener_token_id, record.member_count) == ("expand", parent.token_id, 0)
+
+    def test_record_empty_expansion_refuses_divergent_replay(self) -> None:
+        _db, factory = _setup()
+        _row, parent = _make_row(factory)
+        ref = TokenRef(token_id=parent.token_id, run_id="run-1")
+        factory.data_flow.expand_token(
+            parent_ref=ref,
+            row_id=parent.row_id,
+            child_payloads=[{"v": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+            step_in_pipeline=1,
+        )
+        with pytest.raises(AuditIntegrityError, match="divergent empty-expansion"):
+            factory.data_flow.record_empty_expansion(ref)

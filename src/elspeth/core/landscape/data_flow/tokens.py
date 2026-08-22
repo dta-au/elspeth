@@ -1581,6 +1581,44 @@ class RowTokenRepository:
 
         return children, expand_group_id
 
+    def record_empty_expansion(self, parent_ref: TokenRef) -> str:
+        """Mint the durable group record for a zero-row expansion (spec §4.3).
+
+        The zero-row multi-row-transform path never calls expand_token, so a
+        require_all empty group previously had no durable referent. Idempotent
+        per opener (uq_group_records_opener: one token opens at most one
+        group): a re-driven claim returns the committed group_id. An opener
+        that already opened a NON-empty group is a divergent replay — Tier-1.
+        """
+        self._ownership.validate_token_run_ownership(parent_ref)
+        with self._db.write_connection() as conn:
+            existing = conn.execute(
+                select(group_records_table.c.group_id, group_records_table.c.member_count)
+                .where(group_records_table.c.run_id == parent_ref.run_id)
+                .where(group_records_table.c.opener_token_id == parent_ref.token_id)
+            ).one_or_none()
+            if existing is not None:
+                if int(existing.member_count) != 0:
+                    raise AuditIntegrityError(
+                        f"record_empty_expansion: opener {parent_ref.token_id!r} already opened group "
+                        f"{existing.group_id!r} with member_count={existing.member_count}; divergent empty-expansion replay"
+                    )
+                return str(existing.group_id)
+            group_id = generate_id()
+            result = conn.execute(
+                group_records_table.insert().values(
+                    run_id=parent_ref.run_id,
+                    group_id=group_id,
+                    kind=FrameKind.EXPAND.value,
+                    opener_token_id=parent_ref.token_id,
+                    member_count=0,
+                    created_at=now(),
+                )
+            )
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"record_empty_expansion: INSERT affected zero rows (group_id={group_id})")
+            return group_id
+
     def _verify_aggregation_parent_dispositions(
         self,
         conn: Connection,

@@ -199,6 +199,17 @@ class TokenTraversalEngine:
             if transform_result.rows is None:
                 raise OrchestrationInvariantError("is_multi_row guarantees rows is not None")
             if len(transform_result.rows) == 0:
+                # Spec §4.3 (2026-08-22 synthesis correction): an empty expansion
+                # mints a durable group record (member_count=0) — the referent a
+                # bound require_all empty-group failure needs — but ONLY for an
+                # opener: the mint is gated on creates_tokens. A plain filter's
+                # success_empty() is not an expansion and mints nothing.
+                # Idempotent per opener under re-driven claims.
+                if transform.creates_tokens:
+                    self._processor._token_manager.record_empty_expansion(
+                        current_token,
+                        self._processor._run_id,
+                    )
                 self._processor._record_dropped_by_filter_outcome(
                     token=current_token,
                     transform_name=transform.name,

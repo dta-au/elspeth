@@ -458,6 +458,10 @@ class TokenManager:
         ]
         return child_infos, expand_group_id
 
+    def record_empty_expansion(self, parent_token: TokenInfo, run_id: str) -> str:
+        """Durable member_count=0 group record for a zero-row expansion (spec §4.3)."""
+        return self._data_flow.record_empty_expansion(TokenRef(token_id=parent_token.token_id, run_id=run_id))
+
     # NOTE: Step resolution is handled by the injected StepResolver, which
     # maps NodeID → 1-indexed audit step position. The canonical implementation
     # is RowProcessor._resolve_audit_step_for_node. TokenManager resolves steps

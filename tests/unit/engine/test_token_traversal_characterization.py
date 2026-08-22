@@ -549,6 +549,65 @@ class TestHandleTransformNode:
         assert isinstance(outcome.result, RowResult)
         assert (outcome.result.outcome, outcome.result.path) == (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED)
 
+        # Spec §4.3 (2026-08-22 synthesis correction): the empty-expansion
+        # group_records mint is GATED on creates_tokens — the transform here
+        # is a plain filter (creates_tokens=False, the _make_mock_transform
+        # default), so no group_records row is minted for the dropped token.
+        from sqlalchemy import select
+
+        from elspeth.core.landscape.schema import group_records_table
+
+        with _db.engine.connect() as conn:
+            rows = conn.execute(select(group_records_table).where(group_records_table.c.run_id == "test-run")).all()
+        assert rows == []
+
+    def test_multi_row_empty_with_creates_tokens_mints_empty_group_record(self) -> None:
+        """Spec §4.3: an empty expansion from a token-creating (creates_tokens=True)
+        transform mints a durable member_count=0 group_records row — the referent a
+        bound require_all empty-group failure needs. The GATE is the contract, not
+        just the mint: this is the twin of
+        test_multi_row_empty_returns_filter_dropped_terminal's creates_tokens=False
+        no-mint assertion above."""
+        db, factory = _make_factory()
+        factory.data_flow.create_row("test-run", "source-0", 0, {"value": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_token("row-1", token_id="tok-1")
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        processor = _make_processor(factory)
+        transform = _make_mock_transform(node_id="t-1", name="multi-row-filter", creates_tokens=True)
+        token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
+        empty = TransformResult.success_empty(success_reason={"action": "filtered"})
+
+        def _exec(transform, token, ctx, attempt_offset=0):
+            return empty, token, None
+
+        processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
+        outcome = processor._handle_transform_node(
+            transform=transform,
+            current_token=token,
+            ctx=ctx,
+            node_id=NodeID("t-1"),
+            child_items=[],
+            coalesce_node_id=None,
+            coalesce_name=None,
+            current_on_success_sink="default",
+        )
+
+        assert isinstance(outcome, _TransformTerminal)
+        assert isinstance(outcome.result, RowResult)
+        assert (outcome.result.outcome, outcome.result.path) == (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED)
+
+        from sqlalchemy import select
+
+        from elspeth.core.landscape.schema import group_records_table
+
+        with db.engine.connect() as conn:
+            rows = conn.execute(
+                select(group_records_table.c.kind, group_records_table.c.opener_token_id, group_records_table.c.member_count).where(
+                    group_records_table.c.run_id == "test-run"
+                )
+            ).all()
+        assert [(r.kind, r.opener_token_id, r.member_count) for r in rows] == [("expand", "tok-1", 0)]
+
     def test_max_retries_exceeded_returns_unrouted_failure(self) -> None:
         """Exhausted retries terminate the token as an UNROUTED FAILURE."""
         _db, factory = _make_factory()
