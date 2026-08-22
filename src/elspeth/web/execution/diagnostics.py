@@ -23,6 +23,7 @@ from elspeth.core.landscape.schema import (
     node_states_table,
     operations_table,
     rows_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     tokens_table,
     validation_errors_table,
@@ -33,6 +34,7 @@ from elspeth.web.execution.schemas import (
     RunDiagnosticArtifact,
     RunDiagnosticDiscard,
     RunDiagnosticFailureDetail,
+    RunDiagnosticLineageFrame,
     RunDiagnosticNodeState,
     RunDiagnosticOperation,
     RunDiagnosticsResponse,
@@ -414,10 +416,7 @@ def load_run_diagnostics_from_db(
                 tokens_table.c.token_id,
                 tokens_table.c.row_id,
                 rows_table.c.row_index,
-                tokens_table.c.branch_name,
-                tokens_table.c.fork_group_id,
                 tokens_table.c.join_group_id,
-                tokens_table.c.expand_group_id,
                 tokens_table.c.step_in_pipeline,
                 tokens_table.c.created_at,
                 token_outcomes_table.c.outcome.label("terminal_outcome"),
@@ -444,6 +443,25 @@ def load_run_diagnostics_from_db(
         )
         token_rows = list(conn.execute(token_stmt))
         token_ids = tuple(row.token_id for row in token_rows)
+
+        lineage_by_token: dict[str, list[RunDiagnosticLineageFrame]] = {token_id: [] for token_id in token_ids}
+        if token_ids:
+            lineage_stmt = (
+                select(
+                    token_lineage_frames_table.c.token_id,
+                    token_lineage_frames_table.c.depth,
+                    token_lineage_frames_table.c.kind,
+                    token_lineage_frames_table.c.group_id,
+                    token_lineage_frames_table.c.member_key,
+                )
+                .where(token_lineage_frames_table.c.run_id == landscape_run_id)
+                .where(token_lineage_frames_table.c.token_id.in_(token_ids))
+                .order_by(token_lineage_frames_table.c.token_id, token_lineage_frames_table.c.depth)
+            )
+            for frame_row in conn.execute(lineage_stmt):
+                lineage_by_token[frame_row.token_id].append(
+                    RunDiagnosticLineageFrame(kind=frame_row.kind, group_id=frame_row.group_id, member_key=frame_row.member_key)
+                )
 
         states_by_token: dict[str, list[RunDiagnosticNodeState]] = {token_id: [] for token_id in token_ids}
         if token_ids:
@@ -771,10 +789,8 @@ def load_run_diagnostics_from_db(
                 token_id=row.token_id,
                 row_id=row.row_id,
                 row_index=row.row_index,
-                branch_name=row.branch_name,
-                fork_group_id=row.fork_group_id,
+                lineage=lineage_by_token[row.token_id],
                 join_group_id=row.join_group_id,
-                expand_group_id=row.expand_group_id,
                 step_in_pipeline=row.step_in_pipeline,
                 created_at=row.created_at,
                 terminal_outcome=row.terminal_outcome,

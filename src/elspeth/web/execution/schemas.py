@@ -897,16 +897,22 @@ class RunDiagnosticNodeState(_StrictResponse):
     success_reason: Any | None = None
 
 
+class RunDiagnosticLineageFrame(_StrictResponse):
+    """One lineage frame (outermost first) on a diagnostics token."""
+
+    kind: Literal["fork", "expand"]
+    group_id: str
+    member_key: str
+
+
 class RunDiagnosticToken(_StrictResponse):
     """One token in the bounded diagnostics preview."""
 
     token_id: str
     row_id: str
     row_index: int | None = Field(ge=0)
-    branch_name: str | None
-    fork_group_id: str | None
+    lineage: list[RunDiagnosticLineageFrame]
     join_group_id: str | None
-    expand_group_id: str | None
     step_in_pipeline: int | None = Field(ge=0)
     created_at: datetime
     terminal_outcome: RunDiagnosticTerminalOutcome | None

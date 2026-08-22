@@ -856,14 +856,18 @@ export interface RunDiagnosticNodeState {
   success_reason: unknown | null;
 }
 
+export interface RunDiagnosticLineageFrame {
+  kind: 'fork' | 'expand';
+  group_id: string;
+  member_key: string;
+}
+
 export interface RunDiagnosticToken {
   token_id: string;
   row_id: string;
   row_index: number | null;
-  branch_name: string | null;
-  fork_group_id: string | null;
+  lineage: RunDiagnosticLineageFrame[];
   join_group_id: string | null;
-  expand_group_id: string | null;
   step_in_pipeline: number | null;
   created_at: string;
   terminal_outcome: string | null;

@@ -61,10 +61,8 @@ def _diagnostic_token(**overrides: object) -> RunDiagnosticToken:
         "token_id": "token-1",
         "row_id": "row-1",
         "row_index": 0,
-        "branch_name": None,
-        "fork_group_id": None,
+        "lineage": [],
         "join_group_id": None,
-        "expand_group_id": None,
         "step_in_pipeline": 0,
         "created_at": _DIAGNOSTIC_TIME,
         "terminal_outcome": "success",
@@ -371,6 +369,16 @@ def test_diagnostic_node_state_rejects_impossible_contract_values(field: str, va
 def test_diagnostic_token_rejects_impossible_contract_values(field: str, value: object) -> None:
     with pytest.raises(ValidationError, match=field):
         _diagnostic_token(**{field: value})
+
+
+def test_run_diagnostic_token_carries_lineage_frames() -> None:
+    from elspeth.web.execution.schemas import RunDiagnosticLineageFrame, RunDiagnosticToken
+
+    fields = set(RunDiagnosticToken.model_fields)
+    assert "lineage" in fields
+    assert {"branch_name", "fork_group_id", "expand_group_id"} & fields == set()
+    assert "join_group_id" in fields
+    assert set(RunDiagnosticLineageFrame.model_fields) == {"kind", "group_id", "member_key"}
 
 
 @pytest.mark.parametrize(
