@@ -560,10 +560,11 @@ def validate_escalation_targets(regions: tuple[BoundRegion, ...]) -> None:
     for region in regions:
         if region.binding.on_group_failure == "escalate" and region.depth == 1:
             raise GraphValidationError(
-                f"Scope '{region.binding.closer_name}' declares on_group_failure: escalate at an "
-                f"outermost bound group — there is no enclosing bound group to escalate to "
-                f"(spec §7 rule 8). Use quarantine (terminal handling) at the outermost level, or "
-                f"nest this scope inside another bound group.",
+                f"Scope closed by collector '{region.binding.closer_name}' (opener "
+                f"'{region.binding.opener_name}') declares on_group_failure: escalate at an outermost "
+                f"bound group — there is no enclosing bound group to escalate to (spec §7 rule 8). "
+                f"Use quarantine (terminal handling) at the outermost level, or nest this scope inside "
+                f"another bound group.",
                 component_id=region.binding.closer_name,
                 component_type=region.binding.closer_kind,
             )

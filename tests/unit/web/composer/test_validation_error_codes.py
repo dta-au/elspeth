@@ -504,6 +504,34 @@ class TestClosedCodeCatalogueInvariants:
         assert multiple_barriers not in (intrinsic, downstream)
         assert "barrier" in multiple_barriers[0]
 
+    def test_scope_escalate_at_outermost_resolves_both_the_code_and_the_runtime_text(self) -> None:
+        """Task 10 review N2: the entry is deliberately outside
+        ``_CLOSED_VALIDATION_ERROR_CODES`` (Stage 1 cannot author a scope
+        yet, so this code never appears in the planner's redacted repair
+        feedback) — which means ``test_closed_code_catalogue_is_fully_
+        explainable`` never reaches it. The runtime-message route (the
+        regex alternation's second limb) is therefore the ONLY thing that
+        resolves this entry today, via ``preview_pipeline``'s surfaced
+        Stage-2 build error text, and was otherwise unpinned. Task 9's F1
+        is the precedent for why an unpinned entry is how a wrong remedy
+        ships unnoticed.
+        """
+        by_code = explain_validation_code("scope_escalate_at_outermost")
+        assert by_code is not None
+        assert "escalate" in by_code[0].lower()
+        assert "quarantine" in by_code[1]
+
+        # The bare code never appears in a real GraphValidationError message —
+        # only the runtime text does (core/dag/bound_regions.py,
+        # validate_escalation_targets). Resolve a representative fragment of
+        # that real message, not the code name, to pin the alternation's
+        # SECOND limb specifically.
+        by_runtime_text = explain_validation_code(
+            "Scope closed by collector 'stitcher' (opener 'expand') declares on_group_failure: "
+            "escalate at an outermost bound group — there is no enclosing bound group to escalate to."
+        )
+        assert by_runtime_text == by_code
+
     def test_query_template_unbound_row_fields_resolves_to_multi_query_guidance(self) -> None:
         """The multi-query row-binding code must not fall through to the
         single-prompt unbound-variables entry: the repair is different (bind
