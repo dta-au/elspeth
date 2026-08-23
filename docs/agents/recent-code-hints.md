@@ -8,6 +8,68 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-24 — WS2 config-validation campaign conventions (barrier scopes:
+  collectors, bound regions, parity; branch feature/unified-lineage).** Eight
+  traps, the first four from the campaign plan, the rest measured while
+  landing Tasks 12–13:
+  - (a) The scope-binding config keys (`scope_name`/`scope_opener`/
+    `scope_policy`/`scope_on_group_failure`) exist ONLY on collector nodes and
+    serialise omitted-when-None. Adding any new key to an EXISTING node type's
+    serialisation moves every canonical topology hash in
+    `tests/unit/core/dag/canonical_hash_corpus.json` and every stored
+    `composition_content_hash` — a new key must be omitted-when-absent or it
+    is a corpus-wide re-record you must adjudicate, not a local change.
+  - (b) Bound-region SESE walks (`core/dag/bound_regions.py`) exclude
+    RoutingMode.DIVERT edges BY PINNED DECISION (WS2 plan decision 1; §7 rule
+    9 treats in-region on_error as legal failure semantics, not topology).
+    "Fixing" rule 4 to walk on_error edges rejects the corpus branch-loss
+    fixtures wholesale (8 cases measured at planning time) — the exclusion is
+    the contract, not an oversight.
+  - (c) Every new `raise` under `src/elspeth/core/dag/` or
+    `src/elspeth/core/config.py` needs a SAME-COMMIT parity adjudication:
+    run `scripts/cicd/runtime_rejection_parity.py --write` and adjudicate the
+    seeded entry (mirrored counterparts must be real Stage-1 codes; the
+    unmirrored ceiling has no slack). A message reword re-keys the site —
+    carry the adjudication across, never hand-edit a `key:`.
+  - (d) The escalation fixpoint bound is DERIVED at build
+    (`derive_escalation_fixpoint_bound`, 1000 + 8·depth,
+    `core/dag/bound_regions.py`) and the leader drain reads it from the built
+    graph — never reintroduce a constant iteration bound in
+    `leader_drain`/EOF flush code; competing formulas are deleted, not forked.
+  - (e) The capability gate derives its field inventory from
+    `canonical_set_pipeline_schema()`: documenting a field in
+    `pipeline_capabilities.md` REQUIRES the set_pipeline schema (and its
+    redaction.py pydantic authority) to carry it — the md and schema move in
+    one commit or the gate is red from both directions. And `enum` constraints
+    on set_pipeline node properties trip
+    `assert_set_pipeline_schema_compatible` ("advertised enum is narrower
+    than the runtime model") when the pydantic field is a plain `str | None`
+    — use `["string","null"]` with the vocabulary in the description (the
+    policy/merge precedent).
+  - (f) The redaction snapshot regenerates ONLY via
+    `scripts/cicd/bootstrap_redaction_snapshot.py --write` — never by hand.
+    A regeneration whose entry hashes move with `sensitive_path_count`
+    UNCHANGED still verdicts `direction=weaken` under
+    `check_redaction_direction.py`'s conservative same-count rule: that is
+    disposition (c) of the 2026-08-18 entry below — the PR needs the
+    `policy-weaken-justified` label plus the exact phrase "Redaction policy
+    weakening rationale" in the body, never a code workaround.
+  - (g) The guided capability core is hash-pinned (`capability_core_hash`,
+    `capability_skill.py`) and its exact bytes front EVERY authoring surface.
+    Lane-scoped guidance (guided-only vocabulary, refusal notices) goes in
+    the guided overlay/skill files, NEVER the shared core — a core edit moves
+    the pinned hash and every surface's prompt at once.
+  - (h) Collectors validate (Stage 1) and build (DAG) but CANNOT RUN until
+    WS4: `engine/orchestrator/graph_registration.py` rejects any graph whose
+    collector id map is non-empty (pinned decision 5). The GUIDED lane
+    additionally refuses collector-bearing candidates outright
+    (`guided_collector_not_authorable`,
+    `guided/planning.py::_reject_collector_candidate_nodes`). RULED (John,
+    comment 7878 on elspeth-88bb77953c): the guard lifts AFTER the WS6
+    disposition-vocabulary freeze, never before — lifting is that ticket's
+    work, together with the proposal-projection/frontend parity sweep it
+    describes. Do not remove the guard or extend the projection ahead of it.
+
 - **2026-08-23 — a NEW corpus case fails the WS1 frozen-oracle gate closed, and
   the fix is a scoped write, never a full regenerate.** `tests/integration/core/
   dag/test_oracle_freeze.py::test_frozen_oracle_surface` (campaign instrument,
