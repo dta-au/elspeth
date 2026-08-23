@@ -543,6 +543,12 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "region belongs to a scoped multi-row transform closed by a collector.",
     ),
     (
+        r"scope_escalate_at_outermost|escalate at an outermost bound group",
+        "The scope's failure policy escalates to an enclosing group, but the scope is outermost — nothing encloses it.",
+        "Set on_group_failure: quarantine on the outermost scope, or nest it inside a fork→coalesce "
+        "or another scope that will receive the escalation.",
+    ),
+    (
         r"gate_duplicate_fork_branch",
         "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
         "Remove duplicate entries from the gate's fork_to list while preserving the intended unique branch order.",

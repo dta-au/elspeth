@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, get_args
 
 import pytest
 
@@ -15,6 +15,7 @@ from elspeth.core.config import (
     CollectorSettings,
     GateSettings,
     QueueSettings,
+    RowUnionSettings,
     ScopeSettings,
     SourceSettings,
     TransformSettings,
@@ -1383,13 +1384,21 @@ def _build_fork_coalesce_with_undeclared_expand_in_branch() -> ExecutionGraph:
     )
 
 
-def _build_fork_coalesce_with_scoped_expand_in_branch() -> ExecutionGraph:
+def _build_fork_coalesce_with_scoped_expand_in_branch(
+    *, on_group_failure: Literal["quarantine", "escalate"] = "quarantine"
+) -> ExecutionGraph:
     """Same shape as the undeclared case, but branch_a's expand is a
     declared scope whose collector closes BEFORE the coalesce
     (batch-in-fork-line — legal under ruling 28): source -> gate
     'fork_to' [path_a, path_b] -> coalesce; path_a is
     branch_a_expand (opener) -> page_stitcher (collector, closer) ->
     feeds the coalesce's 'path_a' branch connection.
+
+    The scope's binding nests inside the outer FORK->coalesce region
+    (depth 2), so ``on_group_failure`` defaults to "quarantine" (matching
+    ``ScopeSettings``'s own default) but a caller can pass "escalate" — rule
+    8 (spec §7, this task) legalizes escalate here precisely because an
+    enclosing bound group (the coalesce) exists at depth 1.
     """
     source = _BoundRegionMockSource()
     branch_a = _BoundRegionMultiRowTransform(name="branch_a_expand", output_schema_config=SchemaConfig(mode="observed", fields=None))
@@ -1449,7 +1458,62 @@ def _build_fork_coalesce_with_scoped_expand_in_branch() -> ExecutionGraph:
                 CollectorSettings(name="page_stitcher", plugin="stitch_pages", input="pages", on_success="path_a_out"),
             )
         },
-        scope_settings=[ScopeSettings(name="branch_a_pages", opener="branch_a_expand", closer="page_stitcher", policy="require_all")],
+        scope_settings=[
+            ScopeSettings(
+                name="branch_a_pages",
+                opener="branch_a_expand",
+                closer="page_stitcher",
+                policy="require_all",
+                on_group_failure=on_group_failure,
+            )
+        ],
+    )
+
+
+def _build_top_level_scope(*, on_group_failure: Literal["quarantine", "escalate"]) -> ExecutionGraph:
+    """A standalone scope (opener -> collector), no fork/coalesce anywhere.
+
+    No enclosing bound region exists, so this scope's own binding is the
+    ONLY bound group in the graph — depth 1, outermost. Rule 8 (spec §7)
+    rejects ``escalate`` here: there is nowhere to escalate to.
+    """
+    source = _BoundRegionMockSource()
+    opener = _BoundRegionMultiRowTransform(name="expand", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    collector = _BoundRegionCollectorPlugin(name="stitcher", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=opener,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="expand",
+                    plugin=opener.name,
+                    input="source_out",
+                    on_success="pages",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        collectors={
+            "stitcher": (
+                collector,  # type: ignore[dict-item]
+                CollectorSettings(name="stitcher", plugin="stitch_pages", input="pages", on_success="out"),
+            )
+        },
+        scope_settings=[
+            ScopeSettings(
+                name="doc_pages",
+                opener="expand",
+                closer="stitcher",
+                policy="require_all",
+                on_group_failure=on_group_failure,
+            )
+        ],
     )
 
 
@@ -2096,3 +2160,63 @@ class TestRule6AggregatorBan:
         # FORK region specifically, not the (legal) inner EXPAND region.
         with pytest.raises(GraphValidationError, match="Aggregation 'branch_a_agg' is inside bound region 'coalesce'"):
             _build_aggregation_alongside_nested_scope_in_a_branch()
+
+
+class TestEscalateAtOutermost:
+    """Spec §7 rule 8 (standing ruling): escalate requires an enclosing
+    bound group; outermost closers declare terminal handling.
+    """
+
+    def test_escalate_on_outermost_scope_rejected(self) -> None:
+        with pytest.raises(GraphValidationError, match="escalate at an outermost bound group"):
+            _build_top_level_scope(on_group_failure="escalate")
+
+    def test_escalate_on_nested_scope_is_legal(self) -> None:
+        # A REAL nested region (not a fixture with hand-set depth): the
+        # scope's own binding computes to depth 2 via compute_bound_regions
+        # because it is genuinely nested inside the outer fork->coalesce
+        # region's span — an enclosing bound group exists.
+        graph = _build_fork_coalesce_with_scoped_expand_in_branch(on_group_failure="escalate")
+        assert graph is not None
+        regions = graph.get_bound_regions()
+        scope_region = next(r for r in regions if r.binding.closer_kind == CloserKind.COLLECTOR)
+        assert scope_region.depth == 2
+        assert scope_region.binding.on_group_failure == "escalate"
+
+    def test_quarantine_on_outermost_scope_is_legal(self) -> None:
+        graph = _build_top_level_scope(on_group_failure="quarantine")
+        assert graph is not None
+        (region,) = graph.get_bound_regions()
+        assert region.depth == 1
+        assert region.binding.on_group_failure == "quarantine"
+
+
+class TestRule7RosterAuthorityIsStructural:
+    """Spec §7 rule 7 (standing ruling): require_all is legal exactly where
+    a roster authority exists — declared branches (coalesce/row_union) or
+    a bound EXPAND group (scope). No new runtime raise: the policy
+    vocabularies are already closed per closer kind at the pydantic-model
+    level (spec §2); a runtime check here could never fire.
+    """
+
+    def test_aggregation_settings_has_no_policy_field(self) -> None:
+        # Declaration pin: an aggregator has no roster authority at all
+        # (it consumes a batch, not a group), so it stays policy-free —
+        # asserting the field's ABSENCE is the right shape here.
+        assert "policy" not in AggregationSettings.model_fields
+
+    def test_scope_and_coalesce_policy_literals_include_require_all(self) -> None:
+        # Truth pin, not just a declaration pin: confirm require_all is
+        # actually IN the Literal vocabulary for the two closer kinds whose
+        # roster authority is genuine — ScopeSettings (a bound EXPAND
+        # group) and CoalesceSettings (declared fork branches) — rather
+        # than only pinning the aggregation half's absence.
+        assert "require_all" in get_args(ScopeSettings.model_fields["policy"].annotation)
+        assert "require_all" in get_args(CoalesceSettings.model_fields["policy"].annotation)
+
+    def test_row_union_has_no_configurable_policy_hardcoded_require_all(self) -> None:
+        # row_union's roster authority (declared fork branches) is so
+        # structurally confined there is no policy field to diverge at
+        # all: group_bindings.py hardcodes policy="require_all" for every
+        # ROW_UNION binding, and RowUnionSettings carries no policy field.
+        assert "policy" not in RowUnionSettings.model_fields

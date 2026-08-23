@@ -2048,6 +2048,22 @@ sites:
   disposition: abstains
   note: Stage 1 does not compute bound regions and cannot know the observed nesting depth; the cap is
     a built-graph property — deliberate abstention.
+- key: 4b9e702d55eeed1f
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: validate_escalation_targets
+  exception: GraphValidationError
+  message: 'Scope ''{}'' declares on_group_failure: escalate at an outermost bound group — there is no
+    enclosing bound group to escalate to (spec §7 rule 8). Use quarantine ('
+  ordinal: 0
+  disposition: not_authorable
+  note: Task 10 (WS2 controller). The composer's NodeType closed vocabulary (web/composer/state.py line
+    68, a Literal of transform/gate/aggregation/coalesce/row_union/queue) has no collector or scope member
+    at all — Stage 1 cannot author a scope, let alone one with on_group_failure, so this rejection has
+    no reachable Stage-1 counterpart today. Verified empirically (grepped state.py for any scope/collector
+    handling — zero hits) rather than trusting the plan's claim. Task 12 adds scope authoring to the composer
+    and must re-adjudicate this key to mirrored with a real Stage-1 counterpart code (scope_escalate_at_outermost,
+    already in generation.py's remedy catalogue for explain_validation_error and preview_pipeline's runtime-surfaced
+    text).
 - key: 590b32135dd02949
   path: src/elspeth/core/dag/bound_regions.py
   qualname: validate_no_aggregations_in_regions

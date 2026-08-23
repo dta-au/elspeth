@@ -33,6 +33,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.core.dag.bound_regions import (
     compute_bound_regions,
     derive_escalation_fixpoint_bound,
+    validate_escalation_targets,
     validate_no_aggregations_in_regions,
     validate_openers_bound_in_region,
     validate_sese_regions,
@@ -1892,6 +1893,14 @@ def build_execution_graph(
     )
     validate_openers_bound_in_region(graph, regions, registry, multi_row_node_ids)
     validate_no_aggregations_in_regions(graph, regions, {aid: str(name) for name, aid in aggregation_ids.items()})
+    # rule 7 (roster authority, standing ruling) is structural: the policy
+    # vocabularies are closed per closer kind (spec §2) — ScopeSettings.policy
+    # and CoalesceSettings.policy both include "require_all" (their closers
+    # genuinely have a roster: a bound EXPAND group, or declared fork
+    # branches), RowUnionSettings carries no policy field at all (v1 arrival
+    # policy is require_all unconditionally), and AggregationSettings stays
+    # policy-free. Do not add a runtime check here — it can never fire.
+    validate_escalation_targets(regions)
     max_observed_depth = max((r.depth for r in regions), default=0)
     graph.set_max_bound_region_depth(max_observed_depth)
     graph.set_escalation_fixpoint_bound(derive_escalation_fixpoint_bound(max_observed_depth))
