@@ -883,15 +883,14 @@ class TestInterruptAndResume:
         )
 
         def _blocked_barrier_row() -> Any:
+            # The WHOLE row, not a chosen subset of columns: "unchanged by
+            # finalize" must mean every column (lease_owner, attempt,
+            # barrier_blocked_at, updated_at, ...), not just the four this
+            # test happens to assert on below.
             with setup.db.connection() as conn:
                 return (
                     conn.execute(
-                        select(
-                            token_work_items_table.c.status,
-                            token_work_items_table.c.barrier_key,
-                            token_work_items_table.c.coalesce_name,
-                            token_work_items_table.c.lineage_path_json,
-                        ).where(
+                        select(token_work_items_table).where(
                             token_work_items_table.c.run_id == run_id,
                             token_work_items_table.c.work_item_id == work_item.work_item_id,
                         )
