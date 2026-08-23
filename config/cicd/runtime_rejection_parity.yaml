@@ -2628,6 +2628,25 @@ sites:
   - row_union_downstream_group_invalid
   note: state.py:5740-5753 rejects a coalesce/row_union downstream of a row_union's on_success with no
     intervening sink, the barrier arm of builder.py:1378-1391.
+- key: b5c828819eeaa5c0
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: '{} ''{}'' on_error ''{}'' names closer ''{}'' but ''{}'' is not inside that closer''s bound
+    region. A closer is a legal on_error target only from inside its own region ('
+  ordinal: 0
+  disposition: abstains
+  note: 'Task 11 (WS2 controller). Stage 1 does not compute bound regions at all (established abstention,
+    Task 7''s own parity note), and this relax deliberately does not attempt an approximate membership
+    computation for the REJECT arm specifically: web/composer/state.py''s _validate_runtime_route_destinations
+    accepts any real coalesce/row_union on_error target unconditionally, never reproducing this out-of-region
+    rejection. Accepting is the safe drift direction here -- Stage 2 preview_pipeline runs the real builder
+    and rejects a genuinely out-of-region target with this exact runtime message; a Stage-1 membership
+    check risking a false reject (an approximate lineage-based computation diverging from the real SESE
+    region computation) would be the SAME bad composer-red/runtime-green drift, just from the opposite
+    direction. generation.py carries the on_error_closer_out_of_region remedy entry for preview_pipeline''s
+    runtime-surfaced text; it is not in _CLOSED_VALIDATION_ERROR_CODES since Stage 1 never emits it (same
+    reasoning as bound_region_undeclared_expand).'
 - key: d18650affcf81ac3
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph

@@ -1436,11 +1436,30 @@ def build_execution_graph(
                 mode=RoutingMode.DIVERT,
             )
 
+    # rule 9 (spec §7): on_error may target the ENCLOSING bound region's
+    # closer, not only a sink. closer_name_to_node collects every legal
+    # closer name (coalesce/row_union/collector) so the two error-edge loops
+    # below can recognize a closer-shaped on_error and DEFER it — region
+    # membership is not known yet (compute_bound_regions runs later, after
+    # these loops) — rather than misclassifying it as an unknown sink.
+    # Resolved after region computation, below.
+    closer_name_to_node: dict[str, NodeID] = {
+        **{str(name): nid for name, nid in coalesce_ids.items()},
+        **{str(name): nid for name, nid in row_union_ids.items()},
+        **{str(name): nid for name, nid in collector_ids.items()},
+    }
+    deferred_error_closer_targets: list[tuple[NodeID, str, str, str]] = []  # (node_id, node_name, kind, target)
+
     # Transform error edges
     for wired in transforms:
         on_error = wired.settings.on_error
         if on_error != "discard":
             if SinkName(on_error) not in sink_ids:
+                if on_error in closer_name_to_node:
+                    deferred_error_closer_targets.append(
+                        (transform_ids_by_name[wired.settings.name], wired.settings.name, "transform", on_error)
+                    )
+                    continue
                 suggestions = _suggest_similar(on_error, sorted(str(s) for s in sink_ids))
                 hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
                 raise GraphValidationError(
@@ -1464,6 +1483,9 @@ def build_execution_graph(
         if gate_on_error is None or gate_on_error == "discard":
             continue
         if SinkName(gate_on_error) not in sink_ids:
+            if gate_on_error in closer_name_to_node:
+                deferred_error_closer_targets.append((config_gate_ids[GateName(gate_config.name)], gate_config.name, "gate", gate_on_error))
+                continue
             suggestions = _suggest_similar(gate_on_error, sorted(str(s) for s in sink_ids))
             hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
             raise GraphValidationError(
@@ -1901,6 +1923,34 @@ def build_execution_graph(
     # policy is require_all unconditionally), and AggregationSettings stays
     # policy-free. Do not add a runtime check here — it can never fire.
     validate_escalation_targets(regions)
+
+    # ===== RULE 9: on_error may target the enclosing region's closer (spec §7 rule 9) =====
+    # Resolve the deferrals collected above, now that region membership is
+    # known. A closer is a legal on_error target only from INSIDE its own
+    # bound region: escaping to a closer that does not enclose the failing
+    # node would let a row leave that closer's roster invisibly, the same
+    # loss-blindness rules 5/6 already close for other shapes. The DIVERT
+    # edge this adds targets a coalesce/row_union/collector, not a sink —
+    # exactly the shape schema_validation.py's `_live_predecessors` already
+    # defends the public `add_edge` surface against (see its "REACHABILITY,
+    # stated honestly" docstring, updated alongside this change); runtime
+    # semantics of the edge land in WS3, so until then it is a structural
+    # audit marker, same as every other DIVERT edge.
+    regions_by_closer = {r.binding.closer_node_id: r for r in regions}
+    for error_node_id, error_node_name, error_kind, error_target in deferred_error_closer_targets:
+        closer_node_id = closer_name_to_node[error_target]
+        enclosing_region = regions_by_closer[closer_node_id] if closer_node_id in regions_by_closer else None
+        if enclosing_region is None or error_node_id not in enclosing_region.member_node_ids:
+            raise GraphValidationError(
+                f"{error_kind.capitalize()} '{error_node_name}' on_error '{error_target}' names closer "
+                f"'{error_target}' but '{error_node_name}' is not inside that closer's bound region. A "
+                f"closer is a legal on_error target only from inside its own region (spec §7 rule 9). "
+                f"Use a sink, 'discard', or move the node inside the region.",
+                component_id=error_node_name,
+                component_type=error_kind,
+            )
+        graph.add_edge(error_node_id, closer_node_id, label=error_edge_label(error_node_name), mode=RoutingMode.DIVERT)
+
     max_observed_depth = max((r.depth for r in regions), default=0)
     graph.set_max_bound_region_depth(max_observed_depth)
     graph.set_escalation_fixpoint_bound(derive_escalation_fixpoint_bound(max_observed_depth))

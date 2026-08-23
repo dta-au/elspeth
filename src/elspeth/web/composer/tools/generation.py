@@ -549,6 +549,12 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "or another scope that will receive the escalation.",
     ),
     (
+        r"on_error_closer_out_of_region|names closer .* but .* is not inside that closer's bound region",
+        "on_error names a barrier closer, but the failing node is not inside that closer's bound region, "
+        "so the closer has no membership to settle for it.",
+        "From inside a bound region, on_error may name the region's own closer; elsewhere use a sink name or 'discard'.",
+    ),
+    (
         r"gate_duplicate_fork_branch",
         "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
         "Remove duplicate entries from the gate's fork_to list while preserving the intended unique branch order.",

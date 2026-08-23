@@ -1183,13 +1183,18 @@ def _live_predecessors(graph: ExecutionGraph, node_id: str) -> list[str]:
     filtering edge-wise without regrouping would drop a live predecessor.
 
     REACHABILITY, stated honestly: ``build_execution_graph`` cannot currently
-    produce a DIVERT edge INTO a transform. Error routing in ELSPETH is
-    terminal — every DIVERT edge the builder creates lands on a SINK (source
-    quarantine :1126, transform ``on_error`` :1146, gate ``on_error`` :1169,
-    sink failsink :1189), and a transform's ``on_error`` is rejected outright
-    unless it names a sink (builder.py:1139, mirroring
-    ``TransformSettings.validate_on_error``). So on today's production path
-    this filter is equivalent to bare ``.predecessors()``. It is kept as
+    produce a DIVERT edge INTO a transform — that claim is what THIS
+    function's every caller relies on (each filters to ``NodeType.TRANSFORM``
+    before calling this helper, below), and it still holds. Error routing in
+    ELSPETH is no longer uniformly terminal, though: since spec §7 rule 9
+    (Task 11), an in-region transform/gate's ``on_error`` may target its
+    enclosing bound region's closer (coalesce/row_union/collector), so a
+    DIVERT edge can now land on one of THOSE node kinds too, not only a sink
+    (source quarantine, transform/gate ``on_error``, sink failsink, and now
+    an in-region closer). None of that widens what THIS function sees,
+    because it is never called for a coalesce/row_union/collector node — so
+    on today's production path this filter is still equivalent to bare
+    ``.predecessors()`` for every node it actually examines. It is kept as
     defence-in-depth for the public ``add_edge`` surface — which tests and any
     future "route errors into a repair transform" topology use — and pinned by
     ``test_divert_only_predecessor_is_not_checked``. Do not read it as

@@ -832,7 +832,15 @@ class GateSettings(BaseModel):
     @field_validator("on_error")
     @classmethod
     def validate_on_error(cls, v: str | None) -> str | None:
-        """Validate the optional row-error sink policy."""
+        """Validate the optional row-error policy: a sink name, 'discard', or omitted.
+
+        Shape-only at parse time — this validator accepts any reasonably-shaped
+        identifier, so a name that turns out to be neither a sink nor omitted
+        also passes here when it names a bound region's closer (coalesce/
+        row_union/collector; spec §7 rule 9), from inside that region. Whether
+        the name resolves to a sink or a legal in-region closer is a build-time
+        (DAG compilation) concern, not this parser's.
+        """
         if v is None:
             return None
         if not v.strip():
@@ -1469,7 +1477,8 @@ class TransformSettings(BaseModel):
         description="Connection name or sink name for successfully processed rows",
     )
     on_error: str = Field(
-        description="Sink name for rows that cannot be processed, or 'discard'",
+        description="A sink name, 'discard', or — from inside a bound region — that region's closer "
+        "(coalesce/row_union/collector name; spec §7 rule 9) for rows that cannot be processed",
     )
     options: dict[str, Any] = Field(
         default_factory=dict,

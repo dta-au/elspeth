@@ -532,6 +532,29 @@ class TestClosedCodeCatalogueInvariants:
         )
         assert by_runtime_text == by_code
 
+    def test_on_error_closer_out_of_region_resolves_both_the_code_and_the_runtime_text(self) -> None:
+        """Task 11 (spec §7 rule 9): same shape as the scope_escalate pin
+        above and for the same reason — the entry is outside
+        ``_CLOSED_VALIDATION_ERROR_CODES`` (Stage 1 deliberately RELAXES
+        instead of mirroring the out-of-region rejection, so it never emits
+        this code), which means the runtime-message route (the alternation's
+        second limb, surfaced via ``preview_pipeline``'s Stage-2 build error)
+        is the only live route and would otherwise ship unpinned.
+        """
+        by_code = explain_validation_code("on_error_closer_out_of_region")
+        assert by_code is not None
+        assert "closer" in by_code[0]
+        assert "sink name or 'discard'" in by_code[1]
+
+        # Representative fragment of the real builder message
+        # (core/dag/builder.py rule-9 resolution pass).
+        by_runtime_text = explain_validation_code(
+            "Transform 'cleanup' on_error 'merge_paths' names closer 'merge_paths' but 'cleanup' "
+            "is not inside that closer's bound region. A closer is a legal on_error target only "
+            "from inside its own region (spec §7 rule 9)."
+        )
+        assert by_runtime_text == by_code
+
     def test_query_template_unbound_row_fields_resolves_to_multi_query_guidance(self) -> None:
         """The multi-query row-binding code must not fall through to the
         single-prompt unbound-variables entry: the repair is different (bind

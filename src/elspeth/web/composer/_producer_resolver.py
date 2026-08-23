@@ -116,6 +116,17 @@ class ProducerResolver:
         queue_nodes = {node.id: node for node in nodes if node.node_type == "queue"}
         queue_predecessors: dict[str, dict[str, ProducerEntry]] = {queue_id: {} for queue_id in queue_nodes}
 
+        # Spec §7 rule 9 (Task 11): on_error may name an ENCLOSING bound
+        # region's closer (coalesce/row_union) instead of a sink. That is a
+        # DIVERT edge into an EXISTING node, not a claim to PRODUCE a
+        # connection under the closer's name — a non-terminal closer already
+        # registers its own id as a producer (line below), so treating the
+        # on_error target the same way would falsely collide the two
+        # distinct nodes as duplicate producers of one connection. Closer
+        # names are therefore excluded from on_error's producer
+        # registration below, same carve-out shape as sinks/discard/None.
+        closer_names = {node.id for node in nodes if node.node_type in ("coalesce", "row_union")}
+
         def register(connection_name: str | None, entry: ProducerEntry) -> None:
             if connection_name is None or connection_name == "discard":
                 return
@@ -171,7 +182,8 @@ class ProducerResolver:
                 register(node.id, entry)
             else:
                 register(node.on_success, entry)
-            register(node.on_error, entry)
+            if node.on_error not in closer_names:
+                register(node.on_error, entry)
             if node.routes is not None:
                 for target in node.routes.values():
                     if target == "fork":

@@ -2088,8 +2088,11 @@ def route_destination_facts(state: CompositionState) -> dict[str, RouteDestinati
     the dangling value itself, ``declared_sinks`` (the candidate's
     ``outputs[].sink_name`` set), and for on_success failures
     ``consumable_connections`` (the connections downstream nodes read as their
-    input). ``on_error`` and coalesce ``on_success`` may only target sinks, so
-    those facts deliberately omit ``consumable_connections``.
+    input). ``on_error`` may only target a sink or — from inside a bound
+    region — that region's closer (spec §7 rule 9; a closer-shaped
+    ``on_error`` is accepted, never dangling, so it never reaches this
+    dict). Coalesce ``on_success`` may only target sinks. Neither carries
+    ``consumable_connections``.
 
     AWS acceptance runs 2026-07-30 (ticket elspeth-5904b1683a): the canonical
     CSV-to-JSON prompt intermittently exhausted its repair budget on
@@ -2106,6 +2109,10 @@ def route_destination_facts(state: CompositionState) -> dict[str, RouteDestinati
     consumer_connections = _runtime_consumer_connections(state.nodes)
     declared_sinks = sorted(output_names)
     consumable = sorted(consumer_connections)
+    # Same rule-9 relax as _validate_runtime_route_destinations, kept in
+    # sync: a closer-shaped on_error is no longer dangling, so it must not
+    # generate a "dangling_on_error" repair fact either.
+    closer_names = {node.id for node in state.nodes if node.node_type in ("coalesce", "row_union")}
     facts: dict[str, RouteDestinationFactDict] = {}
 
     def _merge(component: str, entry: RouteDestinationFactDict) -> None:
@@ -2145,6 +2152,7 @@ def route_destination_facts(state: CompositionState) -> dict[str, RouteDestinati
                 and node_on_error is not None
                 and node_on_error != "discard"
                 and node_on_error not in output_names
+                and node_on_error not in closer_names
             ):
                 _merge(
                     component,
@@ -2179,6 +2187,21 @@ def _validate_runtime_route_destinations(
     errors: list[ValidationEntry] = []
     output_names = {output.name for output in outputs}
     consumer_connections = _runtime_consumer_connections(nodes)
+    # Spec §7 rule 9 (Task 11): on_error may target the ENCLOSING bound
+    # region's closer (coalesce/row_union), not only a sink. Stage 1 does
+    # not compute bound regions at all (established abstention, Task 7's
+    # own parity note), so this RELAXES rather than mirrors the runtime's
+    # region-membership check: any real coalesce/row_union node name is
+    # accepted unconditionally, whether or not this node's chain actually
+    # lies inside that closer's region. Accepting is the safe drift
+    # direction — Stage 2 preview_pipeline runs the real builder and
+    # rejects a genuinely out-of-region target with the runtime message;
+    # rejecting a legal in-region target here instead would be
+    # composer-red/runtime-green, the drift that strands the authoring
+    # loop. Scope/collector closers are not in this set: NodeType has no
+    # "collector"/"scope" member (Task 10 finding) — not yet
+    # composer-authorable, so no scope-closer name can appear in `nodes`.
+    closer_names = {node.id for node in nodes if node.node_type in ("coalesce", "row_union")}
     _err = ValidationEntry
 
     for source_name, source in sources.items():
@@ -2236,7 +2259,12 @@ def _validate_runtime_route_destinations(
 
     for node in nodes:
         if node.node_type == "gate":
-            if node.on_error is not None and node.on_error != "discard" and node.on_error not in output_names:
+            if (
+                node.on_error is not None
+                and node.on_error != "discard"
+                and node.on_error not in output_names
+                and node.on_error not in closer_names
+            ):
                 errors.append(
                     _err(
                         f"node:{node.id}",
@@ -2273,7 +2301,12 @@ def _validate_runtime_route_destinations(
                         "transform_on_success_dangling",
                     )
                 )
-            if node.on_error is not None and node.on_error != "discard" and node.on_error not in output_names:
+            if (
+                node.on_error is not None
+                and node.on_error != "discard"
+                and node.on_error not in output_names
+                and node.on_error not in closer_names
+            ):
                 errors.append(
                     _err(
                         f"node:{node.id}",
@@ -3197,6 +3230,11 @@ def _check_schema_contracts(
         for branch_name in _coalesce_branch_names(node.branches)
     }
     internal_connection_names: set[str] = set()
+    # Spec §7 rule 9 (Task 11): same carve-out as ProducerResolver.build's —
+    # a closer-shaped on_error is a DIVERT edge into an EXISTING node, not a
+    # claim to produce a connection under the closer's name, so it must not
+    # be tracked as a duplicate-producer description candidate either.
+    closer_names = {node.id for node in nodes if node.node_type in ("coalesce", "row_union")}
     source_map = sources
 
     _err = ValidationEntry
@@ -3258,7 +3296,12 @@ def _check_schema_contracts(
             _record_description(node.id, f"coalesce '{node.id}'")
         elif node.on_success is not None and node.on_success not in sink_names:
             _record_description(node.on_success, f"node '{node.id}' on_success")
-        if node.on_error is not None and node.on_error != "discard" and node.on_error not in sink_names:
+        if (
+            node.on_error is not None
+            and node.on_error != "discard"
+            and node.on_error not in sink_names
+            and node.on_error not in closer_names
+        ):
             _record_description(node.on_error, f"node '{node.id}' on_error")
         if node.routes is not None:
             for route_label, target in node.routes.items():

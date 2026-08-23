@@ -511,3 +511,135 @@ class TestBoundRegionAggregationInvalidRowUnionStage1Mirror:
 
         codes = {e.error_code for e in summary.errors}
         assert "bound_region_aggregation_invalid" not in codes, summary.errors
+
+
+def _transform_with_on_error(node_id: str, input_name: str, on_success: str, *, on_error: str) -> NodeSpec:
+    return NodeSpec(
+        id=node_id,
+        node_type="transform",
+        plugin="passthrough",
+        input=input_name,
+        on_success=on_success,
+        on_error=on_error,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+def _gate_with_on_error(node_id: str, input_name: str, routes: dict[str, str], *, on_error: str) -> NodeSpec:
+    """A plain (non-forking) routing gate with a row-level on_error set."""
+    return NodeSpec(
+        id=node_id,
+        node_type="gate",
+        plugin=None,
+        input=input_name,
+        on_success=None,
+        on_error=on_error,
+        options={},
+        condition="True",
+        routes=routes,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+class TestOnErrorCloserTargetsStage1Mirror:
+    """Spec §7 rule 9 (Task 11): on_error may target the ENCLOSING bound
+    region's closer, not only a sink — RELAXED at Stage 1, not mirrored:
+    Stage 1 does not compute bound regions (established abstention), so it
+    accepts ANY real coalesce/row_union name unconditionally rather than
+    attempting (and risking getting wrong) an in-region/out-of-region
+    verdict. Accepting is the safe drift direction; Stage 2's real builder
+    catches a genuinely out-of-region target.
+    """
+
+    def test_transform_on_error_naming_the_enclosing_coalesce_is_accepted(self) -> None:
+        state = _empty_state()
+        state = state.with_source(_make_source("g_in"))
+        state = state.with_node(_fork_gate("g", "g_in", ("path_a", "path_b")))
+        state = state.with_node(_transform_with_on_error("t_a", "path_a", "path_a_out", on_error="c"))
+        state = state.with_node(_transform("t_b", "path_b", "path_b_out"))
+        state = state.with_node(_coalesce("c", branches={"path_a": "path_a_out", "path_b": "path_b_out"}, on_success="out"))
+        state = state.with_output(_make_output("out"))
+
+        summary = state.validate()
+
+        codes = {e.error_code for e in summary.errors}
+        assert "transform_on_error_unknown_sink" not in codes, summary.errors
+
+    def test_transform_on_error_naming_a_non_terminal_coalesce_does_not_collide_with_its_own_release(self) -> None:
+        # "c" is NON-TERMINAL (on_success=None): the coalesce publishes its
+        # OWN id as the connection downstream reads. Before the
+        # ProducerResolver carve-out, t_a's on_error="c" DIVERT registered
+        # as a SECOND, competing producer of "c" — a real, reproduced
+        # false-positive duplicate_connection_producer error. A DIVERT edge
+        # into an existing closer does not compete to PRODUCE that
+        # connection, so it must not collide with the closer's own release.
+        state = _empty_state()
+        state = state.with_source(_make_source("g_in"))
+        state = state.with_node(_fork_gate("g", "g_in", ("path_a", "path_b")))
+        state = state.with_node(_transform_with_on_error("t_a", "path_a", "path_a_out", on_error="c"))
+        state = state.with_node(_transform("t_b", "path_b", "path_b_out"))
+        state = state.with_node(_coalesce("c", branches={"path_a": "path_a_out", "path_b": "path_b_out"}, on_success=None))
+        state = state.with_node(_transform("after", "c", "out"))
+        state = state.with_output(_make_output("out"))
+
+        summary = state.validate()
+
+        codes = {e.error_code for e in summary.errors}
+        assert "duplicate_connection_producer" not in codes, summary.errors
+
+    def test_transform_on_error_naming_an_unrelated_real_closer_is_still_accepted(self) -> None:
+        # Accept-is-safe: Stage 1 cannot (and does not attempt to) tell that
+        # t_a is not inside "u"'s region — it accepts any real closer name.
+        # Stage 2's real builder is the one that would reject this.
+        state = _empty_state()
+        state = state.with_source(_make_source("g_in"))
+        state = state.with_node(_fork_gate("g", "g_in", ("path_a", "path_b")))
+        state = state.with_node(_transform_with_on_error("t_a", "path_a", "path_a_out", on_error="u"))
+        state = state.with_node(_transform("t_b", "path_b", "path_b_out"))
+        state = state.with_node(_coalesce("c", branches={"path_a": "path_a_out", "path_b": "path_b_out"}, on_success="union_in"))
+        state = state.with_node(_fork_gate("g2", "union_in", ("q1", "q2")))
+        state = state.with_node(_transform("q1_t", "q1", "q1_out"))
+        state = state.with_node(_transform("q2_t", "q2", "q2_out"))
+        state = state.with_node(_row_union("u", branches={"q1": "q1_out", "q2": "q2_out"}, on_success="out"))
+        state = state.with_output(_make_output("out"))
+
+        summary = state.validate()
+
+        codes = {e.error_code for e in summary.errors}
+        assert "transform_on_error_unknown_sink" not in codes, summary.errors
+
+    def test_gate_on_error_naming_a_real_closer_is_accepted(self) -> None:
+        state = _empty_state()
+        state = state.with_source(_make_source("g_in"))
+        state = state.with_node(_fork_gate("g", "g_in", ("path_a", "path_b")))
+        state = state.with_node(_gate_with_on_error("screen", "path_a", {"pass": "path_a_out"}, on_error="c"))
+        state = state.with_node(_transform("t_b", "path_b", "path_b_out"))
+        state = state.with_node(_coalesce("c", branches={"path_a": "path_a_out", "path_b": "path_b_out"}, on_success="out"))
+        state = state.with_output(_make_output("out"))
+
+        summary = state.validate()
+
+        codes = {e.error_code for e in summary.errors}
+        assert "gate_on_error_unknown_sink" not in codes, summary.errors
+
+    def test_on_error_naming_neither_sink_nor_closer_still_rejected(self) -> None:
+        # Casualty watch: the pre-existing negative case must keep firing —
+        # relaxing the check must not accept genuinely unknown targets.
+        state = _empty_state()
+        state = state.with_source(_make_source("t_in"))
+        state = state.with_node(_transform_with_on_error("t", "t_in", "out", on_error="nonexistent_thing"))
+        state = state.with_output(_make_output("out"))
+
+        summary = state.validate()
+
+        codes = {e.error_code for e in summary.errors}
+        assert "transform_on_error_unknown_sink" in codes, summary.errors
