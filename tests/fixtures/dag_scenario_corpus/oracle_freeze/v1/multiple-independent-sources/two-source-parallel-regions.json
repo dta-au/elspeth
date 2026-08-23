@@ -1,0 +1,459 @@
+{
+ "case_id": "two-source-parallel-regions",
+ "expansions": [],
+ "rows": [
+  6,
+  6,
+  0
+ ],
+ "scenario_id": "multiple-independent-sources",
+ "sink_outputs": [
+  {
+   "rows": [
+    "{\"orders_a\":{\"id\":1,\"value\":10},\"orders_b\":{\"id\":1,\"value\":10}}",
+    "{\"orders_a\":{\"id\":2,\"value\":20},\"orders_b\":{\"id\":2,\"value\":20}}",
+    "{\"orders_a\":{\"id\":3,\"value\":30},\"orders_b\":{\"id\":3,\"value\":30}}"
+   ],
+   "sink_name": "orders_output"
+  },
+  {
+   "rows": [
+    "{\"refunds_a\":{\"id\":101,\"value\":-5},\"refunds_b\":{\"id\":101,\"value\":-5}}",
+    "{\"refunds_a\":{\"id\":102,\"value\":-10},\"refunds_b\":{\"id\":102,\"value\":-10}}",
+    "{\"refunds_a\":{\"id\":103,\"value\":-15},\"refunds_b\":{\"id\":103,\"value\":-15}}"
+   ],
+   "sink_name": "refunds_output"
+  }
+ ],
+ "status": "completed",
+ "terminal_dispositions": [
+  {
+   "key": "orders:0#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "orders:0#0"
+  },
+  {
+   "key": "orders:0#1",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": "orders_output",
+   "token_key": "orders:0#1"
+  },
+  {
+   "key": "orders:0#2",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "orders:0#2"
+  },
+  {
+   "key": "orders:0#3",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "orders:0#3"
+  },
+  {
+   "key": "orders:1#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "orders:1#0"
+  },
+  {
+   "key": "orders:1#1",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": "orders_output",
+   "token_key": "orders:1#1"
+  },
+  {
+   "key": "orders:1#2",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "orders:1#2"
+  },
+  {
+   "key": "orders:1#3",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "orders:1#3"
+  },
+  {
+   "key": "orders:2#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "orders:2#0"
+  },
+  {
+   "key": "orders:2#1",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": "orders_output",
+   "token_key": "orders:2#1"
+  },
+  {
+   "key": "orders:2#2",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "orders:2#2"
+  },
+  {
+   "key": "orders:2#3",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "orders:2#3"
+  },
+  {
+   "key": "refunds:0#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "refunds:0#0"
+  },
+  {
+   "key": "refunds:0#1",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": "refunds_output",
+   "token_key": "refunds:0#1"
+  },
+  {
+   "key": "refunds:0#2",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "refunds:0#2"
+  },
+  {
+   "key": "refunds:0#3",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "refunds:0#3"
+  },
+  {
+   "key": "refunds:1#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "refunds:1#0"
+  },
+  {
+   "key": "refunds:1#1",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": "refunds_output",
+   "token_key": "refunds:1#1"
+  },
+  {
+   "key": "refunds:1#2",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "refunds:1#2"
+  },
+  {
+   "key": "refunds:1#3",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "refunds:1#3"
+  },
+  {
+   "key": "refunds:2#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "refunds:2#0"
+  },
+  {
+   "key": "refunds:2#1",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": "refunds_output",
+   "token_key": "refunds:2#1"
+  },
+  {
+   "key": "refunds:2#2",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "refunds:2#2"
+  },
+  {
+   "key": "refunds:2#3",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "refunds:2#3"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "orders:0#0",
+   "parents": [],
+   "row_key": "orders:0"
+  },
+  {
+   "branch_name": null,
+   "key": "orders:0#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "orders:0#2"
+    },
+    {
+     "ordinal": 1,
+     "parent_key": "orders:0#3"
+    }
+   ],
+   "row_key": "orders:0"
+  },
+  {
+   "branch_name": "orders_a",
+   "key": "orders:0#2",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "orders:0#0"
+    }
+   ],
+   "row_key": "orders:0"
+  },
+  {
+   "branch_name": "orders_b",
+   "key": "orders:0#3",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "orders:0#0"
+    }
+   ],
+   "row_key": "orders:0"
+  },
+  {
+   "branch_name": null,
+   "key": "orders:1#0",
+   "parents": [],
+   "row_key": "orders:1"
+  },
+  {
+   "branch_name": null,
+   "key": "orders:1#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "orders:1#2"
+    },
+    {
+     "ordinal": 1,
+     "parent_key": "orders:1#3"
+    }
+   ],
+   "row_key": "orders:1"
+  },
+  {
+   "branch_name": "orders_a",
+   "key": "orders:1#2",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "orders:1#0"
+    }
+   ],
+   "row_key": "orders:1"
+  },
+  {
+   "branch_name": "orders_b",
+   "key": "orders:1#3",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "orders:1#0"
+    }
+   ],
+   "row_key": "orders:1"
+  },
+  {
+   "branch_name": null,
+   "key": "orders:2#0",
+   "parents": [],
+   "row_key": "orders:2"
+  },
+  {
+   "branch_name": null,
+   "key": "orders:2#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "orders:2#2"
+    },
+    {
+     "ordinal": 1,
+     "parent_key": "orders:2#3"
+    }
+   ],
+   "row_key": "orders:2"
+  },
+  {
+   "branch_name": "orders_a",
+   "key": "orders:2#2",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "orders:2#0"
+    }
+   ],
+   "row_key": "orders:2"
+  },
+  {
+   "branch_name": "orders_b",
+   "key": "orders:2#3",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "orders:2#0"
+    }
+   ],
+   "row_key": "orders:2"
+  },
+  {
+   "branch_name": null,
+   "key": "refunds:0#0",
+   "parents": [],
+   "row_key": "refunds:0"
+  },
+  {
+   "branch_name": null,
+   "key": "refunds:0#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "refunds:0#2"
+    },
+    {
+     "ordinal": 1,
+     "parent_key": "refunds:0#3"
+    }
+   ],
+   "row_key": "refunds:0"
+  },
+  {
+   "branch_name": "refunds_a",
+   "key": "refunds:0#2",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "refunds:0#0"
+    }
+   ],
+   "row_key": "refunds:0"
+  },
+  {
+   "branch_name": "refunds_b",
+   "key": "refunds:0#3",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "refunds:0#0"
+    }
+   ],
+   "row_key": "refunds:0"
+  },
+  {
+   "branch_name": null,
+   "key": "refunds:1#0",
+   "parents": [],
+   "row_key": "refunds:1"
+  },
+  {
+   "branch_name": null,
+   "key": "refunds:1#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "refunds:1#2"
+    },
+    {
+     "ordinal": 1,
+     "parent_key": "refunds:1#3"
+    }
+   ],
+   "row_key": "refunds:1"
+  },
+  {
+   "branch_name": "refunds_a",
+   "key": "refunds:1#2",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "refunds:1#0"
+    }
+   ],
+   "row_key": "refunds:1"
+  },
+  {
+   "branch_name": "refunds_b",
+   "key": "refunds:1#3",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "refunds:1#0"
+    }
+   ],
+   "row_key": "refunds:1"
+  },
+  {
+   "branch_name": null,
+   "key": "refunds:2#0",
+   "parents": [],
+   "row_key": "refunds:2"
+  },
+  {
+   "branch_name": null,
+   "key": "refunds:2#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "refunds:2#2"
+    },
+    {
+     "ordinal": 1,
+     "parent_key": "refunds:2#3"
+    }
+   ],
+   "row_key": "refunds:2"
+  },
+  {
+   "branch_name": "refunds_a",
+   "key": "refunds:2#2",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "refunds:2#0"
+    }
+   ],
+   "row_key": "refunds:2"
+  },
+  {
+   "branch_name": "refunds_b",
+   "key": "refunds:2#3",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "refunds:2#0"
+    }
+   ],
+   "row_key": "refunds:2"
+  }
+ ]
+}

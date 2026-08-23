@@ -24,7 +24,7 @@ is a working document under the normal delivery posture.
   Verify with `git status --porcelain tests/fixtures/dag_scenario_corpus/oracle_freeze/`
   that only brand-new (`??`) files appeared, never an `M` against an existing
   snapshot. Landed with elspeth-7d68dd828e (conditional-routing:route-reopen-
-  resume-second-sink).
+  resume-second-sink, multiple-independent-sources:two-source-parallel-regions).
 - **2026-08-22 — WS1a unified-lineage prep conventions (branch feature/unified-lineage).**
   Four traps until the WS1b flip lands: (1) `TokenInfo.lineage_path` is
   WRITE-ONLY during WS1 prep — reading it from production code before the

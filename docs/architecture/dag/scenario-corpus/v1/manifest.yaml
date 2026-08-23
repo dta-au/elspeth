@@ -300,6 +300,11 @@ evidence:
     locator: multiple-independent-sources:independent-roots-reopen-resume
     claim: A declared production sink-effect BEFORE_EFFECT interruption after both independent sources are exhausted proves six ordered durable rows and exactly two source loads, then closes and reopens fresh database, payload-store, settings, plugins, graph, and config objects for public resume that reuses all six token, scheduler-work, sink-effect, artifact, and member identities, publishes the canonical six-row output once, terminalizes work and outcomes, removes the checkpoint, and preserves durable/export parity; this single-process pre-platform evidence is provisional until the deferred-platform rebase.
     stages: [config, build, runtime, audit, recovery]
+  - id: harness-multiple-independent-sources-two-source-parallel-regions
+    kind: harness
+    locator: multiple-independent-sources:two-source-parallel-regions
+    claim: Two independently named source roots each drive their own flat fork-to-coalesce region and terminate at their own sink in a single run, so independent parallel regions and independent per-sink finalization are witnessed together in one topology, a shape no other corpus scenario carries; recorded row lineage is shared per source root rather than tied to the fork/coalesce shape (documented cost, not a defect); this is a semantic-runtime oracle and cannot claim audit or recovery evidence.
+    stages: [config, build, runtime]
   - id: harness-multi-source-queue-fan-in-queued-fan-in
     kind: harness
     locator: multi-source-queue-fan-in:queued-fan-in
@@ -1398,6 +1403,16 @@ scenarios:
             - sink_effect_member
             - token
             - token_outcome
+      - id: two-source-parallel-regions
+        workflow: run
+        fixture: multiple-independent-sources/two-source-parallel-regions.yaml
+        input_fixtures:
+          orders: multiple-independent-sources/orders.csv
+          refunds: multiple-independent-sources/refunds.csv
+        output_artifacts:
+          orders_output: orders_output.jsonl
+          refunds_output: refunds_output.jsonl
+        expected: {"kind":"semantic_runtime","status":"completed","sink_outputs":[{"sink_name":"orders_output","rows":["{\"orders_a\":{\"id\":1,\"value\":10},\"orders_b\":{\"id\":1,\"value\":10}}","{\"orders_a\":{\"id\":2,\"value\":20},\"orders_b\":{\"id\":2,\"value\":20}}","{\"orders_a\":{\"id\":3,\"value\":30},\"orders_b\":{\"id\":3,\"value\":30}}"]},{"sink_name":"refunds_output","rows":["{\"refunds_a\":{\"id\":101,\"value\":-5},\"refunds_b\":{\"id\":101,\"value\":-5}}","{\"refunds_a\":{\"id\":102,\"value\":-10},\"refunds_b\":{\"id\":102,\"value\":-10}}","{\"refunds_a\":{\"id\":103,\"value\":-15},\"refunds_b\":{\"id\":103,\"value\":-15}}"]}],"rows_processed":6,"rows_succeeded":6,"rows_failed":0,"projection_sha256":"9474d56e576232aafac49b41d0fa3089e841c72c12e67c7b1e2952f5a1810a1a","projection_counts":{"rows":6,"tokens":24,"parent_links":24,"node_states":30,"routes":12,"terminal_dispositions":24,"scheduler_work":24},"audit_record_counts":[{"record_type":"artifact","count":2},{"record_type":"call","count":6},{"record_type":"edge","count":8},{"record_type":"group_record","count":6},{"record_type":"manifest","count":1},{"record_type":"node","count":8},{"record_type":"node_state","count":30},{"record_type":"operation","count":4},{"record_type":"routing_event","count":12},{"record_type":"row","count":6},{"record_type":"run","count":1},{"record_type":"scheduler_event","count":78},{"record_type":"sink_effect","count":2},{"record_type":"sink_effect_attempt","count":6},{"record_type":"sink_effect_member","count":6},{"record_type":"sink_effect_stream","count":2},{"record_type":"token","count":24},{"record_type":"token_outcome","count":24},{"record_type":"token_parent","count":24}],"source_operation_count":2}
     dimensions:
       config:
         status: pass
@@ -1415,10 +1430,13 @@ scenarios:
           - core-builder-schema-plural-sources-08
           - core-builder-schema-plural-sources-11
           - harness-multiple-independent-sources-independent-roots
+          - harness-multiple-independent-sources-two-source-parallel-regions
       contracts: *contracts_pass
       runtime:
         status: pass
-        evidence: [harness-multiple-independent-sources-independent-roots]
+        evidence:
+          - harness-multiple-independent-sources-independent-roots
+          - harness-multiple-independent-sources-two-source-parallel-regions
       audit:
         status: pass
         evidence: [core-builder-schema-plural-sources-07, harness-multiple-independent-sources-independent-roots]
