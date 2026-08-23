@@ -43,7 +43,7 @@ elspeth run --settings examples/row_union_ab_experiment/settings.yaml --execute
 
 ## Variants
 
-Four configurations, each exercising a different part of the barrier's contract.
+Five configurations, each exercising a different part of the barrier's contract.
 
 ### 1. `settings.yaml` — pooled comparison (start here)
 
@@ -65,33 +65,70 @@ the tally. Uses `paired_input.csv`, whose explicit per-ticket `treatment_delta`
 makes the outcome mixed — 6 wins, 2 losses, `win_rate 0.75` — because a uniform
 sweep could not distinguish working pairing from broken pairing.
 
-### 3. `settings_screened.yaml` — success and reject routing
+### 3. `settings_screened.yaml` — screen before the fork
 
-A production-shaped topology where a `quality_screen` gate inside the control
-branch routes tickets below a quality floor to a `screened_out` sink.
+A production-shaped topology where a `quality_screen` gate, wired ahead of
+`variant_fork`, routes tickets below a quality floor straight to a
+`screened_out` sink — before either experiment arm ever exists.
 
 ```bash
 elspeth run --settings examples/row_union_ab_experiment/settings_screened.yaml --execute
 ```
 
-Those tickets' control tokens never reach the barrier, so their groups cannot
-complete. `row_union` is require-all and fails **closed**: the orphaned treatment
-sibling is failed with an audit record naming the loss, rather than being released
-alone to contribute a half-group observation. The run ends `PARTIAL`:
+Screened tickets never fork at all, so `row_union` never has a partial group
+to worry about for them. The run ends **SUCCESS** (exit 0):
 
 ```
-⚠ Run PARTIAL: 8 rows processed | ✓4 succeeded | ✗3 failed | →3 routed (screened_out:3)
+✓ Run COMPLETED: 8 rows processed | ✓4 succeeded | ✗0 failed | ⚠0 quarantined | →3 routed (screened_out:3)
 ```
-
-This designed `PARTIAL` result returns process exit 1; Landscape records the
-run as `completed_with_failures`, retaining the three branch-loss adjudications.
 
 3 of 8 tickets are screened out, so the comparison is computed over the 5
-surviving tickets (`batch_size: 10`) — the correct answer, not a silently biased
-one. The barrier's own adjudication is in the audit trail: 10 completed node
-states and 3 failed, each carrying `failure_reason: row_union_branch_lost`.
+surviving tickets — `baseline_count`/`variant_count` are both 5 and
+`batch_size` is 10 (5 tickets × 2 variants), the correct answer, not a
+silently biased one. Screening ahead of the fork is the only shape a
+screening predicate known before the fork may legally take inside a bound
+group (spec §7 rule 4 rejects a gate that could route to a sink from
+*inside* the region — see `settings_screened_at_settlement.yaml` below for
+the case where the predicate is only knowable after the fork).
 
-### 4. `settings_identity_branches.yaml` — list-form branches
+### 4. `settings_screened_at_settlement.yaml` — screen after the fork, mid-branch
+
+The companion to #3: here the screening predicate is `score`, a field
+`tag_control` computes — it does not exist before the fork, so the screen has
+to live *inside* the control branch, between `tag_control` and the barrier.
+It routes failing tickets to the virtual `discard` sentinel rather than a
+sink (a real in-region sink route is rejected flat by spec §7 rule 4;
+`discard` draws no graph edge at all, so it is invisible to that walk).
+
+```bash
+elspeth run --settings examples/row_union_ab_experiment/settings_screened_at_settlement.yaml --execute
+```
+
+This is the fail-closed cost the pre-ruling-23 shape of this example used to
+demonstrate: a discarded control token orphans its treatment sibling (already
+billed into `variant_union`'s roster), so `row_union` — require-all — fails
+that ticket's group closed rather than releasing half of it. The run ends
+`PARTIAL` (verified):
+
+```
+⚠ Run PARTIAL: 8 rows processed | ✓4 succeeded | ✗3 failed | 0.4s total
+```
+
+This designed `PARTIAL` result returns process exit 1.
+
+3 of 8 tickets fail this way (same three as #3's quality floor: 45, 53, 58);
+the comparison is still computed over the 5 surviving tickets
+(`baseline_count`/`variant_count` both 5, `batch_size` 10). Screened rows are
+never written to a sink here — the control token is discarded before
+producing one — so recover them from the audit trail, not a file:
+
+```bash
+sqlite3 examples/row_union_ab_experiment/runs/settlement.db \
+  "SELECT node_id, status, COUNT(*) FROM node_states
+   WHERE node_id LIKE 'row_union%' GROUP BY 1, 2;"
+```
+
+### 5. `settings_identity_branches.yaml` — list-form branches
 
 The ergonomic list form, `branches: [replica_a, replica_b]`, where each branch
 runs straight from the fork gate to the barrier with no transform chain.

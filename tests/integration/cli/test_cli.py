@@ -973,7 +973,7 @@ class TestJoinCommand:
                 )
             },
         )
-        execution_graph = SimpleNamespace(get_aggregation_id_map=_CallRecorder({}))
+        execution_graph = SimpleNamespace(get_aggregation_id_map=_CallRecorder({}), escalation_fixpoint_bound=1_000)
 
         with (
             patch("elspeth.plugins.infrastructure.runtime_factory.instantiate_plugins_from_config", return_value=plugins),

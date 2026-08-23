@@ -587,7 +587,7 @@ class TestShippedExamples:
         """Designed PARTIAL examples document the CLI's nonzero exit contract."""
         root_readme = (example_pipeline_dir / "README.md").read_text()
         row_union_readme = (example_pipeline_dir / "row_union_ab_experiment" / "README.md").read_text()
-        assert "`row_union_ab_experiment/settings_screened.yaml` | `PARTIAL`, exit 1" in root_readme
+        assert "`row_union_ab_experiment/settings_screened_at_settlement.yaml` | `PARTIAL`, exit 1" in root_readme
         assert "This designed `PARTIAL` result returns process exit 1" in row_union_readme
 
     def test_checkpoint_resume_readme_supplies_settings(self, example_pipeline_dir: Path) -> None:

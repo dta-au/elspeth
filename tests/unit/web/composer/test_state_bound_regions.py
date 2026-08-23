@@ -67,6 +67,25 @@ def _transform(node_id: str, input_name: str, on_success: str) -> NodeSpec:
     )
 
 
+def _routing_gate(node_id: str, input_name: str, routes: dict[str, str]) -> NodeSpec:
+    """A plain (non-forking) routing gate — no ``fork_to``."""
+    return NodeSpec(
+        id=node_id,
+        node_type="gate",
+        plugin=None,
+        input=input_name,
+        on_success=None,
+        on_error=None,
+        options={},
+        condition="True",
+        routes=routes,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
 def _coalesce(node_id: str, *, branches: dict[str, str], on_success: str | None) -> NodeSpec:
     return NodeSpec(
         id=node_id,
@@ -236,3 +255,47 @@ class TestUnboundConsumerFedForkBranchStage1Mirror:
         assert len(offending) == 1, summary.errors
         assert "nowhere" in offending[0].message
         assert "fork_mixed_closure_invalid" not in {e.error_code for e in summary.errors}, summary.errors
+
+
+class TestBoundRegionSinkInsideStage1Mirror:
+    """Spec §7 rule 4, SINK-INSIDE limb only (the backward walk and no-path
+    limb are Stage-1 abstentions — see generation.py's parity note).
+
+    A whole-roster-bound fork (rule 2 passes) whose branch chain contains a
+    plain routing gate with its OWN route straight to a sink is still a leak
+    out of the bound region: rule 2 only checks branch ALIAS membership, not
+    what an inner gate's other routes do.
+    """
+
+    def test_inner_gate_route_to_sink_is_rejected_with_code(self) -> None:
+        state = _empty_state()
+        state = state.with_source(_make_source("g_in"))
+        state = state.with_node(_fork_gate("g", "g_in", ("path_a", "path_b")))
+        state = state.with_node(_routing_gate("screen", "path_a", {"pass": "path_a_out", "fail": "leak"}))
+        state = state.with_node(_transform("t_b", "path_b", "path_b_out"))
+        state = state.with_node(_coalesce("c", branches={"path_a": "path_a_out", "path_b": "path_b_out"}, on_success="out"))
+        state = state.with_output(_make_output("out"))
+        state = state.with_output(_make_output("leak"))
+
+        summary = state.validate()
+
+        codes = {e.error_code for e in summary.errors}
+        assert "bound_region_sink_inside" in codes, summary.errors
+        offending = next(e for e in summary.errors if e.error_code == "bound_region_sink_inside")
+        assert "leak" in offending.message
+
+    def test_fully_in_region_chain_validates_green(self) -> None:
+        # Positive control: same shape, but the inner gate's other route
+        # stays in-region (converges on the same connection) — no leak.
+        state = _empty_state()
+        state = state.with_source(_make_source("g_in"))
+        state = state.with_node(_fork_gate("g", "g_in", ("path_a", "path_b")))
+        state = state.with_node(_routing_gate("screen", "path_a", {"pass": "path_a_out", "fail": "path_a_out"}))
+        state = state.with_node(_transform("t_b", "path_b", "path_b_out"))
+        state = state.with_node(_coalesce("c", branches={"path_a": "path_a_out", "path_b": "path_b_out"}, on_success="out"))
+        state = state.with_output(_make_output("out"))
+
+        summary = state.validate()
+
+        codes = {e.error_code for e in summary.errors}
+        assert "bound_region_sink_inside" not in codes, summary.errors

@@ -1791,6 +1791,65 @@ def _runtime_nodes_downstream_of_connection(
     return tuple(ordered_nodes)
 
 
+def _fork_branch_reaches_sink_before_closer(
+    fork_branches: Sequence[str],
+    closer_id: str,
+    nodes: tuple[NodeSpec, ...],
+    sink_names: set[str],
+) -> str | None:
+    """Stage-1 mirror of the SINK-inside-region forward walk (spec §7 rule 4,
+    sink limb only — the backward walk and no-path limb are `abstains`, see
+    generation.py's catalogue note).
+
+    Walks non-DIVERT edges (``on_error`` excluded — pinned decision 1)
+    forward from a whole-roster-bound fork's own branch connections. Does
+    not expand past ``closer_id``: a bound region's only legal exit is its
+    closer, so anything reached from a branch OTHER than the closer itself
+    is still "inside" the region for this check, mirroring
+    ``_runtime_nodes_downstream_of_connection``'s edge model but stopping at
+    the closer and dropping the ``on_error`` edge it otherwise follows.
+
+    Requires the closer to ALSO be reached by the same walk, or returns
+    None even when a sink was hit: a branch that never reaches the closer
+    at all is the "no path to closer" limb (Stage-1 abstains — the roster's
+    declared VALUES having no producer at all is
+    ``coalesce_branch_unreachable``/``row_union_branch_unreachable``'s job,
+    already a more specific, planner-actionable diagnostic — see
+    guided-incident regression `test_orphaned_coalesce_rejects_with_the_
+    single_observed_code`). Firing here too would silently duplicate that
+    single-code guarantee with a less specific message.
+    """
+    reachable_connections = set(fork_branches)
+    visited_node_ids: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in nodes:
+            if node.id in visited_node_ids or node.node_type == "queue":
+                continue
+            inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
+            if reachable_connections.isdisjoint(inputs):
+                continue
+            visited_node_ids.add(node.id)
+            changed = True
+            if node.id == closer_id:
+                continue
+            if node.node_type == "coalesce" and node.on_success is None:
+                reachable_connections.add(node.id)
+            elif node.on_success is not None:
+                reachable_connections.add(node.on_success)
+            if node.routes is not None:
+                reachable_connections.update(
+                    target for target in node.routes.values() if target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET)
+                )
+            if node.fork_to is not None:
+                reachable_connections.update(node.fork_to)
+    if closer_id not in visited_node_ids:
+        return None
+    sink_hits = sorted(reachable_connections & sink_names)
+    return sink_hits[0] if sink_hits else None
+
+
 def _node_published_connections(node: NodeSpec) -> frozenset[str]:
     """Connections a node publishes rows to — the forward edges of the runtime graph walk.
 
@@ -6685,6 +6744,27 @@ class CompositionState:
                 produced.update(roster)
             orphaned = sorted(declared - produced)
             if len(gate_rosters) == 1 and not orphaned:
+                # Whole-roster fork closure holds — this pair is a candidate
+                # bound region. Stage-1 mirror of spec §7 rule 4's sink-inside
+                # limb only (backward walk + no-path limb `abstains`; see
+                # generation.py's parity note): a plain in-region routing
+                # gate can still leak straight to a sink without ever
+                # forking, exactly the shape rule 2 above cannot see.
+                if closer_node is not None:
+                    _gate_id, roster = next(iter(gate_rosters.items()))
+                    sink_hit = _fork_branch_reaches_sink_before_closer(roster, closer_id, self.nodes, fork_closure_sink_names)
+                    if sink_hit is not None:
+                        errors.append(
+                            _err(
+                                f"node:{closer_id}",
+                                f"A path inside bound group '{closer_id}' (fork branches {roster}) reaches sink "
+                                f"'{sink_hit}' before the group's closer. No token may leave a bound region except "
+                                f"through its closer — sinks inside a bound region are rejected flat (spec §7 rule 4). "
+                                f"Route the in-region chain to '{closer_id}' and move the sink after it.",
+                                "high",
+                                "bound_region_sink_inside",
+                            )
+                        )
                 continue
             closer_word = "Coalesce" if closer_kind == "coalesce" else "row_union"
             gate_summary = "; ".join(f"'{name}' declares {roster}" for name, roster in sorted(gate_rosters.items()))

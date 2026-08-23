@@ -48,13 +48,19 @@ gates:
       'true': fork
       'false': output
     fork_to: [control_branch, treatment_branch]
-  # Row 1's control token is routed away mid-branch, so its group can never
-  # complete; row 2's control token continues to the barrier.
+  # Row 1's control token is discarded mid-branch, so its group can never
+  # complete; row 2's control token continues to the barrier. A gate ROUTE
+  # to a real sink here was spec §7 rule 4's original vehicle (ruling 22
+  # casualty, WS2 Task 7) — a plain conditional MOVE-mode route to a sink
+  # from inside a bound region is now rejected flat at build time. `discard`
+  # is a virtual sentinel (no graph edge at all), so this stays buildable
+  # and still exercises the SAME gate-triggered branch-loss notification
+  # path, just via reason "gate_discarded" instead of "gate_routed_to_sink".
   - name: control_filter
     input: control_staged
     condition: "row['id'] == 1"
     routes:
-      'true': dropped
+      'true': discard
       'false': control_scored
 transforms:
   - name: stage_control
@@ -96,14 +102,6 @@ sinks:
       format: jsonl
       schema:
         mode: observed
-  dropped:
-    plugin: json
-    on_write_failure: discard
-    options:
-      path: {tmp_path / "dropped.jsonl"}
-      format: jsonl
-      schema:
-        mode: observed
 """
     )
     bundle = instantiate_plugins_from_config(settings)
@@ -134,8 +132,18 @@ sinks:
     )
 
 
-def test_gate_routed_branch_loss_fails_its_group_closed(tmp_path: Path) -> None:
-    """The run completes, and the orphaned sibling is failed AS a branch loss."""
+def test_gate_discarded_branch_loss_fails_its_group_closed(tmp_path: Path) -> None:
+    """The run completes, and the orphaned sibling is failed AS a branch loss.
+
+    Re-pointed from a gate ROUTE to a real sink (spec §7 rule 4 casualty,
+    ruling 22, WS2 Task 7 — a plain conditional MOVE-mode route to a sink
+    from inside a bound region is now rejected flat at build time) to a
+    gate `discard` route instead. `discard` draws no graph edge, so the
+    topology stays buildable while still exercising the same gate-triggered
+    pre-barrier branch-loss notification this test exists to pin — only the
+    branch-loss reason string changes, from "gate_routed_to_sink" to
+    "gate_discarded".
+    """
     result = _run(tmp_path)
 
     # The run must reach a terminal state at all: an unreleased durable
@@ -163,6 +171,10 @@ def test_gate_routed_branch_loss_fails_its_group_closed(tmp_path: Path) -> None:
     # The genuine pre-barrier loss persists a durable loss-ledger record.
     losses = conn.execute("SELECT coalesce_name, branch_name FROM coalesce_branch_losses").fetchall()
     assert ("variant_union", "control_branch") in losses, losses
+
+    # The reason string this test now observes, post re-point.
+    reason = conn.execute("SELECT reason FROM coalesce_branch_losses WHERE branch_name = 'control_branch'").fetchone()
+    assert reason == ("gate_discarded",), reason
 
 
 def test_post_release_divert_records_no_branch_loss(tmp_path: Path) -> None:

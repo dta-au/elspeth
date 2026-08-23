@@ -1,32 +1,38 @@
-# Row Union Variant — Screening Gate With Success And Reject Routing
+# Row Union Variant — Screening Gate Before The Fork
 #
-# A production-shaped topology: tickets below a quality floor are screened out
-# of the experiment rather than scored, so the run exercises BOTH the success
-# path and a reject path.
+# A production-shaped topology: tickets below a quality floor are screened
+# out of the experiment before it ever forks, so the run exercises both the
+# success path (screened rows to a sink) and the row_union's own release path
+# with a clean, unconditional roster.
 #
-#   source ─> [variant_fork] ─┬─ control_branch ──> tag_control ─> [quality_screen] ─┬─(pass)─┐
-#                              │                                                      └─(fail)─> screened_out
-#                              └─ treatment_branch ─> tag_treatment ──────────────────────────┐
-#                                                                                    ├─ [variant_union]
-#                                          ─(experiment_in)─> [prompt_experiment] ─> output
+#   source ─(routed)─> [quality_screen] ─(pass)─> [variant_fork] ─┬─ control_branch ──> tag_control ───────┐
+#                                        └─(fail)─> screened_out   └─ treatment_branch ─> tag_treatment ────┤
+#                                                                                                ├─ [variant_union]
+#                                                        ─(experiment_in)─> [prompt_experiment] ─> output
 #
-# WHAT THIS DEMONSTRATES: what a row_union does when one arm of a correlated
-# group legitimately leaves the pipeline.
+# WHAT THIS DEMONSTRATES: a screening gate ahead of a fork-based row_union
+# group, so tickets that fail the screen never mint a fork branch and never
+# create a partial-group obligation at the barrier at all.
 #
-# `quality_screen` routes tickets whose baseline_quality is below 60 to the
-# `screened_out` sink. Those tickets' control tokens never reach the barrier,
-# so their groups can never be completed. row_union is require_all and fails
-# CLOSED: the orphaned treatment sibling is failed with an audit record naming
-# the branch loss, rather than being released alone and silently contributing a
-# half-group observation to the statistics.
+# `quality_screen` routes tickets whose baseline_quality is below 60 straight
+# to the `screened_out` sink — this now happens BEFORE `variant_fork`, so a
+# screened ticket's row never enters the fork/row_union bound region (spec §7
+# rule 4: no path may leave a bound region except through its closer, and a
+# gate that could route straight to a sink from INSIDE the region is rejected
+# flat at build time — screening ahead of the fork is the correct shape for
+# this decision, and the settled-mid-branch variant that pairs with this one,
+# `settings_screened_at_settlement.yaml`, demonstrates the alternative when
+# the screening predicate is only knowable AFTER the fork).
 #
 # With this input, 3 of 8 tickets are screened out (quality 45, 53, 58), so:
-#   - 5 tickets release as complete pairs  -> 10 rows into batch_experiment_compare
-#   - 3 control tokens land in screened_out
-#   - 3 treatment tokens fail closed at the barrier (visible in the audit trail)
+#   - 5 tickets fork, complete both arms, and release as complete pairs
+#     -> 10 rows into batch_experiment_compare
+#   - 3 tickets never fork at all; their rows land in screened_out
 #
 # The comparison is therefore computed over the 5 surviving tickets only —
-# which is the correct answer, not a silently biased one.
+# which is the correct answer, not a silently biased one. Unlike the
+# pre-ruling-23 in-branch screen, no group is ever partially formed and lost,
+# so the run completes SUCCESS (exit 0) with no failure-adjudication records.
 
 sources:
   primary:
@@ -43,8 +49,15 @@ sources:
       on_validation_failure: discard
 
 gates:
-- name: variant_fork
+- name: quality_screen
   input: routed
+  condition: "row['baseline_quality'] >= 60"
+  routes:
+    'true': to_fork
+    'false': screened_out
+
+- name: variant_fork
+  input: to_fork
   condition: "True"
   routes:
     'true': fork
@@ -53,20 +66,11 @@ gates:
     - control_branch
     - treatment_branch
 
-# Screening lives INSIDE the control branch, between its transform and the
-# barrier — the branch chain may contain gates, not just transforms.
-- name: quality_screen
-  input: control_tagged
-  condition: "row['baseline_quality'] >= 60"
-  routes:
-    'true': control_scored
-    'false': screened_out
-
 transforms:
 - name: tag_control
   plugin: value_transform
   input: control_branch
-  on_success: control_tagged
+  on_success: control_scored
   on_error: discard
   options:
     schema:

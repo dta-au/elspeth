@@ -2048,6 +2048,44 @@ sites:
   disposition: abstains
   note: Stage 1 does not compute bound regions and cannot know the observed nesting depth; the cap is
     a built-graph property — deliberate abstention.
+- key: 6e0c349d397920ed
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: validate_sese_regions
+  exception: GraphValidationError
+  message: Bound region '{}' (opener '{}') reaches sink '{}' before the region's closer. No token may
+    leave a bound region except through its closer — sinks inside a bound
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - bound_region_sink_inside
+  note: Spec §7 rule 4 forward walk, sink limb. Stage-1 mirror (web/composer/state.py::_fork_branch_reaches_sink_before_closer,
+    wired into the WHOLE-ROSTER FORK CLOSURE roster-equality pass) checks the same predicate for fork/coalesce
+    and fork/row_union bound regions; scope/collector regions (ruling 28, Task 8) are not yet covered
+    by either the runtime rule or this mirror.
+- key: 072048ad48f5a8fa
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: validate_sese_regions
+  exception: GraphValidationError
+  message: Edge into '{}' (bound region '{}') originates outside the bound region at '{}'. Every path
+    into an in-region node must originate at the opener '{}' (spec §7 rul
+  ordinal: 0
+  disposition: abstains
+  note: Spec §7 rule 4 backward walk (external entry into a bound region) — the coalesce-side counterpart
+    of the row_union chain-descent guard (_trace_branch_endpoints, builder.py, row_union only). Stage-1
+    has no equivalent walk over NodeSpecs for coalesce; row_union's narrower existing code row_union_branch_not_downstream
+    covers part of the row_union subset of this shape, not the coalesce side and not every backward-walk
+    violation. Deliberate Stage-1 abstention (Task 7); full mirror is future work.
+- key: 6bbf64577ab07fbe
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: validate_sese_regions
+  exception: GraphValidationError
+  message: Node '{}' inside bound region '{}' has no success path to the region's closer. Every path from
+    the opener must reach the closer (spec §7 rule 4).
+  ordinal: 0
+  disposition: abstains
+  note: Spec §7 rule 4 forward walk, no-path-to-closer limb. Task 7's Stage-1 mirror covers the sink-inside
+    limb only (see bound_region_sink_inside); a branch that dead-ends without ever reaching the sink OR
+    the closer needs its own NodeSpec walk Stage-1 does not build. Deliberate abstention.
 - key: 6557fc89e6b5c8de
   path: src/elspeth/core/dag/builder.py
   qualname: _parse_contract_schema_config

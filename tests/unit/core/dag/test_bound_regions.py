@@ -11,7 +11,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import CoalesceSettings, GateSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
-from elspeth.core.dag.bound_regions import compute_bound_regions, derive_escalation_fixpoint_bound
+from elspeth.core.dag.bound_regions import compute_bound_regions, derive_escalation_fixpoint_bound, validate_sese_regions
 from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.dag.wiring import WiredTransform
@@ -305,6 +305,267 @@ def _build_partially_overlapping_regions() -> None:
     )
     registry = GroupBindingRegistry(bindings=(binding1, binding2))
     compute_bound_regions(graph, registry, max_depth=5)
+
+
+def _build_fork_coalesce_with_in_region_sink() -> ExecutionGraph:
+    """Fully-bound, roster-equal fork (rule 2 is satisfied) whose 'path_a'
+    branch carries an INNER conditional gate that can route straight to a
+    sink instead of continuing to the coalesce. Rule 2 never sees this: it
+    only checks that branch ALIASES resolve to one closer, not what an
+    inner gate inside that branch's own chain does. Rule 4's forward walk
+    is the only thing that catches it.
+    """
+    source = _BoundRegionMockSource()
+    branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=branch_b,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_b_transform",
+                    plugin=branch_b.name,
+                    input="path_b",
+                    on_success="path_b_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out"), "leak": _BoundRegionMockSink("leak")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="fork_gate",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["path_a", "path_b"],
+            ),
+            GateSettings(
+                name="screen",
+                input="path_a",
+                condition="True",
+                routes={"true": "path_a_out", "false": "leak"},
+            ),
+        ],
+        coalesce_settings=[
+            CoalesceSettings(
+                name="coalesce",
+                branches={"path_a": "path_a_out", "path_b": "path_b_out"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+    )
+
+
+def _build_fork_coalesce_with_branch_on_error_sink() -> ExecutionGraph:
+    """PINNED DECISION 1 control: a branch transform's on_error routes to an
+    OUTSIDE sink (DIVERT mode). Rule 4's walks are success-path-only, so this
+    must build — the loss fixtures' shape and the settlement system's input.
+    """
+    source = _BoundRegionMockSource()
+    branch_a = _BoundRegionTransform(name="branch_a_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=branch_a,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_a_transform",
+                    plugin=branch_a.name,
+                    input="path_a",
+                    on_success="path_a_out",
+                    on_error="errors",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=branch_b,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_b_transform",
+                    plugin=branch_b.name,
+                    input="path_b",
+                    on_success="path_b_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out"), "errors": _BoundRegionMockSink("errors")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="fork_gate",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["path_a", "path_b"],
+            )
+        ],
+        coalesce_settings=[
+            CoalesceSettings(
+                name="coalesce",
+                branches={"path_a": "path_a_out", "path_b": "path_b_out"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+    )
+
+
+def _build_coalesce_with_external_branch_feed() -> None:
+    """Direct predicate pin over the raw add_edge/GroupBinding surface (same
+    escape hatch Task 5 used for the hardest well-nestedness case — see
+    `_build_partially_overlapping_regions`).
+
+    A settings-driven version cannot isolate this violation: any real branch
+    the builder accepts must itself terminate at a sink or a real consumer
+    (the namespace check rejects a truly dangling connection), and either
+    choice trips rule 4's FORWARD checks first, never leaving room to reach
+    the backward walk in isolation. The raw surface bypasses the builder's
+    connection-namespace bookkeeping entirely, which is exactly what isolates
+    the backward-walk predicate: a fork whose 'path_a' branch is declared in
+    the roster but has NO outgoing edge at all, and whose closer's OTHER
+    inbound edge comes from a wholly unrelated chain that never traverses
+    the fork gate — the coalesce-side counterpart of the row_union
+    chain-descent guard (`_trace_branch_endpoints`, builder.py, row_union
+    only). Rule 2 (roster-alias equality) cannot see this: it never asks
+    where a branch's data actually flows from.
+    """
+    graph = ExecutionGraph()
+    for node_id, node_type, plugin_name in [
+        ("opener", NodeType.GATE, "fork_gate"),
+        ("branch_b_transform", NodeType.TRANSFORM, "branch_b_transform"),
+        ("external_source", NodeType.SOURCE, "external_source"),
+        ("external_transform", NodeType.TRANSFORM, "external_transform"),
+        ("closer", NodeType.COALESCE, "coalesce"),
+        ("out", NodeType.SINK, "json"),
+    ]:
+        graph.add_node(node_id, node_type=node_type, plugin_name=plugin_name)
+    graph.add_edge("opener", "branch_b_transform", label="path_b", mode=RoutingMode.MOVE)
+    graph.add_edge("branch_b_transform", "closer", label="continue", mode=RoutingMode.MOVE)
+    graph.add_edge("external_source", "external_transform", label="continue", mode=RoutingMode.MOVE)
+    graph.add_edge("external_transform", "closer", label="continue", mode=RoutingMode.MOVE)
+    graph.add_edge("closer", "out", label="continue", mode=RoutingMode.MOVE)
+
+    binding = GroupBinding(
+        kind=FrameKind.FORK,
+        opener_node_id=NodeID("opener"),
+        opener_name="fork_gate",
+        closer_node_id=NodeID("closer"),
+        closer_name="coalesce",
+        closer_kind=CloserKind.COALESCE,
+        policy="require_all",
+        on_group_failure=None,
+        member_roster=("path_a", "path_b"),
+    )
+    registry = GroupBindingRegistry(bindings=(binding,))
+    regions = compute_bound_regions(graph, registry, max_depth=5)
+    validate_sese_regions(graph, regions)
+
+
+def _build_mixed_closure_sink_plus_bound_sibling() -> ExecutionGraph:
+    """Rule-2-before-rule-4 ordering regression: one branch goes direct to a
+    sink (unbound), its sibling closes at a coalesce (bound) — MIXED closure.
+    Rule 2 (Task 6, builder.py, runs before bound-region computation even
+    starts) must reject this with its own message; rule 4 must never get a
+    chance to run at all for this gate.
+    """
+    source = _BoundRegionMockSource()
+    branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    branch_c = _BoundRegionTransform(name="branch_c_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=branch_b,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_b_transform",
+                    plugin=branch_b.name,
+                    input="path_b",
+                    on_success="path_b_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=branch_c,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_c_transform",
+                    plugin=branch_c.name,
+                    input="path_c",
+                    on_success="path_c_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"leak": _BoundRegionMockSink("leak"), "out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="fork_gate",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["leak", "path_b", "path_c"],
+            )
+        ],
+        coalesce_settings=[
+            CoalesceSettings(
+                name="coalesce",
+                branches={"path_b": "path_b_out", "path_c": "path_c_out"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+    )
+
+
+class TestSESEWalk:
+    """Spec §7 rule 4 (bidirectional SESE, success-path edges only).
+
+    Forward: every non-DIVERT path from a FORK binding's own branch entries
+    reaches the closer before any sink. Backward: every non-DIVERT edge into
+    a region member or the closer originates inside the region. DIVERT
+    edges (on_error, __quarantine__, __failsink__) are excluded from both
+    walks (pinned decision 1, RC-7): every fork-coalesce loss fixture
+    terminates a branch in-region via on_error/discard, and that is the
+    settlement system's input, not a leak this rule may reject.
+    """
+
+    def test_sink_inside_bound_region_rejected(self) -> None:
+        with pytest.raises(GraphValidationError, match=r"reaches sink .* before the region's closer"):
+            _build_fork_coalesce_with_in_region_sink()
+
+    def test_on_error_divert_inside_region_stays_legal(self) -> None:
+        graph = _build_fork_coalesce_with_branch_on_error_sink()
+        assert graph is not None
+
+    def test_external_entry_into_region_rejected(self) -> None:
+        with pytest.raises(GraphValidationError, match="originates outside the bound region"):
+            _build_coalesce_with_external_branch_feed()
+
+    def test_mixed_closure_fires_before_sese_walk(self) -> None:
+        # Rule 2 (mixed closure) must pre-empt rule 4 for this shape: the
+        # gate is rejected before compute_bound_regions/validate_sese_regions
+        # ever runs, so the error is rule 2's, never rule 4's sink-inside
+        # message.
+        with pytest.raises(GraphValidationError, match="mixed closure") as exc_info:
+            _build_mixed_closure_sink_plus_bound_sibling()
+        assert "reaches sink" not in str(exc_info.value)
 
 
 class TestFixpointBound:

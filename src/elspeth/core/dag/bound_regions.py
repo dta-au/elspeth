@@ -1,4 +1,4 @@
-"""Bound-region (SESE) computation and structural validation (spec §7 rules 3, depth cap §6.3).
+"""Bound-region (SESE) computation and structural validation (spec §7 rules 3/4, depth cap §6.3).
 
 A bound region is the SESE span of one bound group: the nodes strictly
 between its opener and its closer. Membership walks SUCCESS-PATH edges
@@ -7,12 +7,11 @@ are failure semantics, not region topology (pinned decision 1 in the WS2
 plan; §7 rule 9 treats in-region on_error as legal).
 
 `BoundRegion.member_node_ids` is a "between" set (forward reach ∩ backward
-reach, minus the opener/closer themselves) — it is NOT yet a verified SESE
-interior. A member may still have an inbound non-DIVERT edge originating
-outside the region, or an outbound edge that bypasses the closer; ruling
-those out is spec §7 rule 4, scoped to Task 7. Consumers reading
-`member_node_ids` before that lands must not assume single-entry/single-exit
-has been proven.
+reach, minus the opener/closer themselves) — it is a verified SESE interior
+ONLY once `validate_sese_regions` (spec §7 rule 4) has run: it rejects a
+member with an outbound edge that reaches a sink before the closer, a member
+with no success path back to the closer, and an inbound edge into any
+in-region node that originates outside the region.
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from elspeth.contracts.enums import RoutingMode
+from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
 from elspeth.contracts.types import NodeID
 from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
 from elspeth.core.dag.models import GraphValidationError
@@ -97,6 +96,58 @@ def _backward_reach(graph: ExecutionGraph, start: NodeID, stop: NodeID) -> set[N
     return seen
 
 
+def _forward_reach_from(graph: ExecutionGraph, starts: set[NodeID], stop: NodeID) -> set[NodeID]:
+    """Nodes reachable from any of ``starts`` via non-DIVERT edges, not expanding through stop.
+
+    Generalizes :func:`_forward_reach` to multiple start nodes. Rule 4's
+    forward walk (:func:`validate_sese_regions`) must NOT anchor at a FORK
+    binding's opener node itself: the opener is an ordinary gate, and its
+    OTHER routing labels (e.g. a plain `'false': <sink>` route sitting beside
+    `'true': fork`) can lead straight to a sink with no fork branch ever
+    taken — that is not a leak out of the region, because no lineage frame
+    for this group was ever minted on that path. The true forward-walk
+    anchor is the set of nodes the opener's *fork branch* edges lead to
+    (``edge.label in binding.member_roster``), never the opener's full
+    outgoing-edge set. Verified against every fork_coalesce/row_union_ab
+    example: each carries exactly this "route to fork" + "route to sink"
+    pair on its opener gate.
+    """
+    seen: set[NodeID] = set()
+    frontier: list[NodeID] = []
+    for start in starts:
+        seen.add(start)
+        if start != stop:
+            frontier.append(start)
+    while frontier:
+        current = frontier.pop()
+        for edge in graph.get_outgoing_edges(current):
+            if edge.mode is RoutingMode.DIVERT:
+                continue
+            nxt = NodeID(edge.to_node)
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            if nxt != stop:
+                frontier.append(nxt)
+    return seen
+
+
+def _fork_branch_starts(graph: ExecutionGraph, binding: GroupBinding) -> set[NodeID]:
+    """The forward-walk anchor for one bound group: a FORK's own branch entries.
+
+    For an EXPAND/scope binding (``member_roster`` empty — ruling 28, Task 8's
+    concern), the opener is a plain multi-row transform with no sibling routing
+    labels to filter out, so the opener node itself is the correct anchor.
+    """
+    if binding.kind is not FrameKind.FORK:
+        return {binding.opener_node_id}
+    return {
+        NodeID(edge.to_node)
+        for edge in graph.get_outgoing_edges(binding.opener_node_id)
+        if edge.mode is not RoutingMode.DIVERT and edge.label in binding.member_roster
+    }
+
+
 def compute_bound_regions(
     graph: ExecutionGraph,
     registry: GroupBindingRegistry,
@@ -154,3 +205,70 @@ def compute_bound_regions(
             component_type=worst.binding.closer_kind,
         )
     return tuple(regions)
+
+
+def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...]) -> None:
+    """§7 rule 4 — bidirectional SESE, success-path edges only (pinned decision 1).
+
+    Forward: every non-DIVERT path from a FORK binding's own branch entries
+    (or an EXPAND binding's opener) reaches the closer before any sink.
+    Backward: every non-DIVERT edge into a region member or the closer
+    originates at the opener or another member.
+
+    Raises:
+        GraphValidationError: a bound region's interior reaches a sink before
+            its closer, a member has no success path back to the closer, or
+            an in-region node's inbound edge originates outside the region.
+    """
+    for region in regions:
+        binding = region.binding
+        in_region = region.member_node_ids | {binding.opener_node_id, binding.closer_node_id}
+
+        # Forward walk, anchored at the branch entries (see
+        # _forward_reach_from's docstring for why the opener node itself is
+        # the wrong anchor). member_node_ids is forward ∩ backward and
+        # therefore already excludes anything with no path back to the
+        # closer, so the sink/no-path checks run over the WIDER forward-only
+        # set, not member_node_ids (a member reached but never returning to
+        # the closer is exactly what "no path to closer" must catch).
+        branch_starts = _fork_branch_starts(graph, binding)
+        forward_only = _forward_reach_from(graph, branch_starts, binding.closer_node_id) - {binding.closer_node_id}
+        closer_reachable = _backward_reach(graph, binding.closer_node_id, binding.opener_node_id)
+        for member in forward_only:
+            info = graph.get_node_info(member)
+            if info.node_type is NodeType.SINK:
+                raise GraphValidationError(
+                    f"Bound region '{binding.closer_name}' (opener '{binding.opener_name}') reaches sink "
+                    f"'{member}' before the region's closer. No token may leave a bound region except "
+                    f"through its closer — sinks inside a bound region are rejected flat (spec §7 rule 4). "
+                    f"Move the sink after the closer, or unbind the group.",
+                    component_id=binding.closer_name,
+                    component_type=binding.closer_kind,
+                )
+            if member not in closer_reachable:
+                raise GraphValidationError(
+                    f"Node '{member}' inside bound region '{binding.closer_name}' has no success path to "
+                    f"the region's closer. Every path from the opener must reach the closer "
+                    f"(spec §7 rule 4).",
+                    component_id=binding.closer_name,
+                    component_type=binding.closer_kind,
+                )
+
+        # Backward walk: every non-DIVERT edge into an in-region node (or the
+        # closer itself) must originate at the opener or another member.
+        entry_targets = region.member_node_ids | {binding.closer_node_id}
+        for member in entry_targets:
+            for edge in graph.get_incoming_edges(member):
+                if edge.mode is RoutingMode.DIVERT:
+                    continue
+                origin = NodeID(edge.from_node)
+                if origin not in in_region:
+                    raise GraphValidationError(
+                        f"Edge into '{member}' (bound region '{binding.closer_name}') originates outside "
+                        f"the bound region at '{origin}'. Every path into an in-region node must "
+                        f"originate at the opener '{binding.opener_name}' (spec §7 rule 4, backward walk; "
+                        f"row_union precedent). Feed that input from inside the region, or move the "
+                        f"consumer outside it.",
+                        component_id=binding.closer_name,
+                        component_type=binding.closer_kind,
+                    )

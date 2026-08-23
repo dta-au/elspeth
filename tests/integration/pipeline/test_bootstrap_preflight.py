@@ -37,6 +37,8 @@ def _raw_sink_effect_preflight_boundary() -> Iterator[None]:
 class _GraphStub:
     """Minimal validated graph surface consumed by bootstrap/context wiring tests."""
 
+    escalation_fixpoint_bound = 1_000
+
     def validate(self) -> None:
         return None
 

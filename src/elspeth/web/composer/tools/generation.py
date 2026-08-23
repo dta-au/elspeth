@@ -522,6 +522,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Make the coalesce/row_union branches keys exactly the gate's fork_to list — same names, none added, none missing.",
     ),
     (
+        r"bound_region_sink_inside",
+        "A path inside a bound group (fork→coalesce/row_union, or scope opener→collector) reaches a sink "
+        "before the group's closer, so a member could leave the group without settling.",
+        "Route the in-region chain to the group's closer and move the sink after it; only the closer "
+        "releases tokens out of a bound region.",
+    ),
+    (
         r"gate_duplicate_fork_branch",
         "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
         "Remove duplicate entries from the gate's fork_to list while preserving the intended unique branch order.",
@@ -1120,6 +1127,9 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "fork_mixed_closure_invalid",
     "fork_multiple_closers_invalid",
     "fork_roster_mismatch",
+    # Bound-region SESE walk (spec §7 rule 4): the sink-inside-region limb
+    # only — the backward walk and no-path limb are Stage-1 abstentions.
+    "bound_region_sink_inside",
     "gate_duplicate_fork_branch",
     "transform_missing_on_success",
     "transform_missing_on_error",

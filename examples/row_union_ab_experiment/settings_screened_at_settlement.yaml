@@ -1,0 +1,142 @@
+# Row Union Variant — Screening Gate INSIDE The Branch, After Settlement Data Exists
+#
+# The companion to `settings_screened.yaml`: that variant screens on a field
+# the SOURCE already carries (`baseline_quality`), so the screen can move
+# ahead of the fork with zero semantic change. Here the screening predicate
+# is the computed `score` field — a value that exists only AFTER the control
+# branch's own transform runs, so it is genuinely unknowable before the fork.
+# The screen therefore has to live INSIDE the bound region, downstream of
+# `tag_control`.
+#
+#   source ─(routed)─> [variant_fork] ─┬─ control_branch ─> tag_control ─> [quality_settle_screen] ─(pass)─┐
+#                                       │                                              └─(fail)─> discard   │
+#                                       └─ treatment_branch ─> tag_treatment ─────────────────────────────┤
+#                                                                                                ├─ [variant_union]
+#                                                        ─(experiment_in)─> [prompt_experiment] ─> output
+#
+# `quality_settle_screen`'s 'false' route targets the virtual `discard`
+# sentinel, not a sink — spec §7 rule 4 rejects flat any in-region route to a
+# REAL sink (that is exactly what forced `settings_screened.yaml`'s
+# screen-before-fork rewrite), but a `discard` route draws no graph edge at
+# all, so it is invisible to the SESE walk and the topology still builds.
+#
+# THE COST OF THIS SHAPE: `variant_union` is `require_all`. When
+# `quality_settle_screen` discards a control token, its treatment sibling has
+# already been (or will be) billed into the union's roster, but the ticket's
+# control arm never arrives. The union cannot complete that ticket's group:
+# the treatment token is failed closed as an orphaned sibling
+# (`scope_group_failed` / `row_union_branch_lost`), and the run ends
+# **PARTIAL** (process exit 1) by design — the same fail-closed contract
+# `settings_screened.yaml` used to exercise before its screen moved ahead of
+# the fork. Screened rows are NOT written to a sink here (there is no sink to
+# write them to — the token is discarded before ever producing a row); they
+# are recovered from the branch-loss ledger (`group_losses`) and the
+# Landscape audit trail, not from a file.
+#
+# STATUS: this settings file BUILDS today (that is what the canonical hash
+# corpus records for it) — the SESE walk explicitly permits a discard
+# in-region. Its documented run behavior above (a clean single-ticket
+# settle-and-fail sequence, rather than a hard crash) depends on WS3's
+# settle-member seam, which has not landed yet in this campaign slice. Do not
+# treat a successful `elspeth run --execute` of this file, or its exact
+# failure shape, as validated until WS3 lands; this file's job for now is
+# only to prove the topology is buildable.
+
+sources:
+  primary:
+    plugin: csv
+    on_success: routed
+    options:
+      path: examples/row_union_ab_experiment/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'ticket: str'
+        - 'baseline_quality: int'
+      on_validation_failure: discard
+
+gates:
+- name: variant_fork
+  input: routed
+  condition: "True"
+  routes:
+    'true': fork
+    'false': output
+  fork_to:
+    - control_branch
+    - treatment_branch
+
+# Screening lives INSIDE the control branch, between its transform and the
+# barrier — `score` is computed by `tag_control` and does not exist before
+# the fork.
+- name: quality_settle_screen
+  input: control_scored
+  condition: "row['score'] >= 60"
+  routes:
+    'true': control_gated
+    'false': discard
+
+transforms:
+- name: tag_control
+  plugin: value_transform
+  input: control_branch
+  on_success: control_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'control'"
+    - target: score
+      expression: "row['baseline_quality'] * 1.0"
+
+- name: tag_treatment
+  plugin: value_transform
+  input: treatment_branch
+  on_success: treatment_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'treatment'"
+    - target: score
+      expression: "row['baseline_quality'] * 1.25"
+
+row_unions:
+- name: variant_union
+  branches:
+    control_branch: control_gated
+    treatment_branch: treatment_scored
+  on_success: experiment_in
+
+aggregations:
+- name: prompt_experiment
+  plugin: batch_experiment_compare
+  input: experiment_in
+  on_success: output
+  on_error: discard
+  trigger: {}
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    variant_field: prompt_variant
+    score_field: score
+    baseline_variant: control
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/row_union_ab_experiment/output/settlement_comparison.json
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/row_union_ab_experiment/runs/settlement.db

@@ -4930,9 +4930,35 @@ class TestComposerRuntimeQueueAgreement:
         with pytest.raises(GraphValidationError, match="Duplicate producer for connection 'inbound'"):
             self._build_runtime_graph_for_settings(settings)
 
-    def test_mapped_coalesce_branch_is_the_queues_single_consumer_in_both_layers(self) -> None:
-        """A mapped branch consumes its connection in Composer exactly as runtime does."""
+    def test_mapped_coalesce_branch_into_a_multi_producer_queue_is_rejected_by_the_runtime(self) -> None:
+        """Runtime-rejects, Composer-abstains: a KNOWN, adjudicated parity gap, not agreement.
+
+        This fixture's queue 'inbound' has THREE producers: two ordinary,
+        unrelated sources (orders/refunds) plus the fork's own 'queued_path'
+        branch, whose output the 'merged' coalesce then reads as one of its
+        two required branches. Spec §7 rule 4's backward walk (WS2 Task 7)
+        now rejects this at build time: the two source->queue edges
+        originate outside the bound region the fork/coalesce pair opens, and
+        rule 4 has no queue exemption (maintainer ruling 2026-08-23,
+        deliberate — see below). Composer Stage 1 mirrors rule 4's
+        sink-inside limb only and deliberately ABSTAINS on the backward walk
+        (`config/cicd/runtime_rejection_parity.yaml` key `072048ad48f5a8fa`),
+        so it still reports this exact same YAML `is_valid: true` — this
+        test used to assert composer/runtime AGREEMENT on this shape; it no
+        longer holds, and the class name is otherwise still accurate for its
+        siblings. Pinning the runtime rejection (the load-bearing half) and
+        naming the composer-side gap explicitly is more honest than forcing
+        a false agreement claim.
+
+        Why the runtime rejection is correct to keep, not an over-strict
+        queue-exemption gap to add: the E1 review's residual-risk note
+        (WS2 controller ledger, 2026-08-23) flagged that a queue node
+        admitted inside a bound region could adopt a barrier prematurely and
+        settle SILENTLY rather than crash — precisely the failure class this
+        rejection forecloses by refusing to build the topology at all.
+        """
         from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.core.dag import GraphValidationError
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         state = composition_state_from_runtime_yaml(self._queue_to_coalesce_yaml(branch_form="mapping"))
@@ -4941,8 +4967,8 @@ class TestComposerRuntimeQueueAgreement:
 
         generated_yaml = composer_yaml_generator.generate_yaml(state)
         settings = load_settings_from_yaml_string(generated_yaml)
-        graph = self._build_runtime_graph_for_settings(settings)
-        graph.validate()
+        with pytest.raises(GraphValidationError, match="originates outside the bound region"):
+            self._build_runtime_graph_for_settings(settings)
 
     def test_mapped_coalesce_and_ordinary_queue_consumers_are_rejected_in_both_layers(self) -> None:
         """A mapped branch plus an ordinary node is forbidden queue fan-out."""

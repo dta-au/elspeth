@@ -31,7 +31,7 @@ These run immediately with no setup:
 | `error_routing` | 17 | Error-triggered routing; fixture ends PARTIAL/exit 1 with 4 blocked rows quarantined by design |
 | `explicit_routing` | 10 | Named route destinations |
 | `fork_coalesce` | 5 each | Parallel path fork/join DAG; ships five `settings*.yaml` files, run one at a time. `settings.yaml` coalesces both branches; `settings_per_branch.yaml` runs a different transform chain per branch (ARCH-15); the three union variants exercise the field-collision policies — `settings_union_last_wins.yaml` and `settings_union_first_wins.yaml` resolve the same collision to opposite branches (`path_b` / `path_a`), and `settings_union_fail.yaml` raises `CoalesceCollisionError` and exits non-zero **by design** |
-| `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group; run one `settings*.yaml` at a time. `settings_screened.yaml` ends PARTIAL **by design** (3 tickets screened out, their orphaned siblings fail closed) |
+| `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group; run one `settings*.yaml` at a time. `settings_screened.yaml` screens ahead of the fork and ends SUCCESS (3 tickets screened out before forking); `settings_screened_at_settlement.yaml` screens mid-branch on a post-fork field and ends PARTIAL **by design** (3 tickets discarded inside the control branch, their orphaned treatment siblings fail closed) |
 | `json_explode` | 3 | JSON source with array expansion (3→6 output) |
 | `transform_pipeline` | 5 | Type coercion followed by dependent derived-field calculations |
 | `landscape_journal` | 2 | JSON source, audit journal |
@@ -58,7 +58,7 @@ per config, not a blanket `-eq 0`:
 |--------|------|-----|
 | `deep_routing/settings.yaml` | 1 | 2 blocked rows quarantined |
 | `error_routing/settings.yaml` | 1 | 4 blocked rows quarantined |
-| `row_union_ab_experiment/settings_screened.yaml` | 1 | 3 tickets screened out, orphaned siblings fail closed |
+| `row_union_ab_experiment/settings_screened_at_settlement.yaml` | 1 | 3 tickets discarded mid-branch, orphaned treatment siblings fail closed |
 | `fork_coalesce/settings_union_fail.yaml` | non-zero | raising `CoalesceCollisionError` is the point of the variant |
 | `chaosweb/settings.yaml` | 1, stochastic | injected fetch faults route to `scrape_failures.csv` |
 | `chaosllm_endurance/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
