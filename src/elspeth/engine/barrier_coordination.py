@@ -697,13 +697,19 @@ class BarrierIntakeCoordinator:
         # resolve_merged_branch_barrier's docstring (elspeth-0bd2cde19a / E1b).
         continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
             outcome.merged_token.branch_name,
-            completed_coalesce_name=coalesce_name,
+            flat_default=(coalesce_name, None),
             branch_to_coalesce=self._branch_to_coalesce,
             branch_to_row_union=self._branch_to_row_union,
         )
         merged_item = self._work_items.create(
             token=outcome.merged_token,
             current_node_id=coalesce_node_id,
+            # Flat/unnested: the resolved name is unchanged from the
+            # just-completed barrier, so supply coalesce_node_id too —
+            # restoring WorkItemFactory.create's mismatch cross-check on
+            # this path (elspeth-0bd2cde19a round-2 F4). Nested: only the
+            # resolved name is known here; create() re-derives the node id.
+            coalesce_node_id=(coalesce_node_id if outcome.merged_token.branch_name is None else None),
             coalesce_name=continuation_coalesce_name,
             row_union_name=continuation_row_union_name,
             join_group_id=outcome.join_group_id,

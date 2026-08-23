@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
+from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
 from elspeth.engine.dag_navigator import DAGNavigator
-from elspeth.engine.work_items import WorkItem, WorkItemFactory
+from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
 from elspeth.testing import make_token_info
 
 
@@ -102,3 +102,66 @@ def test_factory_accepts_matching_coalesce_name_and_node_id() -> None:
     )
 
     assert item.coalesce_node_id == node_id
+
+
+class TestResolveMergedBranchBarrier:
+    """Unit coverage for resolve_merged_branch_barrier's four outcomes (elspeth-0bd2cde19a)."""
+
+    def test_flat_case_returns_caller_supplied_default_unchanged(self) -> None:
+        """merged_branch_name is None (no enclosing frame) -> flat_default verbatim.
+
+        Each call site states its own flat-case contract explicitly (round-2
+        F1): complete_coalesce_merge/_fire_coalesce_merge pass the
+        just-completed coalesce's identity; _notify_coalesce_of_lost_branch
+        passes (None, None), since its flat case never carried barrier
+        context and must not gain any as a side effect of the nested fix.
+        """
+        assert resolve_merged_branch_barrier(
+            None,
+            flat_default=(CoalesceName("merge_outer"), None),
+            branch_to_coalesce={},
+            branch_to_row_union={},
+        ) == (CoalesceName("merge_outer"), None)
+
+        assert resolve_merged_branch_barrier(
+            None,
+            flat_default=(None, None),
+            branch_to_coalesce={},
+            branch_to_row_union={},
+        ) == (None, None)
+
+    def test_nested_branch_bound_to_coalesce_resolves_fresh(self) -> None:
+        result = resolve_merged_branch_barrier(
+            "outer_a",
+            flat_default=(CoalesceName("merge_inner"), None),
+            branch_to_coalesce={BranchName("outer_a"): CoalesceName("merge_outer")},
+            branch_to_row_union={},
+        )
+        assert result == (CoalesceName("merge_outer"), None)
+
+    def test_nested_branch_bound_to_row_union_resolves_fresh(self) -> None:
+        result = resolve_merged_branch_barrier(
+            "outer_a",
+            flat_default=(CoalesceName("merge_inner"), None),
+            branch_to_coalesce={},
+            branch_to_row_union={BranchName("outer_a"): RowUnionName("union_outer")},
+        )
+        assert result == (None, RowUnionName("union_outer"))
+
+    def test_nested_branch_bound_to_neither_map_returns_none_none(self) -> None:
+        """Reachable today (E2 made consumer-fed outer branches authorable, F3).
+
+        A nested region inside an UNBOUND fork branch (fed by an ordinary
+        consumer, spec §7 E2 — no enclosing barrier): the continuation
+        carries no barrier context, distinct from BOTH the flat-default
+        return AND a resolved barrier. See
+        tests/integration/core/dag/test_nested_fork_coalesce.py's unbound-
+        outer-branch case for the end-to-end witness.
+        """
+        result = resolve_merged_branch_barrier(
+            "outer_a",
+            flat_default=(CoalesceName("merge_inner"), None),
+            branch_to_coalesce={},
+            branch_to_row_union={},
+        )
+        assert result == (None, None)

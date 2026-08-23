@@ -3386,9 +3386,30 @@ class RowProcessor:
             # Non-terminal — consume held siblings and emit the merged child's
             # READY continuation in ONE atomic journal transition (F1/D6),
             # then resume the merged token at the coalesce step.
+            #
+            # This is a THIRD merge-release path alongside _fire_coalesce_merge
+            # and complete_coalesce_merge (a LOSS event can itself trigger
+            # CoalesceAction.MERGE under quorum/best_effort/first, not only an
+            # arrival) — a nested inner coalesce's loss-triggered release needs
+            # the same fresh barrier resolution those two already apply
+            # (elspeth-0bd2cde19a round-2 F1; the durable REPLAY of the
+            # identical loss via _replay_branch_losses -> _fire_coalesce_merge
+            # was already correct — only this LIVE path was missing it).
+            # flat_default=(None, None): the flat/unnested case here never
+            # carried barrier context before this fix and still doesn't —
+            # only the nested case was broken; resolve_merged_branch_barrier's
+            # flat arm is a per-call-site contract, not a universal default.
+            continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
+                outcome.merged_token.branch_name,
+                flat_default=(None, None),
+                branch_to_coalesce=self._branch_to_coalesce,
+                branch_to_row_union=self._branch_to_row_union,
+            )
             merged_item = self._work_items.create(
                 token=outcome.merged_token,
                 current_node_id=coalesce_node_id,
+                coalesce_name=continuation_coalesce_name,
+                row_union_name=continuation_row_union_name,
                 join_group_id=outcome.join_group_id,
             )
             self._complete_coalesce_fire(
@@ -4258,13 +4279,19 @@ class RowProcessor:
         # resolve_merged_branch_barrier's docstring (elspeth-0bd2cde19a / E1b).
         continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
             merged_token.branch_name,
-            completed_coalesce_name=coalesce_name,
+            flat_default=(coalesce_name, None),
             branch_to_coalesce=self._branch_to_coalesce,
             branch_to_row_union=self._branch_to_row_union,
         )
         merged_item = self._work_items.create(
             token=merged_token,
             current_node_id=coalesce_node_id,
+            # Flat/unnested: the resolved name is unchanged from the
+            # just-completed barrier, so supply coalesce_node_id too —
+            # restoring WorkItemFactory.create's mismatch cross-check on
+            # this path (elspeth-0bd2cde19a round-2 F4). Nested: only the
+            # resolved name is known here; create() re-derives the node id.
+            coalesce_node_id=(coalesce_node_id if merged_token.branch_name is None else None),
             coalesce_name=continuation_coalesce_name,
             row_union_name=continuation_row_union_name,
         )

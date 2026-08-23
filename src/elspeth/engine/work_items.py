@@ -75,7 +75,7 @@ class WorkItem:
 def resolve_merged_branch_barrier(
     merged_branch_name: str | None,
     *,
-    completed_coalesce_name: CoalesceName,
+    flat_default: tuple[CoalesceName | None, RowUnionName | None],
     branch_to_coalesce: Mapping[BranchName, CoalesceName],
     branch_to_row_union: Mapping[BranchName, RowUnionName],
 ) -> tuple[CoalesceName | None, RowUnionName | None]:
@@ -86,30 +86,42 @@ def resolve_merged_branch_barrier(
 
     - ``merged_branch_name`` is None (spec §7's flat/unnested case — no
       ENCLOSING fork frame remains): the continuation carries no branch
-      identity of its own, so ``completed_coalesce_name`` is returned
-      UNCHANGED, preserving the pre-nesting contract —
+      identity of its own, so the caller-supplied ``flat_default`` is
+      returned UNCHANGED. This is NOT a universal "preserve the pre-nesting
+      contract" default — each call site has its own pre-nesting contract,
+      and ``flat_default`` is how each one states it explicitly:
+      ``complete_coalesce_merge`` and ``_fire_coalesce_merge`` pass
+      ``(completed_coalesce_name, None)`` because
       ``process_single_token``'s ``coalesce_node_id_for_name ==
       current_node_id and resolve_next_node(...) is None`` check (the
-      TERMINAL-coalesce on_success-sink resolution) depends on exactly
-      this value staying set to the just-completed barrier.
+      TERMINAL-coalesce on_success-sink resolution) depends on that value
+      staying set to the just-completed barrier; the loss-triggered merge
+      path (``_notify_coalesce_of_lost_branch``) passes ``(None, None)``
+      because its flat case never carried barrier context and doing so
+      would be an unrelated behaviour change (elspeth-0bd2cde19a round-2
+      F1) — only its NESTED case was ever missing resolution.
     - ``merged_branch_name`` is set (a nested coalesce/row_union closing
       inside another bound region, spec §7 rules 2/5): an ENCLOSING fork
       frame remains, so the released token is that outer branch's member,
       freshly ARRIVING at ITS OWN barrier (if bound to one) — never the
-      barrier it was just released FROM. Reusing
-      ``completed_coalesce_name`` here makes ``_maybe_coalesce_token``'s
-      "arrived at coalesce_node_id" guard re-hold the release at the SAME
-      barrier (elspeth-0bd2cde19a / E1b); this mirrors the
-      ``classify_resume_start`` FORK_CHILD arm's precedent (``processor.py``
-      — ``branch = spec.lineage_path[-1].member_key`` then resolve fresh
-      from ``_branch_to_coalesce``/``_branch_to_row_union``) applied to the
-      live coalesce-completion path. Resolves to ``(None, None)`` when that
-      outer branch is bound to neither map (fork directly to a sink, or an
-      ordinary consumer — spec §7 E2): the continuation carries no barrier
-      context.
+      barrier it was just released FROM, and never ``flat_default``.
+      Reusing the just-completed barrier here makes
+      ``_maybe_coalesce_token``'s "arrived at coalesce_node_id" guard
+      re-hold the release at the SAME barrier (elspeth-0bd2cde19a / E1b);
+      this mirrors the ``classify_resume_start`` FORK_CHILD arm's precedent
+      (``processor.py`` — ``branch = spec.lineage_path[-1].member_key`` then
+      resolve fresh from ``_branch_to_coalesce``/``_branch_to_row_union``)
+      applied to the live coalesce-completion path. Resolves to
+      ``(None, None)`` when that outer branch is bound to neither map (fork
+      directly to a sink, or an ordinary consumer — spec §7 E2): the
+      continuation carries no barrier context. This arm is reachable today
+      (E2 made consumer-fed outer branches authorable) — see
+      ``TestResolveMergedBranchBarrier.test_nested_branch_bound_to_neither_map_returns_none_none``
+      (``tests/unit/engine/test_work_items.py``) and the end-to-end witness
+      in ``tests/integration/core/dag/test_nested_fork_coalesce.py``.
     """
     if merged_branch_name is None:
-        return completed_coalesce_name, None
+        return flat_default
     branch_key = BranchName(merged_branch_name)
     if branch_key in branch_to_coalesce:
         return branch_to_coalesce[branch_key], None
