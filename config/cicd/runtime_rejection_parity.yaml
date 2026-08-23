@@ -2623,6 +2623,31 @@ sites:
   note: _build_metadata_frozen is set only by _freeze_build_metadata() at the end of the builder (graph.py:852-860);
     every setter guarded by this assert is called during construction, before the freeze. No pipeline
     input can flip the flag.
+- key: 21d66b27e7e3b538
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph._resolve_nested_branch_first_node
+  exception: GraphValidationError
+  message: Fork gate '{}' has no outgoing edge labelled '{}' for its nested coalesce branch. This indicates
+    a graph construction bug.
+  ordinal: 0
+  disposition: structural
+  note: Reached only for a branch _is_nested_barrier_branch already classified as nested (its declared
+    "branches" value names a real coalesce/row_union node the builder itself registered); the builder's
+    own producer/consumer match (builder.py CONNECT FORK GATES + MATCH PRODUCERS TO CONSUMERS) always
+    draws exactly one branch-labelled edge from the owning gate for every declared branch. No pipeline
+    input reaches this arm without a prior builder defect.
+- key: a030e15a811fda64
+  path: src/elspeth/core/dag/graph.py
+  qualname: ExecutionGraph._resolve_nested_branch_first_node
+  exception: GraphValidationError
+  message: Fork gate '{}' has {} outgoing edges labelled '{}' ({}) for its nested coalesce branch — disambiguation
+    must be by branch identity, not edge-insertion order (sp
+  ordinal: 0
+  disposition: structural
+  note: Same builder invariant as the sibling site above — a fork branch label is unique per owning gate
+    (builder.py's duplicate-branch check) and the producer/consumer match draws one edge per declared
+    connection name, so more than one branch-labelled out-edge from one gate is unreachable from any
+    authorable config.
 - key: 23471f499ecc0acb
   path: src/elspeth/core/dag/graph.py
   qualname: ExecutionGraph._trace_branch_endpoints

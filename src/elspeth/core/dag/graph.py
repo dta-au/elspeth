@@ -1103,6 +1103,22 @@ class ExecutionGraph:
 
             if is_identity:
                 result[branch_name] = coalesce_nid
+            elif self._is_nested_barrier_branch(branch_info.input_connection):
+                # Nested branch (spec §7 rule 3/5): the declared branches:
+                # value names ANOTHER coalesce/row_union, not a literal
+                # transform. No transform chain exists between this gate and
+                # coalesce_nid — an inner bound region sits between them, and
+                # _trace_branch_endpoints's backward MOVE walk can never
+                # cross it (the inner barrier's own in-edges carry the inner
+                # region's labels, never this outer branch's). The roster
+                # fact (_branch_info binds this branch to coalesce_nid for
+                # require_all settlement) is correct and untouched; only the
+                # per-token dispatch fact changes: resolve the SAME way
+                # _unbound_branch_first_nodes does for a consumer-fed branch
+                # — the fork gate's own branch-labelled out-edge already
+                # points at the true first node (here, the inner region's
+                # opener), drawn by the ordinary producer/consumer match.
+                result[branch_name] = self._resolve_nested_branch_first_node(branch_info.gate_node_id, branch_name)
             else:
                 # Transform branch: trace backwards from coalesce through MOVE edges
                 # to find the first node in this branch's transform chain.
@@ -1136,6 +1152,53 @@ class ExecutionGraph:
         result.update({str(branch_name): node_id for branch_name, node_id in self._unbound_branch_first_nodes.items()})
 
         return result
+
+    def _is_nested_barrier_branch(self, input_connection: str) -> bool:
+        """Whether a coalesce branch's declared value names ANOTHER barrier.
+
+        True exactly when ``branches: {branch_name: input_connection}``
+        points at another coalesce or row_union's name rather than an
+        ordinary transform's connection — the coalesce-feeds-coalesce (or
+        row_union) shape spec §7 rules 2/5 sanction but the legacy
+        transform-chain walker was never rewired to consume (WS2 Task 4/5's
+        ``BoundRegion``/``GroupBindingRegistry`` already model this
+        topology correctly; this predicate is the declarative disambiguator
+        the walker itself cannot supply).
+        """
+        return CoalesceName(input_connection) in self._coalesce_id_map or RowUnionName(input_connection) in self._row_union_id_map
+
+    def _resolve_nested_branch_first_node(self, gate_node_id: NodeID, branch_name: str) -> NodeID:
+        """One-hop resolution for a nested coalesce branch's first node.
+
+        Mirrors ``get_unbound_branch_first_nodes``'s mechanism (spec §7 E2):
+        the fork gate's own branch-labelled out-edge — drawn once, by the
+        ordinary producer/consumer match, regardless of what the branch
+        ultimately feeds — already names the correct first node. For a
+        nested branch that is the inner region's own opener (or its
+        identity-copy target), treated opaquely; the walker never needs to
+        see past it.
+        """
+        matches: list[NodeID] = [
+            NodeID(to_id)
+            for _from_id, to_id, _key, data in self._graph.out_edges(gate_node_id, keys=True, data=True)
+            if data["label"] == branch_name
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise GraphValidationError(
+                f"Fork gate '{gate_node_id}' has no outgoing edge labelled '{branch_name}' for its "
+                "nested coalesce branch. This indicates a graph construction bug.",
+                component_id=str(gate_node_id),
+                component_type="gate",
+            )
+        raise GraphValidationError(
+            f"Fork gate '{gate_node_id}' has {len(matches)} outgoing edges labelled '{branch_name}' "
+            f"({sorted(matches)}) for its nested coalesce branch — disambiguation must be by branch "
+            "identity, not edge-insertion order (spec §7). This indicates a graph construction bug.",
+            component_id=str(gate_node_id),
+            component_type="gate",
+        )
 
     def _trace_branch_endpoints(
         self,

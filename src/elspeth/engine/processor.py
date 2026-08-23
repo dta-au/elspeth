@@ -89,7 +89,7 @@ from elspeth.engine.token_traversal import (
 from elspeth.engine.token_traversal import (
     _TransformTerminal as _TransformTerminal,  # re-export
 )
-from elspeth.engine.work_items import WorkItem, WorkItemFactory
+from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Connection
@@ -739,6 +739,7 @@ class RowProcessor:
             clock=self._clock,
             aggregation_settings=self._aggregation_settings,
             coalesce_node_ids=self._coalesce_node_ids,
+            branch_to_coalesce=self._branch_to_coalesce,
             coordination_token=coordination_token,
             scheduler_lease_owner=self._scheduler_lease_owner,
             live_barrier_holds=self._live_barrier_holds,
@@ -750,6 +751,7 @@ class RowProcessor:
             mark_coalesce_consumed_terminal=self._mark_coalesce_consumed_scheduler_work_terminal,
             row_union_executor=self._row_union_executor,
             row_union_node_ids=self._row_union_node_ids,
+            branch_to_row_union=self._branch_to_row_union,
             complete_row_union_fire=self._complete_row_union_fire,
             released_row_union_items=self.released_row_union_items,
         )
@@ -4233,11 +4235,22 @@ class RowProcessor:
         reconciles idempotently against the READY row inserted here (same
         deterministic work_item_id and field derivation).
         """
+        # A nested branch's release still carries an OUTER fork frame (this
+        # coalesce's own frame is popped) — resolve the continuation's
+        # barrier context FRESH from that branch identity, never reuse
+        # coalesce_name (the barrier it was just released from): see
+        # resolve_merged_branch_barrier's docstring (elspeth-0bd2cde19a / E1b).
+        continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
+            merged_token.branch_name,
+            completed_coalesce_name=coalesce_name,
+            branch_to_coalesce=self._branch_to_coalesce,
+            branch_to_row_union=self._branch_to_row_union,
+        )
         merged_item = self._work_items.create(
             token=merged_token,
             current_node_id=coalesce_node_id,
-            coalesce_node_id=coalesce_node_id,
-            coalesce_name=coalesce_name,
+            coalesce_name=continuation_coalesce_name,
+            row_union_name=continuation_row_union_name,
         )
         self._complete_coalesce_fire(
             coalesce_name=coalesce_name,

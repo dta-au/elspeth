@@ -263,6 +263,7 @@ def _make_coordinator(
         clock=MockClock(start=100.0),
         aggregation_settings={_AGG_NODE: object()} if aggregation_executor is not None else {},
         coalesce_node_ids={_COALESCE: NodeID("coalesce-node")} if coalesce_executor is not None else {},
+        branch_to_coalesce={},
         coordination_token=SimpleNamespace(worker_id="leader-1", epoch=1),
         scheduler_lease_owner="leader-1",
         live_barrier_holds=live_holds if live_holds is not None else {},

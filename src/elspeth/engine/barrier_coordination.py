@@ -42,10 +42,10 @@ from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariant
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, TokenWorkItem
-from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
+from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
 from elspeth.core.landscape.scheduler_repository import token_from_journal_item
 from elspeth.engine._error_hash import compute_error_hash
-from elspeth.engine.work_items import WorkItem, WorkItemFactory
+from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
 
 if TYPE_CHECKING:
     from elspeth.contracts import (
@@ -207,6 +207,7 @@ class BarrierIntakeCoordinator:
         clock: Clock,
         aggregation_settings: Mapping[NodeID, AggregationSettings],
         coalesce_node_ids: Mapping[CoalesceName, NodeID],
+        branch_to_coalesce: Mapping[BranchName, CoalesceName],
         coordination_token: CoordinationToken | None,
         scheduler_lease_owner: str,
         live_barrier_holds: dict[str, _LiveBarrierHold],
@@ -218,6 +219,7 @@ class BarrierIntakeCoordinator:
         mark_coalesce_consumed_terminal: Callable[..., None],
         row_union_executor: RowUnionExecutor | None = None,
         row_union_node_ids: Mapping[RowUnionName, NodeID] | None = None,
+        branch_to_row_union: Mapping[BranchName, RowUnionName] | None = None,
         complete_row_union_fire: Callable[..., None] | None = None,
         released_row_union_items: Callable[..., tuple[WorkItem, ...]] | None = None,
     ) -> None:
@@ -233,6 +235,7 @@ class BarrierIntakeCoordinator:
         self._clock = clock
         self._aggregation_settings = aggregation_settings
         self._coalesce_node_ids = coalesce_node_ids
+        self._branch_to_coalesce = branch_to_coalesce
         self._coordination_token = coordination_token
         self._scheduler_lease_owner = scheduler_lease_owner
         self._live_barrier_holds = live_barrier_holds
@@ -244,6 +247,7 @@ class BarrierIntakeCoordinator:
         self._mark_coalesce_consumed_terminal = mark_coalesce_consumed_terminal
         self._row_union_executor = row_union_executor
         self._row_union_node_ids: Mapping[RowUnionName, NodeID] = row_union_node_ids or {}
+        self._branch_to_row_union: Mapping[BranchName, RowUnionName] = branch_to_row_union or {}
         self._complete_row_union_fire = complete_row_union_fire
         self._released_row_union_items = released_row_union_items
 
@@ -686,11 +690,22 @@ class BarrierIntakeCoordinator:
                 kind=BarrierIntakeDispositionKind.PENDING_SINK,
                 results=(replace(terminal_result, scheduler_pending_sink=True),),
             )
+        # A nested branch's release still carries an OUTER fork frame (this
+        # coalesce's own frame is popped) — resolve the continuation's
+        # barrier context FRESH from that branch identity, never reuse
+        # coalesce_name (the barrier it was just released from): see
+        # resolve_merged_branch_barrier's docstring (elspeth-0bd2cde19a / E1b).
+        continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
+            outcome.merged_token.branch_name,
+            completed_coalesce_name=coalesce_name,
+            branch_to_coalesce=self._branch_to_coalesce,
+            branch_to_row_union=self._branch_to_row_union,
+        )
         merged_item = self._work_items.create(
             token=outcome.merged_token,
             current_node_id=coalesce_node_id,
-            coalesce_node_id=coalesce_node_id,
-            coalesce_name=coalesce_name,
+            coalesce_name=continuation_coalesce_name,
+            row_union_name=continuation_row_union_name,
             join_group_id=outcome.join_group_id,
         )
         self._complete_coalesce_fire(

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
+from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
 
 
 class WorkItemNavigation(Protocol):
@@ -69,6 +70,52 @@ class WorkItem:
                 f"WorkItem cannot target both a coalesce and a row_union barrier: "
                 f"coalesce_name={self.coalesce_name}, row_union_name={self.row_union_name}"
             )
+
+
+def resolve_merged_branch_barrier(
+    merged_branch_name: str | None,
+    *,
+    completed_coalesce_name: CoalesceName,
+    branch_to_coalesce: Mapping[BranchName, CoalesceName],
+    branch_to_row_union: Mapping[BranchName, RowUnionName],
+) -> tuple[CoalesceName | None, RowUnionName | None]:
+    """Barrier context for a coalesce-completion's released continuation.
+
+    A merge's released token has just had its OWN closer's frame popped
+    (``coalesce_tokens``/``pop_closer_frame``). Two shapes:
+
+    - ``merged_branch_name`` is None (spec §7's flat/unnested case — no
+      ENCLOSING fork frame remains): the continuation carries no branch
+      identity of its own, so ``completed_coalesce_name`` is returned
+      UNCHANGED, preserving the pre-nesting contract —
+      ``process_single_token``'s ``coalesce_node_id_for_name ==
+      current_node_id and resolve_next_node(...) is None`` check (the
+      TERMINAL-coalesce on_success-sink resolution) depends on exactly
+      this value staying set to the just-completed barrier.
+    - ``merged_branch_name`` is set (a nested coalesce/row_union closing
+      inside another bound region, spec §7 rules 2/5): an ENCLOSING fork
+      frame remains, so the released token is that outer branch's member,
+      freshly ARRIVING at ITS OWN barrier (if bound to one) — never the
+      barrier it was just released FROM. Reusing
+      ``completed_coalesce_name`` here makes ``_maybe_coalesce_token``'s
+      "arrived at coalesce_node_id" guard re-hold the release at the SAME
+      barrier (elspeth-0bd2cde19a / E1b); this mirrors the
+      ``classify_resume_start`` FORK_CHILD arm's precedent (``processor.py``
+      — ``branch = spec.lineage_path[-1].member_key`` then resolve fresh
+      from ``_branch_to_coalesce``/``_branch_to_row_union``) applied to the
+      live coalesce-completion path. Resolves to ``(None, None)`` when that
+      outer branch is bound to neither map (fork directly to a sink, or an
+      ordinary consumer — spec §7 E2): the continuation carries no barrier
+      context.
+    """
+    if merged_branch_name is None:
+        return completed_coalesce_name, None
+    branch_key = BranchName(merged_branch_name)
+    if branch_key in branch_to_coalesce:
+        return branch_to_coalesce[branch_key], None
+    if branch_key in branch_to_row_union:
+        return None, branch_to_row_union[branch_key]
+    return None, None
 
 
 @dataclass(frozen=True, slots=True)
