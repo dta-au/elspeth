@@ -472,8 +472,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"row_union_branch_aggregation_invalid",
         "A transform-mode aggregation inside a fork branch loses the per-row identity required to satisfy the row_union group.",
-        "Set that aggregation's output_mode to passthrough so each row keeps its identity, or move the aggregation "
-        "upstream of the fork that feeds the row_union.",
+        "Move the aggregation upstream of the fork that feeds the row_union, or downstream of its release — "
+        "aggregators are banned inside every bound region regardless of output_mode (spec §7 rule 6, ruling 25).",
     ),
     (
         r"row_union_nested_fork_invalid",
@@ -537,8 +537,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"bound_region_aggregation_invalid",
-        "An aggregation sits inside a bound group (fork→coalesce or scope). A batch flush consumes "
-        "members the group's roster must account for, so losses inside the batch would be invisible.",
+        "An aggregation sits inside a bound group (fork→coalesce, fork→row_union, or scope). A batch flush "
+        "consumes members the group's roster must account for, so losses inside the batch would be invisible.",
         "Move the aggregation before the group's opener or after its closer; batch work inside a bound "
         "region belongs to a scoped multi-row transform closed by a collector.",
     ),

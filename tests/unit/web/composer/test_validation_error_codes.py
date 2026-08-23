@@ -464,7 +464,13 @@ class TestClosedCodeCatalogueInvariants:
         branch_aggregation = explain_validation_code("row_union_branch_aggregation_invalid")
         assert branch_aggregation is not None
         assert branch_aggregation not in (intrinsic, downstream)
-        assert "passthrough" in branch_aggregation[1]
+        # 2026-08-23 remedy enrichment (Task 9 ruling, F1 fix round): the
+        # remedy no longer recommends output_mode: passthrough — rule 6
+        # (ruling 25) bans aggregators inside every bound region regardless
+        # of mode, so that advice would land the planner straight in a NEW
+        # rejection (the exact wasted-turn defect this pin flip closes).
+        assert "passthrough" not in branch_aggregation[1]
+        assert "rule 6" in branch_aggregation[1]
         assert "trigger" not in branch_aggregation[1]
 
         nested_fork = explain_validation_code("row_union_nested_fork_invalid")

@@ -731,49 +731,71 @@ class TestInterruptAndResume:
         ``test_buffered_only_resume_refuses_interrupted_source_before_pre_
         set_shutdown``; both collapse into this one build-rejection pin.
 
-        A live end-to-end reproduction is also now structurally impossible
-        for a DIFFERENT reason, independent of rule 6: this engine's fork
-        drains ALL sibling branches synchronously inside one
-        ``RowProcessor.process_row()`` call (``_drain_scheduler_claims`` /
-        ``SchedulerDrainCoordinator.drain_claims`` is a plain ``while True``
-        that only returns once every sibling work item reaches a terminal,
-        BLOCKED, or PENDING_SINK state — see ``engine/scheduler_drain.py``),
-        and the main loop's ``shutdown_event`` check runs only AFTER
-        ``process_row()`` returns (``source_iteration.py``, "Graceful
+        A live end-to-end reproduction is ALSO unbuildable for a second,
+        independent reason (in single-worker mode): this engine's fork
+        drains all sibling branches inside one ``RowProcessor.process_row()``
+        call via ``SchedulerDrainCoordinator.drain_claims``
+        (``engine/scheduler_drain.py``), a ``while True`` loop that normally
+        exits only once every sibling work item reaches a terminal, BLOCKED,
+        or PENDING_SINK state (it also exits via a peer-relinquish break, an
+        ``OrchestrationInvariantError``, a ``MAX_WORK_QUEUE_ITERATIONS``
+        raise, or lease-lost/evicted returns — the peer-relinquish arm is
+        production-reachable with a follower attached via ``elspeth join``,
+        which is why this claim is scoped to single-worker mode, not stated
+        unconditionally). The main loop's ``shutdown_event`` check runs only
+        AFTER ``process_row()`` returns (``source_iteration.py``, "Graceful
         shutdown — current row fully processed, safe to stop"). So without
-        an aggregation buffering ``agg_branch``'s token, BOTH fork siblings
-        would reach ``merge_paths`` and merge successfully within the same
-        row's processing, before any shutdown check could interleave — there
-        is no legitimate non-aggregation way to catch a coalesce mid-pending
-        at a shutdown boundary in single-worker mode.
+        an aggregation buffering ``agg_branch``'s token AND without a peer
+        worker to relinquish to, BOTH fork siblings would reach
+        ``merge_paths`` and merge successfully within the same row's
+        processing, before any shutdown check could interleave. Reason 1
+        (rule 6) alone makes the config unbuildable and is sufficient by
+        itself to justify collapsing both superseded tests into this one
+        pin; reason 2 is a supporting argument for the single-worker case.
 
-        Of the two superseded tests' assertion arms:
+        Of the two superseded tests' assertion arms — all four genuinely
+        still covered elsewhere, cited rather than re-proven, since
+        ``_abandon_undecided_tokens_in``'s undecided-token query
+        (run_lifecycle_repository.py, statements at :832-847) reads only
+        ``tokens``/``token_outcomes`` (a correlated ``EXISTS``), never
+        ``token_work_items``/``barrier_key``/``coalesce_name``, making the
+        sweep itself barrier-type-agnostic:
 
-        * ABANDONED token outcomes with the right context, ``can_resume``
-          refusing, ``get_unprocessed_rows`` raising "ABANDONED is
-          non-resumable", and ``resume()`` raising
-          ``IncompleteSourceResumeError`` are barrier-type-agnostic —
-          ``_abandon_undecided_tokens_in``'s undecided-token query
-          (run_lifecycle_repository.py) reads only ``tokens``/
-          ``token_outcomes``, never ``token_work_items``/``barrier_key``/
-          ``coalesce_name`` — and are already pinned by
-          ``tests/unit/core/landscape/test_run_finalization_abandonment.py``
-          and
+        * ABANDONED token outcomes with the right context —
+          ``tests/unit/core/landscape/test_run_finalization_abandonment.py::
+          TestAbandonmentSweepFires`` (:125-146).
+        * ``can_resume`` refusing — ``test_buffered_aggregation_shutdown_
+          persists_recovery_state`` above (:715-718, this same file) and
           ``tests/integration/audit/test_contract_violation_token_outcomes.py::
           test_aggregation_count_flush_violation_abandons_tokens_at_finalization``
-          for an unrelated (non-bound-region) violation shape. Cited, not
-          re-proven.
-        * The pending-AGGREGATION-persistence half (checkpoint + BLOCKED
-          journal rows survive a shutdown) is unaffected by rule 6 and stays
-          covered by ``test_buffered_aggregation_shutdown_persists_recovery_
-          state`` above.
-        * The genuinely coalesce-unique residue — a BLOCKED barrier journal
-          row bearing ``barrier_key``/``coalesce_name``/``branch_name``/
-          ``fork_group_id`` that outlives finalization while its owning
-          token still gets swept as undecided — is rebuilt at the engine
-          level in ``test_pending_coalesce_barrier_survives_finalization_
-          and_its_token_is_abandoned`` below (WS4 restoration tracked as
-          elspeth-ad0c4980fd, sibling of elspeth-c648d4f832).
+          (:321-324).
+        * ``get_unprocessed_rows`` raising "ABANDONED is non-resumable" —
+          ``get_unprocessed_rows`` (core/checkpoint/recovery.py:956) is a
+          thin wrapper over ``get_resume_workset`` (:776), whose raise
+          (:834) is pinned directly by
+          ``tests/unit/core/landscape/test_state_engine_read_model_truth_tables.py``
+          (:493).
+        * ``resume()`` raising ``IncompleteSourceResumeError`` for the
+          INTERRUPTED lifecycle arm specifically —
+          ``tests/integration/pipeline/test_eof_resume_proof.py`` (:528,
+          ``match=r"primary.*interrupted"``) and
+          ``tests/e2e/recovery/test_crash_and_resume.py`` (:622, :631, :640,
+          :665). (``test_contract_violation_token_outcomes.py:328`` pins
+          only the bare LOADING arm, with no match regex — not this arm.)
+
+        **Knowingly NOT re-added**: the dropped
+        ``test_buffered_only_resume_refuses_interrupted_source_before_pre_
+        set_shutdown`` also asserted that a *refused resume advances
+        nothing* — the checkpoint sequence number and the BLOCKED coalesce
+        rows identical before and after the refused
+        ``orchestrator.resume()`` call. No replacement pins that specific
+        checkpoint-sequence/BLOCKED-row invariance anywhere. Adding it
+        faithfully would require driving a real ``Orchestrator.resume()``
+        against a real graph/config here, which reintroduces the same
+        mocking-boundary question this witness was built to avoid (see
+        ``test_pending_coalesce_barrier_survives_finalization_and_its_
+        token_is_abandoned`` below) rather than a cheap addition to it —
+        recorded here as a deliberate, known gap rather than a silent one.
         """
         shutdown_event = threading.Event()
         with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region"):

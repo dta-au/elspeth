@@ -512,6 +512,11 @@ def validate_no_aggregations_in_regions(
     Outside a bound region no roster is watching, so a top-level aggregation
     or one placed after a closer's release is unchanged (ADR-020 posture).
 
+    ``graph`` is unused in this function's body (kept for signature
+    symmetry with the other §7 validators, which all take the built graph);
+    every fact this rule needs — region membership, the aggregation index —
+    is already materialized in its other parameters.
+
     Raises:
         GraphValidationError: an aggregation node is a member of a bound
             region, regardless of the region's closer kind or the
