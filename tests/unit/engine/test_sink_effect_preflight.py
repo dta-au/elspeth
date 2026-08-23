@@ -746,6 +746,7 @@ def test_non_run_pipeline_assembly_does_not_enforce_effect_capability(
         get_route_resolution_map=lambda: {},
         get_transform_id_map=lambda: {},
         get_config_gate_id_map=lambda: {},
+        escalation_fixpoint_bound=1_000,
     )
 
     pipeline_config = assemble_and_validate_pipeline_config(

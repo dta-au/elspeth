@@ -315,6 +315,7 @@ def build_row_processor(
                         coalesce_on_success_map[cname] = coalesce_settings_entry.on_success
 
     branch_to_sink = graph.get_branch_to_sink_map()
+    unbound_branch_first_node = graph.get_unbound_branch_first_nodes()
 
     # ADR-030 §B (slice 5): a follower runs no trigger evaluation
     # (aggregation_settings={}) — instead follower_barrier_node_ids carries
@@ -367,6 +368,7 @@ def build_row_processor(
         row_union_executor=row_union_executor,
         branch_to_row_union=branch_to_row_union,
         branch_to_sink=branch_to_sink,
+        unbound_branch_first_node=unbound_branch_first_node,
         sink_names=frozenset(config.sinks),
         coalesce_on_success_map=coalesce_on_success_map,
         barrier_restore=barrier_restore,

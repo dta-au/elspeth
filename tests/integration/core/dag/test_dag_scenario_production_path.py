@@ -509,15 +509,34 @@ def test_b2_composed_coalesces_execute_exact_semantic_production_oracles(
     fresh = build_scenario(render_settings(case, runtime_root))
 
     assert evidence.graph.topology_hash == fresh.graph_evidence.topology_hash
-    assert (len(projection.rows), len(projection.tokens), sum(len(token.parents) for token in projection.tokens)) == (3, 21, 24)
-    assert (len(projection.node_states), len(projection.routes), len(projection.terminal_dispositions)) == (24, 12, 21)
-    assert len(projection.scheduler_work) == 21
+    expected_projection_shape = {
+        # (rows, tokens, parent_links), (node_states, routes, terminal_dispositions), scheduler_work
+        "sequential-nested-fork-coalesce": ((3, 21, 24), (24, 12, 21), 21),
+        # E2 (spec §7): an outer pure-fan-out fork opens two disjoint depth-1
+        # regions (unbound fork adds no depth), each an independent
+        # whole-roster fork -> coalesce -> sink — one extra fork level versus
+        # the old single-level topology mints more tokens per row.
+        "parallel-coalesces": ((3, 27, 30), (30, 18, 27), 27),
+    }[scenario_id]
+    (expected_rows, expected_tokens, expected_parents), expected_node_route_disposition, expected_scheduler_work = expected_projection_shape
+    assert (len(projection.rows), len(projection.tokens), sum(len(token.parents) for token in projection.tokens)) == (
+        expected_rows,
+        expected_tokens,
+        expected_parents,
+    )
+    assert (
+        len(projection.node_states),
+        len(projection.routes),
+        len(projection.terminal_dispositions),
+    ) == expected_node_route_disposition
+    assert len(projection.scheduler_work) == expected_scheduler_work
     assert evidence.audit.source_operation_count == 1
     assert evidence.audit.portable_projection == projection
 
     expected_graph = {
         "sequential-nested-fork-coalesce": (6, 9, {"coalesce": 2, "gate": 2, "sink": 1, "source": 1}),
-        "parallel-coalesces": (6, 8, {"coalesce": 2, "gate": 1, "sink": 2, "source": 1}),
+        # E2 (spec §7): outer_fork/left_fork/right_fork (3 gates) + merge_left/merge_right (2 coalesces).
+        "parallel-coalesces": (8, 9, {"coalesce": 2, "gate": 3, "sink": 2, "source": 1}),
     }[scenario_id]
     assert (evidence.graph.node_count, evidence.graph.edge_count) == expected_graph[:2]
     assert evidence.graph.node_type_counts is not None
@@ -3127,8 +3146,8 @@ def test_parallel_coalesces_recovery_reuses_finalized_first_sink(
     evidence = run_scenario_case(scenario, case, tmp_path)
 
     _assert_declared_recovery_evidence(scenario, case, evidence)
-    assert evidence.graph.node_count == 6
-    assert evidence.graph.edge_count == 8
+    assert evidence.graph.node_count == 8
+    assert evidence.graph.edge_count == 9
     assert (evidence.runtime.rows_processed, evidence.runtime.rows_succeeded, evidence.runtime.rows_failed) == (3, 6, 0)
     assert tuple((output.sink_name, len(output.rows)) for output in evidence.runtime.sink_outputs) == (
         ("left", 3),

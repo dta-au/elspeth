@@ -737,6 +737,12 @@ def build_execution_graph(
     fork_branch_owner: dict[BranchName, GateName] = {}
     coalesce_branch_plans: dict[BranchName, _CoalesceBranchPlan] = {}
     row_union_branch_gates: dict[BranchName, tuple[GateName, NodeID]] = {}
+    # Unbound (no barrier) branches consumed by exactly one ordinary
+    # downstream transform/gate (spec §7 E2). branch_name -> that consumer's
+    # node id. Registered as a producer once `register_producer` exists
+    # (below); the actual MOVE edge is drawn by the standard "MATCH
+    # PRODUCERS TO CONSUMERS" pass, reusing that machinery unchanged.
+    unbound_consumer_fed_branches: dict[BranchName, NodeID] = {}
     for gate_entry in gate_entries:
         if gate_entry.fork_to:
             branch_counts = Counter(gate_entry.fork_to)
@@ -793,20 +799,103 @@ def build_execution_graph(
                         mode=RoutingMode.COPY,
                     )
                 else:
-                    # NO FALLBACK - this is a configuration error
-                    raise GraphValidationError(
-                        f"Gate '{gate_entry.name}' has fork branch '{branch_name}' with no destination.\n"
-                        f"Fork branches must either:\n"
-                        f"  1. Be listed in a coalesce 'branches' dict/list, or\n"
-                        f"  2. Be listed in a row_union 'branches' dict/list, or\n"
-                        f"  3. Match a sink name exactly\n"
-                        f"\n"
-                        f"Available coalesce branches: {sorted(coalesce_branch_specs.keys())}\n"
-                        f"Available row_union branches: {sorted(row_union_branch_specs.keys())}\n"
-                        f"Available sinks: {sorted(sink_ids.keys())}",
-                        component_id=gate_entry.name,
-                        component_type="gate",
-                    )
+                    # Fourth path (spec §7 E2): a branch consumed by exactly
+                    # one ordinary downstream transform/gate is legal —
+                    # pure fan-out with no barrier claiming it at all. The
+                    # consumer registry doesn't exist yet at this point in
+                    # the build, so scan the raw transform/gate settings
+                    # directly rather than reusing the later registry pass.
+                    consumer_matches: list[tuple[NodeID, str]] = [
+                        (transform_ids_by_name[wired.settings.name], f"transform '{wired.settings.name}'")
+                        for wired in transforms
+                        if wired.settings.input == branch_name
+                    ] + [
+                        (config_gate_ids[GateName(other_gate.name)], f"gate '{other_gate.name}'")
+                        for other_gate in gates
+                        if other_gate.input == branch_name
+                    ]
+                    if len(consumer_matches) == 1:
+                        consumer_node_id, _description = consumer_matches[0]
+                        unbound_consumer_fed_branches[branch_key] = consumer_node_id
+                    elif len(consumer_matches) > 1:
+                        raise GraphValidationError(
+                            f"Gate '{gate_entry.name}' has fork branch '{branch_name}' with "
+                            f"{len(consumer_matches)} downstream consumers: "
+                            f"{sorted(description for _node_id, description in consumer_matches)}. "
+                            "A fork branch may feed at most one consumer (use a gate for fan-out).",
+                            component_id=gate_entry.name,
+                            component_type="gate",
+                        )
+                    else:
+                        # NO FALLBACK - this is a configuration error
+                        raise GraphValidationError(
+                            f"Gate '{gate_entry.name}' has fork branch '{branch_name}' with no destination.\n"
+                            f"Fork branches must either:\n"
+                            f"  1. Be listed in a coalesce 'branches' dict/list, or\n"
+                            f"  2. Be listed in a row_union 'branches' dict/list, or\n"
+                            f"  3. Match a sink name exactly, or\n"
+                            f"  4. Be consumed by exactly one downstream transform/gate 'input'\n"
+                            f"\n"
+                            f"Available coalesce branches: {sorted(coalesce_branch_specs.keys())}\n"
+                            f"Available row_union branches: {sorted(row_union_branch_specs.keys())}\n"
+                            f"Available sinks: {sorted(sink_ids.keys())}",
+                            component_id=gate_entry.name,
+                            component_type="gate",
+                        )
+
+    # ===== WHOLE-ROSTER FORK CLOSURE (spec §7 rule 2, ruling 23) =====
+    # A fork is fully bound (every branch flows to its ONE closer, rosters
+    # equal) or fully unbound (pure fan-out to sinks). Mixed closure and
+    # multi-closer splits are build errors; subset closure can be added
+    # additively later — the reverse narrowing never could be.
+    for gate_entry in gate_entries:
+        if not gate_entry.fork_to:
+            continue
+        closers: dict[str, str] = {}  # branch -> closer name ("coalesce:X" / "row_union:Y")
+        unbound: list[str] = []
+        for branch_name in gate_entry.fork_to:
+            branch_key = BranchName(branch_name)
+            if branch_key in coalesce_branch_specs:
+                closers[branch_name] = f"coalesce:{coalesce_branch_specs[branch_key].coalesce_name}"
+            elif branch_key in row_union_branch_specs:
+                closers[branch_name] = f"row_union:{row_union_branch_specs[branch_key].row_union_name}"
+            else:
+                unbound.append(branch_name)
+        if closers and unbound:
+            raise GraphValidationError(
+                f"Fork gate '{gate_entry.name}' has mixed closure: branches {sorted(closers)} close at a "
+                f"barrier while branches {unbound} go direct to a sink or an ordinary consumer. A fork is either fully bound — "
+                f"every declared branch flows to the fork's single closer — or fully unbound (pure "
+                f"fan-out). Route every branch to the closer, or none (spec §7 rule 2).",
+                component_id=gate_entry.name,
+                component_type="gate",
+            )
+        distinct_closers = sorted(set(closers.values()))
+        if len(distinct_closers) > 1:
+            raise GraphValidationError(
+                f"Fork gate '{gate_entry.name}' closes at multiple barriers: {distinct_closers}. "
+                f"A fork closes entirely at ONE closer (spec §7 rule 2). Split into nested forks — an "
+                f"outer pure fan-out whose branches each contain their own fork→closer pair.",
+                component_id=gate_entry.name,
+                component_type="gate",
+            )
+        if distinct_closers:
+            closer_label = distinct_closers[0]
+            kind, _, closer_name = closer_label.partition(":")
+            declared = (
+                {str(b.branch_name) for b in coalesce_plans[CoalesceName(closer_name)].branches}
+                if kind == "coalesce"
+                else {str(b) for b, spec in row_union_branch_specs.items() if str(spec.row_union_name) == closer_name}
+            )
+            if declared != set(gate_entry.fork_to):
+                raise GraphValidationError(
+                    f"{'Coalesce' if kind == 'coalesce' else 'row_union'} '{closer_name}' roster mismatch: "
+                    f"closer declares {sorted(declared)} but fork gate '{gate_entry.name}' declares "
+                    f"{sorted(gate_entry.fork_to)}. Whole-roster closure requires the closer's branches "
+                    f"to EQUAL the fork's branch list (spec §7 rule 2).",
+                    component_id=closer_name,
+                    component_type=kind,
+                )
 
     # ===== VALIDATE COALESCE BRANCHES ARE PRODUCED BY GATES =====
     # All branches declared in coalesce settings must be produced by some fork gate
@@ -934,6 +1023,21 @@ def build_execution_graph(
             ru_gate_node_id,
             ru_spec.branch_name,
             f"fork branch '{ru_spec.branch_name}' from gate '{ru_gate_name}'",
+        )
+
+    # Unbound (no barrier) consumer-fed branches (spec §7 E2): registering
+    # the branch as a producer here lets the standard "MATCH PRODUCERS TO
+    # CONSUMERS" pass below draw the MOVE edge exactly as it already does for
+    # transform-chain coalesce branches — the branch's downstream consumer
+    # (a transform or gate) already registers itself as a consumer of this
+    # connection name unconditionally, regardless of this branch.
+    for branch_key in unbound_consumer_fed_branches:
+        owning_gate_name = fork_branch_owner[branch_key]
+        register_producer(
+            str(branch_key),
+            config_gate_ids[owning_gate_name],
+            str(branch_key),
+            f"fork branch '{branch_key}' from gate '{owning_gate_name}' (unbound, consumer-fed)",
         )
 
     # ===== BUILD CONSUMER REGISTRY =====
@@ -1313,6 +1417,7 @@ def build_execution_graph(
 
     branch_info: dict[BranchName, BranchInfo] = {branch_name: plan.to_branch_info() for branch_name, plan in coalesce_branch_plans.items()}
     graph.set_branch_info(branch_info)
+    graph.set_unbound_branch_first_nodes(dict(unbound_consumer_fed_branches))
 
     # ===== POPULATE PASS-THROUGH SCHEMA CONFIG =====
     # Coalesce nodes and their downstream gates are structural pass-throughs;

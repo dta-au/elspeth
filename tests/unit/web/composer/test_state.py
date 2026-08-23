@@ -8877,7 +8877,13 @@ class TestPassThroughComposerParity:
         assert consumer_contract.satisfied is True
 
     def test_preview_inherits_upstream_guarantees_through_fork_gate_into_pass_through(self) -> None:
-        """Pass-through preview must follow fork branches back to their producer."""
+        """Pass-through preview must follow fork branches back to their producer.
+
+        The fixture is whole-roster (fork_to == the coalesce's branches): a
+        former third direct-to-sink "overflow" branch was removed when spec §7
+        rule 2 (ruling 23) made mixed closure a build error — it was vehicle,
+        not subject.
+        """
         state = self._empty_state()
         state = state.with_source(
             self._make_source(
@@ -8902,7 +8908,7 @@ class TestPassThroughComposerParity:
                 options={},
                 condition="True",
                 routes={"true": "fork", "false": "fork"},
-                fork_to=("path_a", "path_b", "overflow"),
+                fork_to=("path_a", "path_b"),
                 branches=None,
                 policy=None,
                 merge=None,
@@ -8959,20 +8965,8 @@ class TestPassThroughComposerParity:
                 on_write_failure="discard",
             )
         )
-        state = state.with_output(
-            OutputSpec(
-                name="overflow",
-                plugin="csv",
-                options={
-                    "path": "outputs/overflow.csv",
-                    "schema": {"mode": "observed"},
-                },
-                on_write_failure="discard",
-            )
-        )
         state = state.with_edge(self._make_edge("e1", "source", "fork_gate"))
         state = state.with_edge(EdgeSpec(id="e2", from_node="fork_gate", to_node="pt_node", edge_type="fork", label="path_a"))
-        state = state.with_edge(EdgeSpec(id="e3", from_node="fork_gate", to_node="overflow", edge_type="fork", label="overflow"))
 
         result = state.validate()
 
@@ -9632,6 +9626,13 @@ def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
     coalesce branches keys or sink names — the model keyed coalesce branches
     by incoming connection instead of fork branch name. Composer validation
     accepted it: valid-but-not-runnable.
+
+    Since the E2 destination-rule fix (a fork branch may feed an ordinary
+    downstream consumer), 'branch_b' — consumed by the 'usage' transform —
+    is a LEGAL destination, so this topology's defect is now mixed closure
+    (spec §7 rule 2: 'branch_a' row_union-bound, 'branch_b' unbound), not a
+    missing destination. The genuinely-orphaned-branch case lives in
+    test_state_bound_regions.py::test_orphan_fork_branch_still_has_no_destination.
     """
 
     def _node(**overrides: Any) -> NodeSpec:
@@ -9701,12 +9702,14 @@ def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
 
     result = state.validate()
     entries = [(e.component, e.error_code) for e in result.errors]
-    assert ("node:fork_rows", "fork_branch_no_destination") in entries, entries
-    offending = [e for e in result.errors if e.error_code == "fork_branch_no_destination"]
+    assert ("node:fork_rows", "fork_mixed_closure_invalid") in entries, entries
+    # E2: a consumer-fed branch is a legal destination — the old code must NOT fire here.
+    assert not any(e.error_code == "fork_branch_no_destination" for e in result.errors), entries
+    offending = [e for e in result.errors if e.error_code == "fork_mixed_closure_invalid"]
     assert len(offending) == 1, offending
     assert "branch_b" in offending[0].message
-    assert "fork branch 'branch_a'" not in offending[0].message
-    assert "tone_out" in offending[0].message
+    assert "['branch_a']" in offending[0].message  # bound side named as the barrier-closing set
+    assert "mixed closure" in offending[0].message
 
 
 class TestCompositionStateRowUnion:

@@ -408,6 +408,7 @@ class RowProcessor:
         row_union_executor: RowUnionExecutor | None = None,
         branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
         branch_to_sink: dict[BranchName, SinkName] | None = None,
+        unbound_branch_first_node: dict[BranchName, NodeID] | None = None,
         sink_names: frozenset[str] | None = None,
         coalesce_on_success_map: dict[CoalesceName, str] | None = None,
         barrier_restore: BarrierJournalRestoreContext | None = None,
@@ -444,6 +445,9 @@ class RowProcessor:
             retry_manager: Optional retry manager for transform execution
             coalesce_executor: Optional coalesce executor for fork/join operations
             branch_to_coalesce: Map of branch_name -> coalesce_name for fork/join routing
+            unbound_branch_first_node: Map of branch_name -> first node id for
+                fork branches with no barrier (spec §7 E2): consumed by
+                exactly one ordinary downstream transform/gate, pure fan-out.
             sink_names: Set of valid sink names for route resolution validation.
                 If None, sink validation on jump-target resolution is skipped.
             coalesce_on_success_map: Map of coalesce_name -> terminal sink_name
@@ -527,6 +531,7 @@ class RowProcessor:
         self._row_union_node_ids: dict[RowUnionName, NodeID] = dict(traversal.row_union_node_map)
         self._branch_to_row_union: dict[BranchName, RowUnionName] = branch_to_row_union or {}
         self._branch_to_sink: dict[BranchName, SinkName] = branch_to_sink or {}
+        self._unbound_branch_first_node: dict[BranchName, NodeID] = unbound_branch_first_node or {}
         overlap = set(self._branch_to_coalesce.keys()) & set(self._branch_to_sink.keys())
         if overlap:
             raise OrchestrationInvariantError(
@@ -538,6 +543,14 @@ class RowProcessor:
             raise OrchestrationInvariantError(
                 f"Branch names {sorted(barrier_overlap)} appear in both branch_to_coalesce and branch_to_row_union. "
                 "A fork branch must join at exactly one barrier."
+            )
+        unbound_overlap = set(self._unbound_branch_first_node.keys()) & (
+            set(self._branch_to_coalesce.keys()) | set(self._branch_to_row_union.keys()) | set(self._branch_to_sink.keys())
+        )
+        if unbound_overlap:
+            raise OrchestrationInvariantError(
+                f"Branch names {sorted(unbound_overlap)} appear in unbound_branch_first_node as well as a barrier or "
+                "sink map. A fork branch is exactly one of closer-bound, sink-bound, or consumer-fed."
             )
         self._sink_names: frozenset[str] = sink_names or frozenset()
         self._coalesce_on_success_map: dict[CoalesceName, str] = coalesce_on_success_map or {}
@@ -3004,9 +3017,16 @@ class RowProcessor:
                 coalesce_name=coalesce_name,
             )
 
+        if BranchName(branch) in self._unbound_branch_first_node:
+            # fork → ordinary consumer, no barrier at all (spec §7 E2): re-run
+            # the branch from its first (and only) consuming node — plain
+            # continuation, no coalesce/row_union context to restore.
+            first_node = self._unbound_branch_first_node[BranchName(branch)]
+            return self.process_token(token, ctx, current_node_id=first_node)
+
         raise OrchestrationInvariantError(
             f"Incomplete fork-child token {spec.token_id} is on branch {branch!r} which routes to neither a "
-            f"sink nor a coalesce — no resume-start node resolvable. Audit/DAG inconsistency."
+            f"sink, a coalesce, nor an unbound consumer — no resume-start node resolvable. Audit/DAG inconsistency."
         )
 
     def _maybe_coalesce_token(

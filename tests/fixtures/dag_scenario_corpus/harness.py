@@ -4555,8 +4555,8 @@ def _parallel_sink_finalization_recovery_case(
     if tuple(initial_rendered.settings.sinks) != ("left", "right"):
         raise AssertionError("parallel sink-finalization recovery requires declared sink order ('left', 'right')")
     initial_built = build_scenario(initial_rendered)
-    if (initial_built.graph_evidence.node_count, initial_built.graph_evidence.edge_count) != (6, 8):
-        raise AssertionError("parallel sink-finalization recovery requires the exact six-node/eight-edge graph")
+    if (initial_built.graph_evidence.node_count, initial_built.graph_evidence.edge_count) != (8, 9):
+        raise AssertionError("parallel sink-finalization recovery requires the exact eight-node/nine-edge graph")
     initial_store = FilesystemPayloadStore(payload_root)
     initial_db = LandscapeDB(db_url)
     initial_checkpoint_manager = CheckpointManager(initial_db)
@@ -4651,9 +4651,9 @@ def _parallel_sink_finalization_recovery_case(
                 .mappings()
                 .all()
             )
-        if (len(row_count), len(token_count), len(parent_count)) != (3, 21, 24):
+        if (len(row_count), len(token_count), len(parent_count)) != (3, 27, 30):
             raise AssertionError(
-                "parallel sink-finalization recovery requires 3 rows/21 tokens/24 parents before resume: "
+                "parallel sink-finalization recovery requires 3 rows/27 tokens/30 parents before resume: "
                 f"{len(row_count)}/{len(token_count)}/{len(parent_count)}"
             )
         if {str(state["node_id"]) for state in coalesce_states} != coalesce_ids or any(
@@ -4832,7 +4832,7 @@ def _parallel_sink_finalization_recovery_case(
             len(final_parent_count),
             len(final_state_count),
             len(work_statuses),
-        ) != (3, 21, 24, 24, 21):
+        ) != (3, 27, 30, 30, 27):
             raise AssertionError("parallel sink-finalization recovery changed exact DAG cardinalities")
         if (
             len(outcomes) != len(token_ids)

@@ -779,3 +779,240 @@ class TestTransformOutputFieldCollisionRejectedAtBuild:
         graph = self._build(tmp_path, response_field="title_cased")
 
         graph.validate_edge_compatibility()
+
+
+def _build_gate_fork_graph(
+    *,
+    fork_to: list[str],
+    coalesce: CoalesceSettings | list[CoalesceSettings] | None,
+    extra_sinks: dict[str, Any] | None = None,
+) -> ExecutionGraph:
+    """Minimal source + one fork gate + optional coalesce(s) + sinks graph."""
+    source = _BuilderValidationMockSource()
+    sinks: dict[str, Any] = {"out": _BuilderValidationMockSink()}
+    if extra_sinks:
+        sinks.update(extra_sinks)
+    coalesce_settings: list[CoalesceSettings] = []
+    if coalesce is not None:
+        coalesce_settings = coalesce if isinstance(coalesce, list) else [coalesce]
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[],
+        sinks=sinks,  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="splitter",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=fork_to,
+            )
+        ],
+        coalesce_settings=coalesce_settings,
+    )
+
+
+class TestWholeRosterForkClosure:
+    """Spec §7 rule 2 (ruling 23): a fork closes entirely at ONE closer or not at all."""
+
+    def test_mixed_fork_closure_rejected(self) -> None:
+        # fork_to [failing, survivor]: 'failing' declared by a coalesce,
+        # 'survivor' matches a sink name — buildable today, rejected now.
+        with pytest.raises(GraphValidationError, match="mixed closure"):
+            _build_gate_fork_graph(
+                fork_to=["failing", "survivor"],
+                coalesce=CoalesceSettings(name="merge", branches={"failing": "failing", "second": "second"}, on_success="out"),
+                extra_sinks={"survivor": _BuilderValidationMockSink()},
+            )
+
+    def test_pure_fan_out_fork_stays_legal(self) -> None:
+        # BOTH branches direct to sinks, no closer anywhere: "fully unbound
+        # (pure fan-out)" — LEGAL under rule 2 as written (plan pinned decision 2).
+        graph = _build_gate_fork_graph(
+            fork_to=["left", "right"],
+            coalesce=None,
+            extra_sinks={"left": _BuilderValidationMockSink(), "right": _BuilderValidationMockSink()},
+        )
+        assert graph is not None
+
+    def test_fork_split_across_two_closers_rejected(self) -> None:
+        # The parallel-coalesces shape: ONE fork closing at TWO sibling coalesces.
+        with pytest.raises(GraphValidationError, match="closes at multiple barriers"):
+            _build_gate_fork_graph(
+                fork_to=["left_a", "left_b", "right_a", "right_b"],
+                coalesce=[
+                    CoalesceSettings(name="merge_left", branches={"left_a": "left_a", "left_b": "left_b"}, on_success="out"),
+                    CoalesceSettings(name="merge_right", branches={"right_a": "right_a", "right_b": "right_b"}, on_success="out"),
+                ],
+            )
+
+    def test_closer_roster_must_equal_fork_roster(self) -> None:
+        # Closer declares a strict SUPERSET of the fork's branches → mismatch.
+        with pytest.raises(GraphValidationError, match="roster mismatch"):
+            _build_gate_fork_graph(
+                fork_to=["path_a", "path_b"],
+                coalesce=CoalesceSettings(
+                    name="merge",
+                    branches={"path_a": "path_a", "path_b": "path_b", "path_c": "path_c"},
+                    on_success="out",
+                ),
+            )
+
+
+class TestUnboundConsumerFedForkBranch:
+    """E2: a fork branch consumed by exactly one downstream transform/gate is
+    a legal unbound (pure-fan-out) destination — spec §7 rule 2's "closer or
+    sink" trichotomy gains a fourth path: an ordinary downstream consumer,
+    with no barrier claiming the branch at all (task-8a nested-expand-in-fork;
+    protocols RC-3's ratified B topology)."""
+
+    def test_branch_feeding_a_transform_with_no_barrier_or_sink_match_is_accepted(self) -> None:
+        # task-8a's exact shape: fork_to=[explode_path, control]; "control"
+        # matches a sink directly (rule 3, already legal); "explode_path"
+        # matches NEITHER a coalesce/row_union alias NOR a sink name — it is
+        # consumed only by transform "consumer"'s `input`.
+        source = _BuilderValidationMockSource()
+        consumer = _BuilderValidationTransform(name="consumer", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        graph = ExecutionGraph.from_plugin_instances(
+            sources={"primary": source},  # type: ignore[arg-type]
+            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+            transforms=[
+                WiredTransform(
+                    plugin=consumer,  # type: ignore[arg-type]
+                    settings=TransformSettings(
+                        name="consumer",
+                        plugin=consumer.name,
+                        input="explode_path",
+                        on_success="exploded",
+                        on_error="discard",
+                        options={},
+                    ),
+                )
+            ],
+            sinks={"exploded": _BuilderValidationMockSink(), "control": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+            aggregations={},
+            gates=[
+                GateSettings(
+                    name="splitter",
+                    input="source_out",
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=["explode_path", "control"],
+                )
+            ],
+            coalesce_settings=[],
+        )
+        assert graph is not None
+
+    def test_branch_feeding_a_nested_gate_with_no_barrier_is_accepted(self) -> None:
+        # RC-3's ratified B topology, one region: outer branch "left" feeds an
+        # INNER fork gate directly (input="left"), no barrier claims "left"
+        # itself, and the inner fork closes whole-roster at its own coalesce.
+        source = _BuilderValidationMockSource()
+        graph = ExecutionGraph.from_plugin_instances(
+            sources={"primary": source},  # type: ignore[arg-type]
+            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+            transforms=[],
+            sinks={"out": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+            aggregations={},
+            gates=[
+                GateSettings(
+                    name="outer",
+                    input="source_out",
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=["left"],
+                ),
+                GateSettings(
+                    name="inner",
+                    input="left",
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=["left_a", "left_b"],
+                ),
+            ],
+            coalesce_settings=[
+                CoalesceSettings(name="merge_left", branches={"left_a": "left_a", "left_b": "left_b"}, on_success="out"),
+            ],
+        )
+        assert graph is not None
+
+    def test_branch_with_two_downstream_consumers_is_rejected(self) -> None:
+        # Ambiguous: two different nodes both declare input="shared" — a fork
+        # branch may feed at most one consumer (use a gate for fan-out).
+        source = _BuilderValidationMockSource()
+        t1 = _BuilderValidationTransform(name="t1", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        t2 = _BuilderValidationTransform(name="t2", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        with pytest.raises(GraphValidationError, match="downstream consumers"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+                transforms=[
+                    WiredTransform(
+                        plugin=t1,  # type: ignore[arg-type]
+                        settings=TransformSettings(
+                            name="t1", plugin=t1.name, input="shared", on_success="out", on_error="discard", options={}
+                        ),
+                    ),
+                    WiredTransform(
+                        plugin=t2,  # type: ignore[arg-type]
+                        settings=TransformSettings(
+                            name="t2", plugin=t2.name, input="shared", on_success="out", on_error="discard", options={}
+                        ),
+                    ),
+                ],
+                sinks={"out": _BuilderValidationMockSink(), "other": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[
+                    GateSettings(
+                        name="splitter",
+                        input="source_out",
+                        condition="True",
+                        routes={"true": "fork", "false": "fork"},
+                        fork_to=["shared", "other"],
+                    )
+                ],
+                coalesce_settings=[],
+            )
+
+    def test_unclaimed_branch_still_rejected_with_the_updated_exhaustive_message(self) -> None:
+        # No coalesce/row_union alias, no sink match, no downstream consumer:
+        # still a build error, and the message must name all four legal shapes.
+        with pytest.raises(GraphValidationError, match=r"no destination") as exc_info:
+            _build_gate_fork_graph(fork_to=["orphan", "control"], coalesce=None, extra_sinks={"control": _BuilderValidationMockSink()})
+        assert "exactly one downstream transform/gate" in str(exc_info.value)
+
+    def test_mixed_bound_and_consumer_fed_stays_mixed_closure_rejected(self) -> None:
+        # rule 2 interplay: a consumer-fed (unbound) branch mixed with a
+        # closer-bound branch on the SAME gate is still mixed closure.
+        source = _BuilderValidationMockSource()
+        consumer = _BuilderValidationTransform(name="consumer", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        with pytest.raises(GraphValidationError, match="mixed closure"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+                transforms=[
+                    WiredTransform(
+                        plugin=consumer,  # type: ignore[arg-type]
+                        settings=TransformSettings(
+                            name="consumer", plugin=consumer.name, input="free_path", on_success="out", on_error="discard", options={}
+                        ),
+                    )
+                ],
+                sinks={"out": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[
+                    GateSettings(
+                        name="splitter",
+                        input="source_out",
+                        condition="True",
+                        routes={"true": "fork", "false": "fork"},
+                        fork_to=["free_path", "bound_path"],
+                    )
+                ],
+                coalesce_settings=[
+                    CoalesceSettings(name="merge", branches={"bound_path": "bound_path", "second": "second"}, on_success="out"),
+                ],
+            )

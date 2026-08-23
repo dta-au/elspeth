@@ -9,11 +9,21 @@ sources:
 concurrency:
   max_workers: 1
 gates:
-  - name: parallel_fork
+  - name: outer_fork
     input: fork_input
     condition: "True"
-    routes: {"true": fork, "false": left}
-    fork_to: [left_a, left_b, right_a, right_b]
+    routes: {"true": fork, "false": fork}
+    fork_to: [left_path, right_path]
+  - name: left_fork
+    input: left_path
+    condition: "True"
+    routes: {"true": fork, "false": fork}
+    fork_to: [left_a, left_b]
+  - name: right_fork
+    input: right_path
+    condition: "True"
+    routes: {"true": fork, "false": fork}
+    fork_to: [right_a, right_b]
 coalesce:
   - name: merge_left
     branches: {left_a: left_a, left_b: left_b}

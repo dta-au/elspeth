@@ -2255,6 +2255,31 @@ sites:
   counterpart:
   - fork_branch_declared_by_multiple_gates
   - duplicate_connection_producer
+- key: be18e864d39c6632
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Fork gate ''{}'' closes at multiple barriers: {}. A fork closes entirely at ONE closer (spec
+    §7 rule 2). Split into nested forks — an outer pure fan-out whose bra'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fork_multiple_closers_invalid
+  note: state.py's WHOLE-ROSTER FORK CLOSURE block (immediately after the fork_branch_multiple_barriers
+    check) mirrors builder.py's ruling-23 rule 2 multi-closer split.
+- key: b300c3d4f274d17a
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Fork gate ''{}'' has mixed closure: branches {} close at a barrier while branches {} go direct
+    to a sink or an ordinary consumer. A fork is either fully bound — e'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fork_mixed_closure_invalid
+  note: state.py's WHOLE-ROSTER FORK CLOSURE block mirrors builder.py's ruling-23 rule 2 mixed-closure
+    rejection (re-keyed by the E2 wording fix — "go direct to a sink or an ordinary consumer" replaces
+    "go direct to sinks", since spec §7 E2 makes consumer-fed branches a second way to be unbound).
 - key: 3f1c08a2b4cf5536
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph
@@ -2289,6 +2314,21 @@ sites:
   - fork_branch_no_destination
   note: state.py:5572-5587 requires each fork_to name to be a coalesce/row_union branch key or a sink
     name — the same three-way destination rule as builder.py:728.
+- key: 2e143e69bce3ea77
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Gate ''{}'' has fork branch ''{}'' with {} downstream consumers: {}. A fork branch may feed
+    at most one consumer (use a gate for fan-out).'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - duplicate_connection_consumer
+  note: 'spec §7 E2: a fork branch consumed by >1 downstream transform/gate is not a NEW ambiguity class
+    — it is the same connection-namespace violation state.py already reports generically for any two nodes
+    sharing one input (_validate_runtime_route_destinations''s consumer_claims/duplicate_connection_consumer
+    block), verified empirically: two transforms both declaring input=<fork branch name> trips it today,
+    with no E2-specific code needed.'
 - key: 0ec43a980d71a7e4
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph
@@ -2470,6 +2510,18 @@ sites:
   - row_union_downstream_group_invalid
   note: state.py:5740-5753 rejects a coalesce/row_union downstream of a row_union's on_success with no
     intervening sink, the barrier arm of builder.py:1378-1391.
+- key: 51c6efb011fb0a96
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: '{} ''{}'' roster mismatch: closer declares {} but fork gate ''{}'' declares {}. Whole-roster
+    closure requires the closer''s branches to EQUAL the fork''s branch list '
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - fork_roster_mismatch
+  note: state.py's WHOLE-ROSTER FORK CLOSURE block mirrors builder.py's ruling-23 rule 2 roster-equality
+    check for a fully-bound fork's single closer.
 - key: 3113abc75ea18b67
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph._best_schema_config

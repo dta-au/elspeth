@@ -213,19 +213,25 @@ def build_group_binding_registry(
     bindings: list[GroupBinding] = []
 
     for gate_name, (gate_node_id, fork_to) in fork_rosters.items():
-        # A gate's fork_to is not required to be homogeneous: builder.py
-        # resolves each branch independently against coalesce/row_union
-        # specs or a direct sink name, so one gate can mix a bound branch
-        # with a sink-bound one, or (same-gate only) a coalesce branch with
-        # a row_union branch. "First bound branch wins, in fork_to order" is
-        # the brief's explicit interim (Task 6 rule 2 tightens this to
-        # reject a gate spanning two closers at build time — see the
-        # PINNED interim test in test_group_bindings.py for the exact
-        # divergence this produces against the legacy graph maps until
-        # then). Whichever closer wins, member_roster is filtered to ONLY
-        # the fork_to branches that actually resolve to THAT closer — a
-        # sink-bound or other-closer-bound sibling branch must never join
-        # the roster (review round 1, finding 1 Case A).
+        # builder.py resolves each fork_to branch independently against
+        # coalesce/row_union specs or a direct sink name, so this loop could
+        # in principle see a gate mixing a bound branch with a sink-bound
+        # one, or a coalesce branch with a row_union branch. Task 6's
+        # whole-roster fork closure (spec §7 rule 2 / ruling 23) now rejects
+        # both shapes upstream, at build time, before this registry is
+        # assembled — a fork gate reaching this loop is either fully bound
+        # to exactly ONE closer or fully unbound (pure fan-out, contributing
+        # no binding here at all). "First bound branch wins, in fork_to
+        # order" is therefore no longer a live interim: with rule 2
+        # enforced, resolved_coalesce and resolved_row_union can never both
+        # be reachable from a bound gate's fork_to, so the loop's `break` on
+        # first match is now provably a no-op tie-break rather than a
+        # meaningful choice. member_roster is still filtered to ONLY the
+        # fork_to branches that resolve to the (now-unique) closer, which
+        # for a bound gate is simply every branch in fork_to (review round
+        # 1, finding 1 Case A; see test_group_bindings.py for the retired
+        # interim tests that pinned the old mixed/multi-closer shapes as
+        # build-time rejections instead).
         resolved_coalesce: CoalesceName | None = None
         resolved_row_union: RowUnionName | None = None
         for branch in fork_to:

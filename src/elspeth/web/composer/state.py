@@ -2098,15 +2098,23 @@ def _validate_runtime_route_destinations(
         if candidate.node_type in ("coalesce", "row_union") and candidate.branches is not None
         for branch_name in (candidate.branches.keys() if isinstance(candidate.branches, Mapping) else candidate.branches)
     }
+    # Fourth path (spec §7 E2): a branch consumed by an ordinary downstream
+    # transform/gate `input` is legal pure fan-out — no barrier claims it.
+    # A SET, not a count: ambiguity (two nodes sharing the same `input`) is
+    # already reported once, clearly, by the duplicate_connection_consumer
+    # check below — this predicate only needs "at least one" to admit the
+    # branch as having a destination.
+    unbound_consumer_fed_inputs = {node.input for node in nodes if node.node_type in ("transform", "gate")}
     for node in nodes:
         if node.node_type == "gate" and node.fork_to:
             for branch in node.fork_to:
-                if branch not in barrier_branch_names and branch not in output_names:
+                if branch not in barrier_branch_names and branch not in output_names and branch not in unbound_consumer_fed_inputs:
                     errors.append(
                         _err(
                             f"node:{node.id}",
                             f"Gate '{node.id}' fork branch '{branch}' has no destination: it must be a key "
-                            "in some coalesce/row_union 'branches' mapping or match a sink name exactly. "
+                            "in some coalesce/row_union 'branches' mapping, match a sink name exactly, or be "
+                            "consumed by exactly one downstream transform/gate 'input'. "
                             f"Barrier branch keys: {sorted(barrier_branch_names)}; sinks: {sorted(output_names)}. "
                             "Key barrier branches by FORK BRANCH NAME, with each value naming the connection "
                             "that arrives at the barrier after any per-branch transforms.",
@@ -6587,6 +6595,82 @@ class CompositionState:
                     "fork_branch_multiple_barriers",
                 )
             )
+
+        # Stage-1 mirror of the DAG builder's whole-roster fork closure rule
+        # (core/dag/builder.py "WHOLE-ROSTER FORK CLOSURE", spec §7 rule 2 /
+        # ruling 23): a fork gate is either fully bound — every fork_to
+        # branch closes at the SAME barrier, roster-equal — or fully unbound
+        # (pure fan-out to sinks). Reuses gate_fork_branches_by_id and
+        # barrier_claimants computed above; a branch claimed by >1 barrier is
+        # already reported by fork_branch_multiple_barriers above, so this
+        # picks the first claimant and does not duplicate that finding.
+        barrier_node_by_id = {node.id: node for node in self.nodes if node.node_type in ("coalesce", "row_union")}
+        fork_closure_sink_names = {output.name for output in self.outputs}
+        # Fourth path (spec §7 E2): a branch consumed by an ordinary
+        # downstream transform/gate is unbound (pure fan-out), same as a
+        # direct sink match — mirrors builder.py's WHOLE-ROSTER FORK CLOSURE,
+        # which classifies unbound identically regardless of WHY it is
+        # unbound (sink match vs. consumer-fed).
+        fork_closure_consumer_fed_inputs = {node.input for node in self.nodes if node.node_type in ("transform", "gate")}
+        for gate_id, fork_branches in gate_fork_branches_by_id.items():
+            closer_labels: dict[str, str] = {}
+            unbound_branches: list[str] = []
+            for branch in fork_branches:
+                branch_claimants = barrier_claimants.get(branch)
+                if branch_claimants:
+                    claimant_node = barrier_node_by_id.get(branch_claimants[0])
+                    claimant_kind = claimant_node.node_type if claimant_node is not None else "coalesce"
+                    closer_labels[branch] = f"{claimant_kind}:{branch_claimants[0]}"
+                elif branch in fork_closure_sink_names or branch in fork_closure_consumer_fed_inputs:
+                    unbound_branches.append(branch)
+                # Neither a barrier alias, a sink name, nor a downstream
+                # consumer: an undeclared destination, owned by the
+                # runtime-connection/edge-route checks elsewhere in this
+                # method. Skip it here rather than report a misleading
+                # mixed-closure/roster finding on top.
+            if closer_labels and unbound_branches:
+                errors.append(
+                    _err(
+                        f"node:{gate_id}",
+                        f"Fork gate '{gate_id}' has mixed closure: branches {sorted(closer_labels)} close at a "
+                        f"barrier while branches {sorted(unbound_branches)} go direct to a sink or an ordinary "
+                        "consumer. A fork is either "
+                        "fully bound — every declared branch flows to the fork's single closer — or fully "
+                        "unbound (pure fan-out). Route every branch to the closer, or none (spec §7 rule 2).",
+                        "high",
+                        "fork_mixed_closure_invalid",
+                    )
+                )
+                continue
+            distinct_closers = sorted(set(closer_labels.values()))
+            if len(distinct_closers) > 1:
+                errors.append(
+                    _err(
+                        f"node:{gate_id}",
+                        f"Fork gate '{gate_id}' closes at multiple barriers: {distinct_closers}. "
+                        "A fork closes entirely at ONE closer (spec §7 rule 2). Split into nested forks — an "
+                        "outer pure fan-out whose branches each contain their own fork→closer pair.",
+                        "high",
+                        "fork_multiple_closers_invalid",
+                    )
+                )
+                continue
+            if len(distinct_closers) == 1:
+                closer_kind, _, closer_id = distinct_closers[0].partition(":")
+                closer_node = barrier_node_by_id.get(closer_id)
+                declared = frozenset(_coalesce_branch_names(closer_node.branches)) if closer_node is not None else frozenset()
+                if declared != fork_branches:
+                    errors.append(
+                        _err(
+                            f"node:{closer_id}",
+                            f"{'Coalesce' if closer_kind == 'coalesce' else 'row_union'} '{closer_id}' roster mismatch: "
+                            f"closer declares {sorted(declared)} but fork gate '{gate_id}' declares "
+                            f"{sorted(fork_branches)}. Whole-roster closure requires the closer's branches "
+                            "to EQUAL the fork's branch list (spec §7 rule 2).",
+                            "high",
+                            "fork_roster_mismatch",
+                        )
+                    )
 
         for node in self.nodes:
             if node.node_type == "coalesce":

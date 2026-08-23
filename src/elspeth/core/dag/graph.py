@@ -93,6 +93,11 @@ class ExecutionGraph:
         self._collector_id_map: dict[CollectorName, NodeID] = {}  # collector_name -> node_id
         self._coalesce_id_map: dict[CoalesceName, NodeID] = {}  # coalesce_name -> node_id
         self._branch_info: dict[BranchName, BranchInfo] = {}  # branch_name -> coalesce + gate info
+        # Unbound (no barrier) fork branches consumed by exactly one ordinary
+        # downstream transform/gate (spec §7 E2): branch_name -> that
+        # consumer's node id, the one-hop destination — no backward trace
+        # needed, since the edge IS the direct gate->consumer MOVE edge.
+        self._unbound_branch_first_nodes: dict[BranchName, NodeID] = {}
         self._row_union_id_map: dict[RowUnionName, NodeID] = {}  # row_union_name -> node_id
         self._branch_to_row_union: dict[BranchName, RowUnionName] = {}  # fork branch -> row_union
         self._row_union_branch_gates: dict[BranchName, NodeID] = {}  # fork branch -> owning gate node
@@ -844,6 +849,11 @@ class ExecutionGraph:
         self._assert_build_metadata_mutable()
         self._branch_info = dict(mapping)
 
+    def set_unbound_branch_first_nodes(self, mapping: dict[BranchName, NodeID]) -> None:
+        """Set the unbound (no barrier) consumer-fed branch_name -> first-node mapping (spec §7 E2)."""
+        self._assert_build_metadata_mutable()
+        self._unbound_branch_first_nodes = dict(mapping)
+
     def set_route_label_map(self, mapping: dict[tuple[NodeID, SinkName], str]) -> None:
         """Set the (gate_node, sink_name) -> route_label mapping."""
         self._assert_build_metadata_mutable()
@@ -1119,6 +1129,12 @@ class ExecutionGraph:
                 )
                 result[branch_name] = first_node
 
+        # Unbound (no barrier) consumer-fed branches (spec §7 E2): the
+        # mapping is precomputed at build time as a direct fact (the one-hop
+        # gate->consumer MOVE edge), never derived via backward trace — there
+        # is no barrier to trace back FROM.
+        result.update({str(branch_name): node_id for branch_name, node_id in self._unbound_branch_first_nodes.items()})
+
         return result
 
     def _trace_branch_endpoints(
@@ -1238,6 +1254,15 @@ class ExecutionGraph:
             if data["mode"] == RoutingMode.COPY and NodeID(to_id) in sink_node_to_name:
                 result[BranchName(data["label"])] = sink_node_to_name[NodeID(to_id)]
         return result
+
+    def get_unbound_branch_first_nodes(self) -> dict[BranchName, NodeID]:
+        """Get unbound (no barrier) consumer-fed branch_name -> first-node mapping (spec §7 E2).
+
+        Disjoint from ``get_branch_to_sink_map`` (direct sink match) and the
+        coalesce/row_union branch maps — a fork branch is exactly one of
+        closer-bound, sink-bound, or consumer-fed.
+        """
+        return dict(self._unbound_branch_first_nodes)
 
     def get_branch_gate_map(self) -> dict[BranchName, NodeID]:
         """Get branch_name -> producing gate node ID mapping.

@@ -14,6 +14,7 @@ from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionNa
 from elspeth.core.config import CoalesceSettings, GateSettings, RowUnionSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
+from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.dag.wiring import WiredTransform
 
 
@@ -258,10 +259,17 @@ def test_derived_views_reproduce_graph_maps_exactly() -> None:
 def _build_mixed_coalesce_sink_branch_graph() -> ExecutionGraph:
     """Fork gate mixing a coalesce-bound pair with a direct-to-sink branch.
 
-    Authorable today (builder.py resolves each fork_to branch independently
-    against coalesce/row_union specs or a direct sink name — "option 3" is a
-    branch name that matches a sink exactly, with no barrier at all).
-    Regression fixture for review round 1 finding 1 Case A.
+    Was authorable when this fixture was written (builder.py resolved each
+    fork_to branch independently against coalesce/row_union specs or a
+    direct sink name — "option 3" is a branch name that matches a sink
+    exactly, with no barrier at all). Regression fixture for review round 1
+    finding 1 Case A. Task 6's whole-roster fork closure (spec §7 rule 2 /
+    ruling 23) now rejects this exact shape at build time: 'fast_branch' and
+    'slow_branch' close at a barrier while 'direct_branch' goes direct to a
+    sink — a mixed fork. The fixture is kept (it still constructs the
+    settings/graph inputs; the build call itself is expected to raise) so
+    the rejection has a concrete regression test rather than only Task 6's
+    own builder fixtures.
     """
     source = _GroupBindingsMockSource()
 
@@ -296,25 +304,16 @@ def _build_mixed_coalesce_sink_branch_graph() -> ExecutionGraph:
 
 
 def test_mixed_coalesce_and_sink_branch_roster_excludes_sink_branch() -> None:
-    """Review round 1 finding 1 Case A: member_roster must be filtered to
-    only the branches that resolve to the WINNING closer, never the gate's
-    whole fork_to — a sink-bound sibling branch must never join the roster,
-    and its frames must stay inert (binding_for -> None)."""
-    graph = _build_mixed_coalesce_sink_branch_graph()
-    registry = graph.get_group_bindings()
-
-    assert registry.branch_to_coalesce() == graph.get_branch_to_coalesce_map()
-    assert registry.branch_to_coalesce() == {
-        BranchName("fast_branch"): CoalesceName("merge_results"),
-        BranchName("slow_branch"): CoalesceName("merge_results"),
-    }
-
-    splitter_bindings = [b for b in registry.bindings if b.opener_name == "splitter"]
-    assert len(splitter_bindings) == 1
-    assert splitter_bindings[0].member_roster == ("fast_branch", "slow_branch")
-
-    frame = LineageFrame(kind=FrameKind.FORK, group_id="fg_1", member_key="direct_branch")
-    assert registry.binding_for(frame) is None
+    """Review round 1 finding 1 Case A pinned that member_roster must be
+    filtered to only the branches that resolve to the WINNING closer, never
+    the gate's whole fork_to — a sink-bound sibling branch must never join
+    the roster. Task 6's whole-roster fork closure (spec §7 rule 2 / ruling
+    23) closes that interim era: the mixed shape this fixture builds is now
+    a build-time rejection ("mixed closure"), so the roster-filtering
+    question this test asked can no longer arise — the graph that would
+    need it never builds."""
+    with pytest.raises(GraphValidationError, match="mixed closure"):
+        _build_mixed_coalesce_sink_branch_graph()
 
 
 def _build_mixed_coalesce_row_union_graph() -> ExecutionGraph:
@@ -322,16 +321,14 @@ def _build_mixed_coalesce_row_union_graph() -> ExecutionGraph:
 
     Same-gate mixing is unconstrained by builder.py's ancestor/descendant and
     unrelated-fork-origin row_union checks (those only guard branches
-    arriving from DIFFERENT gates), so this topology is authorable today —
-    review round 1 finding 1 Case B. A one-binding-per-gate registry cannot
-    represent two different closers for one gate, so "first bound branch
-    wins" (this task's explicit brief-sanctioned interim, pending Task 6's
-    rule 2) means the WHOLE gate's binding goes to whichever closer its
-    first fork_to entry resolves to; the other closer's branches get NO
-    binding at all here. This is a KNOWN, PINNED divergence from the legacy
-    graph maps — interim by design — not a bug: filtering member_roster
-    (Case A's fix) stops a binding from claiming members it shouldn't, but a
-    gate spanning two closers is a shape only Task 6's rule 2 can reject.
+    arriving from DIFFERENT gates), so this topology was authorable when
+    this fixture was written — review round 1 finding 1 Case B. Task 6's
+    whole-roster fork closure (spec §7 rule 2 / ruling 23) is exactly what
+    was pending: a fork whose branches split across two different closers
+    (here a coalesce and a row_union) is now a build-time rejection ("closes
+    at multiple barriers"). The "first bound branch wins" interim this
+    docstring used to describe is retired — this shape never reaches the
+    group-bindings registry any more.
     """
     source = _GroupBindingsMockSource()
 
@@ -376,35 +373,18 @@ def _build_mixed_coalesce_row_union_graph() -> ExecutionGraph:
 
 
 def test_mixed_coalesce_and_row_union_same_gate_is_pinned_interim() -> None:
-    """PINNED interim (review round 1 finding 1 Case B). "First bound branch
-    wins" means the whole gate's binding goes to the coalesce here
-    (fast_branch precedes ru_a in fork_to); the row_union branches resolve
-    to NO binding. They are not mis-attributed to the coalesce (that was the
-    actual bug Case A's filter fixed) — they are simply unbound until Task
-    6's rule 2 rejects this topology at build time. The registry's derived
-    view therefore legitimately diverges from the graph's legacy row_union
-    map for exactly this interim-only shape.
+    """Formerly a PINNED interim (review round 1 finding 1 Case B): a
+    one-binding-per-gate registry could not represent two different closers
+    for one gate, so "first bound branch wins" left the row_union branches
+    unbound rather than mis-attributed. That interim era ended here: Task
+    6's whole-roster fork closure (spec §7 rule 2 / ruling 23) now rejects
+    this exact shape at build time — a fork closing at two different
+    barriers ("closes at multiple barriers") — so the registry never sees
+    it and the interim's own question (what does the registry do with the
+    unbound half) no longer applies.
     """
-    graph = _build_mixed_coalesce_row_union_graph()
-    registry = graph.get_group_bindings()
-
-    assert len(registry.bindings) == 1
-    binding = registry.bindings[0]
-    assert binding.opener_name == "splitter"
-    assert binding.closer_kind is CloserKind.COALESCE
-    assert binding.closer_name == "merge_results"
-    assert binding.member_roster == ("fast_branch", "slow_branch")
-
-    assert registry.binding_for(LineageFrame(kind=FrameKind.FORK, group_id="fg_1", member_key="ru_a")) is None
-    assert registry.binding_for(LineageFrame(kind=FrameKind.FORK, group_id="fg_1", member_key="ru_b")) is None
-
-    # The legacy graph map still carries ru_a/ru_b — this is the documented
-    # divergence, not something the registry is expected to reproduce here.
-    assert graph.get_branch_to_row_union_map() == {
-        BranchName("ru_a"): RowUnionName("variant_union"),
-        BranchName("ru_b"): RowUnionName("variant_union"),
-    }
-    assert registry.branch_to_row_union() == {}
+    with pytest.raises(GraphValidationError, match="closes at multiple barriers"):
+        _build_mixed_coalesce_row_union_graph()
 
 
 def _build_fork_row_union_graph() -> ExecutionGraph:

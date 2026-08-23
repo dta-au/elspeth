@@ -448,7 +448,24 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
 # unchanged and preserve their declaration order.
 # Rotated again for elspeth-3875f3b381: one executable row-union recovery
 # reference was added; all 111 prior references are unchanged.
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "4bfe774eeb61ef5fb6db5b66568abe8191fa98ff8abc072237ea65b940b4e31c"
+# 2026-08-23 parallel-coalesces migrated for ruling 23 (spec §7 rule 2, whole-roster
+# fork closure): the old topology (one fork closing at TWO sibling coalesces)
+# is a build-time rejection. Rewritten per RC-3's ratified text (protocols
+# plan §RC-3) as topology B — an outer pure-fan-out fork opening two disjoint
+# depth-1 regions (spec decision 6: an unbound fork adds no depth, so this is
+# NOT the "nested depth-2" RC-3's own prose mislabeled it, corrected here),
+# each an independent whole-roster fork closing at its own require-all
+# coalesce with its own sink — enabled by the E2 fix (a fork branch may feed
+# an ordinary downstream consumer). Only the harness-parallel-coalesces-two-
+# parallel-require-all and harness-parallel-coalesces-resume-after-left-finalize
+# claim texts and this registry hash moved; the recovery case's own fault
+# semantics (first sink finalizes, second held, idempotent resume) are
+# UNCHANGED — only its graph-shape assertions (node/edge/token/parent counts)
+# were updated to the new topology's real observed values. A/B: old manifest
+# verified against pre-migration HEAD b5b92c2b5 (WS2 Task 6 BASE); new
+# manifest verified against this commit's harness run (real observed
+# projection_sha256/counts captured via the corpus harness, never hand-computed).
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "7c8e3ad1d9ca8df0d166bc75b2d903a499109c1b3f8bd1a526da83f45f52cc7a"
 # Digests the FULL case content, so it moves whenever a pinned expected
 # projection does — including a plugin ``source_file_hash`` refresh reaching the
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
@@ -566,7 +583,13 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "4bfe774eeb61ef5fb6db5b66568abe8191fa98ff8ab
 # untouched, not the sanctioned row-union-interleave exception) now compares
 # byte-identical to the live surface after only this manifest field moved —
 # confirming the divergence was the stale pin, not a resume/replay defect.
-EXPECTED_CASE_REGISTRY_SHA256 = "2ece01445d96144b14a8960e33ac3ceba0d290ba23b780296298c384c6381de6"
+# 2026-08-23 parallel-coalesces migrated for ruling 23 / E2 — see the dated
+# note above EXPECTED_EVIDENCE_REGISTRY_SHA256 for the full A/B record. This
+# registry hashes each case's full model_dump (including `expected`), so the
+# hash moves here because the run case's expected projection (sink rows,
+# sha256, counts) is now real observed data from the migrated topology —
+# both cases keep their ids, workflow, and output_artifacts unchanged.
+EXPECTED_CASE_REGISTRY_SHA256 = "86780dccdd3708db2a69422e21c0a6266b14cdf3b96859e143ef705468597c5f"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -631,8 +654,8 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "fork-coalesce-policies:union-collision-fail": "973269df09a38f4beabc778c2b06365a10363444229530974e71888f98a4d57f",
     "sequential-nested-fork-coalesce:two-sequential-require-all": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
     "sequential-nested-fork-coalesce:reopen-terminal-publication": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
-    "parallel-coalesces:two-parallel-require-all": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
-    "parallel-coalesces:resume-after-left-finalize": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
+    "parallel-coalesces:two-parallel-require-all": "41399be936e2425b392b5b241c2b2a87f69e6a2d3423dcd6519b2b99701614df",
+    "parallel-coalesces:resume-after-left-finalize": "41399be936e2425b392b5b241c2b2a87f69e6a2d3423dcd6519b2b99701614df",
     "aggregation-immutable-batch:eof-immutable-membership": "0a6a82b9fbe15356ccf0437bf34b72e3324b6884b8990752c05943e0179fb9cb",
     "aggregation-immutable-batch:resume-after-eof-flush-fault": "c72db99d6e9394db19beaa46770fbdd67ef86ae5b0364bf83094b01bd33945d8",
     "row-expansion-parent-child-recovery:json-explode-parent-child": "bf40f9a9fd913518566c36bd27a0530d6edaed40dde67b69642eabacc48716ed",
@@ -851,11 +874,21 @@ EXPECTED_PARALLEL_COALESCE_YAML = b"""sources:
 concurrency:
   max_workers: 1
 gates:
-  - name: parallel_fork
+  - name: outer_fork
     input: fork_input
     condition: "True"
-    routes: {"true": fork, "false": left}
-    fork_to: [left_a, left_b, right_a, right_b]
+    routes: {"true": fork, "false": fork}
+    fork_to: [left_path, right_path]
+  - name: left_fork
+    input: left_path
+    condition: "True"
+    routes: {"true": fork, "false": fork}
+    fork_to: [left_a, left_b]
+  - name: right_fork
+    input: right_path
+    condition: "True"
+    routes: {"true": fork, "false": fork}
+    fork_to: [right_a, right_b]
 coalesce:
   - name: merge_left
     branches: {left_a: left_a, left_b: left_b}

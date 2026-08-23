@@ -510,6 +510,23 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "fork branch name in the gate's fork_to and wire that branch to it.",
     ),
     (
+        r"fork_mixed_closure_invalid",
+        "A fork routes some branches to a barrier and others direct to sinks. A fork is either fully "
+        "bound (every branch reaches its one closer) or fully unbound (pure fan-out).",
+        "Route every fork branch to the same coalesce/row_union, or route every branch direct to sinks. "
+        "For a partial merge, use nested forks: an outer fan-out whose branch contains its own fork and closer.",
+    ),
+    (
+        r"fork_multiple_closers_invalid",
+        "One fork's branches close at two different barriers, so no single roster can settle the group.",
+        "Give each barrier its own fork: split into nested forks, each closing whole-roster at one barrier.",
+    ),
+    (
+        r"fork_roster_mismatch",
+        "The barrier's declared branches do not equal the fork's declared branch list — whole-roster closure requires exact equality.",
+        "Make the coalesce/row_union branches keys exactly the gate's fork_to list — same names, none added, none missing.",
+    ),
+    (
         r"gate_duplicate_fork_branch",
         "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
         "Remove duplicate entries from the gate's fork_to list while preserving the intended unique branch order.",
@@ -1103,6 +1120,12 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # only join at one barrier" rule for coalesce/coalesce, coalesce/row_union
     # and row_union/row_union claims.
     "fork_branch_multiple_barriers",
+    # Whole-roster fork closure (spec §7 rule 2 / ruling 23): a fork is fully
+    # bound (every branch reaches its one closer, rosters equal) or fully
+    # unbound (pure fan-out) — never a mix, and never split across closers.
+    "fork_mixed_closure_invalid",
+    "fork_multiple_closers_invalid",
+    "fork_roster_mismatch",
     "gate_duplicate_fork_branch",
     "transform_missing_on_success",
     "transform_missing_on_error",

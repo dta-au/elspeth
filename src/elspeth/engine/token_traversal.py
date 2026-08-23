@@ -700,6 +700,22 @@ class TokenTraversalEngine:
                         current_node_id=None,
                     )
                 )
+            elif (
+                cfg_coalesce_name is None
+                and cfg_row_union_name is None
+                and cfg_branch_name
+                and BranchName(cfg_branch_name) in self._processor._unbound_branch_first_node
+            ):
+                # fork -> ordinary consumer, no barrier at all (spec §7 E2):
+                # dispatch straight to the branch's one consuming node.
+                # create_continuation's coalesce/row_union-only barrier path
+                # does not apply here — there is no barrier to restore.
+                child_items.append(
+                    self._processor._work_items.create(
+                        token=child_token,
+                        current_node_id=self._processor._unbound_branch_first_node[BranchName(cfg_branch_name)],
+                    )
+                )
             else:
                 child_items.append(
                     self._processor._work_items.create_continuation(

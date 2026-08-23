@@ -26,6 +26,7 @@ import pytest
 from tests.fixtures.dag_scenario_corpus import oracle_freeze
 from tests.fixtures.dag_scenario_corpus.harness import run_scenario_case
 from tests.fixtures.dag_scenario_corpus.loader import iter_harness_cases, load_manifest
+from tests.fixtures.dag_scenario_corpus.oracle_freeze import RETIRED_ROOT
 from tests.fixtures.dag_scenario_corpus.plugins import install_corpus_plugin_manager
 from tests.fixtures.dag_scenario_corpus.schema import BuildExpectation, HarnessCaseSpec, ScenarioSpec
 
@@ -53,6 +54,23 @@ def test_frozen_oracle_surface(
             "authoritative (protocols plan §S1). No scenario is contested today; "
             "a new CONTESTED entry fails closed here by design."
         )
+
+    if classification is oracle_freeze.OracleClass.RULING_CASUALTY_WS2:
+        retired_migration = RETIRED_ROOT / scenario.id / "MIGRATION.md"
+        if retired_migration.exists():
+            # The class's own definition: RULING_CASUALTY_WS2 "leaves the
+            # frozen set at WS2 only with an adjudicated MIGRATION.md" —
+            # once retired, the live surface is deliberately incomparable to
+            # the pre-migration snapshot (that is the whole point of the
+            # migration), so the byte-identical/invariant-subset checks below
+            # do not apply to this case any more.
+            pytest.skip(
+                f"{scenario.id!r} is a RULING_CASUALTY_WS2 scenario retired via §S3 "
+                f"({retired_migration}); its migrated surface is no longer compared "
+                "against the pre-migration frozen snapshot."
+            )
+        # Not yet retired: still frozen, compared exactly like FROZEN below —
+        # a RULING_CASUALTY_WS2 classification alone grants no exemption.
 
     install_corpus_plugin_manager(monkeypatch)
     evidence = run_scenario_case(scenario, case, tmp_path)
