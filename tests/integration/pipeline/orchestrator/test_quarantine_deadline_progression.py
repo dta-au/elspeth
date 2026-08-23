@@ -361,7 +361,9 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
         ``test_coalesce_timeout_resolves_a_pending_barrier_at_a_
         quarantine_boundary_not_eof`` below, which hand-accepts a
         genuinely overdue barrier directly against a real
-        ``CoalesceExecutor`` instead of requiring a live run to produce it.
+        ``CoalesceExecutor`` instead of requiring a live run to produce it
+        (WS4 restoration tracked as elspeth-ad0c4980fd, sibling of
+        elspeth-c648d4f832).
         """
         clock = MockClock(start=1_750_000_000.0)
         source = _QuarantineStreamSource(clock=clock, on_success="fork_input")

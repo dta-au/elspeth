@@ -772,7 +772,8 @@ class TestInterruptAndResume:
           ``fork_group_id`` that outlives finalization while its owning
           token still gets swept as undecided — is rebuilt at the engine
           level in ``test_pending_coalesce_barrier_survives_finalization_
-          and_its_token_is_abandoned`` below.
+          and_its_token_is_abandoned`` below (WS4 restoration tracked as
+          elspeth-ad0c4980fd, sibling of elspeth-c648d4f832).
         """
         shutdown_event = threading.Event()
         with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region"):

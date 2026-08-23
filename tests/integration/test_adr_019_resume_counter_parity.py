@@ -587,7 +587,7 @@ def test_quorum_timeout_coalesce_branch_hold_is_rejected_by_rule_6() -> None:
     `test_resume_derives_rows_coalesce_failed_from_durable_audit` below,
     which hand-builds the durable FAILED node_states this rule-6 rejection
     would otherwise have required a live run to produce (WS4 restoration
-    tracked as elspeth ticket TBD, sibling of elspeth-c648d4f832).
+    tracked as elspeth-ad0c4980fd, sibling of elspeth-c648d4f832).
     """
     with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region"):
         _build_quorum_timeout_coalesce(MockClock(start=1000.0), [{"value": 10}, {"value": 20}, {"value": 30}])
