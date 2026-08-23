@@ -465,11 +465,6 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Wire each branch transform's on_success to the matching row_union branches value.",
     ),
     (
-        r"row_union_branch_origin_invalid",
-        "The row_union branch aliases come from more than one gate, so the reconverged rows have no single correlation origin.",
-        "Pick every branches key from one gate's fork_to, or add a separate row_union for each fork.",
-    ),
-    (
         r"row_union_branch_not_downstream",
         "A row_union branch alias maps to a connection that is not downstream of that alias's own fork edge.",
         "Wire each branches[alias] value through processing that starts at the matching gate fork branch.",
@@ -1108,7 +1103,6 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "row_union_timeout_invalid",
     "row_union_branch_alias_unreachable",
     "row_union_branch_unreachable",
-    "row_union_branch_origin_invalid",
     "row_union_branch_not_downstream",
     "row_union_branch_aggregation_invalid",
     "row_union_nested_fork_invalid",

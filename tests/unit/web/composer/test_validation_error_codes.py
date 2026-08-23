@@ -325,7 +325,6 @@ class TestClosedCodeCatalogueInvariants:
             "row_union_timeout_invalid",
             "row_union_branch_alias_unreachable",
             "row_union_branch_unreachable",
-            "row_union_branch_origin_invalid",
             "row_union_branch_not_downstream",
             "row_union_branch_aggregation_invalid",
             "row_union_nested_fork_invalid",
@@ -457,26 +456,20 @@ class TestClosedCodeCatalogueInvariants:
         intrinsic = explain_validation_code("row_union_branch_invalid")
         assert intrinsic is not None
 
-        origin = explain_validation_code("row_union_branch_origin_invalid")
-        assert origin is not None
-        assert origin != intrinsic
-        assert "gate" in origin[0] or "gate" in origin[1]
-
         downstream = explain_validation_code("row_union_branch_not_downstream")
         assert downstream is not None
         assert downstream != intrinsic
-        assert downstream != origin
         assert "downstream" in downstream[0] or "downstream" in downstream[1]
 
         branch_aggregation = explain_validation_code("row_union_branch_aggregation_invalid")
         assert branch_aggregation is not None
-        assert branch_aggregation not in (intrinsic, origin, downstream)
+        assert branch_aggregation not in (intrinsic, downstream)
         assert "passthrough" in branch_aggregation[1]
         assert "trigger" not in branch_aggregation[1]
 
         nested_fork = explain_validation_code("row_union_nested_fork_invalid")
         assert nested_fork is not None
-        assert nested_fork not in (intrinsic, origin, downstream, branch_aggregation)
+        assert nested_fork not in (intrinsic, downstream, branch_aggregation)
         assert "nested fork" in nested_fork[0].lower()
         assert "before" in nested_fork[1] or "terminate" in nested_fork[1]
 
@@ -487,14 +480,14 @@ class TestClosedCodeCatalogueInvariants:
 
         downstream_group = explain_validation_code("row_union_downstream_group_invalid")
         assert downstream_group is not None
-        assert downstream_group not in (intrinsic, origin, downstream, branch_aggregation, nested_fork)
+        assert downstream_group not in (intrinsic, downstream, branch_aggregation, nested_fork)
         assert "indivisible" in downstream_group[0] or "indivisible" in downstream_group[1]
         assert "end_of_source" in downstream_group[1]
         assert "branches" not in downstream_group[1]
 
         schema_incompatible = explain_validation_code("row_union_schema_incompatible")
         assert schema_incompatible is not None
-        assert schema_incompatible not in (intrinsic, origin, downstream, downstream_group)
+        assert schema_incompatible not in (intrinsic, downstream, downstream_group)
         assert "long-format" in schema_incompatible[0]
         assert "row_union_schema" in schema_incompatible[1]
 
@@ -502,7 +495,7 @@ class TestClosedCodeCatalogueInvariants:
         # must not fall through to any row_union node-shape entry either.
         multiple_barriers = explain_validation_code("fork_branch_multiple_barriers")
         assert multiple_barriers is not None
-        assert multiple_barriers not in (intrinsic, origin, downstream)
+        assert multiple_barriers not in (intrinsic, downstream)
         assert "barrier" in multiple_barriers[0]
 
     def test_query_template_unbound_row_fields_resolves_to_multi_query_guidance(self) -> None:

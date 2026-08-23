@@ -17001,7 +17001,6 @@ class TestRowUnionTopologyCodesDoNotBlockUnrelatedMutations:
         )
 
         topology_codes = {
-            "row_union_branch_origin_invalid",
             "row_union_branch_not_downstream",
             "row_union_downstream_group_invalid",
             "row_union_schema_incompatible",
