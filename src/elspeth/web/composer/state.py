@@ -6765,128 +6765,121 @@ class CompositionState:
                             "row_union_branch_unreachable",
                         )
                     )
-                # Correlation-origin and downstream-lineage checks. These are
-                # topology findings like their unreachable siblings above, so
-                # they carry their own codes: sharing the intrinsic
-                # ``row_union_branch_invalid`` code put them in the tool
-                # layer's mutation-blocking preflight, where completing the
-                # topology from an unrelated node rolled that node's mutation
-                # back with an error naming the mis-wired row_union.
+                # Downstream-lineage checks. These are topology findings like
+                # their unreachable siblings above, so they carry their own
+                # codes: sharing the intrinsic ``row_union_branch_invalid``
+                # code put them in the tool layer's mutation-blocking
+                # preflight, where completing the topology from an unrelated
+                # node rolled that node's mutation back with an error naming
+                # the mis-wired row_union.
+                #
+                # The correlation-origin check that used to gate this section
+                # (aliases must share one common gate fork_to) is deleted:
+                # the Stage-1 mirror of core/dag/builder.py's WHOLE-ROSTER
+                # FORK CLOSURE rule (fork_roster_mismatch, above) provably
+                # pre-empts it for every shape it caught — a closer whose
+                # roster spans more than one gate's fork_to can never equal
+                # any single contributing gate's own roster (maintainer
+                # ruling 2026-08-23; dead code deleted per prerelease
+                # no-dead-code doctrine, mirroring the builder-side deletion
+                # of the same analysis). Lineage/aggregation/nested-fork
+                # checks below don't depend on a single common origin, so
+                # they now run unconditionally once aliases/connections are
+                # reachable.
                 if not missing_aliases and not missing_branches:
-                    common_gate_ids = sorted(
-                        gate_id
-                        for gate_id, fork_branches in gate_fork_branches_by_id.items()
-                        if set(branch_aliases).issubset(fork_branches)
-                    )
-                    if not common_gate_ids:
-                        alias_origins = ", ".join(
-                            f"'{alias}' from {sorted(gate_id for gate_id, branches in gate_fork_branches_by_id.items() if alias in branches)}"
-                            for alias in branch_aliases
+                    branch_lineages: list[tuple[str, tuple[NodeSpec, ...]]] = []
+                    lineage_is_valid = True
+                    for branch_alias, branch_connection in zip(branch_aliases, branch_connections, strict=True):
+                        is_downstream, lineage = _runtime_connection_lineage(
+                            branch_alias,
+                            branch_connection,
+                            self.sources,
+                            self.nodes,
                         )
+                        if is_downstream:
+                            branch_lineages.append((branch_alias, lineage))
+                            continue
+                        lineage_is_valid = False
                         errors.append(
                             _err(
                                 f"node:{node.id}",
-                                f"row_union '{node.id}' branch aliases must all come from one common gate fork_to "
-                                f"so they share one correlation origin; observed {alias_origins}. "
-                                "Choose every alias from a single gate or create a separate row_union per fork.",
+                                f"row_union '{node.id}' branch alias '{branch_alias}' maps to input connection "
+                                f"'{branch_connection}', which is not downstream of that alias's fork edge. "
+                                "Wire each branches[alias] value through processing that starts at the same gate fork branch.",
                                 "high",
-                                "row_union_branch_origin_invalid",
+                                "row_union_branch_not_downstream",
                             )
                         )
-                    else:
-                        branch_lineages: list[tuple[str, tuple[NodeSpec, ...]]] = []
-                        lineage_is_valid = True
-                        for branch_alias, branch_connection in zip(branch_aliases, branch_connections, strict=True):
-                            is_downstream, lineage = _runtime_connection_lineage(
-                                branch_alias,
-                                branch_connection,
-                                self.sources,
-                                self.nodes,
-                            )
-                            if is_downstream:
-                                branch_lineages.append((branch_alias, lineage))
-                                continue
-                            lineage_is_valid = False
+                    if lineage_is_valid:
+                        branch_aggregations: dict[str, tuple[NodeSpec, str]] = {}
+                        nested_forks: dict[str, tuple[NodeSpec, str]] = {}
+                        for branch_alias, lineage in branch_lineages:
+                            for ancestor in lineage:
+                                if ancestor.node_type == "aggregation" and ancestor.output_mode in (None, "transform"):
+                                    branch_aggregations.setdefault(ancestor.id, (ancestor, branch_alias))
+                                if ancestor.node_type == "gate" and ancestor.fork_to:
+                                    nested_forks.setdefault(ancestor.id, (ancestor, branch_alias))
+                        for aggregation, branch_alias in branch_aggregations.values():
                             errors.append(
                                 _err(
                                     f"node:{node.id}",
-                                    f"row_union '{node.id}' branch alias '{branch_alias}' maps to input connection "
-                                    f"'{branch_connection}', which is not downstream of that alias's fork edge. "
-                                    "Wire each branches[alias] value through processing that starts at the same gate fork branch.",
+                                    f"Aggregation '{aggregation.id}' is inside fork branch '{branch_alias}' that feeds "
+                                    f"row_union '{node.id}' and uses output_mode 'transform' (the default). "
+                                    "A transform-mode flush emits its rows from a single buffered parent token, "
+                                    "so every emitted row carries that parent's row_id and the union group can never "
+                                    f"be satisfied. Set 'output_mode: passthrough' on '{aggregation.id}' so each row "
+                                    "keeps its own identity, or move the aggregation upstream of the originating fork.",
                                     "high",
-                                    "row_union_branch_not_downstream",
+                                    "row_union_branch_aggregation_invalid",
                                 )
                             )
-                        if lineage_is_valid:
-                            branch_aggregations: dict[str, tuple[NodeSpec, str]] = {}
-                            nested_forks: dict[str, tuple[NodeSpec, str]] = {}
-                            for branch_alias, lineage in branch_lineages:
-                                for ancestor in lineage:
-                                    if ancestor.node_type == "aggregation" and ancestor.output_mode in (None, "transform"):
-                                        branch_aggregations.setdefault(ancestor.id, (ancestor, branch_alias))
-                                    if ancestor.node_type == "gate" and ancestor.fork_to:
-                                        nested_forks.setdefault(ancestor.id, (ancestor, branch_alias))
-                            for aggregation, branch_alias in branch_aggregations.values():
-                                errors.append(
-                                    _err(
-                                        f"node:{node.id}",
-                                        f"Aggregation '{aggregation.id}' is inside fork branch '{branch_alias}' that feeds "
-                                        f"row_union '{node.id}' and uses output_mode 'transform' (the default). "
-                                        "A transform-mode flush emits its rows from a single buffered parent token, "
-                                        "so every emitted row carries that parent's row_id and the union group can never "
-                                        f"be satisfied. Set 'output_mode: passthrough' on '{aggregation.id}' so each row "
-                                        "keeps its own identity, or move the aggregation upstream of the originating fork.",
-                                        "high",
-                                        "row_union_branch_aggregation_invalid",
-                                    )
+                        for nested_fork, branch_alias in nested_forks.values():
+                            errors.append(
+                                _err(
+                                    f"node:{node.id}",
+                                    f"Fork gate '{nested_fork.id}' is nested inside fork branch '{branch_alias}' that "
+                                    f"feeds row_union '{node.id}'. A nested fork replaces the enclosing branch identity, "
+                                    "so the union group can never be satisfied. Move the nested fork before the fork "
+                                    f"that produces '{branch_alias}', or terminate that branch at a sink.",
+                                    "high",
+                                    "row_union_nested_fork_invalid",
                                 )
-                            for nested_fork, branch_alias in nested_forks.values():
-                                errors.append(
-                                    _err(
-                                        f"node:{node.id}",
-                                        f"Fork gate '{nested_fork.id}' is nested inside fork branch '{branch_alias}' that "
-                                        f"feeds row_union '{node.id}'. A nested fork replaces the enclosing branch identity, "
-                                        "so the union group can never be satisfied. Move the nested fork before the fork "
-                                        f"that produces '{branch_alias}', or terminate that branch at a sink.",
-                                        "high",
-                                        "row_union_nested_fork_invalid",
-                                    )
+                            )
+                    for downstream in _runtime_nodes_downstream_of_connection(node.on_success or "", self.nodes):
+                        if downstream.node_type in ("coalesce", "row_union"):
+                            errors.append(
+                                _err(
+                                    f"node:{node.id}",
+                                    f"{downstream.node_type} '{downstream.id}' is downstream of row_union '{node.id}' "
+                                    "with no intervening sink. row_union releases an indivisible N-to-N group, "
+                                    "and a correlated barrier cannot safely consume multiple tokens sharing one row_id. "
+                                    "Move the downstream barrier upstream of the fork or terminate the released group at a sink.",
+                                    "high",
+                                    "row_union_downstream_group_invalid",
                                 )
-                        for downstream in _runtime_nodes_downstream_of_connection(node.on_success or "", self.nodes):
-                            if downstream.node_type in ("coalesce", "row_union"):
-                                errors.append(
-                                    _err(
-                                        f"node:{node.id}",
-                                        f"{downstream.node_type} '{downstream.id}' is downstream of row_union '{node.id}' "
-                                        "with no intervening sink. row_union releases an indivisible N-to-N group, "
-                                        "and a correlated barrier cannot safely consume multiple tokens sharing one row_id. "
-                                        "Move the downstream barrier upstream of the fork or terminate the released group at a sink.",
-                                        "high",
-                                        "row_union_downstream_group_invalid",
-                                    )
+                            )
+                            break
+                        if downstream.node_type != "aggregation" or downstream.trigger is None:
+                            continue
+                        try:
+                            trigger = TriggerConfig.model_validate(deep_thaw(downstream.trigger))
+                        except PydanticValidationError:
+                            # The aggregation's intrinsic trigger validator
+                            # owns malformed external input.
+                            continue
+                        if trigger.has_count or trigger.has_timeout or trigger.has_condition:
+                            errors.append(
+                                _err(
+                                    f"node:{node.id}",
+                                    f"Aggregation '{downstream.id}' is downstream of row_union '{node.id}' "
+                                    "but declares a count/timeout/condition trigger. Such triggers can fire "
+                                    "between variants of one source row, splitting an indivisible union group. "
+                                    "Use the implicit end_of_source trigger or move the aggregation upstream of the fork.",
+                                    "high",
+                                    "row_union_downstream_group_invalid",
                                 )
-                                break
-                            if downstream.node_type != "aggregation" or downstream.trigger is None:
-                                continue
-                            try:
-                                trigger = TriggerConfig.model_validate(deep_thaw(downstream.trigger))
-                            except PydanticValidationError:
-                                # The aggregation's intrinsic trigger validator
-                                # owns malformed external input.
-                                continue
-                            if trigger.has_count or trigger.has_timeout or trigger.has_condition:
-                                errors.append(
-                                    _err(
-                                        f"node:{node.id}",
-                                        f"Aggregation '{downstream.id}' is downstream of row_union '{node.id}' "
-                                        "but declares a count/timeout/condition trigger. Such triggers can fire "
-                                        "between variants of one source row, splitting an indivisible union group. "
-                                        "Use the implicit end_of_source trigger or move the aggregation upstream of the fork.",
-                                        "high",
-                                        "row_union_downstream_group_invalid",
-                                    )
-                                )
-                                break
+                            )
+                            break
                 continue
 
             if node.input not in runtime_connections:
