@@ -47,15 +47,22 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
-from elspeth.contracts import Determinism, PipelineRow, RunStatus, SourceRow
-from elspeth.contracts.enums import OutputMode
+from elspeth.contracts import Determinism, PipelineRow, RunStatus, SourceRow, TokenInfo
+from elspeth.contracts.enums import FrameKind, OutputMode
+from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.plugin_protocols import SinkProtocol, SourceProtocol
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
-from elspeth.contracts.types import AggregationName
+from elspeth.contracts.types import AggregationName, CoalesceName, NodeID
 from elspeth.core.config import (
     AggregationSettings,
     CoalesceSettings,
@@ -65,15 +72,77 @@ from elspeth.core.config import (
     TriggerConfig,
 )
 from elspeth.core.dag import ExecutionGraph
+from elspeth.core.dag.models import GraphValidationError
+from elspeth.core.events import EventBusProtocol
+from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.clock import MockClock
+from elspeth.engine.coalesce_executor import CoalesceExecutor
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
+from elspeth.engine.orchestrator.ceremony import RunCeremony
+from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
+from elspeth.engine.orchestrator.run_state import LoopContext
+from elspeth.engine.orchestrator.source_iteration import SourceIterationDriver
+from elspeth.engine.orchestrator.source_lifecycle_recorder import SourceLifecycleRecorder
+from elspeth.engine.orchestrator.types import ExecutionCounters
+from elspeth.engine.processor import RowProcessor
+from elspeth.engine.spans import SpanFactory
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.testing import make_pipeline_row
+from elspeth.testing import make_pipeline_row, make_source_row, make_source_row_quarantined
 from tests.fixtures.base_classes import _TestSchema, _TestSourceBase, as_sink, as_source, as_transform
 from tests.fixtures.factories import wire_transforms
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.plugins import CollectSink
+
+
+@contextmanager
+def _null_track_operation(**_kwargs: Any):
+    yield SimpleNamespace(operation=SimpleNamespace(operation_id="source-op-1"))
+
+
+class _TokenManagerDouble:
+    """Minimal double for the coalesce-merge witness's TokenManager dependency.
+
+    Mirrors ``tests/unit/engine/test_coalesce_executor.py``'s
+    ``_TokenManagerDouble`` — only ``coalesce_tokens`` is exercised by a
+    ``best_effort`` timeout merge.
+    """
+
+    def coalesce_tokens(
+        self,
+        parents: list[TokenInfo],
+        merged_data: PipelineRow,
+        node_id: NodeID,
+        run_id: str,
+        **_kwargs: Any,
+    ) -> tuple[TokenInfo, str]:
+        merged = TokenInfo(
+            row_id=parents[0].row_id,
+            token_id=f"merged-{uuid4().hex[:8]}",
+            row_data=merged_data,
+        )
+        return merged, f"join-{uuid4().hex[:8]}"
+
+
+class _SpyCoalesceExecutor(CoalesceExecutor):
+    """Records, per ``check_timeouts`` call, whether it resolved anything.
+
+    A subclass override — not a runtime method assignment — per the
+    project's masquerade-gate discipline (AGENTS.md: whole-tree AST gates
+    pin dynamic-attribute sites, tests included).
+    """
+
+    def __init__(self, *args: Any, resolutions: list[bool], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._resolutions = resolutions
+
+    def check_timeouts(self, coalesce_name: str) -> list[Any]:
+        results = super().check_timeouts(coalesce_name)
+        self._resolutions.append(bool(results))
+        return results
+
 
 # Deadline budget for the buffered work, and the jump the source applies once
 # the first (valid) row has been consumed. The jump is far larger than the
@@ -277,15 +346,26 @@ class TestQuarantinedRowsAdvanceAggregationDeadlines:
 class TestQuarantinedRowsAdvanceCoalesceDeadlines:
     """Coalesce barrier timeouts must fire from quarantined-row progression."""
 
-    def test_coalesce_timeout_fires_during_a_quarantined_stream(self, payload_store) -> None:
+    def test_hold_branch_aggregation_config_is_rejected_by_rule_6(self, payload_store) -> None:
+        """Reclassified under ruling 25 (spec §7 rule 6, Task 9, WS2 controller ruling 2026-08-23).
+
+        This config used to build the pending barrier by parking
+        ``held_branch``'s forked token inside an aggregation whose
+        ``count=100`` trigger never fires — an in-region aggregation,
+        which `validate_no_aggregations_in_regions` (core/dag/
+        bound_regions.py) now rejects at build time regardless of
+        ``output_mode``. The engine behavior this config used to prove
+        end-to-end — a pending ``best_effort`` barrier resolving from a
+        quarantined-row sweep, not deferred to end-of-input — is rebuilt
+        at the engine level in
+        ``test_coalesce_timeout_resolves_a_pending_barrier_at_a_
+        quarantine_boundary_not_eof`` below, which hand-accepts a
+        genuinely overdue barrier directly against a real
+        ``CoalesceExecutor`` instead of requiring a live run to produce it.
+        """
         clock = MockClock(start=1_750_000_000.0)
         source = _QuarantineStreamSource(clock=clock, on_success="fork_input")
 
-        # The held branch buffers its token in an aggregation whose count=100
-        # trigger never fires, so the valid row's barrier stays pending at
-        # 1-of-2 arrived — a durable pending group that only its timeout can
-        # resolve. best_effort merges what arrived, giving the post-coalesce
-        # transform a row to observe.
         held_branch = _DeadlineFlushObserver(
             name="held_branch_batch",
             on_success="held_ready",
@@ -314,9 +394,6 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
             policy="best_effort",
             timeout_seconds=_DEADLINE_SECONDS,
             merge="nested",
-            # on_success stays None so the coalesce is NON-TERMINAL: it
-            # publishes its own name as a connection that the observing
-            # transform below consumes, instead of writing straight to a sink.
         )
         held_settings = AggregationSettings(
             name="hold_branch",
@@ -327,9 +404,6 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
             trigger=TriggerConfig(count=100),
             output_mode=OutputMode.TRANSFORM,
         )
-        # The observation point is a POST-COALESCE transform, not a sink: sinks
-        # are written after the run body, so a sink row cannot distinguish a
-        # deadline flush from an end-of-input flush.
         wired_observer = wire_transforms(
             [as_transform(observer)],
             source_connection=coalesce.name,
@@ -337,50 +411,167 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
             names=["post_merge_observer"],
         )
 
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={
-                "primary": SourceSettings(plugin=source.name, on_success="fork_input", options={}),
-            },
-            transforms=wired_observer,
-            sinks={"output": as_sink(output_sink), "quarantine": as_sink(quarantine_sink)},
-            aggregations={"hold_branch": (as_transform(held_branch), held_settings)},
-            gates=[fork_gate],
-            coalesce_settings=[coalesce],
-        )
-        held_node_id = graph.get_aggregation_id_map()[AggregationName("hold_branch")]
-        held_branch.node_id = held_node_id
+        with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={
+                    "primary": SourceSettings(plugin=source.name, on_success="fork_input", options={}),
+                },
+                transforms=wired_observer,
+                sinks={"output": as_sink(output_sink), "quarantine": as_sink(quarantine_sink)},
+                aggregations={"hold_branch": (as_transform(held_branch), held_settings)},
+                gates=[fork_gate],
+                coalesce_settings=[coalesce],
+            )
 
-        # Wired transforms are resolved to graph nodes BY POSITION, so the
-        # observer must occupy the same index here as in ``wired_observer``;
-        # the aggregation's transform is resolved by ``node_id`` instead and
-        # follows.
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(observer), as_transform(held_branch)],
-            sinks={"output": as_sink(output_sink), "quarantine": as_sink(quarantine_sink)},
-            aggregation_settings={held_node_id: held_settings},
-            gates=[fork_gate],
-            coalesce_settings=[coalesce],
+    def test_coalesce_timeout_resolves_a_pending_barrier_at_a_quarantine_boundary_not_eof(self) -> None:
+        """Engine-level rebuild (maintainer ruling 2026-08-23, WS2 controller Task 9).
+
+        The claim this test pins does not depend on HOW a coalesce barrier
+        became pending — only on WHEN the engine notices and resolves an
+        overdue one. It is rebuilt by driving the REAL
+        ``SourceIterationDriver.run_main_processing_loop`` — the same loop
+        ``tests/unit/engine/orchestrator/test_source_iteration_quarantine_
+        sweep.py`` pins the call-count CONTRACT for, against a mocked
+        executor — but here against a REAL ``CoalesceExecutor`` carrying a
+        hand-accepted, genuinely overdue pending barrier: one branch
+        ("direct_branch") arrives, the other ("held_branch") never does,
+        mirroring the config-level scenario's shape without needing an
+        in-region aggregation to produce it. ``RowProcessor`` stays a mock,
+        exactly as it already does in that contract test — it is not the
+        subject here; ``CoalesceExecutor.accept()`` and
+        ``.check_timeouts()`` run as real, unmocked production code.
+
+        Distinguishing shape: the clock only advances once the loop moves
+        past the valid row (via a side effect on the quarantine router's
+        ``route()``, mirroring the original source's clock jump timing —
+        elspeth-321f335ff2's fix added the sweep call INSIDE the
+        quarantine branch, so resolution must happen on a quarantined-row
+        boundary call, not the valid row's own). A spy on
+        ``check_timeouts`` records, per call, whether it resolved anything:
+        call 1 (valid row's own boundary, deadline not yet due) must NOT
+        resolve; call 2 (first quarantined-row boundary, after the clock
+        jump) MUST resolve; call 3 (second quarantined-row boundary) sees
+        nothing left pending. ``flush_end_of_input=False`` here rules out
+        an end-of-input flush entirely, so resolution can ONLY have come
+        from a per-row sweep.
+        """
+        clock = MockClock(start=1_750_000_000.0)
+
+        execution = MagicMock(spec=ExecutionRepository)
+        execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=f"cs-{uuid4().hex[:8]}")
+        execution.get_completed_row_ids_for_nodes.return_value = set()
+        execution.has_completed_row_for_node.return_value = False
+        data_flow = MagicMock(spec=DataFlowRepository)
+
+        resolutions: list[bool] = []
+        coalesce_node_id = NodeID("coalesce-merge_paths")
+        coalesce_executor = _SpyCoalesceExecutor(
+            execution,
+            SimpleNamespace(),
+            _TokenManagerDouble(),
+            "run-quarantine-coalesce",
+            step_resolver=lambda node_id: 5,
+            clock=clock,
+            data_flow=data_flow,
+            barrier_restore_reads=SimpleNamespace(
+                get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
+                has_completed_row_for_node=execution.has_completed_row_for_node,
+            ),
+            resolutions=resolutions,
         )
-        settings = ElspethSettings(
-            sources={"primary": {"plugin": source.name, "on_success": "fork_input", "options": {}}},
-            sinks={
-                "output": {"plugin": "test", "on_write_failure": "discard"},
-                "quarantine": {"plugin": "test", "on_write_failure": "discard"},
-            },
-            gates=[fork_gate],
-            coalesce=[coalesce],
+        coalesce_executor.register_coalesce(
+            CoalesceSettings(
+                name="merge_paths",
+                branches=["held_branch", "direct_branch"],
+                policy="best_effort",
+                timeout_seconds=_DEADLINE_SECONDS,
+                merge="nested",
+            ),
+            coalesce_node_id,
         )
 
-        result = _run(config, graph, clock, payload_store, settings)
+        def _process_valid_row(**_kwargs: Any) -> list[Any]:
+            # What a real RowProcessor.process_row would have done for this
+            # row: deliver the direct_branch fork child to the coalesce
+            # point. held_branch's child NEVER arrives — same shape as the
+            # config-level scenario, where its aggregation's count=100
+            # trigger never fired.
+            token = TokenInfo(
+                row_id="row-1",
+                token_id="tok-direct",
+                row_data=make_pipeline_row({"value": 1}),
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="direct_branch"),),
+            )
+            coalesce_executor.accept(token, "merge_paths", arrival_time=clock.monotonic())
+            return []
 
-        # Quarantined rows are a failure lifecycle, so the run terminates
-        # COMPLETED_WITH_FAILURES; the assertion pins that it terminated
-        # cleanly rather than crashing mid-sweep.
-        assert result.status == RunStatus.COMPLETED_WITH_FAILURES
-        assert result.rows_quarantined == _QUARANTINED_ROW_COUNT
-        _assert_fired_before_end_of_input(observer, deadline="coalesce")
+        processor = MagicMock(spec=RowProcessor)
+        processor.process_row.side_effect = _process_valid_row
+        processor.complete_coalesce_merge.return_value = []
+        processor.row_union_executor = None
+
+        driver = SourceIterationDriver(
+            events=MagicMock(spec=EventBusProtocol),
+            span_factory=MagicMock(spec=SpanFactory),
+            ceremony=MagicMock(spec=RunCeremony),
+        )
+        driver._quarantine_router = MagicMock(spec=QuarantineRouter)
+        # The clock only jumps once the loop moves past the valid row —
+        # i.e. once a quarantined row is on deck — mirroring the original
+        # source's clock-jump timing. The jump is far larger than the
+        # timeout budget so the very next sweep sees the deadline expired.
+        driver._quarantine_router.route.side_effect = lambda *a, **kw: clock.advance(_CLOCK_JUMP_SECONDS)
+        lifecycle = MagicMock(spec=SourceLifecycleRecorder)
+        lifecycle.record_field_resolution.return_value = ({}, None)
+        driver._lifecycle_recorder = lifecycle
+
+        source = MagicMock(spec=SourceProtocol)
+        source.name = "fake"
+        source.on_success = "default"
+        sink = MagicMock(spec=SinkProtocol)
+        sink.name = "default"
+
+        rows = [
+            make_source_row({"value": 1}, source_row_index=0),
+            make_source_row_quarantined({"value": "bad"}, source_row_index=1),
+            make_source_row_quarantined({"value": "worse"}, source_row_index=2),
+        ]
+        driver.load_source_with_events = lambda run_id, ctx, active_source: iter(rows)  # type: ignore[method-assign]
+
+        config = PipelineConfig(sources={"fake": source}, transforms=(), sinks={"default": sink})
+        loop_ctx = LoopContext(
+            counters=ExecutionCounters(),
+            pending_tokens={"default": []},
+            processor=processor,
+            ctx=MagicMock(spec=PluginContext),
+            config=config,
+            agg_transform_lookup={},
+            coalesce_executor=coalesce_executor,
+            coalesce_node_map={CoalesceName("merge_paths"): coalesce_node_id},
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.source_iteration.track_operation", _null_track_operation),
+            patch("elspeth.engine.orchestrator.source_iteration.record_schema_contract", return_value=True),
+        ):
+            driver.run_main_processing_loop(
+                loop_ctx,
+                factory=MagicMock(spec=RecorderFactory),
+                run_id="run-quarantine-coalesce",
+                source_id=NodeID("src"),
+                edge_map={},
+                active_source_name="fake",
+                active_source=source,
+                flush_end_of_input=False,
+            )
+
+        assert resolutions == [False, True, False], (
+            f"expected the barrier to resolve on the FIRST quarantined-row boundary sweep "
+            f"(call #2 of 3) — not row 1's own boundary (call #1, deadline not yet due) and "
+            f"not deferred past the loop (flush_end_of_input=False rules out EOF entirely) — "
+            f"got {resolutions!r}"
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience only

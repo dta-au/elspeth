@@ -6883,6 +6883,40 @@ class CompositionState:
                             "coalesce_branch_alias_unreachable",
                         )
                     )
+                # Spec §7 rule 6 (ruling 25): aggregators are banned inside
+                # EVERY bound region, both output modes — flat, unlike the
+                # row_union twin below (`row_union_branch_aggregation_invalid`),
+                # which only flags output_mode: transform (that check targets
+                # a NARROWER, transform-mode-specific hazard: a single
+                # buffered parent's flush colliding on one row_id). This
+                # check stays beside it, keyed to coalesce-bound branches —
+                # scope/collector regions are not yet composer-authorable
+                # (Task 12), so they are not covered here either.
+                if not missing_branches and not missing_aliases:
+                    coalesce_branch_aliases = _coalesce_branch_names(node.branches)
+                    coalesce_branch_connections = _coalesce_branch_connections(node.branches)
+                    coalesce_branch_aggregations: dict[str, tuple[NodeSpec, str]] = {}
+                    for branch_alias, branch_connection in zip(coalesce_branch_aliases, coalesce_branch_connections, strict=True):
+                        is_downstream, lineage = _runtime_connection_lineage(branch_alias, branch_connection, self.sources, self.nodes)
+                        if not is_downstream:
+                            continue
+                        for ancestor in lineage:
+                            if ancestor.node_type == "aggregation" and ancestor.id not in coalesce_branch_aggregations:
+                                coalesce_branch_aggregations[ancestor.id] = (ancestor, branch_alias)
+                    for aggregation, branch_alias in coalesce_branch_aggregations.values():
+                        errors.append(
+                            _err(
+                                f"node:{node.id}",
+                                f"Aggregation '{aggregation.id}' is inside fork branch '{branch_alias}' that feeds "
+                                f"coalesce '{node.id}'. Aggregators are banned inside all bound regions (spec §7 "
+                                "rule 6, ruling 25): a batch flush consumes members the group's roster must "
+                                f"account for. Move '{aggregation.id}' before the fork or after "
+                                f"'{node.id}''s release; for an in-region N->M batch, use a scoped multi-row "
+                                "transform closed by a collector.",
+                                "high",
+                                "bound_region_aggregation_invalid",
+                            )
+                        )
                 continue
             if node.node_type == "row_union":
                 # Intrinsic validation owns malformed external branch values.
@@ -6960,10 +6994,25 @@ class CompositionState:
                     if lineage_is_valid:
                         branch_aggregations: dict[str, tuple[NodeSpec, str]] = {}
                         nested_forks: dict[str, tuple[NodeSpec, str]] = {}
+                        # Spec §7 rule 6 (ruling 25): unlike branch_aggregations
+                        # above (transform-mode only — a narrower, DIFFERENT
+                        # hazard: single-buffered-parent identity collision),
+                        # ruling 25 bans aggregators inside every bound region
+                        # regardless of output_mode. Collected separately so a
+                        # transform-mode node can be reported by BOTH checks —
+                        # both rejections are correct for that node — with this
+                        # loop's own errors.append() running strictly AFTER
+                        # branch_aggregations' below, so the twin's more
+                        # specific message stays FIRST in the errors list for
+                        # the overlap case (pinned by
+                        # test_transform_mode_overlap_reports_the_specific_twin_message_first).
+                        row_union_branch_any_mode_aggregations: dict[str, tuple[NodeSpec, str]] = {}
                         for branch_alias, lineage in branch_lineages:
                             for ancestor in lineage:
                                 if ancestor.node_type == "aggregation" and ancestor.output_mode in (None, "transform"):
                                     branch_aggregations.setdefault(ancestor.id, (ancestor, branch_alias))
+                                if ancestor.node_type == "aggregation" and ancestor.id not in row_union_branch_any_mode_aggregations:
+                                    row_union_branch_any_mode_aggregations[ancestor.id] = (ancestor, branch_alias)
                                 if ancestor.node_type == "gate" and ancestor.fork_to:
                                     nested_forks.setdefault(ancestor.id, (ancestor, branch_alias))
                         for aggregation, branch_alias in branch_aggregations.values():
@@ -6974,10 +7023,25 @@ class CompositionState:
                                     f"row_union '{node.id}' and uses output_mode 'transform' (the default). "
                                     "A transform-mode flush emits its rows from a single buffered parent token, "
                                     "so every emitted row carries that parent's row_id and the union group can never "
-                                    f"be satisfied. Set 'output_mode: passthrough' on '{aggregation.id}' so each row "
-                                    "keeps its own identity, or move the aggregation upstream of the originating fork.",
+                                    f"be satisfied. Move '{aggregation.id}' upstream of the originating fork, or "
+                                    "downstream of its release — aggregators are banned inside every bound region "
+                                    "regardless of output_mode (spec §7 rule 6).",
                                     "high",
                                     "row_union_branch_aggregation_invalid",
+                                )
+                            )
+                        for aggregation, branch_alias in row_union_branch_any_mode_aggregations.values():
+                            errors.append(
+                                _err(
+                                    f"node:{node.id}",
+                                    f"Aggregation '{aggregation.id}' is inside fork branch '{branch_alias}' that feeds "
+                                    f"row_union '{node.id}'. Aggregators are banned inside all bound regions (spec §7 "
+                                    "rule 6, ruling 25): a batch flush consumes members the group's roster must "
+                                    f"account for. Move '{aggregation.id}' before the fork or after "
+                                    f"'{node.id}''s release; for an in-region N->M batch, use a scoped multi-row "
+                                    "transform closed by a collector.",
+                                    "high",
+                                    "bound_region_aggregation_invalid",
                                 )
                             )
                         for nested_fork, branch_alias in nested_forks.values():

@@ -1325,7 +1325,12 @@ def test_transform_mode_branch_aggregation_feeding_row_union_is_rejected(tmp_pat
     assert "control_batch" in message
     assert "variant_union" in message
     assert "row_id" in message
-    assert "passthrough" in message
+    # 2026-08-23 remedy enrichment (Task 9 ruling): the message no longer
+    # recommends output_mode: passthrough as a remedy — rule 6 (ruling 25)
+    # bans aggregators inside every bound region regardless of mode, so
+    # that remedy would land the author straight in a NEW rejection.
+    assert "passthrough" not in message
+    assert "banned inside every bound region" in message
 
 
 def test_unrelated_row_union_fork_does_not_hide_branch_aggregation(tmp_path: Path) -> None:
@@ -1431,15 +1436,37 @@ sinks:
     assert "union_a" in message
 
 
-def test_passthrough_mode_branch_aggregation_feeding_row_union_builds(tmp_path: Path) -> None:
-    """passthrough preserves token identity, so the group stays satisfiable.
+def test_passthrough_mode_branch_aggregation_feeding_row_union_is_rejected(tmp_path: Path) -> None:
+    """Reclassified under ruling 25 (spec §7 rule 6, Task 9, WS2 controller ruling 2026-08-23).
 
-    The guard must not reject this shape: _route_passthrough_results validates
-    1:1 and updates the ORIGINAL tokens, so each buffered row_id keeps its own
-    arrival. Rejecting it would delete a real capability.
+    Until ruling 25, this test proved passthrough mode was the SAFE
+    aggregation shape inside a row_union branch: passthrough preserves token
+    identity (`_route_passthrough_results` validates 1:1 and updates the
+    ORIGINAL tokens), so each buffered row_id keeps its own arrival and the
+    transform-mode identity-collision hazard
+    (`test_transform_mode_branch_aggregation_feeding_row_union_is_rejected`,
+    above) genuinely does not apply here. That property is real and
+    unaffected by ruling 25 — it is not what ruling 25 is about.
+
+    Ruling 25 bans aggregators inside every bound region regardless of
+    output_mode because it closes a DIFFERENT, newer hazard: the
+    BATCH_CONSUMED loss-blindness gap. A lost or failed batch member is
+    invisible to the enclosing region's roster even when passthrough mode
+    correctly preserves per-row identity — identity preservation says
+    nothing about whether the roster can SEE a member the batch consumed
+    and then dropped. `validate_no_aggregations_in_regions`
+    (core/dag/bound_regions.py) now rejects this shape at build time; the
+    capability this test used to prove no longer exists for BOUND regions
+    (an aggregation upstream of the fork, or downstream of the union's
+    release, is untouched — see
+    `test_aggregation_upstream_of_the_fork_is_not_rejected`, below).
     """
-    graph = _build_graph(_branch_agg_yaml(tmp_path, output_mode="passthrough"))
-    assert graph is not None
+    with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region") as exc_info:
+        _build_graph(_branch_agg_yaml(tmp_path, output_mode="passthrough"))
+    message = str(exc_info.value)
+    assert "control_batch" in message
+    assert "variant_union" in message
+    assert "banned inside all bound regions" in message
 
 
 def test_aggregation_upstream_of_the_fork_is_not_rejected(tmp_path: Path) -> None:

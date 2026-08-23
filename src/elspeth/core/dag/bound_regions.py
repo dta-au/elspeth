@@ -405,6 +405,23 @@ def validate_openers_bound_in_region(
     enclosing region is rejected too, so every member of a bound region
     presents exactly one token, statically.
 
+    ``multi_row_node_ids`` is node-kind-agnostic (2026-08-23 review
+    finding, Task 8 follow-up): ruling 28 reads "every creates_tokens node
+    inside a bound region", not "every creates_tokens TRANSFORM", so the
+    builder's census includes aggregation and collector plugins too
+    (``BatchTransformProtocol.creates_tokens``, plugin_protocols.py:613) —
+    not reachable on any shipped plugin today, but the ruling draws no
+    node-kind exception. Two consequences, deliberately NOT special-cased:
+    a ``creates_tokens`` aggregation inside a region is independently
+    rejected by rule 6 (``validate_no_aggregations_in_regions``, called
+    right after this function) regardless of ``creates_tokens`` — both
+    rejections are correct for that shape, and this function runs first, so
+    its "not a declared scope opener" message wins the overlap; a
+    ``creates_tokens`` collector inside a region is a closer, not an
+    opener, and is rejected flat by the SAME "not a declared scope opener"
+    limb below (a collector cannot open its own scope), which is the
+    correct fail-closed outcome.
+
     In-region FORK gates need no arm here: a fork inside a bound region
     either closes at an in-region coalesce/row_union (well-nested, legal —
     rule 3 enforces the nesting, rule 4 the SESE shape), closes outside the
@@ -467,3 +484,51 @@ def validate_openers_bound_in_region(
                     component_id=inner.closer_name,
                     component_type="collector",
                 )
+
+
+def validate_no_aggregations_in_regions(
+    graph: ExecutionGraph,
+    regions: tuple[BoundRegion, ...],
+    aggregation_node_ids: Mapping[NodeID, str],
+) -> None:
+    """§7 rule 6 (ruling 25): aggregators are windows, not closers — banned inside
+    every bound region, BOTH output modes, every closer kind's region.
+
+    A batch flush consumes members a roster must account for; an aggregation
+    inside a bound region can consume (and terminalize) members the region's
+    roster is watching without the region ever seeing the loss — the
+    BATCH_CONSUMED loss-blindness gap. This is a flat ban regardless of
+    ``output_mode``: the pre-existing row_union-specific backward walk in
+    ``build_execution_graph`` (the "BRANCH-INTERNAL AGGREGATION GUARD") only
+    rejects ``output_mode: transform`` aggregations feeding a row_union
+    branch, because THAT check is about a narrower hazard (transform-mode's
+    single-buffered-parent collision); it runs earlier in the builder and
+    still fires first for that one shape (a more specific diagnostic, same
+    precedent as rule 4's sink-inside-vs-no-path priority). This rule closes
+    the wider gap that check does not: passthrough-mode aggregations, and
+    aggregations inside COALESCE or EXPAND (scope/collector) regions, which
+    the row_union-only walk never inspected at all.
+
+    Outside a bound region no roster is watching, so a top-level aggregation
+    or one placed after a closer's release is unchanged (ADR-020 posture).
+
+    Raises:
+        GraphValidationError: an aggregation node is a member of a bound
+            region, regardless of the region's closer kind or the
+            aggregation's output_mode.
+    """
+    for region in regions:
+        binding = region.binding
+        for node_id in sorted(aggregation_node_ids):
+            if node_id not in region.member_node_ids:
+                continue
+            agg_name = aggregation_node_ids[node_id]
+            raise GraphValidationError(
+                f"Aggregation '{agg_name}' is inside bound region '{binding.closer_name}' "
+                f"(opener '{binding.opener_name}'). Aggregators are banned inside all bound "
+                f"regions (spec §7 rule 6, ruling 25): a batch flush consumes members the roster "
+                f"must account for. Move the aggregation before the opener or after the closer; "
+                f"for an in-region N->M batch, use a scoped multi-row transform with a collector.",
+                component_id=agg_name,
+                component_type="aggregation",
+            )

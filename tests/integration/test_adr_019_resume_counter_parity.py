@@ -7,12 +7,17 @@ from pathlib import Path
 
 import pytest
 
+from elspeth.contracts import NodeStateStatus, NodeType
+from elspeth.contracts.errors import CoalesceFailureReason
 from elspeth.contracts.run_result import RunResult
+from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.orchestrator.run_status import derive_resume_terminal_status_from_audit
 from tests.fixtures.base_classes import _TestSourceBase
+from tests.fixtures.landscape import make_recorder_with_run, register_test_node
 from tests.fixtures.plugins import ListSource as _ListSource
+from tests.fixtures.stores import MockClock
 from tests.integration._helpers import (
     build_test_pipeline_with_discard_sink,
     build_test_pipeline_with_failsink_diversion,
@@ -560,123 +565,102 @@ def _build_quorum_timeout_coalesce(clock, rows, *, shutdown_event=None, interrup
     return config, graph, settings
 
 
-# quorum_count(2) == branch_count(2) draws a "consider require_all" advisory
-# UserWarning, but we deliberately use the quorum policy because — unlike
-# require_all — it carries a timeout_seconds that drives the per-row
-# check_timeouts → quorum_not_met_at_timeout path under test. The warning is
-# expected and filtered to keep CI output clean.
-@pytest.mark.filterwarnings("ignore:Coalesce .*quorum_count.*equals branch count:UserWarning")
-def test_resume_derives_rows_coalesce_failed_from_durable_audit() -> None:
-    """End-to-end: a resumed run's rows_coalesce_failed EQUALS the uninterrupted
-    oracle's — coalesce failures consumed in run-1 BEFORE the interrupt and
-    failures consumed during the resume are both reconstructed from the durable
-    FAILED node_states at the run's coalesce nodes (elspeth-7294de558e; the old
-    resume-only graft reported only re-drive failures and under-reported 1 vs 3
-    in this topology).
+def test_quorum_timeout_coalesce_branch_hold_is_rejected_by_rule_6() -> None:
+    """Reclassified under ruling 25 (spec §7 rule 6, Task 9, WS2 controller ruling 2026-08-23).
 
-    See the module comment above for the deterministic-timeout construction and
-    the exhausted-source reshape that makes the interrupt resumable.
+    ``_build_quorum_timeout_coalesce``'s own docstring documents the shape
+    this used to build: "the agg branch holds its token (count=100 trigger
+    never fires), so only the direct branch arrives -> the barrier times
+    out as quorum_not_met." That is an in-region aggregation regardless of
+    output_mode, which `validate_no_aggregations_in_regions` (core/dag/
+    bound_regions.py) now rejects at build time.
+
+    Ruling 25 bans aggregators inside every bound region because it closes
+    the BATCH_CONSUMED loss-blindness gap — a lost or failed batch member
+    is invisible to the enclosing region's roster. The shape this builder
+    demonstrated (a branch member that will NEVER arrive, resolved only by
+    the barrier's own timeout) is superseded for bound regions; the engine
+    behavior it used to prove END-TO-END (a durably-pending best_effort/
+    quorum barrier resolving via `CoalesceExecutor.check_timeouts`, and
+    ADR-019's cumulative audit-derived `rows_coalesce_failed` reconstruction
+    across a pre-interrupt/resume boundary) is rebuilt at the engine level in
+    `test_resume_derives_rows_coalesce_failed_from_durable_audit` below,
+    which hand-builds the durable FAILED node_states this rule-6 rejection
+    would otherwise have required a live run to produce (WS4 restoration
+    tracked as elspeth ticket TBD, sibling of elspeth-c648d4f832).
     """
-    import threading
+    with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region"):
+        _build_quorum_timeout_coalesce(MockClock(start=1000.0), [{"value": 10}, {"value": 20}, {"value": 30}])
 
-    from sqlalchemy import select, text
 
-    from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
-    from elspeth.contracts.errors import GracefulShutdownError
-    from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
-    from elspeth.core.config import CheckpointSettings
-    from elspeth.core.landscape.schema import runs_table
-    from elspeth.engine.clock import MockClock
-    from elspeth.engine.orchestrator import Orchestrator
-    from tests.fixtures.landscape import make_landscape_db
-    from tests.fixtures.stores import MockPayloadStore
+def test_resume_derives_rows_coalesce_failed_from_durable_audit() -> None:
+    """ADR-019 (elspeth-7294de558e): ``rows_coalesce_failed`` is reconstructed
+    CUMULATIVELY from durable FAILED node_states at the run's coalesce
+    nodes — run-1 (pre-interrupt) failures AND resume-time failures both
+    count, from ONE audit query over the whole run_id. The old resume-only
+    graft carried only re-drive failures and under-reported 1 vs 3 in the
+    live-run topology this test used to build end-to-end (see
+    ``test_quorum_timeout_coalesce_branch_hold_is_rejected_by_rule_6``,
+    above, for why that topology is no longer buildable under ruling 25).
 
-    base_rows = [{"value": 10}, {"value": 20}, {"value": 30}]
+    Engine-level rebuild (maintainer ruling 2026-08-23, WS2 controller):
+    ``count_failed_coalesce_barrier_rows`` counts DISTINCT (coalesce node,
+    row_id) pairs over FAILED node_states — a PURE function of durable
+    state (see its own docstring, core/landscape/run_status_projection.py)
+    with no concept of "before/after resume" at all; `derive_terminal_status_from_audit`
+    (aliased `derive_resume_terminal_status_from_audit`) is likewise "pure
+    functions... operating on external state passed via parameters" (module
+    docstring, engine/orchestrator/run_status.py) — real, unmocked
+    production code, called directly against hand-built durable state,
+    exactly as ``tests/unit/core/landscape/test_query_methods.py::
+    TestAuditRunStatusProjection`` already does for the narrower counter
+    beneath it (that suite pins the counting rules directly; THIS test
+    pins the cumulative reconstruction claim ADR-019 is about). Two
+    batches of FAILED node_states are written under ONE run_id — named
+    "pre-interrupt" and "resume" to preserve the original scenario's
+    narrative — proving the derive sums BOTH (3 total), not just the
+    resume batch's own 1 (the exact shape of the bug this ADR fixed).
+    """
+    setup = make_recorder_with_run(run_id="run-adr019", source_node_id="source-0", source_plugin_name="json")
+    factory = setup.factory
+    register_test_node(factory.data_flow, "run-adr019", "coalesce-merge_paths", node_type=NodeType.COALESCE, plugin_name="coalesce")
 
-    # ── Run A (uninterrupted oracle): every barrier fails — rows 1 and 2 time
-    #    out at the next row's per-row handle_coalesce_timeouts, row 3 at the
-    #    end-of-source coalesce flush → rows_coalesce_failed == 3. ──
-    db_a = make_landscape_db()
-    clock_a = MockClock(start=1000.0)
-    cfg_a, graph_a, settings_a = _build_quorum_timeout_coalesce(clock_a, base_rows)
-    run_a = Orchestrator(db_a, clock=clock_a).run(cfg_a, graph=graph_a, settings=settings_a, payload_store=MockPayloadStore())
-    assert run_a.rows_coalesce_failed >= 1, (
-        f"Run A (uninterrupted) must record at least one coalesce timeout failure (oracle non-vacuous); "
-        f"got rows_coalesce_failed={run_a.rows_coalesce_failed}, status={run_a.status}"
-    )
-
-    # ── Run B: interrupt on the FINAL source row (all rows processed, EOF
-    #    flushes not yet run, at least one barrier already consumed by a
-    #    per-row timeout), reshape to the exhausted+crashed-EOF-flush state,
-    #    then resume. The resume's EOF coalesce flush consumes the remaining
-    #    barriers; the audit derive must report run-1 + resume cumulatively. ──
-    db_b = make_landscape_db()
-    ps_b = MockPayloadStore()
-    checkpoint_mgr = CheckpointManager(db_b)
-    checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
-    clock_b = MockClock(start=1000.0)
-    shutdown = threading.Event()
-    cfg_b, graph_b, settings_b = _build_quorum_timeout_coalesce(clock_b, base_rows, shutdown_event=shutdown, interrupt_after=len(base_rows))
-    try:
-        Orchestrator(db_b, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config, clock=clock_b).run(
-            cfg_b, graph=graph_b, settings=settings_b, payload_store=ps_b, shutdown_event=shutdown
+    def _fail_barrier(row_id: str, token_id: str, state_id: str, sequence: int) -> None:
+        factory.data_flow.create_row(
+            "run-adr019",
+            "source-0",
+            0,
+            {"value": 1},
+            row_id=row_id,
+            source_row_index=sequence,
+            ingest_sequence=sequence,
         )
-        raise AssertionError("run-1 was expected to interrupt via graceful shutdown, but completed")
-    except GracefulShutdownError:
-        pass
+        factory.data_flow.create_token(row_id, token_id=token_id)
+        factory.execution.begin_node_state(token_id, "coalesce-merge_paths", "run-adr019", 0, {"value": 1}, state_id=state_id)
+        factory.execution.complete_node_state(
+            state_id=state_id,
+            status=NodeStateStatus.FAILED,
+            error=CoalesceFailureReason(
+                failure_reason="quorum_not_met_at_timeout",
+                expected_branches=("direct_branch", "agg_branch"),
+                branches_arrived=("direct_branch",),
+                merge_policy="best_effort",
+            ),
+            duration_ms=0.0,
+        )
 
-    # Reshape the interruption into the exhausted-then-crashed-EOF-flush state
-    # (same construction as test_eof_resume_proof.py): 'exhausted' is what
-    # finalize_source_iteration records before the EOF flushes run; 'failed' is
-    # what the failure ceremony records when an EOF flush crashes. This is the
-    # resumable shape on the multi-source branch — a mid-source interrupt is
-    # refused with IncompleteSourceResumeError. The mid-source interrupt's
-    # fenced ceremony correctly wrote ADR-038 (NULL, ABANDONED) rows for the
-    # then-incomplete sources; the state being synthesized (crash AFTER
-    # exhaustion) carries none, so a faithful reshape deletes them.
-    with db_b.engine.connect() as conn:
-        run_id = conn.execute(select(runs_table.c.run_id)).fetchone().run_id
-        conn.execute(text("UPDATE runs SET status='failed' WHERE run_id=:rid"), {"rid": run_id})
-        conn.execute(text("UPDATE run_sources SET lifecycle_state='exhausted' WHERE run_id=:rid"), {"rid": run_id})
-        conn.execute(text("DELETE FROM token_outcomes WHERE run_id=:rid AND path='abandoned'"), {"rid": run_id})
-        conn.commit()
+    # "Pre-interrupt" batch: two barriers already failed and durably
+    # recorded before a (simulated) shutdown — the old resume-only graft
+    # would have forgotten these entirely.
+    _fail_barrier("row-1", "tok-r1", "cs-r1", sequence=0)
+    _fail_barrier("row-2", "tok-r2", "cs-r2", sequence=1)
+    # "Resume" batch: one more barrier fails during the resumed re-drive.
+    _fail_barrier("row-3", "tok-r3", "cs-r3", sequence=2)
 
-    # Non-vacuity: run-1 must have already consumed SOME (but not all) barrier
-    # failures before the interrupt — otherwise this test would not distinguish
-    # cumulative audit derivation from the old resume-only graft.
-    run1_failed_barriers = RecorderFactory(db_b).run_status_projection.count_failed_coalesce_barrier_rows(run_id)
-    assert 1 <= run1_failed_barriers < run_a.rows_coalesce_failed, (
-        f"run-1 must consume at least one barrier failure pre-interrupt and leave at least one for the "
-        f"resume (got {run1_failed_barriers} of {run_a.rows_coalesce_failed}); the topology drifted — "
-        f"re-derive the interrupt point."
-    )
+    status, counters = derive_resume_terminal_status_from_audit(factory, "run-adr019")
 
-    recovery_mgr = RecoveryManager(db_b, checkpoint_mgr)
-    check = recovery_mgr.can_resume(run_id, graph_b)
-    assert check.can_resume, f"cannot resume: {check.reason}"
-    resume_point = recovery_mgr.get_resume_point(run_id, graph_b)
-    assert resume_point is not None
-
-    clock_r = MockClock(start=clock_b.monotonic())
-    rcfg, rgraph, rsettings = _build_quorum_timeout_coalesce(clock_r, base_rows)
-    resume_orch = Orchestrator(db_b, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config, clock=clock_r)
-    run_b = resume_orch.resume(resume_point, rcfg, rgraph, payload_store=ps_b, settings=rsettings)
-
-    # ── EQUALITY PIN (the elspeth-7294de558e resolution): the resumed run
-    # reports the SAME rows_coalesce_failed as the uninterrupted oracle. The
-    # old graft carried only re-drive failures (run_B == 1 here, pinned as a
-    # characterization of the under-report until the audit arm existed); the
-    # derive now reconstructs run-1 + resume failures from FAILED coalesce
-    # node_states, one per DISTINCT (coalesce node, row) barrier. ──
-    assert run_a.rows_coalesce_failed == 3, (
-        f"PIN: uninterrupted oracle must fail all 3 barriers; got {run_a.rows_coalesce_failed}. "
-        f"If this changed, the timeout topology moved — re-derive the expected oracle count."
-    )
-    assert run_b.rows_coalesce_failed == run_a.rows_coalesce_failed, (
-        f"Resumed run must report the full run's coalesce failures (run-1 pre-interrupt + resume), "
-        f"derived from durable audit: oracle={run_a.rows_coalesce_failed}, "
-        f"resumed={run_b.rows_coalesce_failed} (run-1 had consumed {run1_failed_barriers} pre-interrupt). "
-        f"resumed < oracle means resume-local counting regressed (the old graft); "
-        f"resumed > oracle means per-branch over-counting (the counter is per failed BARRIER, "
-        f"one DISTINCT (coalesce node, row) pair)."
+    assert counters.rows_coalesce_failed == 3, (
+        f"PIN (elspeth-7294de558e): the derive must reconstruct ALL 3 barrier failures cumulatively from "
+        f"durable audit (2 pre-interrupt + 1 resume), not just the resume batch's own 1 — "
+        f"got rows_coalesce_failed={counters.rows_coalesce_failed}, status={status}"
     )

@@ -536,6 +536,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "before the enclosing group's closer (coalesce/row_union/collector).",
     ),
     (
+        r"bound_region_aggregation_invalid",
+        "An aggregation sits inside a bound group (fork→coalesce or scope). A batch flush consumes "
+        "members the group's roster must account for, so losses inside the batch would be invisible.",
+        "Move the aggregation before the group's opener or after its closer; batch work inside a bound "
+        "region belongs to a scoped multi-row transform closed by a collector.",
+    ),
+    (
         r"gate_duplicate_fork_branch",
         "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
         "Remove duplicate entries from the gate's fork_to list while preserving the intended unique branch order.",
@@ -1137,6 +1144,10 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # Bound-region SESE walk (spec §7 rule 4): the sink-inside-region limb
     # only — the backward walk and no-path limb are Stage-1 abstentions.
     "bound_region_sink_inside",
+    # Spec §7 rule 6 (ruling 25): aggregators banned inside coalesce-bound
+    # branches — the row_union twin (row_union_branch_aggregation_invalid,
+    # above) stays for its narrower transform-mode-only shape.
+    "bound_region_aggregation_invalid",
     "gate_duplicate_fork_branch",
     "transform_missing_on_success",
     "transform_missing_on_error",

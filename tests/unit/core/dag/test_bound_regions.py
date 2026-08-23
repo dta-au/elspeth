@@ -10,6 +10,7 @@ from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID, SinkName
 from elspeth.core.config import (
+    AggregationSettings,
     CoalesceSettings,
     CollectorSettings,
     GateSettings,
@@ -109,6 +110,27 @@ class _BoundRegionCollectorPlugin:
     on_success: str | None = None
     creates_tokens = False
     is_batch_aware = True
+    declared_output_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_input_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
+    passes_through_input = False
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
+
+    def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
+        self.name = name
+        self.config = {"schema": {"mode": "observed"}}
+        self._output_schema_config = output_schema_config
+
+
+class _BoundRegionAggregationTransform:
+    """A stub aggregation-node plugin (spec §7 rule 6, ruling 25)."""
+
+    input_schema = None
+    output_schema = None
+    on_error: str | None = None
+    on_success: str | None = None
+    creates_tokens = False
     declared_output_fields: ClassVar[frozenset[str]] = frozenset()
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
@@ -1671,3 +1693,406 @@ class TestRule5OpenersBoundInRegion:
         regions = graph.get_bound_regions()
         assert {r.binding.closer_kind for r in regions} == {CloserKind.COALESCE, CloserKind.COLLECTOR}
         assert max(r.depth for r in regions) == 3
+
+    def test_creates_tokens_aggregation_inside_region_rejected_by_rule_5_first(self) -> None:
+        # Task 8/9 rider (2026-08-23 review finding): ruling 28 is
+        # node-kind-agnostic, so the builder's multi_row_node_ids census
+        # also covers aggregation plugins with creates_tokens=True (not
+        # reachable on any shipped plugin today, but the ruling draws no
+        # node-kind exception). Rule 6 (validate_no_aggregations_in_regions)
+        # ALSO independently rejects any in-region aggregation regardless of
+        # creates_tokens — both rejections are correct for this shape. Rule
+        # 5 runs FIRST in the builder (builder.py), so ITS message
+        # ("not a declared scope opener") wins the overlap, not rule 6's
+        # ("Aggregators are banned"). Pins that ordering, not just that
+        # *a* rejection happens.
+        source = _BoundRegionMockSource()
+        branch_a_agg = _BoundRegionAggregationTransform(
+            name="branch_a_agg", output_schema_config=SchemaConfig(mode="observed", fields=None)
+        )
+        branch_a_agg.creates_tokens = True  # not otherwise reachable — see docstring above
+        branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+        def _build() -> ExecutionGraph:
+            return ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+                transforms=[
+                    WiredTransform(
+                        plugin=branch_b,  # type: ignore[arg-type]
+                        settings=TransformSettings(
+                            name="branch_b_transform",
+                            plugin=branch_b.name,
+                            input="path_b",
+                            on_success="path_b_out",
+                            on_error="discard",
+                            options={},
+                        ),
+                    ),
+                ],
+                sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+                aggregations={
+                    "branch_a_agg": (
+                        branch_a_agg,  # type: ignore[dict-item]
+                        AggregationSettings(name="branch_a_agg", plugin="agg", input="path_a", on_success="path_a_out", on_error="discard"),
+                    )
+                },
+                gates=[
+                    GateSettings(
+                        name="gate",
+                        input="source_out",
+                        condition="'all'",
+                        routes={"all": "fork"},
+                        fork_to=["path_a", "path_b"],
+                    )
+                ],
+                coalesce_settings=[
+                    CoalesceSettings(
+                        name="coalesce",
+                        branches={"path_a": "path_a_out", "path_b": "path_b_out"},
+                        policy="require_all",
+                        merge="union",
+                        on_success="out",
+                    )
+                ],
+            )
+
+        with pytest.raises(GraphValidationError, match=r"Multi-row transform .* inside bound region") as exc_info:
+            _build()
+        assert "not a declared scope opener" in str(exc_info.value)
+        assert "banned inside all bound regions" not in str(exc_info.value)
+
+    def test_creates_tokens_collector_inside_region_rejected_flat(self) -> None:
+        # Task 8/9 rider: a creates_tokens=True COLLECTOR is a closer, not
+        # an opener — the widened census still names it in
+        # multi_row_node_ids, and it can never be a KEY in
+        # registry.by_opener_node() (that index is keyed by OPENER node ids
+        # only), so it is rejected flat by the SAME "not a declared scope
+        # opener" limb — the correct fail-closed outcome, not a special case.
+        source = _BoundRegionMockSource()
+        branch_a_expand = _BoundRegionMultiRowTransform(
+            name="branch_a_expand", output_schema_config=SchemaConfig(mode="observed", fields=None)
+        )
+        stitcher = _BoundRegionCollectorPlugin(name="page_stitcher", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        stitcher.creates_tokens = True  # not otherwise reachable — see docstring above
+        branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+        with pytest.raises(GraphValidationError, match=r"Multi-row transform 'page_stitcher' inside bound region"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+                transforms=[
+                    WiredTransform(
+                        plugin=branch_a_expand,  # type: ignore[arg-type]
+                        settings=TransformSettings(
+                            name="branch_a_expand",
+                            plugin=branch_a_expand.name,
+                            input="path_a",
+                            on_success="pages",
+                            on_error="discard",
+                            options={},
+                        ),
+                    ),
+                    WiredTransform(
+                        plugin=branch_b,  # type: ignore[arg-type]
+                        settings=TransformSettings(
+                            name="branch_b_transform",
+                            plugin=branch_b.name,
+                            input="path_b",
+                            on_success="path_b_out",
+                            on_error="discard",
+                            options={},
+                        ),
+                    ),
+                ],
+                sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[arg-type]
+                aggregations={},
+                gates=[
+                    GateSettings(
+                        name="gate",
+                        input="source_out",
+                        condition="'all'",
+                        routes={"all": "fork"},
+                        fork_to=["path_a", "path_b"],
+                    )
+                ],
+                coalesce_settings=[
+                    CoalesceSettings(
+                        name="coalesce",
+                        branches={"path_a": "path_a_out", "path_b": "path_b_out"},
+                        policy="require_all",
+                        merge="union",
+                        on_success="out",
+                    )
+                ],
+                collectors={
+                    "page_stitcher": (
+                        stitcher,  # type: ignore[dict-item]
+                        CollectorSettings(name="page_stitcher", plugin="stitch_pages", input="pages", on_success="path_a_out"),
+                    )
+                },
+                scope_settings=[
+                    ScopeSettings(name="branch_a_pages", opener="branch_a_expand", closer="page_stitcher", policy="require_all")
+                ],
+            )
+
+
+def _build_fork_coalesce_with_branch_aggregation(*, output_mode: str) -> ExecutionGraph:
+    """fork [path_a, path_b] -> coalesce; path_a IS an aggregation node.
+
+    Both output_mode: transform and output_mode: passthrough must be
+    rejected (spec §7 rule 6, ruling 25) — the pre-existing row_union-only
+    backward walk in builder.py only rejects output_mode: transform feeding
+    a row_union branch; this rule is a flat ban regardless of mode, and
+    covers coalesce regions the row_union-only walk never inspected.
+    """
+    source = _BoundRegionMockSource()
+    branch_a_agg = _BoundRegionAggregationTransform(name="branch_a_agg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=branch_b,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_b_transform",
+                    plugin=branch_b.name,
+                    input="path_b",
+                    on_success="path_b_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={
+            "branch_a_agg": (
+                branch_a_agg,  # type: ignore[dict-item]
+                AggregationSettings(
+                    name="branch_a_agg",
+                    plugin="agg",
+                    input="path_a",
+                    on_success="path_a_out",
+                    on_error="discard",
+                    output_mode=output_mode,  # type: ignore[arg-type]
+                ),
+            )
+        },
+        gates=[
+            GateSettings(
+                name="gate",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["path_a", "path_b"],
+            )
+        ],
+        coalesce_settings=[
+            CoalesceSettings(
+                name="coalesce",
+                branches={"path_a": "path_a_out", "path_b": "path_b_out"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+    )
+
+
+def _build_top_level_aggregation_pipeline() -> ExecutionGraph:
+    """source -> aggregation -> sink, no fork/coalesce anywhere.
+
+    Outside any bound region no roster is watching (ADR-020 posture) —
+    untouched by rule 6.
+    """
+    source = _BoundRegionMockSource()
+    agg = _BoundRegionAggregationTransform(name="top_agg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={
+            "top_agg": (
+                agg,  # type: ignore[dict-item]
+                AggregationSettings(name="top_agg", plugin="agg", input="source_out", on_success="out", on_error="discard"),
+            )
+        },
+    )
+
+
+def _build_aggregation_after_coalesce_release() -> ExecutionGraph:
+    """fork [path_a, path_b] -> coalesce -> aggregation -> sink.
+
+    The aggregation sits strictly AFTER the coalesce's release (consuming
+    the coalesce's own self-named output connection) — legal under rule 6,
+    same as the top-level case: the region's roster already released before
+    the aggregation ever sees a row.
+    """
+    source = _BoundRegionMockSource()
+    branch_a = _BoundRegionTransform(name="branch_a_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    agg = _BoundRegionAggregationTransform(name="after_agg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=branch_a,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_a_transform",
+                    plugin=branch_a.name,
+                    input="path_a",
+                    on_success="path_a_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=branch_b,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_b_transform",
+                    plugin=branch_b.name,
+                    input="path_b",
+                    on_success="path_b_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={
+            "after_agg": (
+                agg,  # type: ignore[dict-item]
+                AggregationSettings(name="after_agg", plugin="agg", input="coalesce", on_success="out", on_error="discard"),
+            )
+        },
+        gates=[
+            GateSettings(
+                name="gate",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["path_a", "path_b"],
+            )
+        ],
+        coalesce_settings=[
+            # on_success omitted: publishes under the coalesce's own id
+            # ("coalesce"), which the aggregation below consumes as `input`.
+            CoalesceSettings(
+                name="coalesce",
+                branches={"path_a": "path_a_out", "path_b": "path_b_out"},
+                policy="require_all",
+                merge="union",
+            )
+        ],
+    )
+
+
+def _build_aggregation_alongside_nested_scope_in_a_branch() -> ExecutionGraph:
+    """FORK[path_a, path_b] -> coalesce; path_a chains a declared scope
+    (opener -> collector) followed by a SEPARATE aggregation node, both
+    before reaching the coalesce.
+
+    Adversarial nested-region probe (Task 8 checklist precedent, carried
+    into Task 9 per the controller's dispatch): the scope opener/closer are
+    both legally bound (rule 5 has nothing to say — they nest correctly),
+    but the aggregation is a member of the OUTER FORK region only, not the
+    EXPAND region. Proves `validate_no_aggregations_in_regions`'s per-region
+    membership check correctly attributes the aggregation to its enclosing
+    FORK region even when a DIFFERENT, properly-nested EXPAND region also
+    exists in the same branch — the depth machinery must not confuse "this
+    node is in some region" with "this node is in THIS region".
+    """
+    source = _BoundRegionMockSource()
+    branch_a_expand = _BoundRegionMultiRowTransform(name="branch_a_expand", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    stitcher = _BoundRegionCollectorPlugin(name="page_stitcher", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    branch_a_agg = _BoundRegionAggregationTransform(name="branch_a_agg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=branch_a_expand,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_a_expand",
+                    plugin=branch_a_expand.name,
+                    input="path_a",
+                    on_success="pages",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=branch_b,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_b_transform",
+                    plugin=branch_b.name,
+                    input="path_b",
+                    on_success="path_b_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={
+            "branch_a_agg": (
+                branch_a_agg,  # type: ignore[dict-item]
+                AggregationSettings(name="branch_a_agg", plugin="agg", input="stitched", on_success="path_a_out", on_error="discard"),
+            )
+        },
+        gates=[
+            GateSettings(
+                name="gate",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["path_a", "path_b"],
+            )
+        ],
+        coalesce_settings=[
+            CoalesceSettings(
+                name="coalesce",
+                branches={"path_a": "path_a_out", "path_b": "path_b_out"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+        collectors={
+            "page_stitcher": (
+                stitcher,  # type: ignore[dict-item]
+                CollectorSettings(name="page_stitcher", plugin="stitch_pages", input="pages", on_success="stitched"),
+            )
+        },
+        scope_settings=[ScopeSettings(name="branch_a_pages", opener="branch_a_expand", closer="page_stitcher", policy="require_all")],
+    )
+
+
+class TestRule6AggregatorBan:
+    """Spec §7 rule 6 (ruling 25): aggregators are windows, not closers —
+    banned inside every bound region, both output modes, every closer kind.
+    """
+
+    def test_aggregation_inside_coalesce_branch_rejected_both_modes(self) -> None:
+        for output_mode in ("transform", "passthrough"):
+            with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region"):
+                _build_fork_coalesce_with_branch_aggregation(output_mode=output_mode)
+
+    def test_aggregation_outside_regions_stays_legal(self) -> None:
+        assert _build_top_level_aggregation_pipeline() is not None
+        assert _build_aggregation_after_coalesce_release() is not None
+
+    def test_aggregation_alongside_nested_scope_in_a_branch_rejected(self) -> None:
+        # The scope opener/closer are legally bound (rule 5 stays silent);
+        # only the sibling aggregation is rejected, attributed to the OUTER
+        # FORK region specifically, not the (legal) inner EXPAND region.
+        with pytest.raises(GraphValidationError, match="Aggregation 'branch_a_agg' is inside bound region 'coalesce'"):
+            _build_aggregation_alongside_nested_scope_in_a_branch()

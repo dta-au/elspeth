@@ -5211,7 +5211,12 @@ class TestComposerRuntimeRowUnionAgreement:
         composer_result = composition_state_from_runtime_yaml(invalid_yaml).validate()
         composer_error = next(error for error in composer_result.errors if error.error_code == "row_union_branch_aggregation_invalid")
         assert "control_batch" in composer_error.message
-        assert "passthrough" in composer_error.message
+        # 2026-08-23 remedy enrichment (Task 9 ruling): the message no longer
+        # recommends output_mode: passthrough — rule 6 (ruling 25) bans
+        # aggregators inside every bound region regardless of mode, so that
+        # remedy would land the author straight in a NEW rejection.
+        assert "passthrough" not in composer_error.message
+        assert "banned inside every bound region" in composer_error.message
 
         settings = load_settings_from_yaml_string(invalid_yaml)
         with pytest.raises(GraphValidationError) as exc_info:

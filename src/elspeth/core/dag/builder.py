@@ -33,6 +33,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.core.dag.bound_regions import (
     compute_bound_regions,
     derive_escalation_fixpoint_bound,
+    validate_no_aggregations_in_regions,
     validate_openers_bound_in_region,
     validate_sese_regions,
 )
@@ -1714,12 +1715,23 @@ def build_execution_graph(
         # group can never be satisfied, whatever the flush path does with the
         # barrier binding.
         #
-        # output_mode: passthrough is deliberately NOT rejected.
-        # _route_passthrough_results validates 1:1 and updates the ORIGINAL
-        # tokens, so every buffered row_id keeps its own arrival and the group
-        # stays satisfiable. Note OutputMode defaults to TRANSFORM, so an
-        # aggregation that simply omits the field lands in the rejected arm —
-        # hence the diagnostic names the field explicitly.
+        # output_mode: passthrough is NOT rejected by THIS check — it targets
+        # only the transform-mode identity-collision hazard
+        # (_route_passthrough_results validates 1:1 and updates the ORIGINAL
+        # tokens, so every buffered row_id keeps its own arrival for THAT
+        # hazard specifically). Rule 6 (validate_no_aggregations_in_regions,
+        # called later in this function) independently bans ANY aggregation
+        # inside a bound region regardless of output_mode (spec §7 rule 6,
+        # ruling 25 — 2026-08-23: the BATCH_CONSUMED loss-blindness gap, a
+        # DIFFERENT hazard than this check's — a lost batch member is
+        # invisible to the roster even when passthrough preserves identity
+        # correctly). This comment used to say passthrough "stays
+        # satisfiable" and leave it there; it is no longer the whole truth
+        # for a BOUND region, so say so explicitly rather than let the old
+        # sentence imply a capability rule 6 has since removed. Note
+        # OutputMode defaults to TRANSFORM, so an aggregation that simply
+        # omits the field lands in the rejected arm here — hence the
+        # diagnostic names the field explicitly.
         #
         # The walk runs BACKWARD and MUST stop at THIS union's originating fork
         # gate(s). Fork -> branch is a COPY edge only for an identity branch; a
@@ -1767,10 +1779,10 @@ def build_execution_graph(
                             f"A transform-mode flush emits its rows from a single buffered parent token, "
                             f"so every emitted row carries that one parent's row_id: one row_id would "
                             f"contribute several arrivals to the union group while every other buffered "
-                            f"row_id contributes none, and the group can never be satisfied. Set "
-                            f"'output_mode: passthrough' on '{upstream_agg.name}' so each row keeps its "
-                            f"own identity, or move the aggregation upstream of the fork that feeds "
-                            f"'{union_name}'.",
+                            f"row_id contributes none, and the group can never be satisfied. Move "
+                            f"'{upstream_agg.name}' upstream of the fork that feeds '{union_name}', or "
+                            f"downstream of its release — aggregators are banned inside every bound "
+                            f"region regardless of output_mode (spec §7 rule 6).",
                             component_id=str(union_name),
                             component_type="row_union",
                         )
@@ -1843,10 +1855,43 @@ def build_execution_graph(
     # — a declared TransformProtocol field (plugin_protocols.py:393), never a
     # getattr probe (a "just to be safe" default would trip the masquerade
     # gate; a test stub missing the attribute is the stub's own defect).
+    #
+    # Ruling 28 is node-kind-agnostic ("every creates_tokens node inside a
+    # bound region must be a declared scope opener closing in-region") — the
+    # census must ALSO cover BatchTransformProtocol.creates_tokens
+    # (plugin_protocols.py:613), which aggregation and collector plugins
+    # carry too, via the SAME direct attribute access. Not reachable on any
+    # shipped plugin today (no batch-aware plugin sets it True), but the
+    # ruling draws no node-kind exception, so the census must not either
+    # (2026-08-23 review finding, Task 8 follow-up). A creates_tokens
+    # aggregation inside a region is ALSO caught by rule 6
+    # (validate_no_aggregations_in_regions, below) regardless of
+    # creates_tokens — both rejections are correct for that shape; rule 5
+    # runs first (below) so its message wins for the overlap, and rule 6
+    # still independently covers every OTHER aggregation regardless of
+    # creates_tokens. A creates_tokens collector inside a region is a
+    # closer, not an opener, so this widened census rejects it flat via
+    # rule 5's "not a declared scope opener" limb — the correct fail-closed
+    # outcome, since a collector cannot open its own scope.
     multi_row_node_ids: dict[NodeID, str] = {
         transform_ids_by_name[wired.settings.name]: wired.settings.name for wired in transforms if wired.plugin.creates_tokens
     }
+    multi_row_node_ids.update(
+        {
+            aggregation_ids[AggregationName(agg_name)]: agg_name
+            for agg_name, (agg_transform, _agg_settings) in aggregations.items()
+            if agg_transform.creates_tokens
+        }
+    )
+    multi_row_node_ids.update(
+        {
+            collector_ids[CollectorName(collector_name)]: collector_name
+            for collector_name, (collector_transform, _collector_settings) in collectors.items()
+            if collector_transform.creates_tokens
+        }
+    )
     validate_openers_bound_in_region(graph, regions, registry, multi_row_node_ids)
+    validate_no_aggregations_in_regions(graph, regions, {aid: str(name) for name, aid in aggregation_ids.items()})
     max_observed_depth = max((r.depth for r in regions), default=0)
     graph.set_max_bound_region_depth(max_observed_depth)
     graph.set_escalation_fixpoint_bound(derive_escalation_fixpoint_bound(max_observed_depth))

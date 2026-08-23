@@ -14,9 +14,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from elspeth.cli_helpers import instantiate_plugins_from_config
 from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
+from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
@@ -187,7 +190,25 @@ def test_two_variant_fork_unions_into_paired_preference(tmp_path: Path) -> None:
     assert preference["losses"] == 0
 
 
-def test_branch_local_aggregation_flush_still_enters_row_union(tmp_path: Path) -> None:
+def test_branch_local_aggregation_flush_is_rejected_by_rule_6(tmp_path: Path) -> None:
+    """Reclassified under ruling 25 (spec §7 rule 6, Task 9, WS2 controller ruling 2026-08-23).
+
+    Until ruling 25, this test proved a passthrough-mode aggregation flush
+    inside a row_union branch still entered the union correctly at RUNTIME
+    (``_route_passthrough_results`` preserves per-row identity 1:1, so the
+    group stayed satisfiable — the same property
+    ``test_dag_row_union.py::test_passthrough_mode_branch_aggregation_feeding_row_union_is_rejected``
+    documents). That property is real and unaffected by ruling 25.
+
+    Ruling 25 bans aggregators inside every bound region regardless of
+    output_mode because it closes a DIFFERENT hazard: the BATCH_CONSUMED
+    loss-blindness gap — a lost or failed batch member is invisible to the
+    enclosing region's roster even when passthrough mode correctly
+    preserves per-row identity. `validate_no_aggregations_in_regions`
+    (core/dag/bound_regions.py) now rejects this shape at BUILD time, so
+    the runtime-execution assertion this test used to make no longer
+    applies; it now pins the build-time rejection instead.
+    """
     input_path = tmp_path / "input.jsonl"
     output_path = tmp_path / "out.jsonl"
     input_path.write_text('{"id": 1, "copies": 1}\n')
@@ -260,31 +281,18 @@ sinks:
 """
     )
     bundle = instantiate_plugins_from_config(settings)
-    graph = ExecutionGraph.from_plugin_instances(
-        sources=bundle.sources,
-        source_settings_map=bundle.source_settings_map,
-        transforms=bundle.transforms,
-        sinks=bundle.sinks,
-        aggregations=bundle.aggregations,
-        gates=list(settings.gates),
-        queues=settings.queues,
-        row_union_settings=list(settings.row_unions),
-    )
-    config = assemble_and_validate_pipeline_config(
-        sources=bundle.sources,
-        transforms=bundle.transforms,
-        sinks=bundle.sinks,
-        aggregations=bundle.aggregations,
-        settings=settings,
-        graph=graph,
-    )
-
-    result = Orchestrator(LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")).run(
-        config,
-        graph=graph,
-        settings=settings,
-        payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
-    )
-
-    assert result.rows_failed == 0
-    assert len(output_path.read_text().splitlines()) == 2
+    with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region") as exc_info:
+        ExecutionGraph.from_plugin_instances(
+            sources=bundle.sources,
+            source_settings_map=bundle.source_settings_map,
+            transforms=bundle.transforms,
+            sinks=bundle.sinks,
+            aggregations=bundle.aggregations,
+            gates=list(settings.gates),
+            queues=settings.queues,
+            row_union_settings=list(settings.row_unions),
+        )
+    message = str(exc_info.value)
+    assert "control_batch" in message
+    assert "variant_union" in message
+    assert "banned inside all bound regions" in message
