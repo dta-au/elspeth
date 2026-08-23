@@ -3401,8 +3401,10 @@ class RowProcessor:
             # resolve_next_node(coalesce_node_id) is already known non-None,
             # and _maybe_coalesce_token's arrival guard keys on the token's
             # own branch_name, not this field) — measured control-vs-patched
-            # byte-identical (scratchpad/p8_flat_lossmerge.py). See
-            # resolve_merged_branch_barrier's docstring.
+            # byte-identical (elspeth-0bd2cde19a round-2 F1's p8
+            # measurement — see
+            # .superpowers/sdd/2026-08-21-unified-lineage-ws2-config-validation/task-e1-review.md).
+            # See resolve_merged_branch_barrier's docstring.
             continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
                 outcome.merged_token.branch_name,
                 completed_coalesce_name=coalesce_name,
@@ -3412,6 +3414,13 @@ class RowProcessor:
             merged_item = self._work_items.create(
                 token=outcome.merged_token,
                 current_node_id=coalesce_node_id,
+                # Flat/unnested: the resolved name is unchanged from the
+                # just-completed barrier, so supply coalesce_node_id too —
+                # restoring WorkItemFactory.create's mismatch cross-check on
+                # this path, same as the other two sites (elspeth-0bd2cde19a
+                # round-2 F4/N3). Nested: only the resolved name is known
+                # here; create() re-derives the node id.
+                coalesce_node_id=(coalesce_node_id if outcome.merged_token.branch_name is None else None),
                 coalesce_name=continuation_coalesce_name,
                 row_union_name=continuation_row_union_name,
                 join_group_id=outcome.join_group_id,

@@ -8782,6 +8782,14 @@ class TestNotifyCoalesceOfLostBranch:
         assert results == []
         assert len(child_items) == 1
         assert child_items[0].current_node_id == NodeID("coalesce::merge")
+        # Flat/unnested merge (merged_token has no branch_name): the
+        # continuation's coalesce_name/coalesce_node_id both resolve to the
+        # just-completed barrier — both supplied, restoring
+        # WorkItemFactory.create's mismatch cross-check on this path
+        # (elspeth-0bd2cde19a round-2 F4/N3, same pattern as
+        # _fire_coalesce_merge/complete_coalesce_merge).
+        assert child_items[0].coalesce_name == CoalesceName("merge")
+        assert child_items[0].coalesce_node_id == NodeID("coalesce::merge")
         # The merged child's continuation is already journal-durable (F1/D6).
         from sqlalchemy import select
 

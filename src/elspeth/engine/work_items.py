@@ -100,8 +100,9 @@ def resolve_merged_branch_barrier(
       terminal case elsewhere before this point), and
       ``_maybe_coalesce_token``'s arrival guard keys on the released
       TOKEN's ``branch_name`` (already ``None`` here), never this field —
-      measured control-vs-patched byte-identical
-      (elspeth-0bd2cde19a round-2 F1, ``scratchpad/p8_flat_lossmerge.py``).
+      measured control-vs-patched byte-identical (elspeth-0bd2cde19a round-2
+      F1's p8 control-vs-patched measurement — see
+      ``.superpowers/sdd/2026-08-21-unified-lineage-ws2-config-validation/task-e1-review.md``).
       Kept identical to the other two call sites: one simple contract, not
       a per-site special case.
     - ``merged_branch_name`` is set (a nested coalesce/row_union closing
