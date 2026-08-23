@@ -6616,11 +6616,12 @@ class CompositionState:
             closer_labels: dict[str, str] = {}
             unbound_branches: list[str] = []
             for branch in fork_branches:
-                branch_claimants = barrier_claimants.get(branch)
-                if branch_claimants:
-                    claimant_node = barrier_node_by_id.get(branch_claimants[0])
+                if branch in barrier_claimants and barrier_claimants[branch]:
+                    branch_claimants = barrier_claimants[branch]
+                    first_claimant = branch_claimants[0]
+                    claimant_node = barrier_node_by_id[first_claimant] if first_claimant in barrier_node_by_id else None
                     claimant_kind = claimant_node.node_type if claimant_node is not None else "coalesce"
-                    closer_labels[branch] = f"{claimant_kind}:{branch_claimants[0]}"
+                    closer_labels[branch] = f"{claimant_kind}:{first_claimant}"
                 elif branch in fork_closure_sink_names or branch in fork_closure_consumer_fed_inputs:
                     unbound_branches.append(branch)
                 # Neither a barrier alias, a sink name, nor a downstream
@@ -6657,7 +6658,7 @@ class CompositionState:
                 continue
             if len(distinct_closers) == 1:
                 closer_kind, _, closer_id = distinct_closers[0].partition(":")
-                closer_node = barrier_node_by_id.get(closer_id)
+                closer_node = barrier_node_by_id[closer_id] if closer_id in barrier_node_by_id else None
                 declared = frozenset(_coalesce_branch_names(closer_node.branches)) if closer_node is not None else frozenset()
                 if declared != fork_branches:
                     errors.append(
