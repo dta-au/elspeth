@@ -2821,6 +2821,7 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         ("multiple-independent-sources", "independent-roots-reopen-resume"),
         ("multi-source-queue-fan-in", "queued-fan-in-reopen-resume"),
         ("conditional-routing", "route-reopen-resume"),
+        ("conditional-routing", "route-reopen-resume-second-sink"),
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         ("fork-coalesce-policies", "require-all-nested-reopen-after-coalesce"),
         ("sequential-nested-fork-coalesce", "reopen-terminal-publication"),

@@ -465,7 +465,7 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
 # verified against pre-migration HEAD b5b92c2b5 (WS2 Task 6 BASE); new
 # manifest verified against this commit's harness run (real observed
 # projection_sha256/counts captured via the corpus harness, never hand-computed).
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "7c8e3ad1d9ca8df0d166bc75b2d903a499109c1b3f8bd1a526da83f45f52cc7a"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "57372198c8e0fb447a0aa2aca7d5bd68fdbf23ecef5c758440ac3bb20b0ee9ea"
 # Digests the FULL case content, so it moves whenever a pinned expected
 # projection does — including a plugin ``source_file_hash`` refresh reaching the
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
@@ -589,7 +589,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "7c8e3ad1d9ca8df0d166bc75b2d903a499109c1b3f8
 # hash moves here because the run case's expected projection (sink rows,
 # sha256, counts) is now real observed data from the migrated topology —
 # both cases keep their ids, workflow, and output_artifacts unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "86780dccdd3708db2a69422e21c0a6266b14cdf3b96859e143ef705468597c5f"
+EXPECTED_CASE_REGISTRY_SHA256 = "c57fb26f469539c6aa45b7861933d2f45cf9d6f5ee8f60d912de9cb68dc60172"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -629,6 +629,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "multi-source-queue-fan-in:queued-fan-in-reopen-resume": "ccff919ce91062633679fcbe577194b4ce3c852a90c1f8f97622ac371b377c4e",
     "conditional-routing:two-way-gate": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
     "conditional-routing:route-reopen-resume": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
+    "conditional-routing:route-reopen-resume-second-sink": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
     "conditional-routing:error-route-and-discard": "27dbf1f2d1908a6f6f3df8166bff152e56977d93ffc4061c91c48871c26a282b",
     "fork-multiple-terminals-partial-failure:one-terminal-fails": "e0505f84e778047f4d68a47e27f442d82824b898cf58fe5cb084842cfbbdb925",
     "fork-multiple-terminals-partial-failure:reopen-after-partial-terminal": "e0505f84e778047f4d68a47e27f442d82824b898cf58fe5cb084842cfbbdb925",
@@ -721,6 +722,11 @@ EXPECTED_HARNESS_EVIDENCE = (
     (
         "harness-conditional-routing-route-reopen-resume",
         "conditional-routing:route-reopen-resume",
+        ("config", "build", "runtime", "audit", "recovery"),
+    ),
+    (
+        "harness-conditional-routing-route-reopen-resume-second-sink",
+        "conditional-routing:route-reopen-resume-second-sink",
         ("config", "build", "runtime", "audit", "recovery"),
     ),
     (
@@ -5092,6 +5098,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("conditional-routing", "route-reopen-resume"),
+        ("conditional-routing", "route-reopen-resume-second-sink"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_REGISTERED_CASE_IDS),
@@ -5126,11 +5133,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 112
+    assert len(manifest.evidence) == 113
     assert len(assessment_evidence) == 63
-    assert len(harness_evidence) == 49
-    assert len({reference.id for reference in manifest.evidence}) == 112
-    assert len({reference.locator for reference in manifest.evidence}) == 112
+    assert len(harness_evidence) == 50
+    assert len({reference.id for reference in manifest.evidence}) == 113
+    assert len({reference.locator for reference in manifest.evidence}) == 113
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -5152,6 +5159,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("conditional-routing", "route-reopen-resume"),
+        ("conditional-routing", "route-reopen-resume-second-sink"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_REGISTERED_CASE_IDS),
@@ -5223,6 +5231,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("conditional-routing", "audit"),
         ),
         "harness-conditional-routing-route-reopen-resume": (("conditional-routing", "recovery"),),
+        "harness-conditional-routing-route-reopen-resume-second-sink": (("conditional-routing", "recovery"),),
         "harness-fork-multiple-terminals-partial-failure-one-terminal-fails": (
             ("fork-multiple-terminals-partial-failure", "runtime"),
             ("fork-multiple-terminals-partial-failure", "audit"),
@@ -5579,6 +5588,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("conditional-routing", "route-reopen-resume"),
+        ("conditional-routing", "route-reopen-resume-second-sink"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_REGISTERED_CASE_IDS),

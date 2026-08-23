@@ -325,6 +325,11 @@ evidence:
     locator: conditional-routing:route-reopen-resume
     claim: A declared accepted-sink BEFORE_EFFECT interruption after source exhaustion preserves exact 2/1 conditional routes, dispositions, scheduler work, and the accepted effect/member identities across a fresh public resume; the same pre-effect commit intent becomes canonical response-lost evidence, accepted and rejected artifacts publish once in declaration order, work and outcomes terminalize, the checkpoint is removed, and durable/export parity holds; this single-process pre-platform evidence is provisional until the deferred-platform rebase.
     stages: [config, build, runtime, audit, recovery]
+  - id: harness-conditional-routing-route-reopen-resume-second-sink
+    kind: harness
+    locator: conditional-routing:route-reopen-resume-second-sink
+    claim: A declared rejected-sink BEFORE_EFFECT interruption -- the SECOND-executing sink on the same topology -- witnesses a genuinely mixed-state, multi-effect partial externalization (channel B) absent from every other sink-boundary case, whose effects_before snapshot always held exactly one entry, the interrupted target compared against itself. Here effects_before carries two entries in two different states -- accepted already finalized and published, rejected still in flight with its artifact_id already populated before publication. Recovery preserves the same 2/1 conditional routes, dispositions, scheduler work, and the rejected effect/member identity across a fresh public resume; the same pre-effect commit intent becomes canonical response-lost evidence, both artifacts publish once in declaration order, work and outcomes terminalize, the checkpoint is removed, and durable/export parity holds; this single-process pre-platform evidence is provisional until the deferred-platform rebase.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-fork-multiple-terminals-partial-failure-one-terminal-fails
     kind: harness
     locator: fork-multiple-terminals-partial-failure:one-terminal-fails
@@ -3403,6 +3408,35 @@ scenarios:
             - sink_effect_member
             - token
             - token_outcome
+      - id: route-reopen-resume-second-sink
+        workflow: recovery
+        recovery_kind: sink_boundary
+        recovery_fault:
+          kind: sink_effect
+          seam: before_effect
+          sink_name: rejected
+          occurrence: 1
+        fixture: conditional-routing/route-reopen-resume.yaml
+        input_fixtures:
+          primary: conditional-routing/input.csv
+        output_artifacts:
+          accepted: accepted.jsonl
+          rejected: rejected.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 3
+          required_audit_record_types:
+            - artifact
+            - operation
+            - routing_event
+            - row
+            - run
+            - scheduler_event
+            - sink_effect
+            - sink_effect_member
+            - token
+            - token_outcome
     dimensions:
       config:
         status: pass
@@ -3433,7 +3467,9 @@ scenarios:
           - harness-conditional-routing-error-route-and-discard
       recovery:
         status: pass
-        evidence: [harness-conditional-routing-route-reopen-resume]
+        evidence:
+          - harness-conditional-routing-route-reopen-resume
+          - harness-conditional-routing-route-reopen-resume-second-sink
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: *guided_fail

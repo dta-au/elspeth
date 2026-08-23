@@ -8,6 +8,23 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-23 — a NEW corpus case fails the WS1 frozen-oracle gate closed, and
+  the fix is a scoped write, never a full regenerate.** `tests/integration/core/
+  dag/test_oracle_freeze.py::test_frozen_oracle_surface` (campaign instrument,
+  deleted at WS1/WS2 close) parametrizes over EVERY non-build-workflow case in
+  the live manifest via `iter_harness_cases`, with no exemption for a case that
+  did not exist at the pre-flip freeze commit — adding one fails with "No frozen
+  snapshot ... run the freeze writer at the recorded pre-flip commit", because
+  there is no scenario-level or case-level classification for "born after the
+  freeze". The correct response is NOT to touch any existing snapshot (that is
+  the "oracle tampering" the module docstring warns about) — it is to write only
+  the new case's own file, once, by name:
+  `ELSPETH_ORACLE_FREEZE=write pytest "tests/integration/core/dag/test_oracle_freeze.py::test_frozen_oracle_surface[<scenario>--<case>]"`
+  (repeat per new case; `-k` also works if it resolves to exactly your new ids).
+  Verify with `git status --porcelain tests/fixtures/dag_scenario_corpus/oracle_freeze/`
+  that only brand-new (`??`) files appeared, never an `M` against an existing
+  snapshot. Landed with elspeth-7d68dd828e (conditional-routing:route-reopen-
+  resume-second-sink).
 - **2026-08-22 — WS1a unified-lineage prep conventions (branch feature/unified-lineage).**
   Four traps until the WS1b flip lands: (1) `TokenInfo.lineage_path` is
   WRITE-ONLY during WS1 prep — reading it from production code before the
