@@ -1141,6 +1141,57 @@ def _build_transform_with_bogus_on_error() -> ExecutionGraph:
     )
 
 
+def _build_nested_regions_with_inner_transform_on_error_to_outer_closer() -> ExecutionGraph:
+    """An inner fork->coalesce region nested inside one branch of an outer
+    fork->coalesce region; a transform strictly inside the INNER region names
+    the OUTER closer as its on_error target. Legal under rule 9 (spec §7,
+    interpretation 4): any ENCLOSING region's closer qualifies, not only the
+    innermost — reach-based membership makes the outer region transitively
+    contain the inner region's nodes.
+    """
+    source = _BuilderValidationMockSource()
+    deep_transform = _BuilderValidationTransform(name="deep_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=deep_transform,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="deep_transform",
+                    plugin=deep_transform.name,
+                    input="inner_a",
+                    on_success="ia_out",
+                    on_error="merge_outer",  # the OUTER closer, skipping merge_inner
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="outer_gate",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["outer_a", "outer_b"],
+            ),
+            GateSettings(
+                name="inner_gate",
+                input="outer_a",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["inner_a", "inner_b"],
+            ),
+        ],
+        coalesce_settings=[
+            CoalesceSettings(name="merge_inner", branches={"inner_a": "ia_out", "inner_b": "inner_b"}),
+            CoalesceSettings(name="merge_outer", branches={"outer_a": "merge_inner", "outer_b": "outer_b"}, on_success="out"),
+        ],
+    )
+
+
 def _build_fork_coalesce_with_gate_on_error_to_closer() -> ExecutionGraph:
     """Same shape as the transform case, but the deferred on_error is a
     plain routing GATE's row-level on_error — symmetric coverage for the
@@ -1199,3 +1250,23 @@ class TestOnErrorCloserTargets:
     def test_unknown_on_error_sink_message_unchanged(self) -> None:
         with pytest.raises(GraphValidationError, match="references unknown sink"):
             _build_transform_with_bogus_on_error()
+
+    def test_nested_inner_transform_may_name_the_outer_closer(self) -> None:
+        # Interpretation 4: ANY enclosing closer, not only the innermost.
+        # Pins reach-based membership — a representation change that narrowed
+        # rule 9 to innermost-only would redden this before shipping.
+        graph = _build_nested_regions_with_inner_transform_on_error_to_outer_closer()
+        outer_closer_id = graph.get_coalesce_id_map()[CoalesceName("merge_outer")]
+        divert_labels = {e.label for e in graph.get_incoming_edges(outer_closer_id) if e.mode is RoutingMode.DIVERT}
+        assert any("deep_transform" in label for label in divert_labels)
+        inner_closer_id = graph.get_coalesce_id_map()[CoalesceName("merge_inner")]
+        assert not any(e.mode is RoutingMode.DIVERT for e in graph.get_incoming_edges(inner_closer_id))
+
+    def test_rule_9_divert_edges_do_not_trigger_the_divert_coalesce_warning(self) -> None:
+        # The divert-coalesce warning pass runs BEFORE rule-9 resolution, so
+        # rule-9 edges are exempt from its "rows will never reach the
+        # coalesce" text (which would be false for an edge INTO the closer).
+        # Pins the ordering: moving the warning pass after region computation
+        # would start emitting a factually wrong warning here.
+        graph = _build_fork_coalesce_with_branch_on_error_to_closer()
+        assert not any(w.code.startswith("DIVERT_COALESCE_") for w in graph.validation_warnings)

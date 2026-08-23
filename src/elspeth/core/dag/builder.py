@@ -1645,6 +1645,11 @@ def build_execution_graph(
     # Warn about DIVERT edges feeding correlated barriers (non-fatal).
     # set_validation_warnings ASSIGNS, so both barrier kinds contribute to one
     # list and one call — a second call would silently displace the first.
+    # ORDERING CONSTRAINT: this pass must stay BEFORE the rule-9 resolution
+    # pass below, which lands DIVERT edges INTO closers. This warning's text
+    # ("rows will never reach the coalesce") is about diversion AWAY from a
+    # barrier and would be factually wrong for a rule-9 edge; running here,
+    # those edges do not exist yet, which is the intended exemption.
     if coalesce_id_to_config or row_union_id_to_config:
         build_warnings: list[GraphValidationWarning] = []
         if coalesce_id_to_config:
