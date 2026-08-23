@@ -170,14 +170,66 @@ row_unions:
         assert predecessor_plugins == {"passthrough"}
 
     def test_unproduced_branch_rejected(self, tmp_path: Path) -> None:
+        # ghost_branch is a PARTIAL orphan: control_branch/treatment_branch
+        # ARE produced (by variant_fork), only ghost_branch is not. Rule 2's
+        # roster-equality check (spec §7 rule 2) sees the producing gate
+        # registered against this closer and fires there — the standalone
+        # "VALIDATE ROW_UNION BRANCHES ARE PRODUCED BY GATES" orphan check
+        # never runs for a partial orphan (maintainer ruling 2026-08-23);
+        # it stays reachable only when EVERY declared branch is unproduced
+        # (see test_wholly_unproduced_union_rejected below). Pin the rule-2
+        # code and the enriched orphan-listing content so the enrichment is
+        # load-bearing, not decorative — and assert the OLD standalone
+        # check's message shape does not appear, even though it happens to
+        # share the substring "no gate produces" with rule 2's enrichment.
         bad_union = """
 row_unions:
   - name: variant_union
     branches: [control_branch, treatment_branch, ghost_branch]
     on_success: union_out
 """
-        with pytest.raises(GraphValidationError, match="no gate produces"):
+        with pytest.raises(GraphValidationError) as exc_info:
             _build_graph(_yaml(tmp_path, row_unions=bad_union, tail=_PASSTHROUGH_TAIL))
+        message = str(exc_info.value)
+        assert "roster mismatch" in message
+        assert "drawn from 1 fork gate(s)" in message
+        assert "'variant_fork' declares ['control_branch', 'treatment_branch']" in message
+        assert "no gate produces ['ghost_branch']" in message
+        assert "declares branch 'ghost_branch', but no gate produces this branch.\nBranches must be listed" not in message
+
+    def test_wholly_unproduced_union_rejected(self, tmp_path: Path) -> None:
+        # Every declared branch is unproduced (zero overlap with any gate's
+        # fork_to) — no gate ever registers this closer, so rule 2's
+        # per-gate loop never sees it. The standalone "VALIDATE ROW_UNION
+        # BRANCHES ARE PRODUCED BY GATES" check is the only thing that
+        # catches this shape (maintainer ruling 2026-08-23 verified this is
+        # the one still-reachable case; the check was kept, not deleted).
+        bad_union = """
+row_unions:
+  - name: orphan_union
+    branches: [ghost_a, ghost_b]
+    on_success: union_out
+"""
+        extra_sinks = f"""
+  control_branch:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "cb.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  treatment_branch:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "tb.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+"""
+        with pytest.raises(GraphValidationError, match="no gate produces this branch"):
+            _build_graph(_yaml(tmp_path, row_unions=bad_union, tail=_PASSTHROUGH_TAIL, extra_sinks=extra_sinks))
 
     def test_no_destination_error_names_row_unions(self, tmp_path: Path) -> None:
         # third_branch has no coalesce, no row_union, and no sink: the
@@ -380,9 +432,20 @@ row_unions:
             )
 
         message = str(exc_info.value)
-        assert "variant_fork" in message
-        assert "nested_fork" in message
-        assert "ancestor" in message.lower()
+        # Rule 2's roster-equality check (spec §7 rule 2) supersedes the old
+        # row_union-specific "ancestor/descendant fork generations"
+        # diagnostic (maintainer ruling 2026-08-23): a closer whose roster
+        # spans a nested fork generation can never equal any single
+        # contributing gate's own fork_to, so this is now a roster mismatch,
+        # not a bespoke fork-generation check. Pin the rule-2 code and the
+        # enriched, per-gate-roster content (this is what replaces the old
+        # diagnostic's value), and assert the old code does NOT fire.
+        assert "roster mismatch" in message
+        assert "variant_union" in message
+        assert "drawn from 2 fork gate(s)" in message
+        assert "'variant_fork' declares ['control_branch', 'treatment_branch']" in message
+        assert "'nested_fork' declares ['inner_left', 'inner_right']" in message
+        assert "declares branches produced by ancestor/descendant" not in message
 
     def test_coalesce_downstream_of_row_union_rejected(self, tmp_path: Path) -> None:
         # row_union -> transform -> gate(fork_to) -> coalesce used to BUILD and
@@ -557,14 +620,14 @@ gates:
     routes:
       'true': fork
       'false': output
-    fork_to: [control_branch, aux_left]
+    fork_to: [control_branch]
   - name: fork_beta
     input: routed_b
     condition: "True"
     routes:
       'true': fork
       'false': output
-    fork_to: [treatment_branch, aux_right]
+    fork_to: [treatment_branch]
 row_unions:
   - name: variant_union
     branches: [control_branch, treatment_branch]
@@ -587,29 +650,24 @@ sinks:
       format: jsonl
       schema:
         mode: observed
-  aux_left:
-    plugin: json
-    on_write_failure: discard
-    options:
-      path: {tmp_path / "aux_left.jsonl"}
-      format: jsonl
-      schema:
-        mode: observed
-  aux_right:
-    plugin: json
-    on_write_failure: discard
-    options:
-      path: {tmp_path / "aux_right.jsonl"}
-      format: jsonl
-      schema:
-        mode: observed
 """
         with pytest.raises(GraphValidationError) as exc_info:
             _build_graph(yaml_text)
         message = str(exc_info.value)
+        # Rule 2's roster-equality check (spec §7 rule 2) supersedes the old
+        # row_union-specific "unrelated fork gates" origin diagnostic
+        # (maintainer ruling 2026-08-23): a closer whose roster is produced
+        # by more than one fork gate can never equal any single gate's own
+        # fork_to, so this is now a roster mismatch, not a bespoke
+        # cross-origin check. Pin the rule-2 code and the enriched,
+        # per-gate-roster content (this is what replaces the old
+        # diagnostic's value), and assert the old code does NOT fire.
+        assert "roster mismatch" in message
         assert "variant_union" in message
-        assert "fork_alpha" in message
-        assert "fork_beta" in message
+        assert "drawn from 2 fork gate(s)" in message
+        assert "'fork_alpha' declares ['control_branch']" in message
+        assert "'fork_beta' declares ['treatment_branch']" in message
+        assert "declares branches produced by unrelated fork gates" not in message
 
     def test_union_rejects_branch_input_not_descending_from_alias(self, tmp_path: Path) -> None:
         """A mapped input must descend from its own branch alias (elspeth-d560c5e649).

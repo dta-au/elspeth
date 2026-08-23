@@ -6612,6 +6612,15 @@ class CompositionState:
         # which classifies unbound identically regardless of WHY it is
         # unbound (sink match vs. consumer-fed).
         fork_closure_consumer_fed_inputs = {node.input for node in self.nodes if node.node_type in ("transform", "gate")}
+        # closer_gate_rosters accumulates every fork gate that contributes a
+        # branch to a given closer, checked in one closer-centric pass below
+        # rather than per-gate — mirrors core/dag/builder.py's rule-2
+        # restructuring (maintainer ruling 2026-08-23): a closer whose
+        # roster is produced by more than one gate can never equal any
+        # single contributing gate's own fork_to, so a per-gate compare
+        # would let a multi-gate roster whose union happens to equal the
+        # declared set slip through as "legal".
+        closer_gate_rosters: dict[str, dict[str, list[str]]] = {}
         for gate_id, fork_branches in gate_fork_branches_by_id.items():
             closer_labels: dict[str, str] = {}
             unbound_branches: list[str] = []
@@ -6657,21 +6666,40 @@ class CompositionState:
                 )
                 continue
             if len(distinct_closers) == 1:
-                closer_kind, _, closer_id = distinct_closers[0].partition(":")
-                closer_node = barrier_node_by_id[closer_id] if closer_id in barrier_node_by_id else None
-                declared = frozenset(_coalesce_branch_names(closer_node.branches)) if closer_node is not None else frozenset()
-                if declared != fork_branches:
-                    errors.append(
-                        _err(
-                            f"node:{closer_id}",
-                            f"{'Coalesce' if closer_kind == 'coalesce' else 'row_union'} '{closer_id}' roster mismatch: "
-                            f"closer declares {sorted(declared)} but fork gate '{gate_id}' declares "
-                            f"{sorted(fork_branches)}. Whole-roster closure requires the closer's branches "
-                            "to EQUAL the fork's branch list (spec §7 rule 2).",
-                            "high",
-                            "fork_roster_mismatch",
-                        )
-                    )
+                closer_label = distinct_closers[0]
+                if closer_label not in closer_gate_rosters:
+                    closer_gate_rosters[closer_label] = {}
+                closer_gate_rosters[closer_label][gate_id] = sorted(fork_branches)
+
+        # Roster equality, checked once per CLOSER across every contributing
+        # gate. "One gate, no orphans" is the only legal shape: mixed
+        # closure and multi-closer splits are already ruled out above, so a
+        # single contributing gate's own roster is always a subset of the
+        # closer's declared roster — legality collapses to that one case.
+        for closer_label, gate_rosters in closer_gate_rosters.items():
+            closer_kind, _, closer_id = closer_label.partition(":")
+            closer_node = barrier_node_by_id[closer_id] if closer_id in barrier_node_by_id else None
+            declared = set(_coalesce_branch_names(closer_node.branches)) if closer_node is not None else set()
+            produced: set[str] = set()
+            for roster in gate_rosters.values():
+                produced.update(roster)
+            orphaned = sorted(declared - produced)
+            if len(gate_rosters) == 1 and not orphaned:
+                continue
+            closer_word = "Coalesce" if closer_kind == "coalesce" else "row_union"
+            gate_summary = "; ".join(f"'{name}' declares {roster}" for name, roster in sorted(gate_rosters.items()))
+            orphan_clause = f"; no gate produces {orphaned}" if orphaned else ""
+            errors.append(
+                _err(
+                    f"node:{closer_id}",
+                    f"{closer_word} '{closer_id}' roster mismatch: closer declares {sorted(declared)}, "
+                    f"drawn from {len(gate_rosters)} fork gate(s): {gate_summary}{orphan_clause}. Whole-roster "
+                    f"closure requires the closer's branches to come from exactly ONE gate's fork_to, with the "
+                    f"rosters exactly equal (spec §7 rule 2).",
+                    "high",
+                    "fork_roster_mismatch",
+                )
+            )
 
         for node in self.nodes:
             if node.node_type == "coalesce":

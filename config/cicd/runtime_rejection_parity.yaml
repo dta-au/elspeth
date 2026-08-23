@@ -2460,33 +2460,6 @@ sites:
   - row_union_branch_alias_unreachable
   note: state.py:5633-5642 rejects any row_union branch ALIAS absent from every gate's fork_to, the same
     predicate as builder.py:762 ('branch_name not in row_union_branch_gates').
-- key: 55fedc6679041321
-  path: src/elspeth/core/dag/builder.py
-  qualname: build_execution_graph
-  exception: GraphValidationError
-  message: 'row_union ''{}'' declares branches produced by ancestor/descendant fork gates {}. A require-all
-    union cannot span fork generations: the nested fork path replaces '
-  ordinal: 0
-  disposition: mirrored
-  counterpart:
-  - row_union_branch_origin_invalid
-  note: An ancestor/descendant pair means the union's aliases span two distinct fork gates, so no single
-    gate's fork_to is a superset and state.py:5666 fires (common_gate_ids empty). The remaining case —
-    one gate holding all the aliases — needs that gate to be its own fork ancestor, i.e. a graph cycle,
-    which is the separately-tracked Stage-1 cycle-detection gap, not this predicate. For every acyclic
-    topology the two predicates coincide.
-- key: 4ae3d2a996962e70
-  path: src/elspeth/core/dag/builder.py
-  qualname: build_execution_graph
-  exception: GraphValidationError
-  message: 'row_union ''{}'' declares branches produced by unrelated fork gates {}. Rows forked by different
-    gates never share a correlation identity, so a require-all union '
-  ordinal: 0
-  disposition: mirrored
-  counterpart:
-  - row_union_branch_origin_invalid
-  note: 'Unrelated fork gates is the same Stage-1 predicate at state.py:5661-5680: aliases must all come
-    from one common gate fork_to so they share a correlation origin (builder.py:1477).'
 - key: 8c334befe70f521f
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph
@@ -2510,18 +2483,22 @@ sites:
   - row_union_downstream_group_invalid
   note: state.py:5740-5753 rejects a coalesce/row_union downstream of a row_union's on_success with no
     intervening sink, the barrier arm of builder.py:1378-1391.
-- key: 51c6efb011fb0a96
+- key: d18650affcf81ac3
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph
   exception: GraphValidationError
-  message: '{} ''{}'' roster mismatch: closer declares {} but fork gate ''{}'' declares {}. Whole-roster
-    closure requires the closer''s branches to EQUAL the fork''s branch list '
+  message: '{} ''{}'' roster mismatch: closer declares {}, drawn from {} fork gate(s): {}{}. Whole-roster
+    closure requires the closer''s branches to come from exactly ONE gate'
   ordinal: 0
   disposition: mirrored
   counterpart:
   - fork_roster_mismatch
-  note: state.py's WHOLE-ROSTER FORK CLOSURE block mirrors builder.py's ruling-23 rule 2 roster-equality
-    check for a fully-bound fork's single closer.
+  note: Enriched replacement for key 51c6efb011fb0a96 (maintainer ruling 2026-08-23) — rule 2's roster-equality
+    check now runs closer-centric across every contributing fork gate rather than per-gate, so a multi-gate
+    or orphan-branch mismatch names every contributing gate's own roster and any branch no gate produces,
+    superseding the deleted ancestor/descendant (55fedc6679041321) and unrelated-fork-origin (4ae3d2a996962e70)
+    diagnostics for every shape they used to catch. state.py's WHOLE-ROSTER FORK CLOSURE mirror (fork_roster_mismatch)
+    received the matching closer-centric restructuring and message enrichment in the same change.
 - key: 3113abc75ea18b67
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph._best_schema_config

@@ -847,7 +847,22 @@ def build_execution_graph(
     # A fork is fully bound (every branch flows to its ONE closer, rosters
     # equal) or fully unbound (pure fan-out to sinks). Mixed closure and
     # multi-closer splits are build errors; subset closure can be added
-    # additively later — the reverse narrowing never could be.
+    # additively later — the reverse narrowing never could be. Rule 2
+    # supersedes the old row_union-specific origin diagnostics (ancestor/
+    # descendant fork generations, unrelated fork origins): any topology
+    # those two arms used to catch is ALSO a roster mismatch here, since a
+    # closer whose roster spans more than one gate's fork_to can never equal
+    # any single contributing gate's roster (maintainer ruling 2026-08-23;
+    # the arms were deleted as dead code — see the closer-centric check
+    # below for the multi-gate enrichment that replaces their diagnostic
+    # value).
+    #
+    # closer_gate_rosters accumulates, per closer, every fork gate that
+    # contributes a branch to it — a closer_label with >1 entry is exactly
+    # the "unrelated/ancestor-descendant fork gates" shape the deleted arms
+    # used to name explicitly; the roster-equality pass below reads this
+    # map so its message can still name every contributing gate.
+    closer_gate_rosters: dict[str, dict[str, list[str]]] = {}
     for gate_entry in gate_entries:
         if not gate_entry.fork_to:
             continue
@@ -881,21 +896,50 @@ def build_execution_graph(
             )
         if distinct_closers:
             closer_label = distinct_closers[0]
-            kind, _, closer_name = closer_label.partition(":")
-            declared = (
-                {str(b.branch_name) for b in coalesce_plans[CoalesceName(closer_name)].branches}
-                if kind == "coalesce"
-                else {str(b) for b, spec in row_union_branch_specs.items() if str(spec.row_union_name) == closer_name}
-            )
-            if declared != set(gate_entry.fork_to):
-                raise GraphValidationError(
-                    f"{'Coalesce' if kind == 'coalesce' else 'row_union'} '{closer_name}' roster mismatch: "
-                    f"closer declares {sorted(declared)} but fork gate '{gate_entry.name}' declares "
-                    f"{sorted(gate_entry.fork_to)}. Whole-roster closure requires the closer's branches "
-                    f"to EQUAL the fork's branch list (spec §7 rule 2).",
-                    component_id=closer_name,
-                    component_type=kind,
-                )
+            if closer_label not in closer_gate_rosters:
+                closer_gate_rosters[closer_label] = {}
+            closer_gate_rosters[closer_label][gate_entry.name] = list(gate_entry.fork_to)
+
+    # Roster equality, checked once per CLOSER across every contributing
+    # gate (rather than once per gate against the closer's full roster) so
+    # a multi-gate mismatch can name every contributing gate's own roster
+    # plus any branch no gate produces at all, in one message.
+    #
+    # NOTE: legality is NOT "declared == union(all contributing gates'
+    # rosters)" — a multi-gate closer whose combined rosters happen to sum
+    # to exactly the declared set (the common shape: every declared branch
+    # has some producer, just spread across >1 gate) would wrongly pass that
+    # check, silently re-admitting the ancestor/descendant and unrelated-
+    # origin topologies rule 2 is supposed to supersede. The single legal
+    # shape is exactly ONE contributing gate whose own roster has zero
+    # orphans against the declared set; by construction (mixed-closure and
+    # multi-closer-split are already ruled out above) a single contributing
+    # gate's fork_to is always a subset of `declared`, so "one gate, no
+    # orphans" implies exact equality — no separate equality check needed.
+    for closer_label, gate_rosters in closer_gate_rosters.items():
+        kind, _, closer_name = closer_label.partition(":")
+        declared = (
+            {str(b.branch_name) for b in coalesce_plans[CoalesceName(closer_name)].branches}
+            if kind == "coalesce"
+            else {str(b) for b, spec in row_union_branch_specs.items() if str(spec.row_union_name) == closer_name}
+        )
+        produced: set[str] = set()
+        for fork_to in gate_rosters.values():
+            produced.update(fork_to)
+        orphaned = sorted(declared - produced)
+        if len(gate_rosters) == 1 and not orphaned:
+            continue
+        closer_word = "Coalesce" if kind == "coalesce" else "row_union"
+        gate_summary = "; ".join(f"'{name}' declares {sorted(roster)}" for name, roster in sorted(gate_rosters.items()))
+        orphan_clause = f"; no gate produces {orphaned}" if orphaned else ""
+        raise GraphValidationError(
+            f"{closer_word} '{closer_name}' roster mismatch: closer declares {sorted(declared)}, "
+            f"drawn from {len(gate_rosters)} fork gate(s): {gate_summary}{orphan_clause}. Whole-roster "
+            f"closure requires the closer's branches to come from exactly ONE gate's fork_to, with the "
+            f"rosters exactly equal (spec §7 rule 2).",
+            component_id=closer_name,
+            component_type=kind,
+        )
 
     # ===== VALIDATE COALESCE BRANCHES ARE PRODUCED BY GATES =====
     # All branches declared in coalesce settings must be produced by some fork gate
@@ -915,6 +959,15 @@ def build_execution_graph(
                 )
 
     # ===== VALIDATE ROW_UNION BRANCHES ARE PRODUCED BY GATES =====
+    # Reachable only when a row_union's ENTIRE declared roster is disjoint
+    # from every fork gate's fork_to (no gate contributes even one of its
+    # branches) — verified 2026-08-23 (maintainer ruling on the rule-2
+    # supersession above). A PARTIAL orphan (some declared branches produced,
+    # some not) never reaches here: the producing gate(s) already enter
+    # closer_gate_rosters above, so rule 2's roster-equality check fires
+    # first and names the orphan branch itself (declared - produced). Keep
+    # this check for the wholly-disjoint case, where no gate ever registers
+    # the closer at all and rule 2 never sees it.
     if row_union_branch_specs:
         for branch_name, ru_spec in row_union_branch_specs.items():
             if branch_name not in row_union_branch_gates:
@@ -1641,51 +1694,15 @@ def build_execution_graph(
                 for branch_name, (_gate_name, gate_node_id) in row_union_branch_gates.items()
                 if row_union_branch_specs[branch_name].row_union_name == union_name
             }
-            ancestor_descendant_fork_pairs: set[tuple[str, str]] = set()
-            for descendant_gate_id in union_fork_gate_node_ids:
-                fork_ancestor_frontier = [descendant_gate_id]
-                fork_ancestor_seen: set[NodeID] = set()
-                while fork_ancestor_frontier:
-                    fork_ancestor_current = fork_ancestor_frontier.pop()
-                    for in_edge in graph.get_incoming_edges(fork_ancestor_current):
-                        upstream = in_edge.from_node
-                        if upstream in fork_ancestor_seen:
-                            continue
-                        fork_ancestor_seen.add(upstream)
-                        if upstream in union_fork_gate_node_ids:
-                            ancestor_descendant_fork_pairs.add(
-                                (
-                                    configured_fork_gate_names[upstream],
-                                    configured_fork_gate_names[descendant_gate_id],
-                                )
-                            )
-                        fork_ancestor_frontier.append(upstream)
-            if ancestor_descendant_fork_pairs:
-                raise GraphValidationError(
-                    f"row_union '{union_name}' declares branches produced by ancestor/descendant "
-                    f"fork gates {sorted(ancestor_descendant_fork_pairs)}. A require-all union cannot "
-                    f"span fork generations: the nested fork path replaces its ancestor branch, while "
-                    f"the non-nested path omits every nested branch, so no execution can supply all "
-                    f"declared branches. Use branches from one fork generation per row_union.",
-                    component_id=str(union_name),
-                    component_type="row_union",
-                )
-            # Ancestor/descendant pairs got their targeted diagnostic above;
-            # any other multi-gate union means UNRELATED fork origins (e.g.
-            # independent sources). Those rows never share a correlation
-            # identity, so a require-all group can never complete — it would
-            # only surface at timeout/end-of-source (elspeth-d560c5e649).
-            if len(union_fork_gate_node_ids) > 1:
-                origin_gate_names = sorted(configured_fork_gate_names[gate_id] for gate_id in union_fork_gate_node_ids)
-                raise GraphValidationError(
-                    f"row_union '{union_name}' declares branches produced by unrelated fork gates "
-                    f"{origin_gate_names}. Rows forked by different gates never share a correlation "
-                    f"identity, so a require-all union spanning them can never receive a complete "
-                    f"same-row group — every group would wait until timeout or end-of-source and "
-                    f"fail closed. Declare every branch of a row_union in ONE gate's fork_to list.",
-                    component_id=str(union_name),
-                    component_type="row_union",
-                )
+            # Ancestor/descendant fork generations and unrelated multi-gate
+            # origins used to get their own targeted diagnostics here. Both
+            # are now dead code: rule 2 (WHOLE-ROSTER FORK CLOSURE, above)
+            # provably pre-empts both shapes — a closer whose roster spans
+            # more than one gate's fork_to can never equal any single
+            # contributing gate's roster, so the roster-equality check always
+            # fires first and names every contributing gate (maintainer
+            # ruling 2026-08-23; deleted per prerelease no-dead-code
+            # doctrine).
             seen_upstream: set[NodeID] = set()
             upstream_frontier: list[NodeID] = [union_node_id]
             nested_fork_gate_names: set[str] = set()
