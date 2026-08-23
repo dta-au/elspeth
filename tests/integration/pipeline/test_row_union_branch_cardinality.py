@@ -1,30 +1,52 @@
-"""A row-multiplying transform inside a row_union branch must fail closed.
+"""An undeclared row-multiplying transform inside a row_union branch is a build error.
 
 row_union correlates on (row_union_name, row_id), so a branch containing an
 expanding transform emits several children sharing one row_id and cannot
 satisfy the barrier. Coalesce — which correlates identically — surfaces that
-as a loud duplicate-arrival invariant error. row_union must not be quieter:
-before this was fixed the mid-branch continuation dropped the barrier
-binding, so the children walked straight through the union node and the
-group split silently, yielding a half-group statistic with no audit signal
-(elspeth-a5b86149d4 remediation).
+as a loud duplicate-arrival invariant error.
+
+**Reclassified under ruling 28 (spec §7 rule 5, Task 8, WS2 controller ruling
+2026-08-23; see `docs/superpowers/specs/2026-08-21-barrier-scopes-full-nesting-spec.md`
+§7 rule 5).** This module used to prove the RUNTIME-adjudicated posture:
+before elspeth-a5b86149d4, the mid-branch continuation dropped the barrier
+binding, so exploded children walked straight through the union node and the
+group split silently; the fix (`token_traversal.py:254-273`, "the barrier
+binding must survive expansion") made the union node adjudicate the surplus
+children and fail them closed instead, with an audit signal. Ruling 28
+supersedes that whole posture for BOUND regions: "a shape change inside a
+group must itself be a group" — an undeclared multi-row transform inside a
+row_union-bound branch is now rejected at BUILD time
+(`GraphValidationError`, `core/dag/bound_regions.py::validate_openers_bound_in_region`),
+never reaching a run at all. `test_expanding_transform_in_a_branch_does_not_bypass_the_barrier`
+below pins that build-time rejection now, not the runtime adjudication.
+
+The runtime seam this module used to exercise (`token_traversal.py:254-273`,
+"the barrier binding must survive expansion") is NOT dead code — it is still
+reachable through any post-ruling-28 topology this build-time check does not
+yet see, and through pre-ruling-28 persisted/resumed runs — but it has lost
+its only END-TO-END witness here, because there is no legal way to build a
+RUNNABLE pipeline with a multi-row transform inside a bound row_union region
+today: `scopes:`/`collectors:` (the ruling-28-legal replacement) are
+buildable but not yet RUNNABLE — the collector executor is WS4 (spec §7
+plan Decision 5). A direct processor-level plumbing witness for that seam
+(hand-built `TokenInfo`/work-item context, no DAG builder involved) lives in
+`tests/unit/engine/test_processor.py::TestProcessRowMultiRowOutput::
+test_row_union_binding_survives_expansion_on_a_branch`.
 """
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
+
+import pytest
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
 from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
-from elspeth.core.landscape import LandscapeDB
-from elspeth.core.payload_store import FilesystemPayloadStore
-from elspeth.engine.orchestrator import Orchestrator
-from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
+from elspeth.core.dag.models import GraphValidationError
 
 
-def _run(tmp_path: Path) -> object:
+def _build(tmp_path: Path) -> ExecutionGraph:
     input_path = tmp_path / "input.jsonl"
     output_path = tmp_path / "out.jsonl"
     # Each row carries a two-element array, so the treatment branch explodes
@@ -95,7 +117,7 @@ sinks:
 """
     )
     bundle = instantiate_plugins_from_config(settings)
-    graph = ExecutionGraph.from_plugin_instances(
+    return ExecutionGraph.from_plugin_instances(
         sources=bundle.sources,
         source_settings_map=bundle.source_settings_map,
         transforms=bundle.transforms,
@@ -105,47 +127,17 @@ sinks:
         queues=settings.queues,
         row_union_settings=list(settings.row_unions),
     )
-    config = assemble_and_validate_pipeline_config(
-        sources=bundle.sources,
-        transforms=bundle.transforms,
-        sinks=bundle.sinks,
-        aggregations=bundle.aggregations,
-        settings=settings,
-        graph=graph,
-    )
-    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
-    return Orchestrator(db).run(
-        config,
-        graph=graph,
-        settings=settings,
-        payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
-    )
 
 
 def test_expanding_transform_in_a_branch_does_not_bypass_the_barrier(tmp_path: Path) -> None:
-    """Every exploded child is accounted for AT the barrier, none walks past it.
+    """An undeclared multi-row transform inside a row_union branch fails to BUILD (ruling 28).
 
-    Two source rows fork into control + treatment; treatment explodes into
-    two children sharing its row_id, so six branch tokens reach the union
-    for four declared slots. The contract is not that the surplus succeeds —
-    it cannot, correlation is per row_id — but that it is adjudicated by the
-    barrier and recorded, exactly as coalesce adjudicates the same shape.
-    When the binding was dropped, the treatment children never appeared at
-    the union at all and continued downstream ungrouped.
+    `explode_treatment` (creates_tokens=True, plugin json_explode) sits inside
+    `variant_union`'s `treatment_branch` with no `scopes:` entry declaring it
+    an opener. Spec §7 rule 5: every token-creating node inside a bound
+    region must be a declared scope opener whose closer is ALSO inside that
+    region — this topology has neither, so it is rejected flat, before a run
+    is ever attempted.
     """
-    _run(tmp_path)
-
-    conn = sqlite3.connect(str(tmp_path / "audit.db"))
-    union_states = dict(
-        conn.execute("SELECT status, COUNT(*) FROM node_states WHERE node_id LIKE 'row_union_%' GROUP BY status").fetchall()
-    )
-
-    # All six branch arrivals are adjudicated at the barrier: four release as
-    # two complete groups, the two surplus expansion children fail closed.
-    assert sum(union_states.values()) == 6, f"branch tokens bypassed the barrier: {union_states}"
-    assert union_states.get("completed") == 4, union_states
-    assert union_states.get("failed") == 2, union_states
-
-    # Nothing ungrouped leaks downstream: only the released groups are written.
-    sink_completed = conn.execute("SELECT COUNT(*) FROM node_states WHERE node_id LIKE 'sink_%' AND status = 'completed'").fetchone()[0]
-    assert sink_completed == 4, f"expected only released group members at the sink, got {sink_completed}"
+    with pytest.raises(GraphValidationError, match=r"Multi-row transform .* inside bound region"):
+        _build(tmp_path)

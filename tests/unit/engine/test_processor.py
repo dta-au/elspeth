@@ -3920,6 +3920,110 @@ class TestProcessRowMultiRowOutput:
                 success_reason={"action": "expand"},
             )
 
+    def test_row_union_binding_survives_expansion_on_a_branch(self) -> None:
+        """token_traversal.py:254-273 — the row_union binding must survive expansion.
+
+        Direct processor-level witness of the fail-closed seam
+        elspeth-a5b86149d4 fixed, modeled on
+        TestGateSinkRoutingNotifiesCoalesce (hand-built TokenInfo/work-item
+        context driving the real code path, no DAG builder involved).
+
+        Ruling 28 (spec §7 rule 5) now rejects this exact TOPOLOGY at BUILD
+        time when it reaches ``build_execution_graph`` — an undeclared
+        multi-row transform inside a row_union-bound region — which is why
+        ``test_row_union_branch_cardinality.py::
+        test_expanding_transform_in_a_branch_does_not_bypass_the_barrier``
+        was reclassified as a build-rejection test (Task 8). But the RUNTIME
+        seam this test pins is a different, still-live fact: IF a fork-branch
+        token reaches an expanding transform with row_union context threaded
+        through (the only way that could happen post-ruling-28 is a topology
+        the build-time check does not yet see, or a pre-ruling-28 persisted/
+        resumed run), the binding must not be dropped. Dropping it is
+        precisely how the ORIGINAL bug let expanded children walk straight
+        through the row_union node instead of being adjudicated by it.
+
+        This test asserts ONLY the plumbing (each expanded child's WorkItem
+        carries the union binding forward) — it does NOT re-verify that
+        RowUnionExecutor.accept() then correctly rejects a surplus arrival
+        under that binding; that adjudication lives one layer further out
+        (barrier_coordination.py, scheduler drain) and is already covered by
+        RowUnionExecutor's own suite (test_row_union_executor.py) with no
+        dependency on expansion. Driving THAT layer here would require
+        reconstructing scheduler-drain machinery this unit test does not
+        otherwise touch — out of scope for a processor-level plumbing
+        witness; flagging rather than forcing a mock of it, per the
+        controller's own instruction.
+        """
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+
+        contract = _make_contract()
+        output_rows = [
+            make_row({"value": 1}, contract=contract),
+            make_row({"value": 2}, contract=contract),
+        ]
+        multi_result = TransformResult.success_multi(
+            output_rows,
+            success_reason={"action": "expand"},
+        )
+
+        transform = _make_mock_transform(node_id="explode-1", name="explode_treatment", creates_tokens=True, on_success="treatment_scored")
+        source_node = NodeID("source-0")
+        transform_node = NodeID(transform.node_id)
+        union_node = NodeID("row_union::variant_union")
+
+        processor = _make_processor(
+            factory,
+            node_step_map={source_node: 0, transform_node: 1},
+            node_to_next={source_node: transform_node, transform_node: None},
+            node_to_plugin={transform_node: transform},
+            row_union_node_ids={RowUnionName("variant_union"): union_node},
+            branch_to_row_union={BranchName("treatment_branch"): RowUnionName("variant_union")},
+        )
+
+        # A fork-branch token — the innermost FORK frame's member_key IS the
+        # declared branch name (spec §4.1), which is what token.branch_name
+        # derives from (ruling 21: derived accessors are the only read path).
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-treatment",
+            row_data=make_row({"value": 10}, contract=contract),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-treatment_branch", member_key="treatment_branch"),),
+        )
+        # expand_token() re-checks Tier-1 token ownership against the audit
+        # DB (data_flow/ownership.py) before minting children — a fabricated
+        # token needs the same durable row+token rows a real fork would have
+        # written, same helper the coalesce-side fixtures in this file use.
+        _persist_token_for_scheduler(factory, token, ingest_sequence=0)
+
+        def executor_side_effect(*, transform, token, ctx, attempt=0):
+            return (multi_result, token, None)
+
+        with patch.object(processor._transform_executor, "execute_transform", side_effect=executor_side_effect):
+            result, child_items = processor._process_single_token(
+                token=token,
+                ctx=ctx,
+                current_node_id=transform_node,
+                row_union_node_id=union_node,
+                row_union_name=RowUnionName("variant_union"),
+            )
+
+        # Parent is EXPANDED (transient — the real outcome rides expand_token()).
+        assert isinstance(result, RowResult)
+        assert (result.outcome, result.path) == (TerminalOutcome.TRANSIENT, TerminalPath.EXPAND_PARENT)
+
+        # Both expanded children carry the union binding forward — the fix's
+        # exact claim (token_traversal.py:268-272): "the barrier binding must
+        # survive expansion... carrying it makes an unsatisfiable expansion
+        # fail closed at the barrier." Losing it here is exactly the bug
+        # elspeth-a5b86149d4 fixed (children walking through the union
+        # structurally, unbound, instead of arriving at it).
+        assert len(child_items) == 2
+        for item in child_items:
+            assert item.row_union_name == RowUnionName("variant_union")
+            assert item.row_union_node_id == union_node
+            assert item.token.branch_name == "treatment_branch"
+
 
 # =============================================================================
 # process_existing_row (resume path)

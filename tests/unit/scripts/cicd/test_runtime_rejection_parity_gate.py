@@ -45,7 +45,13 @@ from scripts.cicd.runtime_rejection_parity import (
 # 10 = the 2026-08-17 census residue, tracked as elspeth-96e2dd023f (YAML
 # bounds x3, llm profile lowering x3, secret fingerprinting x2, dsn x1,
 # forgiven-field ancestor types x1 / elspeth-ae1410181c).
-UNMIRRORED_CEILING = 10
+# 11 (2026-08-23, maintainer-ruled): + spec §7 rule 5 (ruling 28) undeclared-opener
+# limb (bound_regions.py::validate_openers_bound_in_region, key 54e4545d6795d37c) —
+# authorable in real YAML today (test_row_union_branch_cardinality.py's
+# reclassified build-rejection test is the live proof), Stage 1 has zero rule-5
+# predicate. Tracked as elspeth-239500195b (Stage-1 rule-5 mirror via probe
+# plumbing); ratchet back to 10 when that ticket lands.
+UNMIRRORED_CEILING = 11
 
 
 # --------------------------------------------------------------------------

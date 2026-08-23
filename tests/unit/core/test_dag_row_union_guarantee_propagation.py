@@ -73,6 +73,7 @@ class _BranchTransform:
     input_schema = None
     output_schema = None
     on_error: str | None = None
+    creates_tokens: bool = False
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
@@ -105,6 +106,7 @@ class _RequiringTransform:
     input_schema = None
     output_schema = None
     on_error: str | None = None
+    creates_tokens: bool = False
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()

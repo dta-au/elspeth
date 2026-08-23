@@ -2048,6 +2048,51 @@ sites:
   disposition: abstains
   note: Stage 1 does not compute bound regions and cannot know the observed nesting depth; the cap is
     a built-graph property — deliberate abstention.
+- key: 54e4545d6795d37c
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: validate_openers_bound_in_region
+  exception: GraphValidationError
+  message: 'Multi-row transform ''{}'' inside bound region ''{}'' is not a declared scope opener. Inside
+    a bound region, a shape change must itself be a group (spec §7 rule 5, '
+  ordinal: 0
+  disposition: unmirrored
+  note: 'Spec §7 rule 5 (ruling 28), undeclared-opener limb. Maintainer-ruled 2026-08-23 (John): unmirrored
+    per the strict vocabulary reading (abstains = Stage 1 checks a NARROWER predicate on the SAME rule;
+    unmirrored = authorable, Stage 1 silent) — the rejected shape (a fork/coalesce topology with an ordinary
+    creates_tokens=True transform in one branch, no scope declared) IS authorable through the composer
+    today (fork/coalesce already exist as NodeSpec fields), and Stage 1 has ZERO predicate for rule 5,
+    not a narrower one. `tests/integration/pipeline/test_row_union_branch_cardinality.py:: test_expanding_transform_in_a_branch_does_not_bypass_the_barrier`
+    (reclassified as a ruling-28 build-rejection test the same commit as this ruling) is itself live proof
+    the shape is authorable in real YAML today. UNMIRRORED_CEILING raised 10->11 (test_runtime_rejection_parity_gate.py)
+    under ticket elspeth-239500195b (Stage-1 rule-5 mirror via probe plumbing) — ratchet back to 10 when
+    that ticket lands. The honest fix: `_fork_branch_reaches_sink_before_closer` (state.py) already computes
+    an equivalent forward-walk visited-node set internally for the sink-inside limb but does not RETURN
+    it; threading it out and building a real Stage-1 predicate belongs with elspeth-239500195b / Task
+    12''s composer scope-authoring work, which needs the same membership walk for the OTHER rule-5 limb
+    anyway. Stage 2 preview_pipeline rejects via the runtime builder meanwhile (bound_region_undeclared_expand
+    catalogue entry, generation.py, translates the runtime message).'
+- key: 3956713c3d4e81ba
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: validate_openers_bound_in_region
+  exception: GraphValidationError
+  message: Scope opener '{}' sits inside bound region '{}' but its collector '{}' closes outside it. An
+    inner group must close before the enclosing region's closer (spec §
+  ordinal: 0
+  disposition: structural
+  note: 'Spec §7 rule 5 (ruling 28), closer-outside-region limb. Proved unreachable through build_execution_graph
+    itself, for ANY caller (composer or hand-authored YAML) — not merely hard to author via the composer.
+    Proof: this limb only runs when the opener node X is already a member of the enclosing region''s m1
+    (the loop''s own precondition). compute_bound_regions raises rule 3''s partial-overlap error UNLESS
+    the two regions'' spans are disjoint or nested; since X ∈ m1 ⊆ s1 and X ∈ s2 (X is region 2''s own
+    opener), s1 and s2 already share X and can never be disjoint, so compute_bound_regions returning at
+    all forces either s2 <= m1 or s1 <= m2. s1 <= m2 is impossible (it would require X ∈ m2, but a region''s
+    own opener is excluded from its own member_node_ids by definition) — so only s2 <= m1 can hold, which
+    puts the closer Y ∈ s2 ⊆ m1 too, i.e. exactly the condition this limb rejects. So whenever the loop''s
+    own precondition holds, compute_bound_regions has already guaranteed the limb''s negation. Kept as
+    a defensive invariant per the plan''s Step 3 (verbatim) and Task 5''s well-nestedness code, not because
+    it protects a reachable build today; the raw BoundRegion/GroupBinding test (test_scoped_expand_whose_collector_sits_outside_region_rejected)
+    pins the predicate directly by bypassing compute_bound_regions, which is the ONLY way to exercise
+    it — it does not demonstrate the rule ever fires on a real build.'
 - key: 6e0c349d397920ed
   path: src/elspeth/core/dag/bound_regions.py
   qualname: validate_sese_regions

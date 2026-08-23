@@ -47,6 +47,7 @@ class _Transform:
     output_schema = None
     on_error: str | None = None
     on_success: str | None = "output"
+    creates_tokens = False
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()

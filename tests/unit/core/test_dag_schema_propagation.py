@@ -38,6 +38,7 @@ class MockTransformWithSchemaConfig:
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     on_error: str | None = None
     on_success: str | None = "output"
+    creates_tokens: bool = False
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
@@ -64,6 +65,7 @@ class MockTransformWithoutSchemaConfig:
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed", "guaranteed_fields": ["config_field"]}}
     on_error: str | None = None
     on_success: str | None = "output"
+    creates_tokens: bool = False
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
@@ -1019,6 +1021,7 @@ class _ConfigurableTransform:
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     on_error: str | None = None
     on_success: str | None = "output"
+    creates_tokens: bool = False
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()

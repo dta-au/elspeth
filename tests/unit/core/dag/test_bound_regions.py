@@ -9,9 +9,23 @@ import pytest
 from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID, SinkName
-from elspeth.core.config import CoalesceSettings, GateSettings, QueueSettings, SourceSettings, TransformSettings
+from elspeth.core.config import (
+    CoalesceSettings,
+    CollectorSettings,
+    GateSettings,
+    QueueSettings,
+    ScopeSettings,
+    SourceSettings,
+    TransformSettings,
+)
 from elspeth.core.dag import ExecutionGraph
-from elspeth.core.dag.bound_regions import compute_bound_regions, derive_escalation_fixpoint_bound, validate_sese_regions
+from elspeth.core.dag.bound_regions import (
+    BoundRegion,
+    compute_bound_regions,
+    derive_escalation_fixpoint_bound,
+    validate_openers_bound_in_region,
+    validate_sese_regions,
+)
 from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.dag.wiring import WiredTransform
@@ -50,6 +64,51 @@ class _BoundRegionTransform:
     output_schema = None
     on_error: str | None = None
     on_success: str | None = "output"
+    creates_tokens = False
+    declared_output_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_input_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
+    passes_through_input = False
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
+
+    def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
+        self.name = name
+        self.config = {"schema": {"mode": "observed"}}
+        self._output_schema_config = output_schema_config
+
+
+class _BoundRegionMultiRowTransform:
+    """A creates_tokens=True stub — a scope opener candidate (spec §7 rule 5)."""
+
+    input_schema = None
+    output_schema = None
+    on_error: str | None = None
+    on_success: str | None = "output"
+    creates_tokens = True
+    is_batch_aware = False
+    declared_output_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_input_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
+    passes_through_input = False
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
+
+    def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
+        self.name = name
+        self.config = {"schema": {"mode": "observed"}}
+        self._output_schema_config = output_schema_config
+
+
+class _BoundRegionCollectorPlugin:
+    """A batch-aware stub — the collector plugin closing a declared scope."""
+
+    input_schema = None
+    output_schema = None
+    on_error: str | None = None
+    on_success: str | None = None
+    creates_tokens = False
+    is_batch_aware = True
     declared_output_fields: ClassVar[frozenset[str]] = frozenset()
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
@@ -1239,3 +1298,376 @@ class TestDepthCap:
         assert max(r.depth for r in graph.get_bound_regions()) == 2
         assert graph.get_max_bound_region_depth() == 2
         assert graph.escalation_fixpoint_bound == 1_000 + 8 * 2
+
+
+def _build_fork_coalesce_with_undeclared_expand_in_branch() -> ExecutionGraph:
+    """source -> gate 'fork_to' [path_a, path_b] -> coalesce; path_a IS a
+    creates_tokens=True transform with no scope declared. Legal today
+    (binding-survives-expansion posture, token_traversal.py:254-262) — a
+    GraphValidationError under spec §7 rule 5 (ruling 28): a shape change
+    inside a bound region must itself be a declared group.
+    """
+    source = _BoundRegionMockSource()
+    branch_a = _BoundRegionMultiRowTransform(name="branch_a_expand", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=branch_a,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_a_expand",
+                    plugin=branch_a.name,
+                    input="path_a",
+                    on_success="path_a_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=branch_b,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_b_transform",
+                    plugin=branch_b.name,
+                    input="path_b",
+                    on_success="path_b_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="gate",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["path_a", "path_b"],
+            )
+        ],
+        coalesce_settings=[
+            CoalesceSettings(
+                name="coalesce",
+                branches={"path_a": "path_a_out", "path_b": "path_b_out"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+    )
+
+
+def _build_fork_coalesce_with_scoped_expand_in_branch() -> ExecutionGraph:
+    """Same shape as the undeclared case, but branch_a's expand is a
+    declared scope whose collector closes BEFORE the coalesce
+    (batch-in-fork-line — legal under ruling 28): source -> gate
+    'fork_to' [path_a, path_b] -> coalesce; path_a is
+    branch_a_expand (opener) -> page_stitcher (collector, closer) ->
+    feeds the coalesce's 'path_a' branch connection.
+    """
+    source = _BoundRegionMockSource()
+    branch_a = _BoundRegionMultiRowTransform(name="branch_a_expand", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    stitcher = _BoundRegionCollectorPlugin(name="page_stitcher", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=branch_a,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_a_expand",
+                    plugin=branch_a.name,
+                    input="path_a",
+                    on_success="pages",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=branch_b,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_b_transform",
+                    plugin=branch_b.name,
+                    input="path_b",
+                    on_success="path_b_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="gate",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["path_a", "path_b"],
+            )
+        ],
+        coalesce_settings=[
+            CoalesceSettings(
+                name="coalesce",
+                branches={"path_a": "path_a_out", "path_b": "path_b_out"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+        collectors={
+            "page_stitcher": (
+                stitcher,  # type: ignore[dict-item]
+                CollectorSettings(name="page_stitcher", plugin="stitch_pages", input="pages", on_success="path_a_out"),
+            )
+        },
+        scope_settings=[ScopeSettings(name="branch_a_pages", opener="branch_a_expand", closer="page_stitcher", policy="require_all")],
+    )
+
+
+def _build_scope_closing_outside_region() -> None:
+    """Direct predicate pin over the raw ``BoundRegion``/``GroupBinding``
+    surface (same escape hatch Task 7 used for its backward-walk isolation
+    case, ``_build_coalesce_with_external_branch_feed``).
+
+    This shape CANNOT OCCUR through ``compute_bound_regions`` at all, for
+    ANY caller — not merely "hard to author via settings". Whenever a
+    scope's opener is genuinely a member of a FORK region (this rule's own
+    precondition), the EXPAND region's own SPAN necessarily shares that
+    opener node with the FORK region's span, so ``compute_bound_regions``
+    returning without raising rule 3's partial-overlap error forces the
+    ONLY surviving well-nestedness arm — the EXPAND span nested entirely
+    inside the FORK's members — which puts the EXPAND's own closer inside
+    the FORK region's members too (see
+    ``config/cicd/runtime_rejection_parity.yaml``, key
+    ``3956713c3d4e81ba``, disposition ``structural``, for the full proof).
+    So ``validate_openers_bound_in_region``'s "closes outside" limb is a
+    defensive invariant that ``compute_bound_regions`` already guarantees
+    on every real build, and hand-building the region set below is the
+    ONLY way to exercise the predicate directly — it pins that the check
+    is CORRECT if it ever ran, not that it protects a reachable build.
+    """
+    graph = ExecutionGraph()
+    for node_id, node_type, plugin_name in [
+        ("fork_open", NodeType.GATE, "fork_gate"),
+        ("branch_a", NodeType.TRANSFORM, "branch_a_expand"),
+        ("branch_b", NodeType.TRANSFORM, "branch_b_transform"),
+        ("fork_close", NodeType.COALESCE, "coalesce"),
+        ("scope_close", NodeType.COLLECTOR, "page_stitcher"),
+        ("out", NodeType.SINK, "json"),
+    ]:
+        graph.add_node(node_id, node_type=node_type, plugin_name=plugin_name)
+    graph.add_edge("fork_open", "branch_a", label="path_a", mode=RoutingMode.MOVE)
+    graph.add_edge("fork_open", "branch_b", label="path_b", mode=RoutingMode.MOVE)
+    graph.add_edge("branch_a", "fork_close", label="continue", mode=RoutingMode.MOVE)
+    graph.add_edge("branch_b", "fork_close", label="continue", mode=RoutingMode.MOVE)
+    graph.add_edge("fork_close", "out", label="continue", mode=RoutingMode.MOVE)
+
+    fork_binding = GroupBinding(
+        kind=FrameKind.FORK,
+        opener_node_id=NodeID("fork_open"),
+        opener_name="fork_gate",
+        closer_node_id=NodeID("fork_close"),
+        closer_name="coalesce",
+        closer_kind=CloserKind.COALESCE,
+        policy="require_all",
+        on_group_failure=None,
+        member_roster=("path_a", "path_b"),
+    )
+    scope_binding = GroupBinding(
+        kind=FrameKind.EXPAND,
+        opener_node_id=NodeID("branch_a"),
+        opener_name="branch_a_expand",
+        closer_node_id=NodeID("scope_close"),
+        closer_name="page_stitcher",
+        closer_kind=CloserKind.COLLECTOR,
+        policy="require_all",
+        on_group_failure="quarantine",
+        member_roster=(),
+    )
+    registry = GroupBindingRegistry(bindings=(fork_binding, scope_binding))
+    fork_region = BoundRegion(
+        binding=fork_binding,
+        member_node_ids=frozenset({NodeID("branch_a"), NodeID("branch_b")}),
+        depth=1,
+    )
+    multi_row_node_ids = {NodeID("branch_a"): "branch_a_expand"}
+    validate_openers_bound_in_region(graph, (fork_region,), registry, multi_row_node_ids)
+
+
+def _build_plain_expand_pipeline() -> ExecutionGraph:
+    """source -> creates_tokens=True transform (no scope) -> sink, no
+    fork/coalesce anywhere. Inert expands OUTSIDE bound regions are the
+    batch posture (spec §7 rule 5 applies only INSIDE a bound region) —
+    untouched.
+    """
+    source = _BoundRegionMockSource()
+    expand = _BoundRegionMultiRowTransform(name="explode", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=expand,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="explode",
+                    plugin=expand.name,
+                    input="source_out",
+                    on_success="out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+    )
+
+
+class TestRule5OpenersBoundInRegion:
+    """Spec §7 rule 5 (ruling 28): every token-creating node inside a bound
+    region must be a declared scope opener whose closer is ALSO inside
+    that region.
+    """
+
+    def test_undeclared_expand_inside_coalesce_branch_rejected(self) -> None:
+        with pytest.raises(GraphValidationError, match=r"Multi-row transform .* inside bound region"):
+            _build_fork_coalesce_with_undeclared_expand_in_branch()
+
+    def test_declared_scope_closing_in_region_is_legal(self) -> None:
+        # This is NOT the corpus's first depth-2 unit-test region set —
+        # test_builder_collectors.py::test_expand_outer_fork_inner_bound_regions
+        # (Task 5) already pins depth 2 for an EXPAND-outer/FORK-inner
+        # nesting. What IS new here is the REVERSE mixed-kind nesting
+        # (FORK outer, EXPAND/scope inner — a scope entirely inside one
+        # fork branch), which no existing fixture exercised.
+        graph = _build_fork_coalesce_with_scoped_expand_in_branch()
+        regions = graph.get_bound_regions()
+        assert {r.binding.closer_kind for r in regions} == {CloserKind.COALESCE, CloserKind.COLLECTOR}
+        assert max(r.depth for r in regions) == 2
+
+    def test_scoped_expand_whose_collector_sits_outside_region_rejected(self) -> None:
+        with pytest.raises(GraphValidationError, match="closes outside"):
+            _build_scope_closing_outside_region()
+
+    def test_top_level_undeclared_expand_stays_legal(self) -> None:
+        graph = _build_plain_expand_pipeline()
+        assert graph.get_bound_regions() == ()
+
+    def test_scope_opener_has_no_route_surface_for_the_f2_style_hazard(self) -> None:
+        # Addendum A5.5 (task-7-review.md), commissioned as a Task 8
+        # checklist obligation: rule 4's F2 limb (validate_sese_regions,
+        # bound_regions.py) is guarded `if binding.kind is FrameKind.FORK`
+        # and rejects a FORK opener's own non-branch route that re-enters
+        # the region. The analogous hazard for an EXPAND (scope) opener
+        # would be a non-on_success route on the opener transform that
+        # re-enters the region unframed. That hazard is UNAUTHORABLE, not
+        # merely untested: TransformSettings (the only settings class that
+        # can name a scope's `opener:`, per ScopeSettings.opener) has no
+        # `routes`/`fork_to` field at all — a scope opener is a plain
+        # transform with exactly one on_success connection and one on_error
+        # DIVERT connection (already excluded from every walk). There is no
+        # second edge for an unframed token to travel, so no limb is needed
+        # here; the guard is structural, at the config-schema level.
+        assert "routes" not in TransformSettings.model_fields
+        assert "fork_to" not in TransformSettings.model_fields
+
+        # Truth pin on top of the declaration pin above (the config schema
+        # ruling out routes:/fork_to: proves nothing about edges the BUILDER
+        # itself draws — Task 7's F2/R1/A2/N1 sequence was entirely about
+        # exactly that class of builder-drawn edge no config field predicts).
+        # Build a REAL scope opener and assert its actual graph node has
+        # exactly one non-DIVERT outgoing edge.
+        graph = _build_fork_coalesce_with_scoped_expand_in_branch()
+        registry = graph.get_group_bindings()
+        expand_binding = next(b for b in registry.bindings if b.kind is FrameKind.EXPAND)
+        opener_edges = [edge for edge in graph.get_outgoing_edges(expand_binding.opener_node_id) if edge.mode is not RoutingMode.DIVERT]
+        assert len(opener_edges) == 1
+
+    def test_scoped_expand_nested_inside_a_fork_inside_a_fork(self) -> None:
+        # A5.4-style generalization check (originally commissioned against
+        # rule 4's F2 limb; here pinned against rule 5): a scope nested TWO
+        # bound-region levels deep (FORK -> FORK -> EXPAND) must still be
+        # recognized as a legal declared opener/closer pair by
+        # validate_openers_bound_in_region, which loops over EVERY region
+        # independently rather than only the outermost one.
+        source = _BoundRegionMockSource()
+        outer_b = _BoundRegionTransform(name="outer_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        inner_a = _BoundRegionMultiRowTransform(name="inner_a_expand", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        stitcher = _BoundRegionCollectorPlugin(name="page_stitcher", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        inner_b = _BoundRegionTransform(name="inner_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+        graph = ExecutionGraph.from_plugin_instances(
+            sources={"primary": source},  # type: ignore[arg-type]
+            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+            transforms=[
+                WiredTransform(
+                    plugin=outer_b,  # type: ignore[arg-type]
+                    settings=TransformSettings(
+                        name="outer_b_transform",
+                        plugin=outer_b.name,
+                        input="outer_b",
+                        on_success="outer_b_out",
+                        on_error="discard",
+                        options={},
+                    ),
+                ),
+                WiredTransform(
+                    plugin=inner_a,  # type: ignore[arg-type]
+                    settings=TransformSettings(
+                        name="inner_a_expand", plugin=inner_a.name, input="inner_a", on_success="pages", on_error="discard", options={}
+                    ),
+                ),
+                WiredTransform(
+                    plugin=inner_b,  # type: ignore[arg-type]
+                    settings=TransformSettings(
+                        name="inner_b_transform",
+                        plugin=inner_b.name,
+                        input="inner_b",
+                        on_success="inner_b_out",
+                        on_error="discard",
+                        options={},
+                    ),
+                ),
+            ],
+            sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+            aggregations={},
+            gates=[
+                GateSettings(
+                    name="outer_gate", input="source_out", condition="'all'", routes={"all": "fork"}, fork_to=["outer_a", "outer_b"]
+                ),
+                GateSettings(name="inner_gate", input="outer_a", condition="'all'", routes={"all": "fork"}, fork_to=["inner_a", "inner_b"]),
+            ],
+            coalesce_settings=[
+                CoalesceSettings(
+                    name="inner_coalesce",
+                    branches={"inner_a": "pages_out", "inner_b": "inner_b_out"},
+                    policy="require_all",
+                    merge="union",
+                ),
+                CoalesceSettings(
+                    name="outer_coalesce",
+                    branches={"outer_a": "inner_coalesce", "outer_b": "outer_b_out"},
+                    policy="require_all",
+                    merge="union",
+                    on_success="out",
+                ),
+            ],
+            collectors={
+                "page_stitcher": (
+                    stitcher,  # type: ignore[dict-item]
+                    CollectorSettings(name="page_stitcher", plugin="stitch_pages", input="pages", on_success="pages_out"),
+                )
+            },
+            scope_settings=[ScopeSettings(name="inner_a_pages", opener="inner_a_expand", closer="page_stitcher", policy="require_all")],
+        )
+        regions = graph.get_bound_regions()
+        assert {r.binding.closer_kind for r in regions} == {CloserKind.COALESCE, CloserKind.COLLECTOR}
+        assert max(r.depth for r in regions) == 3

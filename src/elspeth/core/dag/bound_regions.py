@@ -26,6 +26,8 @@ from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
 from elspeth.core.dag.models import GraphValidationError
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from elspeth.core.dag.graph import ExecutionGraph
 
 ESCALATION_ITERATIONS_PER_LEVEL = 8
@@ -384,3 +386,84 @@ def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...
                         component_id=binding.closer_name,
                         component_type=binding.closer_kind,
                     )
+
+
+def validate_openers_bound_in_region(
+    graph: ExecutionGraph,
+    regions: tuple[BoundRegion, ...],
+    registry: GroupBindingRegistry,
+    multi_row_node_ids: Mapping[NodeID, str],
+) -> None:
+    """§7 rule 5 (ruling 28): a shape change inside a group must itself be a group.
+
+    Every token-creating node inside a bound region must be a declared
+    scope opener whose closer is ALSO inside that region. A fork's own
+    branches close at an in-region coalesce/row_union exactly as before
+    (rule 4 already enforces that); this rule adds the EXPAND case: an
+    undeclared multi-row transform inside any bound region is rejected
+    flat, and a declared scope whose collector closes outside the
+    enclosing region is rejected too, so every member of a bound region
+    presents exactly one token, statically.
+
+    In-region FORK gates need no arm here: a fork inside a bound region
+    either closes at an in-region coalesce/row_union (well-nested, legal —
+    rule 3 enforces the nesting, rule 4 the SESE shape), closes outside the
+    enclosing region (rule 3's partial-overlap rejection already fires,
+    before this function ever runs), or fans out to sinks (pure fan-out,
+    unbound — rule 4's sink-inside check already rejects a sink reached
+    from within a bound region). There is no fourth shape for a FORK
+    binding to "complete" here.
+
+    The "closer closes outside" limb below is a DEFENSIVE invariant, not a
+    reachable rejection: whenever an opener node is genuinely a member of
+    the enclosing region (this loop's own precondition), `compute_bound_regions`
+    having already returned without raising rule 3's partial-overlap error
+    forces the opener's own closer to ALSO be a member of that same region
+    (the opener and closer share the enclosing span with the inner region;
+    the only well-nestedness arm that can hold once the opener is a shared
+    member is the inner region nesting entirely inside the outer one, which
+    puts the inner closer in the outer region's members too). So this limb
+    cannot fire on any graph reaching this function through the real
+    `build_execution_graph` path, composer-authored or hand-authored YAML
+    alike — see `config/cicd/runtime_rejection_parity.yaml` (key
+    `3956713c3d4e81ba`, disposition `structural`) for the full proof. Kept
+    per the plan's own Step 3 sketch as a belt-and-suspenders check against a
+    future change to rule 3's own well-nestedness logic; the raw
+    `BoundRegion`/`GroupBindingRegistry` test that exercises it bypasses
+    `compute_bound_regions` entirely for exactly this reason.
+
+    ``graph`` is unused in this function's body (kept for signature
+    symmetry with the other §7 validators, which all take the built graph);
+    every fact this rule needs — region membership, the opener index, the
+    multi-row roster — is already materialized in its other parameters.
+
+    Raises:
+        GraphValidationError: a multi-row transform inside a bound region is
+            not a declared scope opener, or (defensively; see above) its
+            collector closes outside the enclosing region.
+    """
+    bound_openers = registry.by_opener_node()
+    for region in regions:
+        binding = region.binding
+        for node_id in sorted(multi_row_node_ids):
+            transform_name = multi_row_node_ids[node_id]
+            if node_id not in region.member_node_ids:
+                continue
+            inner = bound_openers[node_id] if node_id in bound_openers else None
+            if inner is None:
+                raise GraphValidationError(
+                    f"Multi-row transform '{transform_name}' inside bound region '{binding.closer_name}' "
+                    f"is not a declared scope opener. Inside a bound region, a shape change must itself "
+                    f"be a group (spec §7 rule 5, ruling 28): wrap '{transform_name}' in a scopes: entry "
+                    f"whose collector closes before '{binding.closer_name}'.",
+                    component_id=transform_name,
+                    component_type="transform",
+                )
+            if inner.closer_node_id not in region.member_node_ids:
+                raise GraphValidationError(
+                    f"Scope opener '{transform_name}' sits inside bound region '{binding.closer_name}' "
+                    f"but its collector '{inner.closer_name}' closes outside it. An inner group must "
+                    f"close before the enclosing region's closer (spec §7 rules 3/5).",
+                    component_id=inner.closer_name,
+                    component_type="collector",
+                )

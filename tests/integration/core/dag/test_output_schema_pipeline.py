@@ -61,6 +61,7 @@ class MockFieldAddingTransform:
     output_schema = None
     on_error: str | None = None
     on_success: str | None = "output"
+    creates_tokens: bool = False
     # Left empty so these graph-level cases keep exercising the raw
     # required_input_fields contract surface below, not the projected one.
     declared_input_fields: frozenset[str] = frozenset()

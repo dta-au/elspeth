@@ -529,6 +529,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "releases tokens out of a bound region.",
     ),
     (
+        r"bound_region_undeclared_expand|Multi-row transform '(.+)' inside bound region",
+        "A row-expanding transform sits inside a bound group without being a declared scope, so the "
+        "group's roster cannot account for its children.",
+        "Add a scopes: entry: name the expanding transform as opener and bind a collector that closes "
+        "before the enclosing group's closer (coalesce/row_union/collector).",
+    ),
+    (
         r"gate_duplicate_fork_branch",
         "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
         "Remove duplicate entries from the gate's fork_to list while preserving the intended unique branch order.",

@@ -42,6 +42,7 @@ class _UsageConsumerTransform:
     name = "usage_consumer"
     input_schema = None
     output_schema = None
+    creates_tokens = False
     declared_output_fields: ClassVar[frozenset[str]] = frozenset()
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
