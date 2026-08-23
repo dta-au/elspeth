@@ -225,3 +225,66 @@ def test_row_union_flexible_configs_reject_conflicting_shared_field_types() -> N
     assert compatible is False
     assert conflicts == ("id",)
     assert message == "Conflicting shared field types: id (int vs str)"
+
+
+def test_effective_producer_schema_select_branch_naming_a_nested_coalesce() -> None:
+    """``merge: select`` on a branch that names ANOTHER coalesce resolves cleanly.
+
+    Regression (elspeth-0bd2cde19a round-2 F2): ``merge_outer``'s
+    ``select_branch: outer_a`` names ``merge_inner`` (spec §7 rules 2/5,
+    coalesce-feeds-coalesce) rather than a literal transform chain — the
+    same shape E1a fixed for ``get_branch_first_nodes``. Before the fix,
+    ``get_effective_producer_schema`` fell through to a bare
+    ``_trace_branch_endpoints`` call, which raised eagerly at build time
+    (``graph.validate_edge_compatibility()``) with a message accusing this
+    authorable config of a graph construction bug. The fix resolves the
+    "last node" for a nested branch declaratively (the inner coalesce's own
+    node) via ``_resolve_branch_endpoints``, so resolution recurses into
+    ``merge_inner``'s own effective schema instead of crashing.
+
+    Graph: source -> outer_fork -[outer_a MOVE]-> inner_fork
+           -[inner_a1/inner_a2 COPY]-> merge_inner -[continue MOVE]->
+           merge_outer (merge: select, select_branch: outer_a).
+    """
+    from elspeth.contracts import RoutingMode
+    from elspeth.contracts.types import BranchName, CoalesceName, NodeID
+    from elspeth.core.dag.models import BranchInfo
+
+    graph = ExecutionGraph()
+    graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="csv")
+    graph.add_node("outer_fork", node_type=NodeType.GATE, plugin_name="fork", config={"fork_to": ["outer_a", "outer_b"]})
+    graph.add_node("inner_fork", node_type=NodeType.GATE, plugin_name="fork", config={"fork_to": ["inner_a1", "inner_a2"]})
+    graph.add_node("merge_inner", node_type=NodeType.COALESCE, plugin_name="coalesce", config={"merge": "nested"})
+    graph.add_node(
+        "merge_outer",
+        node_type=NodeType.COALESCE,
+        plugin_name="coalesce",
+        config={"merge": "select", "select_branch": "outer_a"},
+    )
+
+    graph.add_edge("source", "outer_fork", label="continue", mode=RoutingMode.MOVE)
+    graph.add_edge("outer_fork", "inner_fork", label="outer_a", mode=RoutingMode.MOVE)
+    graph.add_edge("inner_fork", "merge_inner", label="inner_a1", mode=RoutingMode.COPY)
+    graph.add_edge("inner_fork", "merge_inner", label="inner_a2", mode=RoutingMode.COPY)
+    graph.add_edge("merge_inner", "merge_outer", label="continue", mode=RoutingMode.MOVE)
+
+    graph.set_branch_info(
+        {
+            BranchName("outer_a"): BranchInfo(
+                coalesce_name=CoalesceName("merge_outer"),
+                gate_node_id=NodeID("outer_fork"),
+                input_connection="merge_inner",
+                uses_transform_chain=True,
+            ),
+        }
+    )
+    graph.set_coalesce_id_map(
+        {
+            CoalesceName("merge_inner"): NodeID("merge_inner"),
+            CoalesceName("merge_outer"): NodeID("merge_outer"),
+        }
+    )
+
+    # Must not raise — merge_inner's own effective schema is None (merge:
+    # nested returns "nothing useful to validate", schema_validation.py:707-709).
+    assert graph.get_effective_producer_schema("merge_outer") is None

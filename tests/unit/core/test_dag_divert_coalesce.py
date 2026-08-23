@@ -846,3 +846,110 @@ class TestDivertCoalesceExclusiveFields:
 
         with pytest.raises(GraphValidationError, match="Cannot trace first transform"):
             graph.warn_divert_coalesce_interactions(configs)
+
+    def test_nested_branch_coexists_with_divert_bearing_ordinary_branch(self) -> None:
+        """A nested branch must not crash the DIVERT/exclusive-fields scan (F2).
+
+        Regression (elspeth-0bd2cde19a round-2 F2): ``merge_outer``'s
+        ``outer_a`` branch names ANOTHER coalesce (``merge_inner``, spec §7
+        rules 2/5) — the same coalesce-feeds-coalesce shape E1a fixed for
+        ``get_branch_first_nodes``. This warning scan hits the identical
+        un-guarded ``_trace_branch_endpoints`` call one function over: with
+        ``merge_outer`` on ``merge: union`` and its OTHER branch
+        (``outer_b``) DIVERT-bearing with an exclusive field, evaluating the
+        nested ``outer_a`` candidate while matching that DIVERT edge's owner
+        used to raise ``GraphValidationError`` before any match could be
+        determined — an authorable config crashing at build with a message
+        accusing the config of an engine bug. ``_resolve_branch_endpoints``
+        must resolve ``outer_a``'s "last node" declaratively (the inner
+        coalesce's own node) instead, so the scan proceeds to correctly
+        attribute the warning to ``outer_b``.
+
+        Graph: source -> outer_fork -[outer_a MOVE]-> inner_fork
+               -[inner_a1/inner_a2 COPY]-> merge_inner -[continue MOVE]->
+               merge_outer; outer_fork -[outer_b MOVE]-> t_b (DIVERT-bearing,
+               exclusive field) -[continue MOVE]-> merge_outer -> sink.
+        """
+        from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+
+        graph = ExecutionGraph()
+        graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="src", config={})
+        graph.add_node("outer_fork", node_type=NodeType.GATE, plugin_name="fork", config={"fork_to": ["outer_a", "outer_b"]})
+        graph.add_node("inner_fork", node_type=NodeType.GATE, plugin_name="fork", config={"fork_to": ["inner_a1", "inner_a2"]})
+        graph.add_node("merge_inner", node_type=NodeType.COALESCE, plugin_name="coalesce:merge", config={})
+        graph.add_node(
+            "t_b",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="transform-b",
+            config={},
+            output_schema_config=SchemaConfig(
+                mode="flexible",
+                fields=(FieldDefinition("only_b", "str", required=True),),
+                guaranteed_fields=("only_b",),
+            ),
+        )
+        graph.add_node("merge_outer", node_type=NodeType.COALESCE, plugin_name="coalesce:merge", config={})
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="sink", config={})
+        graph.add_node("error_sink", node_type=NodeType.SINK, plugin_name="err", config={})
+
+        graph.add_edge("source", "outer_fork", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("outer_fork", "inner_fork", label="outer_a", mode=RoutingMode.MOVE)
+        graph.add_edge("inner_fork", "merge_inner", label="inner_a1", mode=RoutingMode.COPY)
+        graph.add_edge("inner_fork", "merge_inner", label="inner_a2", mode=RoutingMode.COPY)
+        graph.add_edge("merge_inner", "merge_outer", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("outer_fork", "t_b", label="outer_b", mode=RoutingMode.MOVE)
+        graph.add_edge("t_b", "merge_outer", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("t_b", "error_sink", label="__error_t_b__", mode=RoutingMode.DIVERT)
+        graph.add_edge("merge_outer", "sink", label="continue", mode=RoutingMode.MOVE)
+
+        graph.set_branch_info(
+            {
+                BranchName("outer_a"): BranchInfo(
+                    coalesce_name=CoalesceName("merge_outer"),
+                    gate_node_id=NodeID("outer_fork"),
+                    input_connection="merge_inner",
+                    uses_transform_chain=True,
+                    # A nested branch's schema is the inner coalesce's own
+                    # output — arbitrary shape here, present only so the
+                    # branch enters branch_schemas and the crash-prone
+                    # candidate loop.
+                    schema=SchemaConfig(mode="flexible", fields=(), guaranteed_fields=()),
+                ),
+                BranchName("outer_b"): BranchInfo(
+                    coalesce_name=CoalesceName("merge_outer"),
+                    gate_node_id=NodeID("outer_fork"),
+                    input_connection="outer_b",
+                    uses_transform_chain=True,
+                    schema=SchemaConfig(
+                        mode="flexible",
+                        fields=(FieldDefinition("only_b", "str", required=True),),
+                        guaranteed_fields=("only_b",),
+                    ),
+                ),
+            }
+        )
+        graph.set_coalesce_id_map(
+            {
+                CoalesceName("merge_inner"): NodeID("merge_inner"),
+                CoalesceName("merge_outer"): NodeID("merge_outer"),
+            }
+        )
+
+        warnings = graph.warn_divert_coalesce_interactions(
+            {
+                NodeID("merge_outer"): CoalesceSettings(
+                    name="merge_outer",
+                    branches={"outer_a": "merge_inner", "outer_b": "outer_b"},
+                    policy="require_all",
+                    merge="union",
+                )
+            }
+        )
+
+        codes = {w.code for w in warnings}
+        assert "DIVERT_COALESCE_REQUIRE_ALL" in codes
+        assert "DIVERT_COALESCE_EXCLUSIVE_FIELDS" in codes
+        exclusive = next(w for w in warnings if w.code == "DIVERT_COALESCE_EXCLUSIVE_FIELDS")
+        assert "outer_b" in exclusive.message
+        assert "only_b" in exclusive.message
+        assert "outer_a" not in exclusive.message

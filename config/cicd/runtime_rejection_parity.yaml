@@ -2646,8 +2646,8 @@ sites:
   disposition: structural
   note: Same builder invariant as the sibling site above — a fork branch label is unique per owning gate
     (builder.py's duplicate-branch check) and the producer/consumer match draws one edge per declared
-    connection name, so more than one branch-labelled out-edge from one gate is unreachable from any
-    authorable config.
+    connection name, so more than one branch-labelled out-edge from one gate is unreachable from any authorable
+    config.
 - key: 23471f499ecc0acb
   path: src/elspeth/core/dag/graph.py
   qualname: ExecutionGraph._trace_branch_endpoints

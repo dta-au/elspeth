@@ -239,14 +239,19 @@ def warn_divert_coalesce_interactions(
                     if branch_name in branch_schemas:
                         # branch_name ∈ branch_schemas guarantees it is also a key
                         # in graph._branch_info (branch_schemas is derived from it in
-                        # get_coalesce_branch_schemas), so the trace cannot KeyError
-                        # here. A GraphValidationError from the trace is an explicit
-                        # graph-construction-bug signal on first-party state (see
-                        # _trace_branch_endpoints docstring) and must surface — not be
-                        # swallowed, which would silently skip a branch match and
-                        # suppress a real audit-loss warning. This mirrors the
-                        # un-guarded trace call in get_branch_first_nodes.
-                        _first, last = graph._trace_branch_endpoints(coalesce_nid, branch_name)
+                        # get_coalesce_branch_schemas), so the resolution cannot
+                        # KeyError here. A GraphValidationError surfacing from it is
+                        # an explicit graph-construction-bug signal on first-party
+                        # state (see _trace_branch_endpoints's docstring) and must
+                        # surface — not be swallowed, which would silently skip a
+                        # branch match and suppress a real audit-loss warning.
+                        # _resolve_branch_endpoints declaratively handles the NESTED
+                        # case (branch_name names another coalesce, spec §7 rules
+                        # 2/5) that a bare _trace_branch_endpoints call cannot cross
+                        # (elspeth-0bd2cde19a round-2 F2) — for that shape "last" is
+                        # the inner coalesce's own node, which a DIVERT edge escaping
+                        # the inner region can legitimately originate from.
+                        _first, last = graph._resolve_branch_endpoints(coalesce_nid, branch_name)
                         if from_nid == last:
                             matched_branch = branch_name
                             break

@@ -1154,18 +1154,32 @@ class ExecutionGraph:
         return result
 
     def _is_nested_barrier_branch(self, input_connection: str) -> bool:
-        """Whether a coalesce branch's declared value names ANOTHER barrier.
+        """Whether a coalesce branch's declared value names ANOTHER coalesce.
 
         True exactly when ``branches: {branch_name: input_connection}``
-        points at another coalesce or row_union's name rather than an
-        ordinary transform's connection — the coalesce-feeds-coalesce (or
-        row_union) shape spec §7 rules 2/5 sanction but the legacy
-        transform-chain walker was never rewired to consume (WS2 Task 4/5's
+        points at another coalesce's name rather than an ordinary
+        transform's connection — the coalesce-feeds-coalesce shape spec §7
+        rules 2/5 sanction but the legacy transform-chain walker was never
+        rewired to consume (WS2 Task 4/5's
         ``BoundRegion``/``GroupBindingRegistry`` already model this
         topology correctly; this predicate is the declarative disambiguator
         the walker itself cannot supply).
+
+        Coalesce-feeds-row_union is deliberately NOT checked here: a
+        coalesce branch value can never equal a row_union's name (a
+        row_union has a required ``on_success`` connection and publishes
+        nothing under its own name, so no coalesce branch can point at it
+        that way), and the shape it would model — a row_union sitting
+        directly under an outer coalesce with no intervening sink — is
+        rejected at build. E1 review round 2 F5 (elspeth-0bd2cde19a,
+        2026-08-23) proved both authorable variants build-reject; a
+        row_union disjunct here would be dead code claiming coverage it
+        cannot exercise. The SYMMETRIC case — a row_union BRANCH fed by a
+        coalesce — is a live latent gap, tracked separately at
+        elspeth-a01889580f (``get_branch_first_nodes``'s row_union loop,
+        not this predicate).
         """
-        return CoalesceName(input_connection) in self._coalesce_id_map or RowUnionName(input_connection) in self._row_union_id_map
+        return CoalesceName(input_connection) in self._coalesce_id_map
 
     def _resolve_nested_branch_first_node(self, gate_node_id: NodeID, branch_name: str) -> NodeID:
         """One-hop resolution for a nested coalesce branch's first node.
@@ -1199,6 +1213,30 @@ class ExecutionGraph:
             component_id=str(gate_node_id),
             component_type="gate",
         )
+
+    def _resolve_branch_endpoints(self, coalesce_nid: NodeID, branch_name: str) -> tuple[NodeID, NodeID]:
+        """Resolve ``(first_node, last_node)`` for a coalesce branch, transparently
+        handling the nested case ``_trace_branch_endpoints``'s backward MOVE
+        walk cannot cross (spec §7 rules 3/5).
+
+        Shared by ``schema_validation.py``'s ``merge: select`` effective-
+        producer tracing and ``coalesce_warnings.py``'s DIVERT-branch
+        matching — both call sites need a branch's endpoints outside
+        ``get_branch_first_nodes``'s own dispatch map, and both hit the
+        identical eager pre-row ``GraphValidationError`` E1a fixed for
+        fork-child dispatch, one function over (elspeth-0bd2cde19a round-2
+        F2). For a nested branch the "last node" (the effective producer of
+        the declared connection) is simply the inner coalesce's own node —
+        a coalesce publishes its output under its own name, so there is no
+        backward walk to perform at all, only the same one-hop first-node
+        resolution ``get_branch_first_nodes`` already uses.
+        """
+        branch_info = self._branch_info[BranchName(branch_name)]
+        if self._is_nested_barrier_branch(branch_info.input_connection):
+            first_node = self._resolve_nested_branch_first_node(branch_info.gate_node_id, branch_name)
+            last_node = self._coalesce_id_map[CoalesceName(branch_info.input_connection)]
+            return first_node, last_node
+        return self._trace_branch_endpoints(coalesce_nid, branch_name)
 
     def _trace_branch_endpoints(
         self,

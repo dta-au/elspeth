@@ -692,8 +692,12 @@ def get_effective_producer_schema(
                     _cache[node_id] = result
                     return result
             # Transform branch: last transform's edge has label "continue", not
-            # the branch name. Trace backward to find the last transform node.
-            _first, last = graph._trace_branch_endpoints(NodeID(node_id), select_branch)
+            # the branch name. Resolve the last node — for a NESTED branch
+            # (select_branch names another coalesce, spec §7 rules 2/5) that
+            # is the inner coalesce's own node, not a backward-walkable
+            # transform chain; _resolve_branch_endpoints handles both shapes
+            # declaratively (elspeth-0bd2cde19a round-2 F2).
+            _first, last = graph._resolve_branch_endpoints(NodeID(node_id), select_branch)
             result = get_effective_producer_schema(graph, last, _cache)
             _cache[node_id] = result
             return result
