@@ -133,8 +133,14 @@ def _forward_reach_from(graph: ExecutionGraph, starts: set[NodeID], stop: NodeID
     return seen
 
 
-def _fork_branch_starts(graph: ExecutionGraph, binding: GroupBinding) -> set[NodeID]:
+def _fork_branch_starts(graph: ExecutionGraph, binding: GroupBinding, closer_reachable: set[NodeID]) -> set[NodeID]:
     """The forward-walk anchor for one bound group: a FORK's own branch entries.
+
+    ``closer_reachable`` is the caller's ``_backward_reach(closer, opener)``
+    set, computed ONCE per binding and passed in rather than recomputed here
+    (review A5.7, 2026-08-23 fix round: two independently-written traversals
+    that must stay semantically identical is exactly the shape that produced
+    F1 — enforced only by review, not by code, until they were unified).
 
     For an EXPAND/scope binding (``member_roster`` empty — ruling 28, Task 8's
     concern), the opener is a plain multi-row transform with no sibling routing
@@ -142,23 +148,29 @@ def _fork_branch_starts(graph: ExecutionGraph, binding: GroupBinding) -> set[Nod
 
     An opener out-edge qualifies if EITHER its label is in the declared
     roster OR its target is backward-reachable from the closer (review F1,
-    2026-08-23 fix round). The label-only predicate under-admits two real
-    shapes: (a) a route whose target lands back inside the region through a
-    node the roster doesn't name directly (e.g. an intermediate non-fork
-    gate re-entering the region before reaching the closer), and (b) a route
-    whose target happens to be one of the SAME gate's own fork branches
-    under a route label override (`builder.py`'s MATCH-PRODUCERS-TO-CONSUMERS
-    pass draws that edge with the route label, not the branch name, so
-    `edge.label in member_roster` misses it). Both are genuine forward-walk
-    entries; the label check alone let both bypass rule 4 entirely.
+    2026-08-23 fix round). The label-only predicate under-admits a route
+    whose target lands back inside the region through a node the roster
+    doesn't name directly (e.g. an intermediate non-fork gate re-entering
+    the region before reaching the closer) — a genuine forward-walk entry
+    the label check alone would let bypass rule 4 entirely.
+
+    A SEPARATE, now-fixed hazard used to live here too: a route whose target
+    happened to be one of the SAME gate's own fork branches under a route
+    label override, which `builder.py`'s MATCH-PRODUCERS-TO-CONSUMERS pass
+    used to draw under the route label instead of the branch name — making
+    `edge.label in member_roster` ask a correct question of corrupted data
+    (addendum A2). That is now fixed at the producer: `builder.py` tracks
+    `fork_branch_connections` and always labels a fork-branch edge with the
+    branch name, never a same-gate route label, so `edge.label` can be
+    trusted here structurally ("stop parsing, carry the fact structurally
+    from the producer").
     """
     if binding.kind is not FrameKind.FORK:
         return {binding.opener_node_id}
-    inside = _backward_reach(graph, binding.closer_node_id, binding.opener_node_id)
     return {
         NodeID(edge.to_node)
         for edge in graph.get_outgoing_edges(binding.opener_node_id)
-        if edge.mode is not RoutingMode.DIVERT and (edge.label in binding.member_roster or NodeID(edge.to_node) in inside)
+        if edge.mode is not RoutingMode.DIVERT and (edge.label in binding.member_roster or NodeID(edge.to_node) in closer_reachable)
     }
 
 
@@ -247,15 +259,29 @@ def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...
         # closer, so the sink/no-path checks run over the WIDER forward-only
         # set, not member_node_ids (a member reached but never returning to
         # the closer is exactly what "no path to closer" must catch).
-        branch_starts = _fork_branch_starts(graph, binding)
-        forward_only = _forward_reach_from(graph, branch_starts, binding.closer_node_id) - {binding.closer_node_id}
+        #
+        # closer_reachable (_backward_reach(closer, opener)) is computed ONCE
+        # here and threaded into _fork_branch_starts rather than recomputed
+        # independently inside it (review A5.7) — two separately-written
+        # traversals that must stay semantically identical is exactly the
+        # shape that produced F1.
         closer_reachable = _backward_reach(graph, binding.closer_node_id, binding.opener_node_id)
+        branch_starts = _fork_branch_starts(graph, binding, closer_reachable)
+        forward_only = _forward_reach_from(graph, branch_starts, binding.closer_node_id) - {binding.closer_node_id}
         # sorted(): forward_only is a set[NodeID] (NodeID is str-derived), so
         # unordered iteration makes WHICH violation raises first depend on
         # PYTHONHASHSEED (review F3, demonstrated across 8 seeds — including
         # a flip between the sink-inside and no-path-to-closer LIMBS, which
         # carry different parity dispositions). Deterministic order restores
         # a single, reproducible verdict per topology.
+        #
+        # The sink-inside limb is checked, over ALL members, before the
+        # no-path-to-closer limb is checked over any member (review A5.9):
+        # sink-inside is the more specific diagnosis (a token actually left
+        # the region), so it must win regardless of which NodeID happens to
+        # sort first alphabetically. Splitting into two passes makes that
+        # priority a deliberate structural fact, not a lexicographic accident
+        # of whichever violating member's name sorts earliest.
         for member in sorted(forward_only):
             info = graph.get_node_info(member)
             if info.node_type is NodeType.SINK:
@@ -267,6 +293,7 @@ def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...
                     component_id=binding.closer_name,
                     component_type=binding.closer_kind,
                 )
+        for member in sorted(forward_only):
             if member not in closer_reachable:
                 raise GraphValidationError(
                     f"Node '{member}' inside bound region '{binding.closer_name}' has no success path to "
@@ -290,17 +317,31 @@ def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...
         # bound region (e.g. through a queue a real branch also feeds) and
         # settling a branch it was never part of.
         #
-        # legitimate_targets excludes a false positive discovered while
-        # verifying this fix: builder.py's gate fallthrough bookkeeping
-        # (`gate_default_continue_targets`) draws an ADDITIONAL edge labeled
-        # "continue" to a gate's sole unambiguous processing consumer, even
-        # when that consumer was already reached via a real, roster-labeled
-        # branch edge (verified against the nested-fork-in-fork fixture:
-        # `outer_fork`'s "outer_a" branch and its "continue" fallthrough
-        # both target `inner_fork`). A non-roster edge whose target is ALSO
-        # the target of a real branch edge from the same opener is a
-        # harmless duplicate, not a backdoor — only a target unreachable via
-        # any roster-labeled edge is a genuine unframed entry.
+        # legitimate_targets excludes exactly ONE known-dead label, not any
+        # coincidentally-matching target (review R1, BLOCKING, 2026-08-23
+        # re-review: the broad "any target coinciding with a roster edge's
+        # target" form re-opens the exact backdoor this limb exists to
+        # close — make a fork branch's own connection name equal a queue
+        # name, so the roster edge itself lands on that queue, then add a
+        # second, ordinary, non-"continue" route to the same queue; the
+        # broad exclusion skipped it on target-coincidence alone, with the
+        # label never inspected). The cross-module invariant this exclusion
+        # depends on: a config gate's dispatch (`engine/executors/gate.py`)
+        # never emits `RoutingAction.continue_()` — it only emits
+        # `FORK_TO_PATHS` or `ROUTE` to a sink/processing-node/discard, and
+        # raises on an unconfigured label — so builder.py's
+        # `gate_default_continue_targets` fallthrough bookkeeping (which
+        # draws an extra edge labeled "continue" to a gate's sole
+        # unambiguous processing consumer, even when that consumer is
+        # already reached via a real, roster-labeled branch edge) is
+        # suppressing a builder BOOKKEEPING ARTIFACT that is unreachable at
+        # runtime, not a live route. If that invariant ever breaks — a gate
+        # plugin gains `fork_to`, or the config-gate dispatch grows a
+        # continue fallback — this exclusion silently becomes a backdoor
+        # again, with nothing here to catch it. The one instance where this
+        # actually fires across the DAG unit surface today:
+        # `variant_fork` -> `transform_treatment_identity_...`, label
+        # 'continue' (test_dag_row_union.py).
         if binding.kind is FrameKind.FORK:
             opener_edges = graph.get_outgoing_edges(binding.opener_node_id)
             legitimate_targets = {
@@ -312,7 +353,7 @@ def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...
                 if edge.label in binding.member_roster:
                     continue
                 target = NodeID(edge.to_node)
-                if target in legitimate_targets:
+                if edge.label == "continue" and target in legitimate_targets:
                     continue
                 if target in in_region:
                     raise GraphValidationError(

@@ -738,6 +738,235 @@ def _build_queue_backdoor() -> ExecutionGraph:
     )
 
 
+def _build_exclusion_attack(*, evil_route: bool) -> ExecutionGraph:
+    """Review R1 (BLOCKING, re-review of `5a52184a5`): the fork's OWN branch
+    connection name is made to equal the queue name it feeds ('inbound'), so
+    the roster-labelled edge itself lands on the queue; a second, ordinary,
+    non-'continue' route ('evil') targets that SAME queue. The broad form of
+    the `legitimate_targets` exclusion skipped 'evil' on target-coincidence
+    alone (its target is ALSO reached by the roster edge), never inspecting
+    the label — walking straight through into the exact E1 unframed-entry
+    hazard F2 exists to close. `evil_route=False` is the CONTROL (must
+    build); `evil_route=True` is the ATTACK (must be rejected by the F2
+    limb, not silently swallowed by the exclusion).
+    """
+    source = _BoundRegionMockSource()
+    other_leg = _BoundRegionTransform(name="other_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    qleg = _BoundRegionTransform(name="qleg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    routes = {"go": "fork"}
+    if evil_route:
+        routes["evil"] = "inbound"
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="fork_input", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=other_leg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="other_leg",
+                    plugin=other_leg.name,
+                    input="other_path",
+                    on_success="other_done",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=qleg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="qleg",
+                    plugin=qleg.name,
+                    input="inbound",
+                    on_success="qout",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="fork_rows",
+                input="fork_input",
+                condition="'go'",
+                routes=routes,
+                fork_to=["inbound", "other_path"],
+            ),
+        ],
+        queues={"inbound": QueueSettings()},
+        coalesce_settings=[
+            CoalesceSettings(
+                name="merged",
+                branches={"inbound": "qout", "other_path": "other_done"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+    )
+
+
+def _build_onehop_queue_backdoor() -> ExecutionGraph:
+    """Review A1: the solution architect's one-hop discriminator. Same hazard
+    as `_build_queue_backdoor` (opener's non-fork route re-entering the
+    region through the queue a real branch also feeds), one hop shorter —
+    the opener's 'false' route feeds the branch's queue DIRECTLY, with no
+    intermediate transform. Option A (widen membership only) does NOT close
+    this variant (`inbound` stays branch-reachable via `queued_leg`, so the
+    backward walk still authorizes the edge); only Option B's F2 limb does,
+    by rejecting the non-branch route before membership is even consulted.
+    This is the cheapest witness against a future membership-level refactor
+    silently reopening the hole.
+    """
+    source = _BoundRegionMockSource()
+    queued_leg = _BoundRegionTransform(name="queued_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    other_leg = _BoundRegionTransform(name="other_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="fork_input", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=queued_leg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="queued_leg",
+                    plugin=queued_leg.name,
+                    input="queued_path",
+                    on_success="inbound",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=other_leg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="other_leg",
+                    plugin=other_leg.name,
+                    input="other_path",
+                    on_success="other_done",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="fork_rows",
+                input="fork_input",
+                condition="True",
+                routes={"true": "fork", "false": "inbound"},
+                fork_to=["queued_path", "other_path"],
+            ),
+        ],
+        queues={"inbound": QueueSettings()},
+        coalesce_settings=[
+            CoalesceSettings(
+                name="merged",
+                branches={"queued_path": "inbound", "other_path": "other_done"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+    )
+
+
+def _build_nested_opener_queue_backdoor(*, leak: bool) -> ExecutionGraph:
+    """Review A5.4: FORK-inside-FORK with the non-branch-route hazard on the
+    INNER opener, not the outer one. `outer_gate` forks [left, right];
+    `left` enters `inner_gate`, which forks [la_path, lb_path]; `inner_gate`
+    ALSO carries a non-branch route ('leak') that feeds the SAME queue
+    ('la_queue') `la_path`'s own transform legitimately feeds — the exact
+    F2 hazard shape, one nesting level down. The F2 limb is guarded
+    `if binding.kind is FrameKind.FORK` and checks only its OWN opener's
+    immediate out-edges, so nothing in its structure guarantees it fires
+    for an INNER binding rather than only the outer one; this is the first
+    test that actually exercises a nested opener. `leak=False` is the
+    CONTROL (must build); `leak=True` must be rejected pinned to the INNER
+    region ('inner_coalesce'), proving the limb generalizes rather than
+    only ever having been exercised at nesting depth 1.
+    """
+    source = _BoundRegionMockSource()
+    right_transform = _BoundRegionTransform(name="right_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    la_leg = _BoundRegionTransform(name="la_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    lb_leg = _BoundRegionTransform(name="lb_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    leak_leg = _BoundRegionTransform(name="leak_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    inner_routes = {"go": "fork"}
+    if leak:
+        inner_routes["leak"] = "inner_leak_in"
+
+    transforms = [
+        WiredTransform(
+            plugin=right_transform,  # type: ignore[arg-type]
+            settings=TransformSettings(
+                name="right_transform",
+                plugin=right_transform.name,
+                input="right",
+                on_success="right_out",
+                on_error="discard",
+                options={},
+            ),
+        ),
+        WiredTransform(
+            plugin=la_leg,  # type: ignore[arg-type]
+            settings=TransformSettings(
+                name="la_leg", plugin=la_leg.name, input="la_path", on_success="la_queue", on_error="discard", options={}
+            ),
+        ),
+        WiredTransform(
+            plugin=lb_leg,  # type: ignore[arg-type]
+            settings=TransformSettings(
+                name="lb_leg", plugin=lb_leg.name, input="lb_path", on_success="lb_out", on_error="discard", options={}
+            ),
+        ),
+    ]
+    if leak:
+        transforms.append(
+            WiredTransform(
+                plugin=leak_leg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="leak_leg",
+                    plugin=leak_leg.name,
+                    input="inner_leak_in",
+                    on_success="la_queue",
+                    on_error="discard",
+                    options={},
+                ),
+            )
+        )
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=transforms,
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(name="outer_gate", input="source_out", condition="'all'", routes={"all": "fork"}, fork_to=["left", "right"]),
+            GateSettings(name="inner_gate", input="left", condition="'go'", routes=inner_routes, fork_to=["la_path", "lb_path"]),
+        ],
+        queues={"la_queue": QueueSettings()},
+        coalesce_settings=[
+            CoalesceSettings(
+                name="inner_coalesce", branches={"la_path": "la_queue", "lb_path": "lb_out"}, policy="require_all", merge="union"
+            ),
+            CoalesceSettings(
+                name="outer_coalesce",
+                branches={"left": "inner_coalesce", "right": "right_out"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            ),
+        ],
+    )
+
+
 def _build_crosslimb_no_path_violation() -> None:
     """Review F4 (`probe_crosslimb.py`): the no-path-to-closer limb has no
     coverage anywhere in the suite despite being a live, parity-adjudicated
@@ -851,6 +1080,50 @@ class TestSESEWalk:
         # being a live, parity-adjudicated raise site.
         with pytest.raises(GraphValidationError, match="has no success path to"):
             _build_crosslimb_no_path_violation()
+
+    def test_exclusion_attack_control_builds(self) -> None:
+        # Review R1: the CONTROL half of the discriminator — no evil route,
+        # must build clean. Proves the narrowed exclusion still suppresses
+        # the genuine builder bookkeeping artifact (the "continue"
+        # fallthrough) rather than breaking this legitimate topology.
+        _build_exclusion_attack(evil_route=False)
+
+    def test_exclusion_attack_rejected(self) -> None:
+        # Review R1 (BLOCKING): the broad `legitimate_targets` exclusion
+        # skipped ANY non-roster edge whose target coincided with a roster
+        # edge's target, regardless of label — this is the only witness
+        # that discriminates that broad form from the narrowed
+        # `label == "continue"` form. A fork branch's own connection name
+        # is made to equal the queue it feeds, so the roster edge lands on
+        # the queue too; a second, ordinary 'evil' route to that same queue
+        # must still be rejected by the F2 limb, not silently excluded.
+        with pytest.raises(GraphValidationError, match="not one of the fork's declared branches"):
+            _build_exclusion_attack(evil_route=True)
+
+    def test_nested_opener_queue_backdoor_control_builds(self) -> None:
+        # Review A5.4 CONTROL: the nested fork-in-fork topology with no leak
+        # route must build clean.
+        _build_nested_opener_queue_backdoor(leak=False)
+
+    def test_nested_opener_queue_backdoor_rejected(self) -> None:
+        # Review A5.4: the F2 limb is guarded per-binding
+        # (`if binding.kind is FrameKind.FORK`) and checks only its own
+        # opener's immediate out-edges; nothing in its structure guarantees
+        # it fires for a NESTED (inner) opener rather than only ever having
+        # been exercised at nesting depth 1. This pins that it does.
+        with pytest.raises(GraphValidationError, match="not one of the fork's declared branches") as exc_info:
+            _build_nested_opener_queue_backdoor(leak=True)
+        assert "inner_coalesce" in str(exc_info.value)
+
+    def test_onehop_queue_backdoor_rejected(self) -> None:
+        # Review A1: the solution architect's one-hop discriminator — the
+        # opener's non-fork route feeds the branch's queue DIRECTLY, no
+        # intermediate transform. Option A (widen membership only) does NOT
+        # close this variant; only Option B's F2 limb does. The cheapest
+        # witness against a future membership-level refactor reopening the
+        # hole.
+        with pytest.raises(GraphValidationError, match="not one of the fork's declared branches"):
+            _build_onehop_queue_backdoor()
 
 
 class TestFixpointBound:

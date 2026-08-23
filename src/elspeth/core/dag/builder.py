@@ -988,6 +988,18 @@ def build_execution_graph(
     producer_desc: dict[str, str] = {}
     queue_input_edges: defaultdict[str, list[tuple[NodeID, str, str]]] = defaultdict(list)
     gate_connection_route_labels: defaultdict[tuple[NodeID, str], list[str]] = defaultdict(list)
+    # (gate_node_id, connection_name) pairs registered AS a fork branch's own
+    # producer connection. gate_connection_route_labels is keyed only by
+    # (gate_id, target-connection-name-string) — an ordinary route entry
+    # whose target string happens to COINCIDE with a branch's own connection
+    # name (e.g. a route named after one of the gate's own branches) would
+    # otherwise silently override that branch edge's label at draw time
+    # (2026-08-23 fix, addendum A2: the true root cause of the F1 "label
+    # hole" — `edge.label in member_roster` was asking a correct question of
+    # corrupted data). A fork-branch connection's edge must ALWAYS carry the
+    # branch name as its label, never a same-gate route label, regardless of
+    # what else targets that connection name.
+    fork_branch_connections: set[tuple[NodeID, str]] = set()
 
     def register_producer(connection_name: str, node_id: NodeID, label: str, description: str) -> None:
         if connection_name in queue_ids:
@@ -1066,6 +1078,7 @@ def build_execution_graph(
             plan.branch_name,
             f"fork branch '{plan.branch_name}' from gate '{plan.gate_name}'",
         )
+        fork_branch_connections.add((plan.gate_node_id, plan.branch_name))
 
     for branch_key, (ru_gate_name, ru_gate_node_id) in row_union_branch_gates.items():
         ru_spec = row_union_branch_specs[branch_key]
@@ -1077,6 +1090,7 @@ def build_execution_graph(
             ru_spec.branch_name,
             f"fork branch '{ru_spec.branch_name}' from gate '{ru_gate_name}'",
         )
+        fork_branch_connections.add((ru_gate_node_id, ru_spec.branch_name))
 
     # Unbound (no barrier) consumer-fed branches (spec §7 E2): registering
     # the branch as a producer here lets the standard "MATCH PRODUCERS TO
@@ -1092,6 +1106,7 @@ def build_execution_graph(
             str(branch_key),
             f"fork branch '{branch_key}' from gate '{owning_gate_name}' (unbound, consumer-fed)",
         )
+        fork_branch_connections.add((config_gate_ids[owning_gate_name], str(branch_key)))
 
     # ===== BUILD CONSUMER REGISTRY =====
     consumers: dict[str, NodeID] = {}
@@ -1221,12 +1236,19 @@ def build_execution_graph(
     for connection_name, consumer_id in consumers.items():
         producer_id, producer_label = producers[connection_name]
         if producer_id in gate_node_ids and producer_label != "continue":
-            route_labels = gate_connection_route_labels[(producer_id, connection_name)]
-            if route_labels:
-                for route_label in route_labels:
-                    graph.add_edge(producer_id, consumer_id, label=route_label, mode=RoutingMode.MOVE)
-            else:
+            if (producer_id, connection_name) in fork_branch_connections:
+                # This connection IS a fork branch's own producer connection —
+                # its edge must carry the branch name, never a same-gate
+                # route_labels entry that coincidentally targets this same
+                # connection name (addendum A2; see fork_branch_connections).
                 graph.add_edge(producer_id, consumer_id, label=producer_label, mode=RoutingMode.MOVE)
+            else:
+                route_labels = gate_connection_route_labels[(producer_id, connection_name)]
+                if route_labels:
+                    for route_label in route_labels:
+                        graph.add_edge(producer_id, consumer_id, label=route_label, mode=RoutingMode.MOVE)
+                else:
+                    graph.add_edge(producer_id, consumer_id, label=producer_label, mode=RoutingMode.MOVE)
             # Preserve gate fallthrough semantics for RoutingAction.continue_():
             # when a gate has a single downstream processing target, continue
             # should route there even if explicit route labels are present.
