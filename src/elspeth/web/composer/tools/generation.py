@@ -554,6 +554,84 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "so the closer has no membership to settle for it.",
         "From inside a bound region, on_error may name the region's own closer; elsewhere use a sink name or 'discard'.",
     ),
+    # ── Collector node kind (barrier-scopes spec §3, Task 12) ──────────────
+    (
+        r"collector_missing_scope|has no complete scope binding|no scopes: entry",
+        "A collector is an EXPAND-group closer and requires a complete scope binding (spec §7 rule 1); "
+        "without one it has no group to close.",
+        "Set scope_name (the scope identifier), scope_opener (the multi-row transform that opens the "
+        "group), and scope_policy ('require_all' or 'best_effort') on the collector node.",
+    ),
+    (
+        r"collector_scope_policy_invalid|scope_policy .* is not a valid policy",
+        "The collector's scope_policy is outside the closed group-arrival vocabulary.",
+        "Set scope_policy to 'require_all' (a lost member fails the group) or 'best_effort' (the group "
+        "settles with what arrived). There is no default — the author decides.",
+    ),
+    (
+        r"scope_opener_unknown|scope_opener '(.+)' does not name a transform",
+        "The collector's scope_opener does not name a transform node in the pipeline, so no expansion "
+        "opens the group this collector would close.",
+        "Set scope_opener to the multi-row transform (creates_tokens=True) whose expanded rows this "
+        "collector reassembles, and declare that transform in the pipeline.",
+    ),
+    (
+        r"collector_has_trigger_invalid|Collector '(.+)' does not accept 'trigger'",
+        "A collector flushes on end_of_group only; count/timeout/condition triggers are inexpressible "
+        "on a closer (a timeout would silently short the group).",
+        "Remove the trigger field from the collector node. For early-trigger batching use an "
+        "aggregation node outside any bound region instead.",
+    ),
+    (
+        r"collector_missing_plugin|Collector '(.+)' is missing required field 'plugin'",
+        "A collector node needs a batch-transform plugin to reassemble its group.",
+        "Set plugin on the collector node to a batch-aware transform (the same plugin contract aggregations use).",
+    ),
+    (
+        r"collector_plugin_not_batch_aware|is_batch_aware=False",
+        "The collector's plugin is a row-level transform; collectors reuse the batch-transform plugin "
+        "contract and flush the whole group as one batch.",
+        "Set plugin to a batch-aware transform, or use a transform node if per-row processing was intended.",
+    ),
+    (
+        r"collector_config_invalid|Collector '(.+)' does not accept field",
+        "The collector node carries fields outside its shape (gate, coalesce, or aggregation fields).",
+        "Re-emit the collector with only plugin/input/on_success/on_error/options plus its scope "
+        "binding fields (scope_name/scope_opener/scope_policy/scope_on_group_failure).",
+    ),
+    (
+        r"collector_on_success_dangling|Collector '(.+)' on_success '(.+)' is neither a sink",
+        "The collector's flush destination resolves to neither a declared sink nor a connection any downstream node consumes.",
+        "Set the collector's on_success to a declared sink name, or add a downstream node whose input equals it.",
+    ),
+    (
+        r"collector_scope_on_group_failure_invalid|scope_on_group_failure .* is not a valid value",
+        "The collector's scope_on_group_failure is outside the closed failure-handling vocabulary.",
+        "Set scope_on_group_failure to 'quarantine' (terminal handling, the default) or 'escalate' "
+        "(hand the loss to the enclosing bound group — requires one).",
+    ),
+    (
+        r"scope_name_duplicate|Scope name '(.+)' is declared twice",
+        "Two collectors declare the same scope_name, so the scope identifier is ambiguous.",
+        "Give each collector its own unique scope_name.",
+    ),
+    (
+        r"scope_opener_duplicate|Transform '(.+)' opens two scopes",
+        "Two collectors bind the same opener transform — one scope per opener.",
+        "Point each collector's scope_opener at its own multi-row transform, or remove the duplicate collector.",
+    ),
+    (
+        r"scope_name_invalid|Scope name '(.+)' (?:is reserved|contains invalid characters)|Scope name exceeds max length",
+        "The collector's scope_name violates the runtime name rules (length, character class, or a reserved label).",
+        "Set scope_name to a name that starts with a letter and uses only letters, digits, underscores, "
+        "and hyphens, avoiding reserved labels.",
+    ),
+    (
+        r"node_scope_fields_unsupported|does not accept collector scope field",
+        "A non-collector node carries scope_name/scope_opener/scope_policy/scope_on_group_failure, "
+        "which bind an EXPAND group only on collector nodes.",
+        "Remove the scope_* fields from this node, or re-emit it as node_type='collector' if it is the group's closer.",
+    ),
     (
         r"gate_duplicate_fork_branch",
         "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
@@ -1208,6 +1286,24 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "batch_required_fields_invalid",
     "batch_value_field_not_numeric",
     "queue_config_invalid",
+    # ── Collector node kind (barrier-scopes spec §3, Task 12) ──────────────
+    # Intrinsic collector/scope-binding shape plus the cross-collector scope
+    # checks and the decidable half of §7 rule 8 (escalate with provably no
+    # enclosing bound group — full membership stays with Stage 2).
+    "collector_missing_scope",
+    "collector_scope_policy_invalid",
+    "scope_opener_unknown",
+    "collector_has_trigger_invalid",
+    "collector_missing_plugin",
+    "collector_plugin_not_batch_aware",
+    "collector_config_invalid",
+    "collector_on_success_dangling",
+    "collector_scope_on_group_failure_invalid",
+    "scope_name_duplicate",
+    "scope_opener_duplicate",
+    "scope_name_invalid",
+    "node_scope_fields_unsupported",
+    "scope_escalate_at_outermost",
     "structural_node_plugin_forbidden",
     "queue_no_consumer",
     "queue_name_collision",

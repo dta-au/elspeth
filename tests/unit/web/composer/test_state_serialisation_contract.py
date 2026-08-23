@@ -134,6 +134,23 @@ def _structural_node(**overrides: Any) -> dict[str, Any]:
     return node
 
 
+def _collector_node(**overrides: Any) -> dict[str, Any]:
+    node: dict[str, Any] = {
+        "id": "page_stitcher",
+        "node_type": "collector",
+        "plugin": "batch_stats",
+        "input": "pages",
+        "on_success": "out",
+        "on_error": None,
+        "options": {},
+        "scope_name": "document_pages",
+        "scope_opener": "explode",
+        "scope_policy": "require_all",
+    }
+    node.update(overrides)
+    return node
+
+
 @pytest.mark.parametrize(
     ("shape", "expected_hash"),
     [
@@ -152,6 +169,11 @@ def _structural_node(**overrides: Any) -> dict[str, Any]:
             "ab0074986f55de9f78f79946b460e32859b4fe76362e4cbd310b5838e70e7fa2",
             id="row_union_with_list_branches",
         ),
+        pytest.param(
+            [_collector_node()],
+            "03e7cc638ec451ad6f2f0053c8c22acd714700621f22bd029e6e84e3497daa94",
+            id="collector_without_on_group_failure",
+        ),
     ],
 )
 def test_persisted_shape_content_hashes_are_pinned(shape: list[dict[str, Any]], expected_hash: str) -> None:
@@ -163,3 +185,35 @@ def test_persisted_shape_content_hashes_are_pinned(shape: list[dict[str, Any]], 
         "migrated (the proposal bytes are hash-bound), so every base binding for this shape becomes "
         "permanently unverifiable. Re-pin only after deciding what happens to already-persisted states."
     )
+
+
+def test_collector_scope_fields_round_trip_and_omit_when_none() -> None:
+    """Collector ``scope_*`` fields serialise omitted-when-None (2026-08-20 discipline).
+
+    A pre-collector persisted node dict must stay byte-identical (no ``scope_*``
+    keys appear on nodes that never carried them), and a collector's authored
+    scope binding must survive ``from_dict(to_dict(state)) == state``.
+    """
+    payload = _state_payload([_collector_node(), _structural_node(id="join_rows", branches=["left", "right"])])
+    state = CompositionState.from_dict(payload)
+
+    serialized = state.to_dict()
+    collector_dict = next(n for n in serialized["nodes"] if n["id"] == "page_stitcher")
+    coalesce_dict = next(n for n in serialized["nodes"] if n["id"] == "join_rows")
+
+    assert collector_dict["scope_name"] == "document_pages"
+    assert collector_dict["scope_opener"] == "explode"
+    assert collector_dict["scope_policy"] == "require_all"
+    # __post_init__ RECORDS the runtime default (ScopeSettings.on_group_failure
+    # = "quarantine"), exactly like the coalesce merge/policy normalisation.
+    assert collector_dict["scope_on_group_failure"] == "quarantine"
+    # scope_policy is REQUIRED with no default: absent stays absent (None), so
+    # a collector authored without it must serialise WITHOUT the key.
+    sparse = CompositionState.from_dict(_state_payload([_collector_node(scope_policy=None)]))
+    sparse_dict = next(n for n in sparse.to_dict()["nodes"] if n["id"] == "page_stitcher")
+    assert "scope_policy" not in sparse_dict
+
+    for key in ("scope_name", "scope_opener", "scope_policy", "scope_on_group_failure"):
+        assert key not in coalesce_dict
+
+    assert CompositionState.from_dict(serialized) == state

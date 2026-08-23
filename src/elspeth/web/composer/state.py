@@ -14,7 +14,7 @@ from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import PurePosixPath
-from typing import Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict
+from typing import Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict, get_args
 
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
@@ -46,6 +46,7 @@ from elspeth.core.config import (
     _RESERVED_EDGE_LABELS,
     _VALID_NODE_NAME_RE,
     CoalesceSettings,
+    ScopeSettings,
     TriggerConfig,
     _validate_connection_or_sink_name,
     _validate_max_length,
@@ -65,11 +66,11 @@ from elspeth.web.composer._validation_probe import prepare_validation_probe_opti
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
-NodeType = Literal["transform", "gate", "aggregation", "coalesce", "row_union", "queue"]
+NodeType = Literal["transform", "gate", "aggregation", "coalesce", "row_union", "queue", "collector"]
 EdgeType = Literal["on_success", "on_error", "route_true", "route_false", "fork"]
 CoalesceBranches = tuple[str, ...] | Mapping[str, str]
 
-COMPOSER_NODE_TYPES: frozenset[str] = frozenset(("aggregation", "coalesce", "gate", "queue", "row_union", "transform"))
+COMPOSER_NODE_TYPES: frozenset[str] = frozenset(("aggregation", "coalesce", "collector", "gate", "queue", "row_union", "transform"))
 
 _DECLARED_INPUT_FIELDS_OPTION = "required_input_fields"
 _MISSING_DECLARED_INPUT_FIELDS = object()
@@ -85,6 +86,15 @@ _QUEUE_OPTION_KEYS: frozenset[str] = frozenset({"description"})
 # changes its default — the exact drift the normalisation is here to prevent.
 _COALESCE_RUNTIME_POLICY_DEFAULT: Final[str] = CoalesceSettings.model_fields["policy"].default
 _COALESCE_RUNTIME_MERGE_DEFAULT: Final[str] = CoalesceSettings.model_fields["merge"].default
+# Same one-owner rule for the scope binding: ``ScopeSettings.on_group_failure``
+# defaults to "quarantine" (core/config.py); ``ScopeSettings.policy`` is
+# REQUIRED with no default (spec §3), so it deliberately has NO constant here —
+# a Stage-1 default may only RECORD a runtime default, never invent one.
+_SCOPE_RUNTIME_ON_GROUP_FAILURE_DEFAULT: Final[str] = ScopeSettings.model_fields["on_group_failure"].default
+# Closed vocabularies of the scope binding, read from the runtime Literals so
+# the two surfaces cannot disagree (typing.get_args over the annotation).
+_SCOPE_POLICY_VOCABULARY: Final[tuple[str, ...]] = get_args(ScopeSettings.model_fields["policy"].annotation)
+_SCOPE_ON_GROUP_FAILURE_VOCABULARY: Final[tuple[str, ...]] = get_args(ScopeSettings.model_fields["on_group_failure"].annotation)
 
 
 def _row_union_normalized_branches(node_type: str, branches: CoalesceBranches | None) -> CoalesceBranches | None:
@@ -167,6 +177,7 @@ _NODE_TYPE_NAME_LABELS: Final[dict[str, str]] = {
     "coalesce": "Coalesce name",
     "row_union": "row_union name",
     "queue": "Queue name",
+    "collector": "Collector name",
 }
 _LOWERCASE_ONLY_NODE_TYPES: Final[frozenset[str]] = frozenset({"queue"})
 
@@ -313,6 +324,22 @@ def _routing_label_errors(
                     add(component, "Fork branch names must not be empty")
                 else:
                     label(component, branch, "Fork branch name")
+        elif node.node_type == "collector":
+            # Wording tracks CollectorSettings' own validators (core/config.py)
+            # so a repair loop reads one message on both surfaces.
+            if node.input is None or not node.input.strip():
+                add(component, "Collector input connection must not be empty")
+            else:
+                label(component, node.input, "Collector input connection name")
+            if node.on_success is None or not node.on_success.strip():
+                add(component, "Collector on_success must be a connection name or sink name")
+            else:
+                label(component, node.on_success, "Collector on_success connection name")
+            if node.on_error is not None:
+                if not node.on_error.strip():
+                    add(component, "Collector on_error must be a sink name, 'discard', or omitted")
+                elif node.on_error != _DISCARD_ROUTE_TARGET:
+                    label(component, node.on_error, "Collector on_error sink name")
         elif node.node_type in ("coalesce", "row_union"):
             kind = "Coalesce" if node.node_type == "coalesce" else "row_union"
             raw_branches = node.branches
@@ -388,6 +415,10 @@ _RUNTIME_COLLECTION_CAPS: Final[dict[str, int]] = {
     "coalesce": 100,
     "row_unions": 100,
     "aggregations": 100,
+    # ``scopes`` shares the same cap and needs no row of its own: the composer
+    # emits exactly one scopes: entry per collector, so the collectors cap
+    # bounds both sections.
+    "collectors": 100,
 }
 _RUNTIME_SECTION_BY_NODE_TYPE: Final[dict[str, str]] = {
     "transform": "transforms",
@@ -396,6 +427,7 @@ _RUNTIME_SECTION_BY_NODE_TYPE: Final[dict[str, str]] = {
     "coalesce": "coalesce",
     "row_union": "row_unions",
     "queue": "queues",
+    "collector": "collectors",
 }
 _RUNTIME_GATE_MAPPING_CAP: Final = 32  # GateSettings.routes / fork_to max_length
 
@@ -560,6 +592,19 @@ class NodeSpec:
         description: Optional composer-authored one-sentence prose describing
             what this step does, rendered on the Spec tab. Informational only:
             it never participates in validation, lowering, or review hashes.
+        scope_name: Collector scope identifier (the scopes: entry's ``name``,
+            barrier-scopes spec §3). None for non-collector nodes.
+        scope_opener: Multi-row transform that opens the collector's EXPAND
+            group (the scopes: entry's ``opener``). None for non-collector nodes.
+        scope_policy: Group arrival policy ("require_all" or "best_effort").
+            REQUIRED for a collector with no default — ``ScopeSettings.policy``
+            has none (spec §3), so Stage 1 must not invent one. None for
+            non-collector nodes.
+        scope_on_group_failure: require_all failure handling ("quarantine" or
+            "escalate"), defaulted to "quarantine" for collectors so composer
+            state carries the handling the runtime will actually run
+            (``ScopeSettings.on_group_failure`` default). None for
+            non-collector nodes.
     """
 
     id: str
@@ -580,6 +625,10 @@ class NodeSpec:
     expected_output_count: int | None = None
     timeout_seconds: float | None = None
     description: str | None = None
+    scope_name: str | None = None
+    scope_opener: str | None = None
+    scope_policy: str | None = None
+    scope_on_group_failure: str | None = None
 
     def __post_init__(self) -> None:
         # ``CoalesceSettings`` DEFAULTS both optional coalesce fields —
@@ -602,6 +651,15 @@ class NodeSpec:
             object.__setattr__(self, "merge", _COALESCE_RUNTIME_MERGE_DEFAULT)
         if self.node_type == "coalesce" and self.policy is None:
             object.__setattr__(self, "policy", _COALESCE_RUNTIME_POLICY_DEFAULT)
+        # Collector scope binding: ``ScopeSettings.on_group_failure`` has a
+        # runtime default ("quarantine"), so defaulting it here RECORDS a
+        # decision the runtime has already made — the same rule as the coalesce
+        # normalisation above. ``scope_policy`` is deliberately NOT defaulted:
+        # ``ScopeSettings.policy`` is REQUIRED with no default (spec §3), and a
+        # Stage-1 default may only record a runtime default, never invent one —
+        # ``validate()`` rejects the absence (collector_missing_scope) instead.
+        if self.node_type == "collector" and self.scope_on_group_failure is None:
+            object.__setattr__(self, "scope_on_group_failure", _SCOPE_RUNTIME_ON_GROUP_FAILURE_DEFAULT)
         # Do NOT extend this normalisation to ``on_error`` by analogy. The shapes
         # look identical and the remedies are inverted. ``merge`` has a runtime
         # DEFAULT to mirror (``CoalesceSettings.merge = "union"``), so defaulting
@@ -673,6 +731,10 @@ class NodeSpec:
             expected_output_count=d["expected_output_count"] if "expected_output_count" in d else None,
             timeout_seconds=d["timeout_seconds"] if "timeout_seconds" in d else None,
             description=d["description"] if "description" in d else None,
+            scope_name=d["scope_name"] if "scope_name" in d else None,
+            scope_opener=d["scope_opener"] if "scope_opener" in d else None,
+            scope_policy=d["scope_policy"] if "scope_policy" in d else None,
+            scope_on_group_failure=d["scope_on_group_failure"] if "scope_on_group_failure" in d else None,
         )
 
 
@@ -816,6 +878,10 @@ def queue_node_contract_error(node: NodeSpec) -> str | None:
         "output_mode": node.output_mode,
         "expected_output_count": node.expected_output_count,
         "timeout_seconds": node.timeout_seconds,
+        "scope_name": node.scope_name,
+        "scope_opener": node.scope_opener,
+        "scope_policy": node.scope_policy,
+        "scope_on_group_failure": node.scope_on_group_failure,
     }
     present = sorted(name for name, value in forbidden.items() if value is not None)
     if present:
@@ -827,6 +893,252 @@ def queue_node_contract_error(node: NodeSpec) -> str | None:
     if description is not None and not isinstance(description, str):
         return f"Queue '{node.id}' options.description must be a string."
     return None
+
+
+_COLLECTOR_SCOPE_BINDING_FIELDS: Final[tuple[str, ...]] = ("scope_name", "scope_opener", "scope_policy")
+
+
+def _scope_binding_value(node: NodeSpec, field_name: str) -> str | None:
+    """Return a collector scope-binding field as an authored string, or None.
+
+    A persisted payload can carry a non-string or blank value through
+    ``NodeSpec.from_dict``; both mean "not authored" here — the missing-field
+    rejection names the field, which is the honest repair for a malformed
+    value too (set it to a real name).
+    """
+    value = {
+        "scope_name": node.scope_name,
+        "scope_opener": node.scope_opener,
+        "scope_policy": node.scope_policy,
+    }[field_name]
+    if type(value) is not str or not value.strip():
+        return None
+    return value
+
+
+def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) -> list[ValidationEntry]:
+    """Intrinsic (per-node) collector shape checks (barrier-scopes spec §3).
+
+    Mirrors, at composition time, the runtime rejections a collector NodeSpec
+    would otherwise only meet at settings load or DAG build:
+    ``CollectorSettings`` (plugin required, no trigger, extra="forbid"),
+    ``ScopeSettings`` (name rules, closed policy vocabulary), the builder's
+    is_batch_aware requirement, and spec §7 rule 1 (a collector requires its
+    scope binding). Cross-node scope checks (duplicate scope names/openers,
+    escalate-at-outermost) live in :func:`_collector_scope_topology_errors`.
+    """
+    errors: list[ValidationEntry] = []
+    _err = ValidationEntry
+    component = f"node:{node.id}"
+
+    if not node.plugin:
+        errors.append(
+            _err(
+                component,
+                f"Collector '{node.id}' is missing required field 'plugin'. Collectors reuse the "
+                "batch-transform plugin contract (the same plugins aggregations use).",
+                "high",
+                "collector_missing_plugin",
+            )
+        )
+    elif node.plugin in _known_transform_plugin_names() and node.plugin not in _known_batch_aware_transform_plugins():
+        # Mirror of the builder's "Collector '{}' plugin '{}' has
+        # is_batch_aware=False" rejection. An unknown plugin name is owned by
+        # the plugin-availability checks, not this rule.
+        errors.append(
+            _err(
+                component,
+                f"Collector '{node.id}' plugin '{node.plugin}' has is_batch_aware=False. Collectors "
+                "reuse the batch-transform plugin contract; choose a batch-aware plugin.",
+                "high",
+                "collector_plugin_not_batch_aware",
+            )
+        )
+
+    if node.trigger is not None:
+        # CollectorSettings has NO trigger field (extra="forbid"): a closer
+        # flushes on end_of_group ONLY — a timeout/count trigger on a closer
+        # would silently short the group (spec §5).
+        errors.append(
+            _err(
+                component,
+                f"Collector '{node.id}' does not accept 'trigger': a collector flushes on end_of_group "
+                "only (count/timeout/condition triggers are inexpressible on a closer). Remove trigger.",
+                "high",
+                "collector_has_trigger_invalid",
+            )
+        )
+
+    # timeout_seconds is deliberately absent here: the shared
+    # node_timeout_unsupported check in validate() owns that field for every
+    # non-barrier node type, collectors included.
+    forbidden = {
+        "condition": node.condition,
+        "routes": node.routes,
+        "fork_to": node.fork_to,
+        "branches": node.branches,
+        "policy": node.policy,
+        "merge": node.merge,
+        "output_mode": node.output_mode,
+        "expected_output_count": node.expected_output_count,
+    }
+    present = sorted(name for name, value in forbidden.items() if value is not None)
+    if present:
+        errors.append(
+            _err(
+                component,
+                f"Collector '{node.id}' does not accept field(s): {present}. A collector carries "
+                "plugin/input/on_success/on_error/options plus its scope binding "
+                "(scope_name/scope_opener/scope_policy/scope_on_group_failure).",
+                "high",
+                "collector_config_invalid",
+            )
+        )
+
+    missing_scope_fields = [name for name in _COLLECTOR_SCOPE_BINDING_FIELDS if _scope_binding_value(node, name) is None]
+    if missing_scope_fields:
+        errors.append(
+            _err(
+                component,
+                f"Collector '{node.id}' has no complete scope binding: missing {missing_scope_fields}. "
+                "A collector is an EXPAND-group closer and requires a scope (spec §7 rule 1) — set "
+                "scope_name (the scope identifier), scope_opener (the multi-row transform that opens "
+                "the group), and scope_policy ('require_all' or 'best_effort').",
+                "high",
+                "collector_missing_scope",
+            )
+        )
+
+    scope_policy = _scope_binding_value(node, "scope_policy")
+    if scope_policy is not None and scope_policy not in _SCOPE_POLICY_VOCABULARY:
+        errors.append(
+            _err(
+                component,
+                f"Collector '{node.id}' scope_policy {scope_policy!r} is not a valid policy. "
+                f"Valid values: {', '.join(_SCOPE_POLICY_VOCABULARY)}.",
+                "high",
+                "collector_scope_policy_invalid",
+            )
+        )
+
+    # __post_init__ records the runtime default, so None can only mean a
+    # payload authored an explicit null — fold that into the invalid-value arm
+    # rather than silently re-defaulting a value the author wrote.
+    if node.scope_on_group_failure not in _SCOPE_ON_GROUP_FAILURE_VOCABULARY:
+        errors.append(
+            _err(
+                component,
+                f"Collector '{node.id}' scope_on_group_failure {node.scope_on_group_failure!r} is not a "
+                f"valid value. Valid values: {', '.join(_SCOPE_ON_GROUP_FAILURE_VOCABULARY)}.",
+                "high",
+                "collector_scope_on_group_failure_invalid",
+            )
+        )
+
+    scope_name = _scope_binding_value(node, "scope_name")
+    if scope_name is not None:
+        # Mirror ScopeSettings.validate_name (max length, character class,
+        # reserved labels) so a committed scope name cannot die at settings
+        # load. The empty case is the missing-field arm above.
+        try:
+            _validate_max_length(scope_name, field_label="Scope name", max_length=_MAX_NODE_NAME_LENGTH)
+            _validate_node_name_chars(scope_name, field_label="Scope name")
+            if scope_name in _RESERVED_EDGE_LABELS:
+                raise ValueError(f"Scope name '{scope_name}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+        except ValueError as exc:
+            errors.append(_err(component, str(exc), "high", "scope_name_invalid"))
+
+    scope_opener = _scope_binding_value(node, "scope_opener")
+    if scope_opener is not None:
+        opener_node = next((candidate for candidate in nodes if candidate.id == scope_opener), None)
+        if opener_node is None or opener_node.node_type != "transform":
+            errors.append(
+                _err(
+                    component,
+                    f"Collector '{node.id}' scope_opener '{scope_opener}' does not name a transform node "
+                    "in the pipeline. A scope opener is a multi-row transform (creates_tokens=True); set "
+                    "scope_opener to the transform whose expanded rows this collector closes.",
+                    "high",
+                    "scope_opener_unknown",
+                )
+            )
+
+    return errors
+
+
+def _collector_scope_topology_errors(nodes: tuple[NodeSpec, ...]) -> list[ValidationEntry]:
+    """Cross-collector scope checks (spec §7 rules 1 and 8, parse-time half).
+
+    Mirrors ``ElspethSettings._validate_scope_bindings``' authorable rejections
+    — "Scope name '{}' is declared twice" and "Transform '{}' opens two scopes
+    — one scope per opener" — plus the decidable half of §7 rule 8
+    (``validate_escalation_targets``): escalate with provably no enclosing
+    bound group. Stage 1 does not compute bound regions (established
+    abstention), so the rule-8 mirror fires only when the draft holds NO other
+    barrier at all — with another coalesce/row_union/collector present,
+    membership needs the real builder and Stage 2 owns the verdict
+    (accepting is the safe drift direction).
+    """
+    errors: list[ValidationEntry] = []
+    _err = ValidationEntry
+    collectors = [node for node in nodes if node.node_type == "collector"]
+    if not collectors:
+        return errors
+
+    scope_name_owners: dict[str, list[str]] = {}
+    scope_opener_owners: dict[str, list[str]] = {}
+    for node in collectors:
+        scope_name = _scope_binding_value(node, "scope_name")
+        if scope_name is not None:
+            scope_name_owners.setdefault(scope_name, []).append(node.id)
+        scope_opener = _scope_binding_value(node, "scope_opener")
+        if scope_opener is not None:
+            scope_opener_owners.setdefault(scope_opener, []).append(node.id)
+
+    for scope_name, owners in scope_name_owners.items():
+        if len(owners) > 1:
+            errors.append(
+                _err(
+                    f"node:{owners[1]}",
+                    f"Scope name '{scope_name}' is declared twice (collectors {owners}). Scope names must "
+                    "be unique — give each collector its own scope_name.",
+                    "high",
+                    "scope_name_duplicate",
+                )
+            )
+    for scope_opener, owners in scope_opener_owners.items():
+        if len(owners) > 1:
+            errors.append(
+                _err(
+                    f"node:{owners[1]}",
+                    f"Transform '{scope_opener}' opens two scopes (collectors {owners}) — one scope per "
+                    "opener. Point each collector's scope_opener at its own multi-row transform.",
+                    "high",
+                    "scope_opener_duplicate",
+                )
+            )
+
+    barrier_ids = {node.id for node in nodes if node.node_type in ("coalesce", "row_union", "collector")}
+    for node in collectors:
+        if node.scope_on_group_failure != "escalate":
+            continue
+        other_barriers = barrier_ids - {node.id}
+        if other_barriers:
+            continue
+        opener = _scope_binding_value(node, "scope_opener") or "unset"
+        errors.append(
+            _err(
+                f"node:{node.id}",
+                f"Scope closed by collector '{node.id}' (opener '{opener}') declares "
+                "scope_on_group_failure: escalate, but the pipeline holds no other bound group — there "
+                "is no enclosing bound group to escalate to (spec §7 rule 8). Use "
+                "scope_on_group_failure: quarantine (terminal handling) at the outermost level, or nest "
+                "this scope inside another bound group.",
+                "high",
+                "scope_escalate_at_outermost",
+            )
+        )
+    return errors
 
 
 @dataclass(frozen=True, slots=True)
@@ -1211,6 +1523,13 @@ def _known_batch_aware_transform_plugins() -> frozenset[str]:
 
     transforms = get_shared_plugin_manager().get_transforms()
     return frozenset(cls.name for cls in transforms if cls.is_batch_aware)
+
+
+def _known_transform_plugin_names() -> frozenset[str]:
+    """Return every registered transform plugin name (batch-aware or not)."""
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    return frozenset(cls.name for cls in get_shared_plugin_manager().get_transforms())
 
 
 def _known_batch_aware_transform_plugins_requiring_aggregation() -> frozenset[str]:
@@ -2112,7 +2431,7 @@ def route_destination_facts(state: CompositionState) -> dict[str, RouteDestinati
     # Same rule-9 relax as _validate_runtime_route_destinations, kept in
     # sync: a closer-shaped on_error is no longer dangling, so it must not
     # generate a "dangling_on_error" repair fact either.
-    closer_names = {node.id for node in state.nodes if node.node_type in ("coalesce", "row_union")}
+    closer_names = {node.id for node in state.nodes if node.node_type in ("coalesce", "row_union", "collector")}
     facts: dict[str, RouteDestinationFactDict] = {}
 
     def _merge(component: str, entry: RouteDestinationFactDict) -> None:
@@ -2198,10 +2517,10 @@ def _validate_runtime_route_destinations(
     # rejects a genuinely out-of-region target with the runtime message;
     # rejecting a legal in-region target here instead would be
     # composer-red/runtime-green, the drift that strands the authoring
-    # loop. Scope/collector closers are not in this set: NodeType has no
-    # "collector"/"scope" member (Task 10 finding) — not yet
-    # composer-authorable, so no scope-closer name can appear in `nodes`.
-    closer_names = {node.id for node in nodes if node.node_type in ("coalesce", "row_union")}
+    # loop. Collector closers joined the set with the collector node kind
+    # (Task 12) — the builder's rule-9 closer_name_to_node accepts all
+    # three closer kinds (coalesce/row_union/collector).
+    closer_names = {node.id for node in nodes if node.node_type in ("coalesce", "row_union", "collector")}
     _err = ValidationEntry
 
     for source_name, source in sources.items():
@@ -2385,6 +2704,30 @@ def _validate_runtime_route_destinations(
                         "row_union_on_success_dangling",
                     )
                 )
+            continue
+
+        # Mirror the builder's collector on_success resolution ("Collector
+        # '{name}' on_success '{target}' is neither a sink nor a known
+        # connection"): a sink or a consumed connection, like a transform.
+        # on_error carries NO dangling check on purpose — CollectorSettings
+        # validates only its label shape, and the builder builds no
+        # collector on_error edge (an omitted on_error derives the route
+        # from structure, spec §7 rule 9), so rejecting a name here would
+        # be composer-red/runtime-green.
+        if (
+            node.node_type == "collector"
+            and node.on_success is not None
+            and node.on_success not in output_names
+            and node.on_success not in consumer_connections
+        ):
+            errors.append(
+                _err(
+                    f"node:{node.id}",
+                    f"Collector '{node.id}' on_success '{node.on_success}' is neither a sink nor a known connection.",
+                    "high",
+                    "collector_on_success_dangling",
+                )
+            )
 
     return tuple(errors)
 
@@ -2459,7 +2802,7 @@ def gate_route_destinations(node: NodeSpec, route_target: str) -> frozenset[str]
 # (component kind, edge type, target kind) combinations can lower at all —
 # shared by the mutation tools (admission) and validate() (every entry path).
 
-ComponentKind = Literal["source", "output", "transform", "gate", "aggregation", "coalesce", "row_union", "queue"]
+ComponentKind = Literal["source", "output", "transform", "gate", "aggregation", "coalesce", "row_union", "queue", "collector"]
 
 
 def composer_component_kind(
@@ -2512,7 +2855,7 @@ def edge_lowering_error(edge: EdgeSpec, *, from_kind: ComponentKind | None, to_k
         return None
     if edge_type in ("route_true", "route_false", "fork"):
         return f"Only gates can use '{edge_type}' edges; '{edge.from_node}' is a {from_kind}."
-    if from_kind in ("transform", "aggregation"):
+    if from_kind in ("transform", "aggregation", "collector"):
         if edge_type == "on_error" and to_kind is not None and to_kind != "output":
             return (
                 f"{from_kind.capitalize()} '{edge.from_node}' on_error must route to a sink or 'discard'; '{edge.to_node}' is a {to_kind}."
@@ -5996,6 +6339,14 @@ class CompositionState:
                 node_dict["timeout_seconds"] = node.timeout_seconds
             if node.description is not None:
                 node_dict["description"] = node.description
+            if node.scope_name is not None:
+                node_dict["scope_name"] = node.scope_name
+            if node.scope_opener is not None:
+                node_dict["scope_opener"] = node.scope_opener
+            if node.scope_policy is not None:
+                node_dict["scope_policy"] = node.scope_policy
+            if node.scope_on_group_failure is not None:
+                node_dict["scope_on_group_failure"] = node.scope_on_group_failure
             result["nodes"].append(node_dict)
 
         for edge in self.edges:
@@ -6135,7 +6486,7 @@ class CompositionState:
                     _err(
                         f"node:{node.id}",
                         f"Node name '{node.id}' is used by both {node.node_type} and {other}. All node names must be "
-                        "unique across transforms, gates, aggregations, coalesce nodes, row_union nodes, sources, queues, and sinks.",
+                        "unique across transforms, gates, aggregations, coalesce nodes, row_union nodes, collectors, sources, queues, and sinks.",
                         "high",
                         "node_id_collides_with_source_or_sink",
                     )
@@ -6247,6 +6598,33 @@ class CompositionState:
                         "node_timeout_unsupported",
                     )
                 )
+
+            # scope_* fields belong to collector nodes only. Queues are
+            # excluded here because queue_node_contract_error — the single
+            # source of truth for the canonical queue shape, shared with the
+            # YAML generator — already rejects them there.
+            if node.node_type not in ("collector", "queue"):
+                scope_fields_present = sorted(
+                    name
+                    for name, value in (
+                        ("scope_name", node.scope_name),
+                        ("scope_opener", node.scope_opener),
+                        ("scope_policy", node.scope_policy),
+                        ("scope_on_group_failure", node.scope_on_group_failure),
+                    )
+                    if value is not None
+                )
+                if scope_fields_present:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Node '{node.id}' of type '{node.node_type}' does not accept collector scope "
+                            f"field(s): {scope_fields_present}; only collector nodes carry "
+                            "scope_name/scope_opener/scope_policy/scope_on_group_failure.",
+                            "high",
+                            "node_scope_fields_unsupported",
+                        )
+                    )
 
             structural_plugin_error = structural_node_plugin_error(node)
             if structural_plugin_error is not None:
@@ -6663,7 +7041,10 @@ class CompositionState:
                 queue_error = queue_node_contract_error(node)
                 if queue_error is not None:
                     errors.append(_err(f"node:{node.id}", queue_error, "high", "queue_config_invalid"))
+            elif node.node_type == "collector":
+                errors.extend(_collector_intrinsic_errors(node, nodes=self.nodes))
 
+        errors.extend(_collector_scope_topology_errors(self.nodes))
         errors.extend(_validate_runtime_route_destinations(self.sources, self.nodes, self.outputs))
         errors.extend(_validate_edge_route_contract(self.sources, self.nodes, self.outputs, self.edges))
 

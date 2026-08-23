@@ -586,6 +586,12 @@ class TestStageOneRuntimeFatalPromotions:
             ("aggregation", "on_error", "node"): False,
             ("aggregation", "route_true", "output"): False,
             ("aggregation", "fork", "output"): False,
+            ("collector", "on_success", "node"): True,
+            ("collector", "on_success", "output"): True,
+            ("collector", "on_error", "output"): True,
+            ("collector", "on_error", "node"): False,
+            ("collector", "route_true", "output"): False,
+            ("collector", "fork", "output"): False,
             ("gate", "on_success", "node"): True,  # advisory labeled-route picture
             ("gate", "on_success", "output"): False,
             ("gate", "on_error", "node"): False,  # node-level policy, never an edge

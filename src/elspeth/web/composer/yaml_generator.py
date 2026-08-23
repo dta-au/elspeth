@@ -59,7 +59,7 @@ _WEB_ONLY_OPTION_KEYS = frozenset({"blob_ref"}) | AUTHORING_METADATA_OPTION_KEYS
 _PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS = _WEB_ONLY_OPTION_KEYS | frozenset(NESTED_LOCAL_PATH_OPTION_KEYS) | frozenset({"blob_id"})
 _PUBLIC_STORAGE_OPTION_KEYS = frozenset(SOURCE_LOCAL_PATH_OPTION_KEYS) | frozenset(SINK_LOCAL_PATH_OPTION_KEYS)
 _PUBLIC_CUSTODY_SUBTREE_KEYS = frozenset({"custody", "provider_config"})
-_YAML_LOWERED_NODE_TYPES = frozenset({"aggregation", "coalesce", "gate", "queue", "row_union", "transform"})
+_YAML_LOWERED_NODE_TYPES = frozenset({"aggregation", "coalesce", "collector", "gate", "queue", "row_union", "transform"})
 
 
 class PublicCompositionDict(TypedDict):
@@ -337,6 +337,48 @@ def _generate_pipeline_dict(
                 entry["timeout_seconds"] = c["timeout_seconds"]
             doc["coalesce"].append(entry)
 
+    # Collectors — EXPAND-group closers (barrier-scopes spec §3). Each
+    # collector NodeSpec lowers to ONE collectors: entry plus ONE scopes:
+    # entry derived from its scope binding fields; the scope's closer is the
+    # collector's own name by construction, so a composer export can never
+    # produce a dangling closer reference. scope_policy is REQUIRED with no
+    # default and scope_name/scope_opener are mandatory for the node type, so
+    # absences refuse to lower rather than fabricate (never .get with a
+    # default); scope_on_group_failure is recorded by NodeSpec.__post_init__,
+    # so its absence likewise proves a state that never crossed that boundary.
+    collectors = [n for n in state_dict["nodes"] if n["node_type"] == "collector"]
+    if collectors:
+        doc["collectors"] = []
+        doc["scopes"] = []
+        for c in collectors:
+            if c["plugin"] is None:
+                raise PipelineLoweringError(
+                    f"Collector '{c['id']}' has plugin=None — collectors reuse the batch-transform "
+                    f"plugin contract and cannot lower without one"
+                )
+            if c["on_success"] is None:
+                raise PipelineLoweringError(f"Collector '{c['id']}' has on_success=None — a collector requires a flush destination")
+            entry = {
+                "name": c["id"],
+                "plugin": c["plugin"],
+                "input": c["input"],
+                "on_success": c["on_success"],
+            }
+            if c["on_error"] is not None:
+                entry["on_error"] = c["on_error"]
+            if c["options"]:
+                entry["options"] = _strip_web_metadata(dict(c["options"]))
+            doc["collectors"].append(entry)
+            doc["scopes"].append(
+                {
+                    "name": _require_node_key(c, "scope_name", "Collector"),
+                    "opener": _require_node_key(c, "scope_opener", "Collector"),
+                    "closer": c["id"],
+                    "policy": _require_node_key(c, "scope_policy", "Collector"),
+                    "on_group_failure": _require_node_key(c, "scope_on_group_failure", "Collector"),
+                }
+            )
+
     # Sinks — always-present fields, direct access.
     if state_dict["outputs"]:
         doc["sinks"] = {}
@@ -612,7 +654,8 @@ def generate_yaml(state: CompositionState) -> str:
     doc = generate_pipeline_dict(state)
 
     # sort_keys=False preserves insertion order: sources → queues → transforms
-    # → gates → row_unions → aggregations → coalesce → sinks.
+    # → gates → row_unions → aggregations → coalesce → collectors → scopes →
+    # sinks.
     return yaml.dump(doc, default_flow_style=False, sort_keys=False)
 
 

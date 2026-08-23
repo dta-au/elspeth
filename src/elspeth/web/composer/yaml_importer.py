@@ -39,11 +39,13 @@ _UNSUPPORTED_COALESCE_FIELDS = frozenset(
     }
 )
 _ROW_UNION_FIELDS = frozenset({"name", "branches", "on_success", "timeout_seconds", "input"})
+_COLLECTOR_FIELDS = frozenset({"name", "plugin", "input", "on_success", "on_error", "options"})
+_SCOPE_FIELDS = frozenset({"name", "opener", "closer", "policy", "on_group_failure"})
 # Recognised top-level pipeline sections. A parsed document that is a
 # mapping but shares none of these keys is not a pipeline export at all
 # (see the guard in composition_state_from_runtime_yaml).
 _PIPELINE_SECTION_KEYS = frozenset(
-    {"source", "sources", "transforms", "gates", "row_unions", "aggregations", "coalesce", "queues", "sinks"}
+    {"source", "sources", "transforms", "gates", "row_unions", "aggregations", "coalesce", "queues", "sinks", "collectors", "scopes"}
 )
 
 
@@ -385,6 +387,73 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
     return nodes
 
 
+def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section: Any) -> list[NodeSpec]:
+    """Fold ``collectors:`` and ``scopes:`` into collector NodeSpecs.
+
+    A collector NodeSpec carries its scope binding directly
+    (``scope_name``/``scope_opener``/``scope_policy``/``scope_on_group_failure``,
+    barrier-scopes spec §3), so each ``scopes:`` entry locates its closer's
+    NodeSpec and populates those fields. A scope whose closer matches no
+    collector is a reference error here — the composer state has nowhere to
+    carry it. Duplicate collector names are deliberately NOT rejected here:
+    every other node section imports duplicates verbatim and Stage 1 reports
+    ``duplicate_node_id``; the scope fold attaches to the first match so the
+    duplicate survives for validate() to reject.
+    """
+    if collectors_section is None and scopes_section is None:
+        return []
+    collector_nodes: list[NodeSpec] = []
+    if collectors_section is not None:
+        for index, raw_entry in enumerate(_require_sequence(collectors_section, "collectors")):
+            path = f"collectors[{index}]"
+            entry = _require_mapping(raw_entry, path)
+            unknown = sorted(set(entry) - _COLLECTOR_FIELDS, key=lambda field: (type(field).__name__, repr(field)))
+            if unknown:
+                raise RuntimeYamlImportError(f"{path} contains unknown or inapplicable field(s): {unknown}")
+            collector_nodes.append(
+                NodeSpec(
+                    id=_require_nonblank_str(entry, "name", path),
+                    node_type="collector",
+                    plugin=_require_str(entry, "plugin", path),
+                    input=_require_str(entry, "input", path),
+                    on_success=_require_str(entry, "on_success", path),
+                    on_error=_optional_str(entry, "on_error"),
+                    options=dict(_optional_mapping(entry.get("options"), f"{path}.options")),
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+    if scopes_section is not None:
+        for index, raw_entry in enumerate(_require_sequence(scopes_section, "scopes")):
+            path = f"scopes[{index}]"
+            entry = _require_mapping(raw_entry, path)
+            unknown = sorted(set(entry) - _SCOPE_FIELDS, key=lambda field: (type(field).__name__, repr(field)))
+            if unknown:
+                raise RuntimeYamlImportError(f"{path} contains unknown or inapplicable field(s): {unknown}")
+            closer = _require_nonblank_str(entry, "closer", path)
+            matches = [position for position, node in enumerate(collector_nodes) if node.id == closer]
+            if not matches:
+                raise RuntimeYamlImportError(f"{path}.closer '{closer}' must name a collectors: entry")
+            position = matches[0]
+            if collector_nodes[position].scope_name is not None:
+                raise RuntimeYamlImportError(f"{path}.closer '{closer}' is already bound — one scope per closer")
+            collector_nodes[position] = replace(
+                collector_nodes[position],
+                scope_name=_require_nonblank_str(entry, "name", path),
+                scope_opener=_require_nonblank_str(entry, "opener", path),
+                scope_policy=_require_nonblank_str(entry, "policy", path),
+                # Omitted on_group_failure stays None here; NodeSpec.__post_init__
+                # records the runtime default ("quarantine") exactly as the
+                # coalesce merge/policy normalisation does.
+                scope_on_group_failure=_optional_str(entry, "on_group_failure"),
+            )
+    return collector_nodes
+
+
 @trust_boundary(
     tier=3,
     source="web-authored pipeline YAML sinks mapping (untrusted import payload)",
@@ -510,7 +579,7 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
         # was there before, with no error to signal anything went wrong.
         raise RuntimeYamlImportError(
             "pipeline YAML must define at least one pipeline section "
-            "(source, sources, transforms, gates, row_unions, aggregations, coalesce, queues, or sinks)"
+            "(source, sources, transforms, gates, row_unions, aggregations, coalesce, collectors, scopes, queues, or sinks)"
         )
 
     raw_sources = doc.get("sources")
@@ -528,6 +597,7 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
         *_nodes_from_runtime_list(doc.get("row_unions"), "row_unions", "row_union"),
         *_nodes_from_runtime_list(doc.get("aggregations"), "aggregations", "aggregation"),
         *_nodes_from_runtime_list(doc.get("coalesce"), "coalesce", "coalesce"),
+        *_collector_nodes_from_runtime_lists(doc.get("collectors"), doc.get("scopes")),
         # Queues carry no plugin, so the review-stamp map below is a pure no-op
         # for them; they must nonetheless be present in ``nodes`` BEFORE that map
         # so an imported queue survives as a first-class node (elspeth-a5b86149d4).
