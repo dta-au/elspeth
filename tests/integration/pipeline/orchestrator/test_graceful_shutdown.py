@@ -717,6 +717,106 @@ class TestInterruptAndResume:
         assert check.reason is not None
         assert "primary=interrupted" in check.reason
 
+    def test_buffered_aggregation_shutdown_refused_resume_advances_nothing(self, landscape_db: LandscapeDB, payload_store) -> None:
+        """A refused resume must advance nothing (F3 fix round: restores a dropped invariant).
+
+        The now-collapsed
+        ``test_buffered_only_resume_refuses_interrupted_source_before_pre_set_
+        shutdown`` (superseded by rule 6, see
+        ``test_agg_branch_hold_coalesce_config_is_rejected_by_rule_6`` below)
+        also asserted that a REFUSED resume changes nothing: the checkpoint
+        sequence number and the BLOCKED journal rows stay byte-identical
+        across the refusal. That invariant is not coalesce-specific — it is
+        proven here by real end-to-end reproduction, restoring it as a real
+        run rather than leaving it as a documented gap. No mocking-boundary
+        compromise: this is the SAME legal, unaffected-by-rule-6 vehicle as
+        ``test_buffered_aggregation_shutdown_persists_recovery_state`` above
+        (``_build_interruptible_aggregation_config``), extended one step
+        further to attempt the resume and assert the refusal is a true no-op.
+
+        Verified the refusal path is barrier-type-agnostic before reusing
+        this vehicle for it: ``ResumeCoordinator.resume()``
+        (engine/orchestrator/resume.py:729-733) raises
+        ``IncompleteSourceResumeError`` from
+        ``check_source_lifecycle_resumable`` (core/checkpoint/recovery.py:212),
+        which reads ONLY ``run_sources`` (source name -> lifecycle state) —
+        no reference to ``token_work_items``, ``barrier_key``, or
+        ``coalesce_name`` anywhere in that path. The refusal fires purely on
+        source lifecycle, before any barrier-specific code runs, so an
+        aggregation-shaped BLOCKED row exercises the exact same refusal path
+        a coalesce-shaped one would; the coalesce-flavoured invariance is
+        covered here for that reason, same argument as the abandonment
+        query's barrier-type-agnostic read (see the pin test below).
+        """
+        from sqlalchemy import select
+
+        from elspeth.contracts import ResumePoint
+        from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+        from elspeth.contracts.errors import IncompleteSourceResumeError
+        from elspeth.core.checkpoint import CheckpointManager
+        from elspeth.core.config import CheckpointSettings
+        from elspeth.core.landscape.schema import token_work_items_table
+        from elspeth.engine.orchestrator import Orchestrator
+
+        checkpoint_mgr = CheckpointManager(landscape_db)
+        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+
+        shutdown_event = threading.Event()
+        config, graph, output_sink = _build_interruptible_aggregation_config(shutdown_event)
+
+        orchestrator = Orchestrator(
+            db=landscape_db,
+            checkpoint_manager=checkpoint_mgr,
+            checkpoint_config=checkpoint_config,
+        )
+
+        with pytest.raises(GracefulShutdownError) as exc_info:
+            orchestrator.run(config, graph=graph, payload_store=payload_store, shutdown_event=shutdown_event)
+
+        run_id = exc_info.value.run_id
+        assert run_id is not None
+        assert output_sink.results == []
+
+        def _blocked_rows() -> list[Any]:
+            # The WHOLE row, not a chosen subset of columns — "byte-identical
+            # across the refusal" must mean every column, not just the ones
+            # this test happens to assert on.
+            with landscape_db.connection() as conn:
+                return sorted(
+                    (
+                        conn.execute(
+                            select(token_work_items_table).where(
+                                token_work_items_table.c.run_id == run_id,
+                                token_work_items_table.c.status == "blocked",
+                            )
+                        )
+                        .mappings()
+                        .all()
+                    ),
+                    key=lambda row: row["work_item_id"],
+                )
+
+        first_checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
+        assert first_checkpoint is not None
+        before = _blocked_rows()
+        assert before, "expected buffered aggregation tokens as BLOCKED journal rows"
+
+        resume_point = ResumePoint(checkpoint=first_checkpoint, sequence_number=first_checkpoint.sequence_number)
+        with pytest.raises(IncompleteSourceResumeError, match=r"primary.*interrupted"):
+            orchestrator.resume(
+                resume_point=resume_point,
+                config=config,
+                graph=graph,
+                payload_store=payload_store,
+            )
+
+        second_checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
+        assert second_checkpoint is not None
+        assert second_checkpoint.sequence_number == first_checkpoint.sequence_number
+
+        after = _blocked_rows()
+        assert after == before
+
     def test_agg_branch_hold_coalesce_config_is_rejected_by_rule_6(self, landscape_db: LandscapeDB, payload_store) -> None:
         """Reclassified under ruling 25 (spec §7 rule 6, Task 9, WS2 controller ruling 2026-08-23).
 
@@ -783,19 +883,26 @@ class TestInterruptAndResume:
           :665). (``test_contract_violation_token_outcomes.py:328`` pins
           only the bare LOADING arm, with no match regex — not this arm.)
 
-        **Knowingly NOT re-added**: the dropped
+        **Restored, not dropped**: the dropped
         ``test_buffered_only_resume_refuses_interrupted_source_before_pre_
         set_shutdown`` also asserted that a *refused resume advances
         nothing* — the checkpoint sequence number and the BLOCKED coalesce
-        rows identical before and after the refused
-        ``orchestrator.resume()`` call. No replacement pins that specific
-        checkpoint-sequence/BLOCKED-row invariance anywhere. Adding it
-        faithfully would require driving a real ``Orchestrator.resume()``
-        against a real graph/config here, which reintroduces the same
-        mocking-boundary question this witness was built to avoid (see
-        ``test_pending_coalesce_barrier_survives_finalization_and_its_
-        token_is_abandoned`` below) rather than a cheap addition to it —
-        recorded here as a deliberate, known gap rather than a silent one.
+        rows identical before and after the refused ``orchestrator.resume()``
+        call. That invariant is not coalesce-specific: ``ResumeCoordinator.
+        resume()``'s ``IncompleteSourceResumeError`` guard
+        (engine/orchestrator/resume.py:729-733) reads only ``run_sources``
+        via ``check_source_lifecycle_resumable``
+        (core/checkpoint/recovery.py:212) — no reference to
+        ``token_work_items``/``barrier_key``/``coalesce_name`` anywhere in
+        that path, so the refusal fires identically regardless of barrier
+        type. It is restored as a real end-to-end run using the SAME legal,
+        unaffected-by-rule-6 vehicle as
+        ``test_buffered_aggregation_shutdown_persists_recovery_state``
+        above, in
+        ``test_buffered_aggregation_shutdown_refused_resume_advances_
+        nothing`` (same class, above this pin) — zero mocking-boundary
+        compromise, and no need to reconstruct the now-unbuildable
+        coalesce+aggregation shape to prove it.
         """
         shutdown_event = threading.Event()
         with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region"):
