@@ -3387,6 +3387,14 @@ class TestCoalesceNodes:
         own row_union fallout). Both declared fork branches now close at the
         coalesce; only 'path_x' is a genuine orphan no gate produces, which
         isolates the roster-mismatch message this test checks for.
+
+        Naming note (review F10, 2026-08-23): after the reshape, this pins
+        rule 2's aggregate closer-roster-mismatch site (`builder.py` ~935,
+        "…drawn from 1 fork gate(s)… no gate produces […]…"), not the
+        dedicated "coalesce declares branch X but no gate produces this
+        branch" check (`builder.py` ~949) the test's name and original
+        fixture were written against. The dedicated check has no test
+        naming it directly as of this fix round.
         """
         from elspeth.core.config import (
             CoalesceSettings,

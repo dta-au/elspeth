@@ -1796,8 +1796,8 @@ def build_execution_graph(
 
     # ===== BOUND-REGION COMPUTATION (spec §7 rule 3, §6.3 depth cap) =====
     regions = compute_bound_regions(graph, registry, max_depth=max_bound_region_depth)
-    validate_sese_regions(graph, regions)
     graph.set_bound_regions(regions)
+    validate_sese_regions(graph, regions)
     max_observed_depth = max((r.depth for r in regions), default=0)
     graph.set_max_bound_region_depth(max_observed_depth)
     graph.set_escalation_fixpoint_bound(derive_escalation_fixpoint_bound(max_observed_depth))

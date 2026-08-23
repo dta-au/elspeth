@@ -8,8 +8,8 @@ import pytest
 
 from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.types import NodeID
-from elspeth.core.config import CoalesceSettings, GateSettings, SourceSettings, TransformSettings
+from elspeth.contracts.types import NodeID, SinkName
+from elspeth.core.config import CoalesceSettings, GateSettings, QueueSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.bound_regions import compute_bound_regions, derive_escalation_fixpoint_bound, validate_sese_regions
 from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
@@ -534,6 +534,255 @@ def _build_mixed_closure_sink_plus_bound_sibling() -> ExecutionGraph:
     )
 
 
+def _build_natural_sink_via_intermediate_gate() -> ExecutionGraph:
+    """Review F1, manifestation 1 (`probe_natural_sink.py`): the opener's OWN
+    non-fork route ('false': side_conn) feeds an intermediate non-fork gate
+    that re-enters the region (via a queue feeding the coalesce) before
+    reaching a real sink. The label-only anchor missed this because the
+    edge `fork_rows -> side_screen` carries label='false', not a roster
+    branch name — `side_screen` was never walked at all, so its own leak
+    route was invisible.
+    """
+    source = _BoundRegionMockSource()
+    queued_leg = _BoundRegionTransform(name="queued_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    other_leg = _BoundRegionTransform(name="other_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="fork_input", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=queued_leg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="queued_leg",
+                    plugin=queued_leg.name,
+                    input="queued_path",
+                    on_success="inbound",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=other_leg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="other_leg",
+                    plugin=other_leg.name,
+                    input="other_path",
+                    on_success="other_done",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out"), "leak": _BoundRegionMockSink("leak")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="fork_rows",
+                input="fork_input",
+                condition="True",
+                routes={"true": "fork", "false": "side_conn"},
+                fork_to=["queued_path", "other_path"],
+            ),
+            GateSettings(
+                name="side_screen",
+                input="side_conn",
+                condition="True",
+                routes={"true": "inbound", "false": "leak"},
+            ),
+        ],
+        queues={"inbound": QueueSettings()},
+        coalesce_settings=[
+            CoalesceSettings(
+                name="merged",
+                branches={"queued_path": "inbound", "other_path": "other_done"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+    )
+
+
+def _build_label_hole_bypass() -> ExecutionGraph:
+    """Review F1, manifestation 2 (`probe_label_hole.py`): the fork gate has
+    an EXTRA route ('special': path_a) targeting its OWN fork branch under a
+    different label. `builder.py`'s MATCH-PRODUCERS-TO-CONSUMERS pass draws
+    that edge with the route label 'special', not the branch name 'path_a',
+    so `edge.label in member_roster` alone dropped it — the whole 'path_a'
+    branch (including its own in-region leak) was invisible to the walk.
+    Same fork/coalesce shape as `_build_fork_coalesce_with_in_region_sink`.
+    """
+    source = _BoundRegionMockSource()
+    branch_b = _BoundRegionTransform(name="branch_b_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="fork_input", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=branch_b,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_b_transform",
+                    plugin=branch_b.name,
+                    input="path_b",
+                    on_success="path_b_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out"), "output": _BoundRegionMockSink("output"), "leak": _BoundRegionMockSink("leak")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="fork_gate",
+                input="fork_input",
+                condition="'fork_route'",
+                routes={"fork_route": "fork", "other_route": "output", "special": "path_a"},
+                fork_to=["path_a", "path_b"],
+            ),
+            GateSettings(
+                name="screen",
+                input="path_a",
+                condition="True",
+                routes={"true": "path_a_out", "false": "leak"},
+            ),
+        ],
+        coalesce_settings=[
+            CoalesceSettings(
+                name="coalesce",
+                branches={"path_a": "path_a_out", "path_b": "path_b_out"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+    )
+
+
+def _build_queue_backdoor() -> ExecutionGraph:
+    """Review F2 (`probe_queue_backdoor.py`, maintainer-ruled 2026-08-23): the
+    opener's own non-fork route ('false': side_leg_in) feeds a transform
+    that publishes DIRECTLY to the SAME queue connection ('inbound') the
+    'queued_path' branch legitimately feeds. The side-routed token carries
+    no FORK frame — it never took a declared branch — yet arrives at the
+    queue that satisfies 'queued_path' for the coalesce: the exact E1
+    residual-risk shape (a queue inside a bound region adopting a barrier
+    and settling silently) the no-queue-exemption ruling exists to close.
+    """
+    source = _BoundRegionMockSource()
+    queued_leg = _BoundRegionTransform(name="queued_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    other_leg = _BoundRegionTransform(name="other_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    side_leg = _BoundRegionTransform(name="side_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="fork_input", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=queued_leg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="queued_leg",
+                    plugin=queued_leg.name,
+                    input="queued_path",
+                    on_success="inbound",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=other_leg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="other_leg",
+                    plugin=other_leg.name,
+                    input="other_path",
+                    on_success="other_done",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=side_leg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="side_leg",
+                    plugin=side_leg.name,
+                    input="side_leg_in",
+                    on_success="inbound",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="fork_rows",
+                input="fork_input",
+                condition="True",
+                routes={"true": "fork", "false": "side_leg_in"},
+                fork_to=["queued_path", "other_path"],
+            ),
+        ],
+        queues={"inbound": QueueSettings()},
+        coalesce_settings=[
+            CoalesceSettings(
+                name="merged",
+                branches={"queued_path": "inbound", "other_path": "other_done"},
+                policy="require_all",
+                merge="union",
+                on_success="out",
+            )
+        ],
+    )
+
+
+def _build_crosslimb_no_path_violation() -> None:
+    """Review F4 (`probe_crosslimb.py`): the no-path-to-closer limb has no
+    coverage anywhere in the suite despite being a live, parity-adjudicated
+    raise site (`config/cicd/runtime_rejection_parity.yaml` key
+    `6bbf64577ab07fbe`). Direct predicate pin over the raw
+    add_edge/GroupBinding surface (same escape hatch as
+    `_build_coalesce_with_external_branch_feed`): the connection-namespace
+    check rejects most settings-authored dead ends before rule 4 ever runs,
+    so a fork branch whose target has NO outgoing success edge at all is
+    only reachable this way. 'b_leg' is forward-reachable from the opener
+    (branch 'b') but has no path back to the closer at all.
+    """
+    graph = ExecutionGraph()
+    for node_id, node_type, plugin_name in [
+        ("opener", NodeType.GATE, "fork_gate"),
+        ("a_leg", NodeType.TRANSFORM, "a_leg_transform"),
+        ("b_leg", NodeType.TRANSFORM, "b_leg_transform"),
+        ("closer", NodeType.COALESCE, "coalesce"),
+        ("out", NodeType.SINK, "json"),
+    ]:
+        graph.add_node(node_id, node_type=node_type, plugin_name=plugin_name)
+    graph.add_edge("opener", "a_leg", label="a", mode=RoutingMode.MOVE)
+    graph.add_edge("opener", "b_leg", label="b", mode=RoutingMode.MOVE)
+    graph.add_edge("a_leg", "closer", label="continue", mode=RoutingMode.MOVE)
+    # 'b_leg' has NO outgoing edge at all — a dead end unreachable from any
+    # settings-authored config (the connection-namespace check would reject
+    # a dangling on_success first), reachable only on this raw surface.
+    graph.add_edge("closer", "out", label="continue", mode=RoutingMode.MOVE)
+
+    binding = GroupBinding(
+        kind=FrameKind.FORK,
+        opener_node_id=NodeID("opener"),
+        opener_name="fork_gate",
+        closer_node_id=NodeID("closer"),
+        closer_name="coalesce",
+        closer_kind=CloserKind.COALESCE,
+        policy="require_all",
+        on_group_failure=None,
+        member_roster=("a", "b"),
+    )
+    registry = GroupBindingRegistry(bindings=(binding,))
+    regions = compute_bound_regions(graph, registry, max_depth=5)
+    validate_sese_regions(graph, regions)
+
+
 class TestSESEWalk:
     """Spec §7 rule 4 (bidirectional SESE, success-path edges only).
 
@@ -551,8 +800,18 @@ class TestSESEWalk:
             _build_fork_coalesce_with_in_region_sink()
 
     def test_on_error_divert_inside_region_stays_legal(self) -> None:
+        # F6 (review): pin something OBSERVABLE, not just "did not raise" —
+        # the 'errors' sink must be genuinely absent from the region while
+        # both branch transforms are genuinely present, or this test cannot
+        # distinguish "DIVERT correctly excluded" from "region computed
+        # wrongly but happened not to raise".
         graph = _build_fork_coalesce_with_branch_on_error_sink()
-        assert graph is not None
+        regions = graph.get_bound_regions()
+        assert len(regions) == 1
+        member_names = _plugin_names(graph, regions[0].member_node_ids)
+        assert member_names == {"branch_a_transform", "branch_b_transform"}
+        errors_sink_id = graph.get_sink_id_map()[SinkName("errors")]
+        assert errors_sink_id not in regions[0].member_node_ids
 
     def test_external_entry_into_region_rejected(self) -> None:
         with pytest.raises(GraphValidationError, match="originates outside the bound region"):
@@ -566,6 +825,32 @@ class TestSESEWalk:
         with pytest.raises(GraphValidationError, match="mixed closure") as exc_info:
             _build_mixed_closure_sink_plus_bound_sibling()
         assert "reaches sink" not in str(exc_info.value)
+
+    def test_natural_sink_via_intermediate_gate_rejected(self) -> None:
+        # Review F1, manifestation 1: label-only anchor missed a non-roster
+        # opener route re-entering the region through an intermediate gate.
+        with pytest.raises(GraphValidationError, match=r"reaches sink .* before the region's closer"):
+            _build_natural_sink_via_intermediate_gate()
+
+    def test_label_hole_bypass_rejected(self) -> None:
+        # Review F1, manifestation 2: a route targeting the gate's OWN fork
+        # branch under a different label drew an edge the roster-label
+        # filter alone could not see.
+        with pytest.raises(GraphValidationError, match=r"reaches sink .* before the region's closer"):
+            _build_label_hole_bypass()
+
+    def test_queue_backdoor_rejected(self) -> None:
+        # Review F2 (maintainer ruled, 2026-08-23): an unframed token via the
+        # opener's own non-fork route must not be allowed to enter the
+        # region through a queue a real branch also feeds.
+        with pytest.raises(GraphValidationError, match="not one of the fork's declared branches"):
+            _build_queue_backdoor()
+
+    def test_no_path_to_closer_limb_rejected(self) -> None:
+        # Review F4: the no-path-to-closer limb had no test anywhere despite
+        # being a live, parity-adjudicated raise site.
+        with pytest.raises(GraphValidationError, match="has no success path to"):
+            _build_crosslimb_no_path_violation()
 
 
 class TestFixpointBound:

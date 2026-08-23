@@ -10,8 +10,9 @@ plan; §7 rule 9 treats in-region on_error as legal).
 reach, minus the opener/closer themselves) — it is a verified SESE interior
 ONLY once `validate_sese_regions` (spec §7 rule 4) has run: it rejects a
 member with an outbound edge that reaches a sink before the closer, a member
-with no success path back to the closer, and an inbound edge into any
-in-region node that originates outside the region.
+with no success path back to the closer, a non-branch opener route that
+re-enters the region (2026-08-23 fix round, ruled), and an inbound edge into
+any in-region node that originates outside the region.
 """
 
 from __future__ import annotations
@@ -138,13 +139,26 @@ def _fork_branch_starts(graph: ExecutionGraph, binding: GroupBinding) -> set[Nod
     For an EXPAND/scope binding (``member_roster`` empty — ruling 28, Task 8's
     concern), the opener is a plain multi-row transform with no sibling routing
     labels to filter out, so the opener node itself is the correct anchor.
+
+    An opener out-edge qualifies if EITHER its label is in the declared
+    roster OR its target is backward-reachable from the closer (review F1,
+    2026-08-23 fix round). The label-only predicate under-admits two real
+    shapes: (a) a route whose target lands back inside the region through a
+    node the roster doesn't name directly (e.g. an intermediate non-fork
+    gate re-entering the region before reaching the closer), and (b) a route
+    whose target happens to be one of the SAME gate's own fork branches
+    under a route label override (`builder.py`'s MATCH-PRODUCERS-TO-CONSUMERS
+    pass draws that edge with the route label, not the branch name, so
+    `edge.label in member_roster` misses it). Both are genuine forward-walk
+    entries; the label check alone let both bypass rule 4 entirely.
     """
     if binding.kind is not FrameKind.FORK:
         return {binding.opener_node_id}
+    inside = _backward_reach(graph, binding.closer_node_id, binding.opener_node_id)
     return {
         NodeID(edge.to_node)
         for edge in graph.get_outgoing_edges(binding.opener_node_id)
-        if edge.mode is not RoutingMode.DIVERT and edge.label in binding.member_roster
+        if edge.mode is not RoutingMode.DIVERT and (edge.label in binding.member_roster or NodeID(edge.to_node) in inside)
     }
 
 
@@ -212,13 +226,15 @@ def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...
 
     Forward: every non-DIVERT path from a FORK binding's own branch entries
     (or an EXPAND binding's opener) reaches the closer before any sink.
-    Backward: every non-DIVERT edge into a region member or the closer
-    originates at the opener or another member.
+    A non-branch opener route must not re-enter the region at all (F2,
+    maintainer ruled 2026-08-23). Backward: every non-DIVERT edge into a
+    region member or the closer originates at the opener or another member.
 
     Raises:
-        GraphValidationError: a bound region's interior reaches a sink before
-            its closer, a member has no success path back to the closer, or
-            an in-region node's inbound edge originates outside the region.
+        GraphValidationError: a bound region's interior reaches a sink
+            before its closer, a member has no success path back to the
+            closer, a non-branch opener route re-enters the region, or an
+            in-region node's inbound edge originates outside the region.
     """
     for region in regions:
         binding = region.binding
@@ -234,7 +250,13 @@ def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...
         branch_starts = _fork_branch_starts(graph, binding)
         forward_only = _forward_reach_from(graph, branch_starts, binding.closer_node_id) - {binding.closer_node_id}
         closer_reachable = _backward_reach(graph, binding.closer_node_id, binding.opener_node_id)
-        for member in forward_only:
+        # sorted(): forward_only is a set[NodeID] (NodeID is str-derived), so
+        # unordered iteration makes WHICH violation raises first depend on
+        # PYTHONHASHSEED (review F3, demonstrated across 8 seeds — including
+        # a flip between the sink-inside and no-path-to-closer LIMBS, which
+        # carry different parity dispositions). Deterministic order restores
+        # a single, reproducible verdict per topology.
+        for member in sorted(forward_only):
             info = graph.get_node_info(member)
             if info.node_type is NodeType.SINK:
                 raise GraphValidationError(
@@ -254,10 +276,59 @@ def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...
                     component_type=binding.closer_kind,
                 )
 
+        # F2 (maintainer ruled, 2026-08-23): a non-branch opener out-edge
+        # that re-enters the region. Such a route carries no lineage frame
+        # for this group — the token never took a fork branch — so it must
+        # not be allowed to feed an in-region node at all, regardless of
+        # where it leads from there (F1's widened forward walk alone does
+        # not close this: it makes the target get WALKED, which is silent
+        # when the target leads nowhere alarming, but does not stop the
+        # target being treated as a legitimate in-region MEMBER, so the
+        # backward walk below still authorizes the edge). This is exactly
+        # the E1 residual-risk class the 2026-08-23 no-queue-exemption
+        # ruling exists to foreclose: an unframed token silently entering a
+        # bound region (e.g. through a queue a real branch also feeds) and
+        # settling a branch it was never part of.
+        #
+        # legitimate_targets excludes a false positive discovered while
+        # verifying this fix: builder.py's gate fallthrough bookkeeping
+        # (`gate_default_continue_targets`) draws an ADDITIONAL edge labeled
+        # "continue" to a gate's sole unambiguous processing consumer, even
+        # when that consumer was already reached via a real, roster-labeled
+        # branch edge (verified against the nested-fork-in-fork fixture:
+        # `outer_fork`'s "outer_a" branch and its "continue" fallthrough
+        # both target `inner_fork`). A non-roster edge whose target is ALSO
+        # the target of a real branch edge from the same opener is a
+        # harmless duplicate, not a backdoor — only a target unreachable via
+        # any roster-labeled edge is a genuine unframed entry.
+        if binding.kind is FrameKind.FORK:
+            opener_edges = graph.get_outgoing_edges(binding.opener_node_id)
+            legitimate_targets = {
+                NodeID(edge.to_node) for edge in opener_edges if edge.mode is not RoutingMode.DIVERT and edge.label in binding.member_roster
+            }
+            for edge in sorted(opener_edges, key=lambda e: (e.label, e.to_node)):
+                if edge.mode is RoutingMode.DIVERT:
+                    continue
+                if edge.label in binding.member_roster:
+                    continue
+                target = NodeID(edge.to_node)
+                if target in legitimate_targets:
+                    continue
+                if target in in_region:
+                    raise GraphValidationError(
+                        f"Gate '{binding.opener_name}' route '{edge.label}' is not one of the fork's declared "
+                        f"branches, but it feeds '{target}', which is inside bound region "
+                        f"'{binding.closer_name}'. A route outside the fork's branch list carries no lineage "
+                        f"frame for this group, so it must not enter the region (spec §7 rule 4). Route "
+                        f"'{edge.label}' outside the region, or add it to the fork's declared branches.",
+                        component_id=binding.closer_name,
+                        component_type=binding.closer_kind,
+                    )
+
         # Backward walk: every non-DIVERT edge into an in-region node (or the
         # closer itself) must originate at the opener or another member.
         entry_targets = region.member_node_ids | {binding.closer_node_id}
-        for member in entry_targets:
+        for member in sorted(entry_targets):
             for edge in graph.get_incoming_edges(member):
                 if edge.mode is RoutingMode.DIVERT:
                     continue

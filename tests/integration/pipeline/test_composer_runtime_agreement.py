@@ -4970,6 +4970,72 @@ class TestComposerRuntimeQueueAgreement:
         with pytest.raises(GraphValidationError, match="originates outside the bound region"):
             self._build_runtime_graph_for_settings(settings)
 
+    def test_single_producer_queue_inside_bound_region_round_trips_in_both_layers(self) -> None:
+        """Positive control (review F11): the shape the 2026-08-23 ruling does
+        NOT touch. A queue with exactly ONE producer — the fork branch
+        itself, no unrelated external source — round-trips green in both
+        layers, same as before the ruling. Only the MULTI-producer shape
+        (this class's other tests) is rejected; a legal in-region queue with
+        a single producer had no vehicle left in this class after the
+        rename/inversion above.
+        """
+        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        yaml_text = """
+sources:
+  primary:
+    plugin: csv
+    on_success: fork_input
+    options:
+      path: examples/multi_source_queue/input/orders.csv
+      schema: {mode: observed}
+      on_validation_failure: discard
+queues:
+  inbound: {}
+transforms:
+  - name: queued_leg
+    plugin: passthrough
+    input: queued_path
+    on_success: inbound
+    on_error: discard
+    options: {schema: {mode: observed}}
+  - name: other_leg
+    plugin: passthrough
+    input: other_path
+    on_success: other_done
+    on_error: discard
+    options: {schema: {mode: observed}}
+gates:
+  - name: fork_rows
+    input: fork_input
+    condition: "True"
+    routes: {'true': fork, 'false': discard}
+    fork_to: [queued_path, other_path]
+coalesce:
+  - name: merged
+    branches: {queued_path: inbound, other_path: other_done}
+    policy: require_all
+    merge: nested
+    on_success: combined
+sinks:
+  combined:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/multi_source_queue/output/combined.jsonl
+      format: jsonl
+      schema: {mode: observed}
+"""
+        state = composition_state_from_runtime_yaml(yaml_text)
+        composer_result = state.validate()
+        assert composer_result.is_valid, [e.message for e in composer_result.errors]
+
+        generated_yaml = composer_yaml_generator.generate_yaml(state)
+        settings = load_settings_from_yaml_string(generated_yaml)
+        graph = self._build_runtime_graph_for_settings(settings)
+        graph.validate()
+
     def test_mapped_coalesce_and_ordinary_queue_consumers_are_rejected_in_both_layers(self) -> None:
         """A mapped branch plus an ordinary node is forbidden queue fan-out."""
         from elspeth.core.config import load_settings_from_yaml_string

@@ -299,3 +299,42 @@ class TestBoundRegionSinkInsideStage1Mirror:
 
         codes = {e.error_code for e in summary.errors}
         assert "bound_region_sink_inside" not in codes, summary.errors
+
+    def test_leak_via_opener_non_roster_route_is_rejected(self) -> None:
+        # Review F1 (2026-08-23 fix round): the FORK gate's own non-roster
+        # route ('false': 'side_conn') feeds an intermediate non-fork gate
+        # that re-enters the region before leaking to a sink. The
+        # roster-only seed missed this entirely (the edge fork_gate ->
+        # side_screen carries label='false', not a roster branch name) —
+        # both the runtime and the mirror shared this blind spot.
+        state = _empty_state()
+        state = state.with_source(_make_source("g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "side_conn"},
+                fork_to=("path_a", "path_b"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(_routing_gate("side_screen", "side_conn", {"pass": "path_a_out", "fail": "leak"}))
+        state = state.with_node(_transform("t_b", "path_b", "path_b_out"))
+        state = state.with_node(_coalesce("c", branches={"path_a": "path_a_out", "path_b": "path_b_out"}, on_success="out"))
+        state = state.with_output(_make_output("out"))
+        state = state.with_output(_make_output("leak"))
+
+        summary = state.validate()
+
+        codes = {e.error_code for e in summary.errors}
+        assert "bound_region_sink_inside" in codes, summary.errors
+        offending = next(e for e in summary.errors if e.error_code == "bound_region_sink_inside")
+        assert "leak" in offending.message

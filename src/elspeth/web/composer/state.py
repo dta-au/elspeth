@@ -1791,6 +1791,47 @@ def _runtime_nodes_downstream_of_connection(
     return tuple(ordered_nodes)
 
 
+def _closer_backward_reach_connections(nodes: tuple[NodeSpec, ...], closer_node: NodeSpec) -> set[str]:
+    """Connections that (transitively) reach the closer via non-DIVERT edges.
+
+    Composer-side counterpart of core/dag/bound_regions.py's
+    ``_backward_reach`` (spec §7 rule 4, F1 fix): used to widen the
+    fork-branch forward-walk anchor the same way the runtime does — a
+    gate's non-roster route target still counts as a legitimate branch
+    start when that connection is itself backward-reachable from the
+    closer (e.g. an intermediate non-fork gate re-entering the region
+    before reaching the closer). Seeded from the closer's own declared
+    branch connections and expanded backward through every node's
+    non-DIVERT published connections (``on_error`` excluded, matching this
+    module's own forward walk — deliberately NOT ``_node_published_connections``,
+    which includes ``on_error``).
+    """
+    target_connections = set(_coalesce_branch_connections(closer_node.branches))
+    seen_node_ids: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in nodes:
+            if node.id in seen_node_ids or node.id == closer_node.id:
+                continue
+            published: set[str] = set()
+            if node.node_type == "coalesce" and node.on_success is None:
+                published.add(node.id)
+            elif node.on_success is not None:
+                published.add(node.on_success)
+            if node.routes is not None:
+                published.update(target for target in node.routes.values() if target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET))
+            if node.fork_to is not None:
+                published.update(node.fork_to)
+            if published.isdisjoint(target_connections):
+                continue
+            seen_node_ids.add(node.id)
+            changed = True
+            inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
+            target_connections.update(inputs)
+    return target_connections
+
+
 def _fork_branch_reaches_sink_before_closer(
     fork_branches: Sequence[str],
     closer_id: str,
@@ -1808,6 +1849,17 @@ def _fork_branch_reaches_sink_before_closer(
     is still "inside" the region for this check, mirroring
     ``_runtime_nodes_downstream_of_connection``'s edge model but stopping at
     the closer and dropping the ``on_error`` edge it otherwise follows.
+    Traverses queue nodes like any other node (review F5, 2026-08-23 fix
+    round): a queue's own id IS the connection its producers publish to and
+    its consumers read from, so admitting it into the walk costs nothing —
+    excluding it previously left the mirror unable to pick up a sink reached
+    downstream of an in-region queue in every topology shape that isn't
+    already covered by a direct producer/consumer match.
+
+    ``fork_branches`` is the caller's WIDENED seed set (roster branches plus
+    any of the gate's other route targets that are backward-reachable from
+    the closer — review F1's anchor fix, mirrored here since the runtime and
+    Stage-1 shared the same narrow-anchor blind spot).
 
     Requires the closer to ALSO be reached by the same walk, or returns
     None even when a sink was hit: a branch that never reaches the closer
@@ -1825,7 +1877,7 @@ def _fork_branch_reaches_sink_before_closer(
     while changed:
         changed = False
         for node in nodes:
-            if node.id in visited_node_ids or node.node_type == "queue":
+            if node.id in visited_node_ids:
                 continue
             inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
             if reachable_connections.isdisjoint(inputs):
@@ -6752,7 +6804,22 @@ class CompositionState:
                 # forking, exactly the shape rule 2 above cannot see.
                 if closer_node is not None:
                     _gate_id, roster = next(iter(gate_rosters.items()))
-                    sink_hit = _fork_branch_reaches_sink_before_closer(roster, closer_id, self.nodes, fork_closure_sink_names)
+                    # F1 anchor fix (review, 2026-08-23): widen the seed set
+                    # with any of the gate's OWN non-fork route targets that
+                    # are themselves backward-reachable from the closer — the
+                    # roster-only seed missed an intermediate non-fork gate
+                    # re-entering the region before the closer, the same
+                    # blind spot the runtime walk had.
+                    widened_roster = list(roster)
+                    gate_node = next((n for n in self.nodes if n.id == _gate_id), None)
+                    if gate_node is not None and gate_node.routes is not None:
+                        backward_reach = _closer_backward_reach_connections(self.nodes, closer_node)
+                        for route_target in gate_node.routes.values():
+                            if route_target in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET, *roster):
+                                continue
+                            if route_target in backward_reach and route_target not in widened_roster:
+                                widened_roster.append(route_target)
+                    sink_hit = _fork_branch_reaches_sink_before_closer(widened_roster, closer_id, self.nodes, fork_closure_sink_names)
                     if sink_hit is not None:
                         errors.append(
                             _err(

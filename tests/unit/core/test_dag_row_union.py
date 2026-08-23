@@ -958,11 +958,11 @@ def _with_pre_fork_divert(yaml_text: str) -> str:
 # variant_fork -> tag_control (DIVERT) -> mid_gate -> polish_control -> union.
 # The second transform is named so it shares no substring with 'tag_control'.
 # Both routes converge on 'control_gated' (condition is always "True", so
-# 'false' never actually fires) — spec §7 rule 4's forward walk rejects flat
-# any in-region route to a sink, including one only reachable in the
-# hypothetical branch of an always-true condition, so this gate's 'false'
-# route must stay in-region like 'true' rather than naming the sink
-# 'output' would previously have fallen through to pre-rule-4.
+# 'false' never actually fires at runtime). Pre-rule-4, 'false' named the
+# sink 'output' — a route to a real sink from inside a bound region, which
+# spec §7 rule 4's forward walk now rejects flat regardless of whether the
+# route is ever taken at runtime; the fixture keeps 'false' in-region like
+# 'true' instead.
 _MID_GATE = """
   - name: mid_gate
     input: control_mid

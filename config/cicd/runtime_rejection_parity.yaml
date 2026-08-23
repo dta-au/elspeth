@@ -2075,6 +2075,18 @@ sites:
     has no equivalent walk over NodeSpecs for coalesce; row_union's narrower existing code row_union_branch_not_downstream
     covers part of the row_union subset of this shape, not the coalesce side and not every backward-walk
     violation. Deliberate Stage-1 abstention (Task 7); full mirror is future work.
+- key: 095f49bfd797cba2
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: validate_sese_regions
+  exception: GraphValidationError
+  message: Gate '{}' route '{}' is not one of the fork's declared branches, but it feeds '{}', which is
+    inside bound region '{}'. A route outside the fork's branch list ca
+  ordinal: 0
+  disposition: abstains
+  note: 'Spec §7 rule 4, new limb (review F2, maintainer ruled 2026-08-23): a non-branch opener route
+    re-entering the region (e.g. an unframed token backdooring into a queue a real branch also feeds).
+    Consistent with the sibling backward-walk limb (072048ad48f5a8fa): Stage-1 has no equivalent walk
+    over NodeSpecs for this shape. Deliberate abstention; full mirror is future work.'
 - key: 6bbf64577ab07fbe
   path: src/elspeth/core/dag/bound_regions.py
   qualname: validate_sese_regions

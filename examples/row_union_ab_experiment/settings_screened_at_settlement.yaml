@@ -30,8 +30,11 @@
 # `settings_screened.yaml` used to exercise before its screen moved ahead of
 # the fork. Screened rows are NOT written to a sink here (there is no sink to
 # write them to — the token is discarded before ever producing a row); they
-# are recovered from the branch-loss ledger (`group_losses`) and the
-# Landscape audit trail, not from a file.
+# are recorded, fully attributed (row id, branch name, `gate_discarded`
+# reason), in the WS2-era per-branch ledger `coalesce_branch_losses` — NOT
+# only inferable from status counts. The unified `group_losses` table
+# supersedes it once WS3's settle-member seam lands; until then,
+# `coalesce_branch_losses` is the honest recovery path for this variant.
 #
 # STATUS: this settings file BUILDS today (that is what the canonical hash
 # corpus records for it) — the SESE walk explicitly permits a discard
