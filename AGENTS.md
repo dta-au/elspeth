@@ -135,6 +135,14 @@ Both rules are absolute in the composer's authoring path. They do not prohibit
 server-side *validation*, *rejection*, or *redaction* of what the planner
 produces, nor the required-control admission gates that protect runtime data.
 
+One such rejection is deliberately temporary: the guided lane refuses
+collector-bearing candidates (`guided_collector_not_authorable`,
+`guided/planning.py::_reject_collector_candidate_nodes`) as an INTERIM guard
+whose lift trigger is the WS6 disposition-vocabulary freeze (maintainer
+ruling, comment 7878 on elspeth-88bb77953c). Do not remove the guard or
+extend the guided proposal projection with a collector arm ahead of that
+ruling's trigger — lifting is that ticket's work, as one parity sweep.
+
 ## Standing authorization: skills and subagents
 
 Agents are always authorized to invoke skills and dispatch subagents at their

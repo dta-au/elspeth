@@ -1364,6 +1364,30 @@ def _guided_delta_rejection(
     )
 
 
+def _require_collector_free_predecessor(predecessor: CompositionState) -> None:
+    """Refuse a collector-bearing state offered as guided predecessor authority.
+
+    Every legitimate predecessor is a state restored from a binder-sealed
+    guided proposal (``guided_candidate_state``), and the binder's candidate
+    guard (:func:`_reject_collector_candidate_nodes`) means no sealed proposal
+    can carry a collector. That safety currently also rests on the route
+    handler OVERWRITING its initial session-state assignment with the
+    proposal-restored predecessor (an always-dead store) — this check pins the
+    invariant at the seam itself, so a future call site that passes raw
+    session state (which CAN carry collectors authored on the direct surface)
+    fails loudly instead of reconstructing a collector into a bound guided
+    candidate. Deliberately a terminal server-side integrity failure, NOT a
+    repairable candidate rejection: the planner never authored this state.
+    """
+    collector_node_ids = [node.id for node in predecessor.nodes if node.node_type == "collector"]
+    if collector_node_ids:
+        raise AuditIntegrityError(
+            f"guided predecessor authority carries collector node(s) {collector_node_ids}; only "
+            "binder-sealed collector-free states may act as guided predecessors (interim guard, "
+            "elspeth-88bb77953c)"
+        )
+
+
 def _reject_collector_candidate_nodes(bound: Mapping[str, Any]) -> None:
     """Refuse a collector-bearing guided candidate with a repairable rejection.
 
@@ -2610,6 +2634,10 @@ def bind_guided_reviewed_components(
         raise TypeError("route_amnesty_predecessor must be an exact CompositionState or None")
     if route_amnesty_predecessor is not None and predecessor is not None:
         raise ValueError("route_amnesty_predecessor is the amnesty-only seam; the correction flow's predecessor already grants it")
+    if predecessor is not None:
+        _require_collector_free_predecessor(predecessor)
+    if route_amnesty_predecessor is not None:
+        _require_collector_free_predecessor(route_amnesty_predecessor)
 
     bound = cast(dict[str, Any], deep_thaw(pipeline))
     # Collector nodes are not yet authorable in the GUIDED lane. The terminal
@@ -3044,6 +3072,11 @@ def bind_guided_prose_revision_candidate(
 
     if type(authority) is not GuidedRevisionAuthority:
         raise TypeError("authority must be an exact GuidedRevisionAuthority")
+    # The predecessor is reconstruction authority in amend mode (its nodes are
+    # rebuilt into the bound result AFTER the candidate guard has run), so a
+    # collector-bearing predecessor would smuggle a collector past the guard —
+    # pin the collector-free invariant at this seam too.
+    _require_collector_free_predecessor(authority.predecessor)
     # ``amend`` opts out of the binder's route-target rejection: its
     # reconstruction below rebuilds routing from predecessor authority into
     # one closed repair disposition. ``replace`` stages the bound candidate

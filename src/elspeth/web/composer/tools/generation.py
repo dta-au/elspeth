@@ -627,6 +627,18 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "and hyphens, avoiding reserved labels.",
     ),
     (
+        # Runtime-surfaced text limb only (no Stage-1 error_code): the web
+        # runtime preflight and the engine's graph-registration invariant both
+        # carry this kernel until WS4 lands the collector executor.
+        r"collector execution lands in WS4",
+        "The pipeline is structurally valid, but collector execution is not yet available in this "
+        "engine release — a pipeline containing a collector node builds and validates and is then "
+        "refused before running.",
+        "Keep the collector pipeline staged for the release that ships collector execution, or "
+        "remove the collector (and its scope_name/scope_opener/scope_policy/scope_on_group_failure "
+        "fields) to run the remaining topology now.",
+    ),
+    (
         r"node_scope_fields_unsupported|does not accept collector scope field",
         "A non-collector node carries scope_name/scope_opener/scope_policy/scope_on_group_failure, "
         "which bind an EXPAND group only on collector nodes.",

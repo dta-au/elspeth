@@ -322,7 +322,13 @@ def _ready_csv_blob_for_execution(*, blob_ref: str, session_id: UUID, storage_pa
 
 
 def _execution_graph_stub() -> Any:
-    return create_autospec(ExecutionGraph, instance=True)
+    graph = create_autospec(ExecutionGraph, instance=True)
+    # Model the real contract for a collector-free graph: an EMPTY id map.
+    # autospec's default (a truthy MagicMock) would trip the preflight's WS4
+    # collector-runnability refusal on every mocked run — fix the fake, never
+    # the production check.
+    graph.get_collector_id_map.return_value = {}
+    return graph
 
 
 def _orchestrator_stub(result: RunResult | None = None) -> MagicMock:

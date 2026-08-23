@@ -608,6 +608,13 @@ def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
         return {"input": "many_producers", "output": "one_per_item", "expected_output_count": None}
     if node.node_type == "gate":
         return {"input": "one", "output": "one", "expected_output_count": None}
+    if node.node_type != "transform":
+        # Typed fail-closed dispatch: the arms above are exhaustive for the
+        # guided lane's node kinds, and the fall-through below is the
+        # TRANSFORM arm — a collector (refused upstream by the binder guard,
+        # elspeth-88bb77953c) or any future kind must never silently render a
+        # transform-shaped cardinality claim.
+        raise InvariantError(f"wire projection has no row-cardinality arm for node kind {node.node_type!r}")
     if executable_node.plugin is None:
         raise InvariantError("wire projection transform lost its plugin")
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager

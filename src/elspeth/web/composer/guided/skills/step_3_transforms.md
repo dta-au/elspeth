@@ -39,6 +39,14 @@ future-stage intent; do not ask the user to repeat those facts.
 5. Do not silently replace a requested capability with a simpler transform.
    Policy-proven unavailability is a named deployment gap; a different stage is
    a timing distinction, not a capability denial.
+6. Collector nodes and their scope-binding fields (`scope_name`,
+   `scope_opener`, `scope_policy`, `scope_on_group_failure`) are not
+   authorable in this guided lane: a candidate containing one is refused with
+   `guided_collector_not_authorable`. When the intent needs grouped
+   reassembly of expanded rows — a scoped multi-row expansion closed back
+   into one batch — present that boundary to the user as this lane's gap
+   rather than substituting an aggregation or another simpler step (rule 5
+   applies); the direct composer surface can author the collector shape.
 
 ## Presentation and field review
 

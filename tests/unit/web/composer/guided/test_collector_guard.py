@@ -173,3 +173,76 @@ class TestProjectionTypedRejection:
         # collector AS A GATE.
         with pytest.raises(AuditIntegrityError, match="no behavior arm for node kind 'collector'"):
             _node_behavior(_collector_node_spec(), route_aliases={}, branch_aliases={})
+
+
+class TestNoRegretsHardening:
+    """Panel-authorized no-regrets slice (ruling comment 7878, elspeth-88bb77953c)."""
+
+    def test_step_3_overlay_names_the_binder_refusal(self) -> None:
+        # The lane-boundary sentence is BOUND to the binder's rejection: the
+        # overlay must name the exact closed code the binder emits, so a
+        # future rename of either side reddens here instead of drifting the
+        # planner's brief away from the refusal it will actually receive.
+        from elspeth.web.composer.guided.prompts import load_step_chat_skill, load_step_planner_skill
+
+        with pytest.raises(GuidedCandidateBindingRejected) as raised:
+            bind_guided_reviewed_components(_collector_candidate(), _guided())
+        code = raised.value.error_code
+
+        planner_overlay = load_step_planner_skill(GuidedStep.STEP_3_TRANSFORMS)
+        chat_overlay = load_step_chat_skill(GuidedStep.STEP_3_TRANSFORMS)
+        assert code in planner_overlay
+        assert code in chat_overlay
+        # The no-substitution posture rides with the boundary sentence.
+        assert "substituting an aggregation" in planner_overlay
+
+    def test_wire_cardinality_dispatch_fails_typed_for_a_collector(self) -> None:
+        from elspeth.web.composer.guided.emitters import _node_cardinality
+        from elspeth.web.composer.guided.errors import InvariantError
+
+        with pytest.raises(InvariantError, match="no row-cardinality arm for node kind 'collector'"):
+            _node_cardinality(_collector_node_spec(), executable_node=None)
+
+    def test_protocol_node_flow_vocabularies_cannot_drift_apart(self) -> None:
+        # Extending _NODE_TYPES (the WS6 lift scenario) without a flows arm
+        # must fail HERE, not as a KeyError inside payload validation.
+        from elspeth.web.composer.guided.protocol import _LEGAL_NODE_FLOWS, _NODE_TYPES
+
+        assert set(_NODE_TYPES) == set(_LEGAL_NODE_FLOWS)
+
+    def test_prose_revision_refuses_a_collector_bearing_predecessor(self) -> None:
+        from elspeth.web.composer.guided.planning import GuidedRevisionAuthority, bind_guided_prose_revision_candidate
+        from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
+
+        predecessor = CompositionState(
+            sources={"source": SourceSpec(plugin="csv", on_success="pages", options={}, on_validation_failure="discard")},
+            nodes=(_collector_node_spec(),),
+            edges=(),
+            outputs=(OutputSpec(name="output", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        candidate = _collector_candidate()
+        candidate["nodes"] = [candidate["nodes"][0]]  # collector-free candidate
+
+        with pytest.raises(AuditIntegrityError, match="guided predecessor authority carries collector node"):
+            bind_guided_prose_revision_candidate(
+                candidate,
+                _guided(),
+                authority=GuidedRevisionAuthority(mode="amend", predecessor=predecessor),
+            )
+
+    def test_predecessor_guard_names_the_offending_nodes(self) -> None:
+        from elspeth.web.composer.guided.planning import _require_collector_free_predecessor
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata
+
+        state = CompositionState(
+            source=None,
+            nodes=(_collector_node_spec(),),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        with pytest.raises(AuditIntegrityError, match="page_stitcher"):
+            _require_collector_free_predecessor(state)

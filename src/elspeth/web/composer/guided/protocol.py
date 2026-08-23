@@ -760,6 +760,20 @@ _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
 }
 _COMPONENT_KINDS = frozenset({"source", "node", "edge", "output"})
 _NODE_TYPES = frozenset({"transform", "gate", "aggregation", "queue", "coalesce", "row_union"})
+# Per-kind legal flow kinds for node-origin edges. Module-level BESIDE
+# _NODE_TYPES so the two vocabularies cannot drift apart silently: extending
+# _NODE_TYPES (e.g. with "collector" when the elspeth-88bb77953c ruling lifts
+# the guided guard) without a flows arm here fails the coverage pin in
+# test_collector_guard.py, and the validator returns a typed verdict rather
+# than crashing on the miss.
+_LEGAL_NODE_FLOWS: Mapping[str, frozenset[str]] = {
+    "transform": frozenset({"node_success", "node_error"}),
+    "aggregation": frozenset({"node_success", "node_error"}),
+    "gate": frozenset({"gate_route", "gate_fork"}),
+    "queue": frozenset({"queue_continue"}),
+    "coalesce": frozenset({"coalesce_success"}),
+    "row_union": frozenset({"row_union_success"}),
+}
 _FLOW_KINDS = frozenset(
     {
         "source_success",
@@ -2008,15 +2022,13 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             return f"{path}.flow is not legal for its from_endpoint kind"
         if from_kind == "node":
             node_type = node_by_id[from_stable_id]["node_type"]
-            legal_node_flows = {
-                "transform": frozenset({"node_success", "node_error"}),
-                "aggregation": frozenset({"node_success", "node_error"}),
-                "gate": frozenset({"gate_route", "gate_fork"}),
-                "queue": frozenset({"queue_continue"}),
-                "coalesce": frozenset({"coalesce_success"}),
-                "row_union": frozenset({"row_union_success"}),
-            }
-            if flow_kind not in legal_node_flows[node_type]:
+            if node_type not in _LEGAL_NODE_FLOWS:
+                # Typed verdict instead of a bare KeyError: a node kind with
+                # no legal flows on this surface (a collector, until the
+                # elspeth-88bb77953c ruling extends the projection) must fail
+                # validation, not crash it.
+                return f"{path}.flow references node kind {node_type!r}, which has no legal flows on this surface"
+            if flow_kind not in _LEGAL_NODE_FLOWS[node_type]:
                 return f"{path}.flow is not legal for its node_type"
         legal_to_kinds = {
             "source_success": frozenset({"node", "output"}),
