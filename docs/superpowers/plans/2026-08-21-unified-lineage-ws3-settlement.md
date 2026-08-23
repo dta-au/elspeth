@@ -37,7 +37,12 @@ is this workstream's section, §11 its risk posture).
 - Trust-tier corpus diff before/after each slice:
   `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth`
   — compare finding counts against the pre-slice corpus; ADD NOTHING (the fail-closed
-  corpus is the baseline, not zero). Never hand-edit a `judge_metadata_signature`;
+  corpus is the baseline, not zero). WS2 exit baseline: **3167** (3159 + 8 recorded
+  honest Tier-3 adds from WS2 Tasks 12–13, carried for package-level adjudication) —
+  re-certify the number at WS3 start. Counting method: the CONTROLLER-side counted
+  whole-corpus A/B against a pristine-tree export; per-file spot-checks and
+  implementer self-counts missed adds three times in WS2. Never hand-edit a
+  `judge_metadata_signature`;
   never stage a signing bundle during this campaign (bundles are exact-source-bound).
 - Wardline gate before handing back any task that touches external input:
   `wardline scan . --fail-on ERROR --fail-on-inert --trust-pack scripts.wardline_pack --allow-custom-packs --local-only`
@@ -72,7 +77,7 @@ sibling plans' Interfaces blocks carry these signatures before starting):
   - Task 3: `GroupLossSpec(closer_name: str, group_id: str, member_key: str, token_id: str, reason: str)`
     — the frozen dataclass ALREADY LANDS THERE (beside `BranchLossSpec`, which WS1a
     leaves untouched — "WS3 retires it"). WS3 does NOT re-create the type.
-  - Task 4 (schema DDL, epoch 34): `group_losses_table` + `uq_group_losses_natural` +
+  - Task 4 (schema DDL, epoch 35 — the plan draft said 34; WS1a landed 35): `group_losses_table` + `uq_group_losses_natural` +
     the `database.py` `_REQUIRED_COLUMNS`/index entries ALREADY LAND THERE ("Table
     only in WS1a; record/replay verbs are WS3"). Also
     `token_lineage_frames(token_id, run_id, depth, kind, group_id, member_key)`
@@ -110,6 +115,16 @@ sibling plans' Interfaces blocks carry these signatures before starting):
     `member_roster: tuple[str, ...]` — FORK: the declared branch names (`== fork_to`,
     the roster AUTHORITY); EXPAND: `()` (runtime roster via `token_lineage_frames`).
     There is NO `CloserBinding` type and NO `declared_branches` field.
+    (Landed 2026-08-24 verification: `GroupBinding` carries a SUPERSET of these —
+    additionally `kind`, `opener_node_id`, `opener_name`, `closer_node_id`,
+    `on_group_failure` — compatible; consume by keyword, never positionally.)
+  - `GroupBindingRegistry.register_expand_group(group_id: str, *, opener_name: str) -> GroupBinding | None`
+    — landed by WS2 with the ratified contract that **WS3 wires the TokenManager
+    mint-path call site** (`group_bindings.py` module docstring + method docstring,
+    `graph.py` freeze note, WS2 plan :939). Declared scope opener → returns and
+    records its binding; undeclared expand → returns None, records nothing (frames
+    stay inert); re-registration under a different opener raises. Task 5 Step 3b
+    (added 2026-08-24) owns the wiring.
   - `CloserKind` is a `StrEnum`: `COALESCE = "coalesce"`, `ROW_UNION = "row_union"`,
     `COLLECTOR = "collector"` — string-compatible with every serialized surface; WS3
     compares against the enum members (`binding.closer_kind is CloserKind.COALESCE`).
@@ -151,6 +166,10 @@ sibling plans' Interfaces blocks carry these signatures before starting):
 - `RowProcessor._settle_member_losses(current_token, reason, child_items, *, notify_in_memory=True) -> list[RowResult]`
   — THE settlement seam; `_notify_barrier_of_lost_branch` and both kind-specific
   notifiers are deleted.
+- (added 2026-08-24) The `TokenManager.expand_token` mint path calls
+  `GroupBindingRegistry.register_expand_group` unconditionally (Task 5 Step 3b)
+  — the runtime EXPAND-group index WS4's collector executor and Task 8's
+  roster-settlement reads depend on.
 - `SchedulerDrain.take_claim_group_losses(claimed: TokenWorkItem) -> tuple[GroupLossSpec, ...]`
   — frame-authenticated claim guard; `take_claim_branch_loss` is deleted.
 - `BarrierIntakeCoordinator.note_group_failed(*, closer_name: str, group_id: str, reason: str) -> None`
@@ -166,6 +185,80 @@ sibling plans' Interfaces blocks carry these signatures before starting):
   variant imports and reuses it (see Task 10).
 
 ---
+
+## 2026-08-24 amendment — WS3 reviewed against the WS2 execution ledger
+
+This plan was drafted 2026-08-21/22, before WS2 executed. WS2's ledger
+(`.superpowers/sdd/2026-08-21-unified-lineage-ws2-config-validation/progress.md`)
+records in-flight rulings and engine fixes that change this plan. The task-level
+edits are applied in place below (marked "2026-08-24"); this section records the
+deltas that are context rather than task text, plus the carries for the WS3
+controller brief. Nothing here relaxes the pre-flight — it still re-verifies
+everything against the tree at WS3 start.
+
+**Landed-tree deltas absorbed into task text below:**
+
+- `MAX_END_OF_INPUT_FLUSH_ITERATIONS` was DELETED outright by WS2 Task 5 (F4) —
+  not kept as a depth-0 anchor. Task 8's pins rewritten accordingly.
+- WS2 Task 11 (d8da681b3) landed rule 9's build side (explicit
+  `on_error: <closer>` DIVERT edge) with runtime semantics explicitly deferred to
+  WS3 (`builder.py` rule-9 comment; review note N5 records the
+  validate-green/runtime-crash window). New Task 9b owns it.
+- `register_expand_group` landed on `GroupBindingRegistry` with the contract
+  "WS3 wires the TokenManager mint-path call site". New Task 5 Step 3b owns it.
+- E1/E1b/E2 (elspeth-0bd2cde19a) rebuilt the nested merge-release machinery:
+  there are THREE merge-release paths (arrival-fire, durable replay, loss-merge),
+  and `_notify_coalesce_of_lost_branch` now contains the loss-merge continuation
+  resolution via `work_items.resolve_merged_branch_barrier` (single
+  `completed_coalesce_name` contract + restored WorkItemFactory cross-check).
+  Task 5's fold carries that logic; its enumerate-the-callers sweep covers all
+  three paths.
+- The `gate_routed_to_sink` engine arm was DELETED (Task 7 maintainer ruling,
+  supersede+enrich) — one fewer notifier call site than this plan's draft tree.
+- WS2 Task 8's ruling-28 casualty conversion left a mutation-tested
+  processor-level plumbing witness on the `token_traversal.py` undeclared-expand
+  runtime seam, explicitly "pending WS3 supersession" (interim witness for
+  elspeth-c648d4f832; the end-to-end restoration is WS4's). Task 5 supersedes it
+  honestly — re-point, never delete-without-successor.
+- WS2 Task 9 (rule 6) rebuilt three integration harnesses as engine-level
+  witnesses that hand-build barrier/work-item state and call the disposition
+  verbs directly (`test_graceful_shutdown.py`,
+  `test_adr_019_resume_counter_parity.py`,
+  `test_quarantine_deadline_progression.py`), plus whole-row invariance pins
+  (f77510e78/c3272048f discipline). They are consumers of the verbs Task 3
+  renames — in-scope churn, fix signatures, keep the pinned invariants intact.
+- The `group_losses` EXPORT surface already landed (WS1a export-at-flip):
+  `contracts/export_records.py::GroupLossExportRecord`, `exporter.py`, and the
+  data-flow read facades. Its column set pins Task 2's `GroupLoss` row shape —
+  an additional consumed contract, verified matching 2026-08-24.
+
+**Open tickets WS2 filed at WS3's door (this plan now owes them):**
+
+- elspeth-c62d7306a4 — re-point `examples/row_union_ab_experiment/`
+  `settings_screened_at_settlement.yaml`'s recovery-ledger story (README +
+  shipped YAML header) from `coalesce_branch_losses`/`node_states` to
+  `group_losses` once the seam writes it (Task 9 Step 5b, added below).
+- elspeth-a01889580f — `get_branch_first_nodes` row_union arm latent twin (E1
+  F6, pins only, unfixed). Task 9's `nested_row_union_lost_branch` fixture is
+  exactly the never-run shape; Task 9 now carries a pre-check (below).
+- elspeth-033a81214f — barrier-release fault seam + channel-C corpus case is
+  scheduled AFTER WS3; WS3's closeout (Task 10 slice) must note the trigger so
+  it is not lost.
+
+**Carries for the WS3 controller brief (process, not plan text):**
+
+- Widened test sweeps MUST name `tests/unit/core/test_dag.py` explicitly — the
+  `test_dag_*.py` glob misses it (bit WS2 twice; standing widened-sweep rule).
+- elspeth-ec43a7b618: ~20 MagicMock stub sites are fragile on
+  `escalation_fixpoint_bound` (`__index__`); any WS3 harness stubbing
+  `PipelineConfig` must set a real `int` (WS2 fixed two such reds mid-flight).
+- Trust-tier verification is the controller-side counted whole-corpus A/B
+  (see Global Constraints) — never delegated to implementer self-counts.
+- The `web/composer/state.py` maintainer bar was WS2-era; re-check at WS3 start
+  whether it still stands. WS2 handled its casualties via controller-only hunks.
+- Start gate: WS2 is complete only after its Task 15 closeout AND the post-T15
+  no-regrets slice (elspeth-88bb77953c ruling) land — "WS3 starts after WS1 and
+  WS2" means after those, not after Task 13's push.
 
 ### Pre-flight (before Task 1): mechanical citation check
 
@@ -360,6 +453,12 @@ git commit -m "refactor(landscape): retire BranchLossSpec and the coalesce_branc
   `GroupLossRepository` with `list_unadopted_group_losses` / `list_group_losses` /
   `adopt_group_losses` (signatures in the header block);
   `authenticate_adoption_loss(conn, *, run_id, spec, frame_kind, declared_roster) -> None`.
+
+(2026-08-24: the export surface for this ledger already landed —
+`GroupLossExportRecord` in `contracts/export_records.py`, `exporter.py`'s
+`group_loss` records, and `get_group_losses_for_run` on the data-flow read
+facades. Its field set is a consumed contract for the `GroupLoss` row dataclass
+here — verified matching; do not diverge from it.)
 
 This module is a 1:1 migration of `branch_losses.py` with the widened, group-scoped
 key. Carry EVERY behaviour the old module documents: rides the caller's transaction;
@@ -644,6 +743,15 @@ git commit -m "feat(landscape): group_losses ledger with full-table takeover rea
   `group_losses: tuple[GroupLossSpec, ...] = ()`; `complete_barrier` takes
   `group_losses: Sequence[GroupLossSpec] = ()`.
 
+2026-08-24 consumer note: WS2 Task 9 rebuilt three integration harnesses as
+engine-level witnesses that call these verbs directly with hand-built
+barrier/work-item state — `tests/integration/` `test_graceful_shutdown.py`,
+`test_adr_019_resume_counter_parity.py`, `test_quarantine_deadline_progression.py`
+— plus whole-row invariance pins (the f77510e78/c3272048f "whole
+`token_work_items` row unchanged" discipline). They are in-scope churn for this
+task's rename: fix their call signatures mechanically, keep every pinned
+invariant intact (the pins assert row-set equality, not kwarg names).
+
 - [ ] **Step 1: Write the failing test**
 
 ```python
@@ -906,14 +1014,24 @@ diff + wardline gate.
 ### Task 5: The settle-member seam **[SLICE]**
 
 **Files:**
-- Modify: `src/elspeth/engine/processor.py:1428-1449` (empty-flush loss staging),
-  `:1642-1652` (non-empty flush QUARANTINED_AT_SOURCE asymmetry — bypass site 2),
-  `:3028-3103` (`_notify_row_union_of_lost_branch` — absorbed), `:3105-3119`
-  (`_row_union_group_released` — deleted), `:3121-3155` (`_notify_barrier_of_lost_branch`
-  + false docstring — deleted), `:3157-3292` (`_notify_coalesce_of_lost_branch` —
+- Modify: `src/elspeth/engine/processor.py` — empty-flush loss staging and the
+  non-empty flush QUARANTINED_AT_SOURCE asymmetry (bypass site 2; draft anchors
+  `:1428-1449`/`:1642-1652`, re-verify at pre-flight), and the four notifier
+  members (anchors re-verified 2026-08-24; pre-flight re-checks):
+  `:3131` (`_notify_row_union_of_lost_branch` — absorbed), `:3211`
+  (`_row_union_group_released` — deleted), `:3233` (`_notify_barrier_of_lost_branch`
+  + false docstring — deleted), `:3291` (`_notify_coalesce_of_lost_branch` —
   absorbed), every `_notify_barrier_of_lost_branch` call site
   (`git grep -n "_notify_barrier_of_lost_branch" -- src/` — includes
-  `token_traversal.py:198-226`'s zero-row path)
+  `token_traversal.py`'s zero-row path; NOTE 2026-08-24: the
+  `gate_routed_to_sink` arm was deleted by WS2 Task 7's ruling, so the call-site
+  set is smaller than this plan's draft tree — the grep is authoritative)
+- Supersede: the WS2-Task-8 processor-level plumbing witness on
+  `token_traversal.py`'s undeclared-expand runtime seam (in
+  `tests/unit/engine/test_processor.py`, marked "pending WS3 supersession";
+  interim witness for elspeth-c648d4f832) — re-point it at the seam that
+  replaces the old path, mutation-verified again; never delete it without a
+  successor witness in the same commit.
 - Test: `tests/unit/engine/test_settle_member_seam.py` (create)
 
 **Interfaces:**
@@ -1037,8 +1155,9 @@ Expected: FAIL — `AttributeError: ... has no attribute '_settle_member_losses'
 
 - [ ] **Step 3: Implement the seam**
 
-In `processor.py`, DELETE `_notify_barrier_of_lost_branch` (`:3121-3155`, false
-docstring included), `_row_union_group_released` (`:3105-3119` — structurally retired:
+In `processor.py`, DELETE `_notify_barrier_of_lost_branch` (`:3233` as of
+2026-08-24, false docstring included), `_row_union_group_released` (`:3211` —
+structurally retired:
 ruling 27 pops the frame at release, so a post-release terminal no longer carries it
 and the walk can never resolve to the union's group), and fold the two kind-specific
 notifiers into:
@@ -1096,13 +1215,20 @@ notifiers into:
 `_notify_closer_of_loss` dispatches on `binding.closer_kind`:
 
 - `CloserKind.COALESCE`: the body of today's `_notify_coalesce_of_lost_branch` AFTER
-  its staging block (`:3213-3292` — executor-presence check, `notify_branch_lost`,
+  its staging block (executor-presence check, `notify_branch_lost`,
   merged/failure arms) with `coalesce_name = CoalesceName(binding.closer_name)`,
   `lost_branch=frame.member_key`, and the coalesce node id resolved as today
   (`self._coalesce_node_ids[coalesce_name]`). The in-memory executor call keeps its
   `(coalesce_name, row_id, lost_branch, reason)` signature — the pending-state re-key
   to `(coalesce_name, fork_group_id)` is WS4's (spec §5); `current_token.row_id` is in
-  hand here.
+  hand here. **2026-08-24 (E1/E1b carry, elspeth-0bd2cde19a):** the merged arm of
+  this body now resolves the merged continuation's barrier via
+  `work_items.resolve_merged_branch_barrier` (single `completed_coalesce_name`
+  contract; the loss-merge path was E1 review F1's THIRD merge-release path) and
+  restores the WorkItemFactory mismatch cross-check — carry that logic into the
+  fold verbatim, and make this task's enumerate-the-callers sweep cover all three
+  merge-release paths (arrival-fire, durable replay in `barrier_coordination.py`,
+  loss-merge here).
 - `CloserKind.ROW_UNION`: the body of today's `_notify_row_union_of_lost_branch` after
   its staging block (`:3068-3103`), minus the deleted released-group guard.
 - `CloserKind.COLLECTOR`: `raise OrchestrationInvariantError(f"Collector closer {binding.closer_name!r} has no executor wired; collector settlement lands in WS4 integration.")`
@@ -1142,6 +1268,26 @@ The `self._group_bindings` registry reaches the processor from WS2's built graph
 `_branch_to_coalesce` already arrives (read `processor.py:483-499` and the factory in
 `engine/orchestrator/processor_factory.py` for the wiring point; after WS2 the
 branch maps are derived views of this same registry).
+
+- [ ] **Step 3b (added 2026-08-24): wire `register_expand_group` at the expand
+  mint path**
+
+WS2 landed `GroupBindingRegistry.register_expand_group(group_id, *, opener_name)`
+with the ratified contract that WS3 wires the TokenManager call site (the
+registry docstrings and `graph.py`'s freeze note name WS3 explicitly; no other
+workstream plan claims it). Wire it where `TokenManager.expand_token` mints the
+expand group (WS1a Task 8's push site — opener detection already lives INSIDE
+`expand_token` per rev 2.1): call `register_expand_group(group_id,
+opener_name=<the minting node's name>)` unconditionally at mint. Thread the
+registry to TokenManager the same way the processor receives it. Unit tests
+(beside the seam tests or in the TokenManager suite, wherever the mint tests
+already live): declared scope opener → the binding is recorded and
+`binding_for` on the minted frame returns it; undeclared expand → returns None,
+`binding_for` stays None (inert); re-registering one group id under a different
+opener raises. Note: no full-pipeline test is possible yet — collector/scope
+graphs are build-rejected until WS4's executor registers
+(`graph_registration.py` raises, pinned decision 5) — so these are unit-level
+against a real registry; WS4's integration suite exercises the composed path.
 
 - [ ] **Step 4: Run to pass**
 
@@ -1575,15 +1721,16 @@ from elspeth.engine.orchestrator import leader_drain
 
 def test_leader_drain_owns_no_competing_formula():
     assert not hasattr(leader_drain, "derive_end_of_input_flush_bound")
+    # WS2 Task 5 (F4) DELETED the old constant outright — it must not
+    # resurface as a second source of truth beside the derived bound.
+    assert not hasattr(leader_drain, "MAX_END_OF_INPUT_FLUSH_ITERATIONS")
 
 
 def test_depth0_derived_bound_equals_the_historical_constant():
-    # Depth-0 behaviour is byte-identical to the pre-campaign loop.
-    assert (
-        derive_escalation_fixpoint_bound(0)
-        == leader_drain.MAX_END_OF_INPUT_FLUSH_ITERATIONS
-        == 1_000
-    )
+    # Depth-0 behaviour is byte-identical to the pre-campaign loop. The
+    # historical MAX_END_OF_INPUT_FLUSH_ITERATIONS = 1_000 no longer exists
+    # as a name (deleted by WS2); the derived value is the only anchor.
+    assert derive_escalation_fixpoint_bound(0) == 1_000
 
 
 def test_depth5_derived_bound_is_1040():
@@ -1694,11 +1841,14 @@ notifying loss's own `group_id` is in hand).
 derived value — with `PipelineConfig.escalation_fixpoint_bound` set at the
 graph-in-hand construction sites to
 `derive_escalation_fixpoint_bound(graph.get_max_bound_region_depth())`.
-`MAX_END_OF_INPUT_FLUSH_ITERATIONS = 1_000` survives only as the depth-0 default
-anchor. VERIFY: `git grep -n "MAX_END_OF_INPUT_FLUSH_ITERATIONS\|derive_end_of_input_flush_bound" src/`
-must show the constant only as the anchor/default and the WS3-era name not at all —
-any bare-constant loop or competing formula is WS2 drift, fixed in WS2's slice, never
-by growing a formula here.
+`MAX_END_OF_INPUT_FLUSH_ITERATIONS` was DELETED outright by WS2 Task 5's F4 fix
+(2026-08-24 correction: the draft said it survives as the depth-0 anchor — it
+does not; the only remaining mention is a historical note in
+`core/dag/bound_regions.py`'s docstring). VERIFY:
+`git grep -n "MAX_END_OF_INPUT_FLUSH_ITERATIONS\|derive_end_of_input_flush_bound" src/`
+must show ZERO code hits (the bound_regions docstring mention is the one
+tolerated match) — any bare-constant loop, resurrected constant, or competing
+formula is drift, fixed at the owning site, never by growing a formula here.
 
 - [ ] **Step 4: Run to pass**
 
@@ -1726,6 +1876,9 @@ Full `pytest tests/` + trust-tier corpus diff + wardline.
   (Task 5 carried it into `_notify_closer_of_loss`'s ROW_UNION arm; originally
   `:3028-3103`) and the coalesce `outcome.failure_reason` arm (originally
   `:3263-3290`, now calling Task 6's helper)
+- Modify (added 2026-08-24, Step 3b): `examples/row_union_ab_experiment/settings_screened_at_settlement.yaml`
+  header comment + that example's README recovery-ledger paragraph
+  (elspeth-c62d7306a4)
 - Test: `tests/integration/pipeline/test_nested_group_settlement.py` (create)
 
 **Interfaces:**
@@ -1737,6 +1890,16 @@ The mechanism is already in place after Tasks 6+8: the FAIL arms terminalize mem
 and call `note_group_failed`; escalation fires only when an enclosing bound frame
 exists. What this task adds is the END-TO-END pin through real pipelines, because the
 unit harnesses cannot prove the composition.
+
+**Pre-check (added 2026-08-24, before Step 1):** elspeth-a01889580f records the
+`get_branch_first_nodes` row_union arm as the un-fixed latent twin of E1's
+nested-branch walker gap (E1 review F6 — pins only, no fix). The
+`nested_row_union_lost_branch` fixture below (row_union closing a fork inside an
+outer bound region) is exactly the never-run shape. Before writing tests, build
+AND run that topology bare; if it fails at build/startup for the walker reason,
+STOP — fix rides a01889580f's ticket (its acceptance pins are already written),
+never a workaround in this task's fixtures. A failure in the settlement
+behaviour itself stays this task's to fix.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1811,9 +1974,23 @@ these bare tokens: `row_union_branch_lost`, `row_union_timeout`,
 64-char category budget; pass them through unchanged — never prose, never a mapping
 layer. Delete any remaining in-line assumption that a
 group failure is final (grep the arms for comments claiming so; the deleted
-`:3121-3155` docstring's siblings). No enclosing frame ⇒ `note_group_failed` is parked
+`_notify_barrier_of_lost_branch` docstring's siblings). No enclosing frame ⇒
+`note_group_failed` is parked
 then discarded by Task 8's pass — no code branch needed at the call sites; the
 UNIFORMITY is the design.
+
+- [ ] **Step 3b (added 2026-08-24): re-point the screened-at-settlement example's
+  ledger story (elspeth-c62d7306a4)**
+
+WS2 Task 7 (F8b) found `examples/row_union_ab_experiment/settings_screened_at_settlement.yaml`
+RUNS today with its losses recorded through the OLD machinery — the shipped YAML
+header and README point readers at `node_states` and name a then-empty
+`group_losses`; the live ledger was `coalesce_branch_losses`, which Task 1
+deleted. Now that the seam writes `group_losses` (and Task 9's row_union arm
+covers this shape): re-run the example, re-point the YAML header comment and the
+README's recovery-ledger paragraph at `group_losses` with the real observed
+rows, and keep the honest-cost PARTIAL framing intact. Close
+elspeth-c62d7306a4's obligation in this commit (ticket → verifying).
 
 - [ ] **Step 4: Run to pass**
 
@@ -1823,8 +2000,70 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/elspeth/engine/processor.py tests/integration/pipeline/test_nested_group_settlement.py
+git add src/elspeth/engine/processor.py tests/integration/pipeline/test_nested_group_settlement.py \
+        examples/row_union_ab_experiment/settings_screened_at_settlement.yaml \
+        examples/row_union_ab_experiment/README.md
 git commit -m "feat(engine): bound-enclosed closer failures defer verdicts to the enclosing closer"
+```
+
+---
+
+### Task 9b (added 2026-08-24): Rule-9 explicit `on_error: <closer>` runtime semantics
+
+WS2 Task 11 (d8da681b3) landed rule 9's BUILD side: a transform/gate inside a
+bound region may name an enclosing region's closer as `on_error`; the builder
+wires a `RoutingMode.DIVERT` edge into the closer node and rejects the
+out-of-region shape. The landed rule-9 comment in `core/dag/builder.py` states
+"runtime semantics of the edge land in WS3", and the Task 11 review recorded N5:
+a validate-green/runtime-crash window exists until they do. This plan's draft
+predated rule 9 and had no owner for it — this task is that owner.
+
+**Semantics (from WS2-plan decision 4 + spec §7 rule 9):** the explicit route is
+the SAME settlement as the derived route. A failing node with
+`on_error: <closer>` terminalizes through the standard error disposition and
+settles via `_settle_member_losses` exactly as the omitted-`on_error` twin does;
+the DIVERT edge is a structural audit marker. A token must NEVER arrive at the
+closer as a pseudo-member through the error edge — the closer's roster admits
+members, not refugees.
+
+**Files:**
+- Modify: `src/elspeth/engine/processor.py` (and/or the routing dispatch that
+  resolves DIVERT targets — enumerate at pre-flight: `git grep -n "RoutingMode.DIVERT" -- src/elspeth/engine/`
+  and trace where a DIVERT edge whose target is a coalesce/row_union/collector
+  node would be dispatched today; fix at that dispatch site, not by
+  special-casing node names)
+- Test: `tests/integration/pipeline/test_rule9_error_to_closer_runtime.py` (create)
+
+**Interfaces:**
+- Consumes: Task 5's seam; WS2's rule-9 build validation + DIVERT edge.
+- Produces: no new names — behaviour only: explicit-vs-omitted equivalence.
+
+- [ ] **Step 1: Write the failing tests**
+
+Two-pipeline equivalence pin, built with the same builders as Task 9's fixtures:
+(a) in-region transform with explicit `on_error: <closer>`; (b) the byte-identical
+topology with `on_error` omitted. Pin: identical `group_losses` rows (same
+closer/group/member/reason), identical terminal outcomes for every token,
+identical closer verdicts; and a structural pin that NO `token_work_items` row is
+ever enqueued at the closer node via the error route (set-equality over the
+work-item ledger, not absence-by-sampling). Add one out-of-region control
+asserting the build rejection still fires (consumed-contract pin on WS2's rule 9).
+
+- [ ] **Step 2: Run them** — expected: the explicit-edge pipeline crashes or
+  mis-routes (the N5 window), the omitted twin passes.
+
+- [ ] **Step 3: Implement** — route the explicit edge's failing token into the
+  standard terminal-disposition path (which calls the seam), leaving the DIVERT
+  edge as audit structure. If investigation shows the dispatch already
+  degenerates to exactly that (the crash window closed as a side effect of
+  Tasks 5–9), this task becomes the equivalence pin alone — the tests land
+  either way; N5's window must be provably shut.
+
+- [ ] **Step 4: Run to pass**, then commit:
+
+```bash
+git add src/elspeth/engine/processor.py tests/integration/pipeline/test_rule9_error_to_closer_runtime.py
+git commit -m "feat(engine): rule-9 explicit on_error-to-closer settles through the settlement seam"
 ```
 
 ---
@@ -1980,7 +2219,10 @@ git commit -m "test(engine): depth-5 full-unwrap-to-quarantine acceptance eviden
 
 Full `pytest tests/` + trust-tier corpus diff + wardline. This closes WS3's behaviour
 surface; adjudicate any remaining corpus-manifest count rotations now (Task 5 Step 5's
-protocol).
+protocol). Closeout note (2026-08-24): WS3 landing is the TRIGGER for
+elspeth-033a81214f (barrier-release fault seam + channel-C corpus case, incl.
+earning `held_barrier_proven`) — comment on that ticket that its precondition is
+now met; the work itself is not WS3's.
 
 ---
 
@@ -2047,7 +2289,10 @@ from this task is ever committed except added killer tests.
 ## Self-review checklist (run before handing the plan's work back)
 
 1. **Spec §6 coverage:** §6.1 seam + bypasses 1–4 (Tasks 5, 6, 9; site 5 is WS2's
-   ruling-25 build rejection — only the uniform seam call lands here), §6.2 spec/guard/
+   ruling-25 build rejection — only the uniform seam call lands here), §7 rule-9
+   runtime semantics + explicit-vs-derived equivalence (Task 9b — added
+   2026-08-24, closes review note N5's validate-green/runtime-crash window),
+   §6.2 spec/guard/
    ledger/staging/restore (Tasks 1–4, 7), §6.3 escalation items 1–4 + depth-5
    acceptance (Tasks 8, 10), §6.4 policy semantics pinned where WS3 owns them
    (best_effort absorption Task 8; `scope_group_failed`/`all_members_lost`/
@@ -2075,6 +2320,11 @@ in this plan's header and checked by the pre-flight step); `group_records` rows 
 minted for BOTH kinds, so Task 8's opener resolution has no FORK fallback; the
 escalation reason token `"group_failed"`, opener-token `token_id`, and
 recorded_by-at-write-time are ratified; and the row_union failure reasons are
-verified bare categorical tokens (named in Task 9). The one campaign-level open item
-— the `examples/row_union_ab_experiment/settings_screened.yaml` replacement story —
-is a maintainer pedagogy call tracked outside this plan and gates nothing here.
+verified bare categorical tokens (named in Task 9).
+
+(2026-08-24 correction: this section previously said the screened-example story
+"gates nothing here". Stale — WS2 Task 7 landed BOTH screened variants (RC-4)
+and empirically found `settings_screened_at_settlement.yaml` runs today on the
+old loss machinery, filing elspeth-c62d7306a4 to assign WS3 the ledger re-point.
+That obligation is now Task 9 Step 3b. The 2026-08-24 amendment section above
+carries the full WS2-landing delta list.)
