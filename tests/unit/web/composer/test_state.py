@@ -9980,9 +9980,21 @@ class TestCompositionStateRowUnion:
         assert error.component == "node:variant_union"
         assert "control" in error.message
         assert "row_id" in error.message
-        assert "passthrough" in error.message
+        # The remedy must NOT recommend passthrough mode — rule 6 rejects an
+        # in-region aggregation regardless of output_mode (WS2 Task 9 wrong-
+        # remedy enrichment); the message says so instead.
+        assert "passthrough" not in error.message
+        assert "banned inside every bound region" in error.message
 
-    def test_row_union_accepts_passthrough_aggregation_inside_branch(self) -> None:
+    def test_row_union_rejects_passthrough_aggregation_inside_branch(self) -> None:
+        # RULING-25 CASUALTY (WS2 Task 9, 2026-08-23; formerly
+        # test_row_union_accepts_passthrough_aggregation_inside_branch, an
+        # elspeth-a5b86149d4-family positive control). The identity-preservation
+        # property passthrough mode demonstrates is real and unaffected, but
+        # spec §7 rule 6 bans aggregators inside every bound region regardless
+        # of output mode: a batch flush consumes members the region's roster
+        # must account for (loss-blindness), and passthrough does not mitigate
+        # that. Stage 1 mirrors the runtime rejection.
         state = self._state()
         branch_aggregation = self._aggregation(
             "control",
@@ -9997,7 +10009,14 @@ class TestCompositionStateRowUnion:
 
         result = state.validate()
 
-        assert result.is_valid, result.errors
+        assert not result.is_valid
+        error = next(error for error in result.errors if error.error_code == "bound_region_aggregation_invalid")
+        assert error.component == "node:variant_union"
+        assert "control" in error.message
+        assert "rule 6" in error.message
+        # The twin's transform-mode-specific code must NOT fire for a
+        # passthrough aggregation — this shape belongs to rule 6 alone.
+        assert not any(error.error_code == "row_union_branch_aggregation_invalid" for error in result.errors)
 
     def test_row_union_accepts_transform_mode_aggregation_before_fork(self) -> None:
         state = self._state()
