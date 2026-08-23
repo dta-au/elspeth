@@ -266,11 +266,13 @@ Same discipline as the WS1b plan's pre-flight. The `file:line` anchors below wer
 taken from the pre-WS1/WS2 tree and WILL have drifted by the time WS3 starts. Before
 touching code:
 
-- [ ] For every `src/...:<line>` citation in this plan, open the cited file and
+- [x] For every `src/...:<line>` citation in this plan, open the cited file and
   confirm the named symbol/block is at (or near) the anchor; where it moved, update
   the citation in THIS plan (docs-only commit, pathspec-staged) — never "fix" code to
-  match a stale anchor.
-- [ ] Verify each consumed sibling symbol imports from the landed tree exactly as the
+  match a stale anchor. [DONE 2026-08-24, WS3 controller: all anchors above
+  re-verified/corrected in this commit; the eleventh database.py FK tuple was the
+  one substantive miss]
+- [x] Verify each consumed sibling symbol imports from the landed tree exactly as the
   header block states: `FrameKind`, `LineageFrame`, `path_branch_name` /
   `path_fork_group_id` / `path_expand_group_id` / `pop_closer_frame`
   (`contracts/identity.py` / `contracts/enums.py`); `GroupLossSpec`
@@ -280,9 +282,10 @@ touching code:
   `derive_escalation_fixpoint_bound` (`core/dag/bound_regions.py`);
   `graph.get_group_bindings()` / `graph.get_max_bound_region_depth()`.
   A quick smoke: `python -c "from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry, CloserKind; from elspeth.core.dag.bound_regions import derive_escalation_fixpoint_bound; from elspeth.contracts.scheduler import GroupLossSpec; from elspeth.contracts.identity import LineageFrame, pop_closer_frame"`.
-- [ ] Any missing or renamed symbol is sibling-plan drift: STOP and reconcile with the
+- [x] Any missing or renamed symbol is sibling-plan drift: STOP and reconcile with the
   owning plan (WS1a/WS1b/WS2) before Task 1 — the canon names above are ratified; do
-  not adapt WS3 call sites to a divergent landing.
+  not adapt WS3 call sites to a divergent landing. [2026-08-24: smoke import PASSED
+  verbatim; no drift found; trust-tier baseline re-certified 3167 exact.]
 
 ### Task 1: Retire `BranchLossSpec` and the `coalesce_branch_losses` table **[SLICE]**
 
@@ -292,14 +295,17 @@ verification entries). This task VERIFIES the landed contract and deletes the re
 artifacts — do not re-create anything.
 
 **Files:**
-- Modify: `src/elspeth/contracts/scheduler.py:70-86` (DELETE `BranchLossSpec`;
+- Modify: `src/elspeth/contracts/scheduler.py:72-90` (DELETE `BranchLossSpec`;
   `GroupLossSpec` sits beside it already — leave it exactly as WS1a landed it)
-- Modify: `src/elspeth/core/landscape/schema.py:1037-1064` (DELETE
+  [anchors re-verified 2026-08-24 pre-flight]
+- Modify: `src/elspeth/core/landscape/schema.py:1046-1072` (DELETE
   `coalesce_branch_losses_table` + the `uq_coalesce_branch_losses_natural` index;
   `group_losses_table` already exists further down — leave it)
-- Modify: `src/elspeth/core/landscape/database.py:454-463` (DELETE the ten
-  `("coalesce_branch_losses", ...)` tuples — the `("group_losses", ...)` entries were
-  appended by WS1a) and `:734` (DELETE
+- Modify: `src/elspeth/core/landscape/database.py:476-485` (DELETE the ten
+  `("coalesce_branch_losses", ...)` column tuples — the `("group_losses", ...)`
+  entries were appended by WS1a), `:528` (DELETE the
+  `("coalesce_branch_losses", "run_id", "runs")` FK tuple — pre-flight found this
+  ELEVENTH entry the draft missed) and `:756` (DELETE
   `("coalesce_branch_losses", "uq_coalesce_branch_losses_natural")` — the
   `("group_losses", "uq_group_losses_natural")` entry exists)
 - Test: `tests/unit/core/landscape/test_group_losses_schema.py` (create)
@@ -388,12 +394,12 @@ table is still present in the WS1a-landed tree.
 
 - [ ] **Step 3: Delete `BranchLossSpec` from `contracts/scheduler.py`**
 
-Delete the `BranchLossSpec` class (`:70-86`) outright. Leave `GroupLossSpec` (landed
+Delete the `BranchLossSpec` class (`:72-90`) outright. Leave `GroupLossSpec` (landed
 by WS1a Task 3, directly below it) untouched — if its fields differ from the canonical
 five `(closer_name, group_id, member_key, token_id, reason)`, STOP and reconcile with
 the WS1a plan before proceeding; do not fork the contract.
 
-- [ ] **Step 4: Delete the retired table from `schema.py:1037-1064`**
+- [ ] **Step 4: Delete the retired table from `schema.py:1046-1072`**
 
 Delete `coalesce_branch_losses_table` and its `uq_coalesce_branch_losses_natural`
 `Index(...)` block. `group_losses_table` + the named unique
@@ -411,8 +417,9 @@ DELETED, dev databases are wiped — `auth.db` NEVER).
 
 - [ ] **Step 5: Prune `database.py` verification lists**
 
-At `:454-463` delete the ten `("coalesce_branch_losses", ...)` tuples; at `:734`
-delete `("coalesce_branch_losses", "uq_coalesce_branch_losses_natural")`. The
+At `:476-485` delete the ten `("coalesce_branch_losses", ...)` column tuples; at
+`:528` delete the `("coalesce_branch_losses", "run_id", "runs")` FK tuple; at
+`:756` delete `("coalesce_branch_losses", "uq_coalesce_branch_losses_natural")`. The
 `("group_losses", ...)` column entries and
 `("group_losses", "uq_group_losses_natural")` were appended by WS1a — verify they are
 present; add nothing.
@@ -438,8 +445,11 @@ git commit -m "refactor(landscape): retire BranchLossSpec and the coalesce_branc
 **Files:**
 - Create: `src/elspeth/core/landscape/scheduler/group_losses.py`
 - Delete: `src/elspeth/core/landscape/scheduler/branch_losses.py`
-- Modify: `src/elspeth/core/landscape/scheduler/__init__.py:16,43`
-- Modify: `src/elspeth/core/landscape/scheduler_repository.py:809-835` (facade methods)
+- Modify: `src/elspeth/core/landscape/scheduler/__init__.py:13` (import block) +
+  the `__all__` exports [re-verified 2026-08-24 pre-flight]
+- Modify: `src/elspeth/core/landscape/scheduler_repository.py:790-801` (facade
+  methods) and `:108` (the `self.branch_losses = CoalesceBranchLossRepository(engine)`
+  component attribute)
 - Test: `tests/unit/core/landscape/test_scheduler_repository_group_losses.py` (create —
   migrated from `test_scheduler_repository_coalesce_branch_losses.py`, which is deleted)
 - Test: `tests/testcontainer/core/test_group_loss_reason_postgres.py` (create — migrated
@@ -675,7 +685,7 @@ def authenticate_adoption_loss(
             return
     raise AuditIntegrityError(
         f"Adoption-context group loss for closer {spec.closer_name!r} group {spec.group_id!r} "
-        f"member {spec.member_key!r} has no durable roster-authority witness "
+        f"member {spec.member_key!r} has no durable roster authority witness "
         f"({frame_kind.name}); losses are staged only for members the group actually minted."
     )
 ```
@@ -687,7 +697,7 @@ def authenticate_adoption_loss(
 same ordering (`recorded_at, loss_id`), same docstrings updated to the new vocabulary.
 Delete `branch_losses.py`. Update `scheduler/__init__.py` exports
 (`record_group_loss`, `GroupLoss`, `GroupLossRepository`, `authenticate_adoption_loss`)
-and the `scheduler_repository.py` facade (`:809-835`): `list_unadopted_group_losses`,
+and the `scheduler_repository.py` facade (`:790-801`): `list_unadopted_group_losses`,
 `list_group_losses`, `adopt_group_losses` delegating to `self.group_losses`
 (rename the `self.branch_losses` component attribute where it is constructed — grep
 `branch_losses` in that file and rename all).
@@ -730,9 +740,11 @@ git commit -m "feat(landscape): group_losses ledger with full-table takeover rea
 ### Task 3: Disposition plumbing — singular `branch_loss` to `group_losses` collection **[SLICE]**
 
 **Files:**
-- Modify: `src/elspeth/core/landscape/scheduler/dispositions.py:103,139,168,199,228,278,637,665,786,921-935`
-- Modify: `src/elspeth/core/landscape/scheduler_repository.py:492-620,695` (wrapper kwargs)
-- Modify: `src/elspeth/core/landscape/scheduler/barrier.py:95,482` (`complete_barrier` losses)
+- Modify: `src/elspeth/core/landscape/scheduler/dispositions.py:103,139,168,199,228,278,637,665,784,922`
+  [re-verified 2026-08-24 pre-flight: `_transition_on` def is `:784`, the
+  recording block starts `:922`]
+- Modify: `src/elspeth/core/landscape/scheduler_repository.py:473-601,676-693` (wrapper kwargs)
+- Modify: `src/elspeth/core/landscape/scheduler/barrier.py:96,480-483` (`complete_barrier` losses)
 - Test: `tests/unit/core/landscape/test_scheduler_repository_group_losses.py` (extend)
 
 **Interfaces:**
@@ -745,8 +757,10 @@ git commit -m "feat(landscape): group_losses ledger with full-table takeover rea
 
 2026-08-24 consumer note: WS2 Task 9 rebuilt three integration harnesses as
 engine-level witnesses that call these verbs directly with hand-built
-barrier/work-item state — `tests/integration/` `test_graceful_shutdown.py`,
-`test_adr_019_resume_counter_parity.py`, `test_quarantine_deadline_progression.py`
+barrier/work-item state — exact paths (pre-flight 2026-08-24):
+`tests/integration/pipeline/orchestrator/test_graceful_shutdown.py`,
+`tests/integration/test_adr_019_resume_counter_parity.py`,
+`tests/integration/pipeline/orchestrator/test_quarantine_deadline_progression.py`
 — plus whole-row invariance pins (the f77510e78/c3272048f "whole
 `token_work_items` row unchanged" discipline). They are in-scope churn for this
 task's rename: fix their call signatures mechanically, keep every pinned
@@ -794,8 +808,8 @@ Expected: FAIL — `TypeError: mark_failed() got an unexpected keyword argument 
 In `dispositions.py`, for every verb listed above replace
 `branch_loss: BranchLossSpec | None = None` with
 `group_losses: tuple[GroupLossSpec, ...] = ()` and thread it through `_transition`
-(`:637`), `_transition_with_ready_children` (`:665`) and `_transition_on` (`:786`).
-The recording block at `:921-935` becomes:
+(`:637`), `_transition_with_ready_children` (`:665`) and `_transition_on` (`:784`).
+The recording block at `:922` becomes:
 
 ```python
         for spec in group_losses:
@@ -812,9 +826,10 @@ The recording block at `:921-935` becomes:
 
 Docstrings: replace the "§E.5 fork-lineage branch feeding a coalesce" prose with
 "spec §6.2: losses staged by the settle-member seam for any bound closer kind". Update
-the `scheduler_repository.py` wrappers (`:492-620` — six signatures) mechanically. In
+the `scheduler_repository.py` wrappers (`:473-601` — six signatures, plus the
+`complete_barrier` wrapper's `branch_losses` at `:676-693`) mechanically. In
 `barrier.py`, `complete_barrier`'s `branch_losses: Sequence[BranchLossSpec] = ()`
-(`:95`) becomes `group_losses: Sequence[GroupLossSpec] = ()`, and the loop at `:482`
+(`:96`) becomes `group_losses: Sequence[GroupLossSpec] = ()`, and the loop at `:480-483`
 calls `record_group_loss(conn, run_id=run_id, spec=spec, recorded_by=..., now=now)`
 using the same identity the surrounding verb already threads (read `:460-500` for the
 in-scope identity — it is the coordination token's worker attribution; keep exactly
@@ -849,8 +864,11 @@ tree is not green earlier. Never leave the shared checkout red between pushes.
 ### Task 4: Frame-authenticated CLAIM guard — `take_claim_group_losses`
 
 **Files:**
-- Modify: `src/elspeth/engine/scheduler_drain.py:49,293,320,644,655,664,721,758,781,983-1007`
-- Modify: `src/elspeth/engine/processor.py:145,647-653,727,3915-3945,4304-4306`
+- Modify: `src/elspeth/engine/scheduler_drain.py:49,293,320,644,655,664,721,758,781,981-1007`
+- Modify: `src/elspeth/engine/processor.py:148,702-708,784,4085-4120,4500`
+  [re-verified 2026-08-24 pre-flight: import `:148`, `_pending_branch_losses`
+  field `:702-708`, constructor kwarg `:784`, flush producer-transaction block
+  `:4085-4120`, `_take_claim_branch_loss` delegate `:4500`]
 - Test: `tests/unit/engine/test_group_loss_claim_guard.py` (create)
 
 **Interfaces:**
@@ -934,7 +952,7 @@ Expected: FAIL — `AttributeError: ... has no attribute 'take_claim_group_losse
 
 - [ ] **Step 3: Implement the guard and the mechanical renames**
 
-Replace `take_claim_branch_loss` (`scheduler_drain.py:983-1007`) with:
+Replace `take_claim_branch_loss` (`scheduler_drain.py:981-1007`) with:
 
 ```python
     def take_claim_group_losses(self, claimed: TokenWorkItem) -> tuple[GroupLossSpec, ...]:
@@ -979,12 +997,12 @@ Mechanical renames in the same commit (grep-driven, exhaustive):
   constructor param `pending_group_losses`; call sites `:664/:721/:758/:781` become
   `group_losses=self.take_claim_group_losses(claimed)` (pass the CLAIMED ITEM, not the
   token_id); the `.clear()` calls at `:644/:655` keep their positions.
-- `processor.py:145` import; `:647-653` field `self._pending_group_losses: list[GroupLossSpec] = []`
-  (keep the §E.5 comment, reworded to §6.2); `:727` kwarg; `:3915-3945` — the flush's
+- `processor.py:148` import; `:702-708` field `self._pending_group_losses: list[GroupLossSpec] = []`
+  (keep the §E.5 comment, reworded to §6.2); `:784` kwarg; `:4085-4120` — the flush's
   producer-transaction block renames `branch_losses`→`group_losses` and passes
-  `group_losses=group_losses` to `complete_barrier`; `:4304-4306` delegate becomes
+  `group_losses=group_losses` to `complete_barrier`; `:4500` delegate becomes
   `_take_claim_group_losses(self, claimed: TokenWorkItem)`.
-- The staging append sites (`processor.py:3058-3067` and `:3202-3211`) are rewritten by
+- The staging append sites (`processor.py:3164` and `:3336`) are rewritten by
   Task 5; for THIS commit convert them minimally to `GroupLossSpec` keyed by the
   token's innermost FORK frame so the tree stays green:
   `GroupLossSpec(closer_name=str(coalesce_name), group_id=current_token.fork_group_id, member_key=str(branch_name), token_id=current_token.token_id, reason=reason)`
@@ -1015,8 +1033,9 @@ diff + wardline gate.
 
 **Files:**
 - Modify: `src/elspeth/engine/processor.py` — empty-flush loss staging and the
-  non-empty flush QUARANTINED_AT_SOURCE asymmetry (bypass site 2; draft anchors
-  `:1428-1449`/`:1642-1652`, re-verify at pre-flight), and the four notifier
+  non-empty flush QUARANTINED_AT_SOURCE asymmetry (bypass site 2; re-verified
+  2026-08-24 pre-flight: empty-flush notify call `:1499`, non-empty flush
+  quarantined loop `:1700-1755`), and the four notifier
   members (anchors re-verified 2026-08-24; pre-flight re-checks):
   `:3131` (`_notify_row_union_of_lost_branch` — absorbed), `:3211`
   (`_row_union_group_released` — deleted), `:3233` (`_notify_barrier_of_lost_branch`
@@ -1027,9 +1046,11 @@ diff + wardline gate.
   `gate_routed_to_sink` arm was deleted by WS2 Task 7's ruling, so the call-site
   set is smaller than this plan's draft tree — the grep is authoritative)
 - Supersede: the WS2-Task-8 processor-level plumbing witness on
-  `token_traversal.py`'s undeclared-expand runtime seam (in
-  `tests/unit/engine/test_processor.py`, marked "pending WS3 supersession";
-  interim witness for elspeth-c648d4f832) — re-point it at the seam that
+  `token_traversal.py`'s undeclared-expand runtime seam:
+  `tests/unit/engine/test_processor.py::test_row_union_binding_survives_expansion_on_a_branch`
+  (`:3923` — pre-flight located it; its docstring carries the supersession
+  framing, not a literal "pending WS3" marker; interim witness for
+  elspeth-c648d4f832) — re-point it at the seam that
   replaces the old path, mutation-verified again; never delete it without a
   successor witness in the same commit.
 - Test: `tests/unit/engine/test_settle_member_seam.py` (create)
@@ -1239,9 +1260,12 @@ notifiers into:
 
 Then rewrite every caller: `git grep -n "_notify_barrier_of_lost_branch" -- src/` and
 replace each call with `_settle_member_losses` (same arguments — the signature is
-unchanged apart from the name). The empty-flush path (`:1441-1448`) keeps
+unchanged apart from the name). Pre-flight 2026-08-24 call-site roster: ONE in
+`processor.py` (`:1499`, the empty-flush path) and EIGHT in `token_traversal.py`
+(`:165,:224,:347,:381,:475,:509,:619,:639`) — the grep remains authoritative.
+The empty-flush path (`:1499`) keeps
 `notify_in_memory=False`. Fix bypass site 2 by extending the non-empty flush loop
-(`:1642-1652`): quarantined members call the seam too —
+(`:1700-1755`): quarantined members call the seam too —
 
 ```python
             for i, token in enumerate(fctx.buffered_tokens):
@@ -1317,9 +1341,11 @@ rotation ledger), never as part of WS1's.
 ### Task 6: Retire the coalesce executor's raw terminals (bypass site 1)
 
 **Files:**
-- Modify: `src/elspeth/engine/coalesce_executor.py:837-846` (late arrival), `:1050-1059`
-  (group failure), `:1250-1259` (merge-exception cleanup) — and the `CoalesceOutcome`
-  contract at `:52` (`outcomes_recorded` flips to `False` on these arms)
+- Modify: `src/elspeth/engine/coalesce_executor.py:852-861` (late arrival), `:1068-1076`
+  (group failure), `:1271-1279` (merge-exception cleanup) — and the `CoalesceOutcome`
+  contract at `:62-79` (`outcomes_recorded` flips to `False` on these arms)
+  [re-verified 2026-08-24 pre-flight; each block carries a "DIRECT terminal
+  write — bypasses RowProcessor._notify_barrier_of_lost_branch" comment marking it]
 - Modify: `src/elspeth/engine/processor.py` (`_notify_closer_of_loss` failure arm; the
   `outcome.failure_reason` consumers), `src/elspeth/engine/barrier_coordination.py:447-482`
   (late-arrival intake arm), `:487-510` (arrival-completes-failure arm), `:792-819`
@@ -1431,10 +1457,12 @@ git commit -m "feat(engine): closers stop writing token terminals; callers recor
 ### Task 7: Ledger replay and full-table takeover restore onto `group_losses`
 
 **Files:**
-- Modify: `src/elspeth/engine/barrier_coordination.py:703-828` (`_replay_branch_losses`
-  → `_replay_group_losses`), the `BarrierRecoveryCoordinator` restore path (grep
-  `list_coalesce_branch_losses` under `src/` — the §E.4 seed site cited by the spec at
-  `scheduler/branch_losses.py:193`'s consumer)
+- Modify: `src/elspeth/engine/barrier_coordination.py:728-853` (`_replay_branch_losses`
+  → `_replay_group_losses`; the public `replay_durable_branch_losses` wrapper is
+  `:851-853`, its intake call site `:359`), the `BarrierRecoveryCoordinator` restore
+  path (pre-flight 2026-08-24: the §E.4 full-table seed site is
+  `barrier_coordination.py:1502` via the `scheduler_repository.py:794` facade over
+  `scheduler/branch_losses.py:209`)
 - Modify: `tests/e2e/recovery/test_suspended_winner_fences.py` (migrate the
   `adopt_coalesce_branch_losses` fence arm to `adopt_group_losses` — MIGRATED, not
   duplicated)
@@ -1499,7 +1527,7 @@ Expected: FAIL — `replay_durable_group_losses` missing.
 
 - [ ] **Step 3: Implement**
 
-Rewrite `_replay_branch_losses` (`:703-828`) as `_replay_group_losses`:
+Rewrite `_replay_branch_losses` (`:728-850`) as `_replay_group_losses`:
 
 ```python
         losses = self._scheduler.list_unadopted_group_losses(run_id=self._run_id)
@@ -1540,8 +1568,8 @@ coalesce arms (which are otherwise carried verbatim — including the
 the same read facade `_barrier_restore_reads` already exposes —
 `has_released_row_for_node` shows the pattern; put it beside that.)
 
-Rename the public `replay_durable_branch_losses` (`:826-829`) and its callers
-(`processor.py:3943` renamed in Task 4's block; grep for the rest). Point the takeover
+Rename the public `replay_durable_branch_losses` (`:851-853`) and its callers
+(`processor.py:4085-4120` flush block renamed in Task 4's block; grep for the rest). Point the takeover
 restore's full-table read at `list_group_losses(run_id=..., closer_names=...)` — grep
 `list_coalesce_branch_losses` for the restore call site and carry its scoping
 frozenset semantics.
@@ -2307,7 +2335,9 @@ from this task is ever committed except added killer tests.
    moved (Tasks 6, 9, 10) — the unique index only self-detects the double-write
    direction.
 4. **One fixpoint formula:** `git grep -n "derive_end_of_input_flush_bound" src/ tests/`
-   returns nothing; the only formula in the tree is WS2's
+   returns no CODE hits (pre-flight 2026-08-24: `core/dag/bound_regions.py:41,:48`
+   docstring mentions of the deleted names are the tolerated matches — they
+   document the history); the only formula in the tree is WS2's
    `derive_escalation_fixpoint_bound` and the EOF loop iterates
    `PipelineConfig.escalation_fixpoint_bound`.
 
