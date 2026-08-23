@@ -33,14 +33,14 @@ def _make_output(name: str) -> OutputSpec:
     return OutputSpec(name=name, plugin="csv", options={}, on_write_failure="discard")
 
 
-def _transform(node_id: str, input_name: str, on_success: str) -> NodeSpec:
+def _transform(node_id: str, input_name: str, on_success: str, *, on_error: str = "discard") -> NodeSpec:
     return NodeSpec(
         id=node_id,
         node_type="transform",
         plugin="passthrough",
         input=input_name,
         on_success=on_success,
-        on_error="discard",
+        on_error=on_error,
         options={},
         condition=None,
         routes=None,
@@ -291,6 +291,26 @@ class TestCollectorScopeTopology:
         )
         [entry] = _errors_for(state, "scope_opener_duplicate")
         assert "one scope per" in entry.message
+
+    def test_two_transform_on_errors_naming_the_collector_do_not_collide_as_producers(self) -> None:
+        # Rule-9 mechanism pin, collector analogue of the Task-11 coalesce
+        # test in test_state_bound_regions.py: a closer-shaped on_error is a
+        # DIVERT edge into an EXISTING node, not a claim to PRODUCE a
+        # connection under the closer's name. Before the carve-out included
+        # collectors, TWO in-scope claimants produced a false-positive
+        # duplicate_connection_producer ("node 't1' on_error and node 't2'
+        # on_error") on a shape the committed builder ACCEPTS with two DIVERT
+        # edges — the banned composer-red/runtime-green drift.
+        state = _state(
+            _transform("explode", "rows", "pages"),
+            _transform("t1", "pages", "mid", on_error="page_stitcher"),
+            _transform("t2", "mid", "pages_done", on_error="page_stitcher"),
+            _collector(input_name="pages_done"),
+        )
+        summary = state.validate()
+        codes = {entry.error_code for entry in summary.errors}
+        assert "duplicate_connection_producer" not in codes, summary.errors
+        assert "transform_on_error_unknown_sink" not in codes, summary.errors
 
     def test_escalate_with_no_other_barrier_is_rejected(self) -> None:
         state = _state(

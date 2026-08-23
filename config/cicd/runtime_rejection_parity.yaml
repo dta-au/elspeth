@@ -2068,16 +2068,18 @@ sites:
   message: 'Scope closed by collector ''{}'' (opener ''{}'') declares on_group_failure: escalate at an
     outermost bound group — there is no enclosing bound group to escalate to '
   ordinal: 0
-  disposition: mirrored
+  disposition: abstains
   counterpart:
   - scope_escalate_at_outermost
-  note: 'Stage 1 emits scope_escalate_at_outermost (already catalogued in generation.py) for the decidable
-    half of §7 rule 8: scope_on_group_failure=escalate on a collector when the draft holds NO other barrier
-    (coalesce/row_union/collector), so no enclosing bound group can exist. With another barrier present,
-    membership needs the real builder — Stage 1 accepts (its established bound-region abstention; accepting
-    is the safe drift direction) and Stage 2 preview_pipeline rejects with this runtime message. Message
+  note: 'Mirrored on the no-other-barrier topology, abstaining on the rest: Stage 1 emits scope_escalate_at_outermost
+    (already catalogued in generation.py) for the decidable half of §7 rule 8 — scope_on_group_failure=escalate
+    on a collector when the draft holds NO other barrier (coalesce/row_union/collector), so no enclosing
+    bound group can exist. With another barrier present, membership needs the real builder — Stage 1 checks
+    the narrower predicate and deliberately abstains (established bound-region abstention; accepting is
+    the safe drift direction) and Stage 2 preview_pipeline rejects with this runtime message. Message
     follows the Task 10 N1 shape: "Scope closed by collector ''{closer}'' (opener ''{opener}'')" (WS2
-    Task 12).'
+    Task 12; re-dispositioned mirrored → abstains in the Task 12 review round per the file''s partial-mirror
+    precedent).'
 - key: 590b32135dd02949
   path: src/elspeth/core/dag/bound_regions.py
   qualname: validate_no_aggregations_in_regions

@@ -1021,9 +1021,9 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
             )
         )
 
-    # __post_init__ records the runtime default, so None can only mean a
-    # payload authored an explicit null — fold that into the invalid-value arm
-    # rather than silently re-defaulting a value the author wrote.
+    # None never reaches here: __post_init__ normalizes it (explicit null
+    # included) to the recorded runtime default before validate() runs, so
+    # this arm guards only non-None strings outside the vocabulary.
     if node.scope_on_group_failure not in _SCOPE_ON_GROUP_FAILURE_VOCABULARY:
         errors.append(
             _err(
@@ -3577,7 +3577,7 @@ def _check_schema_contracts(
     # a closer-shaped on_error is a DIVERT edge into an EXISTING node, not a
     # claim to produce a connection under the closer's name, so it must not
     # be tracked as a duplicate-producer description candidate either.
-    closer_names = {node.id for node in nodes if node.node_type in ("coalesce", "row_union")}
+    closer_names = {node.id for node in nodes if node.node_type in ("coalesce", "row_union", "collector")}
     source_map = sources
 
     _err = ValidationEntry
