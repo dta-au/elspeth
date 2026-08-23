@@ -1236,19 +1236,33 @@ def build_execution_graph(
     for connection_name, consumer_id in consumers.items():
         producer_id, producer_label = producers[connection_name]
         if producer_id in gate_node_ids and producer_label != "continue":
+            route_labels = gate_connection_route_labels[(producer_id, connection_name)]
             if (producer_id, connection_name) in fork_branch_connections:
                 # This connection IS a fork branch's own producer connection —
-                # its edge must carry the branch name, never a same-gate
-                # route_labels entry that coincidentally targets this same
-                # connection name (addendum A2; see fork_branch_connections).
+                # its edge must ALWAYS carry the branch name, never get
+                # overridden by a same-gate route_labels entry that
+                # coincidentally targets this same connection name (addendum
+                # A2; see fork_branch_connections).
+                #
+                # If a route ALSO targets this connection, its own edge must
+                # STILL be drawn alongside the branch-name edge, not instead
+                # of it (fix round 4, N1, controller-ruled): the route stays
+                # live in the route-resolution map at runtime regardless of
+                # what the graph's edges say, so dropping its edge here
+                # removes rule 4's only witness that an unframed route
+                # re-enters this branch's connection — exactly the F2 hazard
+                # that limb exists to catch. The branch-name edge and a
+                # route-labelled edge to the SAME target are two different
+                # facts about the graph (the branch exists; a route
+                # additionally feeds it), not alternatives.
                 graph.add_edge(producer_id, consumer_id, label=producer_label, mode=RoutingMode.MOVE)
+                for route_label in route_labels:
+                    graph.add_edge(producer_id, consumer_id, label=route_label, mode=RoutingMode.MOVE)
+            elif route_labels:
+                for route_label in route_labels:
+                    graph.add_edge(producer_id, consumer_id, label=route_label, mode=RoutingMode.MOVE)
             else:
-                route_labels = gate_connection_route_labels[(producer_id, connection_name)]
-                if route_labels:
-                    for route_label in route_labels:
-                        graph.add_edge(producer_id, consumer_id, label=route_label, mode=RoutingMode.MOVE)
-                else:
-                    graph.add_edge(producer_id, consumer_id, label=producer_label, mode=RoutingMode.MOVE)
+                graph.add_edge(producer_id, consumer_id, label=producer_label, mode=RoutingMode.MOVE)
             # Preserve gate fallthrough semantics for RoutingAction.continue_():
             # when a gate has a single downstream processing target, continue
             # should route there even if explicit route labels are present.

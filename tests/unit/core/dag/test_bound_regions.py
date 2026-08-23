@@ -661,6 +661,57 @@ def _build_label_hole_bypass() -> ExecutionGraph:
     )
 
 
+def _build_same_gate_route_override_clean_chain(*, override: bool) -> ExecutionGraph:
+    """Review N1 (BLOCKING, final re-review of `ec9109193`): a same-gate
+    route override on a CLEAN branch chain — no sink inside the region, so
+    nothing else fires. The A2 fix (drawing a fork-branch connection's edge
+    unconditionally under the branch name) initially DELETED the
+    route-labelled edge for this shape instead of drawing both: the route
+    ('special' -> 'path_a', the SAME connection 'path_a' branch already
+    produces) stays live in the route-resolution map at runtime regardless
+    of what the graph's edges say, so dropping its edge removed rule 4's
+    only witness that an unframed route re-enters this branch's connection
+    — this shape BUILT at `ec9109193` where it was correctly REJECTED at
+    `5a52184a5`. Fixed by drawing both edges (the branch-name edge AND the
+    route-labelled edge) as two separate facts about the graph, restoring
+    the F2 limb's witness with no `bound_regions.py` change at all.
+    `override=False` is the CONTROL (must build); `override=True` must be
+    rejected by the F2 limb.
+    """
+    source = _BoundRegionMockSource()
+    ta = _BoundRegionTransform(name="ta", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    tb = _BoundRegionTransform(name="tb", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    routes = {"go": "fork"}
+    if override:
+        routes["special"] = "path_a"
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=ta,  # type: ignore[arg-type]
+                settings=TransformSettings(name="ta", plugin=ta.name, input="path_a", on_success="a_out", on_error="discard", options={}),
+            ),
+            WiredTransform(
+                plugin=tb,  # type: ignore[arg-type]
+                settings=TransformSettings(name="tb", plugin=tb.name, input="path_b", on_success="b_out", on_error="discard", options={}),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(name="fork_gate", input="source_out", condition="'go'", routes=routes, fork_to=["path_a", "path_b"]),
+        ],
+        coalesce_settings=[
+            CoalesceSettings(
+                name="coalesce", branches={"path_a": "a_out", "path_b": "b_out"}, policy="require_all", merge="union", on_success="out"
+            ),
+        ],
+    )
+
+
 def _build_queue_backdoor() -> ExecutionGraph:
     """Review F2 (`probe_queue_backdoor.py`, maintainer-ruled 2026-08-23): the
     opener's own non-fork route ('false': side_leg_in) feeds a transform
@@ -1114,6 +1165,21 @@ class TestSESEWalk:
         with pytest.raises(GraphValidationError, match="not one of the fork's declared branches") as exc_info:
             _build_nested_opener_queue_backdoor(leak=True)
         assert "inner_coalesce" in str(exc_info.value)
+
+    def test_same_gate_route_override_clean_chain_control_builds(self) -> None:
+        # Review N1 CONTROL: no route override, must build clean.
+        _build_same_gate_route_override_clean_chain(override=False)
+
+    def test_same_gate_route_override_clean_chain_rejected(self) -> None:
+        # Review N1 (BLOCKING): the A2 builder fix (drawing a fork-branch
+        # edge unconditionally under the branch name) initially DELETED the
+        # route-labelled edge instead of drawing both, silently re-opening
+        # an unframed-entry hazard on a CLEAN branch chain (no sink to
+        # trigger any other limb) that `5a52184a5` correctly rejected. This
+        # is the only witness that discriminates "edge deleted" from "edge
+        # kept alongside the branch-name edge".
+        with pytest.raises(GraphValidationError, match="not one of the fork's declared branches"):
+            _build_same_gate_route_override_clean_chain(override=True)
 
     def test_onehop_queue_backdoor_rejected(self) -> None:
         # Review A1: the solution architect's one-hop discriminator — the
