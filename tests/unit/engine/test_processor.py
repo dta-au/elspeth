@@ -8402,6 +8402,53 @@ class TestResumeIncompleteToken:
         _token_arg, _ctx_arg = process_token.call_args.args
         assert process_token.call_args.kwargs == {"current_node_id": after_expand_node}
 
+    def test_fork_child_branch_to_row_union_resumes_with_row_union_context(self) -> None:
+        """A FORK_CHILD branch bound to a row_union re-drives with row_union context.
+
+        Regression (elspeth-de1941d2bf): the FORK_CHILD arm checked
+        _branch_to_sink, _branch_to_coalesce, and _unbound_branch_first_node,
+        never _branch_to_row_union — a fork-child crashed before its
+        row_union barrier had no resume-start node resolvable and raised.
+        """
+        _, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+
+        branch_first_node = NodeID("branch-first")
+        union_node = NodeID("row_union::variants")
+
+        processor = _make_processor(
+            factory,
+            row_union_node_ids={RowUnionName("variants"): union_node},
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+        )
+        spec = IncompleteTokenSpec(
+            token_id="token-fork-child",
+            row_id="row-1",
+            join_group_id=None,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="control"),),
+            token_data_ref="payload-1",
+            step_in_pipeline=1,
+            max_attempt=0,
+        )
+
+        with (
+            patch.object(processor._nav, "resolve_branch_first_node", return_value=branch_first_node),
+            patch.object(processor, "process_token", return_value=[]) as process_token,
+        ):
+            processor.resume_incomplete_token(
+                spec,
+                make_pipeline_row({"value": 42}),
+                ctx,
+                resume_checkpoint_id="checkpoint-1",
+            )
+
+        process_token.assert_called_once()
+        _token_arg, _ctx_arg = process_token.call_args.args
+        assert process_token.call_args.kwargs == {
+            "current_node_id": branch_first_node,
+            "row_union_name": RowUnionName("variants"),
+        }
+
 
 # =============================================================================
 # _notify_coalesce_of_lost_branch

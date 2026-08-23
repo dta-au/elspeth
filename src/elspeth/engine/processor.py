@@ -2935,6 +2935,8 @@ class RowProcessor:
              None-path routes via branch_to_sink to the terminal sink).
            - branch routes to a coalesce, crashed before the barrier: re-run the branch from
              its first processing node with coalesce context.
+           - branch routes to a row_union, crashed before the barrier: same shape, with
+             row_union context (elspeth-de1941d2bf).
 
         Raises:
             OrchestrationInvariantError: If the token's lineage_path/join_group_id do not
@@ -3017,6 +3019,20 @@ class RowProcessor:
                 ctx,
                 current_node_id=first_node,
                 coalesce_name=coalesce_name,
+            )
+
+        if BranchName(branch) in self._branch_to_row_union:
+            # fork → row_union, crashed BEFORE the barrier: same shape as the
+            # coalesce arm above (elspeth-de1941d2bf) — re-run the branch from
+            # its first node with row_union context so _maybe_row_union_token
+            # fires at the barrier.
+            row_union_name = self._branch_to_row_union[BranchName(branch)]
+            first_node = self._nav.resolve_branch_first_node(branch)
+            return self.process_token(
+                token,
+                ctx,
+                current_node_id=first_node,
+                row_union_name=row_union_name,
             )
 
         if BranchName(branch) in self._unbound_branch_first_node:
