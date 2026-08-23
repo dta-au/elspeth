@@ -10090,10 +10090,13 @@ class TestCompositionStateRowUnion:
         assert any(error.error_code == "row_union_branch_invalid" for error in result.errors)
 
     def test_row_union_rejects_branch_aliases_from_multiple_fork_gates(self) -> None:
+        # Single-branch gates: the pre-rule-2 overflow filler branches were
+        # independently mixed-closure-invalid and would drown the finding
+        # under test.
         second_gate = self._gate(
             id="fork_treatment",
             input="second_fork_in",
-            fork_to=("treatment_branch", "treatment_overflow"),
+            fork_to=("treatment_branch",),
         )
         state = CompositionState(
             sources={
@@ -10101,34 +10104,36 @@ class TestCompositionStateRowUnion:
                 "treatment_source": self._source(on_success="second_fork_in"),
             },
             nodes=(
-                self._gate(fork_to=("control_branch", "control_overflow")),
+                self._gate(fork_to=("control_branch",)),
                 second_gate,
                 self._transform("control", "control_branch", "control_done"),
-                self._transform("control_overflow", "control_overflow", "control_overflow_done"),
                 self._transform("treatment", "treatment_branch", "treatment_done"),
-                self._transform("treatment_overflow", "treatment_overflow", "treatment_overflow_done"),
                 self._row_union(),
                 self._transform("after_union", "union_out", "output"),
             ),
             edges=(),
-            outputs=(
-                self._output(),
-                self._output("control_overflow_done"),
-                self._output("treatment_overflow_done"),
-            ),
+            outputs=(self._output(),),
             metadata=PipelineMetadata(),
             version=1,
         )
 
         result = state.validate()
 
-        origin_error = next(error for error in result.errors if error.error_code == "row_union_branch_origin_invalid")
-        assert "one common gate fork_to" in origin_error.message
-        assert "fork_rows" in origin_error.message
-        assert "fork_treatment" in origin_error.message
+        codes = {error.error_code for error in result.errors}
+        # Rule 2 supersedes the retired origin-analysis mirror (maintainer
+        # ruling 2026-08-23): the enriched roster mismatch is the one
+        # rejection for a union drawn from multiple gates.
+        assert "row_union_branch_origin_invalid" not in codes, codes
+        roster_errors = [error for error in result.errors if error.error_code == "fork_roster_mismatch" and "drawn from" in error.message]
+        assert len(roster_errors) == 1, [error.message for error in result.errors]
+        enriched = roster_errors[0].message
+        assert "variant_union" in enriched
+        assert "drawn from 2 fork gate(s)" in enriched
+        assert "fork_rows" in enriched
+        assert "fork_treatment" in enriched
         # A step-8 topology finding, not the intrinsic node-shape code the
         # mutation preflight blocks on.
-        assert "row_union_branch_invalid" not in {error.error_code for error in result.errors}
+        assert "row_union_branch_invalid" not in codes
 
     def test_row_union_rejects_branch_connection_from_a_different_alias(self) -> None:
         row_union = self._row_union(
