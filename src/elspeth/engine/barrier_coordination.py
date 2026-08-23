@@ -697,7 +697,7 @@ class BarrierIntakeCoordinator:
         # resolve_merged_branch_barrier's docstring (elspeth-0bd2cde19a / E1b).
         continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
             outcome.merged_token.branch_name,
-            flat_default=(coalesce_name, None),
+            completed_coalesce_name=coalesce_name,
             branch_to_coalesce=self._branch_to_coalesce,
             branch_to_row_union=self._branch_to_row_union,
         )

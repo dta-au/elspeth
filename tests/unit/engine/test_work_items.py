@@ -107,33 +107,28 @@ def test_factory_accepts_matching_coalesce_name_and_node_id() -> None:
 class TestResolveMergedBranchBarrier:
     """Unit coverage for resolve_merged_branch_barrier's four outcomes (elspeth-0bd2cde19a)."""
 
-    def test_flat_case_returns_caller_supplied_default_unchanged(self) -> None:
-        """merged_branch_name is None (no enclosing frame) -> flat_default verbatim.
+    def test_flat_case_returns_completed_coalesce_name_unchanged(self) -> None:
+        """merged_branch_name is None (no enclosing frame) -> completed_coalesce_name verbatim.
 
-        Each call site states its own flat-case contract explicitly (round-2
-        F1): complete_coalesce_merge/_fire_coalesce_merge pass the
-        just-completed coalesce's identity; _notify_coalesce_of_lost_branch
-        passes (None, None), since its flat case never carried barrier
-        context and must not gain any as a side effect of the nested fix.
+        One contract for all three call sites (round-2 F1 correction:
+        measured control-vs-patched byte-identical at
+        _notify_coalesce_of_lost_branch too, scratchpad/p8_flat_lossmerge.py
+        — that site's own earlier terminal/non-terminal split means this
+        value is load-bearing only at complete_coalesce_merge/
+        _fire_coalesce_merge's terminal-coalesce check, but is harmless
+        everywhere, so all three sites pass the same thing).
         """
         assert resolve_merged_branch_barrier(
             None,
-            flat_default=(CoalesceName("merge_outer"), None),
+            completed_coalesce_name=CoalesceName("merge_outer"),
             branch_to_coalesce={},
             branch_to_row_union={},
         ) == (CoalesceName("merge_outer"), None)
 
-        assert resolve_merged_branch_barrier(
-            None,
-            flat_default=(None, None),
-            branch_to_coalesce={},
-            branch_to_row_union={},
-        ) == (None, None)
-
     def test_nested_branch_bound_to_coalesce_resolves_fresh(self) -> None:
         result = resolve_merged_branch_barrier(
             "outer_a",
-            flat_default=(CoalesceName("merge_inner"), None),
+            completed_coalesce_name=CoalesceName("merge_inner"),
             branch_to_coalesce={BranchName("outer_a"): CoalesceName("merge_outer")},
             branch_to_row_union={},
         )
@@ -142,7 +137,7 @@ class TestResolveMergedBranchBarrier:
     def test_nested_branch_bound_to_row_union_resolves_fresh(self) -> None:
         result = resolve_merged_branch_barrier(
             "outer_a",
-            flat_default=(CoalesceName("merge_inner"), None),
+            completed_coalesce_name=CoalesceName("merge_inner"),
             branch_to_coalesce={},
             branch_to_row_union={BranchName("outer_a"): RowUnionName("union_outer")},
         )
@@ -160,7 +155,7 @@ class TestResolveMergedBranchBarrier:
         """
         result = resolve_merged_branch_barrier(
             "outer_a",
-            flat_default=(CoalesceName("merge_inner"), None),
+            completed_coalesce_name=CoalesceName("merge_inner"),
             branch_to_coalesce={},
             branch_to_row_union={},
         )
