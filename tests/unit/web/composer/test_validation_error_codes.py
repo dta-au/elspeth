@@ -599,6 +599,7 @@ class TestClosedCodeCatalogueInvariants:
             "guided_delta_nonincident_route",
             "guided_delta_unknown_reference",
             "guided_delta_reviewed_failure_route_required",
+            "guided_collector_not_authorable",
         ),
     )
     def test_guided_delta_codes_are_closed_and_actionable(self, code: str) -> None:

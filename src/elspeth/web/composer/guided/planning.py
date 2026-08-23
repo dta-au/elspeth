@@ -1364,6 +1364,43 @@ def _guided_delta_rejection(
     )
 
 
+def _reject_collector_candidate_nodes(bound: Mapping[str, Any]) -> None:
+    """Refuse a collector-bearing guided candidate with a repairable rejection.
+
+    Interim guard while maintainer ruling elspeth-88bb77953c is open: the
+    guided lane neither authors collectors nor projects them for review (the
+    proposal projection has no collector behavior arm), so a candidate
+    carrying one must be refused cleanly here — at the shared binder every
+    guided candidate path routes through — rather than crash the projection
+    downstream. Malformed ``nodes`` shapes are deliberately ignored: the
+    binder's own shape rejections below own those.
+    """
+    raw_nodes = bound.get("nodes")
+    if type(raw_nodes) is not list:
+        return
+    collector_node_ids: list[str] = []
+    collector_present = False
+    for node in raw_nodes:
+        if isinstance(node, Mapping) and node.get("node_type") == "collector":
+            collector_present = True
+            node_id = node.get("id")
+            if type(node_id) is str and node_id:
+                collector_node_ids.append(node_id)
+    if not collector_present:
+        return
+    raise GuidedCandidateBindingRejected(
+        "guided planner candidate contains collector node(s): collector/scope authoring is not yet "
+        "available in the guided lane. Re-emit the candidate without any node_type='collector' node "
+        "and without scope_name/scope_opener/scope_policy/scope_on_group_failure fields; the guided "
+        "lane authors transform, gate, aggregation, coalesce, row_union, and queue nodes.",
+        error_code="guided_collector_not_authorable",
+        # Node ids are strings the planner itself authored in the rejected
+        # candidate — the same custody class every other connectivity fact in
+        # this module discloses.
+        connectivity={"component_kind": "nodes", "collector_node_ids": cast(JsonValue, collector_node_ids)},
+    )
+
+
 def _canonical_schema_properties() -> Mapping[str, Any]:
     canonical = cast(dict[str, Any], deep_thaw(canonical_set_pipeline_schema()))
     properties = canonical["properties"] if "properties" in canonical else None
@@ -2575,6 +2612,19 @@ def bind_guided_reviewed_components(
         raise ValueError("route_amnesty_predecessor is the amnesty-only seam; the correction flow's predecessor already grants it")
 
     bound = cast(dict[str, Any], deep_thaw(pipeline))
+    # Collector nodes are not yet authorable in the GUIDED lane. The terminal
+    # schema teaches every planner surface the collector node kind (Task 12/13
+    # of the barrier-scopes campaign), but whether and when the guided lane may
+    # propose collectors is an open maintainer ruling (elspeth-88bb77953c) and
+    # the guided proposal projection deliberately carries no collector behavior
+    # arm until it rules. This is a server-side validation REFUSAL — composer
+    # invariant 1 permits rejection, never synthesis — so a collector-bearing
+    # candidate is refused whole, never silently rewritten or stripped, with a
+    # repairable closed-code rejection every guided candidate path shares
+    # (initial/correction deltas, prose amend/replace, and predecessor
+    # documents all route through this binder). Lane-generic: no tutorial or
+    # per-surface branch.
+    _reject_collector_candidate_nodes(bound)
     # Fact-only projection, derived ahead of the rejections below so each can
     # name the reviewed alternatives (the planner already holds these names
     # through guided_redacted_planner_context, so restating them is not new
@@ -3379,7 +3429,15 @@ def _node_behavior(
             "merge": node.merge,
             "timeout_seconds": node.timeout_seconds,
         }
-    assert node.node_type == "gate"
+    if node.node_type != "gate":
+        # Typed fail-closed dispatch, NEVER an assert: under ``python -O`` an
+        # assert vanishes and an unhandled node kind (a collector, until
+        # maintainer ruling elspeth-88bb77953c extends this projection) would
+        # fall through and mis-serialize as a GATE. The binder's collector
+        # guard (_reject_collector_candidate_nodes) refuses such candidates
+        # upstream with a repairable rejection; reaching here is a server-side
+        # integrity failure, deliberately terminal.
+        raise AuditIntegrityError(f"guided proposal projection has no behavior arm for node kind {node.node_type!r}")
     routes = _ordered_gate_routes(node)
     route_names = [name for name, _destination in routes]
     fork_routes = [name for name, destination in routes if destination == "fork"]

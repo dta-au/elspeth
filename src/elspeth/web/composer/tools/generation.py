@@ -903,6 +903,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Return to the reviewed source/output settings form and add or correct the required failure sink before planning topology again.",
     ),
     (
+        r"guided_collector_not_authorable|collector/scope authoring is not yet available in the guided lane",
+        "The guided candidate contains a collector node, but collector/scope authoring is not yet available in the guided lane.",
+        "Re-emit the candidate without any node_type='collector' node and without "
+        "scope_name/scope_opener/scope_policy/scope_on_group_failure fields; author the requested shape with "
+        "the guided lane's node kinds (transform, gate, aggregation, coalesce, row_union, queue).",
+    ),
+    (
         r"guided_route_target_unknown",
         "A routing destination (source/node on_success, node on_error, or edge to_node) names neither a declared "
         "output, a node id, a connection another node consumes, nor 'discard'. The reviewed-output binder cannot "
@@ -1351,6 +1358,11 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "guided_delta_nonincident_route",
     "guided_delta_unknown_reference",
     "guided_delta_reviewed_failure_route_required",
+    # ── Guided collector refusal (interim guard, elspeth-88bb77953c) ───────
+    # The guided binder refuses collector-bearing candidates until the
+    # maintainer rules on guided collector authoring; the code keeps the
+    # refusal inside the bounded repair loop.
+    "guided_collector_not_authorable",
     # ── Reviewed output versus exact field projection ──────────────────────
     "reviewed_output_projection_conflict",
     # ── Unproducible declared output fields (R2-F4, 2026-08-01) ────────────
