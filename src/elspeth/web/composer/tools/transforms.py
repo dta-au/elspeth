@@ -92,6 +92,10 @@ class _UpsertNodeArgumentsModel(BaseModel):
     expected_output_count: int | None = None
     timeout_seconds: _StrictTimeoutSeconds | None = None
     description: str | None = None
+    scope_name: str | None = None
+    scope_opener: str | None = None
+    scope_policy: str | None = None
+    scope_on_group_failure: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -301,6 +305,29 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "type": ["string", "null"],
             "description": _STEP_DESCRIPTION_DESCRIPTION,
         },
+        "scope_name": {
+            "type": ["string", "null"],
+            "description": "Scope identifier for the EXPAND group this collector closes (collector only).",
+        },
+        "scope_opener": {
+            "type": ["string", "null"],
+            "description": "Node id of the multi-row transform that opens the collector's EXPAND group (collector only).",
+        },
+        "scope_policy": {
+            "type": ["string", "null"],
+            "enum": ["require_all", "best_effort", None],
+            "description": (
+                "Group arrival policy (collector only). REQUIRED for collectors — no default; the author "
+                "decides whether a lost member fails the group."
+            ),
+        },
+        "scope_on_group_failure": {
+            "type": ["string", "null"],
+            "enum": ["quarantine", "escalate", None],
+            "description": (
+                "require_all failure handling (collector only). Defaults to 'quarantine'; 'escalate' requires an enclosing bound group."
+            ),
+        },
     },
     "required": ["id", "node_type", "input"],
     "additionalProperties": False,
@@ -359,6 +386,10 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "on_error/routes/fork_to), and options accepts only an optional "
         "description. Multiple producers may publish that name precisely "
         "because the queue is declared. "
+        "collector closes a declared EXPAND scope with a batch-aware plugin: "
+        "set scope_name, scope_opener (the multi-row transform that opens the "
+        "group), scope_policy ('require_all' or 'best_effort', no default), and "
+        "optionally scope_on_group_failure ('quarantine' default, or 'escalate'). "
         "Omit fields that don't apply to your node_type."
     ),
     json_schema=_UPSERT_NODE_DECLARATION_JSON_SCHEMA,
@@ -609,7 +640,9 @@ def _execute_upsert_node(
     # Gates and coalesces intentionally have plugin=None (they're expression-based or
     # structural, not plugin-driven), so the "and plugin is not None" guard covers them.
     # NodeSpec documents this: "plugin: Plugin name. None for gates and coalesces."
-    if node_type in ("transform", "aggregation") and plugin is not None:
+    # Collectors reuse the batch-transform plugin contract, so their plugin
+    # runs the same policy/prevalidation gates (barrier-scopes spec §3).
+    if node_type in ("transform", "aggregation", "collector") and plugin is not None:
         plugin_error = _validate_plugin_name(context, "transform", plugin)
         if plugin_error is not None:
             return _plugin_policy_failure(state, plugin_error)
@@ -679,6 +712,10 @@ def _execute_upsert_node(
         expected_output_count=validated.expected_output_count,
         timeout_seconds=validated.timeout_seconds,
         description=validated.description,
+        scope_name=validated.scope_name,
+        scope_opener=validated.scope_opener,
+        scope_policy=validated.scope_policy,
+        scope_on_group_failure=validated.scope_on_group_failure,
     )
 
     row_union_contract_error = _row_union_node_contract_error(

@@ -43,6 +43,7 @@ CAPABILITY_CORE_NODE_GUIDANCE: Final[Mapping[str, str]] = MappingProxyType(
     {
         "aggregation": "[capability-node:aggregation]",
         "coalesce": "[capability-node:coalesce]",
+        "collector": "[capability-node:collector]",
         "gate": "[capability-node:gate]",
         "queue": "[capability-node:queue]",
         "row_union": "[capability-node:row_union]",

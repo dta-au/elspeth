@@ -79,6 +79,13 @@
   border: 1px solid var(--color-badge-queue-border);
 }
 
+/* Collector — lime (EXPAND-group closer; flushes a completed scope as one batch) */
+.type-badge-collector {
+  background-color: var(--color-badge-collector-bg);
+  color: var(--color-badge-collector);
+  border: 1px solid var(--color-badge-collector-border);
+}
+
 
 /* ---------------------------------------------------------------------------
    Status Badge Utility Classes

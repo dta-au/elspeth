@@ -1931,6 +1931,14 @@ class _PipelineNodeModel(BaseModel):
     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
     # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
     description: str | None = None
+    # Collector scope binding (barrier-scopes spec §3, WS2 Task 12/13): four
+    # structural names — a scope identifier, a transform node id, and two
+    # closed engine vocabularies. Non-Sensitive scalars like the sibling
+    # policy/merge fields; never payload.
+    scope_name: str | None = None
+    scope_opener: str | None = None
+    scope_policy: str | None = None
+    scope_on_group_failure: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3692,6 +3700,10 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "output_mode",
                     "expected_output_count",
                     "timeout_seconds",
+                    "scope_name",
+                    "scope_opener",
+                    "scope_policy",
+                    "scope_on_group_failure",
                 ),
                 sensitive_argument_keys=("options", "routes", "trigger"),
                 argument_summarizers={

@@ -141,6 +141,23 @@ ids identify components; they are not implicit connections.
   ONLY the connections named in its `branches` values; its own `input` field
   is schema-required but is not a consuming binding — set it to the first
   branch's arriving connection by convention.
+- [capability-node:collector] A `collector` closes a declared EXPAND scope: it
+  buffers every row a multi-row transform expanded from one input row and
+  flushes them as ONE batch when the group is complete, in expansion order —
+  never on a count/timeout/condition trigger (`trigger` is rejected on a
+  collector). It applies a batch-aware plugin (the same plugin contract as
+  aggregations) and carries its scope binding directly on the node:
+  `scope_name` (the scope identifier), `scope_opener` (the node id of the
+  multi-row transform that opens the group — it must name a transform in the
+  pipeline), `scope_policy` (`require_all` or `best_effort` — REQUIRED, no
+  default: the author decides whether a lost member fails the group), and
+  optional `scope_on_group_failure` (`quarantine`, the default terminal
+  handling, or `escalate`, which hands the loss to an enclosing bound group
+  and is rejected when provably none exists). One scope per collector and per
+  opener; `on_success` names the flush destination (a sink or a consumed
+  connection); `on_error` is optional (`discard` or a sink name — omitted, the
+  route derives from the scope's group machinery). Omit gate, coalesce, and
+  aggregation fields.
 - [capability-node:row_union] A `row_union` is a plugin-free, correlated
   barrier that waits for every declared fork branch, then releases the
   original branch rows in declared order without merging fields. Declare at
@@ -172,7 +189,7 @@ The terminal schema is authoritative. Its covered structural families are:
 | source | `plugin`, `blob_id`, `options`, `on_success`, `on_validation_failure`, `description`, `inline_blob` |
 | named_source | `plugin`, `options`, `on_success`, `on_validation_failure`, `description` |
 | inline_blob | `filename`, `mime_type`, `content`, `description` |
-| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds`, `description` |
+| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds`, `description`, `scope_name`, `scope_opener`, `scope_policy`, `scope_on_group_failure` |
 | trigger | `count`, `timeout_seconds`, `condition` |
 | edge | `id`, `from_node`, `to_node`, `edge_type`, `label` |
 | output | `sink_name`, `plugin`, `options`, `on_write_failure`, `description` |

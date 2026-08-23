@@ -17,6 +17,7 @@ export const BADGE_COLORS = {
   coalesce: "var(--color-badge-coalesce)",
   row_union: "var(--color-badge-row-union)",
   queue: "var(--color-badge-queue)",
+  collector: "var(--color-badge-collector)",
   sink: "var(--color-badge-sink)",
 } as const;
 
@@ -28,6 +29,7 @@ export const BADGE_BACKGROUNDS = {
   coalesce: "var(--color-badge-coalesce-bg)",
   row_union: "var(--color-badge-row-union-bg)",
   queue: "var(--color-badge-queue-bg)",
+  collector: "var(--color-badge-collector-bg)",
   sink: "var(--color-badge-sink-bg)",
 } as const;
 

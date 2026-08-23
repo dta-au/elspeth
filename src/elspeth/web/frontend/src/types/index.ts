@@ -157,7 +157,8 @@ export type NodeType =
   | "aggregation"
   | "coalesce"
   | "row_union"
-  | "queue";
+  | "queue"
+  | "collector";
 
 /**
  * A node in the pipeline composition DAG.
@@ -183,6 +184,11 @@ export interface NodeSpec {
   timeout_seconds?: number | null;
   /** Composer-authored one-sentence prose shown on the Spec tab. Absent on states authored before the field existed. */
   description?: string | null;
+  /** Collector scope binding (barrier-scopes spec §3): present only on collector nodes. */
+  scope_name?: string | null;
+  scope_opener?: string | null;
+  scope_policy?: string | null;
+  scope_on_group_failure?: string | null;
 }
 
 /** An edge connecting two nodes in the DAG. */

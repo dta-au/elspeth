@@ -10,7 +10,8 @@ export interface TypeBadgeProps extends HTMLAttributes<HTMLSpanElement> {
     | "aggregation"
     | "coalesce"
     | "row_union"
-    | "queue";
+    | "queue"
+    | "collector";
   /** Override the label (defaults to the type name). */
   children?: ReactNode;
 }

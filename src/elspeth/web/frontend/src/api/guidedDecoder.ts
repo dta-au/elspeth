@@ -80,6 +80,7 @@ const COMPOSITION_NODE_TYPES = new Set([
   "coalesce",
   "row_union",
   "queue",
+  "collector",
 ]);
 const COMPOSITION_EDGE_TYPES = new Set(["on_success", "on_error", "route_true", "route_false", "fork"]);
 const POLICY_REASONS = new Set([
@@ -1982,6 +1983,10 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
         "expected_output_count",
         "timeout_seconds",
         "description",
+        "scope_name",
+        "scope_opener",
+        "scope_policy",
+        "scope_on_group_failure",
       ],
     );
     const nodeType = stringValue(node.node_type, `${nodePath}.node_type`);
@@ -2038,6 +2043,18 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
     }
     if (node.description !== undefined) {
       decoded.description = nullableString(node.description, `${nodePath}.description`);
+    }
+    if (node.scope_name !== undefined) {
+      decoded.scope_name = nullableString(node.scope_name, `${nodePath}.scope_name`);
+    }
+    if (node.scope_opener !== undefined) {
+      decoded.scope_opener = nullableString(node.scope_opener, `${nodePath}.scope_opener`);
+    }
+    if (node.scope_policy !== undefined) {
+      decoded.scope_policy = nullableString(node.scope_policy, `${nodePath}.scope_policy`);
+    }
+    if (node.scope_on_group_failure !== undefined) {
+      decoded.scope_on_group_failure = nullableString(node.scope_on_group_failure, `${nodePath}.scope_on_group_failure`);
     }
     return decoded;
   });

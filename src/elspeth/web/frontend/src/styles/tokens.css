@@ -93,6 +93,10 @@
      as its own primitive. Shares one reviewed palette with the website
      hand-mirror; #ff91c8 on #4a2238 is ~6.43:1 (clears the 3:1 badge gate). */
   --color-badge-queue:       #ff91c8;
+  /* Collector — lime, outside every other badge family so the EXPAND-group
+     closer reads as its own primitive. #b9e07a on #33421f is ~7.22:1
+     (clears the 3:1 badge gate). */
+  --color-badge-collector:   #b9e07a;
 
   /* ── Component type badge backgrounds — opaque pre-composited over --color-bg ──── */
   --color-badge-source-bg:   #184244;
@@ -103,6 +107,7 @@
   --color-badge-coalesce-bg: #10434a;
   --color-badge-row-union-bg: #30365f;
   --color-badge-queue-bg:    #4a2238;
+  --color-badge-collector-bg: #33421f;
 
   /* ── Component type badge borders ────────────────────────────────────────── */
   --color-badge-source-border:      rgba(77, 184, 154, 0.3);
@@ -113,6 +118,7 @@
   --color-badge-coalesce-border:    rgba(24, 194, 192, 0.3);
   --color-badge-row-union-border:   rgba(174, 184, 255, 0.35);
   --color-badge-queue-border:       rgba(255, 145, 200, 0.3);
+  --color-badge-collector-border:   rgba(185, 224, 122, 0.3);
 
   /* ── Classification banner — protective-marking colours ──────────────────
      Operator-declared deployment marking (WebSettings.classification_banner),
@@ -495,6 +501,9 @@
   /* Queue — deep pink, mirror of the dark #ff91c8; #a13770 on #f3e1eb is
      ~5.09:1 (clears the 3:1 badge gate). */
   --color-badge-queue:       #a13770;
+  /* Collector — olive-lime mirror of the dark #b9e07a; #5a7a1f on #e9f0da is
+     ~4.23:1 (clears the 3:1 badge gate). */
+  --color-badge-collector:   #5a7a1f;
 
   /* ── Component type badge backgrounds — opaque pre-composited over --color-bg ──── */
   --color-badge-source-bg:   #dcebe9;
@@ -505,6 +514,7 @@
   --color-badge-coalesce-bg: #d8eaec;
   --color-badge-row-union-bg: #e5e8fa;
   --color-badge-queue-bg:    #f3e1eb;
+  --color-badge-collector-bg: #e9f0da;
 
   /* ── Component type badge borders ────────────────────────────────────────── */
   --color-badge-source-border:      rgba(42, 138, 112, 0.35);
@@ -515,6 +525,7 @@
   --color-badge-coalesce-border:    rgba(14, 128, 144, 0.35);
   --color-badge-row-union-border:   rgba(79, 91, 181, 0.4);
   --color-badge-queue-border:       rgba(161, 55, 112, 0.35);
+  --color-badge-collector-border:   rgba(90, 122, 31, 0.35);
 
   /* ── Interactive / accent ────────────────────────────────────────────────── */
   --color-accent:            #156048;

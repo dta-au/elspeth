@@ -165,7 +165,7 @@
     "shape": "declarative"
   },
   "set_pipeline": {
-    "hash": "2be00ea4558632ce540cb0dd4f588a306b0b4c2d1e76ba7a428db72dba70fff6",
+    "hash": "93be9bb79249e452d9a92876ed6da6e3eaaefc2e65d9df6cbb8fe3ba590359c2",
     "sensitive_path_count": 14,
     "shape": "type_driven"
   },
@@ -200,7 +200,7 @@
     "shape": "declarative"
   },
   "upsert_node": {
-    "hash": "5e655ce50aed0c23614781e07992623e85bf1d15d25ead43d8ba5d048eeb69c9",
+    "hash": "b986cfca165f4922b31b1fd6aac56d653466643c88c52274b8bf5d54fe94dbff",
     "sensitive_path_count": 3,
     "shape": "declarative"
   },

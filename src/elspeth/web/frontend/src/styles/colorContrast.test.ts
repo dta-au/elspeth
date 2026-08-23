@@ -26,6 +26,7 @@ const BADGE_TOKEN_KINDS = [
   "coalesce",
   "row_union",
   "queue",
+  "collector",
 ] as const;
 
 it("loads inspected CSS through the runtime stylesheet barrel", () => {

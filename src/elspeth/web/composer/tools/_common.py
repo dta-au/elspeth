@@ -1391,6 +1391,10 @@ def _serialize_node(node: NodeSpec) -> dict[str, Any]:
         "expected_output_count": node.expected_output_count,
         "timeout_seconds": node.timeout_seconds,
         "description": node.description,
+        "scope_name": node.scope_name,
+        "scope_opener": node.scope_opener,
+        "scope_policy": node.scope_policy,
+        "scope_on_group_failure": node.scope_on_group_failure,
     }
 
 
@@ -3052,6 +3056,10 @@ class _SetPipelineNodePayload(TypedDict):
     expected_output_count: int | None
     timeout_seconds: float | None
     description: str | None
+    scope_name: str | None
+    scope_opener: str | None
+    scope_policy: str | None
+    scope_on_group_failure: str | None
 
 
 def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonValue]:

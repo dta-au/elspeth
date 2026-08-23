@@ -1114,7 +1114,10 @@ def build_set_pipeline_candidate(
         if credential_error is not None:
             _record_component_rejection(_candidate(credential_error))
             continue
-        if node_type in ("transform", "aggregation") and node_plugin is not None:
+        # Collectors reuse the batch-transform plugin contract, so their
+        # plugin runs the same policy/prevalidation gates as transform and
+        # aggregation plugins (barrier-scopes spec §3).
+        if node_type in ("transform", "aggregation", "collector") and node_plugin is not None:
             plugin_error = _validate_plugin_name(context, "transform", node_plugin)
             if plugin_error is not None:
                 _record_component_rejection(_plugin_policy_failure(state, plugin_error, component=f"Node '{node_id}'"))
@@ -1370,6 +1373,10 @@ def build_set_pipeline_candidate(
             expected_output_count=n.expected_output_count,
             timeout_seconds=n.timeout_seconds,
             description=n.description,
+            scope_name=n.scope_name,
+            scope_opener=n.scope_opener,
+            scope_policy=n.scope_policy,
+            scope_on_group_failure=n.scope_on_group_failure,
         )
         # Validate every queue's intrinsic shape via the single shared guard
         # BEFORE the new state is assembled/assigned below, so a malformed
@@ -1860,6 +1867,28 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "type": ["string", "null"],
                             "description": _STEP_DESCRIPTION_DESCRIPTION,
                         },
+                        "scope_name": {
+                            "type": ["string", "null"],
+                            "description": "Scope identifier for the EXPAND group this collector closes (collector only).",
+                        },
+                        "scope_opener": {
+                            "type": ["string", "null"],
+                            "description": ("Node id of the multi-row transform that opens the collector's EXPAND group (collector only)."),
+                        },
+                        "scope_policy": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "Group arrival policy (collector only): 'require_all' or 'best_effort'. REQUIRED for "
+                                "collectors — there is no default; the author decides whether a lost member fails the group."
+                            ),
+                        },
+                        "scope_on_group_failure": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "require_all failure handling (collector only): 'quarantine' (default) or 'escalate' "
+                                "('escalate' requires an enclosing bound group)."
+                            ),
+                        },
                     },
                     "required": ["id", "node_type", "input"],
                 },
@@ -1869,7 +1898,11 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "description; multiple producers may publish that name precisely because the queue is declared. "
                     "A row_union is plugin-free require_all fork reconvergence: at least two ordered branches, "
                     "input set to the first branch connection, on_success published to downstream processing "
-                    "(not a sink), no options/routing/policy/merge fields, optional timeout_seconds."
+                    "(not a sink), no options/routing/policy/merge fields, optional timeout_seconds. "
+                    "A collector closes a declared EXPAND scope: node_type='collector', a batch-aware plugin, "
+                    "and the scope binding authored on the node — scope_name, scope_opener (the multi-row "
+                    "transform that opens the group), scope_policy ('require_all' or 'best_effort', no default), "
+                    "and optional scope_on_group_failure ('quarantine' default, or 'escalate')."
                 ),
             },
             "edges": {
