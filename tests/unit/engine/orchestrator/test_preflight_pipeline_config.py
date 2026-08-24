@@ -60,6 +60,9 @@ class _GraphStub:
     def get_config_gate_id_map(self) -> dict[object, object]:
         return {}
 
+    def get_error_routable_closer_names(self) -> frozenset[str]:
+        return frozenset()
+
 
 def test_assemble_pipeline_config_preserves_resolved_audit_config() -> None:
     """The shared runtime assembly path must not create empty Landscape run configs."""

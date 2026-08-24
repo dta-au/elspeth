@@ -314,8 +314,19 @@ class TokenTraversalEngine:
         Returns:
             _TransformTerminal with QUARANTINED or ROUTED_ON_ERROR outcome.
         """
-        if error_sink == "discard":
-            # Intentionally discarded - QUARANTINED
+        if error_sink == "discard" or (error_sink is not None and self._processor._group_bindings.is_error_routable_closer(error_sink)):
+            # Intentionally discarded - QUARANTINED. Also covers rule 9
+            # (spec §7, WS3 Task 9b, Ruling 50): on_error naming this
+            # transform's own enclosing region's closer settles EXACTLY as
+            # this branch — same terminal path, same branch_loss_reason,
+            # same group_losses row (closer/group/member/reason) — because
+            # spec §7 rule 9 requires the explicit route to settle "exactly
+            # as the omitted-on_error twin does". The DIVERT edge into the
+            # closer is a STRUCTURAL AUDIT MARKER only (WS2 Task 11's build
+            # side, recorded separately via record_routing_event) — the
+            # failing token must NEVER arrive at the closer as a
+            # pseudo-member through it; it terminalizes right here, exactly
+            # like a plain discard.
             # The QUARANTINED path tolerates an "unknown_error" fallback for
             # historical reasons; do NOT extend that fallback to ROUTED_ON_ERROR
             # below — see the offensive guard in the routed branch.
@@ -591,7 +602,19 @@ class TokenTraversalEngine:
         if failure is None:
             raise OrchestrationInvariantError("Gate error handling requires FailureInfo evidence")
 
-        if outcome.discarded:
+        if outcome.discarded or (
+            outcome.sink_name is not None and self._processor._group_bindings.is_error_routable_closer(outcome.sink_name)
+        ):
+            # Also covers rule 9 (spec §7, WS3 Task 9b, Ruling 50): on_error
+            # naming this gate's own enclosing region's closer settles
+            # EXACTLY as this branch — same terminal path, same reason,
+            # same group_losses row — because spec §7 rule 9 requires the
+            # explicit route to settle "exactly as the omitted-on_error
+            # twin does". The DIVERT edge into the closer is a STRUCTURAL
+            # AUDIT MARKER only (WS2 Task 11's build side, recorded
+            # separately via record_routing_event) — the failing token
+            # must NEVER arrive at the closer as a pseudo-member through
+            # it; it terminalizes right here, exactly like a plain discard.
             error_hash = compute_error_hash(
                 failure.message,
                 exception_type=failure.exception_type,
@@ -634,6 +657,7 @@ class TokenTraversalEngine:
         error_sink = outcome.sink_name
         if error_sink is None:
             raise OrchestrationInvariantError("Gate DIVERT outcome requires a named error sink or discarded=True")
+
         # Category token only (String(64) audit column, elspeth-74b795208f);
         # the FailureInfo on the routed result carries the detail.
         sibling_results = self._processor._settle_member_losses(

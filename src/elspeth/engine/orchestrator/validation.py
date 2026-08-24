@@ -105,8 +105,21 @@ def validate_pipeline_route_targets(
     route_resolution_map: Mapping[tuple[NodeID, str], RouteDestination],
     transform_id_map: Mapping[int, NodeID],
     config_gate_id_map: Mapping[GateName, NodeID],
+    closer_names: frozenset[str] = frozenset(),
 ) -> None:
-    """Run the full route-target preflight bundle for a pipeline config."""
+    """Run the full route-target preflight bundle for a pipeline config.
+
+    ``closer_names`` (spec §7 rule 9, WS3 Task 9b): legal ``on_error``
+    targets beyond a sink name — coalesce/row_union closer names the
+    graph's own builder already accepted (``ExecutionGraph.
+    get_error_routable_closer_names()``). The BUILDER is the
+    in-region/out-of-region validity authority (``core/dag/builder.py``'s
+    rule-9 resolution runs at graph construction, before this ever sees the
+    config): a closer name reaching this validator implies the builder
+    already accepted it, so this only needs to widen the "is this a legal
+    non-sink destination" membership test — it must NEVER re-derive region
+    membership.
+    """
 
     available_sinks = set(config.sinks.keys())
     validate_route_destinations(
@@ -120,10 +133,12 @@ def validate_pipeline_route_targets(
     validate_transform_error_sinks(
         transforms=config.transforms,
         available_sinks=available_sinks,
+        closer_names=closer_names,
     )
     validate_gate_error_sinks(
         gates=config.gates,
         available_sinks=available_sinks,
+        closer_names=closer_names,
     )
     validate_aggregation_error_sinks(
         aggregation_settings=config.aggregation_settings,
@@ -146,8 +161,10 @@ def validate_pipeline_route_targets(
 def validate_transform_error_sinks(
     transforms: Sequence[RowPlugin],
     available_sinks: set[str],
+    closer_names: frozenset[str] = frozenset(),
 ) -> None:
-    """Validate all transform on_error destinations reference existing sinks.
+    """Validate all transform on_error destinations reference an existing
+    sink OR a legal rule-9 closer.
 
     Called at pipeline initialization, BEFORE any rows are processed.
     This catches config errors early instead of failing mid-run with KeyError.
@@ -155,9 +172,15 @@ def validate_transform_error_sinks(
     Args:
         transforms: List of transform plugins
         available_sinks: Set of sink names from PipelineConfig
+        closer_names: Coalesce/row_union closer names the builder already
+            accepted as this transform's own enclosing-region target (spec
+            §7 rule 9, WS3 Task 9b) — see
+            ``validate_pipeline_route_targets``'s docstring for why this
+            widens membership only, never re-derives region validity.
 
     Raises:
-        RouteValidationError: If any transform on_error references a non-existent sink
+        RouteValidationError: If any transform on_error references neither
+            an existing sink nor a known closer.
     """
     for transform in transforms:
         on_error = transform.on_error
@@ -169,6 +192,9 @@ def validate_transform_error_sinks(
 
         if on_error == "discard":
             # "discard" is a special value, not a sink name
+            continue
+
+        if on_error in closer_names:
             continue
 
         # on_error should reference an existing sink
@@ -184,11 +210,15 @@ def validate_transform_error_sinks(
 def validate_gate_error_sinks(
     gates: Sequence[GateSettings],
     available_sinks: set[str],
+    closer_names: frozenset[str] = frozenset(),
 ) -> None:
-    """Validate optional config-gate row-error destinations."""
+    """Validate optional config-gate row-error destinations reference an
+    existing sink OR a legal rule-9 closer (see ``validate_transform_error_sinks``)."""
     for gate in gates:
         on_error = gate.on_error
         if on_error is None or on_error == "discard":
+            continue
+        if on_error in closer_names:
             continue
         if on_error not in available_sinks:
             raise RouteValidationError(

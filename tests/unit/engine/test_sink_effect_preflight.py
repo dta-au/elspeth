@@ -746,6 +746,7 @@ def test_non_run_pipeline_assembly_does_not_enforce_effect_capability(
         get_route_resolution_map=lambda: {},
         get_transform_id_map=lambda: {},
         get_config_gate_id_map=lambda: {},
+        get_error_routable_closer_names=lambda: frozenset(),
         escalation_fixpoint_bound=1_000,
     )
 

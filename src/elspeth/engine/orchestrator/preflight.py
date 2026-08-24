@@ -666,6 +666,7 @@ def assemble_and_validate_pipeline_config(
         route_resolution_map=graph.get_route_resolution_map(),
         transform_id_map=graph.get_transform_id_map(),
         config_gate_id_map=graph.get_config_gate_id_map(),
+        closer_names=frozenset(graph.get_error_routable_closer_names()),
     )
 
     # NB: Value-source compliance is enforced upstream in

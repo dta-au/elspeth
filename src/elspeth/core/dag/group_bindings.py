@@ -144,6 +144,17 @@ class GroupBindingRegistry:
     def by_closer_node(self) -> dict[NodeID, GroupBinding]:
         return {b.closer_node_id: b for b in self.bindings}
 
+    def is_error_routable_closer(self, name: str) -> bool:
+        """Whether ``name`` is a legal rule-9 ``on_error`` closer target at
+        RUNTIME (spec §7 rule 9, WS3 Task 9b) — coalesce/row_union only.
+
+        Collector closers are excluded (mirrors ``ExecutionGraph.
+        get_error_routable_closer_names()``'s fuller trigger comment):
+        extending this to collectors is WS4 Task 8-12's parity sweep, and a
+        collector-bound graph cannot reach a live dispatch anyway
+        (hard-refused pre-execution)."""
+        return any(binding.closer_name == name and binding.closer_kind is not CloserKind.COLLECTOR for binding in self.bindings)
+
     def binding_for(self, frame: LineageFrame) -> GroupBinding | None:
         """Resolve one lineage frame to its bound closer (None = inert frame).
 
