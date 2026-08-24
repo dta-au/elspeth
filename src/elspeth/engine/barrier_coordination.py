@@ -242,6 +242,10 @@ class BarrierIntakeCoordinator:
         collector_node_ids: Mapping[CollectorName, NodeID] | None = None,
         complete_collector_fire: Callable[..., None] | None = None,
         route_collector_release: Callable[..., CollectorRelease] | None = None,
+        merged_continuation_cursor: Callable[
+            [TokenInfo, CoalesceName], tuple[CoalesceName | None, RowUnionName | None, CollectorName | None]
+        ]
+        | None = None,
     ) -> None:
         self._run_id = run_id
         self._scheduler = scheduler
@@ -277,6 +281,7 @@ class BarrierIntakeCoordinator:
         self._collector_node_ids: Mapping[CollectorName, NodeID] = collector_node_ids or {}
         self._complete_collector_fire = complete_collector_fire
         self._route_collector_release = route_collector_release
+        self._merged_continuation_cursor = merged_continuation_cursor
         # spec §6.3 (Task 8): parked closer FAIL verdicts awaiting settlement,
         # keyed on (closer_name, group_id). In-memory only — re-derivable at
         # takeover because replaying the durable losses re-fires the closer's
@@ -982,12 +987,23 @@ class BarrierIntakeCoordinator:
         # barrier context FRESH from that branch identity, never reuse
         # coalesce_name (the barrier it was just released from): see
         # resolve_merged_branch_barrier's docstring (elspeth-0bd2cde19a / E1b).
-        continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
-            outcome.merged_token.branch_name,
-            completed_coalesce_name=coalesce_name,
-            branch_to_coalesce=self._branch_to_coalesce,
-            branch_to_row_union=self._branch_to_row_union,
-        )
+        continuation_collector_name: CollectorName | None = None
+        if self._merged_continuation_cursor is not None:
+            # The processor's cursor derivation covers the scope case too: a
+            # coalesce INSIDE a scope releases the scope's member, whose
+            # continuation must hold at the collector (the collector cursor
+            # replaces the coalesce cursor; see
+            # RowProcessor._merged_continuation_cursor).
+            continuation_coalesce_name, continuation_row_union_name, continuation_collector_name = self._merged_continuation_cursor(
+                outcome.merged_token, coalesce_name
+            )
+        else:
+            continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
+                outcome.merged_token.branch_name,
+                completed_coalesce_name=coalesce_name,
+                branch_to_coalesce=self._branch_to_coalesce,
+                branch_to_row_union=self._branch_to_row_union,
+            )
         merged_item = self._work_items.create(
             token=outcome.merged_token,
             current_node_id=coalesce_node_id,
@@ -996,9 +1012,10 @@ class BarrierIntakeCoordinator:
             # restoring WorkItemFactory.create's mismatch cross-check on
             # this path (elspeth-0bd2cde19a round-2 F4). Nested: only the
             # resolved name is known here; create() re-derives the node id.
-            coalesce_node_id=(coalesce_node_id if outcome.merged_token.branch_name is None else None),
+            coalesce_node_id=(coalesce_node_id if continuation_coalesce_name == coalesce_name else None),
             coalesce_name=continuation_coalesce_name,
             row_union_name=continuation_row_union_name,
+            collector_name=continuation_collector_name,
             join_group_id=outcome.join_group_id,
         )
         self._complete_coalesce_fire(

@@ -839,6 +839,7 @@ class RowProcessor:
             collector_node_ids=self._collector_node_ids,
             complete_collector_fire=self._complete_collector_fire,
             route_collector_release=self.route_collector_release,
+            merged_continuation_cursor=self._merged_continuation_cursor,
         )
         # Scheduler-drain subsystem (elspeth-c49f33d6e4 component 3): the
         # coordinator owns the durable claim/drain loop, dispositions,
@@ -3918,11 +3919,8 @@ class RowProcessor:
             # measurement — see
             # .superpowers/sdd/2026-08-21-unified-lineage-ws2-config-validation/task-e1-review.md).
             # See resolve_merged_branch_barrier's docstring.
-            continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
-                outcome.merged_token.branch_name,
-                completed_coalesce_name=coalesce_name,
-                branch_to_coalesce=self._branch_to_coalesce,
-                branch_to_row_union=self._branch_to_row_union,
+            continuation_coalesce_name, continuation_row_union_name, continuation_collector_name = self._merged_continuation_cursor(
+                outcome.merged_token, coalesce_name
             )
             merged_item = self._work_items.create(
                 token=outcome.merged_token,
@@ -3932,10 +3930,12 @@ class RowProcessor:
                 # restoring WorkItemFactory.create's mismatch cross-check on
                 # this path, same as the other two sites (elspeth-0bd2cde19a
                 # round-2 F4/N3). Nested: only the resolved name is known
-                # here; create() re-derives the node id.
-                coalesce_node_id=(coalesce_node_id if outcome.merged_token.branch_name is None else None),
+                # here; create() re-derives the node id. Inside a scope the
+                # collector cursor replaces the coalesce cursor entirely.
+                coalesce_node_id=(coalesce_node_id if continuation_coalesce_name == coalesce_name else None),
                 coalesce_name=continuation_coalesce_name,
                 row_union_name=continuation_row_union_name,
+                collector_name=continuation_collector_name,
                 join_group_id=outcome.join_group_id,
             )
             self._complete_coalesce_fire(
@@ -4818,7 +4818,17 @@ class RowProcessor:
                 "A row_union must continue on a processing connection; terminal "
                 "row_union -> sink release is rejected at build time."
             )
-        return tuple(self._work_items.create(token=token, current_node_id=continuation_node_id) for token in released_tokens)
+        # A union inside a scope releases the scope's members: the released
+        # tokens' remaining innermost frame is the bound EXPAND frame, and the
+        # continuation must hold at the collector (spec §7 rules 2/5).
+        return tuple(
+            self._work_items.create(
+                token=token,
+                current_node_id=continuation_node_id,
+                collector_name=self._enclosing_collector_cursor(token),
+            )
+            for token in released_tokens
+        )
 
     def _released_collector_cursor(self, token: TokenInfo) -> tuple[CoalesceName | None, RowUnionName | None, CollectorName | None]:
         """Barrier cursor for a token a collector just released (spec §7 rules 2/5).
@@ -4841,10 +4851,58 @@ class RowProcessor:
             if branch_key in self._branch_to_row_union:
                 return None, self._branch_to_row_union[branch_key], None
             return None, None, None
+        return None, None, self._enclosing_collector_cursor(token)
+
+    def _enclosing_collector_cursor(self, token: TokenInfo) -> CollectorName | None:
+        """The collector cursor a token owes its ENCLOSING scope, if its
+        innermost frame is a bound EXPAND frame (spec §7 rules 2/5).
+
+        Resolved through the registry with the META-9.1 re-derivation, so a
+        release on a worker that never ran the opener still finds the
+        binding. None when the innermost frame is not EXPAND, or the
+        expansion is undeclared (inert).
+        """
+        if not token.lineage_path:
+            return None
+        frame = token.lineage_path[-1]
+        if frame.kind is not FrameKind.EXPAND:
+            return None
         binding = self._group_bindings.binding_for(frame)
+        if binding is None:
+            binding = self._rederive_expand_binding(frame)
         if binding is not None and binding.closer_kind is CloserKind.COLLECTOR:
-            return None, None, CollectorName(binding.closer_name)
-        return None, None, None
+            return CollectorName(binding.closer_name)
+        return None
+
+    def _merged_continuation_cursor(
+        self,
+        merged_token: TokenInfo,
+        completed_coalesce_name: CoalesceName,
+    ) -> tuple[CoalesceName | None, RowUnionName | None, CollectorName | None]:
+        """Barrier cursor for a coalesce merge's released continuation.
+
+        ``resolve_merged_branch_barrier`` covers the flat case (the completed
+        name, load-bearing for a terminal coalesce's sink resolution) and the
+        nested-fork case (the enclosing branch's own barrier). A coalesce
+        INSIDE A SCOPE is the third shape: the merged token's remaining
+        innermost frame is the scope's bound EXPAND frame, so the
+        continuation is that group's member and must hold at the collector —
+        the collector cursor REPLACES the completed coalesce name (such a
+        coalesce is never terminal: its output has to reach the collector,
+        so the flat name is not load-bearing there). One cursor per item
+        (``WorkItem``'s one-barrier rule).
+        """
+        coalesce_name, row_union_name = resolve_merged_branch_barrier(
+            merged_token.branch_name,
+            completed_coalesce_name=completed_coalesce_name,
+            branch_to_coalesce=self._branch_to_coalesce,
+            branch_to_row_union=self._branch_to_row_union,
+        )
+        if merged_token.branch_name is None:
+            enclosing = self._enclosing_collector_cursor(merged_token)
+            if enclosing is not None:
+                return None, None, enclosing
+        return coalesce_name, row_union_name, None
 
     def route_collector_release(
         self,
@@ -4959,11 +5017,8 @@ class RowProcessor:
         # barrier context FRESH from that branch identity, never reuse
         # coalesce_name (the barrier it was just released from): see
         # resolve_merged_branch_barrier's docstring (elspeth-0bd2cde19a / E1b).
-        continuation_coalesce_name, continuation_row_union_name = resolve_merged_branch_barrier(
-            merged_token.branch_name,
-            completed_coalesce_name=coalesce_name,
-            branch_to_coalesce=self._branch_to_coalesce,
-            branch_to_row_union=self._branch_to_row_union,
+        continuation_coalesce_name, continuation_row_union_name, continuation_collector_name = self._merged_continuation_cursor(
+            merged_token, coalesce_name
         )
         merged_item = self._work_items.create(
             token=merged_token,
@@ -4973,9 +5028,11 @@ class RowProcessor:
             # restoring WorkItemFactory.create's mismatch cross-check on
             # this path (elspeth-0bd2cde19a round-2 F4). Nested: only the
             # resolved name is known here; create() re-derives the node id.
-            coalesce_node_id=(coalesce_node_id if merged_token.branch_name is None else None),
+            # Inside a scope the collector cursor replaces the coalesce cursor.
+            coalesce_node_id=(coalesce_node_id if continuation_coalesce_name == coalesce_name else None),
             coalesce_name=continuation_coalesce_name,
             row_union_name=continuation_row_union_name,
+            collector_name=continuation_collector_name,
         )
         self._complete_coalesce_fire(
             coalesce_name=coalesce_name,

@@ -286,4 +286,127 @@ class TestReleaseCursorDerivation:
         bound = make_token_info(data={}, lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="g-outer", member_key="m"),))
         inert = make_token_info(data={}, lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="g-unbound", member_key="m"),))
         assert processor._released_collector_cursor(bound) == (None, None, CollectorName("outer_stitch"))
-        assert processor._released_collector_cursor(inert) == (None, None, None)
+        # An unregistered EXPAND frame is re-derived durably (META-9.1,
+        # pinned in test_first_bound_frame_rederivation.py); here the
+        # re-derivation's UNDECLARED verdict is what makes the frame inert.
+        with patch.object(processor, "_rederive_expand_binding", return_value=None):
+            assert processor._released_collector_cursor(inert) == (None, None, None)
+
+
+class TestNestedReleaseCursor:
+    """A coalesce or row_union INSIDE a scope releases the scope's member:
+    the continuation's remaining innermost frame is the bound EXPAND frame,
+    so it must carry the collector cursor (and hold at the collector) rather
+    than the just-completed barrier's cursor (integration C5, spec §7 rules 2/5)."""
+
+    OUTER_EXPAND = LineageFrame(kind=FrameKind.EXPAND, group_id="g-outer", member_key="m1")
+
+    def _processor(self, factory: Any) -> RowProcessor:
+        registry = GroupBindingRegistry(
+            bindings=(
+                GroupBinding(
+                    kind=FrameKind.EXPAND,
+                    opener_node_id=NodeID("outer-explode"),
+                    opener_name="outer_explode",
+                    closer_node_id=NodeID("collector-outer"),
+                    closer_name="outer_stitch",
+                    closer_kind=CloserKind.COLLECTOR,
+                    policy="require_all",
+                    on_group_failure=None,
+                    member_roster=(),
+                ),
+            )
+        )
+        registry.register_expand_group("g-outer", opener_name="outer_explode")
+        merge_node = NodeID("coalesce::merge")
+        union_node = NodeID("row_union::variants")
+        after_merge = NodeID("after-merge")
+        after_union = NodeID("after-union")
+        return _make_processor(
+            factory,
+            coalesce_node_ids={CoalesceName("merge"): merge_node},
+            row_union_node_ids={RowUnionName("variants"): union_node},
+            branch_to_coalesce={BranchName("path_a"): CoalesceName("merge")},
+            branch_to_row_union={BranchName("path_u"): RowUnionName("variants")},
+            node_step_map={NodeID("source-0"): 0, merge_node: 1, after_merge: 2, union_node: 3, after_union: 4},
+            node_to_next={
+                NodeID("source-0"): merge_node,
+                merge_node: after_merge,
+                after_merge: None,
+                union_node: after_union,
+                after_union: None,
+            },
+            group_bindings=registry,
+        )
+
+    def test_merged_continuation_cursor_three_shapes(self) -> None:
+        _db, factory = _make_factory()
+        processor = self._processor(factory)
+        in_scope = make_token_info(data={}, lineage_path=(self.OUTER_EXPAND,))
+        flat = make_token_info(data={})
+        nested_fork = make_token_info(data={}, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg", member_key="path_a"),))
+        assert processor._merged_continuation_cursor(in_scope, CoalesceName("inner")) == (None, None, CollectorName("outer_stitch"))
+        assert processor._merged_continuation_cursor(flat, CoalesceName("inner")) == (CoalesceName("inner"), None, None)
+        assert processor._merged_continuation_cursor(nested_fork, CoalesceName("inner")) == (CoalesceName("merge"), None, None)
+
+    def test_row_union_release_inside_a_scope_carries_the_collector_cursor(self) -> None:
+        _db, factory = _make_factory()
+        processor = self._processor(factory)
+        in_scope = make_token_info(data={}, lineage_path=(self.OUTER_EXPAND,))
+        flat = make_token_info(data={})
+        items = processor.released_row_union_items(row_union_name=RowUnionName("variants"), released_tokens=(in_scope, flat))
+        assert [(item.current_node_id, item.collector_name, item.row_union_name) for item in items] == [
+            (NodeID("after-union"), CollectorName("outer_stitch"), None),
+            (NodeID("after-union"), None, None),
+        ]
+
+    @pytest.mark.parametrize("in_scope", [True, False], ids=["coalesce-inside-scope", "flat-coalesce"])
+    def test_out_of_claim_merge_continuation_cursor(self, in_scope: bool) -> None:
+        _db, factory = _make_factory()
+        processor = self._processor(factory)
+        merged = make_token_info(data={"v": 1}, lineage_path=(self.OUTER_EXPAND,) if in_scope else ())
+        captured: list[WorkItem] = []
+        with (
+            patch.object(processor, "_complete_coalesce_fire"),
+            patch.object(processor, "_drain_work_queue", side_effect=lambda item, ctx: captured.append(item) or []),
+        ):
+            processor.complete_coalesce_merge(
+                coalesce_name=CoalesceName("merge"),
+                consumed_tokens=(),
+                merged_token=merged,
+                coalesce_node_id=NodeID("coalesce::merge"),
+                ctx=make_context(),
+            )
+        [item] = captured
+        if in_scope:
+            assert (item.collector_name, item.coalesce_name, item.coalesce_node_id) == (CollectorName("outer_stitch"), None, None)
+        else:
+            assert (item.collector_name, item.coalesce_name, item.coalesce_node_id) == (
+                None,
+                CoalesceName("merge"),
+                NodeID("coalesce::merge"),
+            )
+
+    def test_intake_merge_fire_emits_the_collector_cursor_on_the_ready_row(self) -> None:
+        """The coordinator's fire path consumes the processor's derivation:
+        the READY emission written by complete_barrier carries the collector
+        cursor for an in-scope merge."""
+        from types import SimpleNamespace
+
+        from elspeth.engine.coalesce_executor import CoalesceOutcome
+
+        _db, factory = _make_factory()
+        processor = self._processor(factory)
+        merged = make_token_info(data={"v": 1}, lineage_path=(self.OUTER_EXPAND,))
+        _persist_token_for_scheduler(factory, merged)
+        outcome = CoalesceOutcome(held=False, merged_token=merged, consumed_tokens=(), coalesce_name="merge", join_group_id="jg-1")
+        emitted: list[Any] = []
+        with (
+            patch.object(processor, "_require_coordination_token", return_value=SimpleNamespace(worker_id="leader", epoch=1)),
+            patch.object(
+                processor._scheduler, "complete_barrier", side_effect=lambda **kwargs: emitted.extend(kwargs["emitted_ready"]) or 0
+            ),
+        ):
+            disposition = processor._barrier_intake._fire_coalesce_merge(CoalesceName("merge"), outcome, scope_row_id="row-1")
+        assert disposition.child_items[0].collector_name == CollectorName("outer_stitch")
+        assert [(e.collector_name, e.coalesce_name) for e in emitted] == [("outer_stitch", None)]

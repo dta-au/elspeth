@@ -1322,6 +1322,31 @@ def test_drain_claims_forwards_row_union_metadata_from_pending_items() -> None:
     assert captured["row_union_name"] == row_union_name
 
 
+def test_drain_claims_forwards_collector_name_from_pending_items() -> None:
+    """Integration item 17: the collector cursor survives drain_claims's fast
+    re-dispatch path (the ``claimed.work_item_id in pending_items`` branch)
+    into ``_process_single_token`` unchanged — the mirror of the row_union
+    pin above; only ``_process_single_token`` is faked."""
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, bind_leader_token=True)
+    work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=41)
+    pending_item = WorkItem(token=token, current_node_id=NodeID(NODE_ID), collector_name=CollectorName("stitch"))
+
+    captured: dict[str, Any] = {}
+
+    def fake_process(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        captured.update(kwargs)
+        return _dropped_result(kwargs["token"]), []
+
+    with patch.object(processor, "_process_single_token", new=fake_process):
+        processor._scheduler_drain.drain_claims(
+            ctx=_ctx(setup),
+            pending_items={work_item_id: pending_item},
+            recover_pending_sinks=False,
+        )
+
+    assert captured["collector_name"] == CollectorName("stitch")
+
+
 def test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinned() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     drain_path = repo_root / "src/elspeth/engine/scheduler_drain.py"
