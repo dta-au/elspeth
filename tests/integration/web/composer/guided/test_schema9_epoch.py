@@ -19,8 +19,12 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # 0.7.2 release docs and CHANGELOG already state the 34 boundary.
     # Epoch 35: WS1b flip — branch_name/fork_group_id/expand_group_id and
     # token_outcomes.expected_branches_json retired as stored columns.
+    # Epoch 36 (elspeth-8655045f98): coalesce_effects.group_id, nullable=False
+    # with no defaulting branch — a genuine table-shape change, not a
+    # same-shape widening, so it gets its own epoch rather than folding into
+    # 35 (see schema.py's epoch comment for the full arch-M1 rationale).
     assert SESSION_SCHEMA_EPOCH == 47
-    assert SQLITE_SCHEMA_EPOCH == 35
+    assert SQLITE_SCHEMA_EPOCH == 36
 
 
 def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:

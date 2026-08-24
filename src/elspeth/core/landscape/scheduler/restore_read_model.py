@@ -745,24 +745,33 @@ class BarrierRestoreReadModel:
         *,
         coalesce_node_id: str,
         coalesce_name: str,
-        row_id: str,
+        group_id: str,
         blocked_token_ids: Sequence[str],
     ) -> CommittedCoalesceResidual | None:
-        """Return an exact completed coalesce effect still lacking continuation."""
+        """Return an exact completed coalesce effect still lacking continuation.
+
+        elspeth-8655045f98 (arch-M1 site #4): keyed on group_id, not row_id.
+        Two sibling fork groups can share row_id and each commit their own
+        completed merge at this node — a row_id-only predicate cannot tell
+        them apart and misreads the second legitimate residual as
+        corruption (found >1 completed effect receipt). group_id is
+        collision-free: it is the closing FORK group's id, written by the
+        coalesce writer from its own pre-pop shared_group_id.
+        """
         if not blocked_token_ids:
             return None
         effect_rows = self._ops.execute_fetchall(
             select(coalesce_effects_table)
             .where(coalesce_effects_table.c.run_id == run_id)
             .where(coalesce_effects_table.c.coalesce_node_id == coalesce_node_id)
-            .where(coalesce_effects_table.c.row_id == row_id)
+            .where(coalesce_effects_table.c.group_id == group_id)
             .where(coalesce_effects_table.c.status == "completed")
             .order_by(coalesce_effects_table.c.effect_id)
         )
         if not effect_rows:
             return None
         if len(effect_rows) != 1:
-            raise AuditIntegrityError(f"Coalesce residual {coalesce_name!r}/{row_id!r} has {len(effect_rows)} completed effect receipts")
+            raise AuditIntegrityError(f"Coalesce residual {coalesce_name!r}/{group_id!r} has {len(effect_rows)} completed effect receipts")
         effect = effect_rows[0]
         members = self._ops.execute_fetchall(
             select(
@@ -830,7 +839,7 @@ class BarrierRestoreReadModel:
         )
         if (
             token is None
-            or token.row_id != row_id
+            or token.row_id != effect.row_id
             or token.join_group_id != effect.result_join_group_id
             or token.token_data_ref != effect.expected_token_data_ref
             or type(token.token_data_ref) is not str
@@ -865,7 +874,7 @@ class BarrierRestoreReadModel:
             effect_id=str(effect.effect_id),
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
-            row_id=row_id,
+            row_id=str(effect.row_id),
             result_token_id=str(token.token_id),
             result_join_group_id=str(token.join_group_id),
             token_data_ref=token.token_data_ref,

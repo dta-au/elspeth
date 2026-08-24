@@ -92,6 +92,38 @@ def _materialize(setup, row, refs, completions=None):
     )
 
 
+def _setup_sibling_group(setup, row, *, group_id: str, branches: tuple[str, str]):
+    """A second (or first) fork group sharing ``row``'s row_id — the
+    arch-M1 shape: sibling EXPAND members each open their own FORK group
+    but converge on the same row and the same coalesce node."""
+    parents = [
+        setup.data_flow.create_token(
+            row.row_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=group_id, member_key=branch),),
+        )
+        for branch in branches
+    ]
+    refs = tuple(TokenRef(token_id=token.token_id, run_id=setup.run_id) for token in parents)
+    completions: list[CoalesceParentCompletion] = []
+    for ordinal, ref in enumerate(refs):
+        state = setup.execution.begin_node_state(
+            token_id=ref.token_id,
+            node_id=_COALESCE_NODE_ID,
+            run_id=setup.run_id,
+            step_index=4,
+            input_data={"ordinal": ordinal},
+        )
+        completions.append(
+            CoalesceParentCompletion(
+                parent_ref=ref,
+                state_id=state.state_id,
+                duration_ms=float(ordinal + 1),
+                context_after=None,
+            )
+        )
+    return refs, tuple(completions)
+
+
 def test_materialization_is_idempotent_and_normalizes_parent_evidence() -> None:
     setup, row, refs, completions = _setup()
 
@@ -249,3 +281,93 @@ def test_raw_parent_evidence_cannot_duplicate_token_or_state() -> None:
                 parent_state_id=first["parent_state_id"],
             )
         )
+
+
+def test_sibling_fork_groups_sharing_row_id_commit_independent_residuals() -> None:
+    """elspeth-8655045f98 (arch-M1 site #4, spec §5): sibling EXPAND members
+    sharing row_id each open their own FORK group and each independently
+    complete a merge at the SAME coalesce node — the shape
+    _build_expand_outer_fork_inner names (an EXPAND scope whose members
+    each fork->coalesce through the same 'merge' node). Before this fix,
+    get_committed_coalesce_residual queried by row_id alone: with two
+    completed effects at the same (node, row_id), it found 2 rows and
+    raised AuditIntegrityError — a false corruption alarm on two
+    legitimate, independent merges. The restore-recovery reader must
+    recover BOTH residuals, separately, each with its own members."""
+    setup = make_recorder_with_run(run_id=_RUN_ID)
+    register_test_node(
+        setup.data_flow,
+        setup.run_id,
+        _COALESCE_NODE_ID,
+        node_type=NodeType.COALESCE,
+        plugin_name="coalesce",
+    )
+    row = setup.data_flow.create_row(
+        run_id=setup.run_id,
+        source_node_id=setup.source_node_id,
+        row_index=0,
+        source_row_index=0,
+        ingest_sequence=0,
+        data={"source": True},
+    )
+    a_refs, a_completions = _setup_sibling_group(setup, row, group_id="g-a", branches=("a-left", "a-right"))
+    b_refs, b_completions = _setup_sibling_group(setup, row, group_id="g-b", branches=("b-left", "b-right"))
+
+    merged_a = setup.data_flow.coalesce_tokens(
+        parent_refs=list(a_refs),
+        row_id=row.row_id,
+        coalesce_node_id=_COALESCE_NODE_ID,
+        parent_state_ids=[item.state_id for item in a_completions],
+        merged_payload={"merged": "a"},
+        merged_contract=_CONTRACT,
+        step_in_pipeline=4,
+    )
+    merged_b = setup.data_flow.coalesce_tokens(
+        parent_refs=list(b_refs),
+        row_id=row.row_id,
+        coalesce_node_id=_COALESCE_NODE_ID,
+        parent_state_ids=[item.state_id for item in b_completions],
+        merged_payload={"merged": "b"},
+        merged_contract=_CONTRACT,
+        step_in_pipeline=4,
+    )
+    setup.data_flow.finalize_coalesce_effect(merged=merged_a, parent_completions=a_completions)
+    setup.data_flow.finalize_coalesce_effect(merged=merged_b, parent_completions=b_completions)
+
+    with setup.db.connection() as conn:
+        effects_by_group = {str(effect["group_id"]): effect for effect in conn.execute(select(coalesce_effects_table)).mappings().all()}
+    assert set(effects_by_group) == {"g-a", "g-b"}
+    # mutant #2: the persisted group_id must be the CLOSING FORK group
+    # (shared_group_id, captured pre-pop at the writer), not defaulted to
+    # something merely non-empty (e.g. "" or row_id).
+    assert effects_by_group["g-a"]["row_id"] == row.row_id
+    assert effects_by_group["g-b"]["row_id"] == row.row_id
+    assert effects_by_group["g-a"]["status"] == "completed"
+    assert effects_by_group["g-b"]["status"] == "completed"
+
+    reads = setup.factory.barrier_restore
+    residual_a = reads.get_committed_coalesce_residual(
+        setup.run_id,
+        coalesce_node_id=_COALESCE_NODE_ID,
+        coalesce_name="merge",
+        group_id="g-a",
+        blocked_token_ids=tuple(ref.token_id for ref in a_refs),
+    )
+    residual_b = reads.get_committed_coalesce_residual(
+        setup.run_id,
+        coalesce_node_id=_COALESCE_NODE_ID,
+        coalesce_name="merge",
+        group_id="g-b",
+        blocked_token_ids=tuple(ref.token_id for ref in b_refs),
+    )
+
+    # mutant #1: both residuals recover, SEPARATELY, each with its own
+    # members — a test asserting only "one residual recovers" would still
+    # pass under the un-re-keyed predicate (whichever row sorts first).
+    assert residual_a is not None
+    assert residual_b is not None
+    assert residual_a.effect_id != residual_b.effect_id
+    assert set(residual_a.member_token_ids) == {ref.token_id for ref in a_refs}
+    assert set(residual_b.member_token_ids) == {ref.token_id for ref in b_refs}
+    assert residual_a.result_token_id == merged_a.token_id
+    assert residual_b.result_token_id == merged_b.token_id

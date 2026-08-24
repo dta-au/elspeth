@@ -1,4 +1,4 @@
-"""Schema epoch + required-shape + provenance-write guards (epoch 35)."""
+"""Schema epoch + required-shape + provenance-write guards (epoch 36)."""
 
 from __future__ import annotations
 
@@ -36,9 +36,12 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import make_recorder_with_run
 
 
-def test_epoch_is_thirty_five() -> None:
-    # WS1b Phase B: unified-lineage flip (tri-column retirement).
-    assert SQLITE_SCHEMA_EPOCH == 35
+def test_epoch_is_thirty_six() -> None:
+    # WS1b Phase B: unified-lineage flip (tri-column retirement) landed
+    # epoch 35. Epoch 36 (elspeth-8655045f98): coalesce_effects.group_id,
+    # nullable=False with no defaulting branch, a genuine table-shape
+    # change (schema.py's epoch comment carries the full arch-M1 rationale).
+    assert SQLITE_SCHEMA_EPOCH == 36
 
 
 def test_unified_lineage_tables_exist_with_exact_keys() -> None:

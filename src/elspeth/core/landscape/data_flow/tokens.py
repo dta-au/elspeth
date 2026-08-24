@@ -1019,6 +1019,12 @@ class RowTokenRepository:
                     run_id=run_id,
                     coalesce_node_id=resolved_node_id,
                     row_id=row_id,
+                    # elspeth-8655045f98: the closing FORK group, captured
+                    # pre-pop above (shared_group_id) — NOT re-derived from
+                    # merged_frames, which no longer carries this frame once
+                    # the closer pops it (that re-derivation is the known
+                    # trap: it silently returns the enclosing group or None).
+                    group_id=shared_group_id,
                     parent_set_hash=parent_set_hash,
                     effect_hash=effect_hash,
                     expected_token_data_ref=expected_token_data_ref,

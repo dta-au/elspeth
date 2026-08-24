@@ -32,9 +32,10 @@ def _forge_token_run(*, setup, token_id: str, forged_run_id: str) -> None:
 
 
 def test_current_epoch_preserves_token_row_run_ownership_for_sqlite_and_postgres() -> None:
-    # Epoch 35 (unified-lineage flip) does not touch the tokens/rows
-    # composite FK this test pins; bumped to track the live constant.
-    assert SQLITE_SCHEMA_EPOCH == 35
+    # Epoch 35 (unified-lineage flip) and epoch 36 (elspeth-8655045f98,
+    # coalesce_effects.group_id) do not touch the tokens/rows composite FK
+    # this test pins; bumped to track the live constant.
+    assert SQLITE_SCHEMA_EPOCH == 36
     assert (
         "tokens",
         ("row_id", "run_id"),

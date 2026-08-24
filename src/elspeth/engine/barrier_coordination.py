@@ -1798,14 +1798,32 @@ class BarrierRecoveryCoordinator:
             recovered_coalesce_member_ids: set[str] = set()
             for coalesce_name, coalesce_node_id in self._coalesce_node_ids.items():
                 node_items = [item for item in coalesce_items if item.barrier_key == str(coalesce_name)]
-                row_ids = sorted({item.row_id for item in node_items})
-                for row_id in row_ids:
-                    group_items = tuple(item for item in node_items if item.row_id == row_id)
+                # elspeth-8655045f98 (arch-M1 site #4): group identity, not
+                # row_id — two sibling fork groups can share row_id and each
+                # commit their own completed coalesce_effects row at this
+                # node; a row_id-keyed loop lumps their BLOCKED items
+                # together and asks get_committed_coalesce_residual a
+                # row-scoped question the durable ledger can no longer
+                # answer with one row. Same derivation shape as the
+                # holdless-reconcile classification below.
+                coalesce_residual_group_ids_by_token_id: dict[str, str] = {}
+                for item in node_items:
+                    group_id = path_fork_group_id(item.lineage_path)
+                    if group_id is None:
+                        raise AuditIntegrityError(
+                            f"Restore reconcile: coalesce journal item for token {item.token_id!r} at "
+                            f"{item.barrier_key!r} (run {self._run_id!r}) has no innermost FORK frame — "
+                            "only forked branch tokens block at a coalesce barrier; journal corruption."
+                        )
+                    coalesce_residual_group_ids_by_token_id[item.token_id] = group_id
+                group_ids = sorted(set(coalesce_residual_group_ids_by_token_id.values()))
+                for group_id in group_ids:
+                    group_items = tuple(item for item in node_items if coalesce_residual_group_ids_by_token_id[item.token_id] == group_id)
                     coalesce_residual = self._barrier_restore_reads.get_committed_coalesce_residual(
                         self._run_id,
                         coalesce_node_id=str(coalesce_node_id),
                         coalesce_name=str(coalesce_name),
-                        row_id=row_id,
+                        group_id=group_id,
                         blocked_token_ids=tuple(item.token_id for item in group_items),
                     )
                     if coalesce_residual is None:

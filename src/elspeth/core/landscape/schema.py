@@ -330,7 +330,20 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        sole lineage truth. join_group_id stays on tokens/token_work_items
 #        (merge-event identity, D1). Pre-1.0 delete-and-recreate boundary; no
 #        migration.
-SQLITE_SCHEMA_EPOCH = 35
+#   36 → coalesce_effects.group_id (elspeth-8655045f98, WS4 Task 12 part 2,
+#        arch-M1 site #4): two sibling fork groups sharing one row_id can
+#        each complete their own merge at the same coalesce node, and the
+#        restore-recovery reader (get_committed_coalesce_residual) had no
+#        column to tell them apart, raising a false AuditIntegrityError on
+#        the legitimate second residual. Unlike epoch 35's collector_name
+#        addition (nullable, no table-shape change, landed within-epoch),
+#        this column is nullable=False with no defaulting branch — a
+#        genuine table-shape change, not a same-shape widening — so it gets
+#        its own epoch rather than folding into 35. uq_coalesce_effects_scope
+#        is unchanged (row_id kept, argument on that decision at the
+#        constraint's own definition). Pre-1.0 delete-and-recreate boundary;
+#        no migration.
+SQLITE_SCHEMA_EPOCH = 36
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -1277,6 +1290,17 @@ coalesce_effects_table = Table(
     Column("run_id", String(64), nullable=False),
     Column("coalesce_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
     Column("row_id", String(64), nullable=False),
+    # Epoch 36 (elspeth-8655045f98, arch-M1 site #4): the closing FORK
+    # group's id, captured pre-pop at the writer (coalesce_tokens'
+    # shared_group_id, NOT re-derived from the merged token's own path,
+    # which no longer carries the frame once the closer pops it). Sibling
+    # fork groups share row_id but never share group_id, so this is the
+    # collision-free key the restore reader needs — row_id alone let two
+    # independently-completed sibling merges look like corruption
+    # (get_committed_coalesce_residual raised on >1 row). nullable=False,
+    # no defaulting branch: the writer's own guard already requires the
+    # anchor to carry an innermost FORK frame before it gets this far.
+    Column("group_id", String(64), nullable=False),
     Column("parent_set_hash", String(64), nullable=False),
     Column("effect_hash", String(64), nullable=False),
     Column("expected_token_data_ref", String(64), nullable=False),
@@ -1287,6 +1311,23 @@ coalesce_effects_table = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True)),
     UniqueConstraint("effect_id", "run_id", name="uq_coalesce_effects_run_identity"),
+    # uq_coalesce_effects_scope deliberately KEEPS row_id, not group_id
+    # (elspeth-8655045f98 review disposition): group_id structurally
+    # determines row_id (a fork group belongs to exactly one row) and
+    # parent_set_hash already discriminates sibling groups today — they
+    # never share a parent token set — so (row_id, parent_set_hash) and
+    # (group_id, parent_set_hash) give equivalent idempotency protection
+    # here. Swapping in group_id would buy nothing against arch-M1 while
+    # opening a real gap: the idempotency SELECT immediately below (which
+    # this constraint backstops) cannot cheaply gain group_id — the
+    # closing FORK group isn't known until the parent lineage paths load
+    # inside write_connection(), after this scope is built — so a
+    # constraint keyed on group_id while the SELECT stays row_id-keyed
+    # would let a legitimate idempotent retry miss the SELECT and hit the
+    # constraint as a hard IntegrityError instead of an idempotent return
+    # (the surrounding code's own contract: a natural-key IntegrityError
+    # here means a violated lock invariant, not idempotency, and must
+    # surface unchanged). The existing tuple remains correct as-is.
     UniqueConstraint(
         "run_id",
         "coalesce_node_id",
