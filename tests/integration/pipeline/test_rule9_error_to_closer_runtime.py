@@ -281,10 +281,9 @@ _TRANSFORM_OMITTED_YAML = _TRANSFORM_EXPLICIT_YAML.replace("on_error: merge", "o
 def test_transform_explicit_on_error_to_closer_settles_like_the_omitted_twin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The N5 equivalence pin: a transform naming its own enclosing
     require_all coalesce via on_error settles IDENTICALLY (same
-    group_losses closer/member/reason, same held-sibling terminal path) to
-    the same topology with on_error: discard — except the directly-failing
-    token's OWN path is UNROUTED (not QUARANTINED_AT_SOURCE), the one
-    deliberate divergence recorded in this module's docstring."""
+    group_losses closer/member/reason, same held-sibling terminal path,
+    same per-token (outcome, path) pairs — Ruling 50, zero divergence) to
+    the same topology with on_error: discard."""
     install_corpus_plugin_manager(monkeypatch)
 
     explicit_dir = tmp_path / "explicit"
