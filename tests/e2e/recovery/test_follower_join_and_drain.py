@@ -54,9 +54,9 @@ from sqlalchemy import select, update
 from elspeth.contracts import RunStatus
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError, RunWorkerEvictedError
-from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape.schema import (
-    coalesce_branch_losses_table,
+    group_losses_table,
     run_coordination_table,
     run_workers_table,
     runs_table,
@@ -470,17 +470,17 @@ class TestFollowerDispositions:
         crashed.db.close()
 
     def test_follower_lossy_coalesce_branch_writes_branch_loss_record_in_same_txn(self, tmp_path: Path) -> None:
-        """D3: lossy coalesce → branch-loss record written with mark_failed.
+        """D3: lossy coalesce → group-loss record written with mark_failed.
 
-        We simulate a lossy branch-loss disposition by calling mark_failed with
-        a BranchLossSpec (the same API the engine uses in processor.py).  The
-        branch-loss record is written in the same transaction as the mark_failed
-        (E.5 uniformity rule); adopted_epoch IS NULL; recorded_by == follower_id.
-        Idempotent on (run_id, coalesce_name, row_id, branch_name).
+        We simulate a lossy group-loss disposition by calling mark_failed with
+        a GroupLossSpec (the same API the engine uses in processor.py).  The
+        group-loss record is written in the same transaction as the mark_failed
+        (spec §6.2 uniformity rule); adopted_epoch IS NULL; recorded_by ==
+        follower_id (stamped from expected_lease_owner by the disposition
+        layer — GroupLossSpec itself carries no recorded_by).
+        Idempotent on (run_id, closer_name, group_id, member_key).
         The follower did NOT fire/fail the merge (no batch rows from follower).
         """
-        from elspeth.core.landscape.scheduler_repository import BranchLossSpec
-
         clock = MockClock(start=_T0)
         crashed = _run_to_interrupted_checkpoint(tmp_path, clock)
         clock.advance(_DEFAULT_LEASE_SECONDS + 60)
@@ -490,12 +490,6 @@ class TestFollowerDispositions:
 
         token_id, _wid = _seed_ready_row(crashed, ingest_sequence=7)
 
-        # Get the row_id for the branch-loss spec.
-        with crashed.db.engine.connect() as conn:
-            row_id = str(
-                conn.execute(select(token_work_items_table.c.row_id).where(token_work_items_table.c.token_id == token_id)).scalar_one()
-            )
-
         claimed = crashed.repo.claim_ready(
             run_id=crashed.run_id,
             lease_owner=follower_id,
@@ -504,37 +498,36 @@ class TestFollowerDispositions:
         )
         assert claimed is not None and claimed.token_id == token_id
 
-        branch_loss = BranchLossSpec(
-            coalesce_name="coalesce_0",
-            row_id=row_id,
-            branch_name="branch_a",
+        group_loss = GroupLossSpec(
+            closer_name="coalesce_0",
+            group_id="fg-coalesce_0",
+            member_key="branch_a",
             token_id=token_id,
             reason="failed",
-            recorded_by=follower_id,
         )
         crashed.repo.mark_failed(
             work_item_id=claimed.work_item_id,
             now=clock.now_utc(),
             expected_lease_owner=follower_id,
-            branch_loss=branch_loss,
+            group_losses=(group_loss,),
         )
 
-        # Branch-loss record committed in the SAME transaction as mark_failed.
+        # Group-loss record committed in the SAME transaction as mark_failed.
         with crashed.db.engine.connect() as conn:
             losses = conn.execute(
-                select(coalesce_branch_losses_table).where(
-                    coalesce_branch_losses_table.c.run_id == crashed.run_id,
-                    coalesce_branch_losses_table.c.coalesce_name == "coalesce_0",
-                    coalesce_branch_losses_table.c.row_id == row_id,
-                    coalesce_branch_losses_table.c.branch_name == "branch_a",
+                select(group_losses_table).where(
+                    group_losses_table.c.run_id == crashed.run_id,
+                    group_losses_table.c.closer_name == "coalesce_0",
+                    group_losses_table.c.group_id == "fg-coalesce_0",
+                    group_losses_table.c.member_key == "branch_a",
                 )
             ).fetchall()
-        assert len(losses) == 1, "exactly one branch-loss record"
+        assert len(losses) == 1, "exactly one group-loss record"
         (loss,) = losses
         assert loss.adopted_epoch is None, "leader adopts later; follower does not set adopted_epoch"
         assert loss.recorded_by == follower_id
 
-        # Idempotent: a second call on the same (run_id, coalesce_name, row_id, branch_name)
+        # Idempotent: a second call on the same (run_id, closer_name, group_id, member_key)
         # must not raise (the scheduler INSERT OR IGNORE or UNIQUE handles it).
         # Re-seed to get a fresh LEASED row for the idempotency call.
         _token_id2, _wid2 = _seed_ready_row(crashed, ingest_sequence=8)
@@ -545,31 +538,30 @@ class TestFollowerDispositions:
             now=clock.now_utc(),
         )
         assert claimed2 is not None
-        # Same (coalesce_name, row_id, branch_name) → idempotent.
-        branch_loss_dup = BranchLossSpec(
-            coalesce_name="coalesce_0",
-            row_id=row_id,
-            branch_name="branch_a",
+        # Same (closer_name, group_id, member_key) → idempotent.
+        group_loss_dup = GroupLossSpec(
+            closer_name="coalesce_0",
+            group_id="fg-coalesce_0",
+            member_key="branch_a",
             token_id=token_id,
             reason="failed",
-            recorded_by=follower_id,
         )
         crashed.repo.mark_failed(
             work_item_id=claimed2.work_item_id,
             now=clock.now_utc(),
             expected_lease_owner=follower_id,
-            branch_loss=branch_loss_dup,
+            group_losses=(group_loss_dup,),
         )
         with crashed.db.engine.connect() as conn:
             loss_count = conn.execute(
-                select(coalesce_branch_losses_table).where(
-                    coalesce_branch_losses_table.c.run_id == crashed.run_id,
-                    coalesce_branch_losses_table.c.coalesce_name == "coalesce_0",
-                    coalesce_branch_losses_table.c.row_id == row_id,
-                    coalesce_branch_losses_table.c.branch_name == "branch_a",
+                select(group_losses_table).where(
+                    group_losses_table.c.run_id == crashed.run_id,
+                    group_losses_table.c.closer_name == "coalesce_0",
+                    group_losses_table.c.group_id == "fg-coalesce_0",
+                    group_losses_table.c.member_key == "branch_a",
                 )
             ).fetchall()
-        assert len(loss_count) == 1, "idempotent: still exactly one branch-loss record for this (coalesce, row, branch)"
+        assert len(loss_count) == 1, "idempotent: still exactly one group-loss record for this (closer, group, member)"
 
         # Follower did NOT fire/fail a merge (no adopt_blocked_barrier_item calls).
         from elspeth.core.landscape.schema import batches_table

@@ -52,12 +52,13 @@ from sqlalchemy import delete, insert, select
 
 from elspeth.contracts import RowResult, TokenInfo
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError, RunWorkerEvictedError, SchedulerLeaseLostError
 from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import FailureInfo
-from elspeth.contracts.scheduler import BranchLossSpec, SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -278,8 +279,14 @@ def _enqueue_ready(
     clock: MockClock,
     *,
     sequence: int,
+    lineage_path: tuple[LineageFrame, ...] = (),
 ) -> tuple[str, TokenInfo]:
-    """Enqueue a READY continuation; return (work_item_id, token)."""
+    """Enqueue a READY continuation; return (work_item_id, token).
+
+    ``lineage_path`` (spec §6.2): the claim guard authenticates a staged
+    group-loss spec against the CLAIMED item's own lineage_path, so tests
+    staging a loss must enqueue one carrying the matching frame.
+    """
     row, token = setup.data_flow.create_row_with_token(
         run_id=setup.run_id,
         source_node_id=setup.source_node_id,
@@ -297,6 +304,7 @@ def _enqueue_ready(
         ingest_sequence=sequence,
         available_at=clock.now_utc(),
         row_payload_json=_PAYLOAD,
+        lineage_path=lineage_path,
     )
     token_info = TokenInfo(row_id=row.row_id, token_id=token.token_id, row_data=PipelineRow({"id": sequence}, _CONTRACT))
     return item.work_item_id, token_info
@@ -700,18 +708,18 @@ def test_row_span_covers_terminal_disposition_failure() -> None:
 
 
 def test_child_and_parent_disposition_roll_back_when_branch_loss_write_fails() -> None:
-    """The child, parent event, and §E.5 loss share one commit boundary."""
+    """The child, parent event, and §6.2 loss share one commit boundary."""
     processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
-    parent_work_item_id, parent_token = _enqueue_ready(setup, spy, clock, sequence=0)
+    loss_frame = LineageFrame(kind=FrameKind.FORK, group_id="fg-merge", member_key="left")
+    parent_work_item_id, parent_token = _enqueue_ready(setup, spy, clock, sequence=0, lineage_path=(loss_frame,))
     child_item = _unscheduled_work_item(setup, sequence=1)
-    processor._pending_branch_losses.append(
-        BranchLossSpec(
-            coalesce_name="merge",
-            row_id=parent_token.row_id,
-            branch_name="left",
+    processor._pending_group_losses.append(
+        GroupLossSpec(
+            closer_name="merge",
+            group_id=loss_frame.group_id,
+            member_key=loss_frame.member_key,
             token_id=parent_token.token_id,
             reason="test branch loss",
-            recorded_by=LEADER_OWNER,
         )
     )
 
@@ -721,7 +729,7 @@ def test_child_and_parent_disposition_roll_back_when_branch_loss_write_fails() -
     with (
         patch.object(processor, "_process_single_token", new=produce_child),
         patch(
-            "elspeth.core.landscape.scheduler.dispositions.record_coalesce_branch_loss",
+            "elspeth.core.landscape.scheduler.dispositions.record_group_loss",
             side_effect=RuntimeError("injected branch-loss write failure"),
         ),
         pytest.raises(RuntimeError, match="injected branch-loss write failure"),
@@ -926,14 +934,16 @@ def test_lease_lost_mid_processing_abandons_result_and_writes_no_disposition() -
     mark_* disposition is issued for the abandoned claim."""
     processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
     work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=0)
-    processor._pending_branch_losses.append(
-        BranchLossSpec(
-            coalesce_name="merge",
-            row_id=token.row_id,
-            branch_name="left",
+    # The lease-lost abandonment clears the staging list unconditionally
+    # (scheduler_drain.py's abandonment arms), never reaching the claim
+    # guard — a real frame match is not required here.
+    processor._pending_group_losses.append(
+        GroupLossSpec(
+            closer_name="merge",
+            group_id="fg-merge",
+            member_key="left",
             token_id=token.token_id,
             reason="staged before the lease was lost",
-            recorded_by=LEADER_OWNER,
         )
     )
 
@@ -945,7 +955,7 @@ def test_lease_lost_mid_processing_abandons_result_and_writes_no_disposition() -
         results = processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
 
     assert results == []
-    assert processor._pending_branch_losses == [], "staged §E.5 losses are discarded with the abandoned claim"
+    assert processor._pending_group_losses == [], "staged §6.2 losses are discarded with the abandoned claim"
     verbs = spy.verbs()
     assert "mark_failed" not in verbs
     assert "mark_terminal" not in verbs
@@ -992,14 +1002,13 @@ def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviv
     if surviving_peer:
         _register_worker(setup, "worker-peer")
     work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=0)
-    processor._pending_branch_losses.append(
-        BranchLossSpec(
-            coalesce_name="merge",
-            row_id=token.row_id,
-            branch_name="left",
+    processor._pending_group_losses.append(
+        GroupLossSpec(
+            closer_name="merge",
+            group_id="fg-merge",
+            member_key="left",
             token_id=token.token_id,
             reason="staged before membership loss",
-            recorded_by=LEADER_OWNER,
         )
     )
     refused_image: list[tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]] = []
@@ -1022,7 +1031,7 @@ def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviv
 
     assert exc_info.value.worker_id == LEADER_OWNER
     assert exc_info.value.run_id == setup.run_id
-    assert processor._pending_branch_losses == []
+    assert processor._pending_group_losses == []
     assert len(refused_image) == 1
     assert _durable_claim_image(setup, work_item_id) == refused_image[0]
     assert len(spy.calls_for("heartbeat_lease")) == 1

@@ -24,8 +24,8 @@ from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import (
-    coalesce_branch_losses_table,
     edges_table,
+    group_losses_table,
     node_states_table,
     nodes_table,
     operations_table,
@@ -229,7 +229,7 @@ def _assert_scheduler_sink_terminalization(
     assert outcome["sink_name"] == "errors"
     assert outcome["error_hash"] == work_item["pending_error_hash"]
 
-    assert _rows(evidence.db, coalesce_branch_losses_table, run_id=run_id) == []
+    assert _rows(evidence.db, group_losses_table, run_id=run_id) == []
 
     effects = _rows(evidence.db, sink_effects_table, run_id=run_id)
     assert len(effects) == 1

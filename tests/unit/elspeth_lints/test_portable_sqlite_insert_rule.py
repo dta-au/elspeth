@@ -13,7 +13,7 @@ from elspeth_lints.rules.contract_invariants.portable_sqlite_insert.rule import 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PORTABLE_DISPATCH_MODULES = (
-    "src/elspeth/core/landscape/scheduler/branch_losses.py",
+    "src/elspeth/core/landscape/scheduler/group_losses.py",
     "src/elspeth/web/preferences/service.py",
     "src/elspeth/web/secrets/user_store.py",
     "src/elspeth/web/sessions/service.py",

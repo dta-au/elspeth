@@ -43,15 +43,15 @@ from sqlalchemy import select, update
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.identity import LineageFrame
-from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import CoalesceSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
-from elspeth.core.landscape.scheduler_repository import record_coalesce_branch_loss
+from elspeth.core.landscape.scheduler_repository import record_group_loss
 from elspeth.core.landscape.schema import (
-    coalesce_branch_losses_table,
+    group_losses_table,
     node_states_table,
     run_coordination_table,
     scheduler_events_table,
@@ -71,6 +71,7 @@ from tests.unit.engine.test_processor import (
     _make_factory,
     _make_processor,
     _persist_blocked_scheduler_work,
+    _persist_token_for_scheduler,
 )
 
 _T0 = 1_750_000_000.0
@@ -197,17 +198,26 @@ def _release_events(db: LandscapeDB, token_id: str) -> list[dict[str, Any]]:
         ]
 
 
-def _record_foreign_loss(db: LandscapeDB, clock: MockClock, *, branch: str, token_id: str, reason: str) -> None:
-    """A follower-recorded durable loss (production verb, ``adopted_epoch IS NULL``)."""
+def _record_foreign_loss(db: LandscapeDB, clock: MockClock, factory: Any, *, branch: str, token_id: str, reason: str) -> None:
+    """A follower-recorded durable loss (production verb, ``adopted_epoch IS NULL``).
+
+    Covers the all-members-lost shape (spec §6.2): the lost member's token
+    is minted durably (a fork child always is) even though it never arrived
+    at the closer — ``group_losses.token_id`` carries an FK to ``tokens``,
+    so the loss row needs a real token to reference.
+    """
+    _persist_token_for_scheduler(factory, _branch_token(branch, token_id=token_id))
     with begin_write(db.engine) as conn:
-        assert record_coalesce_branch_loss(
+        assert record_group_loss(
             conn,
             run_id=RUN_ID,
-            coalesce_name="merge",
-            row_id="row-1",
-            branch_name=branch,
-            token_id=token_id,
-            reason=reason,
+            spec=GroupLossSpec(
+                closer_name="merge",
+                group_id="fg-row-1",
+                member_key=branch,
+                token_id=token_id,
+                reason=reason,
+            ),
             recorded_by="worker-follower",
             now=clock.now_utc(),
         )
@@ -215,7 +225,7 @@ def _record_foreign_loss(db: LandscapeDB, clock: MockClock, *, branch: str, toke
 
 def _loss_rows(db: LandscapeDB) -> list[dict[str, Any]]:
     with db.connection() as conn:
-        return [dict(row) for row in conn.execute(select(coalesce_branch_losses_table)).mappings()]
+        return [dict(row) for row in conn.execute(select(group_losses_table)).mappings()]
 
 
 def _assert_quiescent_and_finalize_ready(processor: Any) -> None:
@@ -552,7 +562,7 @@ class TestBranchLossReplay:
         # Branch a held (live arrival); branch b's loss recorded follower-style.
         held_results = _arrive_via_intake(factory, processor, _branch_token("a"))
         assert held_results == []
-        _record_foreign_loss(db, clock, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
+        _record_foreign_loss(db, clock, factory, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
 
         # ONE leader intake pass: adopt-the-loss (journal-first) -> replay
         # through notify_branch_lost -> require_all fails the group NOW,
@@ -579,7 +589,7 @@ class TestBranchLossReplay:
 
         held_results = _arrive_via_intake(factory, processor, _branch_token("a"))
         assert held_results == []
-        _record_foreign_loss(db, clock, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
+        _record_foreign_loss(db, clock, factory, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
 
         ctx = make_context(landscape=factory.plugin_audit_writer())
         results = processor.run_barrier_intake(ctx)
@@ -630,7 +640,7 @@ class TestBranchLossReplay:
         # BEFORE the replay (adopted_epoch stays NULL).
         held_results = _arrive_via_intake(factory, processor_a, _branch_token("a"))
         assert held_results == []
-        _record_foreign_loss(db, clock, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
+        _record_foreign_loss(db, clock, factory, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
         (loss_row,) = _loss_rows(db)
         assert loss_row["adopted_epoch"] is None
 

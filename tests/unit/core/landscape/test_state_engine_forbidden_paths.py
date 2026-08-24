@@ -506,7 +506,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
     """
     expected = {
         "adopt_blocked_barrier_item",
-        "adopt_coalesce_branch_losses",
+        "adopt_group_losses",
         "complete_barrier",
         "complete_run",
         "create_checkpoint",
@@ -542,9 +542,9 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             "tests/unit/core/landscape/test_scheduler_repository_adopt_barrier_item.py",
             "test_stale_token_refused_with_fence_refusal_and_zero_mutation",
         ),
-        "adopt_coalesce_branch_losses": (
-            "tests/unit/core/landscape/test_scheduler_repository_coalesce_branch_losses.py",
-            "test_stale_token_adopt_refused_with_fence_refusal",
+        "adopt_group_losses": (
+            "tests/e2e/recovery/test_suspended_winner_fences.py",
+            "test_stale_adopt_group_losses_refused",
         ),
         "complete_barrier": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",

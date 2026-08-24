@@ -61,8 +61,12 @@ def test_unified_lineage_tables_exist_with_exact_keys() -> None:
         "adopted_epoch",
     }
     # No defaulted getattr here — the whole-tree masquerade gate pins the exact
-    # set of dynamic-attribute sites; every table constraint carries .name.
-    natural = next(c for c in group_losses_table.constraints if c.name == "uq_group_losses_natural")
+    # set of dynamic-attribute sites; every table index carries .name.
+    # Named unique Index (not UniqueConstraint), matching the retired
+    # coalesce_branch_losses precedent — required for _REQUIRED_INDEXES
+    # verifiability (ruling 2026-08-24).
+    natural = next(ix for ix in group_losses_table.indexes if ix.name == "uq_group_losses_natural")
+    assert natural.unique
     assert [col.name for col in natural.columns] == ["run_id", "closer_name", "group_id", "member_key"]
 
 
@@ -227,11 +231,15 @@ def test_token_work_items_has_barrier_adopted_epoch() -> None:
 
 
 def test_epoch_21_coordination_tables_are_defined() -> None:
-    """Epoch 21 (ADR-030 slice 2): the four coordination tables exist in metadata."""
+    """Epoch 21 (ADR-030 slice 2): the four coordination tables exist in metadata.
+
+    The fourth table was ``coalesce_branch_losses`` through epoch 34; WS3
+    retires it in favor of the unified ``group_losses`` ledger (spec §6.2).
+    """
     assert "run_coordination" in metadata.tables
     assert "run_workers" in metadata.tables
     assert "run_coordination_events" in metadata.tables
-    assert "coalesce_branch_losses" in metadata.tables
+    assert "group_losses" in metadata.tables
 
 
 def test_checkpoints_have_barrier_scalars_column() -> None:
@@ -289,16 +297,16 @@ def test_required_columns_include_epoch_21_coordination_substrate() -> None:
     for column in (
         "loss_id",
         "run_id",
-        "coalesce_name",
-        "row_id",
-        "branch_name",
+        "closer_name",
+        "group_id",
+        "member_key",
         "token_id",
         "reason",
         "recorded_by",
         "recorded_at",
         "adopted_epoch",
     ):
-        assert ("coalesce_branch_losses", column) in required
+        assert ("group_losses", column) in required
 
 
 def test_required_columns_include_epoch_22_routing_event_run_scope() -> None:

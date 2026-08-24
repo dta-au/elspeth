@@ -16,12 +16,12 @@ import elspeth.core.landscape.database as database_module
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError, SchedulerLeaseLostError
-from elspeth.contracts.scheduler import BranchLossSpec, SchedulerEventType, TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.schema import (
-    coalesce_branch_losses_table,
+    group_losses_table,
     metadata,
     nodes_table,
     rows_table,
@@ -587,7 +587,7 @@ def test_normal_dispositions_refuse_reclaimed_sink_redrive_without_mutation(verb
     the sink-redrive subtype.  Refusal must occur before any part of the
     transactional state/event/branch-loss image changes.
     """
-    from elspeth.contracts.scheduler import BranchLossSpec, TokenWorkStatus
+    from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkStatus
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 
     engine = _make_scheduler_engine()
@@ -606,13 +606,12 @@ def test_normal_dispositions_refuse_reclaimed_sink_redrive_without_mutation(verb
     assert reclaimed.pending_sink_name == "sink-a"
 
     before = _disposition_state_snapshot(engine, work_item_id=item.work_item_id)
-    branch_loss = BranchLossSpec(
-        coalesce_name="merge",
-        row_id="row-1",
-        branch_name="left",
+    group_loss = GroupLossSpec(
+        closer_name="merge",
+        group_id="fg-1",
+        member_key="left",
         token_id="token-1",
         reason="refused-normal-disposition",
-        recorded_by="worker-b",
     )
 
     with pytest.raises(AuditIntegrityError, match="transform-lease row"):
@@ -622,7 +621,7 @@ def test_normal_dispositions_refuse_reclaimed_sink_redrive_without_mutation(verb
             work_item_id=item.work_item_id,
             payload=payload,
             now=now + timedelta(seconds=4),
-            branch_loss=branch_loss,
+            group_loss=group_loss,
         )
 
     assert _disposition_state_snapshot(engine, work_item_id=item.work_item_id) == before
@@ -647,14 +646,13 @@ def test_transform_disposition_truth_table_commits_exact_row_event_and_branch_lo
     replacement_payload = TokenSchedulerRepository.serialize_row_payload(
         PipelineRow({"id": 2}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     )
-    branch_loss = (
-        BranchLossSpec(
-            coalesce_name="merge",
-            row_id="row-1",
-            branch_name="left",
+    group_loss = (
+        GroupLossSpec(
+            closer_name="merge",
+            group_id="fg-1",
+            member_key="left",
             token_id="token-1",
             reason=verb,
-            recorded_by="worker-b",
         )
         if supports_branch_loss
         else None
@@ -667,7 +665,7 @@ def test_transform_disposition_truth_table_commits_exact_row_event_and_branch_lo
         work_item_id=item.work_item_id,
         payload=replacement_payload,
         now=disposition_at,
-        branch_loss=branch_loss,
+        group_loss=group_loss,
     )
 
     work_item, _, events, branch_losses = _disposition_state_snapshot(engine, work_item_id=item.work_item_id)
@@ -715,9 +713,9 @@ def test_transform_disposition_truth_table_commits_exact_row_event_and_branch_lo
         loss = branch_losses[0]
         assert loss["run_id"] == "run-1"
         assert loss["token_id"] == "token-1"
-        assert loss["row_id"] == "row-1"
-        assert loss["coalesce_name"] == "merge"
-        assert loss["branch_name"] == "left"
+        assert loss["group_id"] == "fg-1"
+        assert loss["closer_name"] == "merge"
+        assert loss["member_key"] == "left"
         assert loss["reason"] == verb
         assert loss["recorded_by"] == "worker-b"
         assert loss["recorded_at"] == _stored_datetime(disposition_at)
@@ -740,7 +738,7 @@ def test_transform_disposition_truth_table_refuses_stale_owner_without_mutation(
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = _make_transform_lease(repo, payload=payload, now=now)
     before = _disposition_state_snapshot(engine, work_item_id=item.work_item_id)
-    branch_loss = _branch_loss_for(verb) if supports_branch_loss else None
+    group_loss = _branch_loss_for(verb) if supports_branch_loss else None
 
     with pytest.raises(AuditIntegrityError, match="expected lease_owner 'stale-worker'"):
         _invoke_normal_disposition(
@@ -749,7 +747,7 @@ def test_transform_disposition_truth_table_refuses_stale_owner_without_mutation(
             work_item_id=item.work_item_id,
             payload=payload,
             now=now + timedelta(seconds=2),
-            branch_loss=branch_loss,
+            group_loss=group_loss,
             expected_lease_owner="stale-worker",
         )
 
@@ -785,7 +783,7 @@ def test_transform_disposition_truth_table_refuses_departed_member_without_mutat
             )
         )
     before = _disposition_state_snapshot(engine, work_item_id=item.work_item_id)
-    branch_loss = _branch_loss_for(verb) if supports_branch_loss else None
+    group_loss = _branch_loss_for(verb) if supports_branch_loss else None
 
     with pytest.raises(RunWorkerEvictedError, match="worker-b"):
         _invoke_normal_disposition(
@@ -794,7 +792,7 @@ def test_transform_disposition_truth_table_refuses_departed_member_without_mutat
             work_item_id=item.work_item_id,
             payload=payload,
             now=now + timedelta(seconds=2),
-            branch_loss=branch_loss,
+            group_loss=group_loss,
             worker_id="worker-b",
         )
 
@@ -827,7 +825,7 @@ def test_transform_disposition_truth_table_rolls_back_when_event_insert_fails(
         return original_record(conn, event_type=event_type, **kwargs)
 
     monkeypatch.setattr(repo.events, "record", fail_target_event)
-    branch_loss = _branch_loss_for(verb) if supports_branch_loss else None
+    group_loss = _branch_loss_for(verb) if supports_branch_loss else None
 
     with pytest.raises(LandscapeRecordError, match=f"forced {verb} event failure"):
         _invoke_normal_disposition(
@@ -836,7 +834,7 @@ def test_transform_disposition_truth_table_rolls_back_when_event_insert_fails(
             work_item_id=item.work_item_id,
             payload=payload,
             now=now + timedelta(seconds=2),
-            branch_loss=branch_loss,
+            group_loss=group_loss,
         )
 
     assert _disposition_state_snapshot(engine, work_item_id=item.work_item_id) == before
@@ -859,7 +857,7 @@ def test_branch_loss_failure_rolls_back_disposition_row_and_event(monkeypatch: p
         del args, kwargs
         raise LandscapeRecordError(f"forced {verb} branch-loss failure")
 
-    monkeypatch.setattr(dispositions_module, "record_coalesce_branch_loss", fail_branch_loss)
+    monkeypatch.setattr(dispositions_module, "record_group_loss", fail_branch_loss)
 
     with pytest.raises(LandscapeRecordError, match=f"forced {verb} branch-loss failure"):
         _invoke_normal_disposition(
@@ -868,7 +866,7 @@ def test_branch_loss_failure_rolls_back_disposition_row_and_event(monkeypatch: p
             work_item_id=item.work_item_id,
             payload=payload,
             now=now + timedelta(seconds=2),
-            branch_loss=_branch_loss_for(verb),
+            group_loss=_branch_loss_for(verb),
         )
 
     assert _disposition_state_snapshot(engine, work_item_id=item.work_item_id) == before
@@ -1022,7 +1020,7 @@ def test_dedicated_sink_redrive_terminalizers_still_accept_reclaimed_sink_leases
 
 def test_normal_disposition_rolls_back_when_scheduler_event_insert_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     """The shared disposition transaction is atomic with its event and loss."""
-    from elspeth.contracts.scheduler import BranchLossSpec, SchedulerEventType
+    from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 
     engine = _make_scheduler_engine()
@@ -1055,13 +1053,14 @@ def test_normal_disposition_rolls_back_when_scheduler_event_insert_fails(monkeyp
             work_item_id=item.work_item_id,
             now=now + timedelta(seconds=2),
             expected_lease_owner="worker-a",
-            branch_loss=BranchLossSpec(
-                coalesce_name="merge",
-                row_id="row-1",
-                branch_name="left",
-                token_id="token-1",
-                reason="failed",
-                recorded_by="worker-a",
+            group_losses=(
+                GroupLossSpec(
+                    closer_name="merge",
+                    group_id="fg-1",
+                    member_key="left",
+                    token_id="token-1",
+                    reason="failed",
+                ),
             ),
         )
 
@@ -1867,16 +1866,17 @@ def _invoke_normal_disposition(
     work_item_id: str,
     payload: str,
     now: datetime,
-    branch_loss: BranchLossSpec | None = None,
+    group_loss: GroupLossSpec | None = None,
     expected_lease_owner: str = "worker-b",
     worker_id: str | None = None,
 ) -> TokenWorkItem:
+    group_losses = () if group_loss is None else (group_loss,)
     if verb == "mark_terminal":
         return repo.mark_terminal(
             work_item_id=work_item_id,
             now=now,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             worker_id=worker_id,
         )
     if verb == "mark_failed":
@@ -1884,7 +1884,7 @@ def _invoke_normal_disposition(
             work_item_id=work_item_id,
             now=now,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             worker_id=worker_id,
         )
     if verb == "mark_blocked":
@@ -1907,20 +1907,19 @@ def _invoke_normal_disposition(
             error_message="replacement error",
             now=now,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             worker_id=worker_id,
         )
     raise AssertionError(f"unknown normal disposition {verb!r}")
 
 
-def _branch_loss_for(verb: str) -> BranchLossSpec:
-    return BranchLossSpec(
-        coalesce_name="merge",
-        row_id="row-1",
-        branch_name="left",
+def _branch_loss_for(verb: str) -> GroupLossSpec:
+    return GroupLossSpec(
+        closer_name="merge",
+        group_id="fg-1",
+        member_key="left",
         token_id="token-1",
         reason=verb,
-        recorded_by="worker-b",
     )
 
 
@@ -1945,8 +1944,7 @@ def _disposition_state_snapshot(
             .all()
         ]
         branch_losses = [
-            dict(row)
-            for row in conn.execute(select(coalesce_branch_losses_table).order_by(coalesce_branch_losses_table.c.loss_id)).mappings().all()
+            dict(row) for row in conn.execute(select(group_losses_table).order_by(group_losses_table.c.loss_id)).mappings().all()
         ]
     return work_item, coordination, events, branch_losses
 

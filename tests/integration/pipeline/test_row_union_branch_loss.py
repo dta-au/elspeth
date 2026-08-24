@@ -169,11 +169,11 @@ def test_gate_discarded_branch_loss_fails_its_group_closed(tmp_path: Path) -> No
     assert any("row_union_branch_lost" in reason for reason in reasons), reasons
 
     # The genuine pre-barrier loss persists a durable loss-ledger record.
-    losses = conn.execute("SELECT coalesce_name, branch_name FROM coalesce_branch_losses").fetchall()
+    losses = conn.execute("SELECT closer_name, member_key FROM group_losses").fetchall()
     assert ("variant_union", "control_branch") in losses, losses
 
     # The reason string this test now observes, post re-point.
-    reason = conn.execute("SELECT reason FROM coalesce_branch_losses WHERE branch_name = 'control_branch'").fetchone()
+    reason = conn.execute("SELECT reason FROM group_losses WHERE member_key = 'control_branch'").fetchone()
     assert reason == ("gate_discarded",), reason
 
 
@@ -182,7 +182,7 @@ def test_post_release_divert_records_no_branch_loss(tmp_path: Path) -> None:
 
     Released row_union tokens keep their branch_name, so a terminal divert
     after the release re-enters the loss-notification path; it must not stage
-    a durable coalesce_branch_losses record claiming a pre-barrier loss.
+    a durable group_losses record claiming a pre-barrier loss.
     """
     input_path = tmp_path / "input.jsonl"
     input_path.write_text('{"id": 1, "amount": 10}\n{"id": 2, "amount": 20}\n')
@@ -300,5 +300,5 @@ sinks:
     assert union_states == {"completed": 4}, union_states
 
     # The post-release divert must not fabricate a pre-barrier loss record.
-    losses = conn.execute("SELECT coalesce_name, row_id, branch_name FROM coalesce_branch_losses").fetchall()
+    losses = conn.execute("SELECT closer_name, group_id, member_key FROM group_losses").fetchall()
     assert losses == [], losses

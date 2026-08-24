@@ -20,12 +20,13 @@ from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ProgrammingError
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import SchemaCompatibilityError
-from elspeth.core.landscape.scheduler.branch_losses import record_coalesce_branch_loss
+from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
-    coalesce_branch_losses_table,
+    group_losses_table,
     nodes_table,
     rows_table,
     runs_table,
@@ -378,7 +379,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
             )
 
 
-def test_postgres_coalesce_branch_loss_insert_is_dialect_safe(
+def test_postgres_group_loss_insert_is_dialect_safe(
     tmp_path: Path,
     runtime_database: _RuntimeDatabase,
 ) -> None:
@@ -400,36 +401,66 @@ def test_postgres_coalesce_branch_loss_insert_is_dialect_safe(
                     openrouter_catalog_source="bundled",
                 )
             )
-            first_inserted = record_coalesce_branch_loss(
-                conn,
-                run_id="coalesce-loss-postgres-run",
-                coalesce_name="merge",
-                row_id="row-1",
-                branch_name="left",
+            # group_losses.token_id carries an FK to tokens — seed a minimal
+            # source node/row/token for "token-left" before recording its loss.
+            conn.execute(
+                insert(nodes_table).values(
+                    run_id="coalesce-loss-postgres-run",
+                    node_id="source-1",
+                    plugin_name="test-source",
+                    node_type=NodeType.SOURCE.value,
+                    plugin_version="1.0",
+                    determinism="deterministic",
+                    config_hash="cfg",
+                    config_json="{}",
+                    registered_at=now,
+                )
+            )
+            conn.execute(
+                insert(rows_table).values(
+                    row_id="row-1",
+                    run_id="coalesce-loss-postgres-run",
+                    source_node_id="source-1",
+                    row_index=0,
+                    source_row_index=0,
+                    ingest_sequence=0,
+                    source_data_hash="hash-row-1",
+                    created_at=now,
+                )
+            )
+            conn.execute(
+                insert(tokens_table).values(
+                    token_id="token-left",
+                    row_id="row-1",
+                    run_id="coalesce-loss-postgres-run",
+                    created_at=now,
+                )
+            )
+            loss_spec = GroupLossSpec(
+                closer_name="merge",
+                group_id="fg-1",
+                member_key="left",
                 token_id="token-left",
                 reason="failed",
+            )
+            first_inserted = record_group_loss(
+                conn,
+                run_id="coalesce-loss-postgres-run",
+                spec=loss_spec,
                 recorded_by="worker-1",
                 now=now,
             )
-            duplicate_inserted = record_coalesce_branch_loss(
+            duplicate_inserted = record_group_loss(
                 conn,
                 run_id="coalesce-loss-postgres-run",
-                coalesce_name="merge",
-                row_id="row-1",
-                branch_name="left",
-                token_id="token-left",
-                reason="failed",
+                spec=loss_spec,
                 recorded_by="worker-1",
                 now=now,
             )
 
         with landscape.engine.connect() as conn:
             rows = (
-                conn.execute(
-                    select(coalesce_branch_losses_table).where(coalesce_branch_losses_table.c.run_id == "coalesce-loss-postgres-run")
-                )
-                .mappings()
-                .all()
+                conn.execute(select(group_losses_table).where(group_losses_table.c.run_id == "coalesce-loss-postgres-run")).mappings().all()
             )
 
     assert first_inserted is True

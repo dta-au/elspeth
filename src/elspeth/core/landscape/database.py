@@ -515,6 +515,7 @@ _REQUIRED_FOREIGN_KEYS: tuple[tuple[str, str, str], ...] = (
     ("run_coordination", "run_id", "runs"),
     ("run_workers", "run_id", "runs"),
     ("run_coordination_events", "run_id", "runs"),
+    ("group_losses", "run_id", "runs"),
     ("operations", "sink_effect_id", "sink_effects"),
     ("audit_export_snapshot_chunks", "snapshot_id", "audit_export_snapshots"),
     ("sink_effect_export_snapshots", "snapshot_id", "audit_export_snapshots"),

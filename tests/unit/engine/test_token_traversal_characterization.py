@@ -644,7 +644,9 @@ class TestHandleTransformNode:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Secret-bearing retry failures must not reach branch-loss audit text."""
-        from elspeth.core.landscape.scheduler.branch_losses import record_coalesce_branch_loss
+        from dataclasses import replace
+
+        from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 
         db, factory = _make_factory()
         coalesce_name = CoalesceName("merge")
@@ -682,36 +684,28 @@ class TestHandleTransformNode:
         assert isinstance(outcome, _TransformTerminal)
         assert isinstance(outcome.result, RowResult)
         assert outcome.result.error is not None
-        branch_loss = processor._pending_branch_losses.pop()
+        group_loss = processor._pending_group_losses.pop()
         with db.write_connection() as conn:
-            assert record_coalesce_branch_loss(
+            assert record_group_loss(
                 conn,
                 run_id="test-run",
-                coalesce_name=branch_loss.coalesce_name,
-                row_id=branch_loss.row_id,
-                branch_name=branch_loss.branch_name,
-                token_id=branch_loss.token_id,
-                reason=branch_loss.reason,
-                recorded_by=branch_loss.recorded_by,
+                spec=group_loss,
+                recorded_by="worker-1",
                 now=datetime.now(UTC),
             )
         with (
-            caplog.at_level(logging.WARNING, logger="elspeth.core.landscape.scheduler.branch_losses"),
+            caplog.at_level(logging.WARNING, logger="elspeth.core.landscape.scheduler.group_losses"),
             db.write_connection() as conn,
         ):
-            assert not record_coalesce_branch_loss(
+            assert not record_group_loss(
                 conn,
                 run_id="test-run",
-                coalesce_name=branch_loss.coalesce_name,
-                row_id=branch_loss.row_id,
-                branch_name=branch_loss.branch_name,
-                token_id=branch_loss.token_id,
-                reason="max_retries_exceeded_replay",
-                recorded_by=branch_loss.recorded_by,
+                spec=replace(group_loss, reason="max_retries_exceeded_replay"),
+                recorded_by="worker-1",
                 now=datetime.now(UTC),
             )
 
-        [durable_loss] = factory.scheduler.list_coalesce_branch_losses(run_id="test-run")
+        [durable_loss] = factory.scheduler.list_group_losses(run_id="test-run")
         assert outcome.result.error.message == "<redacted-secret>"
         assert outcome.result.error.last_error == "<redacted-secret>"
         assert durable_loss.reason == "max_retries_exceeded"
@@ -785,7 +779,7 @@ class TestHandleTransformErrorStatus:
         The detail travels via compute_error_hash on the token outcome; the
         column carries only the category token.
         """
-        from elspeth.core.landscape.scheduler.branch_losses import record_coalesce_branch_loss
+        from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 
         db, factory = _make_factory()
         coalesce_name = CoalesceName("merge")
@@ -819,21 +813,17 @@ class TestHandleTransformErrorStatus:
         )
 
         assert isinstance(outcome, _TransformTerminal)
-        branch_loss = processor._pending_branch_losses.pop()
-        assert branch_loss.reason == "quarantined"
+        group_loss = processor._pending_group_losses.pop()
+        assert group_loss.reason == "quarantined"
         with db.write_connection() as conn:
-            assert record_coalesce_branch_loss(
+            assert record_group_loss(
                 conn,
                 run_id="test-run",
-                coalesce_name=branch_loss.coalesce_name,
-                row_id=branch_loss.row_id,
-                branch_name=branch_loss.branch_name,
-                token_id=branch_loss.token_id,
-                reason=branch_loss.reason,
-                recorded_by=branch_loss.recorded_by,
+                spec=group_loss,
+                recorded_by="worker-1",
                 now=datetime.now(UTC),
             )
-        [durable_loss] = factory.scheduler.list_coalesce_branch_losses(run_id="test-run")
+        [durable_loss] = factory.scheduler.list_group_losses(run_id="test-run")
         assert durable_loss.reason == "quarantined"
 
     def test_error_routed_branch_loss_reason_is_bounded_category_token(self) -> None:
@@ -875,8 +865,8 @@ class TestHandleTransformErrorStatus:
         )
 
         assert isinstance(outcome, _TransformTerminal)
-        branch_loss = processor._pending_branch_losses.pop()
-        assert branch_loss.reason == "error_routed"
+        group_loss = processor._pending_group_losses.pop()
+        assert group_loss.reason == "error_routed"
         # The detail is preserved on the routed result, not in the reason column.
         assert isinstance(outcome.result, RowResult)
         assert outcome.result.error is not None

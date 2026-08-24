@@ -30,7 +30,6 @@ RETIRED_FIELD_NAMES = {"branch_name", "fork_group_id", "expand_group_id"}
 COLUMN_ALLOWLIST = {
     ("tokens", "join_group_id"),  # merge-event anchor; coalesce_effects composite FK target (spec §4.1)
     ("token_work_items", "join_group_id"),  # merged-token work-item carrier (ruling 20, plan decision D1)
-    ("coalesce_branch_losses", "branch_name"),  # WS3 replaces this table with group_losses; until then it stands
 }
 
 
