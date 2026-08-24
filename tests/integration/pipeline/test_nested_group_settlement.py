@@ -40,6 +40,7 @@ that rots. Task 9's third scenario is therefore proven only for the flat
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -581,9 +582,19 @@ def test_nested_row_union_branch_is_unauthorable_by_design(tmp_path: Path) -> No
     real (the loop lacks the ``_is_nested_barrier_branch``/
     ``_resolve_nested_branch_first_node`` treatment the coalesce loop has),
     but every topology that would reach it is independently build-rejected
-    here — this is NOT the shape that gap needs a fixture for."""
-    for index, yaml_template in enumerate((_NESTED_FORK_FEEDS_ROW_UNION_YAML, _ROW_UNION_FEEDS_OUTER_COALESCE_YAML)):
+    here — this is NOT the shape that gap needs a fixture for.
+
+    Each ``pytest.raises`` carries ``match=`` on a fragment unique to its
+    OWN guard (verified against the real raised text, not guessed) — a bare
+    ``GraphValidationError`` here would also pass if an unrelated validation
+    error fired first, silently rotting this premise-defect pin into
+    "something rejected this" instead of "THIS guard rejected this"."""
+    cases = (
+        (_NESTED_FORK_FEEDS_ROW_UNION_YAML, "nested fork replaces the enclosing branch identity"),
+        (_ROW_UNION_FEEDS_OUTER_COALESCE_YAML, "cannot consume an N-to-N group"),
+    )
+    for index, (yaml_template, message_fragment) in enumerate(cases):
         case_dir = tmp_path / f"case-{index}"
         case_dir.mkdir()
-        with pytest.raises(GraphValidationError):
+        with pytest.raises(GraphValidationError, match=re.escape(message_fragment)):
             _build_and_run(yaml_template, case_dir)

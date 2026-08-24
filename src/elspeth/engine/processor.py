@@ -3179,6 +3179,25 @@ class RowProcessor:
         quarantined loop (ruling 25 makes a bound frame unreachable there in
         a buildable graph; the check exists to fail AT that impossible state
         rather than stage a loss the flush has no consumer for).
+
+        WS3 Task 9 EXPAND-safety note: this walk's skip-unbound-frames
+        behaviour is what makes a row_union closer's resolved `frame.group_id`
+        provably its own FORK group today, even though an EXPAND frame can
+        legally stack on top of a row_union's FORK frame before the union
+        (`_note_row_union_group_failed_from_token`'s docstring in
+        barrier_coordination.py explains why that stacking is legal). An
+        EXPAND frame only resolves a binding via `GroupBindingRegistry.
+        binding_for` when it is in `_expand_groups`, which is populated
+        solely by `register_expand_group` — called only by a declared
+        scope's collector opener — and collector execution does not run
+        until WS4 (`graph_registration.py` hard-refuses any graph with a
+        non-empty collector id map, mirroring the ticketed gap on
+        `BarrierIntakeCoordinator._binding_for_closer_name` in
+        barrier_coordination.py, elspeth-c00a82bf97). So no EXPAND
+        frame can be BOUND today, and this walk always resolves past one to
+        the enclosing FORK frame. Re-adjudicate this note once WS4 lifts
+        that refusal and collector-bound EXPAND frames become reachable
+        here.
         """
         for frame in reversed(current_token.lineage_path):
             binding = self._group_bindings.binding_for(frame)
