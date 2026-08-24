@@ -484,6 +484,41 @@ def _make_processor(
     )
 
 
+def _make_claimed_work_item(
+    *,
+    token_id: str = "tok-claimed",
+    lineage_path: tuple[LineageFrame, ...] = (),
+    run_id: str = "test-run",
+    row_id: str = "row-1",
+    node_id: str | None = "transform-1",
+    lease_owner: str = "worker-1",
+) -> Any:
+    """A minimal LEASED TokenWorkItem stand-in for the group-loss claim guard
+    (spec §6.2): callers only need ``token_id``/``lineage_path`` to shape, so
+    every other field carries a harmless placeholder."""
+    from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
+
+    now = datetime.now(UTC)
+    return TokenWorkItem(
+        work_item_id=f"wi-{token_id}",
+        run_id=run_id,
+        token_id=token_id,
+        row_id=row_id,
+        node_id=node_id,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json="{}",
+        status=TokenWorkStatus.LEASED,
+        attempt=1,
+        available_at=now,
+        created_at=now,
+        updated_at=now,
+        lineage_path=lineage_path,
+        lease_owner=lease_owner,
+        lease_expires_at=now + timedelta(seconds=60),
+    )
+
+
 def _make_mock_transform(
     *,
     node_id: str = "transform-1",
@@ -7566,7 +7601,7 @@ class TestExecuteTransformWithRetry:
             lost_branch=token.branch_name,
             reason="max_retries_exceeded",
         )
-        assert len(processor._pending_branch_losses) == 1
+        assert len(processor._pending_group_losses) == 1
 
     def test_retry_configuration_does_not_change_named_error_destination(self) -> None:
         """Retry-off and exhausted-retry paths produce the same route triple."""
@@ -8601,10 +8636,10 @@ class TestNotifyCoalesceOfLostBranch:
         results, child_items = processor._route_empty_emission_results(fctx)
 
         coalesce.notify_branch_lost.assert_not_called()
-        assert len(processor._pending_branch_losses) == 1
+        assert len(processor._pending_group_losses) == 1
         with (
             patch.object(processor._scheduler, "complete_barrier", side_effect=RuntimeError("aggregation commit failed")),
-            patch.object(processor._barrier_intake, "replay_durable_branch_losses") as replay,
+            patch.object(processor._barrier_intake, "replay_durable_group_losses") as replay,
             patch.object(processor, "_complete_coalesce_fire") as complete_coalesce,
             pytest.raises(RuntimeError, match="aggregation commit failed"),
         ):
@@ -8620,14 +8655,14 @@ class TestNotifyCoalesceOfLostBranch:
         coalesce.notify_branch_lost.assert_not_called()
         replay.assert_not_called()
         complete_coalesce.assert_not_called()
-        assert len(processor._pending_branch_losses) == 1
+        assert len(processor._pending_group_losses) == 1
 
         ordered_events: list[str] = []
 
         def committed_barrier(**kwargs: object) -> None:
-            branch_losses = kwargs["branch_losses"]
-            assert isinstance(branch_losses, tuple)
-            assert len(branch_losses) == 1
+            group_losses = kwargs["group_losses"]
+            assert isinstance(group_losses, tuple)
+            assert len(group_losses) == 1
             ordered_events.append("aggregation_committed")
 
         def replay_after_commit() -> tuple[object, ...]:
@@ -8636,7 +8671,7 @@ class TestNotifyCoalesceOfLostBranch:
 
         with (
             patch.object(processor._scheduler, "complete_barrier", side_effect=committed_barrier),
-            patch.object(processor._barrier_intake, "replay_durable_branch_losses", side_effect=replay_after_commit),
+            patch.object(processor._barrier_intake, "replay_durable_group_losses", side_effect=replay_after_commit),
         ):
             processor._complete_aggregation_flush(
                 NodeID("aggregate-1"),
@@ -8648,7 +8683,7 @@ class TestNotifyCoalesceOfLostBranch:
             )
 
         assert ordered_events == ["aggregation_committed", "loss_replayed"]
-        assert processor._pending_branch_losses == []
+        assert processor._pending_group_losses == []
 
     def test_no_coalesce_executor_returns_empty(self) -> None:
         """Without coalesce_executor, returns empty list."""
@@ -9129,11 +9164,13 @@ class TestRowUnionBranchLossTelemetry:
 
         assert processor._notify_row_union_of_lost_branch(lost_token, "error_routed") == []
 
-        loss = processor._take_claim_branch_loss("lost-token")
-        assert loss is not None
-        assert loss.coalesce_name == "variants"
-        assert loss.row_id == "row-1"
-        assert loss.branch_name == "control"
+        claimed = _make_claimed_work_item(token_id="lost-token", lineage_path=lost_token.lineage_path)
+        losses = processor._take_claim_group_losses(claimed)
+        assert len(losses) == 1
+        (loss,) = losses
+        assert loss.closer_name == "variants"
+        assert loss.group_id == "fg-control"
+        assert loss.member_key == "control"
         assert loss.reason == "error_routed"
 
     def test_failed_siblings_emit_token_completed_after_audit(self) -> None:
@@ -9196,7 +9233,8 @@ class TestRowUnionBranchLossTelemetry:
         assert processor._notify_row_union_of_lost_branch(released_token, "routed_to_sink") == []
 
         row_union_executor.notify_branch_lost.assert_not_called()
-        assert processor._take_claim_branch_loss("released-token") is None
+        claimed = _make_claimed_work_item(token_id="released-token", lineage_path=released_token.lineage_path)
+        assert processor._take_claim_group_losses(claimed) == ()
 
     def test_released_group_stages_no_durable_loss_follower(self) -> None:
         # Followers have no executor; the durable status-COMPLETED node state
@@ -9221,7 +9259,8 @@ class TestRowUnionBranchLossTelemetry:
 
         assert processor._notify_row_union_of_lost_branch(released_token, "routed_to_sink") == []
 
-        assert processor._take_claim_branch_loss("released-token") is None
+        claimed = _make_claimed_work_item(token_id="released-token", lineage_path=released_token.lineage_path)
+        assert processor._take_claim_group_losses(claimed) == ()
 
     def test_failure_closed_group_still_stages_durable_loss_follower(self) -> None:
         # A FAILED closure at the union node is not a release: a later
@@ -9251,9 +9290,10 @@ class TestRowUnionBranchLossTelemetry:
 
         assert processor._notify_row_union_of_lost_branch(lost_token, "error_routed") == []
 
-        loss = processor._take_claim_branch_loss("failed-token")
-        assert loss is not None
-        assert loss.branch_name == "control"
+        claimed = _make_claimed_work_item(token_id="failed-token", lineage_path=lost_token.lineage_path)
+        losses = processor._take_claim_group_losses(claimed)
+        assert len(losses) == 1
+        assert losses[0].member_key == "control"
 
 
 # =============================================================================

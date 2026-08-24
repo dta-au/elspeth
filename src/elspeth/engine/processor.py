@@ -145,7 +145,7 @@ from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import (
     BarrierEmission,
     BarrierTerminalOutcomeSpec,
-    BranchLossSpec,
+    GroupLossSpec,
     TokenWorkItem,
     TokenWorkStatus,
 )
@@ -699,13 +699,13 @@ class RowProcessor:
         # processor's lifetime — bounded by run size.
         # RowProcessor is single-threaded per row, so no concurrent access.
         self._live_barrier_holds: dict[str, _LiveBarrierHold] = {}
-        # §E.5 record-then-notify: BranchLossSpecs accumulated by
+        # §6.2 record-then-notify: GroupLossSpecs accumulated by
         # `_notify_coalesce_of_lost_branch` during the current claim/flush;
-        # consumed by the disposition that commits the branch's terminal state
+        # consumed by the disposition that commits the member's terminal state
         # (the drain's mark_failed/mark_pending_sink/mark_terminal, or the
         # flush's complete_barrier) so the durable loss record rides the SAME
         # transaction as the disposition.
-        self._pending_branch_losses: list[BranchLossSpec] = []
+        self._pending_group_losses: list[GroupLossSpec] = []
 
         # F1 (THE RESTORE INVERSION): on resume, barrier buffers are rebuilt
         # FROM journal BLOCKED rows + audit tables. The old direction —
@@ -781,7 +781,7 @@ class RowProcessor:
             scheduler_lease_owner_registered=self._scheduler_lease_owner_registered,
             resume_checkpoint_id=self._resume_checkpoint_id,
             live_barrier_holds=self._live_barrier_holds,
-            pending_branch_losses=self._pending_branch_losses,
+            pending_group_losses=self._pending_group_losses,
         )
         # Component 4 (c49): the DAG token-traversal state machine. Holds only a
         # back-reference and resolves processor seams at call time, so tests that
@@ -3148,7 +3148,7 @@ class RowProcessor:
         pops the FORK frame only off the RELEASED tokens the union itself
         returns, never off a live token still traversing downstream of it). A
         group that already released is not a pre-barrier loss — staging one
-        would persist a false coalesce_branch_losses record on a healthy run.
+        would persist a false group_losses record on a healthy run.
         A genuine pre-barrier loss can never coincide with a released group
         (release requires every
         branch to arrive), so the guard changes no legitimate loss.
@@ -3161,14 +3161,20 @@ class RowProcessor:
         row_union_name = self._branch_to_row_union[branch_name]
         if self._row_union_group_released(row_union_name, current_token.row_id):
             return []
-        self._pending_branch_losses.append(
-            BranchLossSpec(
-                coalesce_name=str(row_union_name),
-                row_id=current_token.row_id,
-                branch_name=str(branch_name),
+        # Minimal WS3 conversion (Task 5 rewrites this via a lineage-path
+        # walk): key on the token's innermost FORK frame. fork_group_id is
+        # derived from the same lineage_path as branch_name (both read the
+        # innermost FORK frame), so it is non-None whenever branch_name is
+        # (the guard above already returned on branch_name is None).
+        fork_group_id = current_token.fork_group_id
+        assert fork_group_id is not None, "fork_group_id is derived from the same frame as branch_name, checked above"
+        self._pending_group_losses.append(
+            GroupLossSpec(
+                closer_name=str(row_union_name),
+                group_id=fork_group_id,
+                member_key=str(branch_name),
                 token_id=current_token.token_id,
                 reason=reason,
-                recorded_by=self._scheduler_lease_owner,
             )
         )
         if self._row_union_executor is None or not notify_in_memory:
@@ -3322,25 +3328,31 @@ class RowProcessor:
         coalesce_name = self._branch_to_coalesce[branch_name]
 
         coalesce_node_id = self._coalesce_node_ids[coalesce_name]
-        # §E.5 record-then-notify: stage the durable loss record BEFORE the
+        # §6.2 record-then-notify: stage the durable loss record BEFORE the
         # in-memory notify, and UNCONDITIONALLY (regardless of whether this
         # worker has a coalesce_executor). A follower has no in-process
-        # CoalesceExecutor, but it MUST still write the durable branch-loss row
+        # CoalesceExecutor, but it MUST still write the durable group-loss row
         # in the same transaction as its mark_failed/divert so the leader's
-        # next journal-intake can see the loss (design §E.5:366-374).
+        # next journal-intake can see the loss (design §6.2).
         # The spec rides the branch token's own disposition transaction (the
         # drain's mark_failed / mark_pending_sink / mark_terminal for the
         # claimed token, or the flush's complete_barrier for empty-emission
         # losses) — committed iff the disposition commits, idempotent on the
         # natural key.
-        self._pending_branch_losses.append(
-            BranchLossSpec(
-                coalesce_name=str(coalesce_name),
-                row_id=current_token.row_id,
-                branch_name=str(branch_name),
+        # Minimal WS3 conversion (Task 5 rewrites this via a lineage-path
+        # walk): key on the token's innermost FORK frame. fork_group_id is
+        # derived from the same lineage_path as branch_name (both read the
+        # innermost FORK frame), so it is non-None whenever branch_name is
+        # (the guard above already returned on branch_name is None).
+        fork_group_id = current_token.fork_group_id
+        assert fork_group_id is not None, "fork_group_id is derived from the same frame as branch_name, checked above"
+        self._pending_group_losses.append(
+            GroupLossSpec(
+                closer_name=str(coalesce_name),
+                group_id=fork_group_id,
+                member_key=str(branch_name),
                 token_id=current_token.token_id,
                 reason=reason,
-                recorded_by=self._scheduler_lease_owner,
             )
         )
 
@@ -3393,7 +3405,7 @@ class RowProcessor:
             # arrival) — a nested inner coalesce's loss-triggered release needs
             # the same fresh barrier resolution those two already apply
             # (elspeth-0bd2cde19a round-2 F1; the durable REPLAY of the
-            # identical loss via _replay_branch_losses -> _fire_coalesce_merge
+            # identical loss via _replay_group_losses -> _fire_coalesce_merge
             # was already correct — only this LIVE path was missing it).
             # completed_coalesce_name=coalesce_name, same call shape as the
             # other two sites: for the flat/unnested case this is NOT
@@ -4088,7 +4100,7 @@ class RowProcessor:
                     )
                 )
 
-        branch_losses = tuple(self._pending_branch_losses)
+        group_losses = tuple(self._pending_group_losses)
         self._scheduler.complete_barrier(
             run_id=self._run_id,
             barrier_key=str(node_id),
@@ -4107,15 +4119,15 @@ class RowProcessor:
             # Attributed park (ADR-030): the post-sink strict owner CAS
             # terminalizes these handoffs under this worker's lease identity.
             pending_sink_lease_owner=self._scheduler_lease_owner,
-            branch_losses=branch_losses,
+            group_losses=group_losses,
             terminal_outcomes=tuple(terminal_outcomes),
         )
-        if branch_losses:
+        if group_losses:
             # The producer transaction is now authoritative. Only after it
             # commits may loss intake mutate a coalesce/row-union executor or
             # fire that downstream barrier. A crash before this replay leaves
             # an unadopted durable ledger row for the next intake/restore.
-            del self._pending_branch_losses[: len(branch_losses)]
+            del self._pending_group_losses[: len(group_losses)]
             for disposition in self._barrier_intake.replay_durable_branch_losses():
                 results = (*results, *disposition.results)
                 child_items.extend(disposition.child_items)
@@ -4497,9 +4509,9 @@ class RowProcessor:
         """Rebuild a sink-bound row result without re-running its producer node (delegate)."""
         return self._scheduler_drain.row_result_from_pending_sink(scheduled)
 
-    def _take_claim_branch_loss(self, claimed_token_id: str) -> BranchLossSpec | None:
-        """Take the staged §E.5 loss record for the claim being disposed (delegate)."""
-        return self._scheduler_drain.take_claim_branch_loss(claimed_token_id)
+    def _take_claim_group_losses(self, claimed: TokenWorkItem) -> tuple[GroupLossSpec, ...]:
+        """Take the staged loss records for the claim being disposed (delegate, spec §6.2)."""
+        return self._scheduler_drain.take_claim_group_losses(claimed)
 
     def _heartbeat_active_claim(self) -> None:
         """Refresh the active scheduler lease if the heartbeat interval elapsed.

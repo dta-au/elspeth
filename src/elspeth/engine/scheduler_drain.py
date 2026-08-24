@@ -14,7 +14,7 @@ Boundary rules (mirrors engine/barrier_coordination.py):
   ``_scheduler_drains_since_maintenance``) and SHARES two mutable objects by
   reference with the processor and the barrier subsystem:
   ``live_barrier_holds`` (also injected into BarrierIntakeCoordinator) and
-  ``pending_branch_losses`` (appended by the processor's coalesce loss path,
+  ``pending_group_losses`` (appended by the processor's loss-staging path,
   consumed by both this drain's dispositions and the flush path). Copying
   either would silently break §E.2 intake parity / §E.5 loss-riding
   transactions.
@@ -46,7 +46,7 @@ from elspeth.contracts.errors import (
     SchedulerLeaseLostError,
 )
 from elspeth.contracts.results import FailureInfo
-from elspeth.contracts.scheduler import BranchLossSpec, TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
 from elspeth.engine._error_hash import compute_error_hash
 
 if TYPE_CHECKING:
@@ -290,7 +290,7 @@ class SchedulerDrainCoordinator:
         scheduler_lease_owner_registered: bool,
         resume_checkpoint_id: str | None,
         live_barrier_holds: dict[str, _LiveBarrierHold],
-        pending_branch_losses: list[BranchLossSpec],
+        pending_group_losses: list[GroupLossSpec],
     ) -> None:
         self._processor = processor
         # Explicit role decided at construction (elspeth-577179bba1): the
@@ -313,11 +313,11 @@ class SchedulerDrainCoordinator:
         self._resume_checkpoint_id = resume_checkpoint_id
         # SHARED references (never copy): the live-token stash is written by
         # the processor's block-deciding producers and read by both the
-        # barrier intake and this drain; the branch-loss stage is appended by
-        # the processor's coalesce loss path and consumed by this drain's
+        # barrier intake and this drain; the group-loss stage is appended by
+        # the processor's loss-staging path and consumed by this drain's
         # dispositions and the processor's flush path.
         self._live_barrier_holds = live_barrier_holds
-        self._pending_branch_losses = pending_branch_losses
+        self._pending_group_losses = pending_group_losses
         # Active scheduler claim state for in-loop heartbeat refresh
         # (ADR-026 RC6 multi-worker, filigree elspeth-ddde8144b6). These
         # fields are non-None only inside ``drain_claims`` between
@@ -641,7 +641,7 @@ class SchedulerDrainCoordinator:
                         # completion if active work remains. Staged §E.5 loss
                         # records are discarded with the abandoned claim (the
                         # peer's re-drive re-stages them with its own disposition).
-                        self._pending_branch_losses.clear()
+                        self._pending_group_losses.clear()
                         exc.add_note("scheduler lease lost during row processing; in-flight token result was abandoned")
                         self._spans.mark_error(row_span, exc)
                         return results
@@ -652,7 +652,7 @@ class SchedulerDrainCoordinator:
                         # either mutate the abandoned lease through the lenient
                         # N=0 disposition fence or mask this signal behind an
                         # AuditIntegrityError when another member remains.
-                        self._pending_branch_losses.clear()
+                        self._pending_group_losses.clear()
                         exc.add_note("worker membership lost during row processing; in-flight token result was abandoned")
                         raise
                     except Exception as processing_exc:
@@ -661,7 +661,7 @@ class SchedulerDrainCoordinator:
                                 work_item_id=claimed.work_item_id,
                                 now=self._clock.now_utc(),
                                 expected_lease_owner=claimed_lease_owner,
-                                branch_loss=self.take_claim_branch_loss(claimed.token_id),
+                                group_losses=self.take_claim_group_losses(claimed),
                                 worker_id=self._disposition_fence_worker_id(),
                             )
                         except RunWorkerEvictedError as evicted_exc:
@@ -718,7 +718,7 @@ class SchedulerDrainCoordinator:
                     error_hash = scheduler_error_hash(sink_bound_result)
                     error_message = scheduler_error_message(sink_bound_result)
                     pending_sink_now = self._clock.now_utc()
-                    branch_loss = self.take_claim_branch_loss(claimed.token_id)
+                    group_losses = self.take_claim_group_losses(claimed)
                     worker_id = self._disposition_fence_worker_id()
                     if child_items:
                         _, scheduled_children = self._scheduler.mark_pending_sink_with_ready_children(
@@ -732,7 +732,7 @@ class SchedulerDrainCoordinator:
                             error_message=error_message,
                             now=pending_sink_now,
                             expected_lease_owner=claimed_lease_owner,
-                            branch_loss=branch_loss,
+                            group_losses=group_losses,
                             worker_id=worker_id,
                         )
                         self._retain_scheduled_children(child_items, scheduled_children, pending_items)
@@ -747,7 +747,7 @@ class SchedulerDrainCoordinator:
                             error_message=error_message,
                             now=pending_sink_now,
                             expected_lease_owner=claimed_lease_owner,
-                            branch_loss=branch_loss,
+                            group_losses=group_losses,
                             worker_id=worker_id,
                         )
                     if sink_bound_result.outcome is TerminalOutcome.FAILURE:
@@ -755,7 +755,7 @@ class SchedulerDrainCoordinator:
                     result = with_scheduler_pending_sink_handoff(result, claimed.token_id)
                 elif scheduler_result_failed_claimed_token(result, claimed.token_id):
                     failed_now = self._clock.now_utc()
-                    branch_loss = self.take_claim_branch_loss(claimed.token_id)
+                    group_losses = self.take_claim_group_losses(claimed)
                     worker_id = self._disposition_fence_worker_id()
                     if child_items:
                         _, scheduled_children = self._scheduler.mark_failed_with_ready_children(
@@ -763,7 +763,7 @@ class SchedulerDrainCoordinator:
                             emitted_ready=tuple(self._work_codec.ready_emission(child_item) for child_item in child_items),
                             now=failed_now,
                             expected_lease_owner=claimed_lease_owner,
-                            branch_loss=branch_loss,
+                            group_losses=group_losses,
                             worker_id=worker_id,
                         )
                         self._retain_scheduled_children(child_items, scheduled_children, pending_items)
@@ -772,13 +772,13 @@ class SchedulerDrainCoordinator:
                             work_item_id=claimed.work_item_id,
                             now=failed_now,
                             expected_lease_owner=claimed_lease_owner,
-                            branch_loss=branch_loss,
+                            group_losses=group_losses,
                             worker_id=worker_id,
                         )
                     self._spans.mark_error(row_span, RowResultError())
                 else:
                     terminal_now = self._clock.now_utc()
-                    branch_loss = self.take_claim_branch_loss(claimed.token_id)
+                    group_losses = self.take_claim_group_losses(claimed)
                     worker_id = self._disposition_fence_worker_id()
                     if child_items:
                         _, scheduled_children = self._scheduler.mark_terminal_with_ready_children(
@@ -786,7 +786,7 @@ class SchedulerDrainCoordinator:
                             emitted_ready=tuple(self._work_codec.ready_emission(child_item) for child_item in child_items),
                             now=terminal_now,
                             expected_lease_owner=claimed_lease_owner,
-                            branch_loss=branch_loss,
+                            group_losses=group_losses,
                             worker_id=worker_id,
                         )
                         self._retain_scheduled_children(child_items, scheduled_children, pending_items)
@@ -795,7 +795,7 @@ class SchedulerDrainCoordinator:
                             work_item_id=claimed.work_item_id,
                             now=terminal_now,
                             expected_lease_owner=claimed_lease_owner,
-                            branch_loss=branch_loss,
+                            group_losses=group_losses,
                             worker_id=worker_id,
                         )
 
@@ -978,31 +978,41 @@ class SchedulerDrainCoordinator:
             )
         return claimed.lease_owner
 
-    def take_claim_branch_loss(self, claimed_token_id: str) -> BranchLossSpec | None:
-        """Take the staged §E.5 loss record for the claim being disposed.
+    def take_claim_group_losses(self, claimed: TokenWorkItem) -> tuple[GroupLossSpec, ...]:
+        """Take the staged losses for the claim being disposed (spec §6.2).
 
-        A single claim loses at most ONE branch (the claimed token reaches
-        exactly one lossy terminal arm); the record rides the claim's own
-        ``mark_failed`` / ``mark_pending_sink`` / ``mark_terminal``
-        transaction. More than one staged record, or a record for a different
-        token, is a processor bug.
+        Frame-authenticated: each staged spec must name a (group_id,
+        member_key) frame that the claimed token's own lineage_path carries —
+        self-authenticating, because frames are minted by openers and never
+        asserted by failing code. At most one loss per bound frame per claim.
+        The old token-equality guard is retired with BranchLossSpec: for a
+        FORK frame this guard is exactly as strong (the branch token carries
+        its own branch frame), and for EXPAND frames it is the correct
+        generalization the old guard crashed on.
         """
-        if not self._pending_branch_losses:
-            return None
-        if len(self._pending_branch_losses) > 1:
-            staged = [(spec.token_id, spec.branch_name) for spec in self._pending_branch_losses]
-            raise OrchestrationInvariantError(
-                f"Claim disposition for token {claimed_token_id!r} found {len(self._pending_branch_losses)} staged "
-                f"branch-loss records ({staged!r}); one claim loses at most one branch. Processor bug."
-            )
-        spec = self._pending_branch_losses.pop()
-        if spec.token_id != claimed_token_id:
-            raise OrchestrationInvariantError(
-                f"Claim disposition for token {claimed_token_id!r} found a staged branch-loss record for "
-                f"token {spec.token_id!r} (branch {spec.branch_name!r}); the loss must ride its own token's "
-                "disposition. Processor bug."
-            )
-        return spec
+        if not self._pending_group_losses:
+            return ()
+        staged = tuple(self._pending_group_losses)
+        self._pending_group_losses.clear()
+        claimed_frames = {(frame.group_id, frame.member_key) for frame in claimed.lineage_path}
+        seen: set[tuple[str, str]] = set()
+        for spec in staged:
+            key = (spec.group_id, spec.member_key)
+            if key not in claimed_frames:
+                raise OrchestrationInvariantError(
+                    f"Claim disposition for token {claimed.token_id!r} found a staged group-loss "
+                    f"record for group {spec.group_id!r} member {spec.member_key!r} that the claimed "
+                    "token's lineage path does not carry. Frames are minted by openers, never "
+                    "asserted by failing code. Processor bug."
+                )
+            if key in seen:
+                raise OrchestrationInvariantError(
+                    f"Claim disposition for token {claimed.token_id!r} staged two losses for group "
+                    f"{spec.group_id!r} member {spec.member_key!r}; at most one loss per bound frame "
+                    "per claim. Processor bug."
+                )
+            seen.add(key)
+        return staged
 
     # ─────────────────────────────────────────────────────────────────────────
     # Active-claim heartbeat and live-hold keys

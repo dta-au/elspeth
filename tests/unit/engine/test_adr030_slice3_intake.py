@@ -39,7 +39,7 @@ from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import AggregationSettings
 from elspeth.core.landscape.schema import (
-    coalesce_branch_losses_table,
+    group_losses_table,
     scheduler_events_table,
     token_work_items_table,
 )
@@ -52,6 +52,7 @@ from elspeth.testing import make_row, make_token_info
 from tests.fixtures.factories import make_context
 from tests.unit.engine.test_processor import (
     BarrierJournalRestoreContext,
+    _make_claimed_work_item,
     _make_factory,
     _make_mock_transform,
     _make_processor,
@@ -250,8 +251,8 @@ class TestLateArrivalRelease:
         assert processor.has_unresolved_scheduler_work() is False
 
 
-class TestBranchLossHandOff:
-    """§H 479 / §E.5 — record-then-notify, one-drain-step must-fail, takeover."""
+class TestGroupLossHandOff:
+    """§H 479 / §6.2 — record-then-notify, one-drain-step must-fail, takeover."""
 
     def _forked_processor(self, factory: Any, coalesce_executor: Any, *, barrier_restore: Any = None) -> Any:
         return _make_processor(
@@ -300,10 +301,14 @@ class TestBranchLossHandOff:
         assert sibling_results[0].token.token_id == "tok-held"
 
         # The staged loss rides the claim's own disposition transaction.
-        spec = processor._take_claim_branch_loss("tok-lost")
-        assert spec is not None
-        assert (spec.coalesce_name, spec.row_id, spec.branch_name, spec.token_id) == ("merge", "row-1", "path_b", "tok-lost")
-        assert spec.recorded_by == processor._scheduler_lease_owner
+        # Frame-authenticated (spec §6.2): the claim guard checks the staged
+        # spec's (group_id, member_key) against the CLAIMED token's own
+        # lineage_path, which is the losing token's own frame here.
+        claimed = _make_claimed_work_item(token_id="tok-lost", lineage_path=losing_token.lineage_path)
+        losses = processor._take_claim_group_losses(claimed)
+        assert len(losses) == 1
+        (spec,) = losses
+        assert (spec.closer_name, spec.group_id, spec.member_key, spec.token_id) == ("merge", "fg-adr030-test", "path_b", "tok-lost")
 
         # Drive the disposition the drain would issue and prove atomic commit.
         from tests.unit.engine.test_processor import _persist_token_for_scheduler
@@ -326,13 +331,18 @@ class TestBranchLossHandOff:
             work_item_id=item.work_item_id,
             now=processor._clock.now_utc(),
             expected_lease_owner="test-harness",
-            branch_loss=spec,
+            group_losses=losses,
         )
         with db.connection() as conn:
-            loss_rows = conn.execute(select(coalesce_branch_losses_table)).mappings().all()
+            loss_rows = conn.execute(select(group_losses_table)).mappings().all()
         assert len(loss_rows) == 1
-        assert loss_rows[0]["branch_name"] == "path_b"
+        assert loss_rows[0]["member_key"] == "path_b"
         assert loss_rows[0]["adopted_epoch"] is None  # intake-pending replay cursor
+        # GroupLossSpec carries no recorded_by (unlike the retired
+        # BranchLossSpec): the disposition layer stamps the lease owner it
+        # already holds — the attribution invariant moves to this durable
+        # ledger row.
+        assert loss_rows[0]["recorded_by"] == "test-harness"
 
         # The next intake marks the loss adopted; the in-memory replay dedups
         # via has_recorded_branch_loss (record-then-notify already ran).
@@ -341,7 +351,7 @@ class TestBranchLossHandOff:
         assert results == [] and child_items == []
         coalesce.notify_branch_lost.assert_called_once()  # the in-claim call only
         with db.connection() as conn:
-            adopted_epoch = conn.execute(select(coalesce_branch_losses_table.c.adopted_epoch)).scalar_one()
+            adopted_epoch = conn.execute(select(group_losses_table.c.adopted_epoch)).scalar_one()
         assert adopted_epoch == 1
 
     def test_loss_survives_takeover_via_restore_ledger_seed(self) -> None:
@@ -394,19 +404,20 @@ class TestBranchLossHandOff:
             lease_seconds=60,
             now=bootstrap._clock.now_utc(),
         )
-        from elspeth.core.landscape.scheduler_repository import BranchLossSpec
+        from elspeth.core.landscape.scheduler_repository import GroupLossSpec
 
         factory.scheduler.mark_failed(
             work_item_id=item.work_item_id,
             now=bootstrap._clock.now_utc(),
             expected_lease_owner="dead-leader",
-            branch_loss=BranchLossSpec(
-                coalesce_name="merge",
-                row_id="row-1",
-                branch_name="path_b",
-                token_id="tok-lost",
-                reason="quarantined:boom",
-                recorded_by="dead-leader",
+            group_losses=(
+                GroupLossSpec(
+                    closer_name="merge",
+                    group_id="fg-adr030-test",
+                    member_key="path_b",
+                    token_id="tok-lost",
+                    reason="quarantined:boom",
+                ),
             ),
         )
 
