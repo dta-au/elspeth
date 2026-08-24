@@ -297,3 +297,35 @@ class GroupLossRepository:
             )
             marked = result.rowcount
         return 0 if marked is None else int(marked)
+
+    def stage_escalation_loss(
+        self,
+        *,
+        run_id: str,
+        spec: GroupLossSpec,
+        frame_kind: FrameKind,
+        declared_roster: tuple[str, ...] | None,
+        recorded_by: str,
+        now: datetime,
+        coordination_token: CoordinationToken,
+    ) -> bool:
+        """Escalation staging (spec §6.3, Task 8): authenticate the spec
+        against the durable roster authority, then append the loss row —
+        inside ONE fenced leader transaction, the same fencing
+        ``adopt_group_losses`` uses. There is no claimed token at intake
+        time (this runs out-of-claim, from the barrier-intake pass), so the
+        adoption-context guard (``authenticate_adoption_loss``) substitutes
+        for the in-claim guard ``_stage_group_loss`` uses. Returns whatever
+        ``record_group_loss`` returns: ``True`` if this call inserted the
+        row, ``False`` if an identical row already existed (idempotent
+        re-derivation at takeover, spec §6.3 item 3).
+        """
+        with fenced_leader_transaction(
+            self._engine,
+            token=coordination_token,
+            now=now,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="stage_escalation_loss",
+        ) as conn:
+            authenticate_adoption_loss(conn, run_id=run_id, spec=spec, frame_kind=frame_kind, declared_roster=declared_roster)
+            return record_group_loss(conn, run_id=run_id, spec=spec, recorded_by=recorded_by, now=now)

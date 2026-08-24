@@ -17,6 +17,7 @@ delegators.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, overload
@@ -95,6 +96,7 @@ from elspeth.core.landscape.schema import (
     aggregation_results_table,
     batch_members_table,
     batches_table,
+    group_records_table,
     node_states_table,
     token_lineage_frames_table,
     token_outcomes_table,
@@ -106,7 +108,17 @@ if TYPE_CHECKING:
     from elspeth.contracts.node_state_context import NodeStateContext
     from elspeth.contracts.payload_store import PayloadStore
 
-__all__ = ["ExecutionRepository"]
+__all__ = ["ExecutionRepository", "GroupRecord"]
+
+
+@dataclass(frozen=True, slots=True)
+class GroupRecord:
+    """One ``group_records`` row (spec §4.3): the durable opener/roster-size
+    witness minted for both FORK and EXPAND groups."""
+
+    kind: FrameKind
+    opener_token_id: str
+    member_count: int
 
 
 class ExecutionRepository:
@@ -440,6 +452,57 @@ class ExecutionRepository:
                 f"found {len(rows)}: {[str(row.token_id) for row in rows]!r}"
             )
         return str(rows[0].token_id)
+
+    def get_group_record(self, *, run_id: str, group_id: str) -> GroupRecord | None:
+        """Read one ``group_records`` row (spec §4.3: mints for BOTH FORK and
+        EXPAND openers). ``None`` means the ledger references a group the
+        audit trail never minted."""
+        query = select(
+            group_records_table.c.kind,
+            group_records_table.c.opener_token_id,
+            group_records_table.c.member_count,
+        ).where(
+            group_records_table.c.run_id == run_id,
+            group_records_table.c.group_id == group_id,
+        )
+        row = self._ops.execute_fetchone(query)
+        if row is None:
+            return None
+        return GroupRecord(kind=FrameKind(row.kind), opener_token_id=str(row.opener_token_id), member_count=int(row.member_count))
+
+    def any_member_token_for_group(self, *, run_id: str, group_id: str) -> str | None:
+        """An arbitrary token whose lineage passes through ``group_id``
+        (escalation's enclosing-frame walk, spec §6.3): bound-region SESE
+        nesting guarantees every member of a group shares the same
+        enclosing prefix, so ONE witness token is sufficient — ``None``
+        means the group minted no frames at all."""
+        query = (
+            select(token_lineage_frames_table.c.token_id)
+            .where(
+                token_lineage_frames_table.c.run_id == run_id,
+                token_lineage_frames_table.c.group_id == group_id,
+            )
+            .limit(1)
+        )
+        row = self._ops.execute_fetchone(query)
+        return None if row is None else str(row.token_id)
+
+    def member_keys_for_group(self, *, run_id: str, group_id: str) -> tuple[str, ...]:
+        """DISTINCT ``member_key`` values minted for one group (EXPAND roster
+        derivation, spec §5): the runtime-minted roster, unlike a FORK
+        binding's static ``member_roster``. Sorted for deterministic
+        iteration; callers cross-check the count against ``group_records.
+        member_count``."""
+        query = (
+            select(token_lineage_frames_table.c.member_key)
+            .where(
+                token_lineage_frames_table.c.run_id == run_id,
+                token_lineage_frames_table.c.group_id == group_id,
+            )
+            .distinct()
+        )
+        rows = self._ops.execute_fetchall(query)
+        return tuple(sorted({str(row.member_key) for row in rows}))
 
     def record_routing_event(
         self,

@@ -37,12 +37,14 @@ from typing import TYPE_CHECKING
 from elspeth.contracts import RowResult, TokenInfo, TransformProtocol
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierScalars, CoalescePendingScalars
-from elspeth.contracts.enums import BatchStatus, TerminalOutcome, TerminalPath, TriggerType
+from elspeth.contracts.enums import BatchStatus, FrameKind, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.freeze import deep_freeze
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, GroupLossSpec, TokenWorkItem
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
+from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
 from elspeth.core.landscape.scheduler_repository import GroupLoss, token_from_journal_item
 from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
 
@@ -223,6 +225,7 @@ class BarrierIntakeCoordinator:
         branch_to_row_union: Mapping[BranchName, RowUnionName] | None = None,
         complete_row_union_fire: Callable[..., None] | None = None,
         released_row_union_items: Callable[..., tuple[WorkItem, ...]] | None = None,
+        group_bindings: GroupBindingRegistry | None = None,
     ) -> None:
         self._run_id = run_id
         self._scheduler = scheduler
@@ -253,6 +256,14 @@ class BarrierIntakeCoordinator:
         self._branch_to_row_union: Mapping[BranchName, RowUnionName] = branch_to_row_union or {}
         self._complete_row_union_fire = complete_row_union_fire
         self._released_row_union_items = released_row_union_items
+        self._group_bindings: GroupBindingRegistry = group_bindings if group_bindings is not None else GroupBindingRegistry(bindings=())
+        # spec §6.3 (Task 8): parked closer FAIL verdicts awaiting settlement,
+        # keyed on (closer_name, group_id). In-memory only — re-derivable at
+        # takeover because replaying the durable losses re-fires the closer's
+        # FAIL verdict, which re-parks the note (note_group_failed's own
+        # docstring), and escalation staging is idempotent on the ledger's
+        # natural key.
+        self._failed_group_notes: dict[tuple[str, str], str] = {}
 
     def _require_coordination_token(self) -> CoordinationToken:
         """The leader fencing token, REQUIRED for the slice-3 adoption verbs."""
@@ -360,6 +371,11 @@ class BarrierIntakeCoordinator:
                     dispositions.append(disposition)
 
         dispositions.extend(self._replay_group_losses())
+        # spec §6.3 (Task 8) — escalation runs AFTER durable-loss replay, in
+        # the SAME intake step: a note staged into the ledger THIS pass is
+        # picked up by the NEXT pass's replay above (one-pass-per-drain-cycle
+        # latency, spec-accepted).
+        self._stage_pending_escalations()
         return BarrierIntakePassOutcome(dispositions=tuple(dispositions))
 
     def _adopt_aggregation_row(self, row: TokenWorkItem, ctx: PluginContext) -> BarrierIntakeDisposition | None:
@@ -468,6 +484,11 @@ class BarrierIntakeCoordinator:
             # intake pass is out-of-claim (no take_claim_group_losses call
             # ever runs here), so without this the staged spec would be
             # orphaned exactly like the sweep path was before Ruling 39.
+            self._note_group_failed_from_token(
+                closer_name=str(coalesce_name),
+                token=token,
+                reason=outcome.failure_reason or "late_arrival_after_merge",
+            )
             late_child_items: list[WorkItem] = []
             late_cascaded_results = self._record_group_member_terminals(
                 tuple(outcome.consumed_tokens),
@@ -525,6 +546,7 @@ class BarrierIntakeCoordinator:
             # so any escalated loss it stages is drained and threaded into
             # THAT SAME call — see the late-arrival arm's comment above for
             # the full rationale (this intake pass is out-of-claim too).
+            self._note_group_failed_from_token(closer_name=str(coalesce_name), token=token, reason=error_msg)
             cascade_child_items: list[WorkItem] = []
             cascaded_results = self._record_group_member_terminals(
                 tuple(outcome.consumed_tokens),
@@ -605,6 +627,9 @@ class BarrierIntakeCoordinator:
             return BarrierIntakeDisposition(kind=BarrierIntakeDispositionKind.HELD)
 
         if outcome.late_arrival:
+            self._note_group_failed_from_token(
+                closer_name=str(row_union_name), token=token, reason=outcome.failure_reason or "late_arrival_after_release"
+            )
             released = self._scheduler.mark_blocked_barrier_terminal(
                 run_id=self._run_id,
                 barrier_key=str(row_union_name),
@@ -656,6 +681,7 @@ class BarrierIntakeCoordinator:
         if outcome.failure_reason:
             # Whole-group failure completed by this arrival (v1 fail-closed):
             # every held branch — this one included — holds a BLOCKED row.
+            self._note_group_failed_from_token(closer_name=str(row_union_name), token=token, reason=outcome.failure_reason)
             self._scheduler.mark_blocked_barrier_terminal(
                 run_id=self._run_id,
                 barrier_key=str(row_union_name),
@@ -831,6 +857,9 @@ class BarrierIntakeCoordinator:
                 if not row_union_outcome.failure_reason:
                     raise OrchestrationInvariantError(f"Replayed row_union group loss {loss.loss_id!r} produced a non-failure outcome.")
                 consumed_tokens = tuple(row_union_outcome.consumed_tokens)
+                # loss.group_id IS the failed group's own id — no need to
+                # re-derive it from a consumed token's lineage.
+                self.note_group_failed(closer_name=loss.closer_name, group_id=loss.group_id, reason=row_union_outcome.failure_reason)
                 self._complete_row_union_fire(
                     row_union_name=RowUnionName(loss.closer_name),
                     consumed_tokens=consumed_tokens,
@@ -885,6 +914,9 @@ class BarrierIntakeCoordinator:
                 # BEFORE the durable "release them all" below so any
                 # escalated loss it stages is drained and threaded into
                 # THAT SAME call — this replay loop is out-of-claim too.
+                # loss.group_id IS the failed group's own id — no need to
+                # re-derive it from a consumed token's lineage.
+                self.note_group_failed(closer_name=loss.closer_name, group_id=loss.group_id, reason=outcome.failure_reason)
                 replay_child_items: list[WorkItem] = []
                 cascaded_replay_results = self._record_group_member_terminals(
                     tuple(outcome.consumed_tokens),
@@ -925,6 +957,176 @@ class BarrierIntakeCoordinator:
     def replay_durable_group_losses(self) -> tuple[BarrierIntakeDisposition, ...]:
         """Replay committed loss-ledger entries after their producer commits."""
         return tuple(self._replay_group_losses())
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Escalation — intake-only, verdicts wait for settlement (spec §6.3, Task 8)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def note_group_failed(self, *, closer_name: str, group_id: str, reason: str) -> None:
+        """Park a closer FAIL verdict for intake-time escalation (spec §6.3).
+
+        Idempotent in-memory park; re-derivable at takeover because replaying
+        the durable losses re-fires the closer's FAIL verdict, which re-parks
+        the note, and escalation staging is idempotent on the ledger's
+        natural key."""
+        self._failed_group_notes[(closer_name, group_id)] = reason
+
+    def _note_group_failed_from_token(self, *, closer_name: str, token: TokenInfo, reason: str) -> None:
+        """Park a FAIL verdict keyed on the arriving/consumed token's own
+        innermost lineage frame (spec §6.3): a token that reached a
+        coalesce/row_union closer always carries the FORK frame that routed
+        it there, so that frame's ``group_id`` IS the failed group. Empty
+        ``lineage_path`` is unreachable in production (every fork child
+        mints one) — tolerated as a silent no-op here only because
+        dispatch-only synthetic test fixtures build lineage-free tokens on
+        purpose, mirroring `_record_group_member_terminals`'s own
+        empty-input tolerance."""
+        if not token.lineage_path:
+            return
+        self.note_group_failed(closer_name=closer_name, group_id=token.lineage_path[-1].group_id, reason=reason)
+
+    def _binding_for_closer_name(self, closer_name: str) -> GroupBinding | None:
+        """The FAILED group's own binding (spec §7 rule 1: a closer closes at
+        most one group, so ``closer_name`` resolves at most one binding).
+        ``None`` means this build's registry carries no binding for the
+        closer at all — a bare legacy processor wired only through
+        ``branch_to_coalesce``/``branch_to_row_union`` (no ``group_bindings``),
+        never a real built graph (``build_group_binding_registry`` mints a
+        binding for every coalesce/row_union node a bound fork actually
+        routes to). Treated as inert by the caller, matching
+        ``GroupBindingRegistry.binding_for``'s own "no binding = nothing
+        tracked" contract (spec §2) rather than raising."""
+        for binding in self._group_bindings.bindings:
+            if binding.closer_name == closer_name:
+                return binding
+        return None
+
+    def _group_roster_settled(self, *, closer_name: str, group_id: str, binding: GroupBinding) -> bool:
+        """Whether every minted member of the failed group has durably closed
+        (spec §6.3 item 2): a `group_losses` row OR a completed
+        `token_outcomes` row for the member's own token. FORK rosters are the
+        binding's static `member_roster` (the config roster authority); EXPAND
+        rosters are runtime-minted, so they are read from `token_lineage_frames`
+        and cross-checked against `group_records.member_count` (spec §5)."""
+        if binding.kind is FrameKind.FORK:
+            roster = binding.member_roster
+        else:
+            roster = self._execution.member_keys_for_group(run_id=self._run_id, group_id=group_id)
+            record = self._execution.get_group_record(run_id=self._run_id, group_id=group_id)
+            if record is None or record.member_count != len(roster):
+                raise AuditIntegrityError(
+                    f"EXPAND group {group_id!r} (run {self._run_id!r}) roster mismatch: "
+                    f"group_records.member_count={None if record is None else record.member_count!r}, "
+                    f"DISTINCT token_lineage_frames.member_key count={len(roster)}."
+                )
+        settled_members = {
+            loss.member_key
+            for loss in self._scheduler.list_group_losses(run_id=self._run_id, closer_names=frozenset({closer_name}))
+            if loss.group_id == group_id
+        }
+        for member_key in roster:
+            if member_key in settled_members:
+                continue
+            token_id = self._execution.resolve_group_member_token(
+                run_id=self._run_id, kind=binding.kind, group_id=group_id, member_key=member_key
+            )
+            outcome = self._data_flow.get_token_outcome(token_id)
+            if outcome is None or not outcome.completed:
+                return False
+        return True
+
+    def _enclosing_bound_frame(self, group_id: str) -> tuple[LineageFrame, GroupBinding] | None:
+        """The ENCLOSING bound frame for a failed group (spec §6.3 item 3):
+        read any member token's durable lineage frames, drop the failed
+        group's own frame, walk the remainder innermost-first to the first
+        BOUND frame. `None` means outermost — today's behaviour verbatim
+        (ruling 19)."""
+        witness_token_id = self._execution.any_member_token_for_group(run_id=self._run_id, group_id=group_id)
+        if witness_token_id is None:
+            raise AuditIntegrityError(
+                f"Escalation for group {group_id!r} (run {self._run_id!r}) found no token_lineage_frames "
+                "witness — the ledger references a group the audit trail never minted."
+            )
+        full_path = self._data_flow.load_lineage_paths(self._run_id, [witness_token_id])[witness_token_id]
+        own_frame_index = next(i for i, frame in enumerate(full_path) if frame.group_id == group_id)
+        for frame in reversed(full_path[:own_frame_index]):
+            binding = self._group_bindings.binding_for(frame)
+            if binding is not None:
+                return frame, binding
+        return None
+
+    def _opener_token_id_for_group(self, group_id: str) -> str:
+        """The failed group's opener token (spec §6.3 item 4, ratified):
+        `group_records.opener_token_id` — rows exist for BOTH FORK and EXPAND
+        openers, so there is no fallback path."""
+        record = self._execution.get_group_record(run_id=self._run_id, group_id=group_id)
+        if record is None:
+            raise AuditIntegrityError(
+                f"Escalation for group {group_id!r} (run {self._run_id!r}) has no group_records row — "
+                "the ledger references a group the audit trail never minted."
+            )
+        return record.opener_token_id
+
+    def _stage_escalation_loss(self, spec: GroupLossSpec, *, frame_kind: FrameKind, binding: GroupBinding) -> None:
+        """Durable escalation write (spec §6.3): authenticate against the
+        roster authority, then append — inside the fenced adoption
+        transaction (no claimed token exists at intake time, so this
+        substitutes for the in-claim claim-guard `_stage_group_loss` uses).
+        The staged row is picked up by the NEXT intake pass's
+        `_replay_group_losses` (which notifies the enclosing executor) —
+        that is the one-pass-per-drain-cycle latency the spec accepts."""
+        coordination_token = self._require_coordination_token()
+        self._scheduler.stage_escalation_loss(
+            run_id=self._run_id,
+            spec=spec,
+            frame_kind=frame_kind,
+            declared_roster=binding.member_roster if frame_kind is FrameKind.FORK else None,
+            recorded_by=self._scheduler_lease_owner,
+            now=self._clock.now_utc(),
+            coordination_token=coordination_token,
+        )
+
+    def _stage_pending_escalations(self) -> None:
+        """Leader-only escalation pass, run once per intake iteration AFTER
+        durable-loss replay: for each parked FAIL verdict whose roster has
+        durably closed, stage ONE loss against the enclosing bound frame in
+        the adoption transaction, authenticated against the roster
+        authority, then notify the enclosing closer via the normal replay
+        machinery on the next pass.
+
+        Reason is the bare category token "group_failed" (spec §6.3 item 5)
+        — NEVER conflated with "row_union_group_failed" (a direct row-union
+        closure): "group_failed" names an ESCALATED loss, where an inner
+        group's failure consumed the outer member; "row_union_group_failed"
+        names a row-union group's OWN direct closure. Consumers key routing
+        decisions on this distinction.
+        """
+        for (closer_name, group_id), _reason in list(self._failed_group_notes.items()):
+            failed_binding = self._binding_for_closer_name(closer_name)
+            if failed_binding is None:
+                # No roster authority for this closer at all (see
+                # _binding_for_closer_name) — cannot authenticate or even
+                # check settlement; discard rather than crash a run over a
+                # test-harness/legacy-wiring gap that never arises from a
+                # real built graph.
+                del self._failed_group_notes[(closer_name, group_id)]
+                continue
+            if not self._group_roster_settled(closer_name=closer_name, group_id=group_id, binding=failed_binding):
+                continue
+            enclosing = self._enclosing_bound_frame(group_id)
+            if enclosing is None:
+                del self._failed_group_notes[(closer_name, group_id)]
+                continue  # outermost: declared terminal handling already ran (ruling 19)
+            frame, binding = enclosing
+            spec = GroupLossSpec(
+                closer_name=binding.closer_name,
+                group_id=frame.group_id,
+                member_key=frame.member_key,
+                token_id=self._opener_token_id_for_group(group_id),
+                reason="group_failed",
+            )
+            self._stage_escalation_loss(spec, frame_kind=frame.kind, binding=binding)
+            del self._failed_group_notes[(closer_name, group_id)]
 
 
 class BarrierRecoveryCoordinator:

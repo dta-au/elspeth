@@ -756,6 +756,7 @@ class RowProcessor:
             aggregation_settings=self._aggregation_settings,
             coalesce_node_ids=self._coalesce_node_ids,
             branch_to_coalesce=self._branch_to_coalesce,
+            group_bindings=self._group_bindings,
             coordination_token=coordination_token,
             scheduler_lease_owner=self._scheduler_lease_owner,
             live_barrier_holds=self._live_barrier_holds,
@@ -3507,6 +3508,8 @@ class RowProcessor:
         )
         if outcome is None or not outcome.consumed_tokens:
             return []
+        if outcome.failure_reason:
+            self._barrier_intake.note_group_failed(closer_name=str(row_union_name), group_id=frame.group_id, reason=outcome.failure_reason)
         self._complete_row_union_fire(
             row_union_name=row_union_name,
             consumed_tokens=outcome.consumed_tokens,
@@ -3657,6 +3660,7 @@ class RowProcessor:
             return []
 
         if outcome.failure_reason:
+            self._barrier_intake.note_group_failed(closer_name=str(coalesce_name), group_id=frame.group_id, reason=outcome.failure_reason)
             self._mark_coalesce_consumed_scheduler_work_terminal(
                 coalesce_name=coalesce_name,
                 consumed_tokens=tuple(outcome.consumed_tokens),

@@ -488,6 +488,7 @@ class TestRowUnionLossReplay:
             loss_id="loss-1",
             closer_name="variant_union",
             token_id="lost-token",
+            group_id="fg-barrier-coordination-test",
             member_key="control",
             reason="error_routed",
         )
