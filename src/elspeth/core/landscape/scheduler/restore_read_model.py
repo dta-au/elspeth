@@ -3,6 +3,21 @@
 These queries encode ADR-030 crash-window semantics for journal restore. They
 live with scheduler/barrier recovery rather than the generic token-outcome
 writer so the persistence layer does not own restore policy.
+
+**Group-collector-node-resolution family (META-22)**: :meth:`BarrierRestoreReadModel.resolve_group_collector_node`
+is the durable derivation of "which node(s) has this group completed at" —
+a SET, not a single value, since a nested outer group's frame is carried by
+every descendant token at any depth (I-6), so it can legitimately show
+completions at more than one node once inner scopes have also completed.
+Any caller holding BOTH a durable node_id (from this method or an
+equivalent completed-group scan) AND a config-side node_id
+(``self._node_ids[collector_name]``) for the SAME group must cross-check
+membership — the config node must be ONE OF the durable set, never
+compared as if the set were a single value — and fail closed on
+disagreement (see :class:`~elspeth.engine.journal_restore.CollectorJournalRestorer`
+for the restore-time item-level cross-check this backs). WS5's future
+EXPAND re-derivation query should resolve through this same method rather
+than re-deriving the join independently.
 """
 
 from __future__ import annotations
@@ -170,6 +185,46 @@ class BarrierRestoreReadModel:
                 result[row.token_id] = int(row.max_attempt)
         return result
 
+    def get_max_node_state_attempts_for_node(
+        self,
+        run_id: str,
+        token_ids: Sequence[str],
+        *,
+        node_id: str,
+    ) -> dict[str, int]:
+        """Max ``node_states.attempt`` per token, scoped to ONE node (Task 7, META-14.1).
+
+        Sibling of :meth:`get_max_node_state_attempts`, not a widening of it:
+        that method's callers (``barrier_coordination.py``, ``scheduler_drain.py``)
+        derive a token's resume attempt at the SAME node it is about to
+        re-arrive at, where an unscoped max is the intended shape or is
+        additionally scoped by ``step_index``. The collector's opener-attempt
+        derivation is different in kind — the opener token visited at least
+        one OTHER node (wherever it triggered the expansion) before the
+        collector node ever wrote it a node_state at all, so an unscoped (or
+        merely ``step_index``-scoped) read risks picking up that PRODUCER
+        node's attempt instead of the collector's own flush-guard history,
+        exactly the failure mode ``scheduler_drain.py``'s sink attempt-offset
+        comment warns about ("producer-node attempts must not inflate the
+        offset"). A dedicated node-scoped method removes the ambiguity
+        entirely rather than relying on step_index correlation, which a
+        constant step_resolver (as in this module's own test fixtures) cannot
+        even exercise.
+        """
+        result: dict[str, int] = {}
+        for i in range(0, len(token_ids), _TOKEN_ID_CHUNK_SIZE):
+            chunk = list(token_ids[i : i + _TOKEN_ID_CHUNK_SIZE])
+            query = (
+                select(node_states_table.c.token_id, func.max(node_states_table.c.attempt).label("max_attempt"))
+                .where(node_states_table.c.run_id == run_id)
+                .where(node_states_table.c.node_id == node_id)
+                .where(node_states_table.c.token_id.in_(chunk))
+                .group_by(node_states_table.c.token_id)
+            )
+            for row in self._ops.execute_fetchall(query):
+                result[row.token_id] = int(row.max_attempt)
+        return result
+
     def get_open_node_state_ids(
         self,
         run_id: str,
@@ -177,7 +232,14 @@ class BarrierRestoreReadModel:
         node_ids: Sequence[str],
         token_ids: Sequence[str],
     ) -> dict[str, str]:
-        """Outstanding OPEN coalesce-hold node_state ids per token."""
+        """Outstanding OPEN node_state ids per token, at the given node(s).
+
+        Generalised (Task 7, first collector user — was "coalesce-hold" only):
+        parameterised by ``node_ids`` from the start, so it already worked for
+        any barrier node with an accept-time hold journaled as a PENDING
+        node_state (canon item 11) — coalesce, and now the collector's
+        per-member arrival holds and M-4's restored-state_id cross-check.
+        """
         if not node_ids:
             return {}
         result: dict[str, str] = {}
@@ -348,6 +410,91 @@ class BarrierRestoreReadModel:
             .limit(1)
         )
         return self._ops.execute_fetchone(query) is not None
+
+    def resolve_group_collector_node(self, *, run_id: str, group_id: str) -> frozenset[str]:
+        """The set of DURABLE node_ids where ``group_id`` shows a completed
+        node_state (Task 7, META-22).
+
+        Same depth-agnostic join as :meth:`has_completed_group_for_node`
+        (I-6): any completed node_state whose token carries ``group_id``'s
+        frame, at any depth, DISTINCT on node_id. Deliberately a SET, not a
+        single value — nesting makes "exactly one node" false on healthy
+        data: an OUTER group's frame is carried by every descendant token at
+        ANY depth (see :func:`test_group_completion_joins_match_any_frame_depth_not_only_innermost`,
+        the sibling test this method's own test file already documents this
+        against), so a doubly-nested descendant completing at an INNER
+        collector's node legitimately adds that inner node to this set
+        alongside the outer group's own closer node. That is not ambiguity
+        to resolve to one value — it is the same intentional any-depth
+        semantic :meth:`has_completed_group_for_node` already has, applied
+        to node identity instead of a boolean.
+
+        Empty before the group has completed anywhere — there is no durable
+        evidence yet, and config remains the only source before completion
+        (a still-pending group's eventual collector cannot be cross-checked
+        this way).
+
+        Callers that need "is config's node ONE OF the durable nodes for
+        this group" should test membership (``config_node_id in result``),
+        never equality against a single resolved value — see
+        :class:`~elspeth.engine.journal_restore.CollectorJournalRestorer`'s
+        cross-check.
+        """
+        query = (
+            select(node_states_table.c.node_id)
+            .select_from(
+                node_states_table.join(
+                    token_lineage_frames_table,
+                    (node_states_table.c.token_id == token_lineage_frames_table.c.token_id)
+                    & (node_states_table.c.run_id == token_lineage_frames_table.c.run_id),
+                )
+            )
+            .where(
+                node_states_table.c.run_id == run_id,
+                token_lineage_frames_table.c.group_id == group_id,
+                node_states_table.c.completed_at.isnot(None),
+            )
+            .distinct()
+        )
+        return frozenset(str(row.node_id) for row in self._ops.execute_fetchall(query))
+
+    def get_settled_member_token_ids(self, *, run_id: str, node_id: str, group_id: str) -> frozenset[str]:
+        """Token ids that settled ``group_id``'s roster at ``node_id`` (Task 7, META-20b).
+
+        The durable twin of :meth:`has_completed_group_for_node` — same join,
+        same DEPTH-AGNOSTIC semantics (I-6: matches ``group_id`` at any frame
+        depth on the token's lineage path), but projecting
+        ``node_states.token_id`` instead of an existence/``limit(1)`` check.
+        Reconstructs `CollectorExecutor`'s in-memory settled-token-id memory
+        (I-3, fix round 2) from durable state after a takeover or a
+        ``max_completed_keys`` eviction (fix round 3, META-20b) — both
+        producers of an empty in-memory set are the same class of gap, and
+        this read is the honest fix for both.
+
+        Returns TOKEN_IDS, not member_keys: ``accept()`` compares
+        ``token.token_id`` against this set, and the two diverge for a merged
+        member whose durable frame's member_key differs from the token_id
+        that carries it (T4-5 prep's B-8) — do not "helpfully" convert to
+        member_keys.
+        """
+        query = (
+            select(node_states_table.c.token_id)
+            .select_from(
+                node_states_table.join(
+                    token_lineage_frames_table,
+                    (node_states_table.c.token_id == token_lineage_frames_table.c.token_id)
+                    & (node_states_table.c.run_id == token_lineage_frames_table.c.run_id),
+                )
+            )
+            .where(
+                node_states_table.c.run_id == run_id,
+                node_states_table.c.node_id == node_id,
+                token_lineage_frames_table.c.group_id == group_id,
+                node_states_table.c.completed_at.isnot(None),
+            )
+            .distinct()
+        )
+        return frozenset(row.token_id for row in self._ops.execute_fetchall(query))
 
     def has_released_group_for_node(self, *, run_id: str, node_id: str, group_id: str) -> bool:
         """Status-COMPLETED variant (row_union release discrimination).

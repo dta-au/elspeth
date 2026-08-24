@@ -10,6 +10,7 @@ aggregator is a window, never a closer; ``executors/aggregation.py`` and
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,7 @@ from elspeth.contracts.errors import (
     PluginContractViolation,
 )
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.config import CollectorSettings, ScopeSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -33,6 +35,7 @@ from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.aggregation_result import validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.state_guard import NodeStateGuard
+from elspeth.engine.journal_restore import CollectorJournalRestorer
 from elspeth.engine.spans import SpanFactory
 
 if TYPE_CHECKING:
@@ -88,6 +91,19 @@ class _PendingGroup:
     arrived: dict[str, _MemberEntry] = field(default_factory=dict)
     lost: dict[str, str] = field(default_factory=dict)  # member_key -> reason
     first_arrival: float = 0.0
+    # C-1 (Task 7, META-14.1): the flush guard's own audit identity, anchored
+    # on opener_token_id. A fresh group's flush has never run at this node,
+    # so flush_attempt=0/flush_resume_checkpoint_id=None (today's literal
+    # default, unchanged). A group rebuilt via restore whose opener already
+    # holds a node_state at this collector node (an orphaned OPEN state from
+    # a flush interrupted before the entries loop completed any member — the
+    # opener carries no frame in its own group, so has_completed_group_for_node
+    # cannot see it, and it would otherwise collide on
+    # UniqueConstraint(token_id, node_id, attempt) at re-flush) derives
+    # flush_attempt = max_attempt + 1 instead. Set ONLY by _open_group, never
+    # by a caller directly.
+    flush_attempt: int = 0
+    flush_resume_checkpoint_id: str | None = None
 
 
 class CollectorExecutor:
@@ -326,7 +342,9 @@ class CollectorExecutor:
     def _roster_settled(pending: _PendingGroup) -> bool:
         return frozenset(pending.arrived) | frozenset(pending.lost) == pending.roster
 
-    def _open_group(self, collector_name: str, group_id: str, *, first_arrival: float) -> _PendingGroup:
+    def _open_group(
+        self, collector_name: str, group_id: str, *, first_arrival: float, resume_checkpoint_id: str | None = None
+    ) -> _PendingGroup:
         record = self._barrier_restore_reads.get_group_record(run_id=self._run_id, group_id=group_id)
         if record is None:
             raise AuditIntegrityError(
@@ -355,11 +373,39 @@ class CollectorExecutor:
                 f"{len(roster)} DISTINCT member_key rows in token_lineage_frames (spec §5)."
             )
         ordinals = self._barrier_restore_reads.get_group_member_ordinals(run_id=self._run_id, opener_token_id=record.opener_token_id)
+        # C-1 (Task 7, META-14.1): derive the flush guard's attempt from the
+        # opener's OWN durable node_state history at THIS collector node —
+        # node-scoped (get_max_node_state_attempts_for_node), not merely
+        # step_index-scoped, because the opener visited at least one OTHER
+        # node (wherever it triggered the expansion) before ever reaching
+        # this one, and an unscoped/step-scoped read risks picking up that
+        # producer node's attempt instead. Runs on EVERY open (fresh accept()
+        # arrivals included, not just restore) — a truly fresh opener has no
+        # prior node_state here at all, so the read naturally returns
+        # attempt=0, identical to today's literal default; only a group
+        # whose flush was interrupted mid-guard (orphaned OPEN state,
+        # invisible to has_completed_group_for_node since the opener carries
+        # no frame in its own group) or already-flushed-once
+        # (COMPLETED — but that group is discovered via completed-group
+        # reconstruction and never reaches this rebuild path at all, see
+        # CollectorJournalRestorer) produces a nonzero attempt here.
+        node_id = self._node_ids[collector_name]
+        max_attempts = self._barrier_restore_reads.get_max_node_state_attempts_for_node(
+            self._run_id, [record.opener_token_id], node_id=str(node_id)
+        )
+        flush_attempt = max_attempts[record.opener_token_id] + 1 if record.opener_token_id in max_attempts else 0
         return _PendingGroup(
             roster=roster,
             opener_token_id=record.opener_token_id,
             ordinals=ordinals,
             first_arrival=first_arrival,
+            flush_attempt=flush_attempt,
+            # A resume_checkpoint_id is genuine PROVENANCE for a re-attempt —
+            # a fresh group's first-ever flush (flush_attempt == 0) does not
+            # carry one even when opened during a resumed run, mirroring the
+            # attempt>0-pairs-with-a-checkpoint convention elsewhere in this
+            # codebase (e.g. scheduler_drain.py's sink attempt-offset guard).
+            flush_resume_checkpoint_id=resume_checkpoint_id if flush_attempt > 0 else None,
         )
 
     def has_recorded_member_loss(self, collector_name: str, group_id: str, member_key: str) -> bool:
@@ -455,6 +501,165 @@ class CollectorExecutor:
             collector_name=collector_name,
             group_id=group_id,
             closed_without_plugin="empty_expansion",
+        )
+
+    def restore_from_journal(
+        self,
+        *,
+        items: Sequence[TokenWorkItem],
+        state_ids: Mapping[str, str],
+        attempt_offsets: Mapping[str, int],
+        resume_checkpoint_id: str,
+    ) -> None:
+        """Rebuild pending collector groups from journal BLOCKED rows (Task 7, F1 resume path).
+
+        Call EXACTLY ONCE per resume, and hold a FIXED order against WS3's
+        group-loss intake replay (I-7): whichever of {this call, that
+        replay} runs first, the order must be consistent, not accidental —
+        ``notify_member_lost`` calls ``_open_group`` itself when it sees a
+        group with no pending entry, and a subsequent
+        ``restore_from_journal`` call would then find a non-empty
+        ``self._pending`` and raise below.
+
+        Validation (structural checks, completed-group discovery — which
+        ALSO reconstructs the settled-token-id memory a post-closure
+        redelivery needs, META-20b — and M-4's open-hold cross-check) all
+        live in :class:`CollectorJournalRestorer`. This method applies the
+        result: completed groups seed ``self._completed_keys`` with their
+        REAL settled sets (not the empty default this class's other five
+        ``_mark_completed`` call sites use); pending groups rebuild through
+        ``_open_group`` (I-6 — roster/ordinals re-derived from the durable
+        authorities, never trusted from the journal) with a per-member
+        roster/ordinal cross-check identical to ``accept()``'s own
+        fresh-arrival guards.
+
+        No scalars parameter: arrived members are journal BLOCKED rows,
+        losses replay through WS3's intake (full-table on takeover, spec
+        §6.2), the roster is ``group_records``, and the settled-token
+        memory is now reconstructed durably too (META-20b) — there is no
+        underivable in-memory-only state EXCEPT ``arrival_time``/
+        ``first_arrival`` (I-5/I-10), set below to restore-time monotonic
+        since there is no durable source for them (truthful-but-short: a
+        restored member's eventual ``duration_ms`` measures POST-RESTORE
+        residence, not total hold time since its original arrival — the
+        blessed alternative to a boot-relative-garbage ``0.0`` default).
+
+        Args:
+            items: ALL collector BLOCKED journal rows, one call per resume.
+            state_ids: Per-token OPEN node_state id for the PENDING arrival
+                hold — one entry per LIVE (non-post-closure) journal token;
+                a post-closure residual's token legitimately has none (its
+                hold is COMPLETED, not OPEN) and is dropped, not rejected.
+            attempt_offsets: Per-token resume attempt offset
+                (``max_attempt + 1``), covering the same live tokens as
+                ``state_ids``.
+            resume_checkpoint_id: Checkpoint id stamped on restored tokens
+                and, for a group whose opener's flush was interrupted
+                mid-guard, on the re-derived flush guard's own resume
+                provenance.
+
+        Raises:
+            OrchestrationInvariantError: If ``self._pending`` is non-empty
+                (I-7's ordering guard — mirrors
+                ``RowUnionExecutor.restore_from_journal``'s identical
+                "restore requires an empty executor" precedent), or if any
+                restored group's roster is ALREADY complete (I-8): this
+                method has no ``PluginContext`` and so cannot itself
+                trigger ``_execute_flush`` the way a live ``accept()``
+                would, and nothing else re-evaluates a group whose roster
+                already satisfies ``_roster_settled`` — leaving it
+                installed would be a silent, permanently-unflushable wedge.
+                Integration must add a post-restore flush-trigger sweep
+                (a ``PluginContext``-bearing follow-up call) before this
+                case can be resolved instead of refused. This disposition
+                ASSUMES the closing arrival (the one that completes a
+                roster) is never itself journaled BLOCKED — there is no
+                production dispatch path yet to verify that against
+                (I-4/META-4: ``processor.collector_executor`` does not
+                exist). If integration's dispatch instead journals every
+                arrival BEFORE processing it, a genuinely complete-in-the-
+                journal roster becomes reachable on the ordinary crash-mid-
+                flush path (not just this narrower edge case), and this
+                raise must become a flush-trigger call instead — flagged
+                for ratification, not a settled fact.
+            AuditIntegrityError: On any journal/audit disagreement — see
+                :meth:`CollectorJournalRestorer.restore`, plus the I-6
+                roster/ordinal cross-checks below.
+        """
+        if self._pending:
+            raise OrchestrationInvariantError("collector restore requires an empty executor pending map")
+
+        restored = CollectorJournalRestorer(
+            settings=self._settings,
+            node_ids=self._node_ids,
+            barrier_restore_reads=self._barrier_restore_reads,
+            run_id=self._run_id,
+        ).restore(
+            items=items,
+            state_ids=state_ids,
+            attempt_offsets=attempt_offsets,
+            resume_checkpoint_id=resume_checkpoint_id,
+        )
+
+        for key, settled_token_ids in restored.completed_groups:
+            self._mark_completed(key, settled_token_ids=settled_token_ids)
+
+        restore_now = self._clock.monotonic()
+        built_groups: list[tuple[tuple[str, str], _PendingGroup]] = []
+        for group in restored.pending_groups:
+            collector_name, group_id = group.key
+            pending = self._open_group(collector_name, group_id, first_arrival=restore_now, resume_checkpoint_id=resume_checkpoint_id)
+            for member in group.members:
+                if member.member_key not in pending.roster:
+                    # I-6: the same cross-check accept()'s fresh-arrival path
+                    # applies above — a journal-restored member is not
+                    # exempt from proving membership against the durable
+                    # roster (the restorer supplies MEMBERS only; it cannot
+                    # perform this check itself, see its docstring).
+                    raise AuditIntegrityError(
+                        f"Restored token {member.token.token_id} claims member "
+                        f"{member.member_key!r} of group {group_id!r} at collector "
+                        f"'{collector_name}' but the durable roster is {sorted(pending.roster)!r}."
+                    )
+                ordinal = pending.ordinals.get(member.member_key)
+                if ordinal is None:
+                    # I-6: same ordinal cross-check as accept()'s
+                    # fresh-arrival path — a restored member is not exempt
+                    # either.
+                    raise AuditIntegrityError(
+                        f"Restored member {member.member_key!r} of group {group_id!r} has no "
+                        f"token_parents ordinal under opener {pending.opener_token_id!r} — "
+                        "expansion audit inconsistency."
+                    )
+                pending.arrived[member.member_key] = _MemberEntry(
+                    token=member.token, arrival_time=restore_now, state_id=member.state_id, ordinal=ordinal
+                )
+            if self._roster_settled(pending):
+                # I-8 (complete-roster restore): fail closed rather than
+                # silently wedge. See the Raises section above.
+                raise OrchestrationInvariantError(
+                    f"Collector group {group_id!r} at '{collector_name}' restored with a "
+                    f"COMPLETE roster (all {len(pending.roster)} members already arrived per "
+                    "the journal) — flushing requires a PluginContext this restore path does "
+                    "not have. Refusing rather than leaving a silently unflushable group in "
+                    "memory; integration must add a post-restore flush-trigger sweep."
+                )
+            built_groups.append((group.key, pending))
+
+        # Install only after every group in this restore call validated
+        # cleanly (validate-before-mutate, matching CoalesceJournalRestorer's
+        # discipline) — a failed restore must leave self._pending exactly as
+        # empty as the guard above found it, not partially populated.
+        for key, pending in built_groups:
+            self._pending[key] = pending
+
+        slog.info(
+            "collector_journal_restored",
+            pending_groups=len(built_groups),
+            completed_groups=len(restored.completed_groups),
+            token_count=restored.token_count,
+            run_id=self._run_id,
+            resume_checkpoint_id=resume_checkpoint_id,
         )
 
     def _check_landscape_for_completion(self, collector_name: str, group_id: str) -> bool:
@@ -607,8 +812,14 @@ class CollectorExecutor:
             run_id=self._run_id,
             step_index=step,
             input_data=batch_input,
-            attempt=0,
-            resume_checkpoint_id=None,
+            # C-1 (Task 7, META-14.1): was a literal attempt=0/
+            # resume_checkpoint_id=None — collided with an orphaned OPEN
+            # guard state from an interrupted flush on takeover re-flush
+            # (UniqueConstraint(token_id, node_id, attempt)). Both fields
+            # now come from _PendingGroup, derived once by _open_group from
+            # the opener's own durable node_state history at this node.
+            attempt=pending.flush_attempt,
+            resume_checkpoint_id=pending.flush_resume_checkpoint_id,
             auto_fail_phase="collector_flush",
         ) as guard:
             result = transform.process(pipeline_rows, ctx)

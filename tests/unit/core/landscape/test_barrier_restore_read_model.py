@@ -357,6 +357,76 @@ def test_get_completed_group_ids_for_nodes_pairs() -> None:
     assert setup.factory.barrier_restore.get_completed_group_ids_for_nodes("other-run", frozenset({node_id})) == set()
 
 
+def test_resolve_group_collector_node_agrees_with_the_real_closer() -> None:
+    # META-22 happy path: the durable walk (resolve_group_collector_node)
+    # must name the SAME node a real close completed at — empty before
+    # completion (no durable evidence yet), a singleton set after.
+    setup = make_recorder_with_run(run_id="run-restore-resolve-node-happy")
+    node_id = register_test_node(setup.factory.data_flow, setup.run_id, "stitch")
+    row = setup.factory.data_flow.create_row(
+        setup.run_id,
+        setup.source_node_id,
+        0,
+        {"id": 1},
+        source_row_index=0,
+        ingest_sequence=0,
+        row_id="row-1",
+    )
+    member = setup.factory.data_flow.create_token(
+        row_id=row.row_id,
+        token_id="token-member",
+        lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="g-expand-1", member_key="m-1"),),
+    )
+    assert setup.factory.barrier_restore.resolve_group_collector_node(run_id=setup.run_id, group_id="g-expand-1") == frozenset()
+
+    state = setup.factory.execution.begin_node_state(member.token_id, node_id, setup.run_id, 1, {"id": 1})
+    setup.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+
+    assert setup.factory.barrier_restore.resolve_group_collector_node(run_id=setup.run_id, group_id="g-expand-1") == frozenset({node_id})
+
+
+def test_resolve_group_collector_node_returns_every_node_for_a_nested_group() -> None:
+    # META-22 "forced apart" case, corrected after review: the mechanism a
+    # genuine durable-vs-config divergence would trip is NOT "raise on two
+    # distinct nodes" — that shape is the ordinary, HEALTHY signature of a
+    # nested EXPAND scope (I-6's depth-agnostic join means an outer group's
+    # frame is carried by every descendant, so a token completing under an
+    # INNER collector legitimately shows the OUTER group_id as completed
+    # there too, alongside the outer group's own closer node). Pin that
+    # directly: two distinct completion nodes for the SAME group_id must
+    # come back as a two-element SET, not raise.
+    setup = make_recorder_with_run(run_id="run-restore-resolve-node-forced-apart")
+    node_a = register_test_node(setup.factory.data_flow, setup.run_id, "stitch-a")
+    node_b = register_test_node(setup.factory.data_flow, setup.run_id, "stitch-b")
+    row = setup.factory.data_flow.create_row(
+        setup.run_id,
+        setup.source_node_id,
+        0,
+        {"id": 1},
+        source_row_index=0,
+        ingest_sequence=0,
+        row_id="row-1",
+    )
+    member_a = setup.factory.data_flow.create_token(
+        row_id=row.row_id,
+        token_id="token-member-a",
+        lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="g-expand-split", member_key="m-a"),),
+    )
+    member_b = setup.factory.data_flow.create_token(
+        row_id=row.row_id,
+        token_id="token-member-b",
+        lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="g-expand-split", member_key="m-b"),),
+    )
+    state_a = setup.factory.execution.begin_node_state(member_a.token_id, node_a, setup.run_id, 1, {"id": 1})
+    setup.factory.execution.complete_node_state(state_a.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+    state_b = setup.factory.execution.begin_node_state(member_b.token_id, node_b, setup.run_id, 1, {"id": 1})
+    setup.factory.execution.complete_node_state(state_b.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+
+    assert setup.factory.barrier_restore.resolve_group_collector_node(run_id=setup.run_id, group_id="g-expand-split") == frozenset(
+        {node_a, node_b}
+    )
+
+
 def test_group_completion_joins_match_any_frame_depth_not_only_innermost() -> None:
     """I-6: the three group_id-keyed joins (has_completed_group_for_node,
     has_released_group_for_node, get_completed_group_ids_for_nodes) match a

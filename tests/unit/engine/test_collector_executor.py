@@ -20,20 +20,24 @@ import pytest
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import FrameKind, TerminalPath
+from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, PluginContractViolation
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
-from elspeth.contracts.scheduler import GroupLossSpec
+from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import CollectorSettings, ScopeSettings
 from elspeth.core.landscape.scheduler.group_losses import record_group_loss
+from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
+from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import group_records_table, node_states_table, token_parents_table
 from elspeth.engine.executors.collector import CollectorExecutor, CollectorOutcome
 from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_field
 from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+
+_JOURNAL_T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -136,11 +140,24 @@ class _EnvExecutor:
     def get_registered_names(self) -> list[str]:
         return self._executor.get_registered_names()
 
+    def restore_from_journal(
+        self,
+        *,
+        items: list[TokenWorkItem],
+        state_ids: dict[str, str],
+        attempt_offsets: dict[str, int],
+        resume_checkpoint_id: str,
+    ) -> None:
+        self._executor.restore_from_journal(
+            items=items, state_ids=state_ids, attempt_offsets=attempt_offsets, resume_checkpoint_id=resume_checkpoint_id
+        )
+
 
 class _CollectorEnv:
     """Real-DB-backed test environment for one registered collector 'stitch'."""
 
     def __init__(self, *, policy: str) -> None:
+        self.policy = policy
         self.setup = make_recorder_with_run()
         self.db = self.setup.db
         self.factory = self.setup.factory
@@ -237,6 +254,76 @@ class _CollectorEnv:
                 .where(token_parents_table.c.run_id == self.run_id)
                 .where(token_parents_table.c.token_id == token_id)
             )
+
+    def fresh_executor(self) -> _EnvExecutor:
+        """A SECOND CollectorExecutor against the SAME Landscape (Task 7).
+
+        Distinct in-memory state (own _pending/_completed_keys, own
+        transform instance) sharing the same DB/run_id/node_id/registration
+        as env.executor — the "takeover" shape: one process settles a
+        group, a DIFFERENT process instance restores/redelivers against it,
+        proving reconstruction reads durable state rather than happening to
+        still hold in-memory history (task-6-7-review-prep.md AMENDMENT
+        (b), takeover flavor).
+        """
+        transform = _FakeCollectorTransform()
+        raw = CollectorExecutor(
+            self.factory.execution,
+            _SpanFactorySentinel(),
+            self.token_manager,
+            self.run_id,
+            step_resolver=lambda _node_id: 1,
+            data_flow=self.factory.data_flow,
+            barrier_restore_reads=self.factory.barrier_restore,
+        )
+        settings = CollectorSettings(name="stitch", plugin="recording_stitch", input="pages_in", on_success="assembled_out")
+        scope = ScopeSettings(name="scope1", opener="expand_node", closer="stitch", policy=self.policy)
+        raw.register_collector(settings, scope, self.node_id, transform)
+        wrapped = _EnvExecutor(raw, self.ctx)
+        wrapped.transform = transform  # type: ignore[attr-defined]  # test-only convenience handle
+        return wrapped
+
+    def blocked_item_for(self, member: TokenInfo, *, collector_name: str) -> TokenWorkItem:
+        """Build a BLOCKED journal row for `member` as list_blocked_barrier_items
+        would return it (Task 7) — mirrors test_coalesce_executor.py's
+        `_blocked_item` precedent, collector-shaped: barrier_key is the
+        COMPOUND collector:<name>:<group_id> form (spec §4.3), not a bare
+        name, and lineage_path carries member's real innermost EXPAND frame
+        (never synthesised) since restore's I-6 cross-check depends on it.
+        """
+        frame = member.lineage_path[-1]
+        return TokenWorkItem(
+            work_item_id=f"wi-{member.token_id}",
+            run_id=self.run_id,
+            token_id=member.token_id,
+            row_id=member.row_id,
+            node_id=str(self.node_id),
+            step_index=0,
+            ingest_sequence=0,
+            row_payload_json=TokenSchedulerRepository.serialize_row_payload(member.row_data),
+            status=TokenWorkStatus.BLOCKED,
+            attempt=0,
+            available_at=_JOURNAL_T0,
+            created_at=_JOURNAL_T0,
+            updated_at=_JOURNAL_T0,
+            barrier_key=collector_barrier_key(collector_name, frame.group_id),
+            lineage_path=member.lineage_path,
+            collector_name=collector_name,
+            barrier_blocked_at=_JOURNAL_T0,
+        )
+
+    def state_ids_for(self, items: list[TokenWorkItem]) -> dict[str, str]:
+        """Read back the real OPEN node_state ids for these journal items'
+        tokens (Task 7) — the audit-derived state_ids restore_from_journal
+        requires. The members must already have gone through a LIVE accept()
+        (on env.executor, before the simulated crash) so a real PENDING hold
+        exists to read back; a synthesised state_id would defeat M-4's
+        open-hold cross-check by construction."""
+        return self.factory.barrier_restore.get_open_node_state_ids(
+            self.run_id,
+            node_ids=[str(self.node_id)],
+            token_ids=[item.token_id for item in items],
+        )
 
     def open_hold_token_ids(self, *, node: str) -> list[str]:
         assert node == "stitch"
@@ -717,3 +804,347 @@ def test_collector_flush_plugin_exception_autofails_with_phase(collector_env: _C
         env.executor.accept(members[0], "stitch", ctx=env.ctx)
     # NodeStateGuard auto-failed the flush state with the new phase:
     assert env.latest_node_state_error_phase(node="stitch") == "collector_flush"
+
+
+class TestRestore:
+    """restore_from_journal (Task 7, F1 resume path).
+
+    task-6-7-review-prep.md's C-1/I-5/I-6/I-7/I-8/M-4 plus the META-20b
+    AMENDMENT (settled-token-set reconstruction). See CollectorJournalRestorer's
+    module docstring for the full design rationale.
+    """
+
+    def test_restore_rebuilds_buffers_and_ordinal_flush_survives_takeover(self, collector_env: _CollectorEnv) -> None:
+        # Plan's Step 1 headline test, adapted to the real fixture. Arrival
+        # order is unrecoverable after takeover, ordinal order is not:
+        # journal items handed in reversed order, a subsequent LIVE closing
+        # arrival must still flush 0,1,2.
+        env = collector_env
+        members, _group_id = env.seed_group(count=3)
+        env.executor.accept(members[1], "stitch")
+        env.executor.accept(members[2], "stitch")
+        items = [env.blocked_item_for(m, collector_name="stitch") for m in (members[1], members[2])]
+        state_ids = env.state_ids_for(items)
+        fresh = env.fresh_executor()
+        fresh.restore_from_journal(
+            items=list(reversed(items)),
+            state_ids=state_ids,
+            attempt_offsets={m.token_id: 0 for m in (members[1], members[2])},
+            resume_checkpoint_id="ckpt-1",
+        )
+        assert fresh.buffered_member_count() == 2
+        outcome = fresh.accept(members[0], "stitch", ctx=env.ctx)
+        assert outcome.held is False
+        assert fresh.transform.seen_rows == [m.row_data.to_dict() for m in members]  # ordinal order
+
+    def test_restore_rejects_unknown_collector(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        item = env.blocked_item_for(members[0], collector_name="not-registered")
+        state_ids = env.state_ids_for([item])
+        fresh = env.fresh_executor()
+        with pytest.raises(AuditIntegrityError, match="unknown collector"):
+            fresh.restore_from_journal(
+                items=[item], state_ids=state_ids, attempt_offsets={members[0].token_id: 0}, resume_checkpoint_id="ckpt-1"
+            )
+
+    def test_restore_requires_empty_executor(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")  # env.executor already has a pending group
+        item = env.blocked_item_for(members[0], collector_name="stitch")
+        state_ids = env.state_ids_for([item])
+        with pytest.raises(OrchestrationInvariantError, match="empty executor"):
+            env.executor.restore_from_journal(
+                items=[item], state_ids=state_ids, attempt_offsets={members[0].token_id: 0}, resume_checkpoint_id="ckpt-1"
+            )
+
+    def test_restore_missing_state_id_for_a_live_item_is_an_audit_inconsistency(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        item = env.blocked_item_for(members[0], collector_name="stitch")
+        fresh = env.fresh_executor()
+        with pytest.raises(AuditIntegrityError, match="No entry in state_ids"):
+            fresh.restore_from_journal(items=[item], state_ids={}, attempt_offsets={members[0].token_id: 0}, resume_checkpoint_id="ckpt-1")
+
+    def test_restore_missing_attempt_offset_is_an_audit_inconsistency(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        item = env.blocked_item_for(members[0], collector_name="stitch")
+        state_ids = env.state_ids_for([item])
+        fresh = env.fresh_executor()
+        with pytest.raises(AuditIntegrityError, match="No entry in attempt_offsets"):
+            fresh.restore_from_journal(items=[item], state_ids=state_ids, attempt_offsets={}, resume_checkpoint_id="ckpt-1")
+
+    def test_restore_out_of_roster_member_crashes(self, collector_env: _CollectorEnv) -> None:
+        # I-6: a journal item's frame naming a member_key the durable roster
+        # does not contain must raise the SAME AuditIntegrityError the
+        # fresh-arrival path gives — restore is not exempt from this
+        # cross-check just because the restorer cannot perform it itself
+        # (it has no access to _open_group).
+        import dataclasses
+
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        item = env.blocked_item_for(members[0], collector_name="stitch")
+        bogus_frame = LineageFrame(kind=FrameKind.EXPAND, group_id=group_id, member_key="not-a-real-member")
+        item = dataclasses.replace(item, lineage_path=(bogus_frame,))
+        state_ids = env.state_ids_for([item])
+        fresh = env.fresh_executor()
+        with pytest.raises(AuditIntegrityError, match="durable roster"):
+            fresh.restore_from_journal(
+                items=[item], state_ids=state_ids, attempt_offsets={members[0].token_id: 0}, resume_checkpoint_id="ckpt-1"
+            )
+
+    def test_restore_ordinal_mismatch_crashes(self, collector_env: _CollectorEnv) -> None:
+        # I-6's ordinal twin: roster-valid member, but no token_parents row
+        # under the opener (the same cross-table inconsistency FIX 1 /
+        # fix round 3 targets on the LIVE path — this is its restore twin).
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        env.delete_token_parents_row(token_id=members[0].token_id)
+        item = env.blocked_item_for(members[0], collector_name="stitch")
+        state_ids = env.state_ids_for([item])
+        fresh = env.fresh_executor()
+        with pytest.raises(AuditIntegrityError, match="token_parents ordinal"):
+            fresh.restore_from_journal(
+                items=[item], state_ids=state_ids, attempt_offsets={members[0].token_id: 0}, resume_checkpoint_id="ckpt-1"
+            )
+
+    def test_restore_rejects_a_state_id_that_does_not_name_an_open_hold(self, collector_env: _CollectorEnv) -> None:
+        # M-4: presence in the caller's state_ids mapping is not enough — the
+        # named state_id must actually be OPEN at this node. A stale or
+        # already-completed state_id restored into a _MemberEntry would be
+        # double-completed at flush.
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        item = env.blocked_item_for(members[0], collector_name="stitch")
+        fresh = env.fresh_executor()
+        with pytest.raises(AuditIntegrityError, match="does not name an OPEN node_state"):
+            fresh.restore_from_journal(
+                items=[item],
+                state_ids={members[0].token_id: "bogus-state-id"},
+                attempt_offsets={members[0].token_id: 0},
+                resume_checkpoint_id="ckpt-1",
+            )
+
+    def test_restore_of_a_complete_roster_fails_closed_pending_a_flush_trigger(self, collector_env: _CollectorEnv) -> None:
+        # I-8: a journal that (rarely — the ordinary closing arrival is
+        # never itself journaled, see the takeover-reflush test below) holds
+        # a COMPLETE roster leaves restore with no PluginContext to flush
+        # it. Fail closed rather than silently wedge a permanently-unflushable
+        # group into self._pending.
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        # Simulate the second member's own accept()-time durable hold write
+        # succeeding without going through the live executor at all (the
+        # only way to reach "both members durably OPEN, roster complete"
+        # without letting the live API auto-flush it away).
+        env.factory.execution.begin_node_state(
+            token_id=members[1].token_id,
+            node_id=str(env.node_id),
+            run_id=env.run_id,
+            step_index=1,
+            input_data=members[1].row_data.to_dict(),
+            attempt=0,
+            resume_checkpoint_id=None,
+        )
+        items = [env.blocked_item_for(m, collector_name="stitch") for m in members]
+        state_ids = env.state_ids_for(items)
+        fresh = env.fresh_executor()
+        with pytest.raises(OrchestrationInvariantError, match="COMPLETE"):
+            fresh.restore_from_journal(
+                items=items,
+                state_ids=state_ids,
+                attempt_offsets={m.token_id: 0 for m in members},
+                resume_checkpoint_id="ckpt-1",
+            )
+        # Validate-before-mutate: a failed restore leaves _pending exactly
+        # as empty as it found it — nothing partially installed.
+        assert fresh._executor._pending == {}
+
+    def test_takeover_reflush_after_crash_mid_flush_uses_a_distinct_attempt(self, collector_env: _CollectorEnv) -> None:
+        # C-1 / META-14.1's exact required trace: "crash mid-flush ->
+        # takeover -> re-flush green at attempt=1." Constructed by hand (two
+        # accept() calls plus a manual begin_node_state for the opener), NOT
+        # read off a real dispatch path — processor.collector_executor does
+        # not exist yet (I-4/META-4), so there is no production code to
+        # verify "the CLOSING arrival is never itself journaled" against.
+        # ASSUMES a held=False outcome parks nothing (it goes straight into
+        # _execute_flush, whose opener-anchored guard opens attempt=0, OPEN,
+        # before the crash), so restore sees only the N-1 EARLIER arrivals'
+        # journal rows (roster genuinely incomplete from the journal's own
+        # perspective) and I-8's complete-roster guard does not fire here.
+        # This is a DECISION about integration's future dispatch shape, not
+        # a verified fact — if integration journals every arrival before
+        # dispatch (BLOCKED-then-processed rather than processed-then-maybe-
+        # BLOCKED), this test's premise breaks and I-8's raise must become a
+        # flush-trigger instead (see collector.py's restore_from_journal
+        # docstring and the task-7-report.md write-up, both flagged for
+        # ratification). A later LIVE arrival for the missing member must
+        # re-flush at a DISTINCT attempt, not collide with the
+        # orphaned attempt=0 state.
+        env = collector_env
+        members, group_id = env.seed_group(count=3)
+        env.executor.accept(members[1], "stitch")
+        env.executor.accept(members[2], "stitch")
+        record = env.factory.barrier_restore.get_group_record(run_id=env.run_id, group_id=group_id)
+        assert record is not None
+        env.factory.execution.begin_node_state(
+            token_id=record.opener_token_id,
+            node_id=str(env.node_id),
+            run_id=env.run_id,
+            step_index=1,
+            input_data={"batch_rows": []},
+            attempt=0,
+            resume_checkpoint_id=None,
+        )
+        items = [env.blocked_item_for(m, collector_name="stitch") for m in (members[1], members[2])]
+        state_ids = env.state_ids_for(items)
+        fresh = env.fresh_executor()
+        fresh.restore_from_journal(
+            items=items,
+            state_ids=state_ids,
+            attempt_offsets={m.token_id: 0 for m in (members[1], members[2])},
+            resume_checkpoint_id="ckpt-1",
+        )
+        outcome = fresh.accept(members[0], "stitch", ctx=env.ctx)
+        assert outcome.held is False
+        assert fresh.transform.seen_rows == [m.row_data.to_dict() for m in members]  # the re-flush actually ran
+
+        from sqlalchemy import select
+
+        with env.db.connection() as conn:
+            attempts = sorted(
+                row.attempt
+                for row in conn.execute(
+                    select(node_states_table.c.attempt)
+                    .where(node_states_table.c.run_id == env.run_id)
+                    .where(node_states_table.c.node_id == str(env.node_id))
+                    .where(node_states_table.c.token_id == record.opener_token_id)
+                )
+            )
+        # Mutant 14: the flush guard's attempt left at the literal 0 would
+        # either collide (IntegrityError, test never reaches here) or,
+        # if silently overwritten, leave only ONE row. Two DISTINCT
+        # attempts (the orphaned 0, and the real re-flush's 1) proves both
+        # that no collision occurred AND that attempt genuinely advanced.
+        assert attempts == [0, 1]
+        # Mutant 15 (I-5): the re-flushed members' duration_ms must not be a
+        # boot-relative garbage number from a 0.0-seeded arrival_time —
+        # restore-time monotonic keeps it small and truthful (post-restore
+        # residence, not total hold time).
+        with env.db.connection() as conn:
+            durations = [
+                row.duration_ms
+                for row in conn.execute(
+                    select(node_states_table.c.duration_ms)
+                    .where(node_states_table.c.run_id == env.run_id)
+                    .where(node_states_table.c.node_id == str(env.node_id))
+                    .where(node_states_table.c.token_id.in_([members[1].token_id, members[2].token_id]))
+                    .where(node_states_table.c.status == "completed")
+                )
+            ]
+        assert durations and all(0 <= d < 60_000 for d in durations)  # sane, not boot-relative
+
+    def test_restore_of_an_already_closed_group_settled_redelivery_skips_without_a_second_flush_call(
+        self, collector_env: _CollectorEnv
+    ) -> None:
+        # META-20b takeover flavor (the AMENDMENT's required test): settling
+        # done by env.executor, restore+redelivery by a SECOND executor
+        # instance against the SAME Landscape — the property that
+        # distinguishes "reconstructed from durable state" from "happened
+        # to still be in memory". Also C-1's second required trace: "crash
+        # post-flush -> takeover -> NO second plugin call."
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        outcome = env.executor.accept(members[1], "stitch")
+        assert outcome.held is False
+        assert env.transform.call_count == 1
+
+        fresh = env.fresh_executor()
+        fresh.restore_from_journal(items=[], state_ids={}, attempt_offsets={}, resume_checkpoint_id="ckpt-1")
+        # Restore did NOT re-open the group — the reconstruction populated
+        # _completed_keys, not a resurrected pending entry.
+        assert fresh._executor._pending == {}
+
+        redelivered = fresh.accept(members[0], "stitch", ctx=env.ctx)
+        assert redelivered.held is True  # the skip shape, not merely "no crash"
+        assert fresh.transform.call_count == 0  # NO second plugin call, on the FRESH instance
+
+    def test_restore_of_an_already_closed_group_distinct_token_redelivery_still_raises(self, collector_env: _CollectorEnv) -> None:
+        # The counter-case the skip test above sits beside (mutant guard):
+        # a token that was NOT among the settled members must still raise
+        # after restore — proves the reconstruction returns the REAL
+        # settled set, not an accept-everything shortcut.
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        env.executor.accept(members[1], "stitch")
+        # A DISTINCT token for the same settled member (same EXPAND frame,
+        # fresh token_id) — must still raise, unlike a SAME-token
+        # redelivery, which the sibling test above proves is a skip.
+        distinct = env.reissue_with_new_token_id(members[0])
+
+        fresh = env.fresh_executor()
+        fresh.restore_from_journal(items=[], state_ids={}, attempt_offsets={}, resume_checkpoint_id="ckpt-1")
+        with pytest.raises(AuditIntegrityError, match="not among the members"):
+            fresh.accept(distinct, "stitch", ctx=env.ctx)
+
+    def test_restore_drops_post_closure_residual_items_without_raising(self, collector_env: _CollectorEnv) -> None:
+        # The step-order fix a reviewer must be able to see directly: a
+        # BLOCKED-looking journal row for a member of an ALREADY-completed
+        # group has no entry in state_ids/attempt_offsets (its hold is
+        # COMPLETED, not OPEN — the caller derives those mappings from OPEN
+        # holds only). Validating coverage BEFORE partitioning completed
+        # groups would reject this as journal corruption on a perfectly
+        # healthy tree; partitioning FIRST drops it silently instead.
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        env.executor.accept(members[1], "stitch")
+        stale_item = env.blocked_item_for(members[0], collector_name="stitch")  # residual, COMPLETED not OPEN
+
+        fresh = env.fresh_executor()
+        fresh.restore_from_journal(items=[stale_item], state_ids={}, attempt_offsets={}, resume_checkpoint_id="ckpt-1")
+        assert fresh._executor._pending == {}
+        assert fresh._executor._completed_keys
+
+    def test_restore_cross_checks_durable_vs_config_collector_node_and_raises_on_divergence(self, collector_env: _CollectorEnv) -> None:
+        # META-22: an item declares collector_name="stitch" (config node =
+        # env.node_id) for a group that durably completed at a completely
+        # DIFFERENT, foreign node — durable and config derivations of "the
+        # collector node for this group" disagree. Must fail loudly rather
+        # than silently trusting either side (misclassifying a residual, or
+        # routing a live arrival into the wrong collector's roster rebuild).
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        foreign_node_id = register_test_node(env.factory.data_flow, env.run_id, "some-other-node")
+        member_a_frame = members[0].lineage_path[-1]
+        assert member_a_frame.group_id == group_id
+        state = env.factory.execution.begin_node_state(
+            token_id=members[0].token_id,
+            node_id=foreign_node_id,
+            run_id=env.run_id,
+            step_index=1,
+            input_data=members[0].row_data.to_dict(),
+            attempt=0,
+            resume_checkpoint_id=None,
+        )
+        env.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={}, duration_ms=1.0)
+
+        item = env.blocked_item_for(members[1], collector_name="stitch")
+        state_ids = env.state_ids_for([item])
+        fresh = env.fresh_executor()
+        with pytest.raises(AuditIntegrityError, match="disagree"):
+            fresh.restore_from_journal(
+                items=[item], state_ids=state_ids, attempt_offsets={members[1].token_id: 0}, resume_checkpoint_id="ckpt-1"
+            )
