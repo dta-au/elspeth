@@ -344,7 +344,14 @@ class TestBranchLoss:
         # A sibling arriving afterwards must fail closed, never wait forever.
         late = executor.accept(_make_token(token_id="tok_a", branch_name="branch_a"), "variant_union")
         assert late.held is False
-        assert late.failure_reason is not None
+        # 2026-08-24 re-review R2: the specific reason, not merely "is not
+        # None" — a loss-driven closure must NOT be recorded as a release
+        # (in-memory arm; the durable point-read arm's equivalent
+        # discrimination is pinned separately by
+        # test_landscape_fallback_distinguishes_released_from_failed_closure).
+        # "late_arrival_after_release" here would mean this closure was
+        # wrongly recorded as a release.
+        assert late.failure_reason == "row_union_branch_lost"
 
     def test_lost_branch_after_release_records_nothing(self) -> None:
         # Released tokens keep branch_name, so a terminal divert downstream
@@ -365,6 +372,14 @@ class TestBranchLoss:
         assert outcome is None
         assert executor.has_recorded_branch_loss("variant_union", "row_1", "branch_a") is False
         data_flow.record_token_outcome.assert_not_called()
+        # 2026-08-24 re-review R2: the post-release notify_branch_lost call
+        # above must not overwrite the closure kind — a genuine straggler
+        # for this key is still reported against the release, not the
+        # branch loss it just no-op'd on. accept() checks the completed-key
+        # cache before branch validity, so a duplicate branch_name still
+        # reaches the late-arrival arm.
+        straggler = executor.accept(_make_token(token_id="tok_straggler", branch_name="branch_a"), "variant_union")
+        assert straggler.failure_reason == "late_arrival_after_release"
 
     def test_lost_branch_after_evicted_release_uses_durable_completion_before_recording(self) -> None:
         executor, execution, _data_flow, _clock = _make_executor(max_completed_keys=1)

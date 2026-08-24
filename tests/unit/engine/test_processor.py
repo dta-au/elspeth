@@ -9329,15 +9329,23 @@ class TestRowUnionBranchLossTelemetry:
         structurally, with no explicit release check, and identically
         whether or not this worker holds a coalesce/row_union executor.
 
-        A non-empty lineage_path is load-bearing here, not decorative: an
-        empty path (this test's earlier shape) settles nothing under ANY
-        implementation, including a deleted walk — indistinguishable from
-        `test_root_token_settles_nothing` in the seam suite. The surviving
-        EXPAND frame forces the walk to actually inspect a real frame and
-        correctly find no binding for it (registry.binding_for is 2-armed:
-        FORK frames key on member_key, EXPAND on group_id — this exercises
-        the EXPAND arm specifically), while the registered `variants`
-        row_union binding proves the registry itself is not just empty.
+        A non-empty lineage_path is load-bearing here, not decorative — but
+        honestly scoped (2026-08-24 re-review R1): every assertion below is
+        negative (`== []`, `assert_not_called()`, `== ()`), so this test
+        alone still passes against a `_settle_member_losses` that returns
+        `[]` unconditionally — no purely negative test rules that out. What
+        the surviving EXPAND frame actually kills is a MIS-RESOLVING walk:
+        one that resolves a frame it should not, or that routes an EXPAND
+        frame through the FORK-by-`member_key` index instead of
+        `binding_for`'s EXPAND-by-`group_id` arm (an empty path exercises
+        neither arm at all). The registered `variants` row_union binding
+        proves the registry itself is not just structurally empty. The
+        deleted-walk mutant this test cannot kill alone is covered by the
+        seam suite's positive tests and, in THIS class, by the immediately
+        adjacent `test_failure_closed_group_still_stages_durable_loss_follower`,
+        which drives the same shape of registry and a FORK frame that DOES
+        stage — together the pair supplies the differential a single
+        negative test cannot.
         """
         _, factory = _make_factory()
         released_token = make_token_info(
