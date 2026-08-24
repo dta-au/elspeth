@@ -10739,34 +10739,13 @@ class TestReadyEmissionEnqueueParity:
             collector_name=emission.collector_name,
         )
 
-        # collector_name is carved out of the blanket equality check, NOT
-        # dropped from the pin: the emission side is now real (this mirror
-        # call passes emission.collector_name, exactly like every other
-        # field), but the enqueue side is STILL None regardless of flavor —
-        # scheduler_drain.py's enqueue_work_item computes fields.collector_name
-        # via the codec but never forwards it into its enqueue_ready call
-        # kwargs, a forwarding gap in a WS3-owned file this fix round
-        # deliberately does not touch (held-hunk item 3 fixed the FACADE one
-        # layer down, TokenSchedulerRepository.enqueue_ready — see
-        # test_facade_enqueue_ready_forwards_collector_name — but
-        # scheduler_drain.py, the caller ABOVE the facade, is a separate,
-        # still-open gap). Asserting full equality including this one field
-        # would either fail today or require silently patching
-        # enqueue_kwargs to fake a value scheduler_drain.py never actually
-        # produces — the latter would make this pin lie about what
-        # production code does, exactly what the class exists to prevent.
-        assert {k: v for k, v in values_from_emission.items() if k != "collector_name"} == {
-            k: v for k, v in values_from_enqueue.items() if k != "collector_name"
-        }
-        # M-1 (fix-round-3 review): NOT redundant with the exclusion above —
-        # this is the FORCING mechanism. The exclusion only stops the
-        # blanket equality from failing; this line is what actually fails
-        # (flips from None to "stitch") the moment scheduler_drain.py starts
-        # forwarding collector_name, which is exactly the signal that must
-        # trigger flipping this pin to a real-value assertion. Removing it
-        # as "redundant, the exclusion covers it" would delete the only
-        # thing watching for that forwarding gap closing.
-        assert values_from_enqueue["collector_name"] is None
+        # collector_name was excluded here until scheduler_drain.py's
+        # enqueue_ready / enqueue_ready_claimed call sites forwarded
+        # fields.collector_name — that forwarding landed at 02aa2ba6b (WS3).
+        # Both sides are now real derivations; assert full equality across
+        # the whole column set, collector_name included, so a future
+        # regression on either side (emission or enqueue) fails here.
+        assert values_from_emission == values_from_enqueue
         # Pin the projected column count: adding a journal column to ONE of
         # the two builders (or to the mapper) must force this pin to be
         # revisited rather than silently desync the reconciliation contract.
@@ -10801,22 +10780,21 @@ class TestReadyEmissionEnqueueParity:
             # WS3+WS4 integration item) — neither _queue_key_for_blocked_item
             # nor _barrier_key_for_blocked_item know about collector_name, so
             # a collector-bound item derives queue_key/barrier_key EXACTLY
-            # like a plain structural-queue item today.
+            # like a plain structural-queue item today. That gap is separate
+            # from field FORWARDING and is untouched by this flip.
             #
-            # collector_name ITSELF is now real on the emission side (fix
-            # round: the mirror call above passes emission.collector_name),
-            # proving ready_emission/_ready_work_item_values correctly
-            # project it. The enqueue side stays None — see the block
-            # comment above the equality assertion for the still-open
-            # scheduler_drain.py forwarding gap this fix round deliberately
-            # does not touch.
+            # collector_name forwarding landed at 02aa2ba6b (WS3): both the
+            # emission side (ready_emission/_ready_work_item_values) and the
+            # enqueue side (scheduler_drain.py's enqueue_ready call) now
+            # derive the real value — assert both, not just the emission
+            # side, so a regression on either lane fails here.
             assert values_from_emission["queue_key"] == str(continue_node)
             assert values_from_emission["barrier_key"] is None
             assert values_from_emission["coalesce_node_id"] is None
             assert values_from_emission["coalesce_name"] is None
             assert values_from_emission["row_union_name"] is None
             assert values_from_emission["collector_name"] == "stitch"
-            assert values_from_enqueue["collector_name"] is None
+            assert values_from_enqueue["collector_name"] == "stitch"
         else:
             assert values_from_emission["queue_key"] == str(continue_node)
             assert values_from_emission["barrier_key"] is None
