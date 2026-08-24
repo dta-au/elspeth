@@ -1092,7 +1092,7 @@ class RowProcessor:
 
         Returns:
             BarrierScalars with aggregation latches keyed by str(node_id) and
-            coalesce lost-branch records keyed by (coalesce_name, row_id).
+            coalesce lost-branch records keyed by (coalesce_name, fork_group_id).
         """
         coalesce: dict[tuple[str, str], CoalescePendingScalars] = (
             dict(self._coalesce_executor.get_barrier_scalars()) if self._coalesce_executor is not None else {}

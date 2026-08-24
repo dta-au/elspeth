@@ -1711,8 +1711,17 @@ class BarrierRecoveryCoordinator:
         # accept() never wrote the PENDING hold node_state (the leader died
         # between steps 1 and 2 of the coalesce intake adoption).
         #
-        # Two sub-cases, identified by whether the row's (coalesce_name, row_id)
-        # key is Landscape-completed:
+        # Two sub-cases, identified by whether the row's (coalesce_name,
+        # row_id) key is Landscape-completed via get_completed_row_ids_
+        # for_nodes. This is deliberately NOT the group-keyed
+        # get_completed_group_ids_for_nodes sibling that _pending and the
+        # checkpoint scalars now use (WS4 Task 8-10, a195a3512) — this
+        # crash-window classification still reads literal row_id. Flagged,
+        # not changed, in that commit's checkpoint report: under the
+        # arch-M1 shape (two sibling fork groups sharing one row_id), a
+        # completed sibling group could make this row-id check misclassify
+        # a still-pending sibling's holdless item. Verify against that
+        # report before touching this wording or logic again.
         #
         # a. Key completed (late-arrival crash §E.3a): the group already
         #    resolved; journal-release the row here at restore exactly like the
