@@ -68,6 +68,23 @@ def _is_collector_prefixed_string(node: ast.expr) -> bool:
     return False
 
 
+def _assignment_target_name(target: ast.expr) -> str | None:
+    """The bound name for a simple or attribute assignment target, else None.
+
+    Structural narrowing (isinstance over ast.expr's closed subclass set),
+    not a dynamic-attribute probe: ast.Name.id and ast.Attribute.attr are
+    each accessed directly only after the node's own type confirms the
+    field exists. Subscript/Tuple/List/Starred targets (none of which are a
+    plausible "variable literally named barrier_key" shape for this
+    search's purpose) fall through to None rather than being probed.
+    """
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return None
+
+
 def test_no_production_writer_of_collector_barrier_keys_exists_yet() -> None:
     """Scans every src/elspeth/**/*.py for a barrier_key= call-keyword or
     assignment constructed from a "collector:"-prefixed literal/f-string.
@@ -91,8 +108,7 @@ def test_no_production_writer_of_collector_barrier_keys_exists_yet() -> None:
                 value = node.value
                 if value is not None and _is_collector_prefixed_string(value):
                     for target in targets:
-                        name = getattr(target, "attr", None) or getattr(target, "id", None)
-                        if name == "barrier_key":
+                        if _assignment_target_name(target) == "barrier_key":
                             hits.append((str(path.relative_to(REPO_ROOT)), node.lineno))
     assert hits == [], (
         "A production writer of collector barrier_keys now exists "
