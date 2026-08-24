@@ -16,7 +16,7 @@ from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 
@@ -30,6 +30,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.config import AggregationSettings, CoalesceSettings, TriggerConfig
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import CoalesceExecutor
@@ -116,10 +117,13 @@ def _coalesce_restorer(
     execution = MagicMock(spec=ExecutionRepository)
     execution.get_completed_row_ids_for_nodes.return_value = set()
     # get_completed_group_ids_for_nodes lives on BarrierRestoreReadModel, not
-    # ExecutionRepository (spec-checked here) — assign explicitly (WS4
-    # Task 10: _reconstruct_completed_keys_from_landscape now queries the
-    # group-keyed sibling).
-    execution.get_completed_group_ids_for_nodes = MagicMock(return_value=completed_pairs if completed_pairs is not None else set())
+    # ExecutionRepository (spec-checked here) — a fully autospec'd read-model
+    # INSTANCE (not a bare `spec=` on the unbound function, which would
+    # require every call site to also pass `self`) gives a correctly
+    # bound-method-shaped mock (WS4 Task 10:
+    # _reconstruct_completed_keys_from_landscape now queries this sibling).
+    execution.get_completed_group_ids_for_nodes = create_autospec(BarrierRestoreReadModel, instance=True).get_completed_group_ids_for_nodes
+    execution.get_completed_group_ids_for_nodes.return_value = completed_pairs if completed_pairs is not None else set()
     return CoalesceJournalRestorer(
         settings=settings if settings is not None else {"merge": _coalesce_settings()},
         node_ids=node_ids if node_ids is not None else {"merge": NodeID("co-1")},
@@ -419,15 +423,20 @@ class TestCoalesceFacadeValidateBeforeMutate:
         execution = MagicMock(spec=ExecutionRepository)
         execution.get_completed_row_ids_for_nodes.return_value = set()
         execution.has_completed_row_for_node.return_value = False
-        # has_completed_group_for_node lives on BarrierRestoreReadModel, not
-        # ExecutionRepository (spec-checked here) — assign explicitly before
-        # binding it into the SimpleNamespace below (WS4 Task 8: the live
-        # notify_branch_lost/accept path now queries the group-keyed sibling).
-        execution.has_completed_group_for_node = MagicMock(return_value=False)
-        # get_completed_group_ids_for_nodes: same reasoning, WS4 Task 10 —
-        # CoalesceJournalRestorer's completed-key reconstruction now queries
-        # the group-keyed sibling.
-        execution.get_completed_group_ids_for_nodes = MagicMock(return_value=set())
+        # has_completed_group_for_node/get_completed_group_ids_for_nodes live
+        # on BarrierRestoreReadModel, not ExecutionRepository (spec-checked
+        # here). A fully autospec'd read-model INSTANCE (not a bare `spec=`
+        # on the unbound function, which would require every call site to
+        # also pass `self`) gives correctly bound-method-shaped mocks —
+        # assign explicitly before binding into the SimpleNamespace below
+        # (WS4 Task 8: the live notify_branch_lost/accept path queries
+        # has_completed_group_for_node; Task 10: CoalesceJournalRestorer's
+        # completed-key reconstruction queries get_completed_group_ids_for_nodes).
+        _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+        execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+        execution.has_completed_group_for_node.return_value = False
+        execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
+        execution.get_completed_group_ids_for_nodes.return_value = set()
         executor = CoalesceExecutor(
             execution=execution,
             span_factory=MagicMock(spec=SpanFactory),

@@ -51,7 +51,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 from uuid import uuid4
 
 import pytest
@@ -77,6 +77,7 @@ from elspeth.core.events import EventBusProtocol
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import CoalesceExecutor
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
@@ -465,9 +466,13 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
         execution.get_completed_row_ids_for_nodes.return_value = set()
         execution.has_completed_row_for_node.return_value = False
         # has_completed_group_for_node lives on BarrierRestoreReadModel, not
-        # ExecutionRepository (spec-checked here) — assign explicitly (WS4
-        # Task 8: the live accept() path now queries the group-keyed sibling).
-        execution.has_completed_group_for_node = MagicMock(return_value=False)
+        # ExecutionRepository (spec-checked here). A fully autospec'd
+        # read-model INSTANCE (not a bare `spec=` on the unbound function,
+        # which would require every call site to also pass `self`) gives a
+        # correctly bound-method-shaped mock (WS4 Task 8: the live accept()
+        # path now queries the group-keyed sibling).
+        execution.has_completed_group_for_node = create_autospec(BarrierRestoreReadModel, instance=True).has_completed_group_for_node
+        execution.has_completed_group_for_node.return_value = False
         data_flow = MagicMock(spec=DataFlowRepository)
 
         resolutions: list[bool] = []

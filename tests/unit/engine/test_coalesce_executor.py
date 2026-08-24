@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Literal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 from uuid import uuid4
 
 import pytest
@@ -37,6 +37,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.config import CoalesceSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import (
@@ -233,16 +234,23 @@ def _make_executor(
     # Tests that exercise Landscape-based restoration override this per-test.
     execution.get_completed_row_ids_for_nodes.return_value = set()
     execution.has_completed_row_for_node.return_value = False
-    # has_completed_group_for_node lives on BarrierRestoreReadModel, not on
-    # ExecutionRepository (spec-checked here), so it cannot be pulled off
-    # `execution` the way has_completed_row_for_node is — assign explicitly
-    # (spec=, unlike spec_set=, allows setting attributes absent from the
-    # spec class; only unset access is fenced) before
-    # _restore_reads_from_execution_double reads it below.
-    execution.has_completed_group_for_node = MagicMock(return_value=False)
+    # has_completed_group_for_node/get_completed_group_ids_for_nodes live on
+    # BarrierRestoreReadModel, not on ExecutionRepository (spec-checked
+    # here), so they cannot be pulled off `execution` the way
+    # has_completed_row_for_node is. A fully autospec'd read-model INSTANCE
+    # (not a bare `spec=` on the unbound function, which would require every
+    # call site to also pass `self`) gives correctly bound-method-shaped
+    # mocks — assign the bound methods explicitly (spec=, unlike spec_set=,
+    # allows setting attributes absent from the spec class; only unset
+    # access is fenced) before _restore_reads_from_execution_double reads
+    # them below.
+    _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+    execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+    execution.has_completed_group_for_node.return_value = False
     # WS4 Task 10: restore's completed-key reconstruction now queries the
     # group-keyed sibling too.
-    execution.get_completed_group_ids_for_nodes = MagicMock(return_value=set())
+    execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
+    execution.get_completed_group_ids_for_nodes.return_value = set()
     data_flow = MagicMock(spec=DataFlowRepository)
     span_factory = _SpanFactorySentinel()
     token_manager = _TokenManagerDouble()
@@ -275,16 +283,23 @@ def _make_raw_executor(
     execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=_next_state_id())
     execution.get_completed_row_ids_for_nodes.return_value = set()
     execution.has_completed_row_for_node.return_value = False
-    # has_completed_group_for_node lives on BarrierRestoreReadModel, not on
-    # ExecutionRepository (spec-checked here), so it cannot be pulled off
-    # `execution` the way has_completed_row_for_node is — assign explicitly
-    # (spec=, unlike spec_set=, allows setting attributes absent from the
-    # spec class; only unset access is fenced) before
-    # _restore_reads_from_execution_double reads it below.
-    execution.has_completed_group_for_node = MagicMock(return_value=False)
+    # has_completed_group_for_node/get_completed_group_ids_for_nodes live on
+    # BarrierRestoreReadModel, not on ExecutionRepository (spec-checked
+    # here), so they cannot be pulled off `execution` the way
+    # has_completed_row_for_node is. A fully autospec'd read-model INSTANCE
+    # (not a bare `spec=` on the unbound function, which would require every
+    # call site to also pass `self`) gives correctly bound-method-shaped
+    # mocks — assign the bound methods explicitly (spec=, unlike spec_set=,
+    # allows setting attributes absent from the spec class; only unset
+    # access is fenced) before _restore_reads_from_execution_double reads
+    # them below.
+    _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+    execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+    execution.has_completed_group_for_node.return_value = False
     # WS4 Task 10: restore's completed-key reconstruction now queries the
     # group-keyed sibling too.
-    execution.get_completed_group_ids_for_nodes = MagicMock(return_value=set())
+    execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
+    execution.get_completed_group_ids_for_nodes.return_value = set()
     data_flow = MagicMock(spec=DataFlowRepository)
     span_factory = _SpanFactorySentinel()
     token_manager = _TokenManagerDouble()
@@ -2338,8 +2353,11 @@ class TestDefaultClock:
 
         execution = MagicMock(spec=ExecutionRepository)
         execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id="s1")
-        execution.has_completed_group_for_node = MagicMock(return_value=False)
-        execution.get_completed_group_ids_for_nodes = MagicMock(return_value=set())
+        _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+        execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+        execution.has_completed_group_for_node.return_value = False
+        execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
+        execution.get_completed_group_ids_for_nodes.return_value = set()
         executor = CoalesceExecutor(
             execution,
             _SpanFactorySentinel(),
@@ -2356,8 +2374,11 @@ class TestDefaultClock:
         clock = MockClock(start=42.0)
         execution = MagicMock(spec=ExecutionRepository)
         execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id="s1")
-        execution.has_completed_group_for_node = MagicMock(return_value=False)
-        execution.get_completed_group_ids_for_nodes = MagicMock(return_value=set())
+        _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+        execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+        execution.has_completed_group_for_node.return_value = False
+        execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
+        execution.get_completed_group_ids_for_nodes.return_value = set()
         executor = CoalesceExecutor(
             execution,
             _SpanFactorySentinel(),
@@ -2903,6 +2924,12 @@ class TestLandscapeCompletedKeys:
         # same-typed positional str and produce no crash — only this
         # which-method assertion catches it.
         execution.reset_mock()
+        # has_completed_group_for_node is an autospec'd BarrierRestoreReadModel
+        # instance's bound method assigned onto `execution` (mock-discipline
+        # gate: no unspecced Mock() constructors) — execution.reset_mock()
+        # does not recurse into it (it isn't execution's own child mock the
+        # way a spec-generated attribute is), so it needs its own reset.
+        execution.has_completed_group_for_node.reset_mock()
         execution.has_completed_group_for_node.return_value = True
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_0")
         outcome = executor.accept(late, "merge")
