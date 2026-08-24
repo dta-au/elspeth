@@ -78,6 +78,8 @@ tests/unit/engine/orchestrator/test_types.py::not hasattr(types, 'RowProcessorHa
 tests/unit/engine/test_batch_adapter.py::not hasattr(waiter, '_entries')
 tests/unit/engine/test_batch_adapter.py::not hasattr(waiter, '_lock')
 tests/unit/engine/test_engine_facade.py::not hasattr(engine, name)
+tests/unit/engine/test_leader_drain_flush_bound.py::not hasattr(leader_drain, 'MAX_END_OF_INPUT_FLUSH_ITERATIONS')
+tests/unit/engine/test_leader_drain_flush_bound.py::not hasattr(leader_drain, 'derive_end_of_input_flush_bound')
 tests/unit/engine/test_plugin_detection.py::hasattr(duck, 'process')
 tests/unit/engine/test_plugin_detection.py::hasattr(duck, 'process')
 tests/unit/engine/test_work_items.py::not hasattr(DAGNavigator, 'create_continuation_work_item')

@@ -288,6 +288,7 @@ def test_rm13_barrier_intake_adopts_the_exact_pending_listing_in_order() -> None
     coordinator._row_union_executor = None
     coordinator._coalesce_node_ids = {}
     coordinator._row_union_node_ids = {}
+    coordinator._failed_group_notes = {}
 
     def _adopt(row: object, ctx: object) -> None:
         assert ctx == "context-sentinel"
