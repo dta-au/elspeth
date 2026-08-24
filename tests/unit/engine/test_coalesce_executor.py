@@ -1849,6 +1849,40 @@ class TestNotifyBranchLost:
         with pytest.raises(OrchestrationInvariantError, match="not in expected branches"):
             executor.notify_branch_lost("merge", "row_1", "c", "reason")
 
+    def test_loss_notification_is_group_scoped(self):
+        """spec §5 (arch-M1), Task 11 discriminator (plan Step 1 / review-prep
+        mutant #11): a loss in fork group A must not settle sibling fork
+        group B on the same row_id, and a query about group B's loss state
+        must not see group A's recorded loss either.
+
+        best_effort with 3 branches, losing only 1: group A stays PENDING
+        (2 of 3 accounted, not all) with a real lost_branches entry still in
+        `_pending` — this is deliberate, not require_all's immediate fail/
+        remove. A mutant that makes `has_recorded_branch_loss` scan ALL
+        pending groups for this coalesce_name (ignoring which group the
+        caller asked about) would find "right" recorded lost in group A's
+        STILL-LIVE entry and wrongly answer True for group B's query too;
+        require_all would have already deleted group A's entry by the time
+        of the query, letting that exact mutant pass by coincidence.
+        """
+        executor, *_ = _make_executor()
+        executor.register_coalesce(
+            _settings(name="merge_x", branches=["left", "mid", "right"], policy="best_effort", timeout_seconds=60.0), "node_1"
+        )
+        a_left = _make_token(row_id="row-1", branch_name="left", token_id="t-al", fork_group_id="g-a")
+        b_left = _make_token(row_id="row-1", branch_name="left", token_id="t-bl", fork_group_id="g-b")
+        executor.accept(a_left, "merge_x")
+        executor.accept(b_left, "merge_x")
+
+        outcome = executor.notify_branch_lost("merge_x", "g-a", "right", "quarantined")
+
+        # best_effort with 2 of 3 branches accounted ("left" arrived, "right"
+        # lost, "mid" still outstanding) does not resolve — group A stays
+        # pending, group B is untouched.
+        assert outcome is None
+        assert executor.has_recorded_branch_loss("merge_x", "g-a", "right") is True
+        assert executor.has_recorded_branch_loss("merge_x", "g-b", "right") is False
+
     def test_require_all_any_loss_fails(self):
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"], policy="require_all"), "node_1")
