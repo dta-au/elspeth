@@ -4128,7 +4128,7 @@ class RowProcessor:
             # fire that downstream barrier. A crash before this replay leaves
             # an unadopted durable ledger row for the next intake/restore.
             del self._pending_group_losses[: len(group_losses)]
-            for disposition in self._barrier_intake.replay_durable_branch_losses():
+            for disposition in self._barrier_intake.replay_durable_group_losses():
                 results = (*results, *disposition.results)
                 child_items.extend(disposition.child_items)
 

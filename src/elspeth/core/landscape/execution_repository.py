@@ -381,6 +381,21 @@ class ExecutionRepository:
         """Return whether one row completed as COMPLETED at one node in one run."""
         return self.node_states.has_released_row_for_node(run_id=run_id, node_id=node_id, row_id=row_id)
 
+    def row_id_for_token(self, *, run_id: str, token_id: str) -> str | None:
+        """Return the durable row_id for one token, or None if it never minted.
+
+        Transitional resolution (spec §5/§6.2): mirrors
+        :meth:`BarrierRestoreReadModel.row_id_for_token` for callers that
+        construct the barrier-intake/recovery coordinators with this
+        compatibility facade instead of the narrower read model.
+        """
+        query = select(tokens_table.c.row_id).where(
+            tokens_table.c.token_id == token_id,
+            tokens_table.c.run_id == run_id,
+        )
+        row = self._ops.execute_fetchone(query)
+        return None if row is None else str(row.row_id)
+
     def record_routing_event(
         self,
         state_id: str,

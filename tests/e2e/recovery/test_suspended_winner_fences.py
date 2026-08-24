@@ -29,7 +29,7 @@ Common contract asserted for EVERY fenced verb:
       expiry moves forward (verify-AND-EXTEND, design :246-255).
 
 Slice scope: ``adopt_blocked_barrier_item`` and
-``adopt_coalesce_branch_losses`` joined this matrix in slice 3 (design :490);
+``adopt_group_losses`` joined this matrix in slice 3 (design :490);
 the membership-fence arms (``claim_ready`` / ``claim_pending_sink`` /
 ``enqueue_ready`` refusing ``RunWorkerEvictedError``) are slice 4.
 """
@@ -52,19 +52,19 @@ from elspeth.contracts.errors import (
     RunLeadershipLostError,
     RunWorkerEvictedError,
 )
-from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
 from elspeth.core.landscape.scheduler_repository import (
     BatchMembershipSpec,
     BufferedOutcomeSpec,
     TokenSchedulerRepository,
-    record_coalesce_branch_loss,
+    record_group_loss,
 )
 from elspeth.core.landscape.schema import (
     batch_members_table,
     batches_table,
-    coalesce_branch_losses_table,
+    group_losses_table,
     run_coordination_table,
     run_workers_table,
     runs_table,
@@ -478,29 +478,40 @@ class TestSuspendedWinnerFences:
         assert live_buffered == 1, "exactly one live non-terminal BUFFERED acceptance"
         crashed.db.close()
 
-    def test_stale_adopt_coalesce_branch_losses_refused(self, tmp_path: Path) -> None:
-        """Slice 3 (design §E.5): a deposed leader cannot move the branch-loss
+    def test_stale_adopt_group_losses_refused(self, tmp_path: Path) -> None:
+        """Slice 3 (spec §6.2): a deposed leader cannot move the group-loss
         replay cursor (``adopted_epoch`` stays NULL for the real leader's
         intake replay)."""
         crashed, token_old = _takeover_image(tmp_path)
+        row = crashed.factory.data_flow.create_row(
+            run_id=crashed.run_id,
+            source_node_id=crashed.source_node_id,
+            row_index=99,
+            data={"id": 99},
+            source_row_index=99,
+            ingest_sequence=99,
+        )
+        token = crashed.factory.data_flow.create_token(row_id=row.row_id, token_id="token-left")
         with begin_write(crashed.db.engine) as conn:
-            assert record_coalesce_branch_loss(
+            assert record_group_loss(
                 conn,
                 run_id=crashed.run_id,
-                coalesce_name="merge",
-                row_id="row-3",
-                branch_name="left",
-                token_id="token-left",
-                reason="failed",
+                spec=GroupLossSpec(
+                    closer_name="merge",
+                    group_id="fg_3",
+                    member_key="left",
+                    token_id=token.token_id,
+                    reason="failed",
+                ),
                 recorded_by=WORKER_OLD,
                 now=crashed.clock.now_utc(),
             )
-        (loss,) = crashed.repo.list_unadopted_coalesce_branch_losses(run_id=crashed.run_id)
+        (loss,) = crashed.repo.list_unadopted_group_losses(run_id=crashed.run_id)
         current = _usurp(crashed)
         seat_before = _coordination_row(crashed.db, crashed.run_id)
 
         with pytest.raises(RunLeadershipLostError) as exc_info:
-            crashed.repo.adopt_coalesce_branch_losses(
+            crashed.repo.adopt_group_losses(
                 run_id=crashed.run_id,
                 loss_ids=(loss.loss_id,),
                 now=crashed.clock.now_utc(),
@@ -510,21 +521,21 @@ class TestSuspendedWinnerFences:
 
         with crashed.db.engine.connect() as conn:
             adopted_epoch = conn.execute(
-                select(coalesce_branch_losses_table.c.adopted_epoch).where(coalesce_branch_losses_table.c.loss_id == loss.loss_id)
+                select(group_losses_table.c.adopted_epoch).where(group_losses_table.c.loss_id == loss.loss_id)
             ).scalar_one()
         assert adopted_epoch is None, "the replay cursor did not move"
-        _assert_refusal_contract(crashed, verb="adopt_coalesce_branch_losses", stale_epoch=token_old.leader_epoch, seat_before=seat_before)
+        _assert_refusal_contract(crashed, verb="adopt_group_losses", stale_epoch=token_old.leader_epoch, seat_before=seat_before)
 
         # Positive control: the current leader marks it under its own epoch.
-        marked = crashed.repo.adopt_coalesce_branch_losses(
+        marked = crashed.repo.adopt_group_losses(
             run_id=crashed.run_id,
             loss_ids=(loss.loss_id,),
             now=crashed.clock.now_utc(),
             coordination_token=current,
         )
         assert marked == 1
-        assert crashed.repo.list_unadopted_coalesce_branch_losses(run_id=crashed.run_id) == []
-        full = crashed.repo.list_coalesce_branch_losses(run_id=crashed.run_id)
+        assert crashed.repo.list_unadopted_group_losses(run_id=crashed.run_id) == []
+        full = crashed.repo.list_group_losses(run_id=crashed.run_id)
         assert [loss_row.adopted_epoch for loss_row in full] == [current.leader_epoch]
         _assert_seat_extended(crashed, seat_before)
         crashed.db.close()

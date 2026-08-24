@@ -5,8 +5,9 @@ from datetime import UTC, datetime
 from elspeth.contracts import NodeStateStatus, NodeType
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalPath
+from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.core.landscape.database import begin_write
-from elspeth.core.landscape.scheduler_repository import record_coalesce_branch_loss
+from elspeth.core.landscape.scheduler_repository import record_group_loss
 from tests.fixtures.landscape import make_recorder_with_run, register_test_node
 
 
@@ -100,17 +101,29 @@ def test_barrier_restore_read_model_reports_open_coalesce_hold_state_ids() -> No
     ) == {token.token_id: "state-high"}
 
 
-def test_barrier_restore_read_model_finds_one_durable_branch_loss_by_group() -> None:
+def test_barrier_restore_read_model_finds_one_durable_group_loss_by_closer() -> None:
     setup = make_recorder_with_run(run_id="run-restore-branch-loss")
+    row = setup.factory.data_flow.create_row(
+        setup.run_id,
+        setup.source_node_id,
+        0,
+        {"id": 1},
+        row_id="row-lost",
+        source_row_index=0,
+        ingest_sequence=0,
+    )
+    setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-lost")
     with begin_write(setup.db.engine) as conn:
-        record_coalesce_branch_loss(
+        record_group_loss(
             conn,
             run_id=setup.run_id,
-            coalesce_name="variant_union",
-            row_id="row-lost",
-            branch_name="treatment",
-            token_id="token-lost",
-            reason="error_routed",
+            spec=GroupLossSpec(
+                closer_name="variant_union",
+                group_id="eg_1",
+                member_key="treatment",
+                token_id="token-lost",
+                reason="error_routed",
+            ),
             recorded_by="worker-1",
             now=datetime(2026, 7, 30, tzinfo=UTC),
         )
@@ -136,6 +149,10 @@ def test_barrier_restore_read_model_finds_one_durable_branch_loss_by_group() -> 
         barrier_name="variant_union",
         row_id="row-lost",
     )
+    # Transitional row_id resolution (spec §5/§6.2): the ledger row carries no
+    # row_id — row_id_for_token recovers it from the token the loss names.
+    assert reads.row_id_for_token(run_id=setup.run_id, token_id="token-lost") == "row-lost"
+    assert reads.row_id_for_token(run_id=setup.run_id, token_id="no-such-token") is None
 
 
 def test_barrier_restore_read_model_reports_completed_coalesce_row_ids() -> None:

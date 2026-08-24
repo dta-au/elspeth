@@ -43,7 +43,7 @@ from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, TokenWorkItem
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
-from elspeth.core.landscape.scheduler_repository import token_from_journal_item
+from elspeth.core.landscape.scheduler_repository import GroupLoss, token_from_journal_item
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
 
@@ -256,7 +256,7 @@ class BarrierIntakeCoordinator:
         if self._coordination_token is None:
             raise OrchestrationInvariantError(
                 "Journal-first barrier intake requires the leader coordination token (ADR-030 §E.2): "
-                "adopt_blocked_barrier_item / adopt_coalesce_branch_losses are fenced verbs with no "
+                "adopt_blocked_barrier_item / adopt_group_losses are fenced verbs with no "
                 "unfenced arm. Construct RowProcessor with coordination_token — the orchestrator "
                 "binds it at begin_run (epoch 1) or at the resume takeover CAS."
             )
@@ -356,7 +356,7 @@ class BarrierIntakeCoordinator:
                 if disposition is not None:
                     dispositions.append(disposition)
 
-        dispositions.extend(self._replay_branch_losses())
+        dispositions.extend(self._replay_group_losses())
         return BarrierIntakePassOutcome(dispositions=tuple(dispositions))
 
     def _adopt_aggregation_row(self, row: TokenWorkItem, ctx: PluginContext) -> BarrierIntakeDisposition | None:
@@ -725,8 +725,27 @@ class BarrierIntakeCoordinator:
             child_items=(merged_item,),
         )
 
-    def _replay_branch_losses(self) -> list[BarrierIntakeDisposition]:
-        """§E.5 loss intake: mark unadopted durable losses, replay into memory.
+    def _row_id_for_loss(self, loss: GroupLoss) -> str:
+        """Resolve the transitional executor key's row_id from the loss's token.
+
+        The unified ``group_losses`` ledger row no longer carries ``row_id``,
+        but the executors' in-memory notify is still keyed
+        ``(closer_name, row_id)`` until WS4 re-keys them (spec §5). The
+        durable ``tokens`` row is the resolution source: an intake-path DB
+        read (leader, once per unadopted loss) — NOT the hot accounting
+        path, so the pinned "never a DB query" commitment (§4.1) is
+        untouched.
+        """
+        row_id = self._barrier_restore_reads.row_id_for_token(run_id=self._run_id, token_id=loss.token_id)
+        if row_id is None:
+            raise AuditIntegrityError(
+                f"Group-loss {loss.loss_id!r} names token {loss.token_id!r} with no durable tokens row; "
+                "the ledger references a token the audit trail never minted."
+            )
+        return row_id
+
+    def _replay_group_losses(self) -> list[BarrierIntakeDisposition]:
+        """spec §6.2 loss intake: mark unadopted durable losses, replay into memory.
 
         Journal-first: the fenced cursor mark commits BEFORE the in-memory
         replay — a crash between mark and replay loses nothing because the
@@ -742,40 +761,41 @@ class BarrierIntakeCoordinator:
         dispositions: list[BarrierIntakeDisposition] = []
         if self._coalesce_executor is None and self._row_union_executor is None:
             return dispositions
-        losses = self._scheduler.list_unadopted_coalesce_branch_losses(run_id=self._run_id)
+        losses = self._scheduler.list_unadopted_group_losses(run_id=self._run_id)
         if not losses:
             return dispositions
         coordination_token = self._require_coordination_token()
-        self._scheduler.adopt_coalesce_branch_losses(
+        self._scheduler.adopt_group_losses(
             run_id=self._run_id,
             loss_ids=[loss.loss_id for loss in losses],
             now=self._clock.now_utc(),
             coordination_token=coordination_token,
         )
         for loss in losses:
-            if loss.coalesce_name in {str(name) for name in self._row_union_node_ids}:
+            row_id = self._row_id_for_loss(loss)
+            if loss.closer_name in {str(name) for name in self._row_union_node_ids}:
                 if self._row_union_executor is None or self._complete_row_union_fire is None:
                     raise OrchestrationInvariantError(
-                        f"Durable branch loss {loss.loss_id!r} targets row_union {loss.coalesce_name!r}, "
+                        f"Durable group loss {loss.loss_id!r} targets row_union {loss.closer_name!r}, "
                         "but no row_union executor/completion seam is configured."
                     )
-                if self._row_union_executor.has_recorded_branch_loss(loss.coalesce_name, loss.row_id, loss.branch_name):
+                if self._row_union_executor.has_recorded_branch_loss(loss.closer_name, row_id, loss.member_key):
                     continue
                 row_union_outcome = self._row_union_executor.notify_branch_lost(
-                    row_union_name=loss.coalesce_name,
-                    row_id=loss.row_id,
-                    lost_branch=loss.branch_name,
+                    row_union_name=loss.closer_name,
+                    row_id=row_id,
+                    lost_branch=loss.member_key,
                     reason=loss.reason,
                 )
                 if row_union_outcome is None:
                     continue
                 if not row_union_outcome.failure_reason:
-                    raise OrchestrationInvariantError(f"Replayed row_union branch loss {loss.loss_id!r} produced a non-failure outcome.")
+                    raise OrchestrationInvariantError(f"Replayed row_union group loss {loss.loss_id!r} produced a non-failure outcome.")
                 consumed_tokens = tuple(row_union_outcome.consumed_tokens)
                 self._complete_row_union_fire(
-                    row_union_name=RowUnionName(loss.coalesce_name),
+                    row_union_name=RowUnionName(loss.closer_name),
                     consumed_tokens=consumed_tokens,
-                    scope_row_id=loss.row_id,
+                    scope_row_id=row_id,
                 )
                 row_union_failure_results: list[RowResult] = []
                 for consumed_token in consumed_tokens:
@@ -798,30 +818,30 @@ class BarrierIntakeCoordinator:
                 continue
             if self._coalesce_executor is None:
                 raise OrchestrationInvariantError(
-                    f"Durable branch loss {loss.loss_id!r} targets coalesce {loss.coalesce_name!r}, but no coalesce executor is configured."
+                    f"Durable group loss {loss.loss_id!r} targets coalesce {loss.closer_name!r}, but no coalesce executor is configured."
                 )
-            if self._coalesce_executor.has_recorded_branch_loss(loss.coalesce_name, loss.row_id, loss.branch_name):
+            if self._coalesce_executor.has_recorded_branch_loss(loss.closer_name, row_id, loss.member_key):
                 continue
             outcome = self._coalesce_executor.notify_branch_lost(
-                coalesce_name=loss.coalesce_name,
-                row_id=loss.row_id,
-                lost_branch=loss.branch_name,
+                coalesce_name=loss.closer_name,
+                row_id=row_id,
+                lost_branch=loss.member_key,
                 reason=loss.reason,
             )
             if outcome is None:
                 continue
-            coalesce_name = CoalesceName(loss.coalesce_name)
+            coalesce_name = CoalesceName(loss.closer_name)
             if outcome.merged_token is not None:
-                dispositions.append(self._fire_coalesce_merge(coalesce_name, outcome, scope_row_id=loss.row_id))
+                dispositions.append(self._fire_coalesce_merge(coalesce_name, outcome, scope_row_id=row_id))
                 continue
             if outcome.failure_reason:
                 self._mark_coalesce_consumed_terminal(
                     coalesce_name=coalesce_name,
                     consumed_tokens=tuple(outcome.consumed_tokens),
                 )
-                # Replayed must-fail (§E.5: a must-fail group fails within one
+                # Replayed must-fail (§6.2: a must-fail group fails within one
                 # drain iteration of the loss becoming visible): mirror the
-                # branch-loss notification failure arm — RowResults for the
+                # group-loss notification failure arm — RowResults for the
                 # held siblings the failure consumed.
                 coalesce_failure_results: list[RowResult] = []
                 for consumed_token in outcome.consumed_tokens:
@@ -843,14 +863,14 @@ class BarrierIntakeCoordinator:
                 )
                 continue
             raise OrchestrationInvariantError(
-                f"Replayed branch loss {loss.loss_id!r} ({loss.coalesce_name!r}/{loss.row_id!r}/{loss.branch_name!r}) "
+                f"Replayed group loss {loss.loss_id!r} ({loss.closer_name!r}/{row_id!r}/{loss.member_key!r}) "
                 f"produced an invalid CoalesceOutcome: held={outcome.held}, merged=None, failure_reason=None."
             )
         return dispositions
 
-    def replay_durable_branch_losses(self) -> tuple[BarrierIntakeDisposition, ...]:
+    def replay_durable_group_losses(self) -> tuple[BarrierIntakeDisposition, ...]:
         """Replay committed loss-ledger entries after their producer commits."""
-        return tuple(self._replay_branch_losses())
+        return tuple(self._replay_group_losses())
 
 
 class BarrierRecoveryCoordinator:
@@ -902,6 +922,22 @@ class BarrierRecoveryCoordinator:
         self._prepare_committed_aggregation_output = prepare_committed_aggregation_output
         self._complete_committed_aggregation_output = complete_committed_aggregation_output
         self._complete_committed_coalesce_residual = complete_committed_coalesce_residual
+
+    def _row_id_for_loss(self, loss: GroupLoss) -> str:
+        """Resolve the transitional executor key's row_id from the loss's token.
+
+        Same resolution as :meth:`BarrierIntakeCoordinator._row_id_for_loss`
+        (spec §5/§6.2): the ledger row carries no ``row_id``; the durable
+        ``tokens`` row gives it. Restore-path read, not the hot accounting
+        path.
+        """
+        row_id = self._barrier_restore_reads.row_id_for_token(run_id=self._run_id, token_id=loss.token_id)
+        if row_id is None:
+            raise AuditIntegrityError(
+                f"Group-loss {loss.loss_id!r} names token {loss.token_id!r} with no durable tokens row; "
+                "the ledger references a token the audit trail never minted."
+            )
+        return row_id
 
     def restore_from_journal(self, restore: BarrierJournalRestoreContext) -> None:
         """Rebuild aggregation buffers and coalesce pendings from journal BLOCKED rows.
@@ -1493,39 +1529,41 @@ class BarrierRecoveryCoordinator:
                 # are journal-released above, deferred ones handled post-restore.
                 coalesce_items = [item for item in coalesce_items if item.token_id in coalesce_state_ids]
 
-        # §E.5/§E.4: the durable coalesce_branch_losses ledger is the restore
-        # source of truth for lost_branches across takeover; the D3 checkpoint
-        # scalar is retained as a cross-check only (union, table wins on a
-        # reason disagreement — the first durable record may already have
-        # fired a must-fail policy).
-        durable_branch_losses = (
-            self._scheduler.list_coalesce_branch_losses(
+        # spec §6.2/§E.4: the durable group_losses ledger is the restore
+        # source of truth for lost_branches across takeover — read the FULL
+        # table regardless of adopted_epoch (stated requirement); the D3
+        # checkpoint scalar is retained as a cross-check only (union, table
+        # wins on a reason disagreement — the first durable record may
+        # already have fired a must-fail policy).
+        durable_group_losses = (
+            self._scheduler.list_group_losses(
                 run_id=self._run_id,
-                coalesce_names=frozenset(coalesce_keys),
+                closer_names=frozenset(coalesce_keys),
             )
             if self._coalesce_executor is not None
             else []
         )
         effective_coalesce_scalars: dict[tuple[str, str], CoalescePendingScalars] = dict(scalars.coalesce)
         if self._coalesce_executor is not None:
-            for loss in durable_branch_losses:
-                if loss.coalesce_name in row_union_keys:
+            for loss in durable_group_losses:
+                if loss.closer_name in row_union_keys:
                     continue
-                key = (loss.coalesce_name, loss.row_id)
+                row_id = self._row_id_for_loss(loss)
+                key = (loss.closer_name, row_id)
                 existing = effective_coalesce_scalars[key] if key in effective_coalesce_scalars else None
                 lost_branches = dict(existing.lost_branches) if existing is not None else {}
-                checkpoint_reason = lost_branches[loss.branch_name] if loss.branch_name in lost_branches else None
+                checkpoint_reason = lost_branches[loss.member_key] if loss.member_key in lost_branches else None
                 if checkpoint_reason is not None and checkpoint_reason != loss.reason:
                     logger.warning(
                         "coalesce restore: checkpoint lost-branch reason %r for %s/%s/%s disagrees with the durable "
                         "loss ledger %r; the ledger wins",
                         checkpoint_reason,
-                        loss.coalesce_name,
-                        loss.row_id,
-                        loss.branch_name,
+                        loss.closer_name,
+                        row_id,
+                        loss.member_key,
                         loss.reason,
                     )
-                lost_branches[loss.branch_name] = loss.reason
+                lost_branches[loss.member_key] = loss.reason
                 effective_coalesce_scalars[key] = CoalescePendingScalars(lost_branches=lost_branches)
 
         # ---- Mutate ---------------------------------------------------------

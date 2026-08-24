@@ -38,9 +38,9 @@ from elspeth.core.landscape.schema import (
     aggregation_results_table,
     batch_members_table,
     batches_table,
-    coalesce_branch_losses_table,
     coalesce_effect_members_table,
     coalesce_effects_table,
+    group_losses_table,
     node_states_table,
     token_lineage_frames_table,
     token_outcomes_table,
@@ -283,14 +283,44 @@ class BarrierRestoreReadModel:
         )
         return self._ops.execute_fetchone(query) is not None
 
+    def row_id_for_token(self, *, run_id: str, token_id: str) -> str | None:
+        """Return the durable row_id for one token, or None if it never minted.
+
+        Transitional resolution (spec §5/§6.2): the unified ``group_losses``
+        ledger carries no ``row_id`` — callers that still key on
+        ``(closer_name, row_id)`` resolve it from the token's own durable
+        row here.
+        """
+        query = select(tokens_table.c.row_id).where(
+            tokens_table.c.token_id == token_id,
+            tokens_table.c.run_id == run_id,
+        )
+        row = self._ops.execute_fetchone(query)
+        return None if row is None else str(row.row_id)
+
     def has_branch_loss_for_group(self, *, run_id: str, barrier_name: str, row_id: str) -> bool:
-        """Return whether the durable ledger records any loss for one barrier group."""
+        """Return whether the durable ledger records any loss for one barrier group.
+
+        ``group_losses`` carries no ``row_id`` (spec §6.2 unification) — the
+        join through ``tokens`` on ``(token_id, run_id)`` recovers the same
+        "any durable loss for this barrier+row" semantics the retired
+        ``coalesce_branch_losses`` query answered directly.
+        """
         query = (
-            select(coalesce_branch_losses_table.c.loss_id)
+            select(group_losses_table.c.loss_id)
+            .select_from(
+                group_losses_table.join(
+                    tokens_table,
+                    and_(
+                        group_losses_table.c.token_id == tokens_table.c.token_id,
+                        group_losses_table.c.run_id == tokens_table.c.run_id,
+                    ),
+                )
+            )
             .where(
-                coalesce_branch_losses_table.c.run_id == run_id,
-                coalesce_branch_losses_table.c.coalesce_name == barrier_name,
-                coalesce_branch_losses_table.c.row_id == row_id,
+                group_losses_table.c.run_id == run_id,
+                group_losses_table.c.closer_name == barrier_name,
+                tokens_table.c.row_id == row_id,
             )
             .limit(1)
         )
