@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 type NodeStateAutoFailPhase = Literal[
     "aggregation_flush",
+    "collector_flush",
     "gate_evaluation_routing",
     "retry_pre_attempt_shutdown",
     "transform_execution",
@@ -54,6 +55,7 @@ type NodeStateAutoFailPhase = Literal[
 _NODE_STATE_AUTO_FAIL_PHASES: frozenset[NodeStateAutoFailPhase] = frozenset(
     {
         "aggregation_flush",
+        "collector_flush",
         "gate_evaluation_routing",
         "retry_pre_attempt_shutdown",
         "transform_execution",
