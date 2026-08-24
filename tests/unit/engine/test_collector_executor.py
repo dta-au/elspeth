@@ -1113,6 +1113,37 @@ class TestRestore:
         assert fresh.buffered_member_count() == 0
         assert env.open_hold_token_ids(node="stitch") == []
 
+    def test_restore_rejects_a_ledger_loss_for_a_member_outside_the_roster(self, collector_env: _CollectorEnv) -> None:
+        # 805121a58 review Minor: the outside-the-roster cross-check in the
+        # ledger rebuild had no test (mutant "delete the raise" stayed
+        # green). Mirrors the journaled-arrival sibling below.
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        with env.db.write_connection() as conn:
+            record_group_loss(
+                conn,
+                run_id=env.run_id,
+                spec=GroupLossSpec(
+                    closer_name="stitch",
+                    group_id=group_id,
+                    # A real token (group_losses.token_id is a foreign key)
+                    # claiming a member_key the durable roster never minted.
+                    member_key="not-a-real-member",
+                    token_id=members[1].token_id,
+                    reason="quarantined",
+                ),
+                recorded_by="crashed-leader",
+                now=datetime.now(UTC),
+            )
+        items = [env.blocked_item_for(members[0], collector_name="stitch")]
+        fresh = env.fresh_executor()
+        with pytest.raises(AuditIntegrityError, match="outside the durable roster"):
+            fresh.restore_from_journal(
+                items=items, state_ids=env.state_ids_for(items), attempt_offsets={members[0].token_id: 0}, resume_checkpoint_id="ckpt-1"
+            )
+        assert fresh._executor._pending == {}  # validate-before-mutate
+
     def test_restore_rejects_a_ledger_loss_for_a_journaled_arrival(self, collector_env: _CollectorEnv) -> None:
         # The same arrived-and-lost invariant notify_member_lost enforces live.
         env = collector_env
