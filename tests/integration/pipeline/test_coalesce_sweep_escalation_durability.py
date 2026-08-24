@@ -47,6 +47,7 @@ from sqlalchemy import select
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID
@@ -82,6 +83,34 @@ def _durable_failed_token_outcomes(db: Any, *, run_id: str) -> dict[str, tuple[s
             )
         ).all()
     return {row.token_id: (row.outcome, row.path) for row in rows}
+
+
+def _mint_group_member_token(factory: Any, *, row_id: str, token_id: str, group_id: str, member_key: str) -> None:
+    """Durably mint the token a real `fork_token` call would have created
+    for this frame (Ruling 42, `resolve_group_member_token`'s lookup target):
+    crafted-token tests must build real lineage, not just a real consumed
+    sibling — the 2026-08-22 convention ("the fix is always the fixture,
+    never the pop") applies identically here to the new group-member-token
+    read. Without this, the escalated siblings' own (deeper) lineage rows
+    are the ONLY rows carrying this frame, and `resolve_group_member_token`
+    correctly finds none whose OWN path terminates there."""
+    try:
+        factory.data_flow.resolve_row_ingest_sequence(row_id)
+    except AuditIntegrityError:
+        factory.data_flow.create_row(
+            run_id=RUN_ID,
+            source_node_id="source-0",
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            row_id=row_id,
+            data={},
+        )
+    factory.data_flow.create_token(
+        row_id,
+        token_id=token_id,
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=group_id, member_key=member_key),),
+    )
 
 
 def test_sweep_timeout_escalation_loss_is_durable_and_drains_pending() -> None:
@@ -148,7 +177,10 @@ def test_sweep_timeout_escalation_loss_is_durable_and_drains_pending() -> None:
     # inner_a1 arrives and holds (require_all needs inner_a2 too); inner_a2
     # never arrives, so merge_inner's timeout fails the group. inner_a1's
     # lineage carries the OUTER fork frame (outer_a) beneath its own inner
-    # frame — the shape a real fork-in-fork run produces.
+    # frame — the shape a real fork-in-fork run produces. The outer_a-only
+    # token (what a real fork_token call mints for the fork the inner group
+    # opened FROM) must exist durably too — see _mint_group_member_token.
+    _mint_group_member_token(factory, row_id="row-1", token_id="tok-outer-a", group_id="fg-outer-row1", member_key="outer_a")
     token = TokenInfo(
         row_id="row-1",
         token_id="tok-inner-a1",
@@ -185,6 +217,9 @@ def test_sweep_timeout_escalation_loss_is_durable_and_drains_pending() -> None:
     assert rows[0]["closer_name"] == "merge_outer"
     assert rows[0]["group_id"] == "fg-outer-row1"
     assert rows[0]["member_key"] == "outer_a"
+    # Ruling 42: token_id is the LOST MEMBER's own token, not the reporting
+    # inner sibling's.
+    assert rows[0]["token_id"] == "tok-outer-a"
     assert rows[0]["adopted_epoch"] is None  # not yet replayed into any leader's memory
 
     # I2 / Ruling 40: the ONE consumed inner token has a durable FAILURE/
@@ -270,6 +305,10 @@ def test_three_branch_timeout_dedupes_escalation_to_one_outer_loss() -> None:
 
     # inner_a1 and inner_a2 arrive and hold; inner_a3 never arrives. Both
     # held siblings share the SAME outer frame (fg-outer-row1, outer_a).
+    # The outer_a-only token must exist durably too — see
+    # _mint_group_member_token.
+    _mint_group_member_token(factory, row_id="row-1", token_id="tok-outer-a", group_id="fg-outer-row1", member_key="outer_a")
+
     def _sibling(member_key: str, token_id: str) -> TokenInfo:
         return TokenInfo(
             row_id="row-1",
@@ -310,6 +349,9 @@ def test_three_branch_timeout_dedupes_escalation_to_one_outer_loss() -> None:
         rows = [dict(row) for row in conn.execute(select(group_losses_table)).mappings()]
     outer_losses = [row for row in rows if row["closer_name"] == "merge_outer" and row["member_key"] == "outer_a"]
     assert len(outer_losses) == 1, f"expected exactly one escalated outer_a loss (deduplicated), got {outer_losses!r}"
+    # Ruling 42: the deduplicated loss's identity is the LOST MEMBER's own
+    # token, not either reporting inner sibling's.
+    assert outer_losses[0]["token_id"] == "tok-outer-a"
     assert processor._pending_group_losses == []
 
     # I2 / Ruling 40: BOTH consumed siblings have their own durable FAILURE/

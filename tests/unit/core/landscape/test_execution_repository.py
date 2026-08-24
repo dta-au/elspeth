@@ -27,6 +27,7 @@ from elspeth.contracts import (
     BatchStatus,
     CallStatus,
     CallType,
+    FrameKind,
     FrameworkBugError,
     NodeStateCompleted,
     NodeStateFailed,
@@ -61,7 +62,7 @@ from elspeth.core.landscape.model_loaders import (
 )
 from elspeth.core.landscape.schema import node_states_table, routing_events_table
 from elspeth.core.payload_store import FilesystemPayloadStore
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run
 from tests.fixtures.stores import MockPayloadStore
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -2543,6 +2544,93 @@ class TestCallRecordingWithPayloadStore:
 
 
 # ---------------------------------------------------------------------------
+# WS3 Task 6 fix round 2 (Ruling 42): resolve_group_member_token
+# ---------------------------------------------------------------------------
+
+
+class TestResolveGroupMemberToken:
+    """Direct coverage for `resolve_group_member_token` (Ruling 42): the
+    honest identity for an escalated group loss is the token whose OWN
+    lineage path terminates at the resolved frame — not a descendant that
+    also carries the same frame as an ancestor."""
+
+    def _mint(self, factory: RecorderFactory, *, run_id: str, row_id: str, token_id: str, frames: list[tuple[str, str]]) -> None:
+        from elspeth.contracts.identity import LineageFrame
+
+        factory.data_flow.create_token(
+            row_id,
+            token_id=token_id,
+            lineage_path=tuple(LineageFrame(kind=FrameKind.FORK, group_id=g, member_key=m) for g, m in frames),
+        )
+
+    def test_resolves_the_token_whose_own_path_terminates_at_the_frame(self) -> None:
+        setup = make_recorder_with_run(run_id="run-1")
+        factory = setup.factory
+        factory.data_flow.create_row(
+            run_id="run-1",
+            source_node_id=setup.source_node_id,
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            row_id="row-1",
+            data={},
+        )
+        # outer_a-only token: the frame IS its own terminal frame.
+        self._mint(factory, run_id="run-1", row_id="row-1", token_id="tok-outer-a", frames=[("fg-outer", "outer_a")])
+        # A descendant that forked further: the SAME frame appears as its
+        # ancestor, but it has a deeper frame of its own — must be excluded.
+        self._mint(
+            factory,
+            run_id="run-1",
+            row_id="row-1",
+            token_id="tok-inner-a1",
+            frames=[("fg-outer", "outer_a"), ("fg-inner", "inner_a1")],
+        )
+
+        resolved = factory.execution.resolve_group_member_token(
+            run_id="run-1", kind=FrameKind.FORK, group_id="fg-outer", member_key="outer_a"
+        )
+
+        assert resolved == "tok-outer-a"
+
+    def test_raises_when_no_token_terminates_at_the_frame(self) -> None:
+        setup = make_recorder_with_run(run_id="run-1")
+        factory = setup.factory
+
+        with pytest.raises(AuditIntegrityError, match="expected exactly one token"):
+            factory.execution.resolve_group_member_token(
+                run_id="run-1", kind=FrameKind.FORK, group_id="fg-nonexistent", member_key="outer_a"
+            )
+
+    def test_raises_when_only_a_descendant_carries_the_frame(self) -> None:
+        """A frame that exists ONLY as an ancestor of deeper tokens (the
+        outer_a-only token itself was never minted, e.g. audit corruption or
+        a test fixture that skipped it) must not silently resolve to a
+        descendant."""
+        setup = make_recorder_with_run(run_id="run-1")
+        factory = setup.factory
+        factory.data_flow.create_row(
+            run_id="run-1",
+            source_node_id=setup.source_node_id,
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            row_id="row-1",
+            data={},
+        )
+        self._mint(
+            factory,
+            run_id="run-1",
+            row_id="row-1",
+            token_id="tok-inner-a1",
+            frames=[("fg-outer", "outer_a"), ("fg-inner", "inner_a1")],
+        )
+
+        with pytest.raises(AuditIntegrityError, match="expected exactly one token"):
+            factory.execution.resolve_group_member_token(run_id="run-1", kind=FrameKind.FORK, group_id="fg-outer", member_key="outer_a")
+
+
+# ---------------------------------------------------------------------------
 # M4: Delegation signature alignment test
 # ---------------------------------------------------------------------------
 
@@ -2740,6 +2828,12 @@ class TestDelegationSignatureAlignment:
             lambda execution: execution.row_id_for_token,
             ExecutionRepository.row_id_for_token,
             id="row_id_for_token",
+        ),
+        pytest.param(
+            "resolve_group_member_token",
+            lambda execution: execution.resolve_group_member_token,
+            ExecutionRepository.resolve_group_member_token,
+            id="resolve_group_member_token",
         ),
         pytest.param(
             "reconcile_source_completions_from_scheduler",

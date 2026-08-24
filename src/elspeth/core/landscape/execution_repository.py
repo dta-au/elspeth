@@ -21,7 +21,7 @@ from datetime import datetime
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, overload
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -38,6 +38,7 @@ from elspeth.contracts import (
     CallStatus,
     CallType,
     CoalesceFailureReason,
+    FrameKind,
     NodeState,
     NodeStateCompleted,
     NodeStateFailed,
@@ -95,6 +96,7 @@ from elspeth.core.landscape.schema import (
     batch_members_table,
     batches_table,
     node_states_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     tokens_table,
 )
@@ -395,6 +397,49 @@ class ExecutionRepository:
         )
         row = self._ops.execute_fetchone(query)
         return None if row is None else str(row.row_id)
+
+    def resolve_group_member_token(self, *, run_id: str, kind: FrameKind, group_id: str, member_key: str) -> str:
+        """Resolve the ONE token whose OWN lineage path terminates at one
+        frame (WS3 Task 6 fix round 2, Ruling 42).
+
+        The honest identity for an ESCALATED group loss is the token that
+        WAS the lost outer member — not whichever inner sibling's failure
+        happened to notice the loss first. That token is the one minted by
+        the fork/expand that opened this frame's group, whose OWN lineage
+        path never gained a frame beyond this one (a descendant that forked
+        again carries this SAME frame too, but at a depth strictly less than
+        its own deepest frame — the ``NOT EXISTS`` below excludes it). Reads
+        `token_lineage_frames` via its existing `ix_token_lineage_frames_group`
+        index; mints no new schema.
+
+        Raises `AuditIntegrityError` if zero or more than one token matches —
+        both are lineage corruption for a frame `_first_bound_frame` resolved
+        against the group-binding registry, which requires the frame to have
+        actually been minted.
+        """
+        deeper = token_lineage_frames_table.alias("deeper")
+        outer = token_lineage_frames_table.alias("outer")
+        query = select(outer.c.token_id).where(
+            outer.c.run_id == run_id,
+            outer.c.kind == kind.value,
+            outer.c.group_id == group_id,
+            outer.c.member_key == member_key,
+            ~exists(
+                select(1).where(
+                    deeper.c.token_id == outer.c.token_id,
+                    deeper.c.run_id == outer.c.run_id,
+                    deeper.c.depth > outer.c.depth,
+                )
+            ),
+        )
+        rows = self._ops.execute_fetchall(query)
+        if len(rows) != 1:
+            raise AuditIntegrityError(
+                f"resolve_group_member_token: expected exactly one token whose own lineage path "
+                f"terminates at group_id={group_id!r} member_key={member_key!r} (run_id={run_id!r}), "
+                f"found {len(rows)}: {[str(row.token_id) for row in rows]!r}"
+            )
+        return str(rows[0].token_id)
 
     def record_routing_event(
         self,

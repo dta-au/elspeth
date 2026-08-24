@@ -3183,6 +3183,21 @@ class RowProcessor:
                 return frame, binding
         return None
 
+    def _resolve_member_token_id(self, frame: LineageFrame) -> str:
+        """The honest `GroupLossSpec.token_id` for an ESCALATED loss (fix
+        round 2, Ruling 42): the token that WAS the lost outer member — the
+        one whose OWN lineage path terminates at `frame` — not whichever
+        inner sibling's failure happened to discover the loss. Existing
+        machinery only: `ExecutionRepository.resolve_group_member_token`
+        reads `token_lineage_frames` via its existing group/member index; no
+        new schema, no new walk."""
+        return self._execution.resolve_group_member_token(
+            run_id=self._run_id,
+            kind=frame.kind,
+            group_id=frame.group_id,
+            member_key=frame.member_key,
+        )
+
     def _settle_member_losses(
         self,
         current_token: TokenInfo,
@@ -3190,8 +3205,23 @@ class RowProcessor:
         child_items: list[WorkItem],
         *,
         notify_in_memory: bool = True,
+        escalated: bool = False,
     ) -> list[RowResult]:
         """THE single settlement seam (spec §6.1) — now actually single.
+
+        ``escalated`` (fix round 2, Ruling 42): the ONLY caller that passes
+        `True` is `_record_group_member_terminals`'s escalation walk. There,
+        `current_token` is a synthetic remaining-lineage token built from
+        whichever consumed sibling's call happened to run — its `token_id`
+        is NOT the identity of the thing that was actually lost (the OUTER
+        member), it is one of potentially several inner siblings that each
+        independently notice the SAME outer loss. `GroupLossSpec.token_id`
+        is derived instead via `_resolve_member_token_id` (the token whose
+        OWN lineage terminates at the resolved bound frame — the honest
+        "what was lost", not "who happened to report it"). Every OTHER
+        caller (direct losses — the failing token IS the member) is
+        untouched: `current_token.token_id` stays authoritative there,
+        exactly as before.
 
         Every terminal disposition that CAN CARRY A MEMBER LOSS either calls
         this or fails closed at cause instead (2026-08-24 re-review N1,
@@ -3251,12 +3281,13 @@ class RowProcessor:
         # a masking claim-guard error against a later, unrelated claim.
         if notify_in_memory and binding.closer_kind is CloserKind.COALESCE:
             _ = self._coalesce_node_ids[CoalesceName(binding.closer_name)]
+        member_token_id = self._resolve_member_token_id(frame) if escalated else current_token.token_id
         self._stage_group_loss(
             GroupLossSpec(
                 closer_name=binding.closer_name,
                 group_id=frame.group_id,
                 member_key=frame.member_key,
-                token_id=current_token.token_id,
+                token_id=member_token_id,
                 reason=reason,
             )
         )
@@ -3266,12 +3297,26 @@ class RowProcessor:
 
     def _stage_group_loss(self, spec: GroupLossSpec) -> None:
         for staged in self._pending_group_losses:
-            if (staged.group_id, staged.member_key) == (spec.group_id, spec.member_key):
-                raise OrchestrationInvariantError(
-                    f"Settlement staged a second loss for group {spec.group_id!r} member "
-                    f"{spec.member_key!r} within one claim; at most one loss per bound frame "
-                    "per claim. Processor bug."
-                )
+            if (staged.group_id, staged.member_key) != (spec.group_id, spec.member_key):
+                continue
+            if staged.token_id == spec.token_id:
+                # Fix round 2 (Ruling 42): a cross-call restage of the SAME
+                # outer member's loss — two independent observers (e.g. an
+                # inner _fail_pending consumption and a separate late
+                # arrival) noticing the identical fact through different
+                # inner siblings. Once both derive the member's own token_id
+                # (see _resolve_member_token_id / `escalated=True`), this
+                # arrives as an identical (group_id, member_key, token_id)
+                # triple — duplicate OBSERVATION, not corruption. No-op,
+                # matching record_group_loss's own idempotent-natural-key
+                # tolerance one layer down.
+                return
+            raise OrchestrationInvariantError(
+                f"Settlement staged a second loss for group {spec.group_id!r} member "
+                f"{spec.member_key!r} within one claim with a DIFFERENT token_id "
+                f"(existing={staged.token_id!r}, new={spec.token_id!r}); at most one loss per "
+                "bound frame per claim. Processor bug."
+            )
         self._pending_group_losses.append(spec)
 
     def _take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
@@ -3386,7 +3431,7 @@ class RowProcessor:
             )
 
         remaining_token = replace(consumed_tokens[0], lineage_path=remaining_path)
-        return self._settle_member_losses(remaining_token, failure_reason, child_items)
+        return self._settle_member_losses(remaining_token, failure_reason, child_items, escalated=True)
 
     def record_group_member_terminals(
         self,
