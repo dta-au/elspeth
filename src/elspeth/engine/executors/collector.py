@@ -642,7 +642,11 @@ class CollectorExecutor:
                     f"COMPLETE roster (all {len(pending.roster)} members already arrived per "
                     "the journal) — flushing requires a PluginContext this restore path does "
                     "not have. Refusing rather than leaving a silently unflushable group in "
-                    "memory; integration must add a post-restore flush-trigger sweep."
+                    "memory; integration must add a post-restore flush-trigger sweep. This "
+                    "raise aborts the ENTIRE restore_from_journal call, not just this group — "
+                    "validate-before-mutate means no group from this call is installed, "
+                    "including any already built before this one; the caller must retry the "
+                    "whole call, not skip and retry per-group."
                 )
             built_groups.append((group.key, pending))
 
