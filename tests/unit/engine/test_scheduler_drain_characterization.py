@@ -60,7 +60,7 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.contracts.types import CollectorName, NodeID
+from elspeth.contracts.types import CollectorName, NodeID, RowUnionName
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
@@ -1272,6 +1272,47 @@ def test_enqueue_work_item_forwards_collector_name_unclaimed() -> None:
 
     [kwargs] = spy.calls_for("enqueue_ready")
     assert kwargs["collector_name"] == "intake"
+
+
+def test_drain_claims_forwards_row_union_metadata_from_pending_items() -> None:
+    """WS4 Task 12 drain-forwarding pin (preflight-t8-13.md §3, the ":256"
+    Protocol-signature/":638" re-dispatch coupled pair): a pending in-memory
+    WorkItem carrying row_union_node_id/row_union_name survives
+    drain_claims's fast re-dispatch path (:609's ``claimed.work_item_id in
+    pending_items`` branch) into ``_process_single_token`` unchanged.
+    ``TestReadyEmissionEnqueueParity`` does not cover this — that class
+    derives its enqueue side from a monkeypatched call inside
+    ``enqueue_work_item``, and ``drain_claims`` is never invoked by it; this
+    drives the real ``drain_claims`` coordinator method directly (no
+    monkeypatch of ``drain_claims`` itself), only ``_process_single_token``
+    is faked, to observe exactly what it was called with."""
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, bind_leader_token=True)
+    work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=40)
+
+    row_union_node_id = NodeID("row_union::variant_union")
+    row_union_name = RowUnionName("variant_union")
+    pending_item = WorkItem(
+        token=token,
+        current_node_id=NodeID(NODE_ID),
+        row_union_node_id=row_union_node_id,
+        row_union_name=row_union_name,
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_process(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        captured.update(kwargs)
+        return _dropped_result(kwargs["token"]), []
+
+    with patch.object(processor, "_process_single_token", new=fake_process):
+        processor._scheduler_drain.drain_claims(
+            ctx=_ctx(setup),
+            pending_items={work_item_id: pending_item},
+            recover_pending_sinks=False,
+        )
+
+    assert captured["row_union_node_id"] == row_union_node_id
+    assert captured["row_union_name"] == row_union_name
 
 
 def test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinned() -> None:
