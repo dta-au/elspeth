@@ -25,25 +25,26 @@
 # already been (or will be) billed into the union's roster, but the ticket's
 # control arm never arrives. The union cannot complete that ticket's group:
 # the treatment token is failed closed as an orphaned sibling
-# (`scope_group_failed` / `row_union_branch_lost`), and the run ends
-# **PARTIAL** (process exit 1) by design — the same fail-closed contract
-# `settings_screened.yaml` used to exercise before its screen moved ahead of
-# the fork. Screened rows are NOT written to a sink here (there is no sink to
-# write them to — the token is discarded before ever producing a row); they
-# are recorded, fully attributed (row id, branch name, `gate_discarded`
-# reason), in the WS2-era per-branch ledger `coalesce_branch_losses` — NOT
-# only inferable from status counts. The unified `group_losses` table
-# supersedes it once WS3's settle-member seam lands; until then,
-# `coalesce_branch_losses` is the honest recovery path for this variant.
+# (`row_union_branch_lost`), and the run ends **PARTIAL** (process exit 1) by
+# design — the same fail-closed contract `settings_screened.yaml` used to
+# exercise before its screen moved ahead of the fork. Screened rows are NOT
+# written to a sink here (there is no sink to write them to — the token is
+# discarded before ever producing a row); they are recorded, fully
+# attributed (closer name, lost branch, `gate_discarded` reason), in the
+# unified `group_losses` table (WS3's settle-member seam) — NOT only
+# inferable from status counts:
 #
-# STATUS: this settings file BUILDS today (that is what the canonical hash
-# corpus records for it) — the SESE walk explicitly permits a discard
-# in-region. Its documented run behavior above (a clean single-ticket
-# settle-and-fail sequence, rather than a hard crash) depends on WS3's
-# settle-member seam, which has not landed yet in this campaign slice. Do not
-# treat a successful `elspeth run --execute` of this file, or its exact
-# failure shape, as validated until WS3 lands; this file's job for now is
-# only to prove the topology is buildable.
+#   sqlite3 examples/row_union_ab_experiment/runs/settlement.db \
+#     "SELECT closer_name, member_key, reason FROM group_losses
+#      WHERE closer_name = 'variant_union';"
+#   variant_union|control_branch|gate_discarded   (x3 — one per screened ticket)
+#
+# STATUS (verified 2026-08-24, WS3 Task 9): this settings file BUILDS and
+# RUNS to the documented PARTIAL result above — the SESE walk permits a
+# discard in-region, and WS3's settle-member seam (which this depended on)
+# has landed. `elspeth run --execute` of this file and its exact failure
+# shape are validated; re-verify against the corpus if the settle-member
+# seam or the row_union failure-reason vocabulary changes.
 
 sources:
   primary:

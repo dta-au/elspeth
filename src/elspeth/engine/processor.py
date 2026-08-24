@@ -47,6 +47,7 @@ from elspeth.engine.aggregation_result import (
     validated_quarantined_indices as _validated_quarantined_indices,
 )
 from elspeth.engine.barrier_coordination import (
+    GROUP_FAILED_REASON,
     BarrierIntakeCoordinator,
     BarrierJournalRestoreContext,
     BarrierRecoveryCoordinator,
@@ -3284,18 +3285,32 @@ class RowProcessor:
         if notify_in_memory and binding.closer_kind is CloserKind.COALESCE:
             _ = self._coalesce_node_ids[CoalesceName(binding.closer_name)]
         member_token_id = self._resolve_member_token_id(frame) if escalated else current_token.token_id
+        # An escalated resolution IS the "inner group's failure consumed the
+        # outer member" case by construction (the caller passed
+        # escalated=True precisely because it's walking a consumed sibling's
+        # REMAINING lineage) — the staged reason is always the bare
+        # "group_failed" category token (spec §6.3 item 5), never the inner
+        # disposition's own reason string. `_stage_pending_escalations`
+        # (barrier_coordination.py) writes the SAME natural key with the
+        # SAME constant for its own (intake-only, roster-settled) path;
+        # without this, whichever of the two commits first wins the
+        # natural-key race and can leave the inner reason ("quarantined",
+        # "late_arrival_after_merge", ...) durably recorded against the
+        # OUTER member instead — measured live via the WS3 Task 9 end-to-end
+        # pin (test_nested_inner_failure_settles_outer_member).
+        effective_reason = GROUP_FAILED_REASON if escalated else reason
         self._stage_group_loss(
             GroupLossSpec(
                 closer_name=binding.closer_name,
                 group_id=frame.group_id,
                 member_key=frame.member_key,
                 token_id=member_token_id,
-                reason=reason,
+                reason=effective_reason,
             )
         )
         if not notify_in_memory:
             return []
-        return self._notify_closer_of_loss(binding, frame, current_token, reason, child_items)
+        return self._notify_closer_of_loss(binding, frame, current_token, effective_reason, child_items)
 
     def _stage_group_loss(self, spec: GroupLossSpec) -> None:
         for staged in self._pending_group_losses:

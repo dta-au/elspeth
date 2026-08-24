@@ -120,16 +120,19 @@ This designed `PARTIAL` result returns process exit 1.
 the comparison is still computed over the 5 surviving tickets
 (`baseline_count`/`variant_count` both 5, `batch_size` 10). Screened rows are
 never written to a sink here — the control token is discarded before
-producing one — but the loss is recorded, not merely inferable: the
-WS2-era per-branch ledger `coalesce_branch_losses` carries the actual row
-ids, branch names and `gate_discarded` reasons for all 3 losses (the
-unified `group_losses` table supersedes this ledger once WS3's
-settle-member seam lands; until then, this is the honest recovery path):
+producing one — but the loss is recorded, not merely inferable: the unified
+`group_losses` table (WS3's settle-member seam) carries one row per lost
+ticket, naming the closer, the lost branch, and the machine-readable reason.
+Observed for this run (3 rows, one per screened ticket, all
+`member_key = 'control_branch'`, `reason = 'gate_discarded'`):
 
 ```bash
 sqlite3 examples/row_union_ab_experiment/runs/settlement.db \
-  "SELECT row_id, branch_name, reason FROM coalesce_branch_losses
-   WHERE coalesce_name = 'variant_union';"
+  "SELECT closer_name, member_key, reason FROM group_losses
+   WHERE closer_name = 'variant_union';"
+# variant_union|control_branch|gate_discarded
+# variant_union|control_branch|gate_discarded
+# variant_union|control_branch|gate_discarded
 ```
 
 ### 5. `settings_identity_branches.yaml` — list-form branches

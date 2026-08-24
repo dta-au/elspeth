@@ -71,6 +71,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# spec §6.3 item 5: the bare category token for an ESCALATED loss — an
+# inner group's failure consumed the outer member. Never conflated with
+# "row_union_group_failed" (a row-union group's OWN direct closure,
+# RowUnionExecutor's `_CLOSED_BY_PRIOR_FAILURE`). Shared by
+# `_stage_pending_escalations` (intake-only path) and
+# `RowProcessor._settle_member_losses`'s in-claim escalation walk (WS3
+# Task 9) — both write the SAME natural key in `group_losses` and must
+# agree on the reason, or whichever commits first wins with the wrong one.
+GROUP_FAILED_REASON = "group_failed"
+
 
 @dataclass(frozen=True, slots=True)
 class _LiveBarrierHold:
@@ -1159,7 +1169,7 @@ class BarrierIntakeCoordinator:
                 group_id=frame.group_id,
                 member_key=frame.member_key,
                 token_id=self._opener_token_id_for_group(group_id),
-                reason="group_failed",
+                reason=GROUP_FAILED_REASON,
             )
             self._stage_escalation_loss(spec, frame_kind=frame.kind, binding=binding)
             del self._failed_group_notes[(closer_name, group_id)]
