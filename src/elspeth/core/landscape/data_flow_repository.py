@@ -39,7 +39,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.engine import CoalesceParentCompletion
+from elspeth.contracts.engine import CoalesceParentCompletion, CommittedCollect
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import SchemaContract
@@ -402,6 +402,25 @@ class DataFlowRepository:
             parent_batch_id=parent_batch_id,
             aggregation_parent_dispositions=aggregation_parent_dispositions,
             parent_lineage_path=parent_lineage_path,
+        )
+
+    def collect_tokens(
+        self,
+        member_refs: Sequence[TokenRef],
+        group_id: str,
+        collector_node_id: str,
+        output_payloads: Sequence[Mapping[str, object]],
+        output_contracts: Sequence[SchemaContract],
+        step_in_pipeline: int | None = None,
+    ) -> CommittedCollect:
+        """Close a bound EXPAND group: strict-pop the closer's frame, mint the release."""
+        return self.tokens.collect_tokens(
+            member_refs,
+            group_id,
+            collector_node_id,
+            output_payloads,
+            output_contracts,
+            step_in_pipeline=step_in_pipeline,
         )
 
     def record_empty_expansion(self, parent_ref: TokenRef) -> str:

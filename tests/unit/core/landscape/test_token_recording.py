@@ -27,6 +27,7 @@ from elspeth.core.landscape.schema import (
     token_outcomes_table,
     token_parents_table,
     token_work_items_table,
+    tokens_table,
 )
 from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run, register_test_node
 
@@ -942,6 +943,119 @@ class TestExpandToken:
         )
         assert len(children) == 1
         assert expand_group_id is not None
+
+
+class TestCollectTokens:
+    """Tests for DataFlowRepository.collect_tokens (WS4 Task 3, spec §4.2/§4.4).
+
+    The strict-pop N->M release mint's durable Tier-1 twin: closes a bound
+    EXPAND group (here, an expand_token roster stands in for a collector's
+    arrived members) and mints a fresh EXPAND release group over the popped
+    base path.
+    """
+
+    def test_collect_mints_release_children_over_the_popped_base_path(self):
+        _db, factory = _setup()
+        row, token = _make_row(factory)
+        members, group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 0}, {"item": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
+
+        committed = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+        )
+        assert len(committed.children) == 1
+        assert committed.release_group_id != group_id
+
+        child_id = committed.children[0].token_id
+        child_path = factory.data_flow.load_lineage_paths("run-1", [child_id])[child_id]
+        assert child_path[-1] == LineageFrame(kind=FrameKind.EXPAND, group_id=committed.release_group_id, member_key=child_id)
+        assert child_path[:-1] == ()  # the expand roster's own base path (no enclosing frames here)
+
+        record = _group_record(_db, committed.release_group_id)
+        assert record is not None
+        assert (record.kind, record.opener_token_id, record.member_count) == ("expand", members[0].token_id, 1)
+
+    def test_collect_replay_returns_existing_children_without_reminting(self):
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        members, group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 0}, {"item": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
+
+        first = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+        )
+        replayed = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+        )
+        assert replayed.release_group_id == first.release_group_id
+        assert [c.token_id for c in replayed.children] == [c.token_id for c in first.children]
+
+        with db.connection() as conn:
+            token_count = len(conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == "run-1")).all())
+        # initial token + 2 expand members + 1 release child; the replay minted nothing new.
+        assert token_count == 4
+
+    def test_collect_replay_with_divergent_outputs_refuses_without_mutation(self):
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        members, group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 0}, {"item": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
+
+        first = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+        )
+
+        with pytest.raises(AuditIntegrityError, match="divergent collect replay"):
+            factory.data_flow.collect_tokens(
+                member_refs=member_refs,
+                group_id=group_id,
+                collector_node_id="collector-1",
+                output_payloads=[{"combined": False}],
+                output_contracts=[_MINIMAL_CONTRACT],
+            )
+
+        with db.connection() as conn:
+            token_ids = {
+                row["token_id"] for row in conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == "run-1")).mappings()
+            }
+            record_ids = {
+                row["group_id"]
+                for row in conn.execute(select(group_records_table.c.group_id).where(group_records_table.c.run_id == "run-1")).mappings()
+            }
+        # Unchanged: initial + 2 expand members + 1 release child (the divergent replay wrote nothing).
+        assert token_ids == {token.token_id, *[m.token_id for m in members], first.children[0].token_id}
+        assert record_ids == {group_id, first.release_group_id}
 
 
 class TestValidateOutcomeFields:

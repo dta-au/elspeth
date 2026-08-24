@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import and_, func, select
 from sqlalchemy.engine import Connection, RowMapping
 
-from elspeth.contracts import AggregationParentDisposition, CoalesceParentCompletion, Row, Token
+from elspeth.contracts import AggregationParentDisposition, CoalesceParentCompletion, CommittedChild, CommittedCollect, Row, Token
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath
@@ -1674,6 +1674,194 @@ class RowTokenRepository:
                     )
 
         return children, expand_group_id
+
+    def collect_tokens(
+        self,
+        member_refs: Sequence[TokenRef],
+        group_id: str,
+        collector_node_id: str,
+        output_payloads: Sequence[Mapping[str, object]],
+        output_contracts: Sequence[SchemaContract],
+        step_in_pipeline: int | None = None,
+    ) -> CommittedCollect:
+        """Close a bound EXPAND group: strict-pop the closer's frame, mint the release.
+
+        The durable Tier-1 twin of ``TokenManager.collect_tokens`` (spec
+        §4.2/§4.4; WS1a's single-frame-write-path guard, spec §11): every
+        member's innermost frame must be ``(EXPAND, group_id, <own
+        token_id>)`` — re-derived here from the STORED frames (never trusted
+        from the caller), popped via the shared ``pop_closer_frame`` strict-pop
+        contract, and cross-checked for a shared remaining path exactly like
+        ``coalesce_tokens``' FORK pop above.
+
+        Idempotency mirrors expand_token/fork_token's opener-uniqueness
+        discipline (``uq_group_records_opener``): the release group's opener
+        is the REPRESENTATIVE member (``member_refs[0]``), so a re-drive is
+        detected by that opener already holding a committed group_records row
+        for the release, never by a second natural-key INSERT racing to fail.
+        ``collector_node_id`` identifies the caller for error messages only —
+        ``group_records`` carries no node column (a group_id is globally
+        unique per run, spec §5).
+        """
+        if not member_refs:
+            raise AuditIntegrityError("collect_tokens requires at least one member token")
+        if not output_payloads:
+            raise ValueError("collect_tokens requires at least 1 output payload")
+        if len(output_payloads) != len(output_contracts):
+            raise ValueError("collect_tokens requires output_payloads and output_contracts to align one-for-one")
+        ordered_member_ids = tuple(ref.token_id for ref in member_refs)
+        duplicate_member_ids = sorted(token_id for token_id, count in Counter(ordered_member_ids).items() if count > 1)
+        if duplicate_member_ids:
+            raise AuditIntegrityError(
+                f"collect_tokens received duplicate member tokens for collector {collector_node_id!r}; "
+                f"a group roster requires distinct members: {duplicate_member_ids!r}"
+            )
+        if self._payload_store is None:
+            raise AuditIntegrityError(
+                "collect_tokens requires a configured payload store — each released child's "
+                "payload must be persisted for resume correctness (epoch 11 invariant). "
+                "Pass payload_store= to DataFlowRepository or RecorderFactory."
+            )
+
+        representative = member_refs[0]
+        row_id, run_id = self._ownership.resolve_token_ownership(representative.token_id)
+        for ref in member_refs:
+            self._ownership.validate_token_run_ownership(ref)
+            self._ownership.validate_token_row_ownership(ref.token_id, row_id)
+            if ref.run_id != run_id:
+                raise AuditIntegrityError(
+                    f"Cross-run contamination prevented in collect: member token {ref.token_id!r} "
+                    f"belongs to run {ref.run_id!r}, but the group belongs to run {run_id!r}."
+                )
+
+        # Content-addressed envelopes, same discipline as coalesce/expand:
+        # checkpoint_dumps is type-faithful (datetime survives, unlike
+        # canonical_json) — Tier-1 fidelity for resume reconstruction.
+        output_envelopes = [
+            checkpoint_dumps({"data": dict(payload), "contract": contract.to_checkpoint_format()}).encode("utf-8")
+            for payload, contract in zip(output_payloads, output_contracts, strict=True)
+        ]
+        output_data_refs = [sha256(envelope).hexdigest() for envelope in output_envelopes]
+
+        with self._db.write_connection() as conn:
+            existing = conn.execute(
+                select(group_records_table.c.group_id, group_records_table.c.member_count)
+                .where(group_records_table.c.run_id == run_id)
+                .where(group_records_table.c.opener_token_id == representative.token_id)
+            ).one_or_none()
+            if existing is not None:
+                return self._reconcile_collect_replay(
+                    conn,
+                    representative=representative,
+                    run_id=run_id,
+                    release_group_id=str(existing.group_id),
+                    committed_member_count=int(existing.member_count),
+                    output_data_refs=output_data_refs,
+                )
+
+            member_paths = {ref.token_id: self._load_lineage_frames(conn, token_id=ref.token_id, run_id=run_id) for ref in member_refs}
+            base_paths: set[tuple[LineageFrame, ...]] = set()
+            for ref in member_refs:
+                try:
+                    base_paths.add(pop_closer_frame(member_paths[ref.token_id], kind=FrameKind.EXPAND, group_id=group_id))
+                except OrchestrationInvariantError as exc:
+                    raise AuditIntegrityError(
+                        f"collect_tokens: durable strict pop refused for member token {ref.token_id!r}: {exc}"
+                    ) from exc
+            if len(base_paths) != 1:
+                raise AuditIntegrityError(
+                    "collect_tokens: members do not share their remaining lineage path after the pop; "
+                    f"distinct remaining paths={len(base_paths)}"
+                )
+            base_path = base_paths.pop()
+
+            stored_refs = [self._payload_store.store(envelope) for envelope in output_envelopes]
+            if stored_refs != output_data_refs:
+                raise AuditIntegrityError(
+                    "collect_tokens: payload store returned an identity other than the required SHA-256 content address"
+                )
+
+            release_group_id = generate_id()
+            children: list[CommittedChild] = []
+            for ordinal, payload_ref in enumerate(output_data_refs):
+                child_id = generate_id()
+                timestamp = now()
+                result = conn.execute(
+                    tokens_table.insert().values(
+                        token_id=child_id,
+                        row_id=row_id,
+                        run_id=run_id,
+                        step_in_pipeline=step_in_pipeline,
+                        created_at=timestamp,
+                        token_data_ref=payload_ref,
+                    )
+                )
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(
+                        f"collect_tokens: child token INSERT affected zero rows (token_id={child_id}, ordinal={ordinal})"
+                    )
+
+                result = conn.execute(
+                    token_parents_table.insert().values(
+                        token_id=child_id,
+                        parent_token_id=representative.token_id,
+                        run_id=run_id,
+                        ordinal=ordinal,
+                    )
+                )
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(
+                        f"collect_tokens: token_parent INSERT affected zero rows (child={child_id}, parent={representative.token_id})"
+                    )
+
+                child_path = (*base_path, LineageFrame(kind=FrameKind.EXPAND, group_id=release_group_id, member_key=child_id))
+                self._insert_lineage_frames(conn, token_id=child_id, run_id=run_id, frames=child_path)
+                children.append(CommittedChild(token_id=child_id))
+
+            result = conn.execute(
+                group_records_table.insert().values(
+                    run_id=run_id,
+                    group_id=release_group_id,
+                    kind=FrameKind.EXPAND.value,
+                    opener_token_id=representative.token_id,
+                    member_count=len(output_data_refs),
+                    created_at=now(),
+                )
+            )
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"collect_tokens: group_records INSERT affected zero rows (group_id={release_group_id})")
+
+        return CommittedCollect(release_group_id=release_group_id, children=tuple(children))
+
+    def _reconcile_collect_replay(
+        self,
+        conn: Connection,
+        *,
+        representative: TokenRef,
+        run_id: str,
+        release_group_id: str,
+        committed_member_count: int,
+        output_data_refs: Sequence[str],
+    ) -> CommittedCollect:
+        """Return a previously committed exact collect release or refuse divergence."""
+        children = self._load_children_for_parent(conn, parent_ref=representative)
+        exact = (
+            committed_member_count == len(output_data_refs)
+            and len(children) == len(output_data_refs)
+            and all(
+                child.run_id == run_id and child.token_data_ref == expected_ref and ordinal == expected_ordinal
+                for expected_ordinal, ((child, ordinal), expected_ref) in enumerate(zip(children, output_data_refs, strict=True))
+            )
+        )
+        if not exact:
+            raise AuditIntegrityError(
+                f"collect_tokens: divergent collect replay for opener token {representative.token_id!r}; "
+                "the requested outputs do not match the committed release"
+            )
+        return CommittedCollect(
+            release_group_id=release_group_id,
+            children=tuple(CommittedChild(token_id=child.token_id) for child, _ordinal in children),
+        )
 
     def get_group_records_for_run(self, run_id: str) -> list[RowMapping]:
         """All group_records rows for a run, ordered by group_id (export surface)."""

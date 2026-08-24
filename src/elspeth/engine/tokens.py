@@ -17,7 +17,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.identity import pop_closer_frame
+from elspeth.contracts.identity import LineageFrame, pop_closer_frame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
@@ -415,6 +415,65 @@ class TokenManager:
             lineage_path=merged_path,
         )
         return merged_info, merged.join_group_id
+
+    def collect_tokens(
+        self,
+        members: Sequence[TokenInfo],
+        output_rows: Sequence[PipelineRow],
+        node_id: NodeID,
+        run_id: str,
+        group_id: str,
+    ) -> tuple[TokenInfo, ...]:
+        """Close a bound EXPAND group: strict-pop the closer's frame, mint outputs.
+
+        spec §4.2 (ruling 24 as amended by 28): every member's innermost frame
+        MUST be the closer's own EXPAND frame and all members share the
+        remaining path — §7 rule 5 makes violation a genuine engine invariant.
+        The pop is the SHARED ``pop_closer_frame`` (contracts/identity.py,
+        WS1a Task 1): it raises OrchestrationInvariantError unless
+        ``path[-1]`` matches kind+group_id exactly (empty paths included).
+        The emission is RATIFIED (2026-08-22 synthesis): the aggregation-flush
+        precedent — outputs form a fresh EXPAND group over the popped base
+        path (inert unless bound).
+        """
+        if not members:
+            raise OrchestrationInvariantError("collect_tokens requires at least one member token")
+        # pop_closer_frame owns the innermost-frame validation (kind, group_id,
+        # non-empty path); this method adds only the cross-member consistency check.
+        base_path = pop_closer_frame(members[0].lineage_path, kind=FrameKind.EXPAND, group_id=group_id)
+        for member in members[1:]:
+            popped = pop_closer_frame(member.lineage_path, kind=FrameKind.EXPAND, group_id=group_id)
+            if popped != base_path:
+                raise OrchestrationInvariantError(
+                    f"collect_tokens: member {member.token_id} does not share the group's "
+                    f"remaining path after the strict pop of EXPAND group {group_id!r} — "
+                    f"{popped!r} != {base_path!r} (spec §4.2). Engine/validation bug."
+                )
+        if not output_rows:
+            return ()
+
+        step = self._step_resolver(node_id)
+        committed = self._data_flow.collect_tokens(
+            member_refs=[TokenRef(token_id=m.token_id, run_id=run_id) for m in members],
+            group_id=group_id,
+            collector_node_id=str(node_id),
+            output_payloads=[row.to_dict() for row in output_rows],
+            output_contracts=[row.contract for row in output_rows],
+            step_in_pipeline=step,
+        )
+        release_frames = tuple(
+            (*base_path, LineageFrame(kind=FrameKind.EXPAND, group_id=committed.release_group_id, member_key=child.token_id))
+            for child in committed.children
+        )
+        return tuple(
+            TokenInfo(
+                row_id=members[0].row_id,
+                token_id=child.token_id,
+                row_data=row,
+                lineage_path=path,
+            )
+            for child, row, path in zip(committed.children, output_rows, release_frames, strict=True)
+        )
 
     def expand_token(
         self,

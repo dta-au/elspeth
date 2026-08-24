@@ -110,6 +110,21 @@ class CommittedCoalesceResidual:
 
 
 @dataclass(frozen=True, slots=True)
+class CommittedChild:
+    """One ordered child token minted by a committed collector release (spec §4.2)."""
+
+    token_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedCollect:
+    """Durable result of TokenManager.collect_tokens' strict-pop N->M release mint."""
+
+    release_group_id: str
+    children: tuple[CommittedChild, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class BufferEntry[T]:
     """Entry emitted from the reorder buffer with timing metadata.
 

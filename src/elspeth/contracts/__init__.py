@@ -150,7 +150,9 @@ from elspeth.contracts.engine import (
     CommittedAggregationChild,
     CommittedAggregationOutputReceipt,
     CommittedAggregationResidual,
+    CommittedChild,
     CommittedCoalesceResidual,
+    CommittedCollect,
     PendingOutcome,
     RetryPolicy,
 )
@@ -573,7 +575,9 @@ __all__ = [  # Grouped by category for readability
     "CommittedAggregationChild",
     "CommittedAggregationResidual",
     "CommittedAggregationOutputReceipt",
+    "CommittedChild",
     "CommittedCoalesceResidual",
+    "CommittedCollect",
     "PendingOutcome",
     "RetryPolicy",
     # payload_store
