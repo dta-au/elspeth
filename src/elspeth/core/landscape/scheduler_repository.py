@@ -10,13 +10,13 @@ The behaviour lives in the cohesive components under
 queueing (:class:`SchedulerQueueRepository`), leasing
 (:class:`SchedulerLeaseRepository`), dispositions
 (:class:`SchedulerDispositionRepository`), the barrier journal
-(:class:`BarrierJournalRepository`), the branch-loss ledger
-(:class:`CoalesceBranchLossRepository`), scheduler events
+(:class:`BarrierJournalRepository`), the group-loss ledger
+(:class:`GroupLossRepository`), scheduler events
 (:class:`SchedulerEventStore`), read models (:class:`SchedulerReadModel`)
 and the pure payload codec. :class:`TokenSchedulerRepository` composes them
 behind the historical surface so call sites can migrate incrementally —
 new code should prefer the component attributes (``.queue``, ``.leases``,
-``.dispositions``, ``.barriers``, ``.branch_losses``, ``.reads``,
+``.dispositions``, ``.barriers``, ``.group_losses``, ``.reads``,
 ``.events``) over the flat delegators.
 """
 
@@ -35,8 +35,8 @@ from elspeth.contracts.scheduler import (
     BarrierTerminalOutcomeSpec,
     BatchMembershipSpec,
     BlockedPendingSinkHandoff,
-    BranchLossSpec,
     BufferedOutcomeSpec,
+    GroupLossSpec,
     SchedulerEventType,
     TokenWorkItem,
     TokenWorkStatus,
@@ -45,14 +45,14 @@ from elspeth.core.landscape.database import Tier1Engine, verify_sqlite_tier1_pra
 from elspeth.core.landscape.scheduler import (
     BarrierAdoptionResult,
     BarrierJournalRepository,
-    CoalesceBranchLoss,
-    CoalesceBranchLossRepository,
+    GroupLoss,
+    GroupLossRepository,
     SchedulerDispositionRepository,
     SchedulerEventStore,
     SchedulerLeaseRepository,
     SchedulerQueueRepository,
     SchedulerReadModel,
-    record_coalesce_branch_loss,
+    record_group_loss,
     token_from_journal_item,
 )
 from elspeth.core.landscape.scheduler.payload_codec import deserialize_row_payload, serialize_row_payload
@@ -72,14 +72,14 @@ __all__ = [
     "BarrierEmission",
     "BatchMembershipSpec",
     "BlockedPendingSinkHandoff",
-    "BranchLossSpec",
     "BufferedOutcomeSpec",
-    "CoalesceBranchLoss",
+    "GroupLoss",
+    "GroupLossSpec",
     "SchedulerEventType",
     "TokenSchedulerRepository",
     "TokenWorkItem",
     "TokenWorkStatus",
-    "record_coalesce_branch_loss",
+    "record_group_loss",
     "token_from_journal_item",
 ]
 
@@ -105,7 +105,7 @@ class TokenSchedulerRepository:
         self.queue = SchedulerQueueRepository(engine, events=self.events, leases=self.leases)
         self.dispositions = SchedulerDispositionRepository(engine, events=self.events)
         self.barriers = BarrierJournalRepository(engine, events=self.events)
-        self.branch_losses = CoalesceBranchLossRepository(engine)
+        self.group_losses = GroupLossRepository(engine)
         self.reads = SchedulerReadModel(engine)
 
     # ------------------------------------------------------------------
@@ -470,7 +470,7 @@ class TokenSchedulerRepository:
         work_item_id: str,
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Mark a leased work item terminal."""
@@ -478,7 +478,7 @@ class TokenSchedulerRepository:
             work_item_id=work_item_id,
             now=now,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             worker_id=worker_id,
         )
 
@@ -489,7 +489,7 @@ class TokenSchedulerRepository:
         emitted_ready: Sequence[BarrierEmission],
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
         """Atomically enqueue child continuations and terminalize their parent."""
@@ -498,7 +498,7 @@ class TokenSchedulerRepository:
             emitted_ready=emitted_ready,
             now=now,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             worker_id=worker_id,
         )
 
@@ -508,7 +508,7 @@ class TokenSchedulerRepository:
         work_item_id: str,
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Mark a leased work item failed after retries are exhausted."""
@@ -516,7 +516,7 @@ class TokenSchedulerRepository:
             work_item_id=work_item_id,
             now=now,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             worker_id=worker_id,
         )
 
@@ -527,7 +527,7 @@ class TokenSchedulerRepository:
         emitted_ready: Sequence[BarrierEmission],
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
         """Atomically enqueue child continuations and fail their parent."""
@@ -536,7 +536,7 @@ class TokenSchedulerRepository:
             emitted_ready=emitted_ready,
             now=now,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             worker_id=worker_id,
         )
 
@@ -552,7 +552,7 @@ class TokenSchedulerRepository:
         error_message: str | None,
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Move a claimed item to a durable sink handoff state."""
@@ -566,7 +566,7 @@ class TokenSchedulerRepository:
             error_message=error_message,
             now=now,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             worker_id=worker_id,
         )
 
@@ -583,7 +583,7 @@ class TokenSchedulerRepository:
         error_message: str | None,
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
         """Atomically enqueue children and durably park their parent for a sink."""
@@ -598,7 +598,7 @@ class TokenSchedulerRepository:
             error_message=error_message,
             now=now,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             worker_id=worker_id,
         )
 
@@ -673,7 +673,7 @@ class TokenSchedulerRepository:
         release_context: Mapping[str, object] | None = None,
         coordination_token: CoordinationToken,
         pending_sink_lease_owner: str | None = None,
-        branch_losses: Sequence[BranchLossSpec] = (),
+        group_losses: Sequence[GroupLossSpec] = (),
         terminal_outcomes: Sequence[BarrierTerminalOutcomeSpec] = (),
     ) -> int:
         """Complete a barrier atomically (see :meth:`BarrierJournalRepository.complete_barrier`)."""
@@ -690,7 +690,7 @@ class TokenSchedulerRepository:
             release_context=release_context,
             coordination_token=coordination_token,
             pending_sink_lease_owner=pending_sink_lease_owner,
-            branch_losses=branch_losses,
+            group_losses=group_losses,
             terminal_outcomes=terminal_outcomes,
         )
 
@@ -784,23 +784,23 @@ class TokenSchedulerRepository:
         return self.barriers.reset_adoption_marker_to_pending(work_item_ids=work_item_ids, run_id=run_id)
 
     # ------------------------------------------------------------------
-    # Branch-loss ledger (CoalesceBranchLossRepository)
+    # Group-loss ledger (GroupLossRepository)
     # ------------------------------------------------------------------
 
-    def list_unadopted_coalesce_branch_losses(self, *, run_id: str) -> list[CoalesceBranchLoss]:
-        """Branch-loss rows not yet replayed into leader memory (SE.5 intake read)."""
-        return self.branch_losses.list_unadopted_coalesce_branch_losses(run_id=run_id)
+    def list_unadopted_group_losses(self, *, run_id: str) -> list[GroupLoss]:
+        """Group-loss rows not yet replayed into leader memory (SE.5 intake read)."""
+        return self.group_losses.list_unadopted_group_losses(run_id=run_id)
 
-    def list_coalesce_branch_losses(
+    def list_group_losses(
         self,
         *,
         run_id: str,
-        coalesce_names: frozenset[str] | None = None,
-    ) -> list[CoalesceBranchLoss]:
-        """ALL branch-loss rows, adopted or not (SE.4 takeover restore read)."""
-        return self.branch_losses.list_coalesce_branch_losses(run_id=run_id, coalesce_names=coalesce_names)
+        closer_names: frozenset[str] | None = None,
+    ) -> list[GroupLoss]:
+        """ALL group-loss rows, adopted or not (SE.4 takeover restore read)."""
+        return self.group_losses.list_group_losses(run_id=run_id, closer_names=closer_names)
 
-    def adopt_coalesce_branch_losses(
+    def adopt_group_losses(
         self,
         *,
         run_id: str,
@@ -809,7 +809,7 @@ class TokenSchedulerRepository:
         coordination_token: CoordinationToken,
     ) -> int:
         """Fenced replay-cursor mark: ``adopted_epoch NULL -> epoch`` (SE.5)."""
-        return self.branch_losses.adopt_coalesce_branch_losses(
+        return self.group_losses.adopt_group_losses(
             run_id=run_id,
             loss_ids=loss_ids,
             now=now,

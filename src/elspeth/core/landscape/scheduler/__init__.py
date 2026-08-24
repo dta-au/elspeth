@@ -1,7 +1,7 @@
 """Scheduler persistence components (split from ``TokenSchedulerRepository``).
 
 Each module owns one cohesive slice of the durable token scheduler:
-queueing, leasing, dispositions, barrier journal, branch-loss ledger,
+queueing, leasing, dispositions, barrier journal, group-loss ledger,
 scheduler events, read models, and the pure payload codec. The
 ``TokenSchedulerRepository`` facade in
 ``elspeth.core.landscape.scheduler_repository`` composes them and remains
@@ -10,13 +10,14 @@ the compatibility surface for existing call sites
 """
 
 from elspeth.core.landscape.scheduler.barrier import BarrierAdoptionResult, BarrierJournalRepository
-from elspeth.core.landscape.scheduler.branch_losses import (
-    CoalesceBranchLoss,
-    CoalesceBranchLossRepository,
-    record_coalesce_branch_loss,
-)
 from elspeth.core.landscape.scheduler.dispositions import SchedulerDispositionRepository
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
+from elspeth.core.landscape.scheduler.group_losses import (
+    GroupLoss,
+    GroupLossRepository,
+    authenticate_adoption_loss,
+    record_group_loss,
+)
 from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
 from elspeth.core.landscape.scheduler.payload_codec import (
     deserialize_row_payload,
@@ -32,15 +33,16 @@ __all__ = [
     "BarrierAdoptionResult",
     "BarrierJournalRepository",
     "BarrierRestoreReadModel",
-    "CoalesceBranchLoss",
-    "CoalesceBranchLossRepository",
+    "GroupLoss",
+    "GroupLossRepository",
     "SchedulerDispositionRepository",
     "SchedulerEventStore",
     "SchedulerLeaseRepository",
     "SchedulerQueueRepository",
     "SchedulerReadModel",
+    "authenticate_adoption_loss",
     "deserialize_row_payload",
-    "record_coalesce_branch_loss",
+    "record_group_loss",
     "scrubbed_row_payload_json",
     "serialize_row_payload",
     "token_from_journal_item",
