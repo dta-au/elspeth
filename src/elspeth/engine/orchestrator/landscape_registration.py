@@ -21,12 +21,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
 from elspeth import __version__ as ENGINE_VERSION
 from elspeth.contracts import Determinism, NodeType
 from elspeth.contracts.errors import FrameworkBugError, OrchestrationInvariantError
-from elspeth.contracts.types import NodeID, SinkName
+from elspeth.contracts.types import CollectorName, NodeID, SinkName
 
 if TYPE_CHECKING:
     from elspeth.contracts import SourceProtocol
@@ -76,12 +77,29 @@ def resolve_node_audit_metadata(
     config_gate_node_ids: set[NodeID],
     aggregation_node_ids: set[NodeID],
     coalesce_node_ids: set[NodeID],
+    collector_id_map: Mapping[CollectorName, NodeID] = MappingProxyType({}),
+    collector_transforms: Mapping[CollectorName, _AuditMetadataPlugin] = MappingProxyType({}),
 ) -> dict[NodeID, NodeAuditMetadata]:
-    """Resolve audit metadata for every graph node before Landscape writes."""
+    """Resolve audit metadata for every graph node before Landscape writes.
+
+    Collector nodes are plugin-backed (a batch transform closes the EXPAND
+    group) but ride neither ``config.transforms`` nor an aggregation entry;
+    their instances come from the graph's own accessor
+    (``ExecutionGraph.get_collector_transform_map``, META-29), keyed by the
+    same collector name as ``collector_id_map``.
+    """
 
     plugin_by_node: dict[NodeID, _AuditMetadataPlugin] = {}
     for source_name, source_node_id in source_id_map.items():
         plugin_by_node[source_node_id] = config.sources[source_name]
+
+    for collector_name, collector_node_id in collector_id_map.items():
+        if collector_name not in collector_transforms:
+            raise OrchestrationInvariantError(
+                f"Collector {collector_name!r} (node {collector_node_id!r}) is in the graph's collector id map "
+                "but has no transform instance in its collector transform map; the builder populates both together."
+            )
+        plugin_by_node[collector_node_id] = collector_transforms[collector_name]
 
     for seq, transform in enumerate(config.transforms):
         if seq in transform_id_map:

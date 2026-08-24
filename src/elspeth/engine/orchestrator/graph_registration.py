@@ -130,6 +130,8 @@ class GraphRegistrationService:
             config_gate_node_ids=config_gate_node_ids,
             aggregation_node_ids=aggregation_node_ids,
             coalesce_node_ids=coalesce_node_ids,
+            collector_id_map=graph.get_collector_id_map(),
+            collector_transforms=graph.get_collector_transform_map(),
         )
         source_contracts_by_node_id = resolve_source_contracts_by_node_id(
             config,

@@ -27,8 +27,12 @@ from elspeth.contracts.types import GateName, NodeID, SinkName
 from elspeth.engine.processor import DAGTraversalContext
 
 # Node types that legitimately appear in traversal with no plugin to execute.
-# Closed vocabulary — extend deliberately, never derive by complement.
-_STRUCTURAL_NODE_TYPES = frozenset({NodeType.SOURCE, NodeType.QUEUE, NodeType.COALESCE, NodeType.ROW_UNION})
+# Closed vocabulary — extend deliberately, never derive by complement. A
+# COLLECTOR node carries a batch-transform plugin, but the traversal never
+# runs it: arrivals are held at the node and the CollectorExecutor invokes
+# the plugin at intake (spec §5), so for traversal it is a barrier exactly
+# like coalesce/row_union.
+_STRUCTURAL_NODE_TYPES = frozenset({NodeType.SOURCE, NodeType.QUEUE, NodeType.COALESCE, NodeType.ROW_UNION, NodeType.COLLECTOR})
 
 if TYPE_CHECKING:
     from elspeth.contracts import SinkProtocol, SourceProtocol
@@ -179,6 +183,8 @@ def build_dag_traversal_context(
         node_to_next[coalesce_node_id] = graph.get_next_node(coalesce_node_id)
     for row_union_node_id in graph.get_row_union_id_map().values():
         node_to_next[row_union_node_id] = graph.get_next_node(row_union_node_id)
+    for collector_node_id in graph.get_collector_id_map().values():
+        node_to_next[collector_node_id] = graph.get_next_node(collector_node_id)
 
     # Structural nodes are the explicit closed set of node types that carry no
     # plugin: sources (traversal origins), queues (ADR-025 fan-in primitives),
@@ -202,5 +208,6 @@ def build_dag_traversal_context(
         coalesce_node_map=graph.get_coalesce_id_map(),
         branch_first_node=graph.get_branch_first_nodes(),
         row_union_node_map=graph.get_row_union_id_map(),
+        collector_node_map=graph.get_collector_id_map(),
         structural_node_ids=structural_node_ids,
     )

@@ -91,6 +91,11 @@ class ExecutionGraph:
         self._config_gate_id_map: dict[GateName, NodeID] = {}  # gate_name -> node_id
         self._aggregation_id_map: dict[AggregationName, NodeID] = {}  # agg_name -> node_id
         self._collector_id_map: dict[CollectorName, NodeID] = {}  # collector_name -> node_id
+        # collector_name -> the batch-transform instance the builder received
+        # (META-29): the runtime needs the instance to register the collector
+        # executor and to resolve plugin-backed audit metadata, and — unlike
+        # aggregations, which ride PipelineConfig — nothing else carries it.
+        self._collector_transform_map: dict[CollectorName, TransformProtocol] = {}
         self._coalesce_id_map: dict[CoalesceName, NodeID] = {}  # coalesce_name -> node_id
         self._branch_info: dict[BranchName, BranchInfo] = {}  # branch_name -> coalesce + gate info
         # Unbound (no barrier) fork branches consumed by exactly one ordinary
@@ -824,6 +829,11 @@ class ExecutionGraph:
         self._assert_build_metadata_mutable()
         self._collector_id_map = dict(mapping)
 
+    def set_collector_transform_map(self, mapping: Mapping[CollectorName, TransformProtocol]) -> None:
+        """Set the collector_name -> transform-instance mapping (META-29)."""
+        self._assert_build_metadata_mutable()
+        self._collector_transform_map = dict(mapping)
+
     def set_coalesce_id_map(self, mapping: dict[CoalesceName, NodeID]) -> None:
         """Set the coalesce_name -> node_id mapping."""
         self._assert_build_metadata_mutable()
@@ -978,6 +988,19 @@ class ExecutionGraph:
             Dict mapping collector name to its graph node ID.
         """
         return dict(self._collector_id_map)
+
+    def get_collector_transform_map(self) -> dict[CollectorName, TransformProtocol]:
+        """Get the collector_name -> batch-transform instance mapping (META-29).
+
+        Internal runtime surface, sibling of :meth:`get_collector_id_map`:
+        the processor factory registers each collector on the executor with
+        this instance, and audit-metadata resolution reads its
+        ``plugin_version``/``determinism``/``source_file_hash`` from it. The
+        instances are the exact objects passed to ``from_plugin_instances``
+        (never copied — plugin identity is what ``on_start``/``on_complete``
+        lifecycles key on).
+        """
+        return dict(self._collector_transform_map)
 
     def get_coalesce_id_map(self) -> dict[CoalesceName, NodeID]:
         """Get explicit coalesce_name -> node_id mapping.

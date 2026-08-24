@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.schema_contract import PipelineRow
     from elspeth.contracts.types import CoalesceName, NodeID
     from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
+    from elspeth.engine.executors.collector import CollectorExecutor
     from elspeth.engine.row_union_executor import RowUnionExecutor
     from elspeth.engine.work_items import WorkItem
 
@@ -264,11 +265,23 @@ class RowUnionExecutorSource(Protocol):
     def row_union_executor(self) -> RowUnionExecutor | None: ...
 
 
+class CollectorExecutorSource(Protocol):
+    """Processor surface exposing the leader's collector barrier executor.
+
+    ``None`` on followers and on pipelines with no collector nodes — the
+    end-of-input flush loop treats that as no collector holds to wait for.
+    """
+
+    @property
+    def collector_executor(self) -> CollectorExecutor | None: ...
+
+
 class EndOfInputBarrierProcessorPort(
     AggregationProcessorPort,
     BarrierIntakePort,
     CoalesceCompletionPort,
     RowUnionExecutorSource,
+    CollectorExecutorSource,
     Protocol,
 ):
     """Combined surface needed by the end-of-input barrier flush loop."""
@@ -282,6 +295,7 @@ class RowProcessorHandle(
     BarrierIntakePort,
     CoalesceCompletionPort,
     RowUnionExecutorSource,
+    CollectorExecutorSource,
     SinkTerminalizationPort,
     BarrierScalarsSource,
     ResumeContinuationPort,

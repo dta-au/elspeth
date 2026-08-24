@@ -17,8 +17,9 @@ Dependencies held by the factory:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+from elspeth.contracts import BatchTransformProtocol
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.errors import (
     FrameworkBugError,
@@ -27,6 +28,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.types import (
     CoalesceName,
+    CollectorName,
     NodeID,
     RowUnionName,
 )
@@ -46,10 +48,11 @@ if TYPE_CHECKING:
         BranchName,
         GateName,
     )
-    from elspeth.core.config import AggregationSettings, ElspethSettings
+    from elspeth.core.config import AggregationSettings, ElspethSettings, ScopeSettings
     from elspeth.core.dag import ExecutionGraph
     from elspeth.engine.clock import Clock
     from elspeth.engine.coalesce_executor import CoalesceExecutor
+    from elspeth.engine.executors.collector import CollectorExecutor
     from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
     from elspeth.engine.orchestrator.types import (
         PipelineConfig,
@@ -306,6 +309,70 @@ def build_row_processor(
                 row_union_node_map[RowUnionName(row_union_settings_entry.name)],
             )
 
+    # Collector plane (EXPAND-group closers, barrier-scopes spec §5): the same
+    # coalesce/row_union shape — node ids from the graph, settings from
+    # ElspethSettings — never a PipelineConfig field (META-29). The transform
+    # instance rides the graph's own accessor beside the id map.
+    collector_executor: CollectorExecutor | None = None
+    collector_node_map: dict[CollectorName, NodeID] = graph.get_collector_id_map()
+    if collector_node_map and mode is not ProcessorMode.FOLLOWER:
+        from elspeth.engine.executors.collector import CollectorExecutor
+
+        if settings is None or not settings.collectors:
+            raise OrchestrationInvariantError(
+                "Graph contains collector nodes but settings.collectors is missing. "
+                "Collector settings are required when a scope's members close through a collector barrier."
+            )
+        scopes_by_closer: dict[str, ScopeSettings] = {scope.closer: scope for scope in settings.scopes}
+        collector_transform_map = graph.get_collector_transform_map()
+        # collect_tokens never calls register_expand_group (the release-group
+        # mint is durable, in data_flow), so the executor's own TokenManager
+        # needs no group_bindings — same as the coalesce executor's above.
+        collector_executor = CollectorExecutor(
+            execution=factory.execution,
+            span_factory=span_factory,
+            token_manager=TokenManager(factory.data_flow, step_resolver=step_resolver),
+            run_id=run_id,
+            step_resolver=step_resolver,
+            data_flow=factory.data_flow,
+            clock=clock,
+            max_completed_keys=coalesce_completed_keys_limit,
+            barrier_restore_reads=factory.barrier_restore,
+        )
+        for collector_settings_entry in settings.collectors:
+            collector_name = CollectorName(collector_settings_entry.name)
+            if collector_name not in collector_node_map:
+                raise OrchestrationInvariantError(
+                    f"settings.collectors names {collector_settings_entry.name!r} but the graph has no such collector node "
+                    f"(graph collectors: {sorted(str(name) for name in collector_node_map)})."
+                )
+            if collector_settings_entry.name not in scopes_by_closer:
+                raise OrchestrationInvariantError(
+                    f"Collector {collector_settings_entry.name!r} has no scopes: entry naming it as closer; "
+                    "a collector cannot register without its scope binding (spec §7 rule 1)."
+                )
+            collector_executor.register_collector(
+                collector_settings_entry,
+                scopes_by_closer[collector_settings_entry.name],
+                collector_node_map[collector_name],
+                # The builder rejected any collector plugin with is_batch_aware=False
+                # at graph construction, so the instance IS batch-shaped here — the
+                # same narrowing _process_batch_aggregation_node applies to an
+                # aggregation transform after its own is_batch_aware check.
+                cast(BatchTransformProtocol, collector_transform_map[collector_name]),
+            )
+        # The row_union precedent stops at "settings present"; a settings list
+        # naming only SOME of the graph's collectors would register that
+        # subset and silently strand every group bound to the rest. Exact set
+        # equality, both directions.
+        registered = {CollectorName(name) for name in collector_executor.get_registered_names()}
+        if registered != set(collector_node_map):
+            raise OrchestrationInvariantError(
+                f"settings.collectors registered {sorted(str(name) for name in registered)} but the graph's collector "
+                f"nodes are {sorted(str(name) for name in collector_node_map)}; every graph collector needs exactly "
+                "one settings entry."
+            )
+
     # Derive coalesce on_success from graph's terminal sink map (graph-authoritative),
     # falling back to settings for non-terminal coalesce nodes. Followers never
     # complete a coalesce merge locally, so their map is empty (§B.2).
@@ -373,6 +440,7 @@ def build_row_processor(
         branch_to_coalesce=branch_to_coalesce,
         row_union_executor=row_union_executor,
         branch_to_row_union=branch_to_row_union,
+        collector_executor=collector_executor,
         group_bindings=group_bindings,
         branch_to_sink=branch_to_sink,
         unbound_branch_first_node=unbound_branch_first_node,

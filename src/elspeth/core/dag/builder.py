@@ -685,6 +685,7 @@ def build_execution_graph(
     # collector nodes ONLY, so no pre-existing node's canonical hash moves
     # (spec §3; Task-1 corpus pins it).
     collector_ids: dict[CollectorName, NodeID] = {}
+    collector_transforms: dict[CollectorName, TransformProtocol] = {}
     scopes_by_closer: dict[str, ScopeSettings] = {s.closer: s for s in (scope_settings or ())}
     if collectors:
         for collector_name, (transform, collector_config) in collectors.items():
@@ -716,6 +717,7 @@ def build_execution_graph(
             }
             col_id = node_id("collector", collector_name, collector_node_config)
             collector_ids[CollectorName(collector_name)] = col_id
+            collector_transforms[CollectorName(collector_name)] = transform
             collector_output_schema_config = transform._output_schema_config
             if collector_output_schema_config is None:
                 collector_output_schema_config = _parse_contract_schema_config(
@@ -737,6 +739,7 @@ def build_execution_graph(
                 removed_input_fields=transform.removed_input_fields,
             )
     graph.set_collector_id_map(collector_ids)
+    graph.set_collector_transform_map(collector_transforms)
 
     # ===== CONNECT FORK GATES - EXPLICIT DESTINATIONS ONLY =====
     # CRITICAL: No fallback behavior. All fork branches must have explicit destinations.

@@ -37,7 +37,7 @@ from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.identity import LineageFrame, pop_closer_frame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName, SinkName, StepResolver
+from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName, SinkName, StepResolver
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.aggregation_result import (
@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     from elspeth.engine.clock import Clock
     from elspeth.engine.coalesce_executor import CoalesceExecutor
     from elspeth.engine.executors import GateOutcome
+    from elspeth.engine.executors.collector import CollectorExecutor
     from elspeth.engine.orchestrator.plugin_types import RowPlugin
     from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
     from elspeth.engine.row_union_executor import RowUnionExecutor
@@ -203,11 +204,16 @@ class DAGTraversalContext:
     coalesce_node_map: Mapping[CoalesceName, NodeID]
     branch_first_node: Mapping[str, NodeID] = MappingProxyType({})
     row_union_node_map: Mapping[RowUnionName, NodeID] = MappingProxyType({})
+    # Collector barriers (EXPAND-group closers, barrier-scopes spec §3): the
+    # traversal never executes a collector's plugin itself — the arrival is
+    # held and the CollectorExecutor runs the flush at intake — so, exactly
+    # like coalesce/row_union, the node is structural for traversal.
+    collector_node_map: Mapping[CollectorName, NodeID] = MappingProxyType({})
     # Explicit allowlist of non-plugin traversal nodes (sources, queues,
-    # coalesce points, row_union barriers). Nodes in node_to_next that are
-    # neither plugin-bearing nor in this set fail closed at resolution
-    # instead of being skipped. Barrier nodes are structural by definition
-    # and always unioned in.
+    # coalesce points, row_union and collector barriers). Nodes in
+    # node_to_next that are neither plugin-bearing nor in this set fail
+    # closed at resolution instead of being skipped. Barrier nodes are
+    # structural by definition and always unioned in.
     structural_node_ids: frozenset[NodeID] = frozenset()
 
     def __post_init__(self) -> None:
@@ -217,10 +223,14 @@ class DAGTraversalContext:
         object.__setattr__(self, "coalesce_node_map", deep_freeze(self.coalesce_node_map))
         object.__setattr__(self, "branch_first_node", deep_freeze(self.branch_first_node))
         object.__setattr__(self, "row_union_node_map", deep_freeze(self.row_union_node_map))
+        object.__setattr__(self, "collector_node_map", deep_freeze(self.collector_node_map))
         object.__setattr__(
             self,
             "structural_node_ids",
-            frozenset(self.structural_node_ids) | frozenset(self.coalesce_node_map.values()) | frozenset(self.row_union_node_map.values()),
+            frozenset(self.structural_node_ids)
+            | frozenset(self.coalesce_node_map.values())
+            | frozenset(self.row_union_node_map.values())
+            | frozenset(self.collector_node_map.values()),
         )
 
 
@@ -409,6 +419,7 @@ class RowProcessor:
         branch_to_coalesce: dict[BranchName, CoalesceName] | None = None,
         row_union_executor: RowUnionExecutor | None = None,
         branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
+        collector_executor: CollectorExecutor | None = None,
         group_bindings: GroupBindingRegistry | None = None,
         branch_to_sink: dict[BranchName, SinkName] | None = None,
         unbound_branch_first_node: dict[BranchName, NodeID] | None = None,
@@ -448,6 +459,9 @@ class RowProcessor:
             retry_manager: Optional retry manager for transform execution
             coalesce_executor: Optional coalesce executor for fork/join operations
             branch_to_coalesce: Map of branch_name -> coalesce_name for fork/join routing
+            collector_executor: Optional collector executor (EXPAND-group closers,
+                barrier-scopes spec §5). Leader-only, like the coalesce and row_union
+                executors; ``None`` on followers and on pipelines without collectors.
             group_bindings: The unified FORK/EXPAND group-binding registry (barrier-scopes
                 spec §3, §6.1). ``_settle_member_losses`` walks a failing token's
                 ``lineage_path`` against ``group_bindings.binding_for(frame)`` to find
@@ -542,6 +556,8 @@ class RowProcessor:
         self._row_union_executor = row_union_executor
         self._row_union_node_ids: dict[RowUnionName, NodeID] = dict(traversal.row_union_node_map)
         self._branch_to_row_union: dict[BranchName, RowUnionName] = branch_to_row_union or {}
+        self._collector_executor = collector_executor
+        self._collector_node_ids: dict[CollectorName, NodeID] = dict(traversal.collector_node_map)
         # THE settle-member walk's frame resolver (spec §6.1). Defaults to an
         # empty registry — every frame is inert, nothing staged — rather than
         # None, so _settle_member_losses never needs a None branch.
@@ -843,6 +859,11 @@ class RowProcessor:
     def row_union_executor(self) -> RowUnionExecutor | None:
         """The leader's row_union barrier executor (None on followers)."""
         return self._row_union_executor
+
+    @property
+    def collector_executor(self) -> CollectorExecutor | None:
+        """The leader's collector barrier executor (None on followers)."""
+        return self._collector_executor
 
     @property
     def coordination_token(self) -> CoordinationToken | None:
