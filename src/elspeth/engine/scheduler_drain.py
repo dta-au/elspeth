@@ -985,10 +985,21 @@ class SchedulerDrainCoordinator:
         member_key) frame that the claimed token's own lineage_path carries —
         self-authenticating, because frames are minted by openers and never
         asserted by failing code. At most one loss per bound frame per claim.
-        The old token-equality guard is retired with BranchLossSpec: for a
-        FORK frame this guard is exactly as strong (the branch token carries
-        its own branch frame), and for EXPAND frames it is the correct
-        generalization the old guard crashed on.
+
+        The retired BranchLossSpec guard additionally asserted
+        ``spec.token_id == claimed_token_id``; this guard deliberately drops
+        that identity axis and checks only frame membership. Two distinct
+        tokens can carry the same FORK frame (a branch token and its
+        downstream continuations), so a loss staged for one token can now
+        ride a different co-frame token's disposition transaction — the
+        §E.5 co-commit guarantee loosens from "the losing branch's own
+        disposition" to "some co-frame token's disposition". Durable
+        integrity is unaffected: ``record_group_loss``'s same-key
+        different-token_id check still raises Tier-1
+        ``AuditIntegrityError`` if two distinct tokens ever try to claim the
+        same (closer_name, group_id, member_key). The frame axis is what
+        generalizes correctly to EXPAND frames, where the old token-equality
+        guard did not apply at all.
         """
         if not self._pending_group_losses:
             return ()
