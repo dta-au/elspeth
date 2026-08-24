@@ -146,6 +146,11 @@ class TokenWorkItem:
     coalesce_node_id: str | None = None
     coalesce_name: str | None = None
     row_union_name: str | None = None
+    # WS4 Task 6: the collector's barrier BINDING address (closer's address,
+    # not lineage — spec §4.3). barrier_key = "collector:<collector_name>:<group_id>"
+    # (compound, unlike coalesce/row_union's bare-name key) for a BLOCKED
+    # collector arrival row.
+    collector_name: str | None = None
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
     barrier_blocked_at: datetime | None = None
@@ -198,6 +203,7 @@ class BarrierEmission:
     coalesce_node_id: str | None = None
     coalesce_name: str | None = None
     row_union_name: str | None = None
+    collector_name: str | None = None
     attempt: int = 1
 
     def __post_init__(self) -> None:

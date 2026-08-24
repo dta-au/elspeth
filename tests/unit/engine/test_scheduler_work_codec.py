@@ -22,7 +22,7 @@ from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import BarrierEmission, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
+from elspeth.contracts.types import CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.scheduler_work_codec import (
     TERMINAL_NODE_SENTINEL,
@@ -70,6 +70,7 @@ def _create_work_item(
     coalesce_name: CoalesceName | None = None,
     coalesce_node_id: NodeID | None = None,
     row_union_name: RowUnionName | None = None,
+    collector_name: CollectorName | None = None,
     on_success_sink: str | None = None,
     join_group_id: str | None = None,
 ) -> WorkItem:
@@ -80,6 +81,7 @@ def _create_work_item(
         coalesce_name=coalesce_name,
         row_union_node_id=NodeID(f"row_union_node_{row_union_name}") if row_union_name is not None else None,
         row_union_name=row_union_name,
+        collector_name=collector_name,
         on_success_sink=on_success_sink,
         join_group_id=join_group_id,
     )
@@ -241,6 +243,7 @@ class TestReadyEmissionParity:
             ("coalesce_node_id", emission.coalesce_node_id, fields.coalesce_node_id),
             ("coalesce_name", emission.coalesce_name, fields.coalesce_name),
             ("row_union_name", emission.row_union_name, fields.row_union_name),
+            ("collector_name", emission.collector_name, fields.collector_name),
         )
         covered = {name for name, _, _ in parity}
         declared = {field.name for field in dataclass_fields(ScheduledWorkFields)}

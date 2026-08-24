@@ -738,6 +738,11 @@ token_work_items_table = Table(
     Column("coalesce_node_id", String(NODE_ID_COLUMN_LENGTH)),
     Column("coalesce_name", String(128)),
     Column("row_union_name", String(128)),
+    # WS4 Task 6: the collector's barrier BINDING address (spec §4.3), mirroring
+    # row_union_name's epoch-30 shape one column over. Lands within the current
+    # epoch 35 (pre-1.0, no migration) rather than its own bump — no table-shape
+    # change is entangled with it, unlike epoch 30's original addition.
+    Column("collector_name", String(128)),
     Column("attempt", Integer, nullable=False),
     Column("lease_owner", String(128)),
     Column("lease_expires_at", DateTime(timezone=True)),

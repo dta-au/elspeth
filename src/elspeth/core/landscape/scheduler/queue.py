@@ -66,6 +66,7 @@ class SchedulerQueueRepository:
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Persist a READY token continuation.
@@ -107,6 +108,7 @@ class SchedulerQueueRepository:
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
+            collector_name=collector_name,
         )
         with begin_write(self._engine) as conn:
             # Membership fence (ADR-030 §G, slice 4): checked BEFORE the INSERT
@@ -171,6 +173,7 @@ class SchedulerQueueRepository:
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
     ) -> TokenWorkItem:
         """Persist and claim READY work for an active registered worker.
 
@@ -203,6 +206,7 @@ class SchedulerQueueRepository:
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
+            collector_name=collector_name,
             worker_id=lease_owner,
         )
 
@@ -229,6 +233,7 @@ class SchedulerQueueRepository:
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
     ) -> TokenWorkItem:
         """Compatibility enqueue-and-claim for N=0 fixtures with no registry.
 
@@ -257,6 +262,7 @@ class SchedulerQueueRepository:
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
+            collector_name=collector_name,
             worker_id=None,
         )
 
@@ -282,6 +288,7 @@ class SchedulerQueueRepository:
         coalesce_node_id: str | None,
         coalesce_name: str | None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
         lineage_path: tuple[LineageFrame, ...] = (),
         worker_id: str | None,
     ) -> TokenWorkItem:
@@ -308,6 +315,7 @@ class SchedulerQueueRepository:
                 coalesce_node_id=coalesce_node_id,
                 coalesce_name=coalesce_name,
                 row_union_name=row_union_name,
+                collector_name=collector_name,
                 worker_id=worker_id,
             )
         return item_from_mapping(row)
@@ -336,6 +344,7 @@ class SchedulerQueueRepository:
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
         worker_id: str | None = None,
     ) -> RowMapping:
         """Connection-accepting enqueue-and-claim: composes into the caller's transaction.
@@ -368,6 +377,7 @@ class SchedulerQueueRepository:
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
+            collector_name=collector_name,
         )
         if worker_id is not None:
             fence_holds = conn.execute(select(active_worker_fence_clause(worker_id=worker_id, run_id=run_id))).scalar()
@@ -436,6 +446,7 @@ class SchedulerQueueRepository:
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
     ) -> tuple[Row, Token, TokenWorkItem]:
         """Fenced leader INGEST (ADR-030 §C.4 row 9): one IMMEDIATE transaction.
 
@@ -489,5 +500,6 @@ class SchedulerQueueRepository:
                 coalesce_node_id=coalesce_node_id,
                 coalesce_name=coalesce_name,
                 row_union_name=row_union_name,
+                collector_name=collector_name,
             )
         return row_record, token_record, item_from_mapping(scheduled)

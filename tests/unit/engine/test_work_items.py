@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
+from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.engine.dag_navigator import DAGNavigator
 from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
 from elspeth.testing import make_token_info
@@ -50,7 +50,7 @@ def test_row_union_metadata_must_be_supplied_as_a_pair() -> None:
 
 
 def test_work_item_cannot_target_two_barrier_kinds() -> None:
-    with pytest.raises(OrchestrationInvariantError, match="cannot target both"):
+    with pytest.raises(OrchestrationInvariantError, match="cannot target more than one barrier kind"):
         WorkItem(
             token=make_token_info(data={"value": 1}),
             current_node_id=NodeID("coalesce::merge"),
@@ -59,6 +59,35 @@ def test_work_item_cannot_target_two_barrier_kinds() -> None:
             row_union_node_id=NodeID("row_union::merge"),
             row_union_name=RowUnionName("merge"),
         )
+
+
+def test_work_item_cannot_target_collector_and_coalesce_together() -> None:
+    """WS4 Task 6: collector_name joins the mutual-exclusion count alongside
+    coalesce/row_union — it has no node_id companion (see the WorkItem
+    docstring), so this is the collector-specific pin that
+    test_work_item_cannot_target_two_barrier_kinds (coalesce+row_union)
+    doesn't cover."""
+    with pytest.raises(OrchestrationInvariantError, match="cannot target more than one barrier kind"):
+        WorkItem(
+            token=make_token_info(data={"value": 1}),
+            current_node_id=NodeID("coalesce::merge"),
+            coalesce_node_id=NodeID("coalesce::merge"),
+            coalesce_name=CoalesceName("merge"),
+            collector_name=CollectorName("stitch"),
+        )
+
+
+def test_work_item_collector_name_alone_is_a_legal_bound_cursor() -> None:
+    """The bare-name shape (no collector_node_id companion) is legal on its
+    own — only the multi-kind combination is refused."""
+    item = WorkItem(
+        token=make_token_info(data={"value": 1}),
+        current_node_id=NodeID("stitch"),
+        collector_name=CollectorName("stitch"),
+    )
+    assert item.collector_name == CollectorName("stitch")
+    assert item.coalesce_name is None
+    assert item.row_union_name is None
 
 
 def test_factory_resolves_coalesce_name_from_node_id() -> None:
@@ -102,6 +131,32 @@ def test_factory_accepts_matching_coalesce_name_and_node_id() -> None:
     )
 
     assert item.coalesce_node_id == node_id
+
+
+def test_factory_passes_collector_name_through_without_resolving_a_node_id() -> None:
+    """Unlike coalesce/row_union, collector carries no node-id companion and
+    no navigator resolver call — see the WorkItem docstring's WS4 Task 6
+    note for why."""
+    node_id = NodeID("stitch")
+    navigator = DAGNavigator(
+        node_to_plugin={},
+        node_to_next={node_id: None},
+        coalesce_node_ids={},
+        structural_node_ids=frozenset({node_id}),
+        coalesce_name_by_node_id={},
+        coalesce_on_success_map={},
+        sink_names=frozenset(),
+    )
+
+    item = WorkItemFactory(navigator).create(
+        token=make_token_info(data={"value": 1}),
+        current_node_id=node_id,
+        collector_name=CollectorName("stitch"),
+    )
+
+    assert item.collector_name == CollectorName("stitch")
+    assert item.coalesce_name is None
+    assert item.row_union_name is None
 
 
 class TestResolveMergedBranchBarrier:

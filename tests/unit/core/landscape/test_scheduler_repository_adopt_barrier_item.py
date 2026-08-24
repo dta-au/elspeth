@@ -175,6 +175,61 @@ def _seed_blocked_barrier_hold(db: LandscapeDB, *, sequence: int, barrier_key: s
     return token_id, claimed.work_item_id, blocked_at
 
 
+def _seed_blocked_collector_hold(db: LandscapeDB, *, sequence: int, collector_name: str) -> tuple[str, str, datetime]:
+    """READY → LEASED → BLOCKED collector hold; returns (token_id, work_item_id, blocked_at).
+
+    Seeds ``collector_name`` at the READY enqueue via ``repo.queue`` directly
+    (``SchedulerQueueRepository``, WS4 Task 6's lane) rather than
+    ``TokenSchedulerRepository.enqueue_ready`` (the compatibility facade):
+    the facade's own passthrough was not extended to forward
+    ``collector_name`` in this fix round — it is a WS3-owned file under the
+    same shared-checkout deconfliction as barrier.py/dispositions.py, out of
+    this task's lane. ``mark_blocked`` (used below via the facade normally)
+    only transitions status/queue_key/barrier_key/lease fields, so it never
+    touches ``collector_name`` — the value seeded at enqueue time survives
+    the block transition unchanged.
+    """
+    repo = TokenSchedulerRepository(db.engine)
+    token_id = f"token-collector-{sequence}"
+    row_id = f"row-collector-{sequence}"
+    with db.engine.begin() as conn:
+        conn.execute(
+            insert(rows_table).values(
+                row_id=row_id,
+                run_id=RUN_ID,
+                source_node_id=SOURCE_NODE_ID,
+                row_index=sequence,
+                source_row_index=sequence,
+                ingest_sequence=sequence,
+                source_data_hash=f"hash-{row_id}",
+                created_at=NOW,
+            )
+        )
+        conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=RUN_ID, created_at=NOW))
+    repo.queue.enqueue_ready(
+        run_id=RUN_ID,
+        token_id=token_id,
+        row_id=row_id,
+        node_id=NODE_ID,
+        step_index=1,
+        ingest_sequence=sequence,
+        row_payload_json=_payload_json(),
+        available_at=NOW,
+        collector_name=collector_name,
+    )
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60, now=NOW)
+    assert claimed is not None and claimed.token_id == token_id
+    blocked_at = NOW + timedelta(seconds=2)
+    repo.mark_blocked(
+        work_item_id=claimed.work_item_id,
+        queue_key=None,
+        barrier_key=f"collector:{collector_name}:g-1",
+        now=blocked_at,
+        expected_lease_owner=WORKER,
+    )
+    return token_id, claimed.work_item_id, blocked_at
+
+
 def _work_item(db: LandscapeDB, token_id: str) -> dict[str, object]:
     with db.engine.connect() as conn:
         row = conn.execute(select(token_work_items_table).where(token_work_items_table.c.token_id == token_id)).mappings().one()
@@ -316,6 +371,50 @@ class TestAdoption:
         assert _work_item(db, token_id)["barrier_adopted_epoch"] == token.leader_epoch
         assert _batch_members(db) == []
         assert _outcomes(db, token_id) == []
+
+    def test_adopt_blocked_collector_item_is_cas_fenced(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """Collector arrivals ride the SAME barrier_adopted_epoch CAS as coalesce
+        (spec §5 decision 10: duplicate same-token arrival via lease-expiry
+        redelivery is a CAS-fenced idempotent skip). adopt_blocked_barrier_item
+        is generic over barrier_key's shape (barrier.py:908-990 has no
+        collector-specific branch) — the compound "collector:<name>:<group_id>"
+        key is just another string to the CAS UPDATE predicate."""
+        token_id, work_item_id, _blocked_at = _seed_blocked_collector_hold(db, sequence=0, collector_name="stitch")
+
+        repo = TokenSchedulerRepository(db.engine)
+        adopt_kwargs = {
+            "run_id": RUN_ID,
+            "work_item_id": work_item_id,
+            "token_id": token_id,
+            "barrier_key": "collector:stitch:g-1",
+            "membership": None,
+            "buffered_outcome": None,
+            "now": ADOPT_NOW,
+            "coordination_token": token,
+        }
+        first = repo.adopt_blocked_barrier_item(**adopt_kwargs)
+        assert first.adopted is True
+        assert first.outcome_id is None
+        assert _work_item(db, token_id)["barrier_adopted_epoch"] == token.leader_epoch
+
+        second = repo.adopt_blocked_barrier_item(**adopt_kwargs)
+        assert second.adopted is False  # idempotent skip — the double-accept guard
+        assert _batch_members(db) == []
+        assert _outcomes(db, token_id) == []
+
+    def test_blocked_collector_item_counts_as_blocked_barrier_work(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """leader_drain.py's EOF fixpoint gate: collector-buffered members keep
+        the drain loop alive via list_blocked_barrier_items, which is
+        non-filtered by barrier_key shape by design (barrier.py:1071). This is
+        the journal-row half of the ratified always-journal pin (canon item
+        11, executor half in test_collector_executor.py): every collector
+        arrival is a durable BLOCKED row, and it carries collector_name."""
+        _token_id, _work_item_id, _blocked_at = _seed_blocked_collector_hold(db, sequence=0, collector_name="stitch")
+
+        repo = TokenSchedulerRepository(db.engine)
+        items = repo.list_blocked_barrier_items(run_id=RUN_ID)
+        assert [item.collector_name for item in items] == ["stitch"]
+        assert [item.barrier_key for item in items] == ["collector:stitch:g-1"]
 
 
 class TestAdoptionRefusals:

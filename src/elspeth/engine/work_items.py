@@ -8,7 +8,7 @@ from typing import Protocol
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
+from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
 
 
 class WorkItemNavigation(Protocol):
@@ -28,17 +28,31 @@ class WorkItem:
     """Item in the work queue for DAG processing.
 
     TRAP — do not express group/scope bindings as WorkItem fields. The
-    coalesce_*/row_union_* pairs below are the CURSOR ADDRESS of the barrier
-    this item is currently travelling to, not a lineage membership: group
-    membership rides TokenInfo (fork/expand lineage), and the group→closer
-    binding is a build-time property of the graph (the barrier-scopes spec's
-    binding registry, spec §3). The mutual-exclusion check in __post_init__
-    therefore constrains only the cursor — one item cannot be blocked at two
-    barriers — it does NOT mean a token belongs to at most one group: a token
-    can be a fork branch AND an expand child at once. A new barrier kind
-    (e.g. the collector) gets a cursor pair here only if work items actually
-    block at it; its binding lives in the builder registry, never on this
-    dataclass.
+    coalesce_*/row_union_*/collector_* pairs below are the CURSOR ADDRESS of
+    the barrier this item is currently travelling to, not a lineage
+    membership: group membership rides TokenInfo (fork/expand lineage), and
+    the group→closer binding is a build-time property of the graph (the
+    barrier-scopes spec's binding registry, spec §3). The mutual-exclusion
+    check in __post_init__ therefore constrains only the cursor — one item
+    cannot be blocked at two barriers — it does NOT mean a token belongs to
+    at most one group: a token can be a fork branch AND an expand child at
+    once. A new barrier kind gets a cursor pair here only if work items
+    actually block at it; its binding lives in the builder registry, never
+    on this dataclass. WS4 Task 6: collector_name earns a place here because a
+    collector member IS such a case — an EXPAND member released from an
+    enclosing barrier still carries a bound collector destination forward
+    through BarrierEmission the same way a released fork branch carries a
+    bound coalesce/row_union destination (dispositions.py's
+    _insert_ready_emission_on projects BarrierEmission.collector_name onto
+    the durable row exactly like row_union_name). Unlike coalesce/row_union,
+    collector carries NO node-id companion and no WorkItemNavigation
+    resolver: adding one would extend the WorkItemNavigation Protocol, and
+    its sole production implementer (processor.py's DAGNavigator, WS3-owned,
+    outside this task's lane) does not yet provide it — confirmed by a
+    whole-tree mypy run before landing this shape. barrier_key's compound
+    "collector:<name>:<group_id>" address is name-based, not node-id-based,
+    so the bare name is sufficient until the WS3+WS4 integration item wires a
+    resolver and this comment can be revisited.
     """
 
     token: TokenInfo
@@ -47,6 +61,7 @@ class WorkItem:
     coalesce_name: CoalesceName | None = None
     row_union_node_id: NodeID | None = None
     row_union_name: RowUnionName | None = None
+    collector_name: CollectorName | None = None
     on_success_sink: str | None = None
     join_group_id: str | None = None
 
@@ -65,10 +80,13 @@ class WorkItem:
                 f"WorkItem row_union fields must be both set or both None: "
                 f"row_union_node_id={self.row_union_node_id}, row_union_name={self.row_union_name}"
             )
-        if has_name and has_union_name:
+        has_collector_name = self.collector_name is not None
+        bound_barrier_count = sum((has_name, has_union_name, has_collector_name))
+        if bound_barrier_count > 1:
             raise OrchestrationInvariantError(
-                f"WorkItem cannot target both a coalesce and a row_union barrier: "
-                f"coalesce_name={self.coalesce_name}, row_union_name={self.row_union_name}"
+                f"WorkItem cannot target more than one barrier kind at once: "
+                f"coalesce_name={self.coalesce_name}, row_union_name={self.row_union_name}, "
+                f"collector_name={self.collector_name}"
             )
 
 
@@ -150,14 +168,15 @@ class WorkItemFactory:
         coalesce_name: CoalesceName | None = None,
         coalesce_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
+        collector_name: CollectorName | None = None,
         on_success_sink: str | None = None,
         join_group_id: str | None = None,
     ) -> WorkItem:
-        """Create a cursor with validated coalesce or resolved row-union metadata.
+        """Create a cursor with validated coalesce or resolved row-union/collector metadata.
 
         A single supplied coalesce identity is resolved in the other direction;
         when both are supplied, they must describe the same barrier. Row-union
-        names are always resolved to their structural node ids.
+        and collector names are always resolved to their structural node ids.
         """
         resolved_coalesce_node_id = coalesce_node_id
         resolved_coalesce_name = coalesce_name
@@ -184,6 +203,7 @@ class WorkItemFactory:
             coalesce_name=resolved_coalesce_name,
             row_union_node_id=row_union_node_id,
             row_union_name=row_union_name,
+            collector_name=collector_name,
             on_success_sink=on_success_sink,
             join_group_id=join_group_id,
         )
