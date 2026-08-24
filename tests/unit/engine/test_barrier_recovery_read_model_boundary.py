@@ -18,6 +18,7 @@ RESTORE_NODE_STATE_READ_METHODS = {
     "get_settled_member_token_ids",  # WS4 T7: settled-token twin of has_completed_group_for_node (META-20b)
     "resolve_group_collector_node",  # WS4 T7: durable node-resolution family anchor (META-22)
     "has_group_loss",  # WS4 T12: renamed from has_branch_loss_for_group -- queries group_losses directly by group_id
+    "get_group_member_losses",  # WS4 fix round 2: full-ledger (adopted included) rebuild of collector pending.lost at restore
     "has_completed_group_for_node",  # WS4 T2: group-keyed completed point lookup
     "has_released_group_for_node",  # WS4 T2: group-keyed released point lookup
 }

@@ -566,8 +566,10 @@ class CollectorExecutor:
         fresh-arrival guards.
 
         No scalars parameter: arrived members are journal BLOCKED rows,
-        losses replay through WS3's intake (full-table on takeover, spec
-        §6.2), the roster is ``group_records``, and the settled-token
+        losses are rebuilt here from the FULL ``group_losses`` ledger
+        (adopted included — the journal-first replay only sees unadopted
+        rows, so it covers losses recorded AFTER this restore, spec §6.2),
+        the roster is ``group_records``, and the settled-token
         memory is now reconstructed durably too (META-20b) — there is no
         underivable in-memory-only state EXCEPT ``arrival_time``/
         ``first_arrival`` (I-5/I-10), set below to restore-time monotonic
@@ -662,6 +664,25 @@ class CollectorExecutor:
                 pending.arrived[member.member_key] = _MemberEntry(
                     token=member.token, arrival_time=restore_now, state_id=member.state_id, ordinal=ordinal
                 )
+            # Fix round 2 (b): rebuild pending.lost from the FULL group_losses
+            # ledger, adopted losses INCLUDED. A loss the crashed leader
+            # already adopted is absent from list_unadopted_group_losses, so
+            # the journal-first replay can never re-stage it — this read is
+            # the only way it reaches the rebuilt roster. Cross-checked
+            # exactly as notify_member_lost checks a live loss.
+            losses = self._barrier_restore_reads.get_group_member_losses(run_id=self._run_id, closer_name=collector_name, group_id=group_id)
+            for member_key, reason in losses.items():
+                if member_key not in pending.roster:
+                    raise AuditIntegrityError(
+                        f"Ledger loss for member {member_key!r} of group {group_id!r} at collector "
+                        f"'{collector_name}' names a member outside the durable roster {sorted(pending.roster)!r}."
+                    )
+                if member_key in pending.arrived:
+                    raise OrchestrationInvariantError(
+                        f"Member {member_key!r} of group {group_id!r} at collector '{collector_name}' is both a "
+                        "journaled arrival and a ledger loss — a token cannot both arrive and be error-routed."
+                    )
+                pending.lost[member_key] = reason
             if self._roster_settled(pending):
                 # I-8 (complete-roster restore, journal-before-dispatch):
                 # park for the post-restore flush-trigger sweep — see the

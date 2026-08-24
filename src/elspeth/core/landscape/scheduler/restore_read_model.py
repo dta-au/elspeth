@@ -616,6 +616,28 @@ class BarrierRestoreReadModel:
         )
         return self._ops.execute_fetchone(query) is not None
 
+    def get_group_member_losses(self, *, run_id: str, closer_name: str, group_id: str) -> dict[str, str]:
+        """member_key -> reason for EVERY recorded loss of one bound group,
+        adopted or not (§E.4 takeover restore read, collector twin of
+        ``list_group_losses``).
+
+        WS4 fix-round 2 (b): a takeover executor rebuilds ``pending.lost``
+        from this at restore. It must read the FULL ledger — the
+        journal-first replay only ever sees ``list_unadopted_group_losses``,
+        and a loss the crashed leader already adopted is in neither the
+        unadopted queue nor the rebuilt executor's memory unless this read
+        supplies it. Append-only ledger, first durable record per member
+        wins (``record_group_loss`` is idempotent on the natural key), so
+        one reason per member_key.
+        """
+        query = select(group_losses_table.c.member_key, group_losses_table.c.reason).where(
+            group_losses_table.c.run_id == run_id,
+            group_losses_table.c.closer_name == closer_name,
+            group_losses_table.c.group_id == group_id,
+        )
+        rows = self._ops.execute_fetchall(query)
+        return {str(row.member_key): str(row.reason) for row in rows}
+
     def find_failed_unrouted_terminal_token_ids(self, run_id: str, token_ids: Sequence[str]) -> frozenset[str]:
         """Token ids holding terminal ``(FAILURE, UNROUTED)`` outcomes.
 

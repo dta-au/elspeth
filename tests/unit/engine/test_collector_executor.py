@@ -1042,6 +1042,91 @@ class TestRestore:
         assert fresh.accept(members[0], "stitch", ctx=env.ctx).held is True
         assert fresh.transform.seen_rows == [m.row_data.to_dict() for m in members]  # no second flush
 
+    def _record_ledger_loss(self, env: _CollectorEnv, *, group_id: str, member: TokenInfo, reason: str, adopted: bool) -> None:
+        with env.db.write_connection() as conn:
+            record_group_loss(
+                conn,
+                run_id=env.run_id,
+                spec=GroupLossSpec(
+                    closer_name="stitch", group_id=group_id, member_key=member.token_id, token_id=member.token_id, reason=reason
+                ),
+                recorded_by="crashed-leader",
+                now=datetime.now(UTC),
+            )
+            if adopted:
+                from sqlalchemy import update
+
+                from elspeth.core.landscape.schema import group_losses_table
+
+                conn.execute(
+                    update(group_losses_table)
+                    .where(group_losses_table.c.run_id == env.run_id)
+                    .where(group_losses_table.c.member_key == member.token_id)
+                    .values(adopted_epoch=1)
+                )
+
+    def test_restore_rebuilds_pending_lost_from_the_full_ledger_including_adopted_losses(self, collector_env: _CollectorEnv) -> None:
+        # WS4 fix round 2 (b), broadened: a loss the crashed leader already
+        # ADOPTED is absent from list_unadopted_group_losses, so the
+        # journal-first replay can never re-stage it — only a full-ledger
+        # rebuild at restore puts it back into the roster accounting.
+        env = collector_env
+        members, group_id = env.seed_group(count=3)
+        env.executor.accept(members[1], "stitch")
+        self._record_ledger_loss(env, group_id=group_id, member=members[0], reason="quarantined", adopted=True)
+        items = [env.blocked_item_for(members[1], collector_name="stitch")]
+        fresh = env.fresh_executor()
+        fresh.restore_from_journal(
+            items=items, state_ids=env.state_ids_for(items), attempt_offsets={members[1].token_id: 0}, resume_checkpoint_id="ckpt-1"
+        )
+        # (i) Mutant L-1 (rebuild reads only UNADOPTED losses): the adopted
+        # pre-crash loss must be in pending.lost after restore.
+        assert fresh._executor._pending[("stitch", group_id)].lost == {members[0].token_id: "quarantined"}
+        assert fresh.has_replayed_member_loss("stitch", group_id, members[0].token_id) is True
+        # An outstanding member keeps the roster open; the sweep has nothing.
+        assert fresh.flush_restored_complete_groups(ctx=env.ctx) == ()
+        # (ii) A loss recorded AFTER restore (what the replay actually sees)
+        # is re-notified exactly once in this session and settles the group.
+        assert fresh.has_replayed_member_loss("stitch", group_id, members[2].token_id) is False
+        outcome = fresh.notify_member_lost("stitch", group_id, members[2].token_id, "quarantined")
+        assert outcome is not None and outcome.held is False
+        assert outcome.failure_reason == "collector_missing_members"
+        assert [t.token_id for t in outcome.consumed_tokens] == [members[1].token_id]
+
+    def test_restore_parks_a_roster_completed_by_a_ledger_loss_for_the_flush_sweep(self, collector_env: _CollectorEnv) -> None:
+        # A roster complete only once the ledger loss is rebuilt: restore
+        # parks it and the sweep renders the require_all verdict through
+        # _close_group -> _fail_group, exactly as a live closing loss would.
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        env.executor.accept(members[1], "stitch")
+        self._record_ledger_loss(env, group_id=group_id, member=members[0], reason="quarantined", adopted=True)
+        items = [env.blocked_item_for(members[1], collector_name="stitch")]
+        fresh = env.fresh_executor()
+        fresh.restore_from_journal(
+            items=items, state_ids=env.state_ids_for(items), attempt_offsets={members[1].token_id: 0}, resume_checkpoint_id="ckpt-1"
+        )
+        outcomes = fresh.flush_restored_complete_groups(ctx=env.ctx)
+        assert len(outcomes) == 1
+        assert outcomes[0].failure_reason == "collector_missing_members"
+        assert fresh.transform.seen_rows == []  # require_all failure never invokes the plugin
+        assert fresh.buffered_member_count() == 0
+        assert env.open_hold_token_ids(node="stitch") == []
+
+    def test_restore_rejects_a_ledger_loss_for_a_journaled_arrival(self, collector_env: _CollectorEnv) -> None:
+        # The same arrived-and-lost invariant notify_member_lost enforces live.
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        self._record_ledger_loss(env, group_id=group_id, member=members[0], reason="quarantined", adopted=False)
+        items = [env.blocked_item_for(members[0], collector_name="stitch")]
+        fresh = env.fresh_executor()
+        with pytest.raises(OrchestrationInvariantError, match="both a journaled arrival and a ledger loss"):
+            fresh.restore_from_journal(
+                items=items, state_ids=env.state_ids_for(items), attempt_offsets={members[0].token_id: 0}, resume_checkpoint_id="ckpt-1"
+            )
+        assert fresh._executor._pending == {}  # validate-before-mutate
+
     def test_flush_sweep_refuses_a_parked_group_that_is_no_longer_roster_complete(self, collector_env: _CollectorEnv) -> None:
         # The sweep's guard is for genuinely inconsistent rosters only:
         # nothing between restore and the sweep may legitimately close or
