@@ -41,7 +41,7 @@ from elspeth.contracts.enums import BatchStatus, TerminalOutcome, TerminalPath, 
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.results import FailureInfo
-from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, TokenWorkItem
+from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, GroupLossSpec, TokenWorkItem
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
 from elspeth.core.landscape.scheduler_repository import GroupLoss, token_from_journal_item
 from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
@@ -217,6 +217,7 @@ class BarrierIntakeCoordinator:
         emit_token_completed: Callable[..., None],
         mark_coalesce_consumed_terminal: Callable[..., None],
         record_group_member_terminals: Callable[..., list[RowResult]],
+        take_pending_group_losses: Callable[[], tuple[GroupLossSpec, ...]],
         row_union_executor: RowUnionExecutor | None = None,
         row_union_node_ids: Mapping[RowUnionName, NodeID] | None = None,
         branch_to_row_union: Mapping[BranchName, RowUnionName] | None = None,
@@ -246,6 +247,7 @@ class BarrierIntakeCoordinator:
         self._emit_token_completed = emit_token_completed
         self._mark_coalesce_consumed_terminal = mark_coalesce_consumed_terminal
         self._record_group_member_terminals = record_group_member_terminals
+        self._take_pending_group_losses = take_pending_group_losses
         self._row_union_executor = row_union_executor
         self._row_union_node_ids: Mapping[RowUnionName, NodeID] = row_union_node_ids or {}
         self._branch_to_row_union: Mapping[BranchName, RowUnionName] = branch_to_row_union or {}
@@ -456,6 +458,23 @@ class BarrierIntakeCoordinator:
             # (Task 6, spec §6.1) — terminalized below through the
             # settlement channel, which also walks the late token's
             # REMAINING lineage for an enclosing bound frame (escalation).
+            #
+            # Fix round 3 (Ruling 43): the settlement channel runs BEFORE
+            # the durable scheduler release (mirroring Ruling 39's sweep-path
+            # ordering) so any escalated loss it stages is drained and
+            # threaded into THIS SAME mark_blocked_barrier_terminal call —
+            # the existing group_losses channel WS3 Tasks 1-4 already
+            # threaded through complete_barrier, not a new write path. This
+            # intake pass is out-of-claim (no take_claim_group_losses call
+            # ever runs here), so without this the staged spec would be
+            # orphaned exactly like the sweep path was before Ruling 39.
+            late_child_items: list[WorkItem] = []
+            late_cascaded_results = self._record_group_member_terminals(
+                tuple(outcome.consumed_tokens),
+                failure_reason=outcome.failure_reason or "late_arrival_after_merge",
+                child_items=late_child_items,
+            )
+            late_group_losses = self._take_pending_group_losses()
             released = self._scheduler.mark_blocked_barrier_terminal(
                 run_id=self._run_id,
                 barrier_key=str(coalesce_name),
@@ -468,18 +487,13 @@ class BarrierIntakeCoordinator:
                     "released_by": self._scheduler_lease_owner,
                     "scope_row_id": row.row_id,
                 },
+                group_losses=late_group_losses,
             )
             if released != 1:
                 raise AuditIntegrityError(
                     f"Late-arrival release for token {token.token_id!r} at coalesce {coalesce_name!r} "
                     f"(run {self._run_id!r}) terminalized {released} rows; expected exactly one."
                 )
-            late_child_items: list[WorkItem] = []
-            late_cascaded_results = self._record_group_member_terminals(
-                tuple(outcome.consumed_tokens),
-                failure_reason=outcome.failure_reason or "late_arrival_after_merge",
-                child_items=late_child_items,
-            )
             self._emit_token_completed(token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
             return BarrierIntakeDisposition(
                 kind=BarrierIntakeDispositionKind.TERMINAL,
@@ -500,24 +514,29 @@ class BarrierIntakeCoordinator:
             return self._fire_coalesce_merge(coalesce_name, outcome, scope_row_id=row.row_id)
 
         if outcome.failure_reason:
-            # Group failure completed by this arrival: every consumed branch
-            # (this one included) holds a BLOCKED row — release them all.
-            self._mark_coalesce_consumed_terminal(
-                coalesce_name=coalesce_name,
-                consumed_tokens=tuple(outcome.consumed_tokens),
-            )
             error_msg = outcome.failure_reason
             # The executor no longer writes any consumed branch's terminal
             # outcome itself (Task 6, spec §6.1) — every consumed token
             # (the arriving token included; it is a member of
             # outcome.consumed_tokens too) is terminalized here, through the
             # settlement channel, which also walks each one's REMAINING
-            # lineage for an enclosing bound frame (escalation).
+            # lineage for an enclosing bound frame (escalation). Fix round 3
+            # (Ruling 43): runs BEFORE the durable "release them all" below
+            # so any escalated loss it stages is drained and threaded into
+            # THAT SAME call — see the late-arrival arm's comment above for
+            # the full rationale (this intake pass is out-of-claim too).
             cascade_child_items: list[WorkItem] = []
             cascaded_results = self._record_group_member_terminals(
                 tuple(outcome.consumed_tokens),
                 failure_reason=error_msg,
                 child_items=cascade_child_items,
+            )
+            # Group failure completed by this arrival: every consumed branch
+            # (this one included) holds a BLOCKED row — release them all.
+            self._mark_coalesce_consumed_terminal(
+                coalesce_name=coalesce_name,
+                consumed_tokens=tuple(outcome.consumed_tokens),
+                group_losses=self._take_pending_group_losses(),
             )
             # Emit TokenCompleted telemetry AFTER Landscape recording. Only
             # the arriving token surfaces a RowResult of its own (the held
@@ -855,10 +874,6 @@ class BarrierIntakeCoordinator:
                 dispositions.append(self._fire_coalesce_merge(coalesce_name, outcome, scope_row_id=row_id))
                 continue
             if outcome.failure_reason:
-                self._mark_coalesce_consumed_terminal(
-                    coalesce_name=coalesce_name,
-                    consumed_tokens=tuple(outcome.consumed_tokens),
-                )
                 # Replayed must-fail (§6.2: a must-fail group fails within one
                 # drain iteration of the loss becoming visible): mirror the
                 # group-loss notification failure arm — RowResults for the
@@ -866,12 +881,20 @@ class BarrierIntakeCoordinator:
                 # writes their terminal outcomes itself (Task 6, spec §6.1);
                 # terminalized here through the settlement channel, which
                 # also walks each one's REMAINING lineage for an enclosing
-                # bound frame (escalation).
+                # bound frame (escalation). Fix round 3 (Ruling 43): runs
+                # BEFORE the durable "release them all" below so any
+                # escalated loss it stages is drained and threaded into
+                # THAT SAME call — this replay loop is out-of-claim too.
                 replay_child_items: list[WorkItem] = []
                 cascaded_replay_results = self._record_group_member_terminals(
                     tuple(outcome.consumed_tokens),
                     failure_reason=outcome.failure_reason,
                     child_items=replay_child_items,
+                )
+                self._mark_coalesce_consumed_terminal(
+                    coalesce_name=coalesce_name,
+                    consumed_tokens=tuple(outcome.consumed_tokens),
+                    group_losses=self._take_pending_group_losses(),
                 )
                 coalesce_failure_results: list[RowResult] = []
                 for consumed_token in outcome.consumed_tokens:

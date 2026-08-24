@@ -37,7 +37,7 @@ from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome,
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import RowResult
-from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
 from elspeth.core.config import RowUnionSettings
@@ -221,6 +221,9 @@ def _make_coordinator(
     flush_calls: list[tuple[NodeID, TriggerType]] | None = None,
     fire_calls: list[dict[str, object]] | None = None,
     record_group_member_terminals_calls: list[dict[str, object]] | None = None,
+    mark_coalesce_consumed_terminal_calls: list[dict[str, object]] | None = None,
+    take_pending_group_losses_result: tuple[GroupLossSpec, ...] = (),
+    take_pending_group_losses_calls: list[int] | None = None,
 ) -> BarrierIntakeCoordinator:
     def _flush_batch(node_id: NodeID, transform: object, ctx: object, trigger_type: TriggerType):
         if flush_calls is not None:
@@ -254,6 +257,22 @@ def _make_coordinator(
                 }
             )
         return []
+
+    def _mark_coalesce_consumed_terminal(
+        *,
+        coalesce_name: CoalesceName,
+        consumed_tokens: tuple[TokenInfo, ...],
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> None:
+        if mark_coalesce_consumed_terminal_calls is not None:
+            mark_coalesce_consumed_terminal_calls.append(
+                {"coalesce_name": coalesce_name, "consumed_tokens": consumed_tokens, "group_losses": group_losses}
+            )
+
+    def _take_pending_group_losses() -> tuple[GroupLossSpec, ...]:
+        if take_pending_group_losses_calls is not None:
+            take_pending_group_losses_calls.append(1)
+        return take_pending_group_losses_result
 
     def _terminal_coalesce_row_result(token: TokenInfo, coalesce_name: CoalesceName, *, join_group_id: str, context: str) -> RowResult:
         return RowResult(
@@ -295,8 +314,9 @@ def _make_coordinator(
         complete_coalesce_fire=_complete_coalesce_fire,
         terminal_coalesce_row_result=_terminal_coalesce_row_result,
         emit_token_completed=lambda token, *, outcome, path, sink_name=None: None,
-        mark_coalesce_consumed_terminal=lambda *, coalesce_name, consumed_tokens: None,
+        mark_coalesce_consumed_terminal=_mark_coalesce_consumed_terminal,
         record_group_member_terminals=_record_group_member_terminals,
+        take_pending_group_losses=_take_pending_group_losses,
         row_union_executor=row_union_executor,
         row_union_node_ids=({RowUnionName("variant_union"): NodeID("row_union::variant_union")} if row_union_executor is not None else {}),
         complete_row_union_fire=lambda **kwargs: None,

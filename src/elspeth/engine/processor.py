@@ -766,6 +766,7 @@ class RowProcessor:
             emit_token_completed=self._emit_token_completed,
             mark_coalesce_consumed_terminal=self._mark_coalesce_consumed_scheduler_work_terminal,
             record_group_member_terminals=self.record_group_member_terminals,
+            take_pending_group_losses=self.take_pending_group_losses,
             row_union_executor=self._row_union_executor,
             row_union_node_ids=self._row_union_node_ids,
             branch_to_row_union=self._branch_to_row_union,
@@ -3871,6 +3872,7 @@ class RowProcessor:
         *,
         coalesce_name: CoalesceName,
         consumed_tokens: tuple[TokenInfo, ...],
+        group_losses: tuple[GroupLossSpec, ...] = (),
     ) -> None:
         """Terminalize scheduler rows for coalesce branches consumed by a failure.
 
@@ -3884,10 +3886,17 @@ class RowProcessor:
         arrival whose intake-time accept produced this failure — holds a
         BLOCKED journal row, so the whole consumed set is released here. (The
         historical LEASED-arrival exclusion died with the in-claim arms.)
+
+        ``group_losses`` (fix round 3, Ruling 43): the caller's own drained
+        `take_pending_group_losses()` — an escalation staged from this
+        out-of-claim intake pass, threaded through to the existing
+        `mark_blocked_barrier_terminal`/`complete_barrier`/`record_group_loss`
+        channel so it commits durably in the SAME transaction as this
+        release, exactly like Ruling 39 did for the sweep path.
         """
         blocked_token_ids = tuple(token.token_id for token in consumed_tokens)
         if blocked_token_ids:
-            self.mark_blocked_barrier_terminal(str(coalesce_name), blocked_token_ids)
+            self.mark_blocked_barrier_terminal(str(coalesce_name), blocked_token_ids, group_losses=group_losses)
 
     def _mark_buffered_scheduler_work_terminal(
         self,

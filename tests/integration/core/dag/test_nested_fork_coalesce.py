@@ -403,3 +403,121 @@ def test_nested_region_inside_unbound_outer_branch_completes(tmp_path: Path) -> 
     assert len(inner_rows) == 3
     assert len(b_rows) == 3
     assert {row["inner_a1"]["id"] for row in inner_rows} == {1, 2, 3}
+
+
+# ===== C1 fix round 3: live branch-loss reproduction, committed pin (Ruling 43) =====
+#
+# WS3 Task 6 fix round 3: a full YAML/Orchestrator run driving a LIVE
+# branch-loss notification (not a timeout) through a 3-branch inner fork
+# under require_all. This is the THIRD time this reproduction has been
+# written:
+#   - Fix round 1 hit the original per-consumed-token duplicate-stage crash
+#     (Ruling 38 / C1) via THIS exact live path, but the fix was verified
+#     against a controlled unit-level timeout reproduction instead, because
+#     this shape ALSO hit a second, cross-call duplicate the round-1 fix
+#     didn't cover.
+#   - Fix round 2 (Ruling 42) fixed the cross-call duplicate's IDENTITY (the
+#     escalated loss now carries the lost member's own token_id, so both
+#     independent observers stage an identical, idempotent triple) — this
+#     test then completed WITHOUT crashing, but failed a correctness
+#     assertion: the escalated loss was staged and deduplicated correctly
+#     but never became durable, because the barrier-intake pass that stages
+#     it (via barrier_coordination.py's late-arrival arm) is out-of-claim —
+#     no take_claim_group_losses call ever drains it.
+#   - Fix round 3 (Ruling 43) threads the drained stage into the SAME
+#     mark_blocked_barrier_terminal/complete_barrier/record_group_loss
+#     channel the intake pass's late-arrival arm already uses to commit its
+#     own release — no new write path, mirroring Ruling 39's sweep-path fix.
+_THREE_BRANCH_INNER_LOSS_SETTINGS_YAML_TEMPLATE = """
+sources:
+  primary:
+    plugin: csv
+    on_success: outer_fork_input
+    options:
+      path: {input_path}
+      on_validation_failure: discard
+      schema: {{mode: fixed, fields: ["id: int", "value: int"]}}
+concurrency:
+  max_workers: 1
+gates:
+  - name: outer_fork
+    input: outer_fork_input
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [outer_a, outer_b]
+  - name: inner_fork
+    input: outer_a
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [inner_a1, inner_a2, inner_a3]
+transforms:
+  - name: lose_a3
+    plugin: dag_corpus_branch_loss
+    input: inner_a3
+    on_success: in_a3
+    on_error: discard
+    options:
+      schema: {{mode: observed}}
+coalesce:
+  - name: merge_inner
+    branches: {{inner_a1: inner_a1, inner_a2: inner_a2, inner_a3: in_a3}}
+    policy: require_all
+    merge: nested
+  - name: merge_outer
+    branches: {{outer_a: merge_inner, outer_b: outer_b}}
+    policy: require_all
+    merge: nested
+    on_success: output
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {output_path}
+      format: jsonl
+      schema: {{mode: observed}}
+"""
+
+
+def test_three_branch_inner_loss_escalates_durably_without_cross_call_duplicate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A require_all inner group losing its LAST branch via a LIVE branch-loss
+    notification (not a timeout) must not crash, and its escalated loss to
+    the enclosing coalesce must become durable — deduplicated across the
+    independent inner siblings that each discover it.
+
+    Regression, three rounds (WS3 Task 6, Rulings 38/42/43): round 1 fixed
+    the within-call duplicate-stage crash; round 2 fixed the cross-call
+    duplicate's identity (so it deduplicates instead of crashing); round 3
+    fixed the drain (so the deduplicated loss is durably recorded instead
+    of silently orphaned by the out-of-claim intake pass that stages it).
+    """
+    from sqlalchemy import select
+
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.landscape.schema import group_losses_table
+    from tests.fixtures.dag_scenario_corpus.plugins import install_corpus_plugin_manager
+
+    install_corpus_plugin_manager(monkeypatch)
+
+    single_row_csv = "id,value\n1,10\n"
+    _graph, result_data, output_rows = _build_and_run(_THREE_BRANCH_INNER_LOSS_SETTINGS_YAML_TEMPLATE, tmp_path, input_csv=single_row_csv)
+
+    # The run completes (with failures) instead of crashing.
+    assert result_data["status"] == "completed_with_failures"
+    assert result_data["rows_processed"] == 1
+    assert result_data["rows_succeeded"] == 0
+    assert output_rows == []
+
+    db_path = tmp_path / "audit.db"
+    db = LandscapeDB(f"sqlite:///{db_path}")
+    try:
+        with db.connection() as conn:
+            loss_rows = [dict(row) for row in conn.execute(select(group_losses_table)).mappings()]
+    finally:
+        db.close()
+
+    # Exactly ONE durable group-loss row for the escalated outer member —
+    # the walk resolves it from BOTH consumed inner siblings but must
+    # settle it once (Ruling 38 dedup + Ruling 42 identity).
+    outer_losses = [row for row in loss_rows if row["closer_name"] == "merge_outer" and row["member_key"] == "outer_a"]
+    assert len(outer_losses) == 1, f"expected exactly one escalated outer_a loss, got {outer_losses!r}"
