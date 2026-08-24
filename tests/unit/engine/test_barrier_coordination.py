@@ -220,6 +220,7 @@ def _make_coordinator(
     live_holds: dict[str, _LiveBarrierHold] | None = None,
     flush_calls: list[tuple[NodeID, TriggerType]] | None = None,
     fire_calls: list[dict[str, object]] | None = None,
+    record_group_member_terminals_calls: list[dict[str, object]] | None = None,
 ) -> BarrierIntakeCoordinator:
     def _flush_batch(node_id: NodeID, transform: object, ctx: object, trigger_type: TriggerType):
         if flush_calls is not None:
@@ -237,6 +238,22 @@ def _make_coordinator(
     def _complete_coalesce_fire(**kwargs: object) -> None:
         if fire_calls is not None:
             fire_calls.append(dict(kwargs))
+
+    def _record_group_member_terminals(
+        consumed_tokens: tuple[TokenInfo, ...],
+        *,
+        failure_reason: str,
+        child_items: list[WorkItem],
+    ) -> list[RowResult]:
+        if record_group_member_terminals_calls is not None:
+            record_group_member_terminals_calls.append(
+                {
+                    "consumed_tokens": consumed_tokens,
+                    "failure_reason": failure_reason,
+                    "child_items": child_items,
+                }
+            )
+        return []
 
     def _terminal_coalesce_row_result(token: TokenInfo, coalesce_name: CoalesceName, *, join_group_id: str, context: str) -> RowResult:
         return RowResult(
@@ -279,6 +296,7 @@ def _make_coordinator(
         terminal_coalesce_row_result=_terminal_coalesce_row_result,
         emit_token_completed=lambda token, *, outcome, path, sink_name=None: None,
         mark_coalesce_consumed_terminal=lambda *, coalesce_name, consumed_tokens: None,
+        record_group_member_terminals=_record_group_member_terminals,
         row_union_executor=row_union_executor,
         row_union_node_ids=({RowUnionName("variant_union"): NodeID("row_union::variant_union")} if row_union_executor is not None else {}),
         complete_row_union_fire=lambda **kwargs: None,

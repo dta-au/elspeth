@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.results import RowResult
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
     from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome
+    from elspeth.engine.work_items import WorkItem
 
 
 def _require_sink_name(result: RowResult) -> str:
@@ -123,6 +124,44 @@ def _mark_barrier_tokens_terminal(
             f"Coalesce barrier {barrier_key!r} live consumed {expected_count} token(s), "
             f"but durable scheduler terminalized {terminalized_count}."
         )
+
+
+def _terminalize_swept_coalesce_failure(
+    processor: CoalesceCompletionPort,
+    *,
+    barrier_key: str,
+    consumed_tokens: tuple[TokenInfo, ...],
+    failure_reason: str,
+) -> None:
+    """Record a timeout/flush sweep's consumed tokens' terminals (spec §6.1,
+    Task 6): the coalesce executor no longer writes them itself — reconcile
+    both the Landscape terminal AND the durable scheduler barrier row here.
+
+    The settlement channel's remaining-path walk can, in principle, escalate
+    a loss to an enclosing bound frame — but no nested bound-region topology
+    (fork-in-fork / expand-in-fork) is buildable today, so no currently
+    reachable run can produce a non-empty cascade from a sweep failure. Fail
+    loudly instead of silently mishandling one if that ever changes: this
+    sweep layer has no drain seam to continue a cascaded child item, and
+    folding a cascaded RowResult into this function's caller's hand-rolled
+    counters would double-count against TERMINAL_PAIR_COUNTER_EFFECTS.
+    """
+    if not consumed_tokens:
+        return
+    child_items: list[WorkItem] = []
+    cascaded = processor.record_group_member_terminals(
+        consumed_tokens,
+        failure_reason=failure_reason,
+        child_items=child_items,
+    )
+    if cascaded or child_items:
+        raise OrchestrationInvariantError(
+            f"Coalesce barrier {barrier_key!r} sweep failure escalated to an enclosing bound "
+            f"frame ({len(cascaded)} cascaded result(s), {len(child_items)} child item(s)) — no "
+            "nested bound-region topology is buildable today, and this sweep layer has no seam "
+            "to drain a cascaded continuation. Investigate before extending nesting support."
+        )
+    _mark_barrier_tokens_terminal(processor, barrier_key=barrier_key, consumed_tokens=consumed_tokens)
 
 
 def reconcile_sink_write_diversions(
@@ -397,12 +436,16 @@ def handle_coalesce_timeouts(
                 )
             else:
                 consumed_tokens = tuple(outcome.consumed_tokens)
-                if consumed_tokens:
-                    _mark_barrier_tokens_terminal(
-                        processor,
-                        barrier_key=str(coalesce_name),
-                        consumed_tokens=consumed_tokens,
+                if outcome.failure_reason is None:
+                    raise OrchestrationInvariantError(
+                        f"CoalesceOutcome has_merged=False but failure_reason is None. Coalesce: {coalesce_name!r}."
                     )
+                _terminalize_swept_coalesce_failure(
+                    processor,
+                    barrier_key=str(coalesce_name),
+                    consumed_tokens=consumed_tokens,
+                    failure_reason=outcome.failure_reason,
+                )
                 counters.rows_coalesce_failed += 1
                 counters.rows_failed += len(consumed_tokens)
                 _emit_failed_coalesce_telemetry(ctx, consumed_tokens)
@@ -515,10 +558,15 @@ def flush_coalesce_pending(
                         "Failed CoalesceOutcome from flush_pending() has consumed tokens but no coalesce_name; "
                         "cannot reconcile durable scheduler barrier rows."
                     )
-                _mark_barrier_tokens_terminal(
+                if outcome.failure_reason is None:
+                    raise OrchestrationInvariantError(
+                        f"CoalesceOutcome has_merged=False but failure_reason is None. Coalesce: {outcome.coalesce_name!r}."
+                    )
+                _terminalize_swept_coalesce_failure(
                     processor,
                     barrier_key=str(outcome.coalesce_name),
                     consumed_tokens=tuple(outcome.consumed_tokens),
+                    failure_reason=outcome.failure_reason,
                 )
             counters.rows_coalesce_failed += 1
             counters.rows_failed += len(outcome.consumed_tokens)

@@ -61,6 +61,12 @@ class CoalesceOutcome:
         coalesce_name: Name of the coalesce point that produced this outcome
         outcomes_recorded: True if terminal outcomes were already recorded by executor.
             When True, caller MUST NOT record outcomes again (Bug 9z8 fix).
+            WS3 Task 6 (spec §6.1) retired every failure arm that used to
+            set this True on a returned outcome — the executor no longer
+            records a consumed sibling's terminal itself and this is always
+            False for a failure_reason outcome today; the field stays for
+            the contract (a future returning arm can still set it) rather
+            than being torn out with its one remaining reader gone.
         late_arrival: True when this failure outcome is the late-arrival arm —
             the token arrived after its group already merged/failed (ADR-030
             §E.3a): the journal-first intake releases the token's BLOCKED row
@@ -823,7 +829,6 @@ class CoalesceExecutor:
             # Late arrival after merge/failure already happened
             # Record failure audit trail for this late token
             failure_reason = "late_arrival_after_merge"
-            error_hash = compute_error_hash(failure_reason)
             state = self._execution.begin_node_state(
                 token_id=token.token_id,
                 node_id=node_id,
@@ -845,19 +850,12 @@ class CoalesceExecutor:
                 error=error,
                 duration_ms=0,
             )
-            if self._data_flow is None:
-                raise OrchestrationInvariantError(
-                    "CoalesceExecutor.data_flow is None but token outcome recording requires DataFlowRepository"
-                )
-            # DIRECT terminal write — bypasses RowProcessor._notify_barrier_of_lost_branch:
-            # a held sibling fails here with NO branch loss staged for any enclosing
-            # barrier. Retired into the WS3 settle-member seam (barrier-scopes spec §6.1 item 1).
-            self._data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
-                outcome=TerminalOutcome.FAILURE,
-                path=TerminalPath.UNROUTED,
-                error_hash=error_hash,
-            )
+            # Terminal write retired (WS3 Task 6, spec §6.1 item 1): this
+            # arm no longer calls record_token_outcome directly. The caller
+            # terminalizes the late token through the settlement channel
+            # (RowProcessor._record_group_member_terminals), which also
+            # walks its REMAINING lineage for an enclosing bound frame —
+            # outcomes_recorded=False below is what tells the caller to do so.
 
             # Return failure outcome
             return CoalesceOutcome(
@@ -869,7 +867,7 @@ class CoalesceExecutor:
                     reason="Siblings already merged/failed, this token arrived too late",
                 ),
                 coalesce_name=coalesce_name,
-                outcomes_recorded=True,
+                outcomes_recorded=False,
                 late_arrival=True,
             )
 
@@ -1037,12 +1035,13 @@ class CoalesceExecutor:
                 the default CoalesceMetadata.for_failure() construction.
 
         Returns:
-            CoalesceOutcome with failure_reason set and outcomes_recorded=True
+            CoalesceOutcome with failure_reason set and outcomes_recorded=False
+            (Task 6, spec §6.1: the caller terminalizes consumed_tokens
+            through the settlement channel, not this method).
         """
         coalesce_name = key[0]
         pending = self._pending[key]
         consumed_tokens = tuple(e.token for e in pending.branches.values())
-        error_hash = compute_error_hash(failure_reason)
         now = self._clock.monotonic()
 
         # Complete pending node states with failure
@@ -1061,19 +1060,12 @@ class CoalesceExecutor:
                 error=error,
                 duration_ms=(now - entry.arrival_time) * 1000,
             )
-            if self._data_flow is None:
-                raise OrchestrationInvariantError(
-                    "CoalesceExecutor.data_flow is None but token outcome recording requires DataFlowRepository"
-                )
-            # DIRECT terminal write — bypasses RowProcessor._notify_barrier_of_lost_branch:
-            # a held sibling fails here with NO branch loss staged for any enclosing
-            # barrier. Retired into the WS3 settle-member seam (barrier-scopes spec §6.1 item 1).
-            self._data_flow.record_token_outcome(
-                ref=TokenRef(token_id=entry.token.token_id, run_id=self._run_id),
-                outcome=TerminalOutcome.FAILURE,
-                path=TerminalPath.UNROUTED,
-                error_hash=error_hash,
-            )
+            # Terminal write retired (WS3 Task 6, spec §6.1 item 1): this
+            # arm no longer calls record_token_outcome directly for the
+            # consumed branches. The caller terminalizes them through the
+            # settlement channel (RowProcessor._record_group_member_terminals),
+            # which also walks each one's REMAINING lineage for an
+            # enclosing bound frame.
 
         del self._pending[key]
         self._mark_completed(key)
@@ -1095,7 +1087,7 @@ class CoalesceExecutor:
             consumed_tokens=consumed_tokens,
             coalesce_metadata=metadata,
             coalesce_name=coalesce_name,
-            outcomes_recorded=True,
+            outcomes_recorded=False,
         )
 
     def _execute_merge(

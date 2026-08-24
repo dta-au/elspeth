@@ -8192,8 +8192,12 @@ class TestMaybeCoalesceToken:
         assert handled is True
         assert result is None
 
-    def test_coalesce_failure_with_outcomes_recorded_does_not_duplicate_recording(self) -> None:
-        """When executor already recorded FAILED outcome, the intake must not record again.
+    def test_coalesce_failure_always_records_through_settlement_channel(self) -> None:
+        """Task 6 (spec §6.1): the executor never records a consumed sibling's
+        terminal outcome itself anymore — the caller always does, through the
+        settlement channel, regardless of what outcomes_recorded says on the
+        returned outcome (a stale True from the executor no longer suppresses
+        it; there is structurally only one write site now).
 
         Slice 3 re-pin (ADR-030 §E.2): the accept-time failure surfaces from
         the journal-first intake (the arrival blocked first, then the
@@ -8235,7 +8239,8 @@ class TestMaybeCoalesceToken:
         assert child_items == []
         assert len(results) == 1
         _assert_outcome_pair(results[0], TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
-        record_outcome.assert_not_called()
+        record_outcome.assert_called_once()
+        assert record_outcome.call_args.kwargs["ref"].token_id == "token-1"
         emit_token_completed.assert_called_once()
         # Backdated accept timing (§H 476): the intake passed an explicit
         # monotonic arrival anchor derived from barrier_blocked_at.
@@ -8852,7 +8857,14 @@ class TestNotifyCoalesceOfLostBranch:
     def test_lost_branch_with_failure_returns_sibling_results(self) -> None:
         """Branch loss causing coalesce failure returns FAILED sibling results."""
         _, factory = _make_factory()
-        sibling_token = make_token_info(data={"value": 99})
+        # Task 6 (spec §6.1): the settlement channel pops the consumed
+        # sibling's own FORK frame before walking its remaining lineage, so
+        # a crafted consumed token needs real fork lineage — the same
+        # fork event as `token` below, a different (sibling) branch.
+        sibling_token = make_token_info(
+            data={"value": 99},
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_b"),),
+        )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.notify_branch_lost.return_value = CoalesceOutcome(
             held=False,
@@ -9885,7 +9897,13 @@ class TestGateSinkRoutingNotifiesCoalesce:
             routes={"true": "error_sink", "false": "default"},
         )
 
-        sibling_token = make_token_info(data={"value": 99})
+        # Task 6 (spec §6.1): the settlement channel pops the consumed
+        # sibling's own FORK frame before walking its remaining lineage, so
+        # a crafted consumed token needs real fork lineage.
+        sibling_token = make_token_info(
+            data={"value": 99},
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_b"),),
+        )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.notify_branch_lost.return_value = CoalesceOutcome(
             held=False,

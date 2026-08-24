@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC
 from enum import Enum
 from hashlib import sha256
@@ -35,7 +35,7 @@ from elspeth.contracts.audit_evidence import AuditEvidenceBase
 from elspeth.contracts.barrier_scalars import BarrierScalars, CoalescePendingScalars
 from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS
 from elspeth.contracts.freeze import deep_freeze
-from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.identity import LineageFrame, pop_closer_frame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName, SinkName, StepResolver
 from elspeth.engine._best_effort import best_effort
@@ -765,6 +765,7 @@ class RowProcessor:
             terminal_coalesce_row_result=self._terminal_coalesce_row_result,
             emit_token_completed=self._emit_token_completed,
             mark_coalesce_consumed_terminal=self._mark_coalesce_consumed_scheduler_work_terminal,
+            record_group_member_terminals=self.record_group_member_terminals,
             row_union_executor=self._row_union_executor,
             row_union_node_ids=self._row_union_node_ids,
             branch_to_row_union=self._branch_to_row_union,
@@ -3203,11 +3204,17 @@ class RowProcessor:
              flush's non-quarantined members. This is the NORMAL SUCCESS
              path: it carries no loss at all and never inspects the
              token's frames.
-          2. `CoalesceExecutor`'s three direct `record_token_outcome(FAILURE,
-             UNROUTED)` writes for held siblings consumed by an already-
-             settled loss (`coalesce_executor.py:855`, `:1071`, `:1275`) —
-             consequences of a loss this seam already staged and notified,
-             not member losses of their own. Task 6 retires these sites.
+          2. `CoalesceExecutor`'s direct `record_token_outcome(FAILURE,
+             UNROUTED)` write in `_execute_merge`'s except-cleanup arm
+             (`coalesce_executor.py:~1279`) — a crash-and-reraise path with
+             no live caller to hand a settlement-channel record to; audit
+             completeness for that arm is the executor's own responsibility.
+             Task 6 retired the other two direct writes (late arrival,
+             `_fail_pending`'s group-failure arm): callers now route their
+             consumed siblings through `_record_group_member_terminals`,
+             which both records the terminal AND runs this walk again over
+             each sibling's REMAINING lineage (spec §6.1 — what makes
+             escalation, Task 8, observable).
         Within its actual scope — a disposition that COULD carry a member
         loss — ruling 25 makes exactly one shape unreachable, not absent:
         the non-empty aggregation flush's QUARANTINED_AT_SOURCE disposition
@@ -3260,6 +3267,66 @@ class RowProcessor:
                     "per claim. Processor bug."
                 )
         self._pending_group_losses.append(spec)
+
+    def _record_group_member_terminals(
+        self,
+        consumed_tokens: tuple[TokenInfo, ...],
+        *,
+        failure_reason: str,
+        child_items: list[WorkItem],
+    ) -> list[RowResult]:
+        """Terminalize a closer's consumed members through the standard
+        channel (spec §6.1: no closer writes token terminals directly —
+        Task 6 retires the coalesce executor's three direct
+        `record_token_outcome` writes for held siblings it consumes on a
+        failure arm).
+
+        For each consumed token this ALSO runs the settlement walk over the
+        token's REMAINING lineage — the frames OUTSIDE the closer frame that
+        just consumed it, innermost of THAT to the first bound frame — so a
+        loss inside a nested bound region reaches its enclosing region
+        instead of stopping at the closer that happened to notice it first
+        (what makes escalation, Task 8, observable). A consumed token's own
+        innermost frame is by construction the FORK frame this closer
+        itself closes (bound-region SESE nesting guarantees it — the token
+        could not have arrived here otherwise); `pop_closer_frame` both
+        strips it and crashes loudly if that construction invariant is
+        ever violated, rather than silently walking a wrong path. Reuses
+        `_settle_member_losses` — the ONE settlement walk in this module —
+        rather than re-deriving frame resolution here.
+        """
+        error_hash = compute_error_hash(failure_reason)
+        cascaded: list[RowResult] = []
+        for consumed in consumed_tokens:
+            self._data_flow.record_token_outcome(
+                ref=TokenRef(token_id=consumed.token_id, run_id=self._run_id),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.UNROUTED,
+                error_hash=error_hash,
+            )
+            remaining_path = pop_closer_frame(
+                consumed.lineage_path,
+                kind=FrameKind.FORK,
+                group_id=consumed.lineage_path[-1].group_id if consumed.lineage_path else "",
+            )
+            remaining_token = replace(consumed, lineage_path=remaining_path)
+            cascaded.extend(self._settle_member_losses(remaining_token, failure_reason, child_items))
+        return cascaded
+
+    def record_group_member_terminals(
+        self,
+        consumed_tokens: tuple[TokenInfo, ...],
+        *,
+        failure_reason: str,
+        child_items: list[WorkItem],
+    ) -> list[RowResult]:
+        """Public surface for `_record_group_member_terminals` (spec §6.1
+        Task 6): the CoalesceCompletionPort / BarrierIntakeCoordinator
+        injection point, mirroring how `emit_token_completed` and
+        `mark_coalesce_consumed_terminal` are already threaded to callers
+        outside this class.
+        """
+        return self._record_group_member_terminals(consumed_tokens, failure_reason=failure_reason, child_items=child_items)
 
     def _notify_closer_of_loss(
         self,
@@ -3473,9 +3540,16 @@ class RowProcessor:
                 coalesce_name=coalesce_name,
                 consumed_tokens=tuple(outcome.consumed_tokens),
             )
-            # Merge failed — build RowResults for held sibling tokens.
-            # DB outcomes are already recorded by the executor (outcomes_recorded=True).
-            # These RowResults propagate to the orchestrator for counter accounting.
+            # Merge failed — build RowResults for held sibling tokens. The
+            # executor no longer writes their terminal outcomes itself
+            # (Task 6, spec §6.1); this caller records them through the
+            # settlement channel, which also walks each sibling's REMAINING
+            # lineage for an enclosing bound frame (escalation).
+            cascaded_results = self._record_group_member_terminals(
+                tuple(outcome.consumed_tokens),
+                failure_reason=outcome.failure_reason,
+                child_items=child_items,
+            )
             sibling_results: list[RowResult] = []
             for consumed_token in outcome.consumed_tokens:
                 self._emit_token_completed(
@@ -3495,7 +3569,7 @@ class RowProcessor:
                         ),
                     )
                 )
-            return sibling_results
+            return sibling_results + cascaded_results
 
         return []
 

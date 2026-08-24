@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.types import CoalesceName, NodeID
     from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
     from elspeth.engine.row_union_executor import RowUnionExecutor
+    from elspeth.engine.work_items import WorkItem
 
 
 class TelemetryManagerProtocol(Protocol):
@@ -173,6 +174,19 @@ class CoalesceCompletionPort(Protocol):
         ctx: PluginContext,
     ) -> list[RowResult]:
         """Atomically consume coalesce inputs, emit the merge, and continue."""
+        raise NotImplementedError
+
+    def record_group_member_terminals(
+        self,
+        consumed_tokens: tuple[TokenInfo, ...],
+        *,
+        failure_reason: str,
+        child_items: list[WorkItem],
+    ) -> list[RowResult]:
+        """Terminalize a closer's consumed members (spec §6.1, Task 6) — the
+        executor no longer writes their outcomes itself. Also walks each
+        member's REMAINING lineage for an enclosing bound frame; any
+        cascaded RowResults/child_items surface via the out params."""
         raise NotImplementedError
 
 

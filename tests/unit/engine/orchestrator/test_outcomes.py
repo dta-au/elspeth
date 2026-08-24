@@ -111,9 +111,11 @@ class _FakeProcessor:
     complete_coalesce_merge_results: list[_FakeRowResult] = field(default_factory=list)
     complete_coalesce_merge_side_effect: BaseException | None = None
     mark_blocked_barrier_terminal_result: int = 1
+    record_group_member_terminals_result: list[_FakeRowResult] = field(default_factory=list)
     process_token_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = field(default_factory=list)
     complete_coalesce_merge_calls: list[dict[str, Any]] = field(default_factory=list)
     mark_blocked_barrier_terminal_calls: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+    record_group_member_terminals_calls: list[dict[str, Any]] = field(default_factory=list)
 
     def process_token(self, *args: Any, **kwargs: Any) -> list[_FakeRowResult]:
         self.process_token_calls.append((args, kwargs))
@@ -145,11 +147,28 @@ class _FakeProcessor:
         self.mark_blocked_barrier_terminal_calls.append((barrier_key, token_ids))
         return self.mark_blocked_barrier_terminal_result
 
+    def record_group_member_terminals(
+        self,
+        consumed_tokens: tuple[TokenInfo, ...],
+        *,
+        failure_reason: str,
+        child_items: list[Any],
+    ) -> list[_FakeRowResult]:
+        self.record_group_member_terminals_calls.append(
+            {
+                "consumed_tokens": consumed_tokens,
+                "failure_reason": failure_reason,
+                "child_items": child_items,
+            }
+        )
+        return list(self.record_group_member_terminals_result)
+
 
 def _assert_no_processor_work(processor: _FakeProcessor) -> None:
     assert processor.process_token_calls == []
     assert processor.complete_coalesce_merge_calls == []
     assert processor.mark_blocked_barrier_terminal_calls == []
+    assert processor.record_group_member_terminals_calls == []
 
 
 def _make_result(

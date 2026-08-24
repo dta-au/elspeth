@@ -873,9 +873,12 @@ class TestLateArrival:
         o = executor.accept(late_token, "merge")
         assert o.held is False
         assert o.failure_reason == "late_arrival_after_merge"
-        assert o.outcomes_recorded is True
+        assert o.outcomes_recorded is False
 
-    def test_late_arrival_records_failed_state_and_outcome(self):
+    def test_late_arrival_records_failed_state_but_not_token_outcome(self):
+        """Node-state audit stays the executor's job; the token terminal does not
+        (Task 6, spec §6.1) — the caller records it through the settlement
+        channel now, using outcomes_recorded=False as its signal to do so."""
         executor, execution, data_flow, _, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
         executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
@@ -883,7 +886,7 @@ class TestLateArrival:
         execution.reset_mock()
         data_flow.reset_mock()
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_1")
-        executor.accept(late, "merge")
+        o = executor.accept(late, "merge")
 
         # Should begin + complete with FAILED
         execution.begin_node_state.assert_called_once()
@@ -891,14 +894,9 @@ class TestLateArrival:
         fail_call = execution.complete_node_state.call_args
         assert fail_call.kwargs["status"] == NodeStateStatus.FAILED
 
-        # Should record a terminal FAILED token outcome immediately
-        data_flow.record_token_outcome.assert_called_once()
-        outcome_call = data_flow.record_token_outcome.call_args
-        assert outcome_call.kwargs["ref"].token_id == "t_late"
-        assert outcome_call.kwargs["outcome"] == TerminalOutcome.FAILURE
-        assert outcome_call.kwargs["path"] == TerminalPath.UNROUTED
-        assert isinstance(outcome_call.kwargs["error_hash"], str)
-        assert len(outcome_call.kwargs["error_hash"]) == 16
+        # Must NOT record the terminal token outcome itself anymore.
+        assert data_flow.record_token_outcome.call_count == 0
+        assert o.outcomes_recorded is False
 
     def test_late_arrival_consumed_tokens(self):
         executor, _, _, _, _ = _make_executor()
@@ -1513,7 +1511,7 @@ class TestSelectMerge:
         executor.accept(t1, "merge")
         o = executor.accept(t2, "merge")
         assert o.failure_reason == "select_branch_not_arrived"
-        assert o.outcomes_recorded is True
+        assert o.outcomes_recorded is False
 
     def test_select_ignores_other_branch_data(self):
         """Select merge returns only the selected branch's data."""
@@ -1587,7 +1585,7 @@ class TestCheckTimeouts:
         results = executor.check_timeouts("merge")
         assert len(results) == 1
         assert results[0].failure_reason == "quorum_not_met_at_timeout"
-        assert results[0].outcomes_recorded is True
+        assert results[0].outcomes_recorded is False
 
     def test_require_all_expired_fails(self):
         executor, _, _, _, clock = _make_executor()
@@ -1598,7 +1596,7 @@ class TestCheckTimeouts:
         results = executor.check_timeouts("merge")
         assert len(results) == 1
         assert results[0].failure_reason == "incomplete_branches"
-        assert results[0].outcomes_recorded is True
+        assert results[0].outcomes_recorded is False
 
     def test_multiple_pending_some_expired(self):
         executor, _, _, _, clock = _make_executor()
@@ -2063,7 +2061,7 @@ class TestContractHandling:
         assert "contract_type_conflict" in outcome.failure_reason
         assert outcome.held is False
         assert outcome.merged_token is None
-        assert outcome.outcomes_recorded is True  # Tokens properly terminated
+        assert outcome.outcomes_recorded is False  # caller terminalizes now (Task 6, spec §6.1)
 
     def test_observed_schema_type_conflict_fails_gracefully(self):
         """Observed schemas with runtime type conflicts fail gracefully.
@@ -2106,7 +2104,7 @@ class TestContractHandling:
         assert "count" in outcome.failure_reason  # Field name
         assert "int" in outcome.failure_reason  # Type info
         assert "str" in outcome.failure_reason  # Type info
-        assert outcome.outcomes_recorded is True
+        assert outcome.outcomes_recorded is False
 
 
 # ===========================================================================
@@ -2327,17 +2325,19 @@ class TestFailPendingDetails:
         fail_calls = [c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED]
         assert len(fail_calls) == 1
 
-    def test_failure_records_token_outcomes_failed(self):
+    def test_failure_does_not_record_token_outcomes_itself(self):
+        """Task 6, spec §6.1: _fail_pending's failure arm no longer writes the
+        consumed tokens' terminal outcomes — the caller does, through the
+        settlement channel (outcomes_recorded=False signals this)."""
         executor, _, data_flow, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
         executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
         clock.advance(6.0)
-        executor.check_timeouts("merge")
-        outcome_calls = data_flow.record_token_outcome.call_args_list
-        assert len(outcome_calls) == 1
-        assert outcome_calls[0].kwargs["outcome"] == TerminalOutcome.FAILURE
-        assert outcome_calls[0].kwargs["path"] == TerminalPath.UNROUTED
+        results = executor.check_timeouts("merge")
+        assert data_flow.record_token_outcome.call_count == 0
+        assert len(results) == 1
+        assert results[0].outcomes_recorded is False
 
     def test_failure_metadata_includes_policy(self):
         executor, _, _, _, clock = _make_executor()
@@ -2396,20 +2396,6 @@ class TestFailPendingDetails:
         clock.advance(9.0)
         results = executor.check_timeouts("merge")
         assert results[0].coalesce_metadata.timeout_seconds == 8.0
-
-    def test_failure_error_hash_is_deterministic(self):
-        """The error_hash recorded for failed tokens should be consistent."""
-        executor, _, data_flow, _, clock = _make_executor()
-        s = _settings(policy="require_all", timeout_seconds=5.0)
-        executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        clock.advance(6.0)
-        executor.check_timeouts("merge")
-        # record_token_outcome should have been called with an error_hash
-        kw = data_flow.record_token_outcome.call_args.kwargs
-        assert "error_hash" in kw
-        assert isinstance(kw["error_hash"], str)
-        assert len(kw["error_hash"]) == 16  # sha256[:16]
 
     def test_failure_branches_arrived_in_metadata(self):
         """Failure metadata includes which branches had actually arrived."""
@@ -2693,7 +2679,7 @@ class TestBestEffortTimeoutZeroArrivals:
         assert outcome.held is False
         assert outcome.merged_token is None
         assert outcome.failure_reason == "best_effort_timeout_no_arrivals"
-        assert outcome.outcomes_recorded is True
+        assert outcome.outcomes_recorded is False
 
         # The key should be removed from _pending
         assert ("merge", "row_1") not in executor._pending
@@ -2754,7 +2740,7 @@ class TestBestEffortTimeoutZeroArrivals:
         assert len(results) == 1
         outcome = results[0]
         assert outcome.failure_reason == "best_effort_timeout_no_arrivals"
-        assert outcome.outcomes_recorded is True
+        assert outcome.outcomes_recorded is False
         assert ("merge", "row_1") not in executor._pending
 
     def test_best_effort_timeout_zero_arrivals_does_not_leave_entry_in_pending(self):
@@ -2982,7 +2968,7 @@ class TestSelectBranchNotArrivedFailure:
         assert outcome is not None
         assert outcome.held is False
         assert outcome.failure_reason == "select_branch_not_arrived"
-        assert outcome.outcomes_recorded is True
+        assert outcome.outcomes_recorded is False
 
 
 # ===========================================================================
@@ -3246,7 +3232,7 @@ class TestRestoreFromJournal:
         outcome = executor.accept(late, "merge")
         assert outcome.held is False
         assert outcome.failure_reason == "late_arrival_after_merge"
-        assert outcome.outcomes_recorded is True
+        assert outcome.outcomes_recorded is False
 
     def test_restore_from_journal_keeps_completed_keys_bounded(self) -> None:
         """Restore seeds the FIFO cache through the bounded completion path."""
@@ -3563,7 +3549,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert result.failure_reason is not None
         assert "branch_lost" in result.failure_reason
         assert "a" in result.failure_reason
-        assert result.outcomes_recorded is True
+        assert result.outcomes_recorded is False
 
     def test_require_all_loss_after_partial_arrivals_fails(self):
         """require_all: loss after some branches arrived still fails immediately."""
@@ -3578,7 +3564,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert result is not None
         assert "branch_lost" in result.failure_reason
         assert "c" in result.failure_reason
-        assert result.outcomes_recorded is True
+        assert result.outcomes_recorded is False
         # Consumed tokens should include the arrived branches
         assert len(result.consumed_tokens) == 2
 
@@ -3684,7 +3670,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert result is not None
         assert result.failure_reason == "all_branches_lost"
         assert result.merged_token is None
-        assert result.outcomes_recorded is True
+        assert result.outcomes_recorded is False
 
     # --- first policy ---
 
@@ -3703,7 +3689,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert result_b.held is False
         assert result_b.merged_token is None
         assert result_b.failure_reason == "all_branches_lost"
-        assert result_b.outcomes_recorded is True
+        assert result_b.outcomes_recorded is False
         assert ("merge", "row_1") not in executor._pending
         assert ("merge", "row_1") in executor._completed_keys
 
@@ -3721,7 +3707,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert results[0].held is False
         assert results[0].merged_token is None
         assert results[0].failure_reason == "all_branches_lost"
-        assert results[0].outcomes_recorded is True
+        assert results[0].outcomes_recorded is False
         assert ("merge", "row_1") not in executor._pending
 
     def test_first_policy_timeout_zero_arrivals_from_loss_fails_and_cleans_up(self):
@@ -3739,7 +3725,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert results[0].held is False
         assert results[0].merged_token is None
         assert results[0].failure_reason == "first_timeout_no_arrivals"
-        assert results[0].outcomes_recorded is True
+        assert results[0].outcomes_recorded is False
         assert ("merge", "row_1") not in executor._pending
         assert ("merge", "row_1") in executor._completed_keys
 
@@ -3866,7 +3852,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         result = executor.notify_branch_lost("merge", "row_1", "a", "error_routed")
         assert result is not None
         assert "quorum_impossible" in result.failure_reason
-        assert result.outcomes_recorded is True
+        assert result.outcomes_recorded is False
 
 
 class TestPrecomputedOutputSchema:
