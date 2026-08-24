@@ -589,7 +589,31 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # hash moves here because the run case's expected projection (sink rows,
 # sha256, counts) is now real observed data from the migrated topology —
 # both cases keep their ids, workflow, and output_artifacts unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "96f68167d126fbeca126bfa24cd36c81757478a8f2bf8c8f9269856a559611b2"
+# Rotated 2026-08-24 for WS3 T1-T7 (the unified-lineage group-loss ledger,
+# spec §6.2): the ten fork-coalesce-policies "-lost-c"/"-all-lost" cases
+# (require-all-lost-c, quorum-{union,nested,select,impossible}-lost-c,
+# best-effort-{union,nested,select}-lost-c, best-effort-all-lost,
+# first-all-lost) now write a durable group_losses row per lost branch where
+# the retired coalesce_branch_losses write never reached the exporter's
+# audit_record_counts surface — WS3 Tasks 3/4 moved the disposition-layer
+# write from the retired ledger onto the unified one, and the exporter
+# started counting it as record_type='group_loss'. This is the manifest-count
+# rotation the plan predicted for WS3 Task 5 Step 5's protocol, arriving
+# early because Tasks 3/4 (not Task 5) are what actually moved the write.
+# A/B-verified per case: ran each of the 10 cases standalone, diffed the full
+# left-vs-right AuditRecordCount tuple (not just the failing assertion), and
+# confirmed the ONLY delta in every case is the added group_loss entry — one
+# per lost branch (count=1 for the eight single-branch-c-lost cases, count=3
+# for the two all-branches-lost cases, matching each case's 3-branch fork).
+# Every other audit_record_counts entry, every status/rows_processed/
+# rows_succeeded/rows_failed field, and every projection_sha256/
+# projection_counts pin compared byte-identical old vs observed — the
+# earlier assertions in the same test function (status, row counts, sink
+# outputs, projection) already passed before reaching the audit_record_counts
+# comparison, confirming no other field moved. No case showed a status
+# change, a row-count change, or a lost record type other than the
+# retirement — a pure rotation, not behaviour drift.
+EXPECTED_CASE_REGISTRY_SHA256 = "8963b930c8711ee59b441594dbabcb1be0b3c6ab91891d4f8555bf0da1d45b93"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

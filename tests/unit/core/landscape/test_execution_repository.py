@@ -2736,6 +2736,12 @@ class TestDelegationSignatureAlignment:
             id="has_released_row_for_node",
         ),
         pytest.param(
+            "row_id_for_token",
+            lambda execution: execution.row_id_for_token,
+            ExecutionRepository.row_id_for_token,
+            id="row_id_for_token",
+        ),
+        pytest.param(
             "reconcile_source_completions_from_scheduler",
             lambda execution: execution.reconcile_source_completions_from_scheduler,
             ExecutionRepository.reconcile_source_completions_from_scheduler,
