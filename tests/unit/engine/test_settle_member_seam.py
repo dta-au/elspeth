@@ -371,7 +371,11 @@ def test_record_group_member_terminals_settles_once_not_per_consumed_token(proce
 # ---------------------------------------------------------------------------
 
 
-def test_collector_closer_raises_fail_closed(processor_with_bindings) -> None:
+def test_collector_closer_stages_only_and_defers_the_notify_to_intake(processor_with_bindings) -> None:
+    """COLLECTOR arm (integration item 1): the in-claim seam has no
+    PluginContext and a collector loss can complete a roster and flush, so
+    the arm stages the durable loss and returns no results — the intake's
+    durable-loss replay (which has ctx) performs the in-memory notify."""
     collector_binding = GroupBinding(
         kind=FrameKind.EXPAND,
         opener_node_id=NodeID("__synth_opener__scope"),
@@ -385,8 +389,13 @@ def test_collector_closer_raises_fail_closed(processor_with_bindings) -> None:
     )
     proc = processor_with_bindings({("eg_scope", "tok-child"): collector_binding})
     token = make_token(lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="eg_scope", member_key="tok-child"),))
-    with pytest.raises(OrchestrationInvariantError, match="collector settlement lands in WS4"):
-        proc._settle_member_losses(token, "quarantined", [])
+    child_items: list = []
+    assert proc._settle_member_losses(token, "quarantined", child_items) == []
+    assert child_items == []
+    staged = proc._take_pending_group_losses()
+    assert [(spec.closer_name, spec.group_id, spec.member_key, spec.reason) for spec in staged] == [
+        ("scope_collector", "eg_scope", "tok-child", "quarantined"),
+    ]
 
 
 # ---------------------------------------------------------------------------

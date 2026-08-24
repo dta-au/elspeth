@@ -234,10 +234,16 @@ class WorkItemFactory:
         current_node_id: NodeID,
         coalesce_name: CoalesceName | None = None,
         row_union_name: RowUnionName | None = None,
+        collector_name: CollectorName | None = None,
         on_success_sink: str | None = None,
         join_group_id: str | None = None,
     ) -> WorkItem:
-        """Create a child item that continues after current node or resumes at a barrier."""
+        """Create a child item that continues after current node or resumes at a barrier.
+
+        ``collector_name`` is a plain cursor pass-through: an EXPAND member
+        always advances to the node after its opener (never a fork gate), so
+        the fork-child branch-first-node arm below does not apply to it.
+        """
         if coalesce_name is not None or row_union_name is not None:
             # Fork children route to the first processing node in their branch.
             # Non-fork continuations are already mid-branch and advance normally.
@@ -270,6 +276,7 @@ class WorkItemFactory:
         return self.create(
             token=token,
             current_node_id=self.navigation.resolve_next_node(current_node_id),
+            collector_name=collector_name,
             on_success_sink=on_success_sink,
             join_group_id=join_group_id,
         )

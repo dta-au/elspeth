@@ -29,8 +29,9 @@ from elspeth.contracts.enums import RoutingKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import MaxRetriesExceeded, OrchestrationInvariantError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import FailureInfo
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
+from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
+from elspeth.core.dag.group_bindings import CloserKind
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.work_items import WorkItem
@@ -256,6 +257,38 @@ class TokenTraversalEngine:
                 node_id=node_id,
                 run_id=self._processor._run_id,
             )
+
+            # A declared scope opener's children are bound members of an
+            # EXPAND group that closes at a collector (spec §3): they carry
+            # the collector CURSOR and nothing else — inside the scope the
+            # collector is the innermost barrier, and the enclosing
+            # coalesce/row_union cursor (if any) is re-derived from the
+            # remaining lineage when the collector releases
+            # (RowProcessor._released_collector_cursor). An unbound expansion
+            # keeps today's shape exactly.
+            bound_collector: CollectorName | None = None
+            if node_id in self._processor._opener_binding_by_node_id:
+                opener_binding = self._processor._opener_binding_by_node_id[node_id]
+                if opener_binding.closer_kind is CloserKind.COLLECTOR:
+                    bound_collector = CollectorName(opener_binding.closer_name)
+            if bound_collector is not None:
+                for child_token in child_tokens:
+                    child_items.append(
+                        self._processor._work_items.create_continuation(
+                            token=child_token,
+                            current_node_id=node_id,
+                            collector_name=bound_collector,
+                            on_success_sink=updated_sink,
+                        )
+                    )
+                return _TransformTerminal(
+                    result=RowResult(
+                        token=current_token,
+                        final_data=current_token.row_data,
+                        outcome=TerminalOutcome.TRANSIENT,
+                        path=TerminalPath.EXPAND_PARENT,
+                    )
+                )
 
             # Queue each child for continued processing.
             # Pass updated_sink so terminal children inherit the
@@ -862,6 +895,7 @@ class TokenTraversalEngine:
         attempt_offset: int = 0,
         row_union_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
+        collector_name: CollectorName | None = None,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]:
         """Process a single token through processing nodes starting at node_id.
 
@@ -914,9 +948,11 @@ class TokenTraversalEngine:
                     context=f"start of token processing for token '{token.token_id}'",
                 )
 
+        collector_node_id = self._processor._collector_node_ids[collector_name] if collector_name is not None else None
         for barrier_node_id, barrier_name, barrier_kind in (
             (coalesce_node_id, coalesce_name, "coalesce"),
             (row_union_node_id, row_union_name, "row_union"),
+            (collector_node_id, collector_name, "collector"),
         ):
             self.validate_barrier_ordering(token, current_node_id, barrier_node_id, barrier_name, barrier_kind)
 
@@ -951,6 +987,14 @@ class TokenTraversalEngine:
                 current_node_id=node_id,
                 row_union_node_id=row_union_node_id,
                 row_union_name=row_union_name,
+            )
+            if handled:
+                return (result, child_items)
+
+            handled, result = self._processor._maybe_collector_token(
+                current_token,
+                current_node_id=node_id,
+                collector_name=collector_name,
             )
             if handled:
                 return (result, child_items)

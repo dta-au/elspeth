@@ -162,6 +162,7 @@ from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.scheduler_repository import (
     TokenSchedulerRepository,
 )
@@ -232,6 +233,23 @@ class DAGTraversalContext:
             | frozenset(self.row_union_node_map.values())
             | frozenset(self.collector_node_map.values()),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class CollectorRelease:
+    """Where a collector's released output goes — exactly one lane populated.
+
+    ``items``: READY continuations at the node after the barrier (non-terminal
+    collector). ``sink_results``: sink-bound results for a terminal collector
+    whose ``on_success`` names a sink. Both empty only for an M=0 release.
+    """
+
+    items: tuple[WorkItem, ...]
+    sink_results: tuple[RowResult, ...]
+
+    def __post_init__(self) -> None:
+        if self.items and self.sink_results:
+            raise OrchestrationInvariantError("CollectorRelease: a release is either READY continuations or sink-bound results, never both")
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,6 +438,7 @@ class RowProcessor:
         row_union_executor: RowUnionExecutor | None = None,
         branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
         collector_executor: CollectorExecutor | None = None,
+        collector_on_success_map: dict[CollectorName, str] | None = None,
         group_bindings: GroupBindingRegistry | None = None,
         branch_to_sink: dict[BranchName, SinkName] | None = None,
         unbound_branch_first_node: dict[BranchName, NodeID] | None = None,
@@ -462,6 +481,10 @@ class RowProcessor:
             collector_executor: Optional collector executor (EXPAND-group closers,
                 barrier-scopes spec §5). Leader-only, like the coalesce and row_union
                 executors; ``None`` on followers and on pipelines without collectors.
+            collector_on_success_map: Map of collector_name -> terminal sink_name for
+                collectors whose flush output routes straight to a sink (the
+                coalesce_on_success_map twin; a non-terminal collector has no entry
+                and its release continues at the node after the barrier).
             group_bindings: The unified FORK/EXPAND group-binding registry (barrier-scopes
                 spec §3, §6.1). ``_settle_member_losses`` walks a failing token's
                 ``lineage_path`` against ``group_bindings.binding_for(frame)`` to find
@@ -558,10 +581,15 @@ class RowProcessor:
         self._branch_to_row_union: dict[BranchName, RowUnionName] = branch_to_row_union or {}
         self._collector_executor = collector_executor
         self._collector_node_ids: dict[CollectorName, NodeID] = dict(traversal.collector_node_map)
+        self._collector_on_success_map: dict[CollectorName, str] = dict(collector_on_success_map or {})
         # THE settle-member walk's frame resolver (spec §6.1). Defaults to an
         # empty registry — every frame is inert, nothing staged — rather than
         # None, so _settle_member_losses never needs a None branch.
         self._group_bindings: GroupBindingRegistry = group_bindings if group_bindings is not None else GroupBindingRegistry(bindings=())
+        # opener node -> its scope binding, the same cached index TokenManager
+        # keeps for register_expand_group: the expand path consults it to give
+        # a bound opener's children their collector cursor.
+        self._opener_binding_by_node_id: dict[NodeID, GroupBinding] = self._group_bindings.by_opener_node()
         self._branch_to_sink: dict[BranchName, SinkName] = branch_to_sink or {}
         self._unbound_branch_first_node: dict[BranchName, NodeID] = unbound_branch_first_node or {}
         overlap = set(self._branch_to_coalesce.keys()) & set(self._branch_to_sink.keys())
@@ -790,6 +818,10 @@ class RowProcessor:
             branch_to_row_union=self._branch_to_row_union,
             complete_row_union_fire=self._complete_row_union_fire,
             released_row_union_items=self.released_row_union_items,
+            collector_executor=self._collector_executor,
+            collector_node_ids=self._collector_node_ids,
+            complete_collector_fire=self._complete_collector_fire,
+            route_collector_release=self.route_collector_release,
         )
         # Scheduler-drain subsystem (elspeth-c49f33d6e4 component 3): the
         # coordinator owns the durable claim/drain loop, dispositions,
@@ -848,6 +880,8 @@ class RowProcessor:
                 prepare_committed_aggregation_output=self._prepare_committed_aggregation_output,
                 complete_committed_aggregation_output=self._complete_committed_aggregation_output,
                 complete_committed_coalesce_residual=self._complete_committed_coalesce_residual,
+                collector_executor=self._collector_executor,
+                collector_node_ids=self._collector_node_ids,
             ).restore_from_journal(barrier_restore)
 
     @property
@@ -3191,6 +3225,51 @@ class RowProcessor:
         )
         return True, None
 
+    def _maybe_collector_token(
+        self,
+        current_token: TokenInfo,
+        *,
+        current_node_id: NodeID,
+        collector_name: CollectorName | None,
+    ) -> tuple[bool, RowResult | None]:
+        """Hold an EXPAND member arriving at its collector barrier (spec §5).
+
+        Same journal-first shape as ``_maybe_coalesce_token`` /
+        ``_maybe_row_union_token`` (§E.2): never accepted in-claim — the live
+        token is stashed under the compound ``collector:<name>:<group_id>``
+        key (``collector_barrier_key``, the single construction site) and
+        the drain marks its journal row BLOCKED; the leader's next intake
+        adopts it and runs ``CollectorExecutor.accept``. Followers hold
+        without stashing. The cursor (``collector_name`` on the work item),
+        not the token, decides "which collector": a follower that never ran
+        the opener cannot resolve the EXPAND frame's binding
+        (``GroupBindingRegistry._expand_groups`` is process-local), so the
+        durable cursor is the only authority that survives a hand-off.
+        """
+        if collector_name is None or current_node_id != self._collector_node_ids[collector_name]:
+            return False, None
+        frame = current_token.lineage_path[-1] if current_token.lineage_path else None
+        if frame is None or frame.kind is not FrameKind.EXPAND:
+            raise OrchestrationInvariantError(
+                f"Token {current_token.token_id!r} arrived at collector {collector_name!r} (node {current_node_id!r}) "
+                f"without an innermost EXPAND frame (lineage_path={current_token.lineage_path!r}); a collector "
+                "member's innermost frame is always its own group's (spec §7 rule 5)."
+            )
+        if self._collector_executor is None:
+            logger.debug(
+                "follower: collector barrier hold for token %r at node %r (collector=%r) — marking blocked; leader adopts via journal-intake",
+                current_token.token_id,
+                current_node_id,
+                collector_name,
+            )
+            return True, None
+
+        self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
+            token=current_token,
+            barrier_key=collector_barrier_key(str(collector_name), frame.group_id),
+        )
+        return True, None
+
     def _first_bound_frame(self, current_token: TokenInfo) -> tuple[LineageFrame, GroupBinding] | None:
         """The settle-member walk's frame resolver (spec §6.1): the failing
         token's lineage_path, INNERMOST frame outward, to the FIRST BOUND
@@ -3553,9 +3632,19 @@ class RowProcessor:
         if binding.closer_kind is CloserKind.ROW_UNION:
             return self._notify_row_union_closer_of_loss(binding, frame, current_token, reason)
         if binding.closer_kind is CloserKind.COLLECTOR:
-            raise OrchestrationInvariantError(
-                f"Collector closer {binding.closer_name!r} has no executor wired; collector settlement lands in WS4 integration."
-            )
+            # COLLECTOR arm: stage only. A collector loss can complete the
+            # roster and FLUSH (a plugin call needing the PluginContext), and
+            # this seam carries no ctx — so the in-memory notify runs at the
+            # next intake's durable-loss replay
+            # (BarrierIntakeCoordinator._replay_group_losses, which has ctx
+            # and disposes the outcome exactly like an arrival). Same
+            # stage-then-replay shape the empty-aggregation flush already
+            # uses; latency is one drain iteration. Replay dedups on
+            # CollectorExecutor.has_replayed_member_loss (in-memory) — NEVER
+            # on has_recorded_member_loss, whose durable ledger fallback
+            # would report every just-committed loss as already recorded
+            # and make the replay a permanent no-op.
+            return []
         raise OrchestrationInvariantError(
             f"Unhandled closer kind {binding.closer_kind!r} for closer {binding.closer_name!r}"
         )  # pragma: no cover
@@ -4613,6 +4702,122 @@ class RowProcessor:
             )
         return tuple(self._work_items.create(token=token, current_node_id=continuation_node_id) for token in released_tokens)
 
+    def _released_collector_cursor(self, token: TokenInfo) -> tuple[CoalesceName | None, RowUnionName | None, CollectorName | None]:
+        """Barrier cursor for a token a collector just released (spec §7 rules 2/5).
+
+        ``collect_tokens`` popped the closed group's EXPAND frame; whatever
+        frame is now innermost names the ENCLOSING region the release is a
+        member of, if any: a FORK frame resolves through the branch maps
+        (``resolve_merged_branch_barrier``'s nested arm), an EXPAND frame
+        through the binding registry (a collector-in-collector nest; inert
+        when unbound). A release with no remaining frame, or an unbound one,
+        carries no cursor — an ordinary consumer or a sink awaits it.
+        """
+        if not token.lineage_path:
+            return None, None, None
+        frame = token.lineage_path[-1]
+        if frame.kind is FrameKind.FORK:
+            branch_key = BranchName(frame.member_key)
+            if branch_key in self._branch_to_coalesce:
+                return self._branch_to_coalesce[branch_key], None, None
+            if branch_key in self._branch_to_row_union:
+                return None, self._branch_to_row_union[branch_key], None
+            return None, None, None
+        binding = self._group_bindings.binding_for(frame)
+        if binding is not None and binding.closer_kind is CloserKind.COLLECTOR:
+            return None, None, CollectorName(binding.closer_name)
+        return None, None, None
+
+    def route_collector_release(
+        self,
+        *,
+        collector_name: CollectorName,
+        released_tokens: tuple[TokenInfo, ...],
+    ) -> CollectorRelease:
+        """Where a collector's released output goes (spec §5): READY continuations
+        at the node after the barrier, or sink-bound results for a terminal
+        collector (``on_success`` names a sink). Exactly one of the two lanes is
+        populated. Like ``released_row_union_items`` the cursor must ADVANCE past
+        the collector node — the released tokens are fresh ids (``collect_tokens``
+        mints them), so no work_item_id collision arises, but re-entering the
+        collector would hold the release at the barrier it just left.
+        """
+        collector_node_id = self._collector_node_ids[collector_name]
+        continuation_node_id = self._nav.resolve_next_node(collector_node_id)
+        if continuation_node_id is None:
+            if collector_name not in self._collector_on_success_map:
+                raise OrchestrationInvariantError(
+                    f"Collector {collector_name!r} has no downstream node and no terminal on_success sink; "
+                    "a collector must release into a processing connection or a declared sink."
+                )
+            sink_name = self._collector_on_success_map[collector_name]
+            return CollectorRelease(
+                items=(),
+                sink_results=tuple(
+                    RowResult(
+                        token=token,
+                        final_data=token.row_data,
+                        outcome=TerminalOutcome.SUCCESS,
+                        path=TerminalPath.DEFAULT_FLOW,
+                        sink_name=sink_name,
+                    )
+                    for token in released_tokens
+                ),
+            )
+        items: list[WorkItem] = []
+        for token in released_tokens:
+            coalesce_name, row_union_name, enclosing_collector = self._released_collector_cursor(token)
+            items.append(
+                self._work_items.create(
+                    token=token,
+                    current_node_id=continuation_node_id,
+                    coalesce_name=coalesce_name,
+                    row_union_name=row_union_name,
+                    collector_name=enclosing_collector,
+                )
+            )
+        return CollectorRelease(items=tuple(items), sink_results=())
+
+    def _complete_collector_fire(
+        self,
+        *,
+        collector_name: CollectorName,
+        group_id: str,
+        consumed_tokens: tuple[TokenInfo, ...],
+        scope_row_id: str,
+        release: CollectorRelease,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> None:
+        """Complete a fired collector group as ONE atomic journal transition.
+
+        Consumes the group's BLOCKED rows (all under the compound
+        ``collector:<name>:<group_id>`` key) and emits the release — READY
+        continuations, or PENDING_SINK rows for a terminal collector — in the
+        same F1 ``complete_barrier`` transaction, exactly as
+        ``_complete_coalesce_fire``/``_complete_row_union_fire`` do. Because
+        the key already carries the group id, ``scope_row_id`` narrows nothing
+        further here but is threaded for the repository's membership check
+        parity. ``group_losses``: an escalated loss the settle seam staged
+        while terminalising this group's members rides this same commit
+        (Ruling 43).
+        """
+        consumed_token_ids = tuple(token.token_id for token in consumed_tokens)
+        if not consumed_token_ids and not release.items and not release.sink_results:
+            return
+        self._scheduler.complete_barrier(
+            run_id=self._run_id,
+            barrier_key=collector_barrier_key(str(collector_name), group_id),
+            consumed_token_ids=consumed_token_ids,
+            emitted_pending_sink=tuple(self._sink_emission_from_result(result) for result in release.sink_results),
+            emitted_ready=tuple(self._work_codec.ready_emission(item) for item in release.items),
+            now=self._clock.now_utc(),
+            intake_snapshot_token_ids=frozenset(consumed_token_ids),
+            scope_row_id=scope_row_id,
+            coordination_token=self._require_coordination_token(),
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+            group_losses=group_losses,
+        )
+
     def complete_coalesce_merge(
         self,
         *,
@@ -4900,7 +5105,12 @@ class RowProcessor:
         """
         if item.current_node_id is None:
             return None
-        if item.current_node_id in self._structural_node_ids and item.coalesce_name is None and item.row_union_name is None:
+        if (
+            item.current_node_id in self._structural_node_ids
+            and item.coalesce_name is None
+            and item.row_union_name is None
+            and item.collector_name is None
+        ):
             return str(item.current_node_id)
         return None
 
@@ -4922,6 +5132,19 @@ class RowProcessor:
             return str(item.coalesce_name)
         if item.row_union_name is not None:
             return str(item.row_union_name)
+        if item.collector_name is not None:
+            # THE producer of collector barrier_keys (integration item 1): the
+            # compound address pairs the cursor's collector with the member's
+            # own EXPAND group — a single collector spans many concurrent
+            # groups, so the bare name is not an address.
+            frame = item.token.lineage_path[-1] if item.token.lineage_path else None
+            if frame is None or frame.kind is not FrameKind.EXPAND:
+                raise OrchestrationInvariantError(
+                    f"Work item for token {item.token.token_id!r} carries collector cursor {item.collector_name!r} "
+                    f"but no innermost EXPAND frame (lineage_path={item.token.lineage_path!r}); cannot derive its "
+                    "barrier_key. Processor bug."
+                )
+            return collector_barrier_key(str(item.collector_name), frame.group_id)
         return None
 
     # --- TokenTraversalEngine delegates (c49 component 4) ---
@@ -4943,6 +5166,7 @@ class RowProcessor:
         attempt_offset: int = 0,
         row_union_node_id: NodeID | None = None,
         row_union_name: RowUnionName | None = None,
+        collector_name: CollectorName | None = None,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]:
         return self._token_traversal.process_single_token(
             token,
@@ -4954,6 +5178,7 @@ class RowProcessor:
             attempt_offset,
             row_union_node_id,
             row_union_name,
+            collector_name,
         )
 
     def _handle_transform_node(

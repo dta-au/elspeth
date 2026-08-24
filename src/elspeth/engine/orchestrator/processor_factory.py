@@ -387,6 +387,16 @@ def build_row_processor(
                     if CoalesceName(coalesce_settings_entry.name) == cname and coalesce_settings_entry.on_success is not None:
                         coalesce_on_success_map[cname] = coalesce_settings_entry.on_success
 
+    # A terminal collector (on_success names a sink) releases straight to that
+    # sink; graph-authoritative like coalesce_on_success_map above. Followers
+    # never complete a collector flush locally, so their map is empty.
+    collector_on_success_map: dict[CollectorName, str] = {}
+    if mode is not ProcessorMode.FOLLOWER:
+        terminal_sink_map = graph.get_terminal_sink_map()
+        for collector_name, collector_node_id in collector_node_map.items():
+            if collector_node_id in terminal_sink_map:
+                collector_on_success_map[collector_name] = terminal_sink_map[collector_node_id]
+
     branch_to_sink = graph.get_branch_to_sink_map()
     unbound_branch_first_node = graph.get_unbound_branch_first_nodes()
 
@@ -441,6 +451,7 @@ def build_row_processor(
         row_union_executor=row_union_executor,
         branch_to_row_union=branch_to_row_union,
         collector_executor=collector_executor,
+        collector_on_success_map=collector_on_success_map,
         group_bindings=group_bindings,
         branch_to_sink=branch_to_sink,
         unbound_branch_first_node=unbound_branch_first_node,

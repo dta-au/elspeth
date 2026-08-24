@@ -43,8 +43,9 @@ from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.identity import LineageFrame, path_fork_group_id
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, GroupLossSpec, TokenWorkItem
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
+from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
+from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.scheduler_repository import GroupLoss, token_from_journal_item
 from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
 
@@ -66,7 +67,8 @@ if TYPE_CHECKING:
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
     from elspeth.engine.dag_navigator import DAGNavigator
     from elspeth.engine.executors import AggregationExecutor
-    from elspeth.engine.processor import _PreparedAggregationRoute
+    from elspeth.engine.executors.collector import CollectorExecutor, CollectorOutcome
+    from elspeth.engine.processor import CollectorRelease, _PreparedAggregationRoute
     from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome, RowUnionRestoreEntry
 
 logger = logging.getLogger(__name__)
@@ -236,6 +238,10 @@ class BarrierIntakeCoordinator:
         complete_row_union_fire: Callable[..., None] | None = None,
         released_row_union_items: Callable[..., tuple[WorkItem, ...]] | None = None,
         group_bindings: GroupBindingRegistry | None = None,
+        collector_executor: CollectorExecutor | None = None,
+        collector_node_ids: Mapping[CollectorName, NodeID] | None = None,
+        complete_collector_fire: Callable[..., None] | None = None,
+        route_collector_release: Callable[..., CollectorRelease] | None = None,
     ) -> None:
         self._run_id = run_id
         self._scheduler = scheduler
@@ -267,6 +273,10 @@ class BarrierIntakeCoordinator:
         self._complete_row_union_fire = complete_row_union_fire
         self._released_row_union_items = released_row_union_items
         self._group_bindings: GroupBindingRegistry = group_bindings if group_bindings is not None else GroupBindingRegistry(bindings=())
+        self._collector_executor = collector_executor
+        self._collector_node_ids: Mapping[CollectorName, NodeID] = collector_node_ids or {}
+        self._complete_collector_fire = complete_collector_fire
+        self._route_collector_release = route_collector_release
         # spec §6.3 (Task 8): parked closer FAIL verdicts awaiting settlement,
         # keyed on (closer_name, group_id). In-memory only — re-derivable at
         # takeover because replaying the durable losses re-fires the closer's
@@ -351,7 +361,12 @@ class BarrierIntakeCoordinator:
         results/child_items reproduces the pre-extraction append ordering.
         """
         dispositions: list[BarrierIntakeDisposition] = []
-        if not self._aggregation_settings and self._coalesce_executor is None and self._row_union_executor is None:
+        if (
+            not self._aggregation_settings
+            and self._coalesce_executor is None
+            and self._row_union_executor is None
+            and self._collector_executor is None
+        ):
             return BarrierIntakePassOutcome(dispositions=())
 
         # ADR-030 §E.2 intake scan shape: only intake-pending rows
@@ -363,6 +378,7 @@ class BarrierIntakeCoordinator:
             coalesce_keys = {str(name) for name in self._coalesce_node_ids}
             row_union_keys = {str(name) for name in self._row_union_node_ids}
             aggregation_keys = {str(node_id) for node_id in self._aggregation_settings}
+            collector_names = {str(name) for name in self._collector_node_ids}
             for row in pending_rows:
                 if row.barrier_key in aggregation_keys:
                     disposition = self._adopt_aggregation_row(row, ctx)
@@ -370,17 +386,23 @@ class BarrierIntakeCoordinator:
                     disposition = self._adopt_coalesce_row(row)
                 elif row.barrier_key in row_union_keys:
                     disposition = self._adopt_row_union_row(row)
+                elif row.collector_name is not None and row.collector_name in collector_names:
+                    # A collector row is addressed by its CURSOR, not by a bare
+                    # key: one collector spans many concurrent EXPAND groups,
+                    # so its barrier_key is the compound
+                    # collector:<name>:<group_id> and cannot sit in a name set.
+                    disposition = self._adopt_collector_row(row, ctx)
                 else:
                     raise AuditIntegrityError(
                         f"Intake-pending BLOCKED row for token {row.token_id!r} (run {self._run_id!r}) carries "
-                        f"orphan barrier_key {row.barrier_key!r}: not a configured coalesce "
-                        f"({sorted(coalesce_keys)}), row_union ({sorted(row_union_keys)}), "
-                        f"or aggregation node ({sorted(aggregation_keys)})."
+                        f"orphan barrier_key {row.barrier_key!r} (collector_name={row.collector_name!r}): not a "
+                        f"configured coalesce ({sorted(coalesce_keys)}), row_union ({sorted(row_union_keys)}), "
+                        f"aggregation node ({sorted(aggregation_keys)}), or collector ({sorted(collector_names)})."
                     )
                 if disposition is not None:
                     dispositions.append(disposition)
 
-        dispositions.extend(self._replay_group_losses())
+        dispositions.extend(self._replay_group_losses(ctx))
         # spec §6.3 (Task 8) — escalation runs AFTER durable-loss replay, in
         # the SAME intake step: a note staged into the ledger THIS pass is
         # picked up by the NEXT pass's replay above (one-pass-per-drain-cycle
@@ -727,6 +749,155 @@ class BarrierIntakeCoordinator:
             f"held={outcome.held}, released={len(outcome.released_tokens)}, failure_reason={outcome.failure_reason!r}"
         )
 
+    def _adopt_collector_row(self, row: TokenWorkItem, ctx: PluginContext) -> BarrierIntakeDisposition | None:
+        """Adopt one collector barrier row and run the intake-time accept (spec §5).
+
+        Coalesce-shaped (no batch membership at arrival, fenced adoption,
+        executor memory fed only on the adopted=True arm with the backdated
+        arrival) — but ``accept`` takes the intake ``ctx``, because the
+        arrival that completes the roster FLUSHES the group through its
+        plugin right here. The row's compound ``barrier_key`` must be the
+        one ``collector_barrier_key`` derives from its cursor and its own
+        EXPAND frame: a cursor/key disagreement is two authorities for one
+        fact and fails closed.
+        """
+        if row.barrier_key is None:  # pragma: no cover - excluded by the query contract
+            raise AuditIntegrityError(f"Intake collector row {row.work_item_id!r} has no barrier_key.")
+        if row.collector_name is None:  # pragma: no cover - partition guarantees a collector cursor
+            raise AuditIntegrityError(f"Intake collector row {row.work_item_id!r} has no collector_name cursor.")
+        if self._collector_executor is None:
+            raise OrchestrationInvariantError(f"Intake collector row for {row.barrier_key!r} but no CollectorExecutor is configured.")
+        frame = row.lineage_path[-1] if row.lineage_path else None
+        if frame is None or frame.kind is not FrameKind.EXPAND:
+            raise AuditIntegrityError(
+                f"Intake collector row for token {row.token_id!r} (run {self._run_id!r}) has no innermost EXPAND "
+                f"frame (lineage_path={row.lineage_path!r}); a collector member always carries its own group's frame."
+            )
+        expected_key = collector_barrier_key(str(row.collector_name), frame.group_id)
+        if row.barrier_key != expected_key:
+            raise AuditIntegrityError(
+                f"Intake collector row for token {row.token_id!r} (run {self._run_id!r}) carries barrier_key "
+                f"{row.barrier_key!r} but its cursor/frame derive {expected_key!r}; journal corruption."
+            )
+        coordination_token = self._require_coordination_token()
+        token = self._token_for_intake(row)
+        adoption = self._scheduler.adopt_blocked_barrier_item(
+            run_id=self._run_id,
+            work_item_id=row.work_item_id,
+            token_id=row.token_id,
+            barrier_key=row.barrier_key,
+            membership=None,
+            buffered_outcome=None,
+            now=self._clock.now_utc(),
+            coordination_token=coordination_token,
+        )
+        if not adoption.adopted:
+            return None
+        outcome = self._collector_executor.accept(
+            token,
+            str(row.collector_name),
+            ctx,
+            arrival_time=self._backdated_accept_monotonic(row),
+        )
+        return self._dispose_collector_outcome(outcome, scope_row_id=row.row_id)
+
+    def _dispose_collector_outcome(self, outcome: CollectorOutcome, *, scope_row_id: str) -> BarrierIntakeDisposition | None:
+        """Turn one ``CollectorOutcome`` (arrival OR replayed loss) into its disposition.
+
+        ``held`` keeps the row BLOCKED — including the executor's post-closure
+        same-token skip (M-1's mixed signal): at intake that arm is
+        unreachable anyway, because a redelivered claim of an already-adopted
+        row is ``adopted=False`` and never reaches ``accept``. A release
+        consumes every member's BLOCKED row and emits the continuation in
+        ONE ``complete_barrier``; a failure terminalizes the arrived members
+        through the settle seam (which also walks their remaining lineage
+        for an enclosing bound frame — escalation) and releases their rows.
+        A plugin-free close with nothing consumed (all members lost under
+        best_effort, or an empty expansion) has no rows to move.
+        """
+        if outcome.held:
+            return BarrierIntakeDisposition(kind=BarrierIntakeDispositionKind.HELD)
+        if outcome.collector_name is None or outcome.group_id is None:
+            raise OrchestrationInvariantError("Non-held CollectorOutcome must carry collector_name and group_id")
+        collector_name = CollectorName(outcome.collector_name)
+        group_id = outcome.group_id
+        barrier_key = collector_barrier_key(str(collector_name), group_id)
+
+        if outcome.released_tokens:
+            if self._complete_collector_fire is None or self._route_collector_release is None:
+                raise OrchestrationInvariantError(
+                    f"Collector {collector_name!r} released a group but the fire-completion seams are not wired."
+                )
+            release = self._route_collector_release(collector_name=collector_name, released_tokens=outcome.released_tokens)
+            self._complete_collector_fire(
+                collector_name=collector_name,
+                group_id=group_id,
+                consumed_tokens=tuple(outcome.consumed_tokens),
+                scope_row_id=scope_row_id,
+                release=release,
+                group_losses=self._take_pending_group_losses(),
+            )
+            if release.sink_results:
+                return BarrierIntakeDisposition(
+                    kind=BarrierIntakeDispositionKind.PENDING_SINK,
+                    results=tuple(replace(result, scheduler_pending_sink=True) for result in release.sink_results),
+                )
+            return BarrierIntakeDisposition(
+                kind=BarrierIntakeDispositionKind.READY_CONTINUATION,
+                child_items=release.items,
+            )
+
+        if outcome.failure_reason:
+            self.note_group_failed(closer_name=str(collector_name), group_id=group_id, reason=outcome.failure_reason)
+            consumed_tokens = tuple(outcome.consumed_tokens)
+            failure_child_items: list[WorkItem] = []
+            cascaded_results = self._record_group_member_terminals(
+                consumed_tokens,
+                failure_reason=outcome.failure_reason,
+                child_items=failure_child_items,
+                group_failed=True,
+            )
+            if consumed_tokens:
+                self._scheduler.mark_blocked_barrier_terminal(
+                    run_id=self._run_id,
+                    barrier_key=barrier_key,
+                    token_ids=tuple(token.token_id for token in consumed_tokens),
+                    now=self._clock.now_utc(),
+                    coordination_token=self._require_coordination_token(),
+                    release_context={
+                        "reason": outcome.failure_reason,
+                        "released_by": self._scheduler_lease_owner,
+                        "scope_row_id": scope_row_id,
+                    },
+                    group_losses=self._take_pending_group_losses(),
+                )
+            failure_results: list[RowResult] = []
+            for consumed in consumed_tokens:
+                self._emit_token_completed(consumed, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
+                failure_results.append(
+                    RowResult(
+                        token=consumed,
+                        final_data=consumed.row_data,
+                        outcome=TerminalOutcome.FAILURE,
+                        path=TerminalPath.UNROUTED,
+                        error=FailureInfo(exception_type="CollectorGroupFailure", message=outcome.failure_reason),
+                    )
+                )
+            return BarrierIntakeDisposition(
+                kind=BarrierIntakeDispositionKind.TERMINAL,
+                results=(*failure_results, *cascaded_results),
+                child_items=tuple(failure_child_items),
+            )
+
+        if outcome.closed_without_plugin is not None and not outcome.consumed_tokens:
+            return None
+
+        raise OrchestrationInvariantError(
+            f"CollectorOutcome for collector '{collector_name}' group {group_id!r} is in invalid state: "
+            f"held={outcome.held}, released={len(outcome.released_tokens)}, consumed={len(outcome.consumed_tokens)}, "
+            f"failure_reason={outcome.failure_reason!r}, closed_without_plugin={outcome.closed_without_plugin!r}"
+        )
+
     def _fire_coalesce_merge(
         self,
         coalesce_name: CoalesceName,
@@ -828,22 +999,33 @@ class BarrierIntakeCoordinator:
             )
         return row_id
 
-    def _replay_group_losses(self) -> list[BarrierIntakeDisposition]:
+    def _replay_group_losses(self, ctx: PluginContext | None) -> list[BarrierIntakeDisposition]:
         """spec §6.2 loss intake: mark unadopted durable losses, replay into memory.
 
         Journal-first: the fenced cursor mark commits BEFORE the in-memory
         replay — a crash between mark and replay loses nothing because the
         takeover restore derives lost_branches from the FULL loss table. For
-        ordinary N=1 claim dispositions the replay arm is structurally
-        idle: the producer already notified in-claim (record-then-notify), so
-        ``has_recorded_branch_loss`` (or the executor's completed-keys check)
-        dedups every row. Empty aggregation is the deliberate exception: it
-        stages without notifying, commits the loss with its own barrier, then
-        calls this intake seam so downstream consequences cannot precede the
-        durable loss.
+        ordinary N=1 claim dispositions the coalesce/row_union replay arms
+        are structurally idle: the producer already notified in-claim
+        (record-then-notify), so ``has_recorded_branch_loss`` (or the
+        executor's completed-keys check) dedups every row. Empty aggregation
+        is the deliberate exception: it stages without notifying, commits the
+        loss with its own barrier, then calls this intake seam so downstream
+        consequences cannot precede the durable loss.
+
+        The COLLECTOR arm is the second such exception, by design: the
+        in-claim settle seam carries no ``PluginContext`` and a collector
+        loss can complete a roster and flush, so the producer only STAGES
+        and this replay — which has ``ctx`` — is the one in-memory notify.
+        Its dedup predicate is ``CollectorExecutor.has_replayed_member_loss``
+        (in-memory only: a takeover restore rebuilds ``pending.lost`` from
+        the FULL ledger, adopted losses included, and this replay must not
+        re-notify those) — never ``has_recorded_member_loss``, whose durable
+        ledger fallback reports the very loss being replayed as already
+        recorded and would make this arm a permanent no-op.
         """
         dispositions: list[BarrierIntakeDisposition] = []
-        if self._coalesce_executor is None and self._row_union_executor is None:
+        if self._coalesce_executor is None and self._row_union_executor is None and self._collector_executor is None:
             return dispositions
         losses = self._scheduler.list_unadopted_group_losses(run_id=self._run_id)
         if not losses:
@@ -855,8 +1037,35 @@ class BarrierIntakeCoordinator:
             now=self._clock.now_utc(),
             coordination_token=coordination_token,
         )
+        collector_names = {str(name) for name in self._collector_node_ids}
         for loss in losses:
             row_id = self._row_id_for_loss(loss)
+            if loss.closer_name in collector_names:
+                if self._collector_executor is None:
+                    raise OrchestrationInvariantError(
+                        f"Durable group loss {loss.loss_id!r} targets collector {loss.closer_name!r}, but no collector executor is configured."
+                    )
+                if ctx is None:
+                    raise OrchestrationInvariantError(
+                        f"Durable group loss {loss.loss_id!r} targets collector {loss.closer_name!r} on a replay path "
+                        "with no PluginContext (the empty-aggregation flush); ruling 25 makes an aggregation member "
+                        "inside a bound region unbuildable, so this loss should not exist. Engine/builder bug."
+                    )
+                if self._collector_executor.has_replayed_member_loss(loss.closer_name, loss.group_id, loss.member_key):
+                    continue
+                collector_outcome = self._collector_executor.notify_member_lost(
+                    loss.closer_name,
+                    loss.group_id,
+                    loss.member_key,
+                    loss.reason,
+                    ctx,
+                )
+                if collector_outcome is None:
+                    continue
+                collector_disposition = self._dispose_collector_outcome(collector_outcome, scope_row_id=row_id)
+                if collector_disposition is not None:
+                    dispositions.append(collector_disposition)
+                continue
             if loss.closer_name in {str(name) for name in self._row_union_node_ids}:
                 if self._row_union_executor is None or self._complete_row_union_fire is None:
                     raise OrchestrationInvariantError(
@@ -974,9 +1183,17 @@ class BarrierIntakeCoordinator:
             )
         return dispositions
 
-    def replay_durable_group_losses(self) -> tuple[BarrierIntakeDisposition, ...]:
-        """Replay committed loss-ledger entries after their producer commits."""
-        return tuple(self._replay_group_losses())
+    def replay_durable_group_losses(self, ctx: PluginContext | None = None) -> tuple[BarrierIntakeDisposition, ...]:
+        """Replay committed loss-ledger entries after their producer commits.
+
+        The one caller without a ``ctx`` is the empty-aggregation flush
+        (``RowProcessor._complete_aggregation_flush``): ruling 25 bans an
+        aggregation inside any bound region, so its members carry no bound
+        frame and it can stage no collector loss — the collector arm below
+        fails closed if that ever stops being true, rather than flushing
+        with a context it does not have.
+        """
+        return tuple(self._replay_group_losses(ctx))
 
     # ─────────────────────────────────────────────────────────────────────
     # Escalation — intake-only, verdicts wait for settlement (spec §6.3, Task 8)
@@ -1237,10 +1454,14 @@ class BarrierRecoveryCoordinator:
         ) = None,
         complete_committed_aggregation_output: Callable[[_PreparedAggregationRoute], None] | None = None,
         complete_committed_coalesce_residual: Callable[[CommittedCoalesceResidual, Sequence[TokenWorkItem]], None] | None = None,
+        collector_executor: CollectorExecutor | None = None,
+        collector_node_ids: Mapping[CollectorName, NodeID] | None = None,
     ) -> None:
         self._run_id = run_id
         self._scheduler = scheduler
         self._barrier_restore_reads = barrier_restore_reads
+        self._collector_executor = collector_executor
+        self._collector_node_ids: Mapping[CollectorName, NodeID] = collector_node_ids or {}
         self._execution = execution
         self._aggregation_executor = aggregation_executor
         self._coalesce_executor = coalesce_executor
@@ -1322,9 +1543,11 @@ class BarrierRecoveryCoordinator:
                 "The journal restore partition cannot disambiguate BLOCKED rows for these keys."
             )
 
+        collector_names: set[str] = {str(name) for name in self._collector_node_ids}
         agg_items_by_node: dict[NodeID, list[TokenWorkItem]] = {}
         coalesce_items: list[TokenWorkItem] = []
         row_union_items: list[TokenWorkItem] = []
+        collector_items: list[TokenWorkItem] = []
         intake_pending_count = 0
         for item in items:
             if item.barrier_key is None:  # pragma: no cover - excluded by the query contract
@@ -1332,7 +1555,25 @@ class BarrierRecoveryCoordinator:
                     f"list_blocked_barrier_items returned a row without barrier_key "
                     f"(work_item_id={item.work_item_id!r}, run {self._run_id!r})."
                 )
-            if (
+            # A collector row is recognised by its CURSOR (its compound
+            # collector:<name>:<group_id> key cannot sit in a name set), and
+            # the key must agree with that cursor plus the row's own EXPAND
+            # frame — the same two-authority check the live intake applies.
+            is_collector_row = item.collector_name is not None and item.collector_name in collector_names
+            if is_collector_row:
+                frame = item.lineage_path[-1] if item.lineage_path else None
+                expected_key = (
+                    collector_barrier_key(str(item.collector_name), frame.group_id)
+                    if frame is not None and frame.kind is FrameKind.EXPAND
+                    else None
+                )
+                if item.barrier_key != expected_key:
+                    raise AuditIntegrityError(
+                        f"BLOCKED collector journal row for token {item.token_id!r} (run {self._run_id!r}) carries "
+                        f"barrier_key {item.barrier_key!r} but its cursor {item.collector_name!r} and lineage "
+                        f"{item.lineage_path!r} derive {expected_key!r}; journal corruption — refusing to resume."
+                    )
+            elif (
                 item.barrier_key not in coalesce_keys
                 and item.barrier_key not in row_union_keys
                 and item.barrier_key not in aggregation_keys
@@ -1340,8 +1581,9 @@ class BarrierRecoveryCoordinator:
                 raise AuditIntegrityError(
                     f"BLOCKED journal row for token {item.token_id!r} (run {self._run_id!r}, resume "
                     f"checkpoint {restore.resume_checkpoint_id!r}) carries orphan barrier_key "
-                    f"{item.barrier_key!r}: not a configured coalesce ({sorted(coalesce_keys)}) "
-                    f"row_union ({sorted(row_union_keys)}), or aggregation node ({sorted(aggregation_keys)}). The journal references a "
+                    f"{item.barrier_key!r} (collector_name={item.collector_name!r}): not a configured coalesce "
+                    f"({sorted(coalesce_keys)}), row_union ({sorted(row_union_keys)}), aggregation node "
+                    f"({sorted(aggregation_keys)}), or collector ({sorted(collector_names)}). The journal references a "
                     "barrier this pipeline no longer has — refusing to resume."
                 )
             if item.barrier_adopted_epoch is None:
@@ -1353,7 +1595,9 @@ class BarrierRecoveryCoordinator:
                 # intake, which adopts it under THIS leader's epoch.
                 intake_pending_count += 1
                 continue
-            if item.barrier_key in coalesce_keys:
+            if is_collector_row:
+                collector_items.append(item)
+            elif item.barrier_key in coalesce_keys:
                 coalesce_items.append(item)
             elif item.barrier_key in row_union_keys:
                 row_union_items.append(item)
@@ -1368,7 +1612,16 @@ class BarrierRecoveryCoordinator:
         # Adopted rows only from here down: derivations (attempt offsets,
         # batch ids, hold state ids) cover restored memory, not intake-pending
         # rows.
-        items = [*coalesce_items, *row_union_items, *(item for node_items in agg_items_by_node.values() for item in node_items)]
+        items = [
+            *coalesce_items,
+            *row_union_items,
+            *collector_items,
+            *(item for node_items in agg_items_by_node.values() for item in node_items),
+        ]
+        if collector_items and self._collector_executor is None:
+            raise OrchestrationInvariantError(
+                f"Journal has {len(collector_items)} adopted BLOCKED collector rows but no CollectorExecutor is configured."
+            )
         if coalesce_items and self._coalesce_executor is None:
             raise OrchestrationInvariantError(
                 f"Journal has {len(coalesce_items)} BLOCKED coalesce rows but no CoalesceExecutor is configured."
@@ -2078,6 +2331,30 @@ class BarrierRecoveryCoordinator:
             outcomes = self._row_union_executor.restore_from_journal(entries=restore_entries)
             for outcome in outcomes:
                 self._commit_restored_row_union_outcome(outcome)
+
+        if collector_items and self._collector_executor is not None:
+            # Collector holds: every arrival journals an OPEN node_state at
+            # the collector node (canon item 11); a token with none is a
+            # post-closure residual the executor's restorer drops itself.
+            # The executor rebuilds each group's losses from the FULL ledger
+            # itself (WS4 fix-round #2), and parks any roster that is already
+            # complete for the PluginContext-bearing
+            # CollectorExecutor.flush_restored_complete_groups(ctx) sweep —
+            # that sweep, and the crash-between-collect_tokens-and-
+            # complete_barrier residual completion (the coalesce/aggregation
+            # residual seams' collector twin), are the resume integration's
+            # (Phase 2) and are NOT wired here.
+            collector_state_ids = self._barrier_restore_reads.get_open_node_state_ids(
+                self._run_id,
+                node_ids=[str(node_id) for node_id in self._collector_node_ids.values()],
+                token_ids=[item.token_id for item in collector_items],
+            )
+            self._collector_executor.restore_from_journal(
+                items=collector_items,
+                state_ids=collector_state_ids,
+                attempt_offsets=attempt_offsets,
+                resume_checkpoint_id=restore.resume_checkpoint_id,
+            )
 
         for plan in agg_plans:
             self._aggregation_executor.restore_from_journal(

@@ -71,6 +71,7 @@ from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
 from elspeth.engine.executors import GateOutcome
@@ -10784,21 +10785,20 @@ class TestReadyEmissionEnqueueParity:
             assert path_branch_name(emitted_path) == "path_a"
             assert path_fork_group_id(emitted_path) == "fork-1"
         elif flavor == "collector_cursor":
-            # WS4 Task 6: processor.py/scheduler_drain.py are NOT wired to
-            # collector DISPATCH yet (META-4/META-14.3 deferred that to the
-            # WS3+WS4 integration item) — neither _queue_key_for_blocked_item
-            # nor _barrier_key_for_blocked_item know about collector_name, so
-            # a collector-bound item derives queue_key/barrier_key EXACTLY
-            # like a plain structural-queue item today. That gap is separate
-            # from field FORWARDING and is untouched by this flip.
+            # A barrier-bound item never derives a structural queue key, and
+            # the collector's durable barrier key is the COMPOUND address
+            # (collector_barrier_key: one collector spans many concurrent
+            # EXPAND groups) built from the cursor and the token's own
+            # innermost EXPAND frame — the writer the WS3+WS4 integration
+            # item 1 landed in _barrier_key_for_blocked_item.
             #
             # collector_name forwarding landed at 02aa2ba6b (WS3): both the
             # emission side (ready_emission/_ready_work_item_values) and the
             # enqueue side (scheduler_drain.py's enqueue_ready call) now
             # derive the real value — assert both, not just the emission
             # side, so a regression on either lane fails here.
-            assert values_from_emission["queue_key"] == str(continue_node)
-            assert values_from_emission["barrier_key"] is None
+            assert values_from_emission["queue_key"] is None
+            assert values_from_emission["barrier_key"] == collector_barrier_key("stitch", "expand-1")
             assert values_from_emission["coalesce_node_id"] is None
             assert values_from_emission["coalesce_name"] is None
             assert values_from_emission["row_union_name"] is None

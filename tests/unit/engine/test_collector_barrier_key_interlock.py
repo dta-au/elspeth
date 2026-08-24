@@ -1,62 +1,51 @@
-"""WS4 Task 6 / META-14.2 (C-2): the collector barrier_key interlock.
+"""WS4 Task 6 / META-14.2's collector barrier_key interlock — CONVERTED by the
+WS3+WS4 integration (item 15) when the first production writer landed.
 
 ``collector_barrier_key(name, group_id)`` (core/landscape/scheduler/
-work_items.py) is THE single named construction site for the compound
-"collector:<collector_name>:<group_id>" address (spec §4.3) — landed as a
-CONSTANT/CONVENTION by this task, but no production writer calls it yet:
-the WS3+WS4 integration item's intake arm (BarrierIntakeCoordinator) and
-the processor's mark_blocked call for collector arrivals are the writers,
-and neither is wired until then (META-4/META-10.1/META-14.3).
+work_items.py) is THE single construction site for the compound
+"collector:<collector_name>:<group_id>" address (spec §4.3). Before
+integration this file pinned that NO production writer existed and that
+``BarrierIntakeCoordinator``'s classifier refused such a row as an orphan.
+Both halves flipped in the same commit as the writer, per the self-destruct
+note the original tests carried:
 
-This makes today's accidental "no collector barrier_key row can exist"
-property into an EXPLICIT, pinned interlock (the accidental interlock
-"becomes EXPLICIT" per the META-14 ruling):
-
-1. test_no_production_writer_of_collector_barrier_keys_exists_yet — a
-   whole-tree canary. I-2 (fix round) added a scan for CALLS to
-   collector_barrier_key, since a helper call, however the arguments are
-   computed, evades the ORIGINAL literal/f-string pattern match below. I-1
-   (fix-round-3 review): that addition must not have REPLACED the literal
-   scan — an inline f"collector:{name}:{group_id}" assigned to a
-   barrier_key-named target is exactly what the original scan caught, and
-   a helper-call-only scan misses it entirely. Both scans run; either
-   shape trips the canary.
-2. test_orphan_collector_barrier_key_is_the_current_fail_closed_state pins
-   that IF such a row existed today, BarrierIntakeCoordinator's intake
-   classifier (barrier_coordination.py's run_intake_pass, WS3-owned — this
-   comment lives here, not there, per the shared-checkout lane split) would
-   refuse it with an "orphan barrier_key" AuditIntegrityError, because the
-   classifier only recognizes configured coalesce/row_union/aggregation
-   keys — collector is not in its vocabulary pre-integration. This is the
-   CURRENT deliberate fail-closed state, not a bug: it is what stops a
-   would-be premature collector arrival from being silently misrouted
-   before the integration item's intake classifier arm lands. M-2 (fix
-   round): this test ALSO asserts BarrierIntakeCoordinator.__init__ has no
-   collector-shaped parameter yet, so it fails loudly — not silently
-   keeps "passing" for the wrong reason — the moment integration adds one,
-   even before anyone remembers to update this file's minimal fixture to
-   configure it.
-
-Both tests must be revisited together when integration wires a real
-collector barrier_key writer: (1) will start failing (by design — that is
-its whole purpose) and (2) will need a positive-path sibling once the
-classifier gains a collector arm.
+1. test_every_production_collector_barrier_key_goes_through_the_helper —
+   the no-writer canary's successor. Same two AST walks (a CALL to the helper
+   by name; a barrier_key= keyword / assignment built from a "collector:"
+   literal or f-string), but the call walk now pins the EXACT set of
+   production call sites and the literal walk stays a zero-tolerance
+   canary. A new writer must either go through the helper AND be
+   adjudicated into the expected set, or trip the literal walk — never
+   hand-build the address silently. Residual blind spots (concat,
+   ``.format()``, subscript targets) are closed by convention, not by this
+   scan; ``git grep`` the fragments if you suspect one.
+2. TestCollectorBarrierKeyIntake — the orphan-raise expectation's successor:
+   a collector BLOCKED row classifies to the collector arm (fenced adoption
+   with no batch membership, then ``CollectorExecutor.accept`` fed the
+   intake ``ctx``), and the fail-closed twin: a row whose cursor and
+   compound key disagree is refused as journal corruption.
 """
 
 from __future__ import annotations
 
 import ast
-import inspect
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from elspeth.contracts import TokenInfo
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.types import NodeID
+from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.types import CollectorName, NodeID
 from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
-from elspeth.engine.barrier_coordination import BarrierIntakeCoordinator
+from elspeth.engine.barrier_coordination import BarrierIntakeCoordinator, BarrierIntakeDispositionKind
 from elspeth.engine.clock import MockClock
+from elspeth.engine.executors.collector import CollectorOutcome
 from elspeth.engine.work_items import WorkItemFactory
 from tests.unit.engine.test_barrier_coordination import (
     FakeNav,
@@ -64,22 +53,33 @@ from tests.unit.engine.test_barrier_coordination import (
     RecordingScheduler,
     _batch_aware_transform,
     _blocked_row,
-    _ctx,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _AGG_NODE = NodeID("agg-node")
 _HELPER_NAME = collector_barrier_key.__name__
 
+# The adjudicated production call sites of the helper: (path, enclosing
+# function). Adding one is a deliberate edit here — the durable address has
+# exactly these producers/consumers and nowhere else.
+EXPECTED_HELPER_CALL_SITES = frozenset(
+    {
+        ("src/elspeth/engine/processor.py", "_maybe_collector_token"),
+        ("src/elspeth/engine/processor.py", "_barrier_key_for_blocked_item"),
+        ("src/elspeth/engine/processor.py", "_complete_collector_fire"),
+        ("src/elspeth/engine/barrier_coordination.py", "_adopt_collector_row"),
+        ("src/elspeth/engine/barrier_coordination.py", "_dispose_collector_outcome"),
+        ("src/elspeth/engine/barrier_coordination.py", "restore_from_journal"),
+    }
+)
+
 
 def _call_target_name(func: ast.expr) -> str | None:
     """The called symbol's bare name for a Name or Attribute call target, else None.
 
     Structural narrowing (isinstance over ast.expr's closed subclass set),
-    not a dynamic-attribute probe — mirrors _assignment_target_name's
-    reasoning below: only ast.Name.id (bare `collector_barrier_key(...)`)
-    and ast.Attribute.attr (`work_items.collector_barrier_key(...)`) are
-    read, each after the node's own type confirms the field exists.
+    not a dynamic-attribute probe: only ast.Name.id and ast.Attribute.attr
+    are read, each after the node's own type confirms the field exists.
     """
     if isinstance(func, ast.Name):
         return func.id
@@ -99,15 +99,7 @@ def _is_collector_prefixed_string(node: ast.expr) -> bool:
 
 
 def _assignment_target_name(target: ast.expr) -> str | None:
-    """The bound name for a simple or attribute assignment target, else None.
-
-    Structural narrowing (isinstance over ast.expr's closed subclass set),
-    not a dynamic-attribute probe: ast.Name.id and ast.Attribute.attr are
-    each accessed directly only after the node's own type confirms the
-    field exists. Subscript/Tuple/List/Starred targets (none of which are a
-    plausible "variable literally named barrier_key" shape for this
-    search's purpose) fall through to None rather than being probed.
-    """
+    """The bound name for a simple or attribute assignment target, else None."""
     if isinstance(target, ast.Name):
         return target.id
     if isinstance(target, ast.Attribute):
@@ -115,66 +107,83 @@ def _assignment_target_name(target: ast.expr) -> str | None:
     return None
 
 
-def test_no_production_writer_of_collector_barrier_keys_exists_yet() -> None:
-    """Scans every src/elspeth/**/*.py for EITHER shape of a collector
-    barrier_key construction: a CALL to collector_barrier_key (I-2, catches
-    a helper call however its arguments are computed), OR a barrier_key=
-    call-keyword / assignment built from a "collector:"-prefixed literal or
-    f-string (the ORIGINAL scan shape, restored ADDITIVELY per I-1,
-    fix-round-3 review — the call-site scan alone missed an inline
-    f"collector:{name}:{group_id}" assigned straight to a barrier_key-named
-    target, which is exactly the shape the original scan existed to catch).
-    The literal scan is deliberately narrow — core/dag/builder.py:723
-    legitimately builds an unrelated schema-error owner label
-    (f"collector:{collector_name}", not a barrier_key) that a naive
-    whole-string scan would false-positive on; only assignments/kwargs
-    literally named barrier_key count.
-    """
-    hits: list[tuple[str, int]] = []
+def _enclosing_function_name(tree: ast.AST, node: ast.AST) -> str:
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    cursor: ast.AST | None = node
+    while cursor is not None and not isinstance(cursor, ast.FunctionDef | ast.AsyncFunctionDef):
+        cursor = parents.get(cursor)
+    return cursor.name if isinstance(cursor, ast.FunctionDef | ast.AsyncFunctionDef) else "<module>"
+
+
+def test_every_production_collector_barrier_key_goes_through_the_helper() -> None:
+    """The helper's production call sites are exactly the adjudicated set,
+    and NO production code builds a collector barrier_key from a literal.
+    The literal walk is deliberately narrow — core/dag/builder.py builds an
+    unrelated schema-error owner label (f"collector:{collector_name}", not a
+    barrier_key) that a naive whole-string scan would false-positive on;
+    only assignments/kwargs literally named barrier_key count."""
+    helper_calls: set[tuple[str, str]] = set()
+    literal_hits: list[tuple[str, int]] = []
     for path in sorted((REPO_ROOT / "src" / "elspeth").rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
+        relative = str(path.relative_to(REPO_ROOT))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 if _call_target_name(node.func) == _HELPER_NAME:
-                    hits.append((str(path.relative_to(REPO_ROOT)), node.lineno))
+                    helper_calls.add((relative, _enclosing_function_name(tree, node)))
                     continue
                 for kw in node.keywords:
                     if kw.arg == "barrier_key" and _is_collector_prefixed_string(kw.value):
-                        hits.append((str(path.relative_to(REPO_ROOT)), node.lineno))
+                        literal_hits.append((relative, node.lineno))
             elif isinstance(node, ast.Assign | ast.AnnAssign):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 value = node.value
                 if value is not None and _is_collector_prefixed_string(value):
                     for target in targets:
                         if _assignment_target_name(target) == "barrier_key":
-                            hits.append((str(path.relative_to(REPO_ROOT)), node.lineno))
-    assert hits == [], (
-        "A production writer of collector barrier_keys now exists "
-        f"({hits!r}) — this interlock test's whole premise (no writer exists "
-        "pre-integration) is now false. It must be REMOVED (not weakened) in "
-        "the same commit that adds the writer, per META-14.2's self-destruct "
-        "note (integration worklist item 15): confirm the new writer's "
-        "barrier_key matches the collector:<name>:<group_id> convention and "
-        "that BarrierIntakeCoordinator's classifier gained a matching arm "
-        "(see test_orphan_collector_barrier_key_is_the_current_fail_closed_state "
-        "in this file for the fail-closed test it must supersede)."
+                            literal_hits.append((relative, node.lineno))
+    assert literal_hits == [], (
+        f"Production code hand-builds a collector barrier_key ({literal_hits!r}); "
+        f"call {_HELPER_NAME} (core/landscape/scheduler/work_items.py) instead — it is the single construction site."
+    )
+    assert helper_calls == EXPECTED_HELPER_CALL_SITES, (
+        f"{_HELPER_NAME} call sites drifted from the adjudicated set: "
+        f"added={sorted(helper_calls - EXPECTED_HELPER_CALL_SITES)!r}, "
+        f"removed={sorted(EXPECTED_HELPER_CALL_SITES - helper_calls)!r}. "
+        "Update EXPECTED_HELPER_CALL_SITES deliberately."
     )
 
 
-def _make_aggregation_only_coordinator(*, scheduler: RecordingScheduler) -> BarrierIntakeCoordinator:
-    """Minimal local construction, NOT test_barrier_coordination._make_coordinator.
+class RecordingCollectorExecutor:
+    """Collector executor double: records accept() calls, returns a fixed outcome."""
 
-    That helper (and its whole module) is WS3's actively-dirty lane —
-    reusing it directly hit a live mid-edit inconsistency
-    (BarrierIntakeCoordinator gained a new required
-    take_pending_group_losses parameter that _make_coordinator's own
-    call site had not caught up with yet, confirmed independently: WS3's
-    own test_barrier_coordination.py::TestIntakeFailClosed::test_orphan_barrier_key_raises
-    fails the same way at the time of writing). Only the fields the orphan-raise
-    path actually needs are supplied — aggregation-only, no coalesce/row_union
-    — trimmed from _make_coordinator's shape rather than duplicating its
-    full generality, to minimize this file's coupling to that module's churn.
-    """
+    def __init__(self, outcome: CollectorOutcome) -> None:
+        self.outcome = outcome
+        self.accepted: list[tuple[str, str, object, float]] = []
+
+    def accept(self, token: TokenInfo, collector_name: str, ctx: object, *, arrival_time: float) -> CollectorOutcome:
+        self.accepted.append((token.token_id, collector_name, ctx, arrival_time))
+        return self.outcome
+
+    def notify_member_lost(self, *args: object, **kwargs: object) -> CollectorOutcome | None:
+        raise AssertionError("not reached")
+
+
+def _collector_blocked_row(*, collector_name: str = "stitch", group_id: str = "g-1", barrier_key: str | None = None) -> TokenWorkItem:
+    row = _blocked_row(barrier_key=barrier_key if barrier_key is not None else collector_barrier_key(collector_name, group_id))
+    return replace(
+        row,
+        lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=group_id, member_key="tok-1"),),
+        collector_name=collector_name,
+    )
+
+
+def _make_collector_coordinator(
+    *,
+    scheduler: RecordingScheduler,
+    collector_executor: RecordingCollectorExecutor,
+) -> BarrierIntakeCoordinator:
+    """Minimal local construction: aggregation-only plus the collector plane."""
     resolved_nav = FakeNav(transform=_batch_aware_transform())
     restore_reads = SimpleNamespace(
         get_max_node_state_attempts=lambda run_id, token_ids: {},
@@ -205,36 +214,56 @@ def _make_aggregation_only_coordinator(*, scheduler: RecordingScheduler) -> Barr
         mark_coalesce_consumed_terminal=lambda *, coalesce_name, consumed_tokens: None,
         record_group_member_terminals=lambda *args, **kwargs: [],
         take_pending_group_losses=lambda: (),
+        collector_executor=collector_executor,  # type: ignore[arg-type]
+        collector_node_ids={CollectorName("stitch"): NodeID("collector-node")},
+        complete_collector_fire=lambda **kwargs: (_ for _ in ()).throw(AssertionError("not reached")),
+        route_collector_release=lambda **kwargs: (_ for _ in ()).throw(AssertionError("not reached")),
     )
 
 
-class TestCollectorBarrierKeyFailClosed:
-    def test_orphan_collector_barrier_key_is_the_current_fail_closed_state(self) -> None:
-        # M-2 (fix round): symmetric self-destruct. Without this, the test
-        # below would keep "passing" for the WRONG reason the moment
-        # integration adds collector support to BarrierIntakeCoordinator —
-        # _make_aggregation_only_coordinator's minimal fixture simply never
-        # populates a newly-added collector-shaped parameter, so the
-        # coordinator would fall through to this SAME orphan-raise for
-        # "not configured in THIS fixture" reasons rather than "not in the
-        # classifier's vocabulary at all" reasons. Assert the current
-        # constructor signature has no such parameter FIRST — this fails
-        # loudly the instant integration adds one, forcing a revisit of
-        # both the fixture and this test rather than a silent stale pass.
-        coordinator_params = set(inspect.signature(BarrierIntakeCoordinator.__init__).parameters)
-        collector_params = sorted(name for name in coordinator_params if "collector" in name)
-        assert not collector_params, (
-            f"BarrierIntakeCoordinator gained collector-shaped constructor parameter(s) "
-            f"{collector_params!r} — integration has wired collector support into the "
-            "classifier. _make_aggregation_only_coordinator must be updated to configure "
-            "it (mirroring aggregation_executor/coalesce_executor here), and this test's "
-            "orphan-raise expectation must be replaced with a positive-path collector-"
-            "adoption assertion — it is no longer testing the fail-closed state."
-        )
-
-        row = _blocked_row(barrier_key=collector_barrier_key("stitch", "g-1"))
+class TestCollectorBarrierKeyIntake:
+    def test_collector_blocked_row_is_adopted_by_the_collector_arm(self) -> None:
+        row = _collector_blocked_row()
         scheduler = RecordingScheduler(pending=[row])
-        coordinator = _make_aggregation_only_coordinator(scheduler=scheduler)
+        executor = RecordingCollectorExecutor(CollectorOutcome(held=True, collector_name="stitch", group_id="g-1"))
+        coordinator = _make_collector_coordinator(scheduler=scheduler, collector_executor=executor)
+        ctx = PluginContext(run_id="run-1", config={}, landscape=None)
+
+        outcome = coordinator.run_intake_pass(ctx)
+
+        assert scheduler.calls == ["list_pending", "adopt"]
+        assert [(token_id, name) for token_id, name, _ctx, _arrival in executor.accepted] == [("tok-1", "stitch")]
+        # The executor is fed the intake's OWN PluginContext, never one it constructs.
+        assert executor.accepted[0][2] is ctx
+        assert [d.kind for d in outcome.dispositions] == [BarrierIntakeDispositionKind.HELD]
+
+    def test_adoption_skip_does_not_feed_executor_memory(self) -> None:
+        row = _collector_blocked_row()
+        scheduler = RecordingScheduler(pending=[row], adopted=False)
+        executor = RecordingCollectorExecutor(CollectorOutcome(held=True, collector_name="stitch", group_id="g-1"))
+        coordinator = _make_collector_coordinator(scheduler=scheduler, collector_executor=executor)
+
+        outcome = coordinator.run_intake_pass(PluginContext(run_id="run-1", config={}, landscape=None))
+
+        assert scheduler.calls == ["list_pending", "adopt"]
+        assert executor.accepted == []
+        assert outcome.dispositions == ()
+
+    def test_cursor_and_compound_key_disagreement_fails_closed(self) -> None:
+        row = _collector_blocked_row(barrier_key="stitch")
+        scheduler = RecordingScheduler(pending=[row])
+        executor = RecordingCollectorExecutor(CollectorOutcome(held=True, collector_name="stitch", group_id="g-1"))
+        coordinator = _make_collector_coordinator(scheduler=scheduler, collector_executor=executor)
+
+        with pytest.raises(AuditIntegrityError, match="journal corruption"):
+            coordinator.run_intake_pass(PluginContext(run_id="run-1", config={}, landscape=None))
+        assert scheduler.calls == ["list_pending"]
+
+    def test_unconfigured_collector_cursor_is_still_an_orphan(self) -> None:
+        row = _collector_blocked_row(collector_name="ghost")
+        scheduler = RecordingScheduler(pending=[row])
+        executor = RecordingCollectorExecutor(CollectorOutcome(held=True, collector_name="stitch", group_id="g-1"))
+        coordinator = _make_collector_coordinator(scheduler=scheduler, collector_executor=executor)
 
         with pytest.raises(AuditIntegrityError, match="orphan barrier_key"):
-            coordinator.run_intake_pass(_ctx())
+            coordinator.run_intake_pass(PluginContext(run_id="run-1", config={}, landscape=None))

@@ -321,8 +321,15 @@ def _unscheduled_work_item(setup: RecorderSetup, *, sequence: int, collector_nam
         source_row_index=sequence,
         ingest_sequence=sequence,
     )
+    # A collector cursor always accompanies an EXPAND member (the compound
+    # barrier_key is derived from the cursor AND the innermost EXPAND frame).
+    lineage_path = (
+        () if collector_name is None else (LineageFrame(kind=FrameKind.EXPAND, group_id=f"eg-{sequence}", member_key=token.token_id),)
+    )
     return WorkItem(
-        token=TokenInfo(row_id=row.row_id, token_id=token.token_id, row_data=PipelineRow({"id": sequence}, _CONTRACT)),
+        token=TokenInfo(
+            row_id=row.row_id, token_id=token.token_id, row_data=PipelineRow({"id": sequence}, _CONTRACT), lineage_path=lineage_path
+        ),
         current_node_id=NodeID(NODE_ID),
         collector_name=collector_name,
     )
