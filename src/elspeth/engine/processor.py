@@ -3192,23 +3192,39 @@ class RowProcessor:
     ) -> list[RowResult]:
         """THE single settlement seam (spec §6.1) — now actually single.
 
-        Every REACHABLE terminal-disposition path either calls this or fails
-        closed at cause instead (2026-08-24 re-review N1: ruling 25 makes
-        one shape unreachable, not absent — the non-empty aggregation
-        flush's QUARANTINED_AT_SOURCE disposition raises OrchestrationInvariantError
-        at `_route_transform_results`'s quarantined loop rather than ever
-        reaching this method, because that path has no committed consumer
-        for a staged loss; see the raise site's comment). Every path that
-        DOES call this walks the failing token's lineage_path from the
-        INNERMOST frame outward to the FIRST BOUND frame and stages exactly
-        one GroupLossSpec for that frame's member (record-then-notify:
-        staged unconditionally, before any in-memory notify; the staged
-        record rides this claim's disposition transaction via
-        take_claim_group_losses, or the flush's complete_barrier). Inert
-        frames — no closer bound — are pure provenance and are skipped.
-        Followers stage the innermost bound loss only; the in-memory notify
-        is leader-only (each closer-kind arm no-ops without its executor —
-        see `_notify_closer_of_loss`).
+        Every terminal disposition that CAN CARRY A MEMBER LOSS either calls
+        this or fails closed at cause instead (2026-08-24 re-review N1,
+        tightened re-review round 2: the quantifier is scoped to what this
+        seam owns, not to every terminal disposition in the processor —
+        two classes of terminal disposition are excluded by design, not by
+        omission:
+          1. `_route_transform_results`'s `else` arm in the same quarantined
+             loop — (TRANSIENT, BATCH_CONSUMED) on a successful aggregation
+             flush's non-quarantined members. This is the NORMAL SUCCESS
+             path: it carries no loss at all and never inspects the
+             token's frames.
+          2. `CoalesceExecutor`'s three direct `record_token_outcome(FAILURE,
+             UNROUTED)` writes for held siblings consumed by an already-
+             settled loss (`coalesce_executor.py:855`, `:1071`, `:1275`) —
+             consequences of a loss this seam already staged and notified,
+             not member losses of their own. Task 6 retires these sites.
+        Within its actual scope — a disposition that COULD carry a member
+        loss — ruling 25 makes exactly one shape unreachable, not absent:
+        the non-empty aggregation flush's QUARANTINED_AT_SOURCE disposition
+        raises `OrchestrationInvariantError` at `_route_transform_results`'s
+        quarantined loop rather than ever reaching this method, because
+        that path has no committed consumer for a staged loss; see the
+        raise site's comment). Every path that DOES call this walks the
+        failing token's lineage_path from the INNERMOST frame outward to
+        the FIRST BOUND frame and stages exactly one GroupLossSpec for that
+        frame's member (record-then-notify: staged unconditionally, before
+        any in-memory notify; the staged record rides this claim's
+        disposition transaction via take_claim_group_losses, or the
+        flush's complete_barrier). Inert frames — no closer bound — are
+        pure provenance and are skipped. Followers stage the innermost
+        bound loss only; the in-memory notify is leader-only (each
+        closer-kind arm no-ops without its executor — see
+        `_notify_closer_of_loss`).
         """
         resolved = self._first_bound_frame(current_token)
         if resolved is None:

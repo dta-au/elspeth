@@ -372,12 +372,17 @@ class TestBranchLoss:
         assert outcome is None
         assert executor.has_recorded_branch_loss("variant_union", "row_1", "branch_a") is False
         data_flow.record_token_outcome.assert_not_called()
-        # 2026-08-24 re-review R2: the post-release notify_branch_lost call
-        # above must not overwrite the closure kind — a genuine straggler
-        # for this key is still reported against the release, not the
-        # branch loss it just no-op'd on. accept() checks the completed-key
-        # cache before branch validity, so a duplicate branch_name still
-        # reaches the late-arrival arm.
+        # 2026-08-24 re-review R2 (comment corrected re-review round 2 — the
+        # prior wording implied an ordering dependency that does not
+        # exist): the post-release notify_branch_lost call above must not
+        # overwrite the closure kind — a genuine straggler for this key is
+        # still reported against the release, not the branch loss it just
+        # no-op'd on. This probe reaches the late-arrival arm for two
+        # reasons, neither about check order: "branch_a" is a legitimately
+        # declared branch, so accept()'s branch-validity check passes on
+        # its own merits; and the release already deleted `_pending[key]`,
+        # so there is no held group left for this arrival to be a
+        # duplicate within.
         straggler = executor.accept(_make_token(token_id="tok_straggler", branch_name="branch_a"), "variant_union")
         assert straggler.failure_reason == "late_arrival_after_release"
 

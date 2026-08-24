@@ -9330,19 +9330,19 @@ class TestRowUnionBranchLossTelemetry:
         whether or not this worker holds a coalesce/row_union executor.
 
         A non-empty lineage_path is load-bearing here, not decorative — but
-        honestly scoped (2026-08-24 re-review R1): every assertion below is
+        honestly scoped (2026-08-24 re-review R1). Every assertion below is
         negative (`== []`, `assert_not_called()`, `== ()`), so this test
         alone still passes against a `_settle_member_losses` that returns
         `[]` unconditionally — no purely negative test rules that out. What
-        the surviving EXPAND frame actually kills is a MIS-RESOLVING walk:
-        one that resolves a frame it should not, or that routes an EXPAND
-        frame through the FORK-by-`member_key` index instead of
-        `binding_for`'s EXPAND-by-`group_id` arm (an empty path exercises
-        neither arm at all). The registered `variants` row_union binding
-        proves the registry itself is not just structurally empty. The
-        deleted-walk mutant this test cannot kill alone is covered by the
-        seam suite's positive tests and, in THIS class, by the immediately
-        adjacent `test_failure_closed_group_still_stages_durable_loss_follower`,
+        the surviving EXPAND frame actually kills is a walk that resolves a
+        frame it should not (a "return the first binding regardless"
+        mutant stages a spec, tripping `notify_branch_lost.assert_not_called()`
+        and `_take_claim_group_losses(...) == ()`); an empty path could
+        never exercise that kill at all, since it has nothing to resolve.
+        The deleted-walk mutant this test cannot kill alone is covered by
+        the seam suite's positive tests and, in THIS class, by the
+        immediately adjacent
+        `test_failure_closed_group_still_stages_durable_loss_follower`,
         which drives the same shape of registry and a FORK frame that DOES
         stage — together the pair supplies the differential a single
         negative test cannot.
