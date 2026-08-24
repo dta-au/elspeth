@@ -470,6 +470,30 @@ class SchedulerDrainCoordinator:
             if before_claim is not None:
                 before_claim()
 
+            # Ruling 44 (R2): the intake pass's arms drain staged escalations
+            # via take_pending_group_losses(), which — unlike
+            # take_claim_group_losses() — has no frame authentication against
+            # a claimed token; it is safe only because nothing is staged
+            # when an out-of-claim arm runs. That has been true by
+            # construction three times over (Rulings 38/39/42/43) but was
+            # never actually asserted, and this exact class of gap (a staged
+            # spec surviving past its intended drain point) is what each of
+            # those rounds fixed. Assert it here, at the one place every
+            # iteration passes through before any arm can drain: a non-empty
+            # buffer means an IN-claim path (take_claim_group_losses, or the
+            # empty-batch-flush drain at complete_barrier) left a staged spec
+            # behind instead of draining and committing it in its own
+            # transaction.
+            if self._pending_group_losses:
+                raise OrchestrationInvariantError(
+                    f"Barrier-intake pass entry found {len(self._pending_group_losses)} "
+                    "group loss(es) already staged before any out-of-claim arm ran "
+                    f"({self._pending_group_losses!r}). take_pending_group_losses() drains "
+                    "with no frame authentication (it trusts the buffer is empty on entry); "
+                    "an in-claim path must have staged a spec without draining it before "
+                    "releasing its claim. Processor/scheduler-drain bug."
+                )
+
             # ADR-030 §E.2 (slice 3): per-iteration journal-first intake —
             # adopt intake-pending BLOCKED barrier rows into executor memory,
             # replay durable branch losses (§E.5), release late arrivals

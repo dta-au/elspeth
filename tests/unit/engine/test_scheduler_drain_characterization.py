@@ -473,6 +473,35 @@ def test_recovery_drain_requires_token_before_lease_recovery() -> None:
     assert spy.calls_for("recover_expired_leases") == []
 
 
+def test_barrier_intake_pass_entry_refuses_a_stale_pending_group_loss() -> None:
+    """Ruling 44 (R2): take_pending_group_losses() — the callable every
+    barrier-intake-pass arm now drains through (Ruling 43) — has no frame
+    authentication against a claimed token, unlike take_claim_group_losses.
+    That is safe only because nothing is staged when an out-of-claim arm
+    runs; this was true by construction across Rulings 38/39/42/43 but
+    never actually asserted. A stale spec left behind by an in-claim path
+    that staged without draining before releasing its claim must be loud at
+    the very next intake pass, not silently swept up by the next
+    out-of-claim drain."""
+    processor, spy, setup, _clock = _build(lease_owner=LEADER_OWNER, bind_leader_token=True)
+    processor._pending_group_losses.append(
+        GroupLossSpec(
+            closer_name="merge",
+            group_id="fg-merge",
+            member_key="left",
+            token_id="tok-stale",
+            reason="leaked across a claim boundary",
+        )
+    )
+
+    spy.calls.clear()
+    with pytest.raises(OrchestrationInvariantError, match="Barrier-intake pass entry"):
+        processor.drain_scheduled_work(_ctx(setup))
+
+    # The guard fires before any claim is attempted.
+    assert spy.calls_for("claim_ready") == []
+
+
 def test_sink_bound_result_parks_pending_sink_with_fenced_owner_and_tags_result() -> None:
     """A sink-bound success parks the claim PENDING_SINK: lease owner kept,
     membership fence worker_id threaded, parked metadata mirrors the result,
@@ -713,17 +742,21 @@ def test_child_and_parent_disposition_roll_back_when_branch_loss_write_fails() -
     loss_frame = LineageFrame(kind=FrameKind.FORK, group_id="fg-merge", member_key="left")
     parent_work_item_id, parent_token = _enqueue_ready(setup, spy, clock, sequence=0, lineage_path=(loss_frame,))
     child_item = _unscheduled_work_item(setup, sequence=1)
-    processor._pending_group_losses.append(
-        GroupLossSpec(
-            closer_name="merge",
-            group_id=loss_frame.group_id,
-            member_key=loss_frame.member_key,
-            token_id=parent_token.token_id,
-            reason="test branch loss",
-        )
-    )
 
     def produce_child(**kwargs: Any) -> tuple[RowResult, list[WorkItem]]:
+        # Staged HERE, inside the simulated processing of the claimed item —
+        # matching real production ordering (Ruling 44's barrier-intake-pass
+        # entry guard now refuses a loss staged before this iteration's
+        # intake pass has even run).
+        processor._pending_group_losses.append(
+            GroupLossSpec(
+                closer_name="merge",
+                group_id=loss_frame.group_id,
+                member_key=loss_frame.member_key,
+                token_id=parent_token.token_id,
+                reason="test branch loss",
+            )
+        )
         return _dropped_result(kwargs["token"]), [child_item]
 
     with (
@@ -934,20 +967,24 @@ def test_lease_lost_mid_processing_abandons_result_and_writes_no_disposition() -
     mark_* disposition is issued for the abandoned claim."""
     processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
     work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=0)
-    # The lease-lost abandonment clears the staging list unconditionally
-    # (scheduler_drain.py's abandonment arms), never reaching the claim
-    # guard — a real frame match is not required here.
-    processor._pending_group_losses.append(
-        GroupLossSpec(
-            closer_name="merge",
-            group_id="fg-merge",
-            member_key="left",
-            token_id=token.token_id,
-            reason="staged before the lease was lost",
-        )
-    )
 
     def fake_process(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        # Staged HERE, inside the simulated processing of the claimed item —
+        # matching real production ordering (Ruling 44's barrier-intake-pass
+        # entry guard now refuses a loss staged before this iteration's
+        # intake pass has even run). The lease-lost abandonment clears the
+        # staging list unconditionally (scheduler_drain.py's abandonment
+        # arms), never reaching the claim guard — a real frame match is not
+        # required here.
+        processor._pending_group_losses.append(
+            GroupLossSpec(
+                closer_name="merge",
+                group_id="fg-merge",
+                member_key="left",
+                token_id=token.token_id,
+                reason="staged before the lease was lost",
+            )
+        )
         raise SchedulerLeaseLostError(work_item_id=work_item_id, lease_owner=LEADER_OWNER, run_id=setup.run_id)
 
     spy.calls.clear()
@@ -1002,18 +1039,22 @@ def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviv
     if surviving_peer:
         _register_worker(setup, "worker-peer")
     work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=0)
-    processor._pending_group_losses.append(
-        GroupLossSpec(
-            closer_name="merge",
-            group_id="fg-merge",
-            member_key="left",
-            token_id=token.token_id,
-            reason="staged before membership loss",
-        )
-    )
     refused_image: list[tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]] = []
 
     def fake_process(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        # Staged HERE, inside the simulated processing of the claimed item —
+        # matching real production ordering (Ruling 44's barrier-intake-pass
+        # entry guard now refuses a loss staged before this iteration's
+        # intake pass has even run).
+        processor._pending_group_losses.append(
+            GroupLossSpec(
+                closer_name="merge",
+                group_id="fg-merge",
+                member_key="left",
+                token_id=token.token_id,
+                reason="staged before membership loss",
+            )
+        )
         with setup.db.engine.begin() as conn:
             deleted = conn.execute(delete(run_workers_table).where(run_workers_table.c.worker_id == LEADER_OWNER))
         assert deleted.rowcount == 1

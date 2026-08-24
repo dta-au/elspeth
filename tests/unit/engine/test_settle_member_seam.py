@@ -302,6 +302,62 @@ def test_stage_group_loss_rejects_a_second_loss_for_the_same_bound_frame(process
         proc._settle_member_losses(token_b, "quarantined", [], notify_in_memory=False)
 
 
+def test_stage_group_loss_is_idempotent_for_an_identical_triple(processor_with_bindings) -> None:
+    """Ruling 42's idempotent-triple tolerance, pinned directly at the seam
+    (Ruling 44): staging the exact same (group_id, member_key, token_id)
+    triple twice — e.g. two independent observers noticing the identical
+    fact through different callers — is a duplicate OBSERVATION, not
+    corruption, and is a no-op rather than tripping the cross-token-id raise
+    pinned immediately above. Previously covered only end-to-end
+    (test_coalesce_sweep_escalation_durability.py); this was the reviewer's
+    residual "no direct unit coverage" note."""
+    proc = processor_with_bindings({("fg_inner", "path_a"): coalesce_binding("merge_inner")})
+    token = make_token(lineage_path=(INNER_FORK,), token_id="tok-a")
+    proc._settle_member_losses(token, "quarantined", [], notify_in_memory=False)
+    proc._settle_member_losses(token, "quarantined", [], notify_in_memory=False)
+    assert len(proc._pending_group_losses) == 1
+
+
+def test_record_group_member_terminals_settles_once_not_per_consumed_token(processor_with_bindings) -> None:
+    """Ruling 38 / C1's fix, pinned directly (Ruling 44 / R1). Consumed
+    siblings share their enclosing frame by construction (that is what
+    makes them siblings), so `_record_group_member_terminals` must run the
+    escalation walk ONCE per call, not once per consumed token — a
+    per-token loop stages the same (group_id, member_key) N times.
+
+    This can no longer be pinned by observing the DURABLE outcome: Ruling
+    42 taught `_stage_group_loss` to treat a repeated identical
+    (group_id, member_key, token_id) triple as an idempotent no-op, so a
+    regressed per-token loop now produces the exact same final staged/
+    committed state as the fix — both
+    `test_coalesce_sweep_escalation_durability.py` tests would stay green
+    against it. Counting the walk invocation directly closes that gap:
+    it reds on a per-token-loop regression even though idempotency masks
+    the durable outcome (verified via a throwaway revert of the dedupe,
+    per the project's committed-pin A/B discipline)."""
+    proc = processor_with_bindings({("fg_outer", "left"): coalesce_binding("merge_outer", member_key="left")})
+    token_a = make_token(lineage_path=(OUTER_FORK, INNER_FORK), token_id="tok-a")
+    token_b = make_token(lineage_path=(OUTER_FORK, INNER_FORK), token_id="tok-b")
+
+    with (
+        patch.object(proc, "_settle_member_losses", return_value=[]) as mock_settle,
+        patch.object(proc._data_flow, "record_token_outcome") as mock_record_token_outcome,
+    ):
+        proc._record_group_member_terminals(consumed_tokens=(token_a, token_b), failure_reason="quarantined", child_items=[])
+
+    assert mock_settle.call_count == 1
+    (remaining_token, reason, child_items), kwargs = mock_settle.call_args
+    assert remaining_token.token_id == "tok-a"
+    assert remaining_token.lineage_path == (OUTER_FORK,)
+    assert reason == "quarantined"
+    assert child_items == []
+    assert kwargs == {"escalated": True}
+    # Every consumed token still gets its own terminal write even though the
+    # walk itself is shared — the dedupe is scoped to the escalation walk,
+    # not the per-token terminal record.
+    assert mock_record_token_outcome.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # Collector arm: WS2 forbids building collector bindings until WS4's
 # executor registers, so this is unreachable in a built pipeline today — the
