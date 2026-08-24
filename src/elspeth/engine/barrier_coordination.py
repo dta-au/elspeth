@@ -282,6 +282,12 @@ class BarrierIntakeCoordinator:
         self._complete_collector_fire = complete_collector_fire
         self._route_collector_release = route_collector_release
         self._merged_continuation_cursor = merged_continuation_cursor
+        # META-31: a resumed processor's collector restore installs any
+        # roster that is already complete as PARKED (WS4 fix-round #2/#3);
+        # only the PluginContext-bearing sweep below can close it, and it
+        # must run AFTER the loss replay (I-7 order) — which is exactly this
+        # intake pass. Owed until the sweep call returns without raising.
+        self._collector_restore_sweep_owed: bool = resume_checkpoint_id is not None and collector_executor is not None
         # spec §6.3 (Task 8): parked closer FAIL verdicts awaiting settlement,
         # keyed on (closer_name, group_id). In-memory only — re-derivable at
         # takeover because replaying the durable losses re-fires the closer's
@@ -408,6 +414,7 @@ class BarrierIntakeCoordinator:
                     dispositions.append(disposition)
 
         dispositions.extend(self._replay_group_losses(ctx))
+        dispositions.extend(self._flush_restored_collector_groups(ctx))
         # spec §6.3 (Task 8) — escalation runs AFTER durable-loss replay, in
         # the SAME intake step: a note staged into the ledger THIS pass is
         # picked up by the NEXT pass's replay above (one-pass-per-drain-cycle
@@ -806,6 +813,33 @@ class BarrierIntakeCoordinator:
         )
         return self._dispose_collector_outcome(outcome, scope_row_id=row.row_id)
 
+    def _flush_restored_collector_groups(self, ctx: PluginContext) -> list[BarrierIntakeDisposition]:
+        """META-31: the post-restore flush sweep, once per resume, after the loss replay.
+
+        ``CollectorExecutor.flush_restored_complete_groups(ctx)`` closes
+        every group the restore parked with an already-complete roster —
+        completed by journaled arrivals, by ledger-rebuilt losses, or both —
+        and returns their outcomes, which are disposed exactly like a live
+        arrival's. The executor validates every parked key before closing
+        any, un-parks each only after its close succeeds, and STASHES the
+        outcomes already produced when a later close raises: on an
+        exception this method disposes nothing extra and propagates, the
+        sweep stays owed, and the next intake pass's retry delivers the
+        stashed outcomes first. Restore-without-sweep is the wedge the WS4
+        fix-round named — a parked group never settles otherwise.
+        """
+        if not self._collector_restore_sweep_owed or self._collector_executor is None:
+            return []
+        outcomes = self._collector_executor.flush_restored_complete_groups(ctx)
+        self._collector_restore_sweep_owed = False
+        dispositions: list[BarrierIntakeDisposition] = []
+        for outcome in outcomes:
+            scope_row_id = outcome.consumed_tokens[0].row_id if outcome.consumed_tokens else ""
+            disposition = self._dispose_collector_outcome(outcome, scope_row_id=scope_row_id)
+            if disposition is not None:
+                dispositions.append(disposition)
+        return dispositions
+
     def _unterminalized(self, tokens: Sequence[TokenInfo]) -> tuple[TokenInfo, ...]:
         """The subset of ``tokens`` with no completed terminal outcome yet."""
         missing: list[TokenInfo] = []
@@ -1035,12 +1069,12 @@ class BarrierIntakeCoordinator:
         The unified ``group_losses`` ledger row carries no ``row_id``, and
         every executor call in ``_replay_group_losses`` is already keyed on
         ``loss.group_id`` (WS4 re-keyed them; nothing transitional remains).
-        The only consumers left are the two replay fires' ``scope_row_id`` —
-        ``_complete_row_union_fire`` in the row_union arm and
-        ``_fire_coalesce_merge`` in the coalesce arm — a genuinely row-scoped
+        The only consumers left are the replay fires' ``scope_row_id`` (one
+        per closer-kind arm of ``_replay_group_losses`` — a deliberately
+        non-enumerating statement, C1 review M-1) — a genuinely row-scoped
         concept the ledger cannot supply, so this resolves it from the
-        token's durable ``tokens`` row (both arms need it: re-keying one arm
-        does not free the shim while the other still fires): an intake-path
+        token's durable ``tokens`` row (every arm needs it: re-keying one arm
+        does not free the shim while another still fires): an intake-path
         DB read (leader, once per unadopted loss), NOT the hot accounting
         path, so the pinned "never a DB query" commitment (§4.1) is
         untouched.
@@ -2391,13 +2425,12 @@ class BarrierRecoveryCoordinator:
             # the collector node (canon item 11); a token with none is a
             # post-closure residual the executor's restorer drops itself.
             # The executor rebuilds each group's losses from the FULL ledger
-            # itself (WS4 fix-round #2), and parks any roster that is already
-            # complete for the PluginContext-bearing
-            # CollectorExecutor.flush_restored_complete_groups(ctx) sweep —
-            # that sweep, and the crash-between-collect_tokens-and-
+            # itself (WS4 fix-round #2) and parks any roster that is already
+            # complete; BarrierIntakeCoordinator._flush_restored_collector_groups
+            # closes those on the first intake pass, after the loss replay
+            # (META-31, I-7 order). The crash-between-collect_tokens-and-
             # complete_barrier residual completion (the coalesce/aggregation
-            # residual seams' collector twin), are the resume integration's
-            # (Phase 2) and are NOT wired here.
+            # residual seams' collector twin) is Phase 2 and is NOT wired here.
             collector_state_ids = self._barrier_restore_reads.get_open_node_state_ids(
                 self._run_id,
                 node_ids=[str(node_id) for node_id in self._collector_node_ids.values()],

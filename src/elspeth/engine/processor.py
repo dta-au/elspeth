@@ -3243,6 +3243,21 @@ class RowProcessor:
         )
         return True, None
 
+    def _collector_node_for_cursor(self, collector_name: CollectorName) -> NodeID:
+        """The collector node a work-item cursor names, or a NAMED integrity error.
+
+        A cursor naming a collector this build does not configure is the
+        same two-authorities-disagree fact the intake and restore classifiers
+        refuse ("orphan" / journal corruption) — never a bare KeyError from
+        a subscript (C1 review M-2).
+        """
+        if collector_name not in self._collector_node_ids:
+            raise AuditIntegrityError(
+                f"Work item cursor names collector {collector_name!r} (run {self._run_id!r}) but this build configures "
+                f"only {sorted(str(name) for name in self._collector_node_ids)}; the cursor and the graph disagree."
+            )
+        return self._collector_node_ids[collector_name]
+
     def _maybe_collector_token(
         self,
         current_token: TokenInfo,
@@ -3264,7 +3279,7 @@ class RowProcessor:
         (``GroupBindingRegistry._expand_groups`` is process-local), so the
         durable cursor is the only authority that survives a hand-off.
         """
-        if collector_name is None or current_node_id != self._collector_node_ids[collector_name]:
+        if collector_name is None or current_node_id != self._collector_node_for_cursor(collector_name):
             return False, None
         frame = current_token.lineage_path[-1] if current_token.lineage_path else None
         if frame is None or frame.kind is not FrameKind.EXPAND:
@@ -4918,7 +4933,7 @@ class RowProcessor:
         mints them), so no work_item_id collision arises, but re-entering the
         collector would hold the release at the barrier it just left.
         """
-        collector_node_id = self._collector_node_ids[collector_name]
+        collector_node_id = self._collector_node_for_cursor(collector_name)
         continuation_node_id = self._nav.resolve_next_node(collector_node_id)
         if continuation_node_id is None:
             if collector_name not in self._collector_on_success_map:

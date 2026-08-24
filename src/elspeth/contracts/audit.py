@@ -1488,7 +1488,10 @@ _TERMINAL_PAIR_FIELD_CONSTRAINTS: dict[
     ),
     # join_group_id retired from token_outcomes (D2): the merge-event identity
     # lives only on the result token's tokens.join_group_id column (kept). A
-    # COALESCED outcome carries no discriminator beyond sink_name.
+    # COALESCED outcome carries no discriminator beyond sink_name. Collector
+    # members consumed into a release reuse this pair (META-32): sink_name
+    # None, the consumed-input shape is_counted_coalesced_output leaves
+    # uncounted — no collector-specific pair exists.
     (TerminalOutcome.SUCCESS, TerminalPath.COALESCED): TerminalPairFieldConstraints(
         forbidden=_forbid_except("sink_name"),
     ),

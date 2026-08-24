@@ -18,7 +18,7 @@ import pytest
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.enums import FrameKind
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.types import NodeID
 from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
@@ -154,3 +154,64 @@ def test_frame_for_a_group_never_minted_fails_closed() -> None:
     )
     with pytest.raises(AuditIntegrityError, match="group_records has no such group"):
         settling._first_bound_frame(ghost)
+
+
+def test_two_declared_opener_nodes_holding_the_opener_token_fail_closed() -> None:
+    """Deleting this raise takes candidates[0] and stages the loss against
+    the WRONG closer, silently (C3.5 review M-1)."""
+    _db, factory = _make_factory()
+    children, _group_id = _mint(factory, opener_node=OPENER, registry=_registry())
+    parent_id = f"parent-{OPENER}"
+    factory.execution.record_completed_node_state(
+        token_id=parent_id,
+        node_id=str(OTHER_OPENER),
+        run_id="test-run",
+        step_index=_STEPS[OTHER_OPENER],
+        input_data={"value": 1},
+        output_data={"value": 1},
+        duration_ms=1.0,
+    )
+    settling = _make_processor(factory, node_step_map=_STEPS, group_bindings=_registry())
+    with pytest.raises(AuditIntegrityError, match="holds node_states at 2 declared opener nodes"):
+        settling._first_bound_frame(children[0])
+
+
+def test_group_record_of_another_kind_fails_closed() -> None:
+    from types import SimpleNamespace
+
+    _db, factory = _make_factory()
+    children, group_id = _mint(factory, opener_node=OPENER, registry=_registry())
+    settling = _make_processor(factory, node_step_map=_STEPS, group_bindings=_registry())
+    fork_record = SimpleNamespace(run_id="test-run", group_id=group_id, kind="fork", opener_token_id="x", member_count=2)
+    with (
+        patch.object(settling._barrier_restore_reads, "get_group_record", return_value=fork_record),
+        pytest.raises(AuditIntegrityError, match="lineage/roster disagreement"),
+    ):
+        settling._first_bound_frame(children[0])
+
+
+def test_processor_without_a_restore_read_model_fails_closed_instead_of_stranding() -> None:
+    """The ExecutionRepository fallback has neither read; deleting this
+    raise silently reinstates the stranding bug for fallback-wired
+    processors."""
+    from elspeth.engine.processor import DAGTraversalContext, RowProcessor
+    from elspeth.engine.spans import SpanFactory
+    from tests.fixtures.landscape import make_recorder_with_run
+
+    setup = make_recorder_with_run(run_id="run-fallback", source_node_id="source-0")
+    processor = RowProcessor(
+        execution=setup.execution,
+        data_flow=setup.data_flow,
+        span_factory=SpanFactory(),
+        run_id=setup.run_id,
+        source_node_id=NodeID("source-0"),
+        source_on_success="default",
+        traversal=DAGTraversalContext(node_step_map={NodeID("source-0"): 0}, node_to_plugin={}, node_to_next={}, coalesce_node_map={}),
+        scheduler=setup.factory.scheduler,
+        group_bindings=_registry(),
+    )
+    token = make_token_info(
+        row_id="row-1", token_id="orphan", lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="g", member_key="m"),)
+    )
+    with pytest.raises(OrchestrationInvariantError, match="no barrier restore read model"):
+        processor._first_bound_frame(token)

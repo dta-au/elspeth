@@ -351,6 +351,11 @@ def build_row_processor(
                     f"Collector {collector_settings_entry.name!r} has no scopes: entry naming it as closer; "
                     "a collector cannot register without its scope binding (spec §7 rule 1)."
                 )
+            if collector_name not in collector_transform_map:
+                raise OrchestrationInvariantError(
+                    f"Collector {collector_settings_entry.name!r} (node {collector_node_map[collector_name]!r}) is in the graph's "
+                    "collector id map but has no transform instance in its collector transform map; the builder populates both together."
+                )
             collector_executor.register_collector(
                 collector_settings_entry,
                 scopes_by_closer[collector_settings_entry.name],
@@ -361,10 +366,11 @@ def build_row_processor(
                 # aggregation transform after its own is_batch_aware check.
                 cast(BatchTransformProtocol, collector_transform_map[collector_name]),
             )
-        # The row_union precedent stops at "settings present"; a settings list
-        # naming only SOME of the graph's collectors would register that
-        # subset and silently strand every group bound to the rest. Exact set
-        # equality, both directions.
+        # The row_union precedent stops at "settings present". The per-entry
+        # raise above already guarantees registered ⊆ graph; this equality
+        # covers the OTHER direction — a settings list naming only SOME of
+        # the graph's collectors would register that subset and silently
+        # strand every group bound to the rest. Both guards are load-bearing.
         registered = {CollectorName(name) for name in collector_executor.get_registered_names()}
         if registered != set(collector_node_map):
             raise OrchestrationInvariantError(

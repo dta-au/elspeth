@@ -948,7 +948,7 @@ class TokenTraversalEngine:
                     context=f"start of token processing for token '{token.token_id}'",
                 )
 
-        collector_node_id = self._processor._collector_node_ids[collector_name] if collector_name is not None else None
+        collector_node_id = self._processor._collector_node_for_cursor(collector_name) if collector_name is not None else None
         for barrier_node_id, barrier_name, barrier_kind in (
             (coalesce_node_id, coalesce_name, "coalesce"),
             (row_union_node_id, row_union_name, "row_union"),

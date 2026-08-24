@@ -107,6 +107,8 @@ mapping table below.
 | `ROUTED_ON_ERROR` | `True` | `FAILURE` | `ON_ERROR_ROUTED` | `rows_failed`, `rows_routed_failure` | Yes |
 | `DROPPED_BY_FILTER` | `True` | `SUCCESS` | `FILTER_DROPPED` | `rows_succeeded` | Yes |
 | `COALESCED` | `True` | `SUCCESS` | `COALESCED` | `rows_succeeded`, `rows_coalesced` (structural) | Predicate only (`rows_coalesced` not re-derived) |
+
+A consumed member of a closer's release — a coalesce branch input, and (META-32, 2026-08-25) a collector member consumed into its group's release — also carries `(SUCCESS, COALESCED)` but with `sink_name` NULL, and is deliberately uncounted (`is_counted_coalesced_output`); a collector's released output is an ordinary `(SUCCESS, DEFAULT_FLOW)` row, so a collector-only run leaves `rows_coalesced` at 0.
 | `FAILED` | `True` | `FAILURE` | `UNROUTED` | `rows_failed` | Yes |
 | `QUARANTINED` | `True` | `FAILURE` | `QUARANTINED_AT_SOURCE` | `rows_quarantined`, `rows_failed` | Yes |
 | `DIVERTED` (failsink) | `True` | `TRANSIENT` | `SINK_FALLBACK_TO_FAILSINK` | `rows_diverted` (structural) | No |

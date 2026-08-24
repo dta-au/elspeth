@@ -215,15 +215,22 @@ class _Recorder:
         self.route_calls: list[dict[str, object]] = []
         self.completed: list[tuple[str, TerminalOutcome, TerminalPath]] = []
         self.staged: list[GroupLossSpec] = []
+        # ONE ordered log across every recorded seam (C3 review I-1): the
+        # seam-before-fire ordering is the whole reason item 14 exists, and
+        # separate per-seam lists cannot see an interleaving change.
+        self.sequence: list[str] = []
 
     def record_group_member_terminals(self, consumed_tokens: tuple[TokenInfo, ...], **kwargs: object) -> list[RowResult]:
+        self.sequence.append("seam")
         self.seam_calls.append({"consumed": tuple(t.token_id for t in consumed_tokens), **kwargs})
         return []
 
     def complete_collector_fire(self, **kwargs: object) -> None:
+        self.sequence.append("fire")
         self.fire_calls.append(dict(kwargs))
 
     def route_collector_release(self, **kwargs: object) -> CollectorRelease:
+        self.sequence.append("route")
         self.route_calls.append(dict(kwargs))
         return self.release
 
@@ -242,6 +249,7 @@ def _coordinator(
     executor: object,
     recorder: _Recorder,
     data_flow: _RecordingDataFlow,
+    resume_checkpoint_id: str | None = None,
 ) -> BarrierIntakeCoordinator:
     nav = FakeNav(transform=_batch_aware_transform())
     return BarrierIntakeCoordinator(
@@ -264,7 +272,7 @@ def _coordinator(
         coordination_token=SimpleNamespace(worker_id="leader-1", epoch=1),
         scheduler_lease_owner="leader-1",
         live_barrier_holds={},
-        resume_checkpoint_id=None,
+        resume_checkpoint_id=resume_checkpoint_id,
         flush_batch=lambda node_id, transform, ctx, trigger_type: ((), []),
         complete_coalesce_fire=lambda **kwargs: None,
         terminal_coalesce_row_result=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("not reached")),
@@ -322,6 +330,9 @@ class TestDispatchRelease:
         assert tuple(t.token_id for t in fire["consumed_tokens"]) == ("tok-a", "tok-q", "tok-b")
         assert fire["release"] is recorder.release
         assert [spec.closer_name for spec in fire["group_losses"]] == ["merge_outer"]
+        # The uq_group_records_opener sustainer: member terminals land BEFORE
+        # the journal transition consumes the rows (coalesce_tokens' order).
+        assert recorder.sequence == ["seam", "route", "fire"]
         assert disposition is not None
         assert disposition.kind is BarrierIntakeDispositionKind.READY_CONTINUATION
         assert disposition.child_items == (continuation,)
@@ -469,3 +480,128 @@ class TestLossReplayArm:
         with pytest.raises(OrchestrationInvariantError, match="no PluginContext"):
             coordinator.replay_durable_group_losses()
         assert executor.notified == []
+
+
+class _SweepExecutor:
+    """Executor double for the post-restore sweep: returns each scripted
+    batch of outcomes per call; a scripted exception is raised on that call
+    (the real executor stashes undelivered outcomes and re-delivers on retry)."""
+
+    def __init__(self, script: list[tuple[CollectorOutcome, ...] | Exception]) -> None:
+        self.script = list(script)
+        self.calls: list[object] = []
+
+    def flush_restored_complete_groups(self, ctx: object) -> tuple[CollectorOutcome, ...]:
+        self.calls.append(ctx)
+        step = self.script.pop(0) if self.script else ()
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+    def has_replayed_member_loss(self, *args: object) -> bool:
+        return True
+
+    def accept(self, *args: object, **kwargs: object) -> CollectorOutcome:
+        raise AssertionError("not reached")
+
+
+class TestPostRestoreFlushSweep:
+    """META-31: a resumed processor's parked complete rosters are closed by
+    the PluginContext-bearing sweep on the first intake pass, AFTER the loss
+    replay, and disposed through the seam like a live outcome."""
+
+    def _failure(self) -> CollectorOutcome:
+        return CollectorOutcome(
+            held=False,
+            consumed_tokens=(_member("tok-a"),),
+            collector_name="stitch",
+            group_id="eg-1",
+            failure_reason="collector_missing_members",
+        )
+
+    def test_sweep_runs_once_after_replay_and_disposes_through_the_seam(self) -> None:
+        executor = _SweepExecutor(script=[(self._failure(),)])
+        recorder = _Recorder(release=CollectorRelease(items=(), sink_results=()))
+        scheduler = RecordingScheduler(pending=[], losses=[])
+        coordinator = _coordinator(
+            scheduler=scheduler, executor=executor, recorder=recorder, data_flow=_RecordingDataFlow(), resume_checkpoint_id="ckpt-1"
+        )
+        ctx = PluginContext(run_id="run-1", config={}, landscape=None)
+
+        first = coordinator.run_intake_pass(ctx)
+        second = coordinator.run_intake_pass(ctx)
+
+        assert executor.calls == [ctx]
+        assert [c["group_failed"] for c in recorder.seam_calls] == [True]
+        assert scheduler.calls == ["list_pending", "release", "list_pending"]
+        assert [d.kind for d in first.dispositions] == [BarrierIntakeDispositionKind.TERMINAL]
+        assert second.dispositions == ()
+
+    def test_sweep_is_not_owed_on_a_fresh_run(self) -> None:
+        executor = _SweepExecutor(script=[(self._failure(),)])
+        recorder = _Recorder(release=CollectorRelease(items=(), sink_results=()))
+        coordinator = _coordinator(
+            scheduler=RecordingScheduler(pending=[]), executor=executor, recorder=recorder, data_flow=_RecordingDataFlow()
+        )
+        coordinator.run_intake_pass(PluginContext(run_id="run-1", config={}, landscape=None))
+        assert executor.calls == []
+
+    def test_sweep_exception_propagates_and_stays_owed_for_the_retry(self) -> None:
+        executor = _SweepExecutor(script=[RuntimeError("flush plugin failed"), (self._failure(),)])
+        recorder = _Recorder(release=CollectorRelease(items=(), sink_results=()))
+        coordinator = _coordinator(
+            scheduler=RecordingScheduler(pending=[]),
+            executor=executor,
+            recorder=recorder,
+            data_flow=_RecordingDataFlow(),
+            resume_checkpoint_id="ckpt-1",
+        )
+        ctx = PluginContext(run_id="run-1", config={}, landscape=None)
+        with pytest.raises(RuntimeError, match="flush plugin failed"):
+            coordinator.run_intake_pass(ctx)
+        assert recorder.seam_calls == []
+        retry = coordinator.run_intake_pass(ctx)
+        assert len(executor.calls) == 2
+        assert [d.kind for d in retry.dispositions] == [BarrierIntakeDispositionKind.TERMINAL]
+
+
+class TestCollectorMemberCountersMeta32:
+    """META-32 (a): collector members consumed into a release carry
+    (SUCCESS, COALESCED) with sink_name None and are NOT counted; the release
+    is an ordinary (SUCCESS, DEFAULT_FLOW) success. So N members + 1 release
+    derive rows_succeeded == 1 and rows_coalesced == 0."""
+
+    def test_members_are_uncounted_and_the_release_counts_once(self) -> None:
+        from elspeth.contracts.audit import TokenRef
+        from elspeth.engine.orchestrator import run_status
+
+        factory, proc = _seam_processor()
+        members = (_member("tok-a"), _member("tok-b"), _member("tok-c"))
+        for token in members:
+            _persist_token_for_scheduler(factory, token)
+        proc._record_group_member_terminals(
+            members,
+            failure_reason="",
+            child_items=[],
+            group_failed=False,
+            frame_kind=FrameKind.EXPAND,
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.COALESCED,
+        )
+        released = make_token_info(row_id="row-1", token_id="tok-out")
+        _persist_token_for_scheduler(factory, released)
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id="tok-out", run_id="test-run"),
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+            sink_name="out",
+        )
+
+        _status, counters = run_status.derive_terminal_status_from_audit(factory, "test-run")
+        assert (counters.rows_succeeded, counters.rows_coalesced) == (1, 0)
+
+        # The discriminator is load-bearing: counting every (SUCCESS, COALESCED)
+        # row would tally the three members as outputs.
+        with patch.object(run_status, "is_counted_coalesced_output", return_value=True):
+            _status, mutated = run_status.derive_terminal_status_from_audit(factory, "test-run")
+        assert (mutated.rows_succeeded, mutated.rows_coalesced) == (4, 3)

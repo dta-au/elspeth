@@ -410,3 +410,20 @@ class TestNestedReleaseCursor:
             disposition = processor._barrier_intake._fire_coalesce_merge(CoalesceName("merge"), outcome, scope_row_id="row-1")
         assert disposition.child_items[0].collector_name == CollectorName("outer_stitch")
         assert [(e.collector_name, e.coalesce_name) for e in emitted] == [("outer_stitch", None)]
+
+
+class TestCollectorCursorLookup:
+    def test_cursor_naming_an_unconfigured_collector_is_a_named_integrity_error(self) -> None:
+        """C1 review M-2: every collector-cursor node lookup goes through one
+        helper that raises the intake/restore paths' named error, never a
+        bare KeyError from a subscript."""
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        processor, setup, _clock = _build(mode=ProcessorMode.LEADER, executor=_HoldingCollectorExecutor())
+        token = _expand_member(setup, sequence=7, group_id="g-7")
+        with pytest.raises(AuditIntegrityError, match="cursor names collector 'ghost'"):
+            processor._maybe_collector_token(token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=CollectorName("ghost"))
+        with pytest.raises(AuditIntegrityError, match="cursor names collector 'ghost'"):
+            processor.route_collector_release(collector_name=CollectorName("ghost"), released_tokens=(token,))
+        with pytest.raises(AuditIntegrityError, match="cursor names collector 'ghost'"):
+            processor._process_single_token(token, _ctx(setup), NodeID(COLLECTOR_NODE), collector_name=CollectorName("ghost"))
