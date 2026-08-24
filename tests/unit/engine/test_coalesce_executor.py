@@ -93,6 +93,16 @@ def _restore_reads_from_execution_double(execution: MagicMock) -> SimpleNamespac
     return SimpleNamespace(
         get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
         has_completed_row_for_node=execution.has_completed_row_for_node,
+        # WS4 Task 8: _check_landscape_for_completion now queries the
+        # group-keyed sibling. SimpleNamespace has no auto-attribute
+        # creation, so a production call the double doesn't bind raises
+        # AttributeError rather than silently stubbing a truthy default —
+        # this attribute must be present for accept()'s late-arrival path
+        # to run at all under the new keying.
+        has_completed_group_for_node=execution.has_completed_group_for_node,
+        # WS4 Task 10: restore_from_journal's completed-key reconstruction
+        # now queries the group-keyed sibling too.
+        get_completed_group_ids_for_nodes=execution.get_completed_group_ids_for_nodes,
     )
 
 
@@ -181,9 +191,21 @@ def _make_token(
     branch_name: str | None = "branch_a",
     data: dict[str, Any] | None = None,
     contract: SchemaContract | None = None,
-    fork_group_id: str = "fg-coalesce-test",
+    fork_group_id: str | None = None,
 ) -> TokenInfo:
-    """Build a TokenInfo suitable for coalesce testing."""
+    """Build a TokenInfo suitable for coalesce testing.
+
+    ``fork_group_id`` defaults to mirroring ``row_id`` (WS4 Task 8): the vast
+    majority of this file's tests vary ``row_id`` to express "a distinct
+    pending group" under the pre-Task-8 row-keyed scheme, and never override
+    ``fork_group_id`` — a fixed default there would collide every one of
+    them into ONE key under the new fork_group_id keying. The one test that
+    exercises TWO distinct fork groups sharing ONE row_id (the arch-M1
+    discriminator this task's Step 1 adds) passes ``fork_group_id``
+    explicitly and does not rely on this default.
+    """
+    if fork_group_id is None:
+        fork_group_id = row_id
     if data is None:
         data = {"amount": 100}
     if contract is None:
@@ -211,6 +233,16 @@ def _make_executor(
     # Tests that exercise Landscape-based restoration override this per-test.
     execution.get_completed_row_ids_for_nodes.return_value = set()
     execution.has_completed_row_for_node.return_value = False
+    # has_completed_group_for_node lives on BarrierRestoreReadModel, not on
+    # ExecutionRepository (spec-checked here), so it cannot be pulled off
+    # `execution` the way has_completed_row_for_node is — assign explicitly
+    # (spec=, unlike spec_set=, allows setting attributes absent from the
+    # spec class; only unset access is fenced) before
+    # _restore_reads_from_execution_double reads it below.
+    execution.has_completed_group_for_node = MagicMock(return_value=False)
+    # WS4 Task 10: restore's completed-key reconstruction now queries the
+    # group-keyed sibling too.
+    execution.get_completed_group_ids_for_nodes = MagicMock(return_value=set())
     data_flow = MagicMock(spec=DataFlowRepository)
     span_factory = _SpanFactorySentinel()
     token_manager = _TokenManagerDouble()
@@ -243,6 +275,16 @@ def _make_raw_executor(
     execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=_next_state_id())
     execution.get_completed_row_ids_for_nodes.return_value = set()
     execution.has_completed_row_for_node.return_value = False
+    # has_completed_group_for_node lives on BarrierRestoreReadModel, not on
+    # ExecutionRepository (spec-checked here), so it cannot be pulled off
+    # `execution` the way has_completed_row_for_node is — assign explicitly
+    # (spec=, unlike spec_set=, allows setting attributes absent from the
+    # spec class; only unset access is fenced) before
+    # _restore_reads_from_execution_double reads it below.
+    execution.has_completed_group_for_node = MagicMock(return_value=False)
+    # WS4 Task 10: restore's completed-key reconstruction now queries the
+    # group-keyed sibling too.
+    execution.get_completed_group_ids_for_nodes = MagicMock(return_value=set())
     data_flow = MagicMock(spec=DataFlowRepository)
     span_factory = _SpanFactorySentinel()
     token_manager = _TokenManagerDouble()
@@ -603,6 +645,50 @@ class TestAcceptBasics:
         token = _make_token(branch_name="a")
         outcome = executor.accept(token, "my_merge")
         assert outcome.coalesce_name == "my_merge"
+
+    def test_sibling_fork_groups_sharing_row_id_are_distinct_pending_groups(self):
+        """spec §5 (arch-M1): EXPAND siblings share row_id; each forks into the
+        same coalesce NODE as a DISTINCT concurrent FORK group. Under the old
+        (coalesce_name, row_id) key the second group's first arrival collides
+        with the first group's ("Duplicate arrival for branch 'left'"); under
+        the (coalesce_name, fork_group_id) key both merge independently.
+
+        Fork-INSIDE-fork (not an EXPAND base): every token also shares one
+        OUTER FORK frame (group_id="g-outer-shared") — this kills the mutant
+        that derives the key from the outermost FORK frame
+        (token.lineage_path[0]) instead of the innermost
+        (token.fork_group_id): under that mutant, family A's and family B's
+        "left" tokens would both resolve to the SAME outer group id and
+        collide on the second accept(), exactly the bug this test exists to
+        catch. A single-FORK-frame token can't distinguish the two readings.
+        """
+        executor, *_ = _make_executor()
+        executor.register_coalesce(_settings(name="merge_x", branches=["left", "right"]), "node_1")
+
+        def _sibling_token(token_id: str, fork_group_id: str, branch: str) -> TokenInfo:
+            outer = LineageFrame(kind=FrameKind.FORK, group_id="g-outer-shared", member_key="outer")
+            inner = LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch)
+            return TokenInfo(
+                row_id="row-1",
+                token_id=token_id,
+                row_data=make_row({"amount": 1}, contract=_make_contract(mode="FLEXIBLE")),
+                lineage_path=(outer, inner),
+            )
+
+        t_al = _sibling_token("t-al", "g-fork-a", "left")
+        t_ar = _sibling_token("t-ar", "g-fork-a", "right")
+        t_bl = _sibling_token("t-bl", "g-fork-b", "left")
+        t_br = _sibling_token("t-br", "g-fork-b", "right")
+
+        o1 = executor.accept(t_al, "merge_x")
+        assert o1.held is True
+        o2 = executor.accept(t_bl, "merge_x")  # OLD key: raises "Duplicate arrival for branch 'left'"
+        assert o2.held is True
+        merged_a = executor.accept(t_ar, "merge_x")
+        merged_b = executor.accept(t_br, "merge_x")
+        assert merged_a.merged_token is not None
+        assert merged_b.merged_token is not None
+        assert merged_a.merged_token.token_id != merged_b.merged_token.token_id
 
 
 # ===========================================================================
@@ -1924,7 +2010,10 @@ class TestContractHandling:
             row_id="row_1",
             token_id="t2",
             row_data=bad_row,
-            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-coalesce-test", member_key="b"),),
+            # group_id matches t1's _make_token(row_id="row_1") default
+            # fork_group_id (WS4 Task 8: defaults to mirroring row_id) so
+            # both tokens land in the SAME pending group, as the test intends.
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="row_1", member_key="b"),),
         )
         executor.accept(t1, "merge")
         with pytest.raises(OrchestrationInvariantError, match="has no contract"):
@@ -2249,6 +2338,8 @@ class TestDefaultClock:
 
         execution = MagicMock(spec=ExecutionRepository)
         execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id="s1")
+        execution.has_completed_group_for_node = MagicMock(return_value=False)
+        execution.get_completed_group_ids_for_nodes = MagicMock(return_value=set())
         executor = CoalesceExecutor(
             execution,
             _SpanFactorySentinel(),
@@ -2265,6 +2356,8 @@ class TestDefaultClock:
         clock = MockClock(start=42.0)
         execution = MagicMock(spec=ExecutionRepository)
         execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id="s1")
+        execution.has_completed_group_for_node = MagicMock(return_value=False)
+        execution.get_completed_group_ids_for_nodes = MagicMock(return_value=set())
         executor = CoalesceExecutor(
             execution,
             _SpanFactorySentinel(),
@@ -2803,15 +2896,21 @@ class TestLandscapeCompletedKeys:
         assert ("merge", "row_2") in executor._completed_keys
 
         # Late arrival for evicted row_0 — exact Landscape fallback should catch it
-        # without materializing every completed row for node_1.
+        # without materializing every completed group for node_1. Asserts
+        # WHICH read-model method fired (WS4 Task 8): a mutant that renames
+        # _check_landscape_for_completion's parameter to fork_group_id but
+        # leaves the body calling has_completed_row_for_node would pass a
+        # same-typed positional str and produce no crash — only this
+        # which-method assertion catches it.
         execution.reset_mock()
-        execution.has_completed_row_for_node.return_value = True
+        execution.has_completed_group_for_node.return_value = True
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_0")
         outcome = executor.accept(late, "merge")
 
         assert outcome.held is False
         assert outcome.failure_reason == "late_arrival_after_merge"
-        execution.has_completed_row_for_node.assert_called_once_with(run_id="run_1", node_id="node_1", row_id="row_0")
+        execution.has_completed_group_for_node.assert_called_once_with(run_id="run_1", node_id="node_1", group_id="row_0")
+        execution.has_completed_row_for_node.assert_not_called()
         execution.get_completed_row_ids_for_nodes.assert_not_called()
         # Key should now be in the FIFO cache (backfilled from Landscape)
         assert ("merge", "row_0") in executor._completed_keys
@@ -3021,14 +3120,14 @@ class TestRestoreFromJournal:
 
         executor.restore_from_journal(
             items=items,
-            scalars={("merge", "r1"): CoalescePendingScalars(lost_branches={"mid": "lost"})},
+            scalars={("merge", "fg-1"): CoalescePendingScalars(lost_branches={"mid": "lost"})},
             state_ids={"tA": "st-1", "tB": "st-2"},  # derived from node_states (Task 3.1's caller)
             attempt_offsets={"tA": 1, "tB": 1},  # max_attempt+1 discipline (D5)
             resume_checkpoint_id="cp-0",
             now=t0 + timedelta(seconds=10),
         )
 
-        pending = executor._pending[("merge", "r1")]
+        pending = executor._pending[("merge", "fg-1")]
         assert set(pending.branches) == {"left", "right"}
         assert pending.lost_branches == {"mid": "lost"}
         assert pending.branches["left"].state_id == "st-1"
@@ -3061,7 +3160,10 @@ class TestRestoreFromJournal:
         executor.register_coalesce(s, NodeID("co-1"))
 
         executor.restore_from_journal(
-            items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0)],
+            # fork_group_id matches _make_token's default fork_group_id
+            # mirror-of-row_id ("row_1") below, so the accept() lands in the
+            # SAME restored group (WS4 Task 10 re-key).
+            items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0, fork_group_id="row_1")],
             scalars={},
             state_ids={"t1": "st-1"},
             attempt_offsets={"t1": 2},
@@ -3081,7 +3183,9 @@ class TestRestoreFromJournal:
         executor.register_coalesce(s, NodeID("co-1"))
 
         executor.restore_from_journal(
-            items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="b", blocked_at=_JOURNAL_T0)],
+            # fork_group_id="row_1" matches both the scalars key below and
+            # the accept() call's default fork_group_id mirror (WS4 Task 10).
+            items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="b", blocked_at=_JOURNAL_T0, fork_group_id="row_1")],
             scalars={("merge", "row_1"): CoalescePendingScalars(lost_branches={"a": "error_routed"})},
             state_ids={"t1": "st-1"},
             attempt_offsets={"t1": 1},
@@ -3120,14 +3224,27 @@ class TestRestoreFromJournal:
         assert outcome.merged_token is not None
 
     def test_restore_from_journal_groups_items_per_pending_key(self) -> None:
-        """Items group by (coalesce_name, row_id) — keys restore independently."""
+        """Items group by (coalesce_name, fork_group_id) — keys restore independently."""
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
         executor.register_coalesce(_settings(name="other", branches=["a", "b"]), NodeID("co-2"))
+        # Distinct fork_group_id per intended-independent key — two items
+        # sharing coalesce_name AND fork_group_id would land in ONE group
+        # (that's the point of the arch-M1 fix); this test's point is the
+        # OPPOSITE (independent keys stay independent), so each of the three
+        # intended groups gets its own fork_group_id.
         items = [
-            _blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0),
-            _blocked_item(token_id="t2", row_id="row_2", branch_name="b", blocked_at=_JOURNAL_T0),
-            _blocked_item(token_id="t3", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0, coalesce_name="other", node_id="co-2"),
+            _blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0, fork_group_id="fg-1"),
+            _blocked_item(token_id="t2", row_id="row_2", branch_name="b", blocked_at=_JOURNAL_T0, fork_group_id="fg-2"),
+            _blocked_item(
+                token_id="t3",
+                row_id="row_1",
+                branch_name="a",
+                blocked_at=_JOURNAL_T0,
+                coalesce_name="other",
+                node_id="co-2",
+                fork_group_id="fg-1",
+            ),
         ]
 
         executor.restore_from_journal(
@@ -3139,7 +3256,7 @@ class TestRestoreFromJournal:
             now=_JOURNAL_T0,
         )
 
-        assert set(executor._pending) == {("merge", "row_1"), ("merge", "row_2"), ("other", "row_1")}
+        assert set(executor._pending) == {("merge", "fg-1"), ("merge", "fg-2"), ("other", "fg-1")}
 
     def test_restore_from_journal_missing_scalars_entry_means_no_lost_branches(self) -> None:
         """A pending key absent from scalars restores with empty lost_branches.
@@ -3159,7 +3276,8 @@ class TestRestoreFromJournal:
             now=_JOURNAL_T0,
         )
 
-        assert executor._pending[("merge", "row_1")].lost_branches == {}
+        # key is the item's fork_group_id (default "fg-journal-test").
+        assert executor._pending[("merge", "fg-journal-test")].lost_branches == {}
 
     def test_restore_from_journal_ignores_stale_scalars(self) -> None:
         """A completed scalars-only key is stale — ignored, never rejected.
@@ -3171,12 +3289,16 @@ class TestRestoreFromJournal:
         """
         executor, execution, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
-        execution.get_completed_row_ids_for_nodes.return_value = {("co-1", "row_gone")}
+        execution.get_completed_group_ids_for_nodes.return_value = {("co-1", "row_gone")}
 
         executor.restore_from_journal(
+            # First scalar key matches the item's default fork_group_id
+            # ("fg-journal-test") — the empty-lost_branches merge case; the
+            # second ("row_gone") is an independent, genuinely-stale key
+            # (WS4 Task 10).
             items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0)],
             scalars={
-                ("merge", "row_1"): CoalescePendingScalars(lost_branches={}),
+                ("merge", "fg-journal-test"): CoalescePendingScalars(lost_branches={}),
                 ("merge", "row_gone"): CoalescePendingScalars(lost_branches={"b": "lost"}),
             },
             state_ids={"t1": "s1"},
@@ -3186,7 +3308,7 @@ class TestRestoreFromJournal:
         )
 
         # Only the journal-backed key is restored; the stale key is dropped
-        assert set(executor._pending) == {("merge", "row_1")}
+        assert set(executor._pending) == {("merge", "fg-journal-test")}
 
     def test_restore_from_journal_clamps_wall_clock_backstep(self) -> None:
         """A wall-clock backward step must not put first_arrival in the monotonic future."""
@@ -3210,13 +3332,14 @@ class TestRestoreFromJournal:
             now=_JOURNAL_T0,  # wall clock stepped backward
         )
 
-        assert executor._pending[("merge", "row_1")].first_arrival == pytest.approx(100.0)
+        # key is the item's fork_group_id (default "fg-journal-test").
+        assert executor._pending[("merge", "fg-journal-test")].first_arrival == pytest.approx(100.0)
 
     def test_restore_from_journal_reconstructs_completed_keys_from_landscape(self) -> None:
         """Completed keys rebuild from the Landscape so late arrivals are detected post-resume."""
         executor, execution, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
-        execution.get_completed_row_ids_for_nodes.return_value = {("co-1", "row_0"), ("co-1", "row_9")}
+        execution.get_completed_group_ids_for_nodes.return_value = {("co-1", "row_0"), ("co-1", "row_9")}
 
         executor.restore_from_journal(
             items=[],
@@ -3239,7 +3362,7 @@ class TestRestoreFromJournal:
         """Restore seeds the FIFO cache through the bounded completion path."""
         executor, execution, _, _, _ = _make_executor(max_completed_keys=2)
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
-        execution.get_completed_row_ids_for_nodes.return_value = {("co-1", f"row_{i}") for i in range(5)}
+        execution.get_completed_group_ids_for_nodes.return_value = {("co-1", f"row_{i}") for i in range(5)}
 
         executor.restore_from_journal(
             items=[],
@@ -3421,8 +3544,13 @@ class TestRestoreFromJournal:
 
         with pytest.raises(AuditIntegrityError, match="both arrived and lost"):
             executor.restore_from_journal(
+                # Scalar key matches the item's default fork_group_id
+                # ("fg-journal-test") so the cross-check compares the SAME
+                # group's arrived vs. lost branches (WS4 Task 10) — a
+                # mismatched key would put them in separate groups and this
+                # raise would never fire.
                 items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0)],
-                scalars={("merge", "row_1"): CoalescePendingScalars(lost_branches={"a": "error_routed"})},
+                scalars={("merge", "fg-journal-test"): CoalescePendingScalars(lost_branches={"a": "error_routed"})},
                 state_ids={"t1": "s1"},
                 attempt_offsets={"t1": 1},
                 resume_checkpoint_id="cp-0",

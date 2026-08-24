@@ -11,31 +11,33 @@ Type hierarchy::
     BarrierScalars                          (top-level — serialized as barrier_scalars_json)
       aggregation: dict[str, AggregationNodeScalars]   keyed by aggregation node_id
       coalesce:    dict[tuple[str,str], CoalescePendingScalars]
-                                            keyed by (coalesce_name, row_id)
+                                            keyed by (coalesce_name, fork_group_id)
+                                            (WS4 Task 8/9 re-key, epoch/version 2.0 —
+                                            see BARRIER_SCALARS_VERSION below)
 
 Wire format (JSON column ``checkpoints.barrier_scalars_json``, epoch 20+)::
 
     {
-        "_version": "1.0",
+        "_version": "2.0",
         "aggregation": {
             "<node_id>": {
-                "_version": "1.0",
+                "_version": "2.0",
                 "count_fire_offset": <float|null>,
                 "condition_fire_offset": <float|null>
             },
             ...
         },
         "coalesce": [
-            [[<coalesce_name>, <row_id>], {"_version": "1.0", "lost_branches": {...}}],
+            [[<coalesce_name>, <fork_group_id>], {"_version": "2.0", "lost_branches": {...}}],
             ...
         ]
     }
 
 The ``coalesce`` dict serializes as a **list of [key, value] pairs** rather than
 a JSON object because JSON object keys must be strings and the coalesce key is a
-two-element ``[name, row_id]`` array.  Both ``name`` and ``row_id`` have no
-charset constraint (see ``CoalesceSettings.name`` in ``core/config.py``), so a
-delimiter-joined string approach would require escaping and is fragile.
+two-element ``[name, fork_group_id]`` array.  Both ``name`` and ``fork_group_id``
+have no charset constraint (see ``CoalesceSettings.name`` in ``core/config.py``),
+so a delimiter-joined string approach would require escaping and is fragile.
 
 Trust-tier notes
 ----------------
@@ -54,7 +56,7 @@ from typing import Any
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 
-BARRIER_SCALARS_VERSION = "1.0"
+BARRIER_SCALARS_VERSION = "2.0"
 
 
 def _validate_envelope(data: object, expected_keys: frozenset[str], type_name: str) -> dict[str, Any]:
@@ -167,7 +169,7 @@ class AggregationNodeScalars:
 
 @dataclass(frozen=True, slots=True)
 class CoalescePendingScalars:
-    """Scalar checkpoint state for one pending coalesce (coalesce_name, row_id) key.
+    """Scalar checkpoint state for one pending coalesce (coalesce_name, fork_group_id) key.
 
     Only the lost_branches record is stored — arrived-branch token payloads
     now live in journal BLOCKED rows; counters and state ids derive from audit
@@ -241,7 +243,7 @@ class BarrierScalars:
 
     Attributes:
         aggregation: Per-node trigger latch scalars, keyed by aggregation node_id.
-        coalesce: Per-pending-key scalars, keyed by ``(coalesce_name, row_id)``
+        coalesce: Per-pending-key scalars, keyed by ``(coalesce_name, fork_group_id)``
             tuples.  Both components have no charset constraint.
 
     Properties:
@@ -290,14 +292,14 @@ class BarrierScalars:
     def to_dict(self) -> dict[str, Any]:
         """Serialize to checkpoint column format.
 
-        The ``coalesce`` dict serializes as a list of ``[[name, row_id], scalars]``
-        pairs because JSON object keys must be strings and the coalesce key is a
-        two-element array.
+        The ``coalesce`` dict serializes as a list of ``[[name, fork_group_id],
+        scalars]`` pairs because JSON object keys must be strings and the
+        coalesce key is a two-element array.
         """
         return {
             "_version": BARRIER_SCALARS_VERSION,
             "aggregation": {node_id: scalars.to_dict() for node_id, scalars in self.aggregation.items()},
-            "coalesce": [[[name, row_id], scalars.to_dict()] for (name, row_id), scalars in self.coalesce.items()],
+            "coalesce": [[[name, fork_group_id], scalars.to_dict()] for (name, fork_group_id), scalars in self.coalesce.items()],
         }
 
     @classmethod
@@ -353,8 +355,8 @@ class BarrierScalars:
                     f"Corrupted BarrierScalars: coalesce[{i}] scalars must be a dict, got {type(raw_scalars).__name__}."
                 )
             coalesce_name: str = raw_key[0]
-            coalesce_row_id: str = raw_key[1]
-            coalesce_key = (coalesce_name, coalesce_row_id)
+            coalesce_group_id: str = raw_key[1]
+            coalesce_key = (coalesce_name, coalesce_group_id)
             # to_dict can never emit a duplicate key (it iterates a dict), so a
             # duplicate in the list-of-pairs is by-definition corruption — reject
             # rather than silently last-wins.

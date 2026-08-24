@@ -898,11 +898,11 @@ class BarrierIntakeCoordinator:
                 raise OrchestrationInvariantError(
                     f"Durable group loss {loss.loss_id!r} targets coalesce {loss.closer_name!r}, but no coalesce executor is configured."
                 )
-            if self._coalesce_executor.has_recorded_branch_loss(loss.closer_name, row_id, loss.member_key):
+            if self._coalesce_executor.has_recorded_branch_loss(loss.closer_name, loss.group_id, loss.member_key):
                 continue
             outcome = self._coalesce_executor.notify_branch_lost(
                 coalesce_name=loss.closer_name,
-                row_id=row_id,
+                fork_group_id=loss.group_id,
                 lost_branch=loss.member_key,
                 reason=loss.reason,
             )
@@ -1224,22 +1224,6 @@ class BarrierRecoveryCoordinator:
         self._prepare_committed_aggregation_output = prepare_committed_aggregation_output
         self._complete_committed_aggregation_output = complete_committed_aggregation_output
         self._complete_committed_coalesce_residual = complete_committed_coalesce_residual
-
-    def _row_id_for_loss(self, loss: GroupLoss) -> str:
-        """Resolve the transitional executor key's row_id from the loss's token.
-
-        Same resolution as :meth:`BarrierIntakeCoordinator._row_id_for_loss`
-        (spec §5/§6.2): the ledger row carries no ``row_id``; the durable
-        ``tokens`` row gives it. Restore-path read, not the hot accounting
-        path.
-        """
-        row_id = self._barrier_restore_reads.row_id_for_token(run_id=self._run_id, token_id=loss.token_id)
-        if row_id is None:
-            raise AuditIntegrityError(
-                f"Group-loss {loss.loss_id!r} names token {loss.token_id!r} with no durable tokens row; "
-                "the ledger references a token the audit trail never minted."
-            )
-        return row_id
 
     def restore_from_journal(self, restore: BarrierJournalRestoreContext) -> None:
         """Rebuild aggregation buffers and coalesce pendings from journal BLOCKED rows.
@@ -1850,8 +1834,15 @@ class BarrierRecoveryCoordinator:
             for loss in durable_group_losses:
                 if loss.closer_name in row_union_keys:
                     continue
-                row_id = self._row_id_for_loss(loss)
-                key = (loss.closer_name, row_id)
+                # WS4 Task 9 (C-2): keyed directly on loss.group_id — the
+                # durable group_losses ledger already carries the group id
+                # (group_losses.py:51), so no row_id translation is needed
+                # here any more. This key must agree with what Task 8's
+                # get_barrier_scalars() emits (fork_group_id-keyed) and what
+                # Task 10's CoalesceJournalRestorer groups journal items by
+                # (innermost FORK frame's group_id) — a mismatch on any one
+                # of the three silently drops a checkpointed/durable loss.
+                key = (loss.closer_name, loss.group_id)
                 existing = effective_coalesce_scalars[key] if key in effective_coalesce_scalars else None
                 lost_branches = dict(existing.lost_branches) if existing is not None else {}
                 checkpoint_reason = lost_branches[loss.member_key] if loss.member_key in lost_branches else None
@@ -1861,7 +1852,7 @@ class BarrierRecoveryCoordinator:
                         "loss ledger %r; the ledger wins",
                         checkpoint_reason,
                         loss.closer_name,
-                        row_id,
+                        loss.group_id,
                         loss.member_key,
                         loss.reason,
                     )

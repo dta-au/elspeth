@@ -79,6 +79,30 @@ def test_negative_offset_rejected() -> None:
         AggregationNodeScalars(count_fire_offset=-0.1, condition_fire_offset=None)
 
 
+def test_barrier_scalars_version_2_rejects_v1_payloads() -> None:
+    """The v1->v2 bump (WS4 Task 9) is the fail-closed guard against a stale
+    checkpoint whose coalesce keys are (name, row_id): identical wire SHAPE,
+    changed key SEMANTICS — silent reinterpretation is the failure this
+    version gate exists to prevent."""
+    v1_payload = {
+        "_version": "1.0",
+        "aggregation": {},
+        "coalesce": [[["merge_x", "row-1"], {"_version": "1.0", "lost_branches": {}}]],
+    }
+    with pytest.raises(AuditIntegrityError, match="unsupported version"):
+        BarrierScalars.from_dict(v1_payload)
+
+
+def test_barrier_scalars_round_trips_group_keyed_coalesce_entries() -> None:
+    """Explicit fork_group_id-keyed round-trip (WS4 Task 8/9 re-key)."""
+    scalars = BarrierScalars(
+        aggregation={},
+        coalesce={("merge_x", "g-fork-1"): CoalescePendingScalars(lost_branches={"left": "quarantined"})},
+    )
+    restored = BarrierScalars.from_dict(scalars.to_dict())
+    assert restored.coalesce == scalars.coalesce
+
+
 # ---------------------------------------------------------------------------
 # AggregationNodeScalars validation
 # ---------------------------------------------------------------------------
@@ -226,23 +250,23 @@ class TestCoalescePendingScalarsValidation:
         assert isinstance(s.lost_branches, MappingProxyType)
 
     def test_from_dict_rejects_int_lost_branches_value(self) -> None:
-        d: dict[str, Any] = {"_version": "1.0", "lost_branches": {"b1": 42}}
+        d: dict[str, Any] = {"_version": "2.0", "lost_branches": {"b1": 42}}
         with pytest.raises(AuditIntegrityError, match="lost_branches"):
             CoalescePendingScalars.from_dict(d)
 
     def test_from_dict_rejects_none_lost_branches_value(self) -> None:
-        d: dict[str, Any] = {"_version": "1.0", "lost_branches": {"b1": None}}
+        d: dict[str, Any] = {"_version": "2.0", "lost_branches": {"b1": None}}
         with pytest.raises(AuditIntegrityError, match="lost_branches"):
             CoalescePendingScalars.from_dict(d)
 
     def test_from_dict_rejects_nested_dict_lost_branches_value(self) -> None:
         """A nested dict would silently re-serialize and propagate — must crash."""
-        d: dict[str, Any] = {"_version": "1.0", "lost_branches": {"b1": {"reason": "deep"}}}
+        d: dict[str, Any] = {"_version": "2.0", "lost_branches": {"b1": {"reason": "deep"}}}
         with pytest.raises(AuditIntegrityError, match="lost_branches"):
             CoalescePendingScalars.from_dict(d)
 
     def test_from_dict_rejects_non_str_lost_branches_key(self) -> None:
-        d: dict[str, Any] = {"_version": "1.0", "lost_branches": {7: "reason"}}
+        d: dict[str, Any] = {"_version": "2.0", "lost_branches": {7: "reason"}}
         with pytest.raises(AuditIntegrityError, match="lost_branches"):
             CoalescePendingScalars.from_dict(d)
 
@@ -347,7 +371,7 @@ class TestBarrierScalarsFromDictErrors:
 
     def test_rejects_empty_aggregation_node_id_as_audit_integrity_error(self) -> None:
         d: dict[str, Any] = {
-            "_version": "1.0",
+            "_version": "2.0",
             "aggregation": {"": _agg().to_dict()},
             "coalesce": [],
         }
@@ -355,15 +379,15 @@ class TestBarrierScalarsFromDictErrors:
             BarrierScalars.from_dict(d)
 
     def test_rejects_malformed_coalesce_entry_not_list_of_two(self) -> None:
-        d: dict[str, Any] = {"_version": "1.0", "aggregation": {}, "coalesce": [[1, 2, 3], {}]}
+        d: dict[str, Any] = {"_version": "2.0", "aggregation": {}, "coalesce": [[1, 2, 3], {}]}
         with pytest.raises(AuditIntegrityError):
             BarrierScalars.from_dict(d)
 
     def test_coalesce_entry_key_must_be_two_strings(self) -> None:
         d: dict[str, Any] = {
-            "_version": "1.0",
+            "_version": "2.0",
             "aggregation": {},
-            "coalesce": [[[1, "r"], {"_version": "1.0", "lost_branches": {}}]],
+            "coalesce": [[[1, "r"], {"_version": "2.0", "lost_branches": {}}]],
         }
         with pytest.raises(AuditIntegrityError):
             BarrierScalars.from_dict(d)
@@ -371,11 +395,11 @@ class TestBarrierScalarsFromDictErrors:
     def test_rejects_duplicate_coalesce_key(self) -> None:
         """to_dict can never emit a duplicate key — a duplicate is corruption, not last-wins."""
         d: dict[str, Any] = {
-            "_version": "1.0",
+            "_version": "2.0",
             "aggregation": {},
             "coalesce": [
-                [["merge", "row-1"], {"_version": "1.0", "lost_branches": {}}],
-                [["merge", "row-1"], {"_version": "1.0", "lost_branches": {"b": "lost"}}],
+                [["merge", "row-1"], {"_version": "2.0", "lost_branches": {}}],
+                [["merge", "row-1"], {"_version": "2.0", "lost_branches": {"b": "lost"}}],
             ],
         }
         with pytest.raises(AuditIntegrityError, match="duplicate"):

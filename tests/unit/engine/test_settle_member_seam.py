@@ -77,15 +77,16 @@ def coalesce_binding(name: str, *, member_key: str = "path_a") -> GroupBinding:
 
 
 class _RecordingCoalesceExecutor:
-    """Minimal `notify_branch_lost(coalesce_name, row_id, lost_branch, reason)`
-    stand-in that records every call — no CoalesceOutcome, so the seam's
-    leader-notify path returns [] after recording (outcome is None)."""
+    """Minimal `notify_branch_lost(coalesce_name, fork_group_id, lost_branch,
+    reason)` stand-in that records every call — no CoalesceOutcome, so the
+    seam's leader-notify path returns [] after recording (outcome is None).
+    """
 
     def __init__(self) -> None:
         self.notified: list[tuple[str, str, str, str]] = []
 
-    def notify_branch_lost(self, *, coalesce_name: Any, row_id: Any, lost_branch: Any, reason: Any) -> None:
-        self.notified.append((str(coalesce_name), str(row_id), str(lost_branch), str(reason)))
+    def notify_branch_lost(self, *, coalesce_name: Any, fork_group_id: Any, lost_branch: Any, reason: Any) -> None:
+        self.notified.append((str(coalesce_name), str(fork_group_id), str(lost_branch), str(reason)))
         return None
 
 
@@ -243,7 +244,10 @@ def test_leader_notify_dispatches_to_coalesce_executor(processor_with_bindings, 
     )
     token = make_token(lineage_path=(INNER_FORK,), row_id="row-1")
     proc._settle_member_losses(token, "quarantined", [])
-    assert recording_coalesce_executor.notified == [("merge_inner", "row-1", "path_a", "quarantined")]
+    # fork_group_id is INNER_FORK's group_id ("fg_inner"), not row_id — the
+    # walk resolves the frame, and the frame's group_id is what's notified
+    # (WS4 Task 8 re-key).
+    assert recording_coalesce_executor.notified == [("merge_inner", "fg_inner", "path_a", "quarantined")]
 
 
 def test_quarantined_batch_member_with_a_bound_frame_fails_fast_not_staged(aggregation_flush_processor) -> None:

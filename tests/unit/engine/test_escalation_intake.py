@@ -316,7 +316,7 @@ def test_staged_escalation_replays_and_settles_the_enclosing_closer_on_next_pass
     row = factory.data_flow.create_row(run_id, "source-0", 0, {"value": 1}, source_row_index=0, ingest_sequence=0)
     root = factory.data_flow.create_token(row.row_id)
 
-    outer_children, _outer_group_id = factory.data_flow.fork_token(TokenRef(token_id=root.token_id, run_id=run_id), row.row_id, ["outer_a"])
+    outer_children, outer_group_id = factory.data_flow.fork_token(TokenRef(token_id=root.token_id, run_id=run_id), row.row_id, ["outer_a"])
     (outer_child,) = outer_children
     inner_children, inner_group_id = factory.data_flow.fork_token(
         TokenRef(token_id=outer_child.token_id, run_id=run_id),
@@ -424,4 +424,8 @@ def test_staged_escalation_replays_and_settles_the_enclosing_closer_on_next_pass
     # completed" dedup (the same check _replay_group_losses relies on for
     # idempotent re-drives) now no-ops a repeat call — the real executor
     # considers this row's coalesce resolved, not merely "not yet told".
-    assert outer_executor.notify_branch_lost("outer_closer", row.row_id, "outer_a", "group_failed") is None
+    # Keyed on outer_group_id (WS4 Task 8 re-key), not row.row_id — the
+    # completed-keys/Landscape dedup check would miss under the wrong key,
+    # as it did before this fix (the group settled under outer_group_id,
+    # a lookup by row_id would find nothing and re-run the loss).
+    assert outer_executor.notify_branch_lost("outer_closer", outer_group_id, "outer_a", "group_failed") is None

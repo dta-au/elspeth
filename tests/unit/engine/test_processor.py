@@ -5936,7 +5936,9 @@ class TestDurableSchedulerResumeDrain:
 
         db, factory = _make_factory()
         coalesce_node = NodeID("coalesce::merge")
-        row_id = self._seed_held_coalesce_branch(factory, coalesce_node)
+        # Return value (row_id) is unused: both restore and live-accept keys
+        # are fork_group_id-based now (WS4 Task 8/10) — see "fork-1" below.
+        self._seed_held_coalesce_branch(factory, coalesce_node)
         arrange_executor = self._make_real_coalesce_executor(factory, coalesce_node)
         processor_kwargs: dict[str, Any] = {
             "coalesce_node_ids": {CoalesceName("merge"): coalesce_node},
@@ -5949,7 +5951,10 @@ class TestDurableSchedulerResumeDrain:
 
         results = processor1.drain_scheduled_work(ctx)
         assert results == []
-        assert ("merge", row_id) in arrange_executor._pending
+        # Live accept() path is fork_group_id-keyed (WS4 Task 8); the token's
+        # fork_group_id is "fork-1" (see the resume assertion below, which
+        # independently confirms it via entry.token.fork_group_id).
+        assert ("merge", "fork-1") in arrange_executor._pending
 
         # The hold node_state written by accept() — the state_id the restore must rediscover.
         held_states = [
@@ -5983,7 +5988,10 @@ class TestDurableSchedulerResumeDrain:
             **processor_kwargs,
         )
 
-        pending = resumed_executor._pending[("merge", row_id)]
+        # restore_from_journal now groups by fork_group_id too (WS4 Task 10) —
+        # both the live accept() path and the restore path agree on the key
+        # shape, closing the premise-break window T8-alone would have left.
+        pending = resumed_executor._pending[("merge", "fork-1")]
         assert set(pending.branches) == {"path_a"}
         entry = pending.branches["path_a"]
         assert entry.token.token_id == "token-held-a"
@@ -7693,7 +7701,7 @@ class TestExecuteTransformWithRetry:
         )
         coalesce.notify_branch_lost.assert_called_once_with(
             coalesce_name="merge",
-            row_id=token.row_id,
+            fork_group_id=token.fork_group_id,
             lost_branch=token.branch_name,
             reason="max_retries_exceeded",
         )
@@ -9863,10 +9871,11 @@ class TestGateSinkRoutingNotifiesCoalesce:
             _assert_outcome_pair(result, TerminalOutcome.SUCCESS, TerminalPath.GATE_ROUTED)
             assert result.sink_name == "error_sink"
 
-        # Coalesce must have been notified of the lost branch
+        # Coalesce must have been notified of the lost branch, keyed on the
+        # token's fork_group_id (WS4 Task 8 re-key), not row_id.
         coalesce.notify_branch_lost.assert_called_once_with(
             coalesce_name=CoalesceName("merge"),
-            row_id="row-1",
+            fork_group_id="fg-path_a",
             lost_branch="path_a",
             reason="gate_routed_to_sink",
         )

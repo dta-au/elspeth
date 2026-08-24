@@ -1,7 +1,9 @@
 """CoalesceExecutor: Merges tokens from parallel fork paths.
 
 Coalesce is a stateful barrier that holds tokens until merge conditions are met.
-Tokens are correlated by row_id (same source row that was forked).
+Tokens are correlated by fork_group_id (spec §5 re-key: sibling EXPAND members
+share row_id but fork into distinct concurrent FORK groups, so the group id —
+not the row id — is the collision-free key).
 """
 
 from collections import OrderedDict
@@ -112,7 +114,7 @@ class _BranchEntry:
 
 @dataclass
 class _PendingCoalesce:
-    """Tracks pending tokens for a single row_id at a coalesce point."""
+    """Tracks pending tokens for a single fork group at a coalesce point."""
 
     branches: dict[str, _BranchEntry]  # branch_name -> entry
     first_arrival: float  # For timeout calculation
@@ -440,7 +442,7 @@ class CoalesceExecutor:
     """Executes coalesce operations with audit recording.
 
     Maintains state for pending coalesce operations:
-    - Tracks which tokens have arrived for each row_id
+    - Tracks which tokens have arrived for each fork group
     - Evaluates merge conditions based on policy
     - Merges row data according to strategy
     - Records audit trail via ExecutionRepository
@@ -516,7 +518,7 @@ class CoalesceExecutor:
         # Used to ensure runtime contracts match DAG-computed schemas (P2 fix).
         # When populated, _execute_merge() uses this instead of runtime merge().
         self._output_schemas: dict[str, SchemaContract | None] = {}
-        # Pending tokens: (coalesce_name, row_id) -> _PendingCoalesce
+        # Pending tokens: (coalesce_name, fork_group_id) -> _PendingCoalesce
         self._pending: dict[tuple[str, str], _PendingCoalesce] = {}
         # Completed coalesces: tracks keys that have already merged/failed
         # Used to detect late arrivals after merge and reject them gracefully
@@ -582,8 +584,8 @@ class CoalesceExecutor:
         emission (Task 2.1).
 
         Returns:
-            Mapping of (coalesce_name, row_id) -> CoalescePendingScalars for
-            pending keys with recorded losses only.
+            Mapping of (coalesce_name, fork_group_id) -> CoalescePendingScalars
+            for pending keys with recorded losses only.
         """
         scalars: dict[tuple[str, str], CoalescePendingScalars] = {}
         for key, pending in self._pending.items():
@@ -607,7 +609,7 @@ class CoalesceExecutor:
         BLOCKED rows) is authoritative for arrived-branch token payloads; the
         caller (processor, Task 3.1) partitions journal items by barrier kind
         and derives state ids / attempt offsets from audit tables. Items group
-        by ``(coalesce_name, row_id)``; per group, ``first_arrival`` anchors to
+        by ``(coalesce_name, fork_group_id)``; per group, ``first_arrival`` anchors to
         the OLDEST ``barrier_blocked_at`` expressed on the executor's monotonic
         clock (clamped at 0 against wall-clock skew), and each branch's
         arrival_time preserves the absolute blocked-at offsets.
@@ -703,7 +705,7 @@ class CoalesceExecutor:
             resume_checkpoint_id=resume_checkpoint_id,
         )
 
-    def _check_landscape_for_completion(self, coalesce_name: str, row_id: str) -> bool:
+    def _check_landscape_for_completion(self, coalesce_name: str, fork_group_id: str) -> bool:
         """Check the Landscape for whether a coalesce key has completed.
 
         Cache-miss fallback for late-arrival detection. When the FIFO cache
@@ -717,7 +719,7 @@ class CoalesceExecutor:
 
         Args:
             coalesce_name: Coalesce point name
-            row_id: Source row ID
+            fork_group_id: Fork group ID (spec §5 re-key)
 
         Returns:
             True if the Landscape shows this coalesce already completed
@@ -726,8 +728,8 @@ class CoalesceExecutor:
             return False
         node_id = self._node_ids[coalesce_name]
 
-        if self._barrier_restore_reads.has_completed_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id):
-            self._mark_completed((coalesce_name, row_id))
+        if self._barrier_restore_reads.has_completed_group_for_node(run_id=self._run_id, node_id=str(node_id), group_id=fork_group_id):
+            self._mark_completed((coalesce_name, fork_group_id))
             return True
         return False
 
@@ -740,7 +742,7 @@ class CoalesceExecutor:
         accept() — the FIFO is a performance cache, not a correctness mechanism.
 
         Args:
-            key: (coalesce_name, row_id) tuple to mark as completed
+            key: (coalesce_name, fork_group_id) tuple to mark as completed
         """
         self._completed_keys[key] = None
         # Evict oldest entries if over capacity.
@@ -807,8 +809,17 @@ class CoalesceExecutor:
                 f"Token branch '{token.branch_name}' not in expected branches for coalesce '{coalesce_name}': {settings.branches}"
             )
 
-        # Get or create pending state for this row
-        key = (coalesce_name, token.row_id)
+        # Get or create pending state for this FORK GROUP (spec §5 re-key:
+        # sibling EXPAND members share row_id, so row_id cannot key the
+        # group — arch-M1: two sibling fork groups on one row would collide
+        # under a row-keyed dict).
+        fork_group_id = token.fork_group_id
+        if fork_group_id is None:
+            raise OrchestrationInvariantError(
+                f"Token {token.token_id} has branch_name={token.branch_name!r} but no "
+                f"fork_group_id — lineage corruption (branch and group ride one frame)."
+            )
+        key = (coalesce_name, fork_group_id)
         now = arrival_time if arrival_time is not None else self._clock.monotonic()
 
         # Check if this coalesce already completed (late arrival).
@@ -816,7 +827,7 @@ class CoalesceExecutor:
         # The FIFO is a performance optimization; the Landscape is the
         # source of truth. Evicted FIFO entries are rediscovered from
         # the Landscape, eliminating the eviction window.
-        if key in self._completed_keys or self._check_landscape_for_completion(coalesce_name, token.row_id):
+        if key in self._completed_keys or self._check_landscape_for_completion(coalesce_name, fork_group_id):
             # Late arrival after merge/failure already happened
             # Record failure audit trail for this late token
             failure_reason = "late_arrival_after_merge"
@@ -1012,7 +1023,7 @@ class CoalesceExecutor:
 
         Args:
             settings: Coalesce settings for metadata
-            key: (coalesce_name, row_id) tuple
+            key: (coalesce_name, fork_group_id) tuple
             step: Resolved audit step index for the coalesce node
             failure_reason: Machine-readable failure reason string
             is_timeout: Whether this failure was triggered by a timeout.
@@ -1319,7 +1330,7 @@ class CoalesceExecutor:
             node_id: DAG node ID for audit recording
             pending: The pending coalesce state
             step: Resolved audit step index
-            key: (coalesce_name, row_id) tuple
+            key: (coalesce_name, fork_group_id) tuple
             coalesce_name: Name of the coalesce configuration
             is_timeout: True when triggered by timeout (affects failure reasons
                 and is_timeout flag on _fail_pending)
@@ -1330,7 +1341,7 @@ class CoalesceExecutor:
             event,
             arrived_count=len(pending.branches),
             lost_branches=pending.lost_branches,
-            row_id=key[1],
+            group_id=key[1],
         )
         if decision.action is CoalesceAction.MERGE:
             return self._execute_merge(
@@ -1430,7 +1441,7 @@ class CoalesceExecutor:
         keys_to_process = list(self._pending.keys())
 
         for key in keys_to_process:
-            coalesce_name, _row_id = key
+            coalesce_name, _fork_group_id = key
             settings = self._settings[coalesce_name]
             node_id = self._node_ids[coalesce_name]
             pending = self._pending[key]
@@ -1441,7 +1452,7 @@ class CoalesceExecutor:
             # (Timeout path can't hit this because accept() creates the entry on arrival.)
             if settings.policy == "best_effort" and len(pending.branches) == 0 and not pending.lost_branches:
                 raise OrchestrationInvariantError(
-                    f"Pending coalesce entry for {coalesce_name!r} (row {_row_id}) "
+                    f"Pending coalesce entry for {coalesce_name!r} (fork group {_fork_group_id}) "
                     f"has zero branches and zero lost branches — "
                     f"this is a coalesce state invariant violation"
                 )
@@ -1465,7 +1476,7 @@ class CoalesceExecutor:
 
         return results
 
-    def has_recorded_branch_loss(self, coalesce_name: str, row_id: str, branch_name: str) -> bool:
+    def has_recorded_branch_loss(self, coalesce_name: str, fork_group_id: str, branch_name: str) -> bool:
         """Whether this branch loss is already in executor memory (§E.5 replay dedup).
 
         The journal-first loss replay (per-iteration intake / takeover
@@ -1475,12 +1486,12 @@ class CoalesceExecutor:
         A completed/unknown key returns False — ``notify_branch_lost``'s own
         completed-keys check makes that replay a no-op.
         """
-        key = (coalesce_name, row_id)
+        key = (coalesce_name, fork_group_id)
         if key in self._pending:
             return branch_name in self._pending[key].lost_branches
         # Absent entry: distinguish the two legitimate states rather than
         # conflating them into one silent default.
-        if key in self._completed_keys or self._check_landscape_for_completion(coalesce_name, row_id):
+        if key in self._completed_keys or self._check_landscape_for_completion(coalesce_name, fork_group_id):
             # Completed: the merge already resolved this row's losses;
             # notify_branch_lost's completed-keys check no-ops the replay.
             return False
@@ -1491,7 +1502,7 @@ class CoalesceExecutor:
     def notify_branch_lost(
         self,
         coalesce_name: str,
-        row_id: str,
+        fork_group_id: str,
         lost_branch: str,
         reason: str,
     ) -> CoalesceOutcome | None:
@@ -1511,7 +1522,9 @@ class CoalesceExecutor:
 
         Args:
             coalesce_name: Name of the coalesce configuration
-            row_id: Source row ID (correlates forked tokens)
+            fork_group_id: Fork group ID (correlates the sibling branches;
+                spec §5 re-key — sibling EXPAND members share row_id, so the
+                group id, not the row id, is the collision-free key)
             lost_branch: Name of the branch that was error-routed
             reason: Machine-readable reason for the loss
 
@@ -1521,11 +1534,11 @@ class CoalesceExecutor:
         if coalesce_name not in self._settings:
             raise OrchestrationInvariantError(f"Coalesce '{coalesce_name}' not registered")
 
-        key = (coalesce_name, row_id)
+        key = (coalesce_name, fork_group_id)
 
         # Already completed (race with normal merge) — ignore.
         # Two-level lookup: FIFO cache then Landscape fallback.
-        if key in self._completed_keys or self._check_landscape_for_completion(coalesce_name, row_id):
+        if key in self._completed_keys or self._check_landscape_for_completion(coalesce_name, fork_group_id):
             return None
 
         settings = self._settings[coalesce_name]
@@ -1585,7 +1598,7 @@ class CoalesceExecutor:
 
         Args:
             settings: Coalesce settings for the affected point
-            key: (coalesce_name, row_id) tuple
+            key: (coalesce_name, fork_group_id) tuple
             step: Resolved audit step index for the coalesce node
 
         Returns:
@@ -1597,7 +1610,7 @@ class CoalesceExecutor:
             CoalesceEvent.LOSS,
             arrived_count=len(pending.branches),
             lost_branches=pending.lost_branches,
-            row_id=key[1],
+            group_id=key[1],
         )
         if decision.action is CoalesceAction.MERGE:
             node_id = self._node_ids[settings.name]

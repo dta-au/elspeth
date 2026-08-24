@@ -92,6 +92,9 @@ class _FakeExecutionRepository:
     def has_completed_row_for_node(self, **_: Any) -> bool:
         return False
 
+    def has_completed_group_for_node(self, **_: Any) -> bool:
+        return False
+
 
 class _FakeDataFlowRepository:
     def __init__(self) -> None:
@@ -203,6 +206,7 @@ def make_mock_executor(clock: MockClock | None = None) -> _TestCoalesceExecutor:
         barrier_restore_reads=SimpleNamespace(
             get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
             has_completed_row_for_node=execution.has_completed_row_for_node,
+            has_completed_group_for_node=execution.has_completed_group_for_node,
         ),
     )
 
@@ -241,7 +245,9 @@ class TestCoalesceAuditCleanupFailures:
         with pytest.raises(AuditIntegrityError, match="token outcome write failed"):
             executor.accept(token_b, "test_coalesce")
 
-        key = ("test_coalesce", "row-001")
+        # key is (name, fork_group_id); make_token derives
+        # fork_group_id=f"fg-{row_id}" (WS4 Task 8).
+        key = ("test_coalesce", "fg-row-001")
         assert key in executor._pending
         assert key not in executor._completed_keys
 
@@ -651,14 +657,15 @@ class TestMemoryBoundedProperties:
                 )
                 executor.accept(token, "test_coalesce")
 
-        # Most recent 10 should be retained
+        # Most recent 10 should be retained (key is (name, fork_group_id);
+        # make_token derives fork_group_id=f"fg-{row_id}" — WS4 Task 8).
         for row_num in range(10, 20):
-            key = ("test_coalesce", f"row-{row_num:03d}")
+            key = ("test_coalesce", f"fg-row-{row_num:03d}")
             assert key in executor._completed_keys, f"Recent key {key} should be retained"
 
         # Oldest 10 should be evicted
         for row_num in range(10):
-            key = ("test_coalesce", f"row-{row_num:03d}")
+            key = ("test_coalesce", f"fg-row-{row_num:03d}")
             assert key not in executor._completed_keys, f"Old key {key} should be evicted"
 
 

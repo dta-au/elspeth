@@ -464,6 +464,10 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
         execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=f"cs-{uuid4().hex[:8]}")
         execution.get_completed_row_ids_for_nodes.return_value = set()
         execution.has_completed_row_for_node.return_value = False
+        # has_completed_group_for_node lives on BarrierRestoreReadModel, not
+        # ExecutionRepository (spec-checked here) — assign explicitly (WS4
+        # Task 8: the live accept() path now queries the group-keyed sibling).
+        execution.has_completed_group_for_node = MagicMock(return_value=False)
         data_flow = MagicMock(spec=DataFlowRepository)
 
         resolutions: list[bool] = []
@@ -479,6 +483,7 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
             barrier_restore_reads=SimpleNamespace(
                 get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
                 has_completed_row_for_node=execution.has_completed_row_for_node,
+                has_completed_group_for_node=execution.has_completed_group_for_node,
             ),
             resolutions=resolutions,
         )

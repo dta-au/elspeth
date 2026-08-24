@@ -32,6 +32,7 @@ from unittest.mock import Mock
 import pytest
 
 from elspeth.contracts import TokenInfo, TransformProtocol
+from elspeth.contracts.barrier_scalars import BarrierScalars, CoalescePendingScalars
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError
@@ -524,13 +525,24 @@ class TestGroupLossReplayAndRestore:
     tokens row, and restore reads the FULL loss table regardless of
     adopted_epoch."""
 
-    def test_replay_resolves_row_id_from_the_durable_token_row(self) -> None:
+    def test_replay_keys_the_coalesce_notify_on_the_durable_group_id(self) -> None:
         """Covers the all-members-lost shape too: the member token exists
-        durably even when it never arrived at the closer."""
+        durably even when it never arrived at the closer.
+
+        WS4 Task 8 re-key: the coalesce arm's identity now comes straight
+        from ``loss.group_id`` — ``group_losses`` already carries it
+        (`group_losses.py:51`), so there is no more row_id translation step
+        for THIS call. This supersedes the pre-Task-8 version of this test,
+        which proved the opposite point (that replay resolved row_id from
+        the durable token row rather than a nonexistent loss.row_id) — that
+        translation still happens in ``_row_id_for_loss`` for the row_union
+        arm and ``scope_row_id``, both untouched here, but the coalesce
+        notify no longer depends on it.
+        """
         notified: list[dict[str, object]] = []
 
         class _NotifyingCoalesce:
-            def has_recorded_branch_loss(self, coalesce_name: str, row_id: str, branch_name: str) -> bool:
+            def has_recorded_branch_loss(self, coalesce_name: str, fork_group_id: str, branch_name: str) -> bool:
                 return False
 
             def notify_branch_lost(self, **kwargs: object) -> None:
@@ -541,6 +553,7 @@ class TestGroupLossReplayAndRestore:
             loss_id="loss-1",
             closer_name="merge",
             token_id="tok-lost",
+            group_id="grp-1",
             member_key="path_a",
             reason="quarantined",
         )
@@ -549,10 +562,7 @@ class TestGroupLossReplayAndRestore:
 
         coordinator.run_intake_pass(_ctx())
 
-        # _make_coordinator's row_id_for_token resolves any token_id to
-        # "row-1" — proving the replay went through the token -> row_id
-        # resolution rather than reading a (nonexistent) loss.row_id.
-        assert notified == [{"coalesce_name": "merge", "row_id": "row-1", "lost_branch": "path_a", "reason": "quarantined"}]
+        assert notified == [{"coalesce_name": "merge", "fork_group_id": "grp-1", "lost_branch": "path_a", "reason": "quarantined"}]
 
     def test_takeover_restore_seeds_executor_from_full_table_not_unadopted_subset(self) -> None:
         """Spec §6.2 stated requirement: takeover restore reads the FULL
@@ -562,6 +572,7 @@ class TestGroupLossReplayAndRestore:
             loss_id="loss-adopted",
             closer_name="merge",
             token_id="tok-a",
+            group_id="grp-a",
             member_key="path_a",
             reason="quarantined",
             adopted_epoch=3,
@@ -570,6 +581,7 @@ class TestGroupLossReplayAndRestore:
             loss_id="loss-unadopted",
             closer_name="merge",
             token_id="tok-b",
+            group_id="grp-b",
             member_key="path_b",
             reason="error_routed",
             adopted_epoch=None,
@@ -579,7 +591,6 @@ class TestGroupLossReplayAndRestore:
         scheduler.list_group_losses.return_value = [adopted_loss, unadopted_loss]
         reads = Mock(spec=BarrierRestoreReadModel)
         reads.find_duplicate_live_buffered_acceptances.return_value = []
-        reads.row_id_for_token.side_effect = lambda *, run_id, token_id: {"tok-a": "row-a", "tok-b": "row-b"}[token_id]
         coalesce = Mock(spec=CoalesceExecutor)
         row_union = Mock(spec=RowUnionExecutor)
         row_union.restore_from_journal.return_value = ()
@@ -603,11 +614,83 @@ class TestGroupLossReplayAndRestore:
             BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
         )
 
+        # Keyed on loss.group_id directly (WS4 Task 9, C-2) — no more
+        # row_id_for_token translation for this merge.
         seeded = coalesce.restore_from_journal.call_args.kwargs["scalars"]
-        assert ("merge", "row-a") in seeded
-        assert ("merge", "row-b") in seeded
-        assert dict(seeded[("merge", "row-a")].lost_branches) == {"path_a": "quarantined"}
-        assert dict(seeded[("merge", "row-b")].lost_branches) == {"path_b": "error_routed"}
+        assert ("merge", "grp-a") in seeded
+        assert ("merge", "grp-b") in seeded
+        assert dict(seeded[("merge", "grp-a")].lost_branches) == {"path_a": "quarantined"}
+        assert dict(seeded[("merge", "grp-b")].lost_branches) == {"path_b": "error_routed"}
+
+    def test_checkpointed_loss_survives_merge_with_a_second_durable_loss_on_the_same_group(self) -> None:
+        """WS4 META-24 witness: a group-keyed checkpoint scalar must MERGE
+        with (not be silently dropped by) the durable group_losses read for
+        the SAME group.
+
+        Crash-record: branch 'a' was lost and checkpointed BEFORE the crash
+        (``barrier_scalars.coalesce`` — what a live ``get_barrier_scalars()``
+        would have emitted, WS4 Task 8, group-keyed). Branch 'b' was lost
+        AFTER that checkpoint but before the crash landed durably (present
+        only in ``group_losses``, not yet checkpointed). Restore must
+        produce ONE seeded scalars entry for the group carrying BOTH losses.
+
+        This is the mechanism the hand-traced C-2 gap threatened: the old
+        row-keyed merge (``key = (loss.closer_name, self._row_id_for_loss
+        (loss))``) could never find the group-keyed checkpoint entry as
+        ``existing`` (a row-keyed key never matches a group-keyed one), so it
+        would silently create a SEPARATE, row-keyed, branch-'a'-losing entry
+        — dropping the checkpoint's branch-'a' loss from the group any
+        restore-time reader actually keys on.
+        """
+        checkpoint = BarrierScalars(
+            aggregation={},
+            coalesce={("merge", "fg-crash"): CoalescePendingScalars(lost_branches={"a": "checkpointed_loss"})},
+        )
+        second_loss = SimpleNamespace(
+            loss_id="loss-b",
+            closer_name="merge",
+            token_id="tok-b",
+            group_id="fg-crash",
+            member_key="b",
+            reason="post_checkpoint_loss",
+            adopted_epoch=None,
+        )
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = []
+        scheduler.list_group_losses.return_value = [second_loss]
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        coalesce = Mock(spec=CoalesceExecutor)
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=coalesce,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={_COALESCE: NodeID("coalesce-node")},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=checkpoint, batch_id_remap={})
+        )
+
+        seeded = coalesce.restore_from_journal.call_args.kwargs["scalars"]
+        # ONE entry for the group, carrying BOTH losses merged — not a
+        # dropped checkpoint loss and not two disjoint entries.
+        assert set(seeded) == {("merge", "fg-crash")}
+        assert dict(seeded[("merge", "fg-crash")].lost_branches) == {
+            "a": "checkpointed_loss",
+            "b": "post_checkpoint_loss",
+        }
 
 
 class TestLineageJournalConsistencyWiring:

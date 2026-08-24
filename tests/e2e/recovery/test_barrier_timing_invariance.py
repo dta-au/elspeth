@@ -237,7 +237,9 @@ class TestCoalesceTimeoutInvariance:
         assert intake_results == []
 
         # (1) Frame A anchor: the live-path accept was backdated to T_b.
-        pending_a = executor_a._pending[("merge", "row-1")]
+        # Live accept() is fork_group_id-keyed (WS4 Task 8); token_a's FORK
+        # frame group_id is "fg-row-1".
+        pending_a = executor_a._pending[("merge", "fg-row-1")]
         assert pending_a.first_arrival == pytest.approx(mono_at_tb)
 
         # (2) Frame A at T_b+timeout-ε: no timeout fire (pure when not firing).
@@ -258,7 +260,10 @@ class TestCoalesceTimeoutInvariance:
         assert processor_b.has_blocked_barrier_work() is True
 
         # (1) Frame B anchor: restored from the SAME durable barrier_blocked_at.
-        pending_b = executor_b._pending[("merge", "row-1")]
+        # restore_from_journal now groups by fork_group_id too (WS4 Task 10) —
+        # same key shape as pending_a's live-accept key above ("fg-row-1"),
+        # closing the premise-break window T8-alone would have left.
+        pending_b = executor_b._pending[("merge", "fg-row-1")]
         assert pending_b.first_arrival == pytest.approx(mono_at_tb)
         assert set(pending_b.branches) == {"a"}
 

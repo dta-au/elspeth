@@ -377,7 +377,7 @@ class TestLateBranchRelease:
         # Restore left the intake-pending row for the journal-first intake
         # and reconstructed the completed key from the Landscape.
         assert processor_b.has_blocked_barrier_work() is True
-        assert ("merge", "row-1") in executor_b._completed_keys
+        assert ("merge", "fg-row-1") in executor_b._completed_keys
 
         ctx = make_context(landscape=factory.plugin_audit_writer())
         late_results = processor_b.run_barrier_intake(ctx)
@@ -531,7 +531,7 @@ class TestLateBranchRelease:
         assert b_row_after_restore["barrier_adopted_epoch"] is None, (
             "crash-window recovery must reset adopted epoch to NULL for intake re-processing"
         )
-        key = ("merge", "row-1")
+        key = ("merge", "fg-row-1")
         assert key in executor_b._pending, "branch a must be in _pending from normal restore"
         assert "a" in executor_b._pending[key].branches
 
@@ -658,7 +658,7 @@ class TestBranchLossReplay:
         )
 
         # Restore seeded lost_branches from the durable ledger.
-        pending = executor_b._pending[("merge", "row-1")]
+        pending = executor_b._pending[("merge", "fg-row-1")]
         assert dict(pending.lost_branches) == {"b": "quarantined:boom"}
         assert set(pending.branches) == {"a"}
 

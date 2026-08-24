@@ -54,6 +54,7 @@ class _RecorderDouble:
         self.create_token = _CallRecorder(SimpleNamespace(token_id="token_001"))
         self.coalesce_tokens = _CallRecorder(SimpleNamespace(token_id="merged_001", join_group_id="join_001"))
         self.has_completed_row_for_node = _CallRecorder(False)
+        self.has_completed_group_for_node = _CallRecorder(False)
         self.get_completed_row_ids_for_nodes = _CallRecorder([])
         self.begin_node_state = _CallRecorder(SimpleNamespace(state_id="state_001"))
         self.complete_node_state = _CallRecorder()
@@ -100,6 +101,7 @@ def _restore_reads_from_execution_double(execution: _RecorderDouble) -> SimpleNa
     return SimpleNamespace(
         get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
         has_completed_row_for_node=execution.has_completed_row_for_node,
+        has_completed_group_for_node=execution.has_completed_group_for_node,
     )
 
 

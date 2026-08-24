@@ -72,7 +72,7 @@ class RestoredPendingCoalesce:
     to the pre-extraction restore.
     """
 
-    key: tuple[str, str]  # (coalesce_name, row_id)
+    key: tuple[str, str]  # (coalesce_name, fork_group_id)
     branches: tuple[RestoredCoalesceBranch, ...]
     first_arrival: float  # Monotonic anchor of the OLDEST branch
     lost_branches: Mapping[str, str]
@@ -219,7 +219,7 @@ class CoalesceJournalRestorer:
                     "an audit inconsistency."
                 )
 
-            key = (item.coalesce_name, item.row_id)
+            key = (item.coalesce_name, innermost.group_id)
             if key not in grouped:
                 grouped[key] = {}
             branch_items = grouped[key]
@@ -228,9 +228,9 @@ class CoalesceJournalRestorer:
                     f"BLOCKED journal rows for tokens "
                     f"{branch_items[branch_name].token_id!r} and {item.token_id!r} "
                     f"both claim branch '{branch_name}' at coalesce "
-                    f"{item.coalesce_name!r} for row {item.row_id!r} (run {self._run_id!r}, "
-                    f"resume checkpoint {resume_checkpoint_id!r}) — accept() crashes on a "
-                    "duplicate arrival, so this is journal corruption."
+                    f"{item.coalesce_name!r} for fork group {innermost.group_id!r} (run "
+                    f"{self._run_id!r}, resume checkpoint {resume_checkpoint_id!r}) — "
+                    "accept() crashes on a duplicate arrival, so this is journal corruption."
                 )
             branch_items[branch_name] = item
             blocked_at_by_token[item.token_id] = item.barrier_blocked_at
@@ -266,7 +266,7 @@ class CoalesceJournalRestorer:
             unknown_lost = set(lost_branches) - set(allowed_branches)
             if unknown_lost:
                 raise AuditIntegrityError(
-                    f"Checkpoint lost_branches for coalesce {key[0]!r} row {key[1]!r} "
+                    f"Checkpoint lost_branches for coalesce {key[0]!r} fork group {key[1]!r} "
                     f"(run {self._run_id!r}, resume checkpoint {resume_checkpoint_id!r}) "
                     f"name branches {sorted(unknown_lost)} outside the configured branches "
                     f"{sorted(allowed_branches)} — checkpoint corruption."
@@ -276,7 +276,7 @@ class CoalesceJournalRestorer:
                 # Mirrors the live notify_branch_lost invariant: a branch
                 # cannot both arrive and be lost for the same pending key.
                 raise AuditIntegrityError(
-                    f"Branches {sorted(arrived_and_lost)} at coalesce {key[0]!r} row {key[1]!r} "
+                    f"Branches {sorted(arrived_and_lost)} at coalesce {key[0]!r} fork group {key[1]!r} "
                     f"(run {self._run_id!r}, resume checkpoint {resume_checkpoint_id!r}) "
                     "are recorded as both arrived and lost — journal/checkpoint corruption."
                 )
@@ -301,7 +301,7 @@ class CoalesceJournalRestorer:
         # key: restore it so a later surviving branch accounts against the
         # recorded loss instead of forming a fresh, loss-free pending key.
         for scalar_key in scalars.keys() - grouped.keys():
-            coalesce_name, row_id = scalar_key
+            coalesce_name, fork_group_id = scalar_key
             key_scalars = scalars[scalar_key]
             lost_branches = dict(key_scalars.lost_branches)
             if coalesce_name in self._settings and lost_branches and scalar_key not in completed_key_set:
@@ -311,7 +311,7 @@ class CoalesceJournalRestorer:
                     # coalesce's scalars is corruption, not staleness — only
                     # unknown-coalesce / completed / empty keys drop-and-log.
                     raise AuditIntegrityError(
-                        f"Checkpoint lost_branches for coalesce {coalesce_name!r} row {row_id!r} "
+                        f"Checkpoint lost_branches for coalesce {coalesce_name!r} fork group {fork_group_id!r} "
                         f"(run {self._run_id!r}, resume checkpoint {resume_checkpoint_id!r}) "
                         f"name branches {sorted(unknown_lost)} outside the configured branches "
                         f"{sorted(self._settings[coalesce_name].branches)} — checkpoint corruption."
@@ -325,7 +325,7 @@ class CoalesceJournalRestorer:
                 slog.info(
                     "coalesce_journal_restored_loss_only_scalars",
                     coalesce_name=coalesce_name,
-                    row_id=row_id,
+                    fork_group_id=fork_group_id,
                     run_id=self._run_id,
                     resume_checkpoint_id=resume_checkpoint_id,
                     lost_branches=lost_branches,
@@ -334,7 +334,7 @@ class CoalesceJournalRestorer:
             slog.info(
                 "coalesce_journal_restore_dropped_stale_scalars",
                 coalesce_name=coalesce_name,
-                row_id=row_id,
+                fork_group_id=fork_group_id,
                 run_id=self._run_id,
                 resume_checkpoint_id=resume_checkpoint_id,
                 lost_branches=lost_branches,
@@ -347,16 +347,33 @@ class CoalesceJournalRestorer:
         )
 
     def _reconstruct_completed_keys_from_landscape(self) -> list[tuple[str, str]]:
-        """Read completed coalesce keys from the Landscape audit trail.
+        """Read completed coalesce (name, fork_group_id) keys from the Landscape.
 
         Queries node_states for completed entries at coalesce node IDs, joined
-        with tokens to get row_ids. Maps node_id → coalesce_name via the
-        reverse of the registered node_ids.
+        with token_lineage_frames to get fork_group_ids (WS4 Task 10 re-key —
+        group-keyed sibling of the pre-Task-10 row_id join). Maps node_id →
+        coalesce_name via the reverse of the registered node_ids.
 
         This is the restore seeding path: the Landscape records all completed
         coalesces, but the executor keeps only a bounded FIFO performance
         cache. Late arrivals for evicted keys are rediscovered through an exact
         Landscape point lookup (which stays on the executor).
+
+        Mirrors ``CollectorJournalRestorer._reconstruct_completed_groups_from_
+        landscape``'s landed precedent (T7, META-23 ruling): NOT routed
+        through ``resolve_group_collector_node``/the META-22 resolver family.
+        ``get_completed_group_ids_for_nodes`` returns one pair per FRAME
+        DEPTH per completed token (the depth-agnostic join, T2 review I-6) —
+        a nested fork-in-fork token contributes its ENCLOSING group(s) as
+        completed too, so an outer group can show as completed here because
+        an inner one finished. Routing this enumeration through the resolver
+        to dedup down to "one node per group" would risk DROPPING a genuine
+        completion in favour of a spurious nested one — the unsafe direction
+        (same reasoning as T7's, which applies unchanged to coalesce). Every
+        DISTINCT ``(node_id, group_id)`` pair this scoped query returns is
+        kept and processed independently instead; the resolver family is for
+        point MEMBERSHIP cross-checks, not enumeration. Do not "fix" this
+        method to route through it.
         """
         if not self._node_ids:
             return []
@@ -364,12 +381,16 @@ class CoalesceJournalRestorer:
         # Build reverse map: node_id → coalesce_name
         node_id_to_name: dict[str, str] = {str(nid): name for name, nid in self._node_ids.items()}
 
-        completed_pairs = self._barrier_restore_reads.get_completed_row_ids_for_nodes(
+        completed_pairs = self._barrier_restore_reads.get_completed_group_ids_for_nodes(
             run_id=self._run_id,
             node_ids=frozenset(node_id_to_name.keys()),
         )
 
-        return [(node_id_to_name[node_id_str], row_id) for node_id_str, row_id in completed_pairs if node_id_str in node_id_to_name]
+        return [
+            (node_id_to_name[node_id_str], fork_group_id)
+            for node_id_str, fork_group_id in completed_pairs
+            if node_id_str in node_id_to_name
+        ]
 
 
 # ---------------------------------------------------------------------------

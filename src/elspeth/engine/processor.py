@@ -3611,7 +3611,7 @@ class RowProcessor:
 
         outcome = self._coalesce_executor.notify_branch_lost(
             coalesce_name=coalesce_name,
-            row_id=current_token.row_id,
+            fork_group_id=frame.group_id,
             lost_branch=frame.member_key,
             reason=reason,
         )

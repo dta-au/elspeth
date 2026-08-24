@@ -110,7 +110,7 @@ def decide_coalesce(
     *,
     arrived_count: int,
     lost_branches: Mapping[str, str],
-    row_id: str | None = None,
+    group_id: str | None = None,
 ) -> CoalesceDecision:
     """Decide merge/fail/wait for a coalesce group at a lifecycle event.
 
@@ -127,7 +127,7 @@ def decide_coalesce(
             (``len(pending.branches)``).
         lost_branches: Branch name → loss reason for branches that will
             never arrive (``pending.lost_branches``).
-        row_id: Source row id, used only in the ``'first'``-policy invariant
+        group_id: Fork group id, used only in the ``'first'``-policy invariant
             crash message; callers on the TIMEOUT/FLUSH paths always provide it.
 
     Returns:
@@ -161,7 +161,7 @@ def decide_coalesce(
                 return _fail("first_timeout_no_arrivals" if event is CoalesceEvent.TIMEOUT else "all_branches_lost")
             raise RuntimeError(
                 f"Invariant violation: 'first' policy should never have arrived pending branches "
-                f"at coalesce '{settings.name}', row_id='{row_id}'. "
+                f"at coalesce '{settings.name}', fork_group_id='{group_id}'. "
                 f"'first' merges immediately on arrival — bug in accept()."
             )
         # event is CoalesceEvent.LOSS: if every branch is lost before any

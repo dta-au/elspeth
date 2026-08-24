@@ -433,9 +433,11 @@ class TestGroupLossHandOff:
         # still-pending key: the loss did NOT die with the dead leader.
         restore_call = takeover_coalesce.restore_from_journal.call_args
         assert restore_call is not None
+        # Keyed on GroupLossSpec.group_id directly (WS4 Task 9, C-2) — no
+        # more row_id translation for this merge.
         seeded = restore_call.kwargs["scalars"]
-        assert ("merge", "row-1") in seeded
-        assert dict(seeded[("merge", "row-1")].lost_branches) == {"path_b": "quarantined:boom"}
+        assert ("merge", "fg-adr030-test") in seeded
+        assert dict(seeded[("merge", "fg-adr030-test")].lost_branches) == {"path_b": "quarantined:boom"}
         assert [i.token_id for i in restore_call.kwargs["items"]] == ["tok-held"]
 
 

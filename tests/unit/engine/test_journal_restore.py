@@ -114,11 +114,19 @@ def _coalesce_restorer(
     clock: MockClock | None = None,
 ) -> CoalesceJournalRestorer:
     execution = MagicMock(spec=ExecutionRepository)
-    execution.get_completed_row_ids_for_nodes.return_value = completed_pairs if completed_pairs is not None else set()
+    execution.get_completed_row_ids_for_nodes.return_value = set()
+    # get_completed_group_ids_for_nodes lives on BarrierRestoreReadModel, not
+    # ExecutionRepository (spec-checked here) — assign explicitly (WS4
+    # Task 10: _reconstruct_completed_keys_from_landscape now queries the
+    # group-keyed sibling).
+    execution.get_completed_group_ids_for_nodes = MagicMock(return_value=completed_pairs if completed_pairs is not None else set())
     return CoalesceJournalRestorer(
         settings=settings if settings is not None else {"merge": _coalesce_settings()},
         node_ids=node_ids if node_ids is not None else {"merge": NodeID("co-1")},
-        barrier_restore_reads=SimpleNamespace(get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes),
+        barrier_restore_reads=SimpleNamespace(
+            get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
+            get_completed_group_ids_for_nodes=execution.get_completed_group_ids_for_nodes,
+        ),
         run_id="run_1",
         clock=clock if clock is not None else MockClock(start=100.0),
     )
@@ -161,7 +169,9 @@ class TestCoalesceJournalRestorer:
         assert isinstance(restored, RestoredCoalesceState)
         assert restored.token_count == 2
         (group,) = restored.pending
-        assert group.key == ("merge", "row_1")
+        # key is (coalesce_name, fork_group_id); both items share
+        # _blocked_item's default fork_group_id="fg-journal-test" (WS4 Task 10).
+        assert group.key == ("merge", "fg-journal-test")
         by_branch = {b.branch_name: b for b in group.branches}
         assert set(by_branch) == {"a", "b"}
         # Payloads survive the journal round-trip verbatim.
@@ -227,6 +237,46 @@ class TestCoalesceJournalRestorer:
         assert group.first_arrival == pytest.approx(100.0)
         assert restored.token_count == 0
 
+    def test_restore_groups_journal_items_by_fork_group_not_row(self) -> None:
+        """spec §5 (arch-M1): two sibling fork groups share row_id; restore
+        must rebuild TWO pending entries, not collide on a duplicate-branch
+        claim (WS4 Task 10)."""
+        restorer = _coalesce_restorer(settings={"merge_x": _coalesce_settings(name="merge_x", branches=["left", "right"])})
+        items = [
+            _blocked_item(
+                token_id="t-al", row_id="row-1", branch_name="left", fork_group_id="g-a", coalesce_name="merge_x", blocked_at=_JOURNAL_T0
+            ),
+            _blocked_item(
+                token_id="t-bl", row_id="row-1", branch_name="left", fork_group_id="g-b", coalesce_name="merge_x", blocked_at=_JOURNAL_T0
+            ),
+            _blocked_item(
+                token_id="t-ar", row_id="row-1", branch_name="right", fork_group_id="g-a", coalesce_name="merge_x", blocked_at=_JOURNAL_T0
+            ),
+        ]
+        restored = restorer.restore(
+            items=items,
+            scalars={},
+            state_ids={item.token_id: f"s-{item.token_id}" for item in items},
+            attempt_offsets={item.token_id: 0 for item in items},
+            resume_checkpoint_id="cp-1",
+            now=_JOURNAL_T0,
+        )
+        keys = {group.key for group in restored.pending}
+        assert keys == {("merge_x", "g-a"), ("merge_x", "g-b")}
+
+    def test_restore_rejects_journal_item_without_a_fork_frame(self) -> None:
+        restorer = _coalesce_restorer()
+        item = _blocked_item(token_id="t-x", row_id="row-1", branch_name=None, coalesce_name="merge", blocked_at=_JOURNAL_T0)
+        with pytest.raises(AuditIntegrityError, match="innermost FORK frame"):
+            restorer.restore(
+                items=[item],
+                scalars={},
+                state_ids={"t-x": "s-x"},
+                attempt_offsets={"t-x": 0},
+                resume_checkpoint_id="cp-1",
+                now=_JOURNAL_T0,
+            )
+
     def test_journal_groups_and_loss_only_scalars_coexist(self) -> None:
         """A loss-only scalar for key B must AUGMENT journal-backed groups for key A, not replace them.
 
@@ -248,9 +298,13 @@ class TestCoalesceJournalRestorer:
             now=_JOURNAL_T0,
         )
 
+        # The journal group keys on the item's fork_group_id
+        # ("fg-journal-test", _blocked_item's default); the scalar-only
+        # group keys on its own independent "row_9" — the two must stay
+        # distinct groups, which is exactly this test's point.
         by_key = {group.key: group for group in restored.pending}
-        assert set(by_key) == {("merge", "row_1"), ("merge", "row_9")}
-        assert [b.branch_name for b in by_key[("merge", "row_1")].branches] == ["a"]
+        assert set(by_key) == {("merge", "fg-journal-test"), ("merge", "row_9")}
+        assert [b.branch_name for b in by_key[("merge", "fg-journal-test")].branches] == ["a"]
         assert by_key[("merge", "row_9")].branches == ()
         assert dict(by_key[("merge", "row_9")].lost_branches) == {"b": "error_routed"}
         assert restored.token_count == 1
@@ -338,7 +392,11 @@ class TestCoalesceJournalRestorer:
             items=[
                 _blocked_item(token_id="t_a", row_id="row_1", branch_name="a", coalesce_name="merge", blocked_at=_JOURNAL_T0),
             ],
-            scalars={("merge", "row_1"): CoalescePendingScalars(lost_branches={"b": "lost"})},
+            # Scalar key matches the item's default fork_group_id
+            # ("fg-journal-test") so both merge into ONE group (WS4 Task 10) —
+            # the point of this test is a group with both an arrived branch
+            # AND lost_branches, not two disconnected groups.
+            scalars={("merge", "fg-journal-test"): CoalescePendingScalars(lost_branches={"b": "lost"})},
             state_ids={"t_a": "s_a"},
             attempt_offsets={"t_a": 1},
             resume_checkpoint_id="cp-0",
@@ -361,6 +419,15 @@ class TestCoalesceFacadeValidateBeforeMutate:
         execution = MagicMock(spec=ExecutionRepository)
         execution.get_completed_row_ids_for_nodes.return_value = set()
         execution.has_completed_row_for_node.return_value = False
+        # has_completed_group_for_node lives on BarrierRestoreReadModel, not
+        # ExecutionRepository (spec-checked here) — assign explicitly before
+        # binding it into the SimpleNamespace below (WS4 Task 8: the live
+        # notify_branch_lost/accept path now queries the group-keyed sibling).
+        execution.has_completed_group_for_node = MagicMock(return_value=False)
+        # get_completed_group_ids_for_nodes: same reasoning, WS4 Task 10 —
+        # CoalesceJournalRestorer's completed-key reconstruction now queries
+        # the group-keyed sibling.
+        execution.get_completed_group_ids_for_nodes = MagicMock(return_value=set())
         executor = CoalesceExecutor(
             execution=execution,
             span_factory=MagicMock(spec=SpanFactory),
@@ -372,6 +439,8 @@ class TestCoalesceFacadeValidateBeforeMutate:
             barrier_restore_reads=SimpleNamespace(
                 get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
                 has_completed_row_for_node=execution.has_completed_row_for_node,
+                has_completed_group_for_node=execution.has_completed_group_for_node,
+                get_completed_group_ids_for_nodes=execution.get_completed_group_ids_for_nodes,
             ),
         )
         executor.register_coalesce(settings if settings is not None else _coalesce_settings(), NodeID("co-1"))
@@ -388,7 +457,9 @@ class TestCoalesceFacadeValidateBeforeMutate:
             resume_checkpoint_id="cp-0",
             now=_JOURNAL_T0,
         )
-        assert ("merge", "row_1") in executor._pending
+        # key is (coalesce_name, fork_group_id); _blocked_item's default
+        # fork_group_id is "fg-journal-test" (WS4 Task 10).
+        assert ("merge", "fg-journal-test") in executor._pending
 
         with pytest.raises(AuditIntegrityError, match="NULL barrier_blocked_at"):
             executor.restore_from_journal(
@@ -401,7 +472,7 @@ class TestCoalesceFacadeValidateBeforeMutate:
             )
 
         # The failed second restore must not have cleared the first.
-        assert ("merge", "row_1") in executor._pending
+        assert ("merge", "fg-journal-test") in executor._pending
 
     def test_facade_applies_journal_groups_and_loss_only_scalars_together(self) -> None:
         """Both populations land in executor._pending from one restore call."""
@@ -415,8 +486,8 @@ class TestCoalesceFacadeValidateBeforeMutate:
             now=_JOURNAL_T0,
         )
 
-        assert set(executor._pending) == {("merge", "row_1"), ("merge", "row_9")}
-        assert list(executor._pending[("merge", "row_1")].branches) == ["a"]
+        assert set(executor._pending) == {("merge", "fg-journal-test"), ("merge", "row_9")}
+        assert list(executor._pending[("merge", "fg-journal-test")].branches) == ["a"]
         assert executor._pending[("merge", "row_9")].branches == {}
         assert executor._pending[("merge", "row_9")].lost_branches == {"b": "error_routed"}
 
@@ -431,7 +502,12 @@ class TestCoalesceFacadeValidateBeforeMutate:
         executor = self._make_executor(_coalesce_settings(branches=["a", "b", "c"]))
         executor.restore_from_journal(
             items=[_blocked_item(token_id="t_a", row_id="row_1", branch_name="a", coalesce_name="merge", blocked_at=_JOURNAL_T0)],
-            scalars={("merge", "row_1"): CoalescePendingScalars(lost_branches={"b": "error_routed"})},
+            # Scalar key matches the item's default fork_group_id
+            # ("fg-journal-test") so both merge into ONE restored group (WS4
+            # Task 10) — without this the notify below would target an
+            # unrelated, disconnected scalar-only group instead of "the
+            # restored key" the docstring means, weakening the proof.
+            scalars={("merge", "fg-journal-test"): CoalescePendingScalars(lost_branches={"b": "error_routed"})},
             state_ids={"t_a": "s_a"},
             attempt_offsets={"t_a": 1},
             resume_checkpoint_id="cp-0",
@@ -441,7 +517,7 @@ class TestCoalesceFacadeValidateBeforeMutate:
         # In-place mutation of the restored loss record must succeed; under
         # require_all the second loss makes the merge impossible, so the key
         # fails with BOTH losses recorded in the audit metadata.
-        outcome = executor.notify_branch_lost("merge", "row_1", "c", "error_routed")
+        outcome = executor.notify_branch_lost("merge", "fg-journal-test", "c", "error_routed")
 
         assert outcome is not None
         assert outcome.held is False
