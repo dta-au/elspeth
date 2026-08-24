@@ -6,10 +6,16 @@ closers still receive the loss.
 Harness built directly on real Landscape audit tables (real fork_token/
 create_token/record_token_outcome writes via `_make_factory`'s in-memory DB)
 rather than the full Orchestrator: escalation reads durable group_records /
-token_lineage_frames / token_outcomes state, and the four tests here never
-need a functioning CoalesceExecutor.notify_branch_lost (no test in this file
-drives a SECOND intake pass whose replay step would touch a NEWLY staged
-escalated loss — see the module docstring on `_UnusedCoalesceExecutor`).
+token_lineage_frames / token_outcomes state. The five parking/staging tests
+never need a functioning CoalesceExecutor.notify_branch_lost — no
+run_barrier_intake pass in them touches a NEWLY staged escalated loss on a
+SECOND pass (see `_UnusedCoalesceExecutor`'s docstring). The final
+composition test (`test_staged_escalation_replays_and_settles_the_enclosing_
+closer_on_next_pass`) is the deliberate exception: it wires a REAL
+CoalesceExecutor for the enclosing closer and drives two passes, proving the
+staged row is actually replayed and the enclosing closer genuinely settles —
+not just that the row's fields are correct in isolation (review round 1,
+finding 3).
 """
 
 from __future__ import annotations
@@ -22,8 +28,13 @@ import pytest
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.core.config import CoalesceSettings
 from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
 from elspeth.engine._error_hash import compute_error_hash
+from elspeth.engine.clock import MockClock
+from elspeth.engine.coalesce_executor import CoalesceExecutor
+from elspeth.engine.spans import SpanFactory
+from elspeth.engine.tokens import TokenManager
 from tests.fixtures.factories import make_context
 from tests.unit.engine.test_processor import _TEST_LEADER_WORKER_ID, _make_factory, _make_processor
 
@@ -287,3 +298,130 @@ def test_escalation_staging_is_idempotent_across_redrive(nested_intake_harness):
     h.reark_inner_failure()  # simulate takeover re-deriving the identical FAIL verdict
     h.coordinator.run_barrier_intake(h.ctx)  # re-derive
     assert len([loss for loss in h.group_losses() if loss.reason == "group_failed"]) == 1
+
+
+def test_staged_escalation_replays_and_settles_the_enclosing_closer_on_next_pass():
+    """Composition test (review round 1, finding 3): the generic replay
+    mechanism and the staged row's fields are each pinned separately
+    elsewhere in this file — this proves the COMPOSITION. A real (non-
+    double) CoalesceExecutor is wired for the enclosing ("outer_closer")
+    closer; the inner group fails and settles exactly as in the other
+    tests, but this time the SECOND `run_barrier_intake()` pass's replay
+    step must actually call the real executor's `notify_branch_lost` and
+    observe it settle the outer closer's row — proven via the same public
+    `has_recorded_branch_loss` dedup check `_replay_group_losses` itself
+    uses before calling `notify_branch_lost`."""
+    run_id = "test-run"
+    _db, factory = _make_factory(run_id=run_id)
+    row = factory.data_flow.create_row(run_id, "source-0", 0, {"value": 1}, source_row_index=0, ingest_sequence=0)
+    root = factory.data_flow.create_token(row.row_id)
+
+    outer_children, _outer_group_id = factory.data_flow.fork_token(TokenRef(token_id=root.token_id, run_id=run_id), row.row_id, ["outer_a"])
+    (outer_child,) = outer_children
+    inner_children, inner_group_id = factory.data_flow.fork_token(
+        TokenRef(token_id=outer_child.token_id, run_id=run_id),
+        row.row_id,
+        ["inner_1", "inner_2"],
+        parent_lineage_path=outer_child.lineage_path,
+    )
+
+    outer_binding = GroupBinding(
+        kind=FrameKind.FORK,
+        opener_node_id=NodeID("outer-opener"),
+        opener_name="outer-opener",
+        closer_node_id=NodeID("coalesce::outer_closer"),
+        closer_name="outer_closer",
+        closer_kind=CloserKind.COALESCE,
+        policy="require_all",
+        on_group_failure=None,
+        member_roster=("outer_a",),
+    )
+    inner_binding = GroupBinding(
+        kind=FrameKind.FORK,
+        opener_node_id=NodeID("inner-opener"),
+        opener_name="inner-opener",
+        closer_node_id=NodeID("coalesce::inner_closer"),
+        closer_name="inner_closer",
+        closer_kind=CloserKind.COALESCE,
+        policy="require_all",
+        on_group_failure=None,
+        member_roster=("inner_1", "inner_2"),
+    )
+    registry = GroupBindingRegistry(bindings=(outer_binding, inner_binding))
+    coalesce_node_ids = {
+        CoalesceName("outer_closer"): NodeID("coalesce::outer_closer"),
+        CoalesceName("inner_closer"): NodeID("coalesce::inner_closer"),
+    }
+
+    # A REAL CoalesceExecutor for "outer_closer" — the enclosing closer this
+    # test proves gets genuinely notified/settled. CoalesceSettings.branches
+    # requires >=2 entries (pydantic min_length); "outer_b" is never
+    # exercised — the GroupBinding's own member_roster (the settlement
+    # walk's roster authority) is the SEPARATE, single-member authority that
+    # actually governs this test's escalation.
+    token_manager = TokenManager(factory.data_flow, step_resolver=lambda node_id: 2)
+    outer_executor = CoalesceExecutor(
+        execution=factory.execution,
+        span_factory=SpanFactory(),
+        token_manager=token_manager,
+        run_id=run_id,
+        step_resolver=lambda node_id: 2,
+        clock=MockClock(start=100.0),
+        data_flow=factory.data_flow,
+        barrier_restore_reads=factory.barrier_restore,
+    )
+    outer_executor.register_coalesce(
+        CoalesceSettings(
+            name="outer_closer",
+            branches={"outer_a": "outer_a", "outer_b": "outer_b"},
+            policy="require_all",
+            merge="union",
+            on_success="default",
+        ),
+        NodeID("coalesce::outer_closer"),
+    )
+
+    proc = _make_processor(
+        factory,
+        run_id=run_id,
+        group_bindings=registry,
+        coalesce_executor=outer_executor,
+        coalesce_node_ids=coalesce_node_ids,
+        scheduler_lease_owner=_TEST_LEADER_WORKER_ID,
+    )
+    ctx = make_context(run_id=run_id)
+
+    # Fail the inner group and settle all its members (identical to the
+    # single-pass tests above).
+    proc._barrier_intake.note_group_failed(closer_name="inner_closer", group_id=inner_group_id, reason="quarantined")
+    for child in inner_children:
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=child.token_id, run_id=run_id),
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.UNROUTED,
+            error_hash=compute_error_hash("quarantined"),
+        )
+
+    # Pass 1: stages the escalated loss against "outer_closer" durably.
+    proc.run_barrier_intake(ctx)
+    escalated = [loss for loss in factory.scheduler.list_group_losses(run_id=run_id) if loss.reason == "group_failed"]
+    assert len(escalated) == 1
+    assert escalated[0].closer_name == "outer_closer"
+    # Not yet replayed — staging (pass 1) is a durable write only, never an
+    # in-memory notify (§6.3 item 1).
+    assert escalated[0].adopted_epoch is None
+
+    # Pass 2: replay drains the pass-1 escalated row and calls the REAL
+    # executor's notify_branch_lost — require_all with one lost branch
+    # fails the group immediately, and the executor settles (completes)
+    # this row.
+    proc.run_barrier_intake(ctx)
+
+    (replayed,) = [loss for loss in factory.scheduler.list_group_losses(run_id=run_id) if loss.reason == "group_failed"]
+    assert replayed.adopted_epoch is not None, "the staged row must be marked adopted by pass 2's replay"
+
+    # The genuinely settled proof: notify_branch_lost's own "already
+    # completed" dedup (the same check _replay_group_losses relies on for
+    # idempotent re-drives) now no-ops a repeat call — the real executor
+    # considers this row's coalesce resolved, not merely "not yet told".
+    assert outer_executor.notify_branch_lost("outer_closer", row.row_id, "outer_a", "group_failed") is None

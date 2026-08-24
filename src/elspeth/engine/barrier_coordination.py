@@ -40,7 +40,7 @@ from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierSca
 from elspeth.contracts.enums import BatchStatus, FrameKind, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.freeze import deep_freeze
-from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.identity import LineageFrame, path_fork_group_id
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, GroupLossSpec, TokenWorkItem
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
@@ -484,7 +484,7 @@ class BarrierIntakeCoordinator:
             # intake pass is out-of-claim (no take_claim_group_losses call
             # ever runs here), so without this the staged spec would be
             # orphaned exactly like the sweep path was before Ruling 39.
-            self._note_group_failed_from_token(
+            self._note_coalesce_group_failed_from_token(
                 closer_name=str(coalesce_name),
                 token=token,
                 reason=outcome.failure_reason or "late_arrival_after_merge",
@@ -546,7 +546,7 @@ class BarrierIntakeCoordinator:
             # so any escalated loss it stages is drained and threaded into
             # THAT SAME call — see the late-arrival arm's comment above for
             # the full rationale (this intake pass is out-of-claim too).
-            self._note_group_failed_from_token(closer_name=str(coalesce_name), token=token, reason=error_msg)
+            self._note_coalesce_group_failed_from_token(closer_name=str(coalesce_name), token=token, reason=error_msg)
             cascade_child_items: list[WorkItem] = []
             cascaded_results = self._record_group_member_terminals(
                 tuple(outcome.consumed_tokens),
@@ -627,7 +627,7 @@ class BarrierIntakeCoordinator:
             return BarrierIntakeDisposition(kind=BarrierIntakeDispositionKind.HELD)
 
         if outcome.late_arrival:
-            self._note_group_failed_from_token(
+            self._note_row_union_group_failed_from_token(
                 closer_name=str(row_union_name), token=token, reason=outcome.failure_reason or "late_arrival_after_release"
             )
             released = self._scheduler.mark_blocked_barrier_terminal(
@@ -681,7 +681,7 @@ class BarrierIntakeCoordinator:
         if outcome.failure_reason:
             # Whole-group failure completed by this arrival (v1 fail-closed):
             # every held branch — this one included — holds a BLOCKED row.
-            self._note_group_failed_from_token(closer_name=str(row_union_name), token=token, reason=outcome.failure_reason)
+            self._note_row_union_group_failed_from_token(closer_name=str(row_union_name), token=token, reason=outcome.failure_reason)
             self._scheduler.mark_blocked_barrier_terminal(
                 run_id=self._run_id,
                 barrier_key=str(row_union_name),
@@ -971,19 +971,49 @@ class BarrierIntakeCoordinator:
         natural key."""
         self._failed_group_notes[(closer_name, group_id)] = reason
 
-    def _note_group_failed_from_token(self, *, closer_name: str, token: TokenInfo, reason: str) -> None:
+    def _note_coalesce_group_failed_from_token(self, *, closer_name: str, token: TokenInfo, reason: str) -> None:
         """Park a FAIL verdict keyed on the arriving/consumed token's own
-        innermost lineage frame (spec §6.3): a token that reached a
-        coalesce/row_union closer always carries the FORK frame that routed
-        it there, so that frame's ``group_id`` IS the failed group. Empty
-        ``lineage_path`` is unreachable in production (every fork child
-        mints one) — tolerated as a silent no-op here only because
-        dispatch-only synthetic test fixtures build lineage-free tokens on
-        purpose, mirroring `_record_group_member_terminals`'s own
-        empty-input tolerance."""
+        innermost lineage frame (spec §6.3). Sound to index ``[-1]`` here
+        ONLY because coalesce and fork are strictly LIFO-nested by
+        construction (`pop_closer_frame`'s own docstring,
+        `contracts/identity.py`) — a coalesce closer's own frame IS always
+        the token's innermost frame. Do NOT reuse this for row_union (see
+        `_note_row_union_group_failed_from_token`): unlike coalesce, a
+        row-multiplying transform inside a row_union branch can legally
+        stack a further frame on top of the branch's FORK frame before the
+        token reaches the union. Empty ``lineage_path`` is unreachable in
+        production (every fork child mints one) — tolerated as a silent
+        no-op here only because dispatch-only synthetic test fixtures build
+        lineage-free tokens on purpose, mirroring
+        `_record_group_member_terminals`'s own empty-input tolerance."""
         if not token.lineage_path:
             return
         self.note_group_failed(closer_name=closer_name, group_id=token.lineage_path[-1].group_id, reason=reason)
+
+    def _note_row_union_group_failed_from_token(self, *, closer_name: str, token: TokenInfo, reason: str) -> None:
+        """Park a FAIL verdict using the token's innermost FORK frame (spec
+        §6.3) — a SEARCH, never ``[-1]``. Unlike coalesce, row_union does
+        not strictly LIFO-nest with an intervening multi-row transform: a
+        row-multiplying transform inside the branch (e.g. an expand) can
+        legally stack an EXPAND frame on top of the branch's FORK frame
+        before the token reaches the union (elspeth-a5b86149d4,
+        `pop_fork_frame`'s own docstring,
+        tests/integration/pipeline/test_row_union_branch_cardinality.py) —
+        the same reason `pop_fork_frame` searches for its FORK frame
+        "wherever it sits" rather than popping the innermost one.
+        `path_fork_group_id` performs that same innermost-first search. A
+        token that reached a row_union closer always carries SOME FORK
+        frame (that is how it got routed here); a lineage with no FORK
+        frame at all is lineage corruption, not a legal shape — this fails
+        closed rather than silently discarding the verdict."""
+        group_id = path_fork_group_id(token.lineage_path)
+        if group_id is None:
+            raise OrchestrationInvariantError(
+                f"row_union closer {closer_name!r} FAIL verdict for token {token.token_id!r} carries no FORK "
+                f"frame anywhere in its lineage_path ({token.lineage_path!r}); a token cannot reach a "
+                "row_union closer without one — lineage corruption."
+            )
+        self.note_group_failed(closer_name=closer_name, group_id=group_id, reason=reason)
 
     def _binding_for_closer_name(self, closer_name: str) -> GroupBinding | None:
         """The FAILED group's own binding (spec §7 rule 1: a closer closes at
@@ -1108,7 +1138,13 @@ class BarrierIntakeCoordinator:
                 # _binding_for_closer_name) — cannot authenticate or even
                 # check settlement; discard rather than crash a run over a
                 # test-harness/legacy-wiring gap that never arises from a
-                # real built graph.
+                # real built graph. Inert today: build_group_binding_registry
+                # guarantees a binding for every executable coalesce/
+                # row_union/collector closer, and graph_registration.py
+                # hard-refuses any graph carrying a collector node before
+                # execution — re-adjudicate this arm under filigree
+                # elspeth-c00a82bf97 once WS4 lifts that refusal and
+                # collector closers become reachable here.
                 del self._failed_group_notes[(closer_name, group_id)]
                 continue
             if not self._group_roster_settled(closer_name=closer_name, group_id=group_id, binding=failed_binding):
