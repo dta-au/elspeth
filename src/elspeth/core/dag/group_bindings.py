@@ -18,21 +18,18 @@ registers each new group via ``register_expand_group`` (WS3 wires the
 single TokenManager call site). An unregistered frame is inert — ``None``,
 nothing staged, no roster watching (spec §2).
 
-**``_expand_groups`` is mint-local and process-local (2026-08-24 review
-I3-corrected).** There is no re-derivation from ``group_records`` today —
-``register_expand_group`` has exactly one production caller (the mint
-site), and nothing else writes this index. A follower that did not
-personally run the opener, or any process after a crash/resume, resolves
-every EXPAND frame to ``None`` (inert) regardless of whether the group is
-genuinely bound — FORK frames are immune (static roster, identical on
-every worker's build), EXPAND frames are not. This is latent rather than
-live today: an EXPAND binding only exists when ``scope_settings`` names a
-collector closer, and any graph with a collector node is refused before
-execution (``graph_registration.py``, WS4 not yet landed) — so
-``_expand_binding_by_opener`` is empty in every executable run and this
-gap cannot fire yet. Closing it (follower/resume EXPAND re-derivation from
-the durable ``group_records`` table, which does carry the opener) is
-carried as WS4/WS5-6 work, not implemented here.
+**``_expand_groups`` is mint-local and process-local, and the settle seam
+re-derives on a miss (META-9.1, integration C3.5).** ``register_expand_group``
+has two callers: the mint site (``TokenManager.expand_token``, the opener's
+own process) and ``RowProcessor._rederive_expand_binding``, which a
+follower that never ran the opener — or any process after a crash/resume —
+reaches when ``binding_for`` misses an EXPAND frame. FORK frames are immune
+(static roster, identical on every worker's build); EXPAND group ids are
+runtime-minted, so the re-derivation reads the durable ``group_records``
+opener token, finds the ONE declared opener node that token holds a
+node_state at, takes config's binding for it, cross-checks it by MEMBERSHIP
+against ``resolve_group_collector_node``'s durable closer set (META-22.1),
+and registers the result here. Undeclared expansions stay inert.
 """
 
 from __future__ import annotations

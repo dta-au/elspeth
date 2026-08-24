@@ -590,6 +590,18 @@ class RowProcessor:
         # keeps for register_expand_group: the expand path consults it to give
         # a bound opener's children their collector cursor.
         self._opener_binding_by_node_id: dict[NodeID, GroupBinding] = self._group_bindings.by_opener_node()
+        # Declared EXPAND openers only (scope openers): the META-9.1
+        # re-derivation below iterates exactly these; a pipeline with no
+        # declared scope never pays a durable read for an EXPAND frame.
+        self._expand_opener_binding_by_node_id: dict[NodeID, GroupBinding] = {
+            node_id: binding for node_id, binding in self._opener_binding_by_node_id.items() if binding.kind is FrameKind.EXPAND
+        }
+        # EXPAND group ids this process has already re-derived as UNDECLARED
+        # (META-9.1): an undeclared expansion's frame is inert forever, and
+        # the durable re-derivation is a DB read per miss — remember the
+        # verdict so an ordinary multi-row transform's children cost one read
+        # per group, not one per settled loss.
+        self._inert_expand_groups: set[str] = set()
         self._branch_to_sink: dict[BranchName, SinkName] = branch_to_sink or {}
         self._unbound_branch_first_node: dict[BranchName, NodeID] = unbound_branch_first_node or {}
         overlap = set(self._branch_to_coalesce.keys()) & set(self._branch_to_sink.keys())
@@ -782,6 +794,11 @@ class RowProcessor:
         # released group's status-COMPLETED node state is the durable proof
         # that a later terminal divert is not a pre-barrier branch loss.
         self._barrier_restore_reads = restore_reads
+        # The typed restore read model alone (never the ExecutionRepository
+        # fallback): the META-9.1 EXPAND re-derivation needs its
+        # node-scoped attempt read and the durable closer-node resolver.
+        # Production always wires factory.barrier_restore here.
+        self._barrier_restore_read_model: BarrierRestoreReadModel | None = barrier_restore_reads
         # Barrier subsystem (elspeth-e76a186916): the intake and recovery
         # coordinators own the crash-window adoption/restore ordering (open
         # batch -> fenced adopt -> feed memory -> evaluate trigger) behind one
@@ -3301,9 +3318,85 @@ class RowProcessor:
         """
         for frame in reversed(current_token.lineage_path):
             binding = self._group_bindings.binding_for(frame)
+            if binding is None and frame.kind is FrameKind.EXPAND:
+                binding = self._rederive_expand_binding(frame)
             if binding is not None:
                 return frame, binding
         return None
+
+    def _rederive_expand_binding(self, frame: LineageFrame) -> GroupBinding | None:
+        """Resolve an EXPAND frame the in-memory registry does not know (META-9.1).
+
+        ``GroupBindingRegistry._expand_groups`` is populated only at mint
+        time, by the opener's OWN process. A follower that never ran the
+        opener, or any process after a crash/resume, therefore resolves every
+        EXPAND frame to None — and before this method that meant a lost
+        collector member was treated as UNBOUND (nothing staged), stranding
+        its group's roster forever with no ``group_losses`` row to explain
+        why. FORK frames are immune (their roster is static config).
+
+        Durable re-derivation: the group's ``group_records`` row names the
+        opener TOKEN; the opener NODE is the declared opener node at which
+        that token holds a node_state (an opener token visits exactly one
+        declared opener — it terminates there as EXPAND_PARENT); the binding
+        is config's, keyed on that node. Undeclared expansions (no declared
+        opener node visited) stay inert, remembered per group id. The result
+        is registered on the registry so later frames of the same group are
+        an in-memory hit.
+
+        META-22.1 cross-check, MEMBERSHIP not equality: when the group has
+        durable completion evidence anywhere
+        (``resolve_group_collector_node`` non-empty), config's closer node
+        must be ONE OF those nodes — nesting legitimately adds an inner
+        collector's node to an outer group's set, so equality would raise on
+        healthy nested data. Durable is authoritative: a config closer absent
+        from a non-empty durable set is a silent node-id mismatch and fails
+        closed. Empty before completion — nothing to check yet.
+        """
+        if not self._expand_opener_binding_by_node_id or frame.group_id in self._inert_expand_groups:
+            return None
+        reads = self._barrier_restore_read_model
+        if reads is None:
+            raise OrchestrationInvariantError(
+                f"EXPAND frame for group {frame.group_id!r} (run {self._run_id!r}) is not in the in-memory binding "
+                "registry and this processor has no barrier restore read model to re-derive it from; production "
+                "wires factory.barrier_restore (META-9.1)."
+            )
+        record = reads.get_group_record(run_id=self._run_id, group_id=frame.group_id)
+        if record is None:
+            raise AuditIntegrityError(
+                f"Token lineage carries EXPAND frame for group {frame.group_id!r} (run {self._run_id!r}) but "
+                "group_records has no such group — the opener's expansion mints it unconditionally (spec §4.3)."
+            )
+        if record.kind != FrameKind.EXPAND.value:
+            raise AuditIntegrityError(
+                f"EXPAND frame for group {frame.group_id!r} (run {self._run_id!r}) resolves to a group_records row of "
+                f"kind {record.kind!r}; lineage/roster disagreement."
+            )
+        candidates: list[GroupBinding] = []
+        for opener_node_id, binding in self._expand_opener_binding_by_node_id.items():
+            visited = reads.get_max_node_state_attempts_for_node(self._run_id, [record.opener_token_id], node_id=str(opener_node_id))
+            if record.opener_token_id in visited:
+                candidates.append(binding)
+        if not candidates:
+            self._inert_expand_groups.add(frame.group_id)
+            return None
+        if len(candidates) > 1:
+            raise AuditIntegrityError(
+                f"Opener token {record.opener_token_id!r} of EXPAND group {frame.group_id!r} (run {self._run_id!r}) holds "
+                f"node_states at {len(candidates)} declared opener nodes "
+                f"({sorted(str(b.opener_node_id) for b in candidates)}); an opener token visits exactly one."
+            )
+        binding = candidates[0]
+        durable_closer_nodes = reads.resolve_group_collector_node(run_id=self._run_id, group_id=frame.group_id)
+        if durable_closer_nodes and str(binding.closer_node_id) not in durable_closer_nodes:
+            raise AuditIntegrityError(
+                f"EXPAND group {frame.group_id!r} (run {self._run_id!r}) has durable completion evidence at nodes "
+                f"{sorted(durable_closer_nodes)} but config binds opener {binding.opener_name!r} to closer node "
+                f"{binding.closer_node_id!r}, which is not among them; durable is authoritative — node-id mismatch."
+            )
+        self._group_bindings.register_expand_group(frame.group_id, opener_name=binding.opener_name)
+        return binding
 
     def _resolve_member_token_id(self, frame: LineageFrame) -> str:
         """The honest `GroupLossSpec.token_id` for an ESCALATED loss (fix
