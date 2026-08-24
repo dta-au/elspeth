@@ -3286,18 +3286,18 @@ class RowProcessor:
         legally stack on top of a row_union's FORK frame before the union
         (`_note_row_union_group_failed_from_token`'s docstring in
         barrier_coordination.py explains why that stacking is legal). An
-        EXPAND frame only resolves a binding via `GroupBindingRegistry.
-        binding_for` when it is in `_expand_groups`, which is populated
+        EXPAND frame resolves a binding via `GroupBindingRegistry.
+        binding_for` only when it is in `_expand_groups`, which is populated
         solely by `register_expand_group` — called only by a declared
-        scope's collector opener — and collector execution does not run
-        until WS4 (`graph_registration.py` hard-refuses any graph with a
-        non-empty collector id map, mirroring the ticketed gap on
-        `BarrierIntakeCoordinator._binding_for_closer_name` in
-        barrier_coordination.py, elspeth-c00a82bf97). So no EXPAND
-        frame can be BOUND today, and this walk always resolves past one to
-        the enclosing FORK frame. Re-adjudicate this note once WS4 lifts
-        that refusal and collector-bound EXPAND frames become reachable
-        here.
+        scope's collector opener (integration item 14 re-adjudication: with
+        the collector executor wired, an EXPAND frame minted by a declared
+        opener IS bound, and this walk stops at it — the collector, being
+        the innermost closer, settles that loss; only an UNDECLARED
+        expansion's frame stays inert and is resolved past). A row_union
+        closer's resolved frame is therefore still its own FORK group: a
+        bound EXPAND frame stacked above it belongs to a collector that
+        closes BEFORE the union (SESE nesting), so the token has had that
+        frame popped by the time it reaches the union.
         """
         for frame in reversed(current_token.lineage_path):
             binding = self._group_bindings.binding_for(frame)
@@ -3492,12 +3492,28 @@ class RowProcessor:
         failure_reason: str,
         child_items: list[WorkItem],
         group_failed: bool,
+        frame_kind: FrameKind = FrameKind.FORK,
+        outcome: TerminalOutcome = TerminalOutcome.FAILURE,
+        path: TerminalPath = TerminalPath.UNROUTED,
     ) -> list[RowResult]:
         """Terminalize a closer's consumed members through the standard
         channel (spec §6.1: no closer writes token terminals directly —
         Task 6 retires the coalesce executor's three direct
         `record_token_outcome` writes for held siblings it consumes on a
         failure arm).
+
+        ``frame_kind`` (integration item 14) names the closer's OWN frame
+        kind — FORK for coalesce/row_union members, EXPAND for collector
+        members — and is passed explicitly rather than read off the anchor
+        so the "innermost frame is the closer's own" guard stays a real
+        check. ``outcome``/``path`` are the disposition to write: the
+        FAILURE/UNROUTED default is every failure arm; a collector's
+        SUCCESSFUL flush writes its surviving members' (SUCCESS, COALESCED)
+        through the same channel (the disposition a consumed coalesce member
+        carries, ``sink_name`` None — see ``is_counted_coalesced_output``),
+        with ``group_failed=False`` because a successful closure consumes no
+        enclosing member. ``error_hash`` is derived from ``failure_reason``
+        only for a FAILURE outcome.
 
         ``group_failed`` (final review F1) is the caller's statement of
         WHICH closure this is: ``True`` when this call IS the group's
@@ -3562,14 +3578,14 @@ class RowProcessor:
         if not consumed_tokens:
             return []
         anchor = consumed_tokens[0].lineage_path
-        if not anchor or anchor[-1].kind is not FrameKind.FORK:
+        if not anchor or anchor[-1].kind is not frame_kind:
             raise OrchestrationInvariantError(
                 f"_record_group_member_terminals: consumed token {consumed_tokens[0].token_id!r} has no "
-                f"innermost FORK frame to pop (lineage_path={anchor!r})"
+                f"innermost {frame_kind.name} frame to pop (lineage_path={anchor!r})"
             )
         shared_group_id = anchor[-1].group_id
         remaining_paths = {
-            pop_closer_frame(consumed.lineage_path, kind=FrameKind.FORK, group_id=shared_group_id) for consumed in consumed_tokens
+            pop_closer_frame(consumed.lineage_path, kind=frame_kind, group_id=shared_group_id) for consumed in consumed_tokens
         }
         if len(remaining_paths) != 1:
             raise OrchestrationInvariantError(
@@ -3578,12 +3594,12 @@ class RowProcessor:
             )
         remaining_path = remaining_paths.pop()
 
-        error_hash = compute_error_hash(failure_reason)
+        error_hash = compute_error_hash(failure_reason) if outcome is TerminalOutcome.FAILURE else None
         for consumed in consumed_tokens:
             self._data_flow.record_token_outcome(
                 ref=TokenRef(token_id=consumed.token_id, run_id=self._run_id),
-                outcome=TerminalOutcome.FAILURE,
-                path=TerminalPath.UNROUTED,
+                outcome=outcome,
+                path=path,
                 error_hash=error_hash,
             )
 
@@ -3599,6 +3615,9 @@ class RowProcessor:
         failure_reason: str,
         child_items: list[WorkItem],
         group_failed: bool,
+        frame_kind: FrameKind = FrameKind.FORK,
+        outcome: TerminalOutcome = TerminalOutcome.FAILURE,
+        path: TerminalPath = TerminalPath.UNROUTED,
     ) -> list[RowResult]:
         """Public surface for `_record_group_member_terminals` (spec §6.1
         Task 6): the CoalesceCompletionPort / BarrierIntakeCoordinator
@@ -3607,7 +3626,13 @@ class RowProcessor:
         outside this class.
         """
         return self._record_group_member_terminals(
-            consumed_tokens, failure_reason=failure_reason, child_items=child_items, group_failed=group_failed
+            consumed_tokens,
+            failure_reason=failure_reason,
+            child_items=child_items,
+            group_failed=group_failed,
+            frame_kind=frame_kind,
+            outcome=outcome,
+            path=path,
         )
 
     def _notify_closer_of_loss(

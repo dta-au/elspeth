@@ -801,6 +801,15 @@ class BarrierIntakeCoordinator:
         )
         return self._dispose_collector_outcome(outcome, scope_row_id=row.row_id)
 
+    def _unterminalized(self, tokens: Sequence[TokenInfo]) -> tuple[TokenInfo, ...]:
+        """The subset of ``tokens`` with no completed terminal outcome yet."""
+        missing: list[TokenInfo] = []
+        for token in tokens:
+            existing = self._data_flow.get_token_outcome(token.token_id)
+            if existing is None or not existing.completed:
+                missing.append(token)
+        return tuple(missing)
+
     def _dispose_collector_outcome(self, outcome: CollectorOutcome, *, scope_row_id: str) -> BarrierIntakeDisposition | None:
         """Turn one ``CollectorOutcome`` (arrival OR replayed loss) into its disposition.
 
@@ -828,6 +837,27 @@ class BarrierIntakeCoordinator:
                 raise OrchestrationInvariantError(
                     f"Collector {collector_name!r} released a group but the fire-completion seams are not wired."
                 )
+            # Item 14: the executor writes no survivor terminal (only the
+            # Ruling-36 quarantine writes), and CollectorOutcome carries no
+            # flag to consult (META-17) — the seam records whatever terminal
+            # it finds MISSING among the consumed members, unconditionally.
+            # A quarantined member already holds (FAILURE, QUARANTINED_AT_SOURCE)
+            # and is skipped; a second write would trip
+            # ix_token_outcomes_terminal_unique. Survivors carry
+            # (SUCCESS, COALESCED) with sink_name None — the consumed-input
+            # disposition coalesce members already carry, discriminated from
+            # a routed output by is_counted_coalesced_output. Written BEFORE
+            # complete_barrier, mirroring coalesce_tokens (member terminals
+            # land with the release mint, then the journal transition).
+            self._record_group_member_terminals(
+                self._unterminalized(outcome.consumed_tokens),
+                failure_reason="",
+                child_items=[],
+                group_failed=False,
+                frame_kind=FrameKind.EXPAND,
+                outcome=TerminalOutcome.SUCCESS,
+                path=TerminalPath.COALESCED,
+            )
             release = self._route_collector_release(collector_name=collector_name, released_tokens=outcome.released_tokens)
             self._complete_collector_fire(
                 collector_name=collector_name,
@@ -851,11 +881,18 @@ class BarrierIntakeCoordinator:
             self.note_group_failed(closer_name=str(collector_name), group_id=group_id, reason=outcome.failure_reason)
             consumed_tokens = tuple(outcome.consumed_tokens)
             failure_child_items: list[WorkItem] = []
+            # Arrived members of a failed group: (FAILURE, UNROUTED) — the
+            # spec §6.3 "survivors terminate scope_group_failed" write — plus
+            # ONE escalation walk over their shared remaining lineage (an
+            # enclosing bound frame, if any, is staged a group_failed loss).
+            # A failure arm never flushed, so no member holds a prior
+            # terminal; the seam's own duplicate detection stands.
             cascaded_results = self._record_group_member_terminals(
                 consumed_tokens,
                 failure_reason=outcome.failure_reason,
                 child_items=failure_child_items,
                 group_failed=True,
+                frame_kind=FrameKind.EXPAND,
             )
             if consumed_tokens:
                 self._scheduler.mark_blocked_barrier_terminal(
