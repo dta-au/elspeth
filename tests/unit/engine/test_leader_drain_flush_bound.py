@@ -71,6 +71,7 @@ class _NonConvergingCoalesceExecutor:
 class _NonConvergingProcessor:
     run_id = "test-run"
     row_union_executor = None
+    collector_executor = None
 
     def count_unquiesced_scheduler_work(self) -> int:
         return 0

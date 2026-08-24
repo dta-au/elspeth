@@ -219,6 +219,7 @@ class _IdleTimeoutProcessorFake:
     """Placeholder processor for idle-timeout tests where timeout flushing is patched."""
 
     row_union_executor = None
+    collector_executor = None
 
 
 def _idle_polling_config(**overrides: Any) -> PipelineConfig:

@@ -88,6 +88,7 @@ def _mock_processor() -> MagicMock:
     """Create a RowProcessor mock with optional runtime collaborators absent."""
     processor = MagicMock(spec=RowProcessor)
     processor.row_union_executor = None
+    processor.collector_executor = None
     return processor
 
 

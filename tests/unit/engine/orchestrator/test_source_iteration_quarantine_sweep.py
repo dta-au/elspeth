@@ -179,6 +179,7 @@ def test_shutdown_set_during_empty_first_fetch_records_interrupted_without_eof_f
 
     processor = MagicMock(spec=RowProcessor)
     processor.row_union_executor = None
+    processor.collector_executor = None
     source = MagicMock(spec=SourceProtocol)
     source.name = "llm"
     source.on_success = "default"

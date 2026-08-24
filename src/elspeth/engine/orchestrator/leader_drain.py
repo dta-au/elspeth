@@ -453,7 +453,8 @@ def run_end_of_input_barrier_flush(
     guarantees nothing outside the loop can newly ``mark_blocked``.
     """
     row_union_executor = processor.row_union_executor
-    if not config.aggregation_settings and coalesce_executor is None and row_union_executor is None:
+    collector_executor = processor.collector_executor
+    if not config.aggregation_settings and coalesce_executor is None and row_union_executor is None and collector_executor is None:
         return
 
     unquiesced = processor.count_unquiesced_scheduler_work()
@@ -514,11 +515,20 @@ def run_end_of_input_barrier_flush(
                 counters=counters,
             )
 
+        # No collector flush arm, by design (spec §5): a collector closes on
+        # end_of_group only — it has no timeout and nothing to force at EOF.
+        # Every buffered member holds a BLOCKED row, so an unsettled group
+        # keeps has_blocked_barrier_work() true and the loop alive until its
+        # roster settles through intake (arrival or loss replay); a group
+        # that never settles is the non-convergence below, named as such.
         if not processor.has_blocked_barrier_work():
             return
 
+    collector_detail = ""
+    if collector_executor is not None:
+        collector_detail = f" Collector members still buffered in memory: {collector_executor.buffered_member_count()}."
     raise OrchestrationInvariantError(
         f"End-of-input barrier flush for run '{processor.run_id}' did not converge within "
         f"{flush_iteration_bound} intake/flush rounds; durable BLOCKED barrier holds remain. "
-        "Possible barrier cycle or a flush that re-deposits its own inputs."
+        f"Possible barrier cycle or a flush that re-deposits its own inputs.{collector_detail}"
     )

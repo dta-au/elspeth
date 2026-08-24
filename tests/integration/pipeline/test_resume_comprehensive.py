@@ -293,6 +293,7 @@ class _ResumeLoopContextFake:
 class _ResumeLoopProcessorFake:
     run_id: str
     row_union_executor = None
+    collector_executor = None
 
     def has_scheduled_work(self) -> bool:
         return False

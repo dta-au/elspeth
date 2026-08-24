@@ -518,6 +518,7 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
         processor.process_row.side_effect = _process_valid_row
         processor.complete_coalesce_merge.return_value = []
         processor.row_union_executor = None
+        processor.collector_executor = None
 
         driver = SourceIterationDriver(
             events=MagicMock(spec=EventBusProtocol),
