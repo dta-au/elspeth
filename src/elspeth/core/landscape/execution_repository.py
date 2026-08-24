@@ -378,7 +378,8 @@ class ExecutionRepository:
         Mirrors :meth:`BarrierRestoreReadModel.row_id_for_token` for callers
         that construct the barrier-intake coordinator with this compatibility
         facade instead of the narrower read model; it resolves the row-scoped
-        ``scope_row_id`` for a coalesce merge fire (spec §5/§6.2).
+        ``scope_row_id`` for its two group-loss replay fires — the row_union
+        completion and the coalesce merge (spec §5/§6.2).
         """
         query = select(tokens_table.c.row_id).where(
             tokens_table.c.token_id == token_id,

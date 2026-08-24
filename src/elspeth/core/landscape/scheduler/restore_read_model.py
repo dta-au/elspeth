@@ -559,7 +559,8 @@ class BarrierRestoreReadModel:
 
         The unified ``group_losses`` ledger carries no ``row_id`` (spec
         §5/§6.2); the barrier intake coordinator resolves the row-scoped
-        ``scope_row_id`` for a coalesce merge fire from the token's own
+        ``scope_row_id`` for its two group-loss replay fires (the row_union
+        completion and the coalesce merge) from the token's own
         durable row here. Every group-keyed executor call takes
         ``loss.group_id`` directly and never needs this.
         """

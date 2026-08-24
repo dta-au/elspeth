@@ -805,14 +805,17 @@ class BarrierIntakeCoordinator:
         )
 
     def _row_id_for_loss(self, loss: GroupLoss) -> str:
-        """Resolve the row-scoped ``scope_row_id`` for a coalesce merge fire.
+        """Resolve the row-scoped ``scope_row_id`` for the group-loss replay fires.
 
         The unified ``group_losses`` ledger row carries no ``row_id``, and
         every executor call in ``_replay_group_losses`` is already keyed on
         ``loss.group_id`` (WS4 re-keyed them; nothing transitional remains).
-        The one consumer left is ``_fire_coalesce_merge``'s ``scope_row_id``
-        — a genuinely row-scoped concept the ledger cannot supply — so this
-        resolves it from the token's durable ``tokens`` row: an intake-path
+        The only consumers left are the two replay fires' ``scope_row_id`` —
+        ``_complete_row_union_fire`` in the row_union arm and
+        ``_fire_coalesce_merge`` in the coalesce arm — a genuinely row-scoped
+        concept the ledger cannot supply, so this resolves it from the
+        token's durable ``tokens`` row (both arms need it: re-keying one arm
+        does not free the shim while the other still fires): an intake-path
         DB read (leader, once per unadopted loss), NOT the hot accounting
         path, so the pinned "never a DB query" commitment (§4.1) is
         untouched.
