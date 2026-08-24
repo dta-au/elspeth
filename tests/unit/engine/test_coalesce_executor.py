@@ -1880,6 +1880,16 @@ class TestNotifyBranchLost:
         # lost, "mid" still outstanding) does not resolve — group A stays
         # pending, group B is untouched.
         assert outcome is None
+        # M-1 (T11 review) insurance: the aliveness precondition this test
+        # relies on is currently pinned only by has_recorded_branch_loss's
+        # non-pending paths returning False -- a property of the method
+        # under test, not an independent check. If a later change gives it
+        # the durable-ledger fallback its collector sibling
+        # has_recorded_member_loss got in I-4, the g-a assertion below could
+        # satisfy from the ledger with group A's in-memory entry gone,
+        # silently re-vacuating the discriminator. Assert group A is still
+        # genuinely PENDING before trusting the queries.
+        assert ("merge_x", "g-a") in executor._pending
         assert executor.has_recorded_branch_loss("merge_x", "g-a", "right") is True
         assert executor.has_recorded_branch_loss("merge_x", "g-b", "right") is False
 
