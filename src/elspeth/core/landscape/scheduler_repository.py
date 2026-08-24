@@ -29,6 +29,7 @@ from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
 )
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import (
     BarrierEmission,
@@ -132,6 +133,7 @@ class TokenSchedulerRepository:
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Persist a READY token continuation (see :meth:`SchedulerQueueRepository.enqueue_ready`)."""
@@ -153,6 +155,7 @@ class TokenSchedulerRepository:
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
+            collector_name=collector_name,
             worker_id=worker_id,
         )
 
@@ -179,6 +182,7 @@ class TokenSchedulerRepository:
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
     ) -> TokenWorkItem:
         """Persist and claim READY work for an active registered worker."""
         return self.queue.enqueue_ready_claimed(
@@ -202,6 +206,7 @@ class TokenSchedulerRepository:
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
+            collector_name=collector_name,
         )
 
     def enqueue_ready_claimed_legacy_unfenced(
@@ -227,6 +232,7 @@ class TokenSchedulerRepository:
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
     ) -> TokenWorkItem:
         """Compatibility enqueue-and-claim for N=0 repository test fixtures."""
         return self.queue.enqueue_ready_claimed_legacy_unfenced(
@@ -250,6 +256,7 @@ class TokenSchedulerRepository:
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
+            collector_name=collector_name,
         )
 
     def ingest_row_with_initial_claim(
@@ -274,6 +281,7 @@ class TokenSchedulerRepository:
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
     ) -> tuple[Row, Token, TokenWorkItem]:
         """Fenced leader INGEST (see :meth:`SchedulerQueueRepository.ingest_row_with_initial_claim`)."""
         return self.queue.ingest_row_with_initial_claim(
@@ -296,6 +304,7 @@ class TokenSchedulerRepository:
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
+            collector_name=collector_name,
         )
 
     def _ready_work_item_values(
@@ -317,6 +326,7 @@ class TokenSchedulerRepository:
         coalesce_node_id: str | None,
         coalesce_name: str | None,
         row_union_name: str | None = None,
+        collector_name: str | None = None,
         lineage_path: tuple[LineageFrame, ...] = (),
     ) -> dict[str, object]:
         """Historical test seam over :func:`ready_work_item_values`."""
@@ -338,6 +348,7 @@ class TokenSchedulerRepository:
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
+            collector_name=collector_name,
         )
 
     # ------------------------------------------------------------------
@@ -814,6 +825,28 @@ class TokenSchedulerRepository:
         return self.group_losses.adopt_group_losses(
             run_id=run_id,
             loss_ids=loss_ids,
+            now=now,
+            coordination_token=coordination_token,
+        )
+
+    def stage_escalation_loss(
+        self,
+        *,
+        run_id: str,
+        spec: GroupLossSpec,
+        frame_kind: FrameKind,
+        declared_roster: tuple[str, ...] | None,
+        recorded_by: str,
+        now: datetime,
+        coordination_token: CoordinationToken,
+    ) -> bool:
+        """Fenced escalation staging (spec §6.3, Task 8): authenticate + append."""
+        return self.group_losses.stage_escalation_loss(
+            run_id=run_id,
+            spec=spec,
+            frame_kind=frame_kind,
+            declared_roster=declared_roster,
+            recorded_by=recorded_by,
             now=now,
             coordination_token=coordination_token,
         )

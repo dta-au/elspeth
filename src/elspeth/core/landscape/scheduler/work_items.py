@@ -31,6 +31,24 @@ def work_item_id(run_id: str, token_id: str, node_id: str | None, attempt: int) 
     return hashlib.sha256(raw).hexdigest()
 
 
+def collector_barrier_key(collector_name: str, group_id: str) -> str:
+    """The compound barrier_key address for a collector-bound work item (spec §4.3).
+
+    "collector:<collector_name>:<group_id>" — unlike coalesce/row_union's
+    bare-name barrier_key (one closer per node), a single collector name
+    spans many concurrent EXPAND groups, so the group_id must be part of
+    the address (WS4 Task 6 / META-14.2, ruled a constant convention). THE
+    single construction site: every caller that needs a collector's
+    barrier_key string calls this rather than re-deriving the format
+    inline — including test_collector_barrier_key_interlock.py's
+    no-production-writer canary, which is retargeted (I-2, fix round) to
+    scan for CALLS to this symbol rather than pattern-matching bare
+    literals/f-strings, so a helper call, string concat, or .format() can
+    no longer evade it the way a naive scan could.
+    """
+    return f"collector:{collector_name}:{group_id}"
+
+
 def work_item_identity(values: dict[str, object]) -> str:
     return (
         f"run_id={values['run_id']!r} token_id={values['token_id']!r} row_id={values['row_id']!r} "

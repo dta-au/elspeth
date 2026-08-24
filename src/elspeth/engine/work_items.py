@@ -184,11 +184,18 @@ class WorkItemFactory:
         on_success_sink: str | None = None,
         join_group_id: str | None = None,
     ) -> WorkItem:
-        """Create a cursor with validated coalesce or resolved row-union/collector metadata.
+        """Create a cursor with validated coalesce or resolved row-union metadata.
 
         A single supplied coalesce identity is resolved in the other direction;
         when both are supplied, they must describe the same barrier. Row-union
-        and collector names are always resolved to their structural node ids.
+        names are always resolved to their structural node ids. M-1 (fix
+        round): collector names are NOT — see the WorkItem class docstring's
+        WS4 Task 6 note for why (no WorkItemNavigation.resolve_collector_node
+        exists; adding one broke mypy against processor.py's DAGNavigator).
+        This corrects the previous version of this docstring, which claimed
+        row-union AND collector names were both always resolved — false for
+        collector, and contradicting that same class docstring three
+        paragraphs up.
         """
         resolved_coalesce_node_id = coalesce_node_id
         resolved_coalesce_name = coalesce_name

@@ -29,6 +29,7 @@ from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.scheduler_repository import (
     BatchMembershipSpec,
     BufferedOutcomeSpec,
@@ -223,11 +224,53 @@ def _seed_blocked_collector_hold(db: LandscapeDB, *, sequence: int, collector_na
     repo.mark_blocked(
         work_item_id=claimed.work_item_id,
         queue_key=None,
-        barrier_key=f"collector:{collector_name}:g-1",
+        barrier_key=collector_barrier_key(collector_name, "g-1"),
         now=blocked_at,
         expected_lease_owner=WORKER,
     )
     return token_id, claimed.work_item_id, blocked_at
+
+
+def test_facade_enqueue_ready_forwards_collector_name(db: LandscapeDB, token: CoordinationToken) -> None:
+    """I-3 (fix round): the durable round-trip tests above are strong, but
+    they all reach the durable table through repo.queue.enqueue_ready
+    directly (see _seed_blocked_collector_hold's own docstring for why —
+    at the time it was written, TokenSchedulerRepository.enqueue_ready
+    itself, the FACADE every real production caller actually uses, had no
+    collector_name parameter at all). That was the one silent-NULL site:
+    a caller going through the facade with collector_name set would have
+    it dropped with no error. Now that the facade forwards it (held-hunk
+    item 3), pin the round trip through the facade specifically, not the
+    sub-repository."""
+    repo = TokenSchedulerRepository(db.engine)
+    token_id = "token-facade-collector"
+    row_id = "row-facade-collector"
+    with db.engine.begin() as conn:
+        conn.execute(
+            insert(rows_table).values(
+                row_id=row_id,
+                run_id=RUN_ID,
+                source_node_id=SOURCE_NODE_ID,
+                row_index=0,
+                source_row_index=0,
+                ingest_sequence=0,
+                source_data_hash=f"hash-{row_id}",
+                created_at=NOW,
+            )
+        )
+        conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=RUN_ID, created_at=NOW))
+    repo.enqueue_ready(
+        run_id=RUN_ID,
+        token_id=token_id,
+        row_id=row_id,
+        node_id=NODE_ID,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=_payload_json(),
+        available_at=NOW,
+        collector_name="stitch",
+    )
+    assert _work_item(db, token_id)["collector_name"] == "stitch"
 
 
 def _work_item(db: LandscapeDB, token_id: str) -> dict[str, object]:
@@ -386,7 +429,7 @@ class TestAdoption:
             "run_id": RUN_ID,
             "work_item_id": work_item_id,
             "token_id": token_id,
-            "barrier_key": "collector:stitch:g-1",
+            "barrier_key": collector_barrier_key("stitch", "g-1"),
             "membership": None,
             "buffered_outcome": None,
             "now": ADOPT_NOW,
@@ -414,7 +457,7 @@ class TestAdoption:
         repo = TokenSchedulerRepository(db.engine)
         items = repo.list_blocked_barrier_items(run_id=RUN_ID)
         assert [item.collector_name for item in items] == ["stitch"]
-        assert [item.barrier_key for item in items] == ["collector:stitch:g-1"]
+        assert [item.barrier_key for item in items] == [collector_barrier_key("stitch", "g-1")]
 
 
 class TestAdoptionRefusals:

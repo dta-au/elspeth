@@ -145,6 +145,27 @@ def _make_collector_item(**overrides) -> WorkItem:
     return WorkItem(**defaults)
 
 
+def _make_row_union_item(**overrides) -> WorkItem:
+    """A row_union-bound item: no coalesce_name/coalesce_node_id (mutually
+    exclusive with row_union_name — WorkItem.__post_init__ refuses both)."""
+    token = TokenInfo(
+        row_id="row-1",
+        token_id="tok-1",
+        row_data=PipelineRow({"id": 1, "name": "alpha"}, _CONTRACT),
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
+    )
+    defaults = {
+        "token": token,
+        "current_node_id": NodeID("normalize"),
+        "row_union_node_id": NodeID("row_union::variants"),
+        "row_union_name": RowUnionName("variants"),
+        "on_success_sink": "default-sink",
+        "join_group_id": "join-1",
+    }
+    defaults.update(overrides)
+    return WorkItem(**defaults)
+
+
 def _scheduler_row_from_fields(fields: ScheduledWorkFields) -> TokenWorkItem:
     """Materialize the durable row exactly as the repository persists the bundle."""
     return TokenWorkItem(
@@ -219,6 +240,25 @@ class TestReadyFieldsRoundTrip:
         assert rehydrated.collector_name == item.collector_name
         assert rehydrated.coalesce_name is None
         assert rehydrated.row_union_name is None
+
+    def test_row_union_name_round_trips_through_scheduler_row(self) -> None:
+        """M-4 (fix round): coalesce and collector each have a positive
+        rehydrate assertion (test_work_item_round_trips_through_scheduler_row,
+        test_collector_name_round_trips_through_scheduler_row); row_union_name
+        only ever appeared as an "is None" spot-check inside the collector
+        test. The row_union_name mapper fix removed the mask but nothing
+        positively pinned this field on the rehydrate axis — symmetric
+        coverage for all three barrier kinds."""
+        codec = _make_codec()
+        item = _make_row_union_item()
+
+        fields = codec.ready_fields(item)
+        assert fields.row_union_name == "variants"
+
+        rehydrated = codec.work_item_from_scheduler(_scheduler_row_from_fields(fields))
+        assert rehydrated.row_union_name == item.row_union_name
+        assert rehydrated.coalesce_name is None
+        assert rehydrated.collector_name is None
 
     def test_derived_fields_match_resolvers(self) -> None:
         codec = _make_codec()

@@ -10736,17 +10736,34 @@ class TestReadyEmissionEnqueueParity:
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
             row_union_name=emission.row_union_name,
+            collector_name=emission.collector_name,
         )
 
-        assert values_from_emission == values_from_enqueue
+        # collector_name is carved out of the blanket equality check, NOT
+        # dropped from the pin: the emission side is now real (this mirror
+        # call passes emission.collector_name, exactly like every other
+        # field), but the enqueue side is STILL None regardless of flavor —
+        # scheduler_drain.py's enqueue_work_item computes fields.collector_name
+        # via the codec but never forwards it into its enqueue_ready call
+        # kwargs, a forwarding gap in a WS3-owned file this fix round
+        # deliberately does not touch (held-hunk item 3 fixed the FACADE one
+        # layer down, TokenSchedulerRepository.enqueue_ready — see
+        # test_facade_enqueue_ready_forwards_collector_name — but
+        # scheduler_drain.py, the caller ABOVE the facade, is a separate,
+        # still-open gap). Asserting full equality including this one field
+        # would either fail today or require silently patching
+        # enqueue_kwargs to fake a value scheduler_drain.py never actually
+        # produces — the latter would make this pin lie about what
+        # production code does, exactly what the class exists to prevent.
+        assert {k: v for k, v in values_from_emission.items() if k != "collector_name"} == {
+            k: v for k, v in values_from_enqueue.items() if k != "collector_name"
+        }
+        assert values_from_enqueue["collector_name"] is None
         # Pin the projected column count: adding a journal column to ONE of
         # the two builders (or to the mapper) must force this pin to be
         # revisited rather than silently desync the reconciliation contract.
         # Epoch 35 flip: tri-column lineage retirement (31 -> 28).
-        # WS4 Task 6: collector_name cursor column (28 -> 29). The mapper
-        # emits it as None until the enqueue_ready facade forwards the
-        # emission's value (WS4 held-hunk item 3) — that hunk must extend
-        # this mirror call with collector_name=emission.collector_name.
+        # WS4 Task 6: collector_name cursor column (28 -> 29).
         assert len(values_from_emission) == 29
 
         # Spot-check the per-flavor derived keys so a failure localizes.
@@ -10772,26 +10789,25 @@ class TestReadyEmissionEnqueueParity:
             assert path_fork_group_id(emitted_path) == "fork-1"
         elif flavor == "collector_cursor":
             # WS4 Task 6: processor.py/scheduler_drain.py are NOT wired to
-            # collector dispatch yet (META-4/META-14.3 deferred that to the
+            # collector DISPATCH yet (META-4/META-14.3 deferred that to the
             # WS3+WS4 integration item) — neither _queue_key_for_blocked_item
             # nor _barrier_key_for_blocked_item know about collector_name, so
-            # a collector-bound item derives EXACTLY like a plain structural-
-            # queue item today. collector_name itself is None on BOTH sides
-            # here even though the input WorkItem set it: scheduler_drain.py's
-            # enqueue_work_item computes fields.collector_name via the codec
-            # but never forwards it into the enqueue_ready/enqueue_ready_claimed
-            # call kwargs (a forwarding gap in the SAME class as the already-
-            # tracked held-hunk item 3, one layer up the stack — flagged
-            # separately, not fixed here). Once that forwarding lands, this
-            # branch's collector_name assertions must flip to "== 'stitch'",
-            # which is exactly the point of pinning them now: that flip will
-            # force this test to be revisited rather than silently staying green.
+            # a collector-bound item derives queue_key/barrier_key EXACTLY
+            # like a plain structural-queue item today.
+            #
+            # collector_name ITSELF is now real on the emission side (fix
+            # round: the mirror call above passes emission.collector_name),
+            # proving ready_emission/_ready_work_item_values correctly
+            # project it. The enqueue side stays None — see the block
+            # comment above the equality assertion for the still-open
+            # scheduler_drain.py forwarding gap this fix round deliberately
+            # does not touch.
             assert values_from_emission["queue_key"] == str(continue_node)
             assert values_from_emission["barrier_key"] is None
             assert values_from_emission["coalesce_node_id"] is None
             assert values_from_emission["coalesce_name"] is None
             assert values_from_emission["row_union_name"] is None
-            assert values_from_emission["collector_name"] is None
+            assert values_from_emission["collector_name"] == "stitch"
             assert values_from_enqueue["collector_name"] is None
         else:
             assert values_from_emission["queue_key"] == str(continue_node)

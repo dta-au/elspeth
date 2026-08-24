@@ -707,6 +707,7 @@ class BarrierJournalRepository:
             "coalesce_node_id": emission.coalesce_node_id,
             "coalesce_name": emission.coalesce_name,
             "row_union_name": emission.row_union_name,
+            "collector_name": emission.collector_name,
             "attempt": emission.attempt,
             "lease_owner": parked_lease_owner,
             "lease_expires_at": None,
@@ -777,6 +778,7 @@ class BarrierJournalRepository:
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
             row_union_name=emission.row_union_name,
+            collector_name=emission.collector_name,
         )
         values["created_at"] = claim_order_at
         insert_work_item(conn, values=values, operation="barrier-completion READY emission")
