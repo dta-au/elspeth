@@ -1,8 +1,11 @@
 """RowUnionExecutor: releases fork-branch tokens as indivisible groups.
 
-row_union is the correlated, same-row_id, N->N UNION ALL barrier
-(elspeth-a5b86149d4 v1 contract). It holds fork-branch tokens per
-(row_union_name, row_id) until EVERY declared branch has arrived, then
+row_union is the correlated, same-fork-group, N->N UNION ALL barrier
+(elspeth-a5b86149d4 v1 contract; re-keyed WS4 Task 12, spec §5 arch-M1 —
+sibling EXPAND members share row_id but fork into distinct concurrent FORK
+groups, so the group id, not the row id, is the collision-free key). It
+holds fork-branch tokens per (row_union_name, fork_group_id) until EVERY
+declared branch has arrived, then
 releases the ORIGINAL tokens as one group in declared branch order. It never
 merges fields, deduplicates rows, fabricates rows, or synthesizes a wide
 intermediate row — payloads pass through untouched and token_id/row_id are
@@ -105,7 +108,7 @@ class _BranchEntry:
 
 @dataclass
 class _PendingRowUnion:
-    """Tracks held tokens for a single row_id at a row_union barrier."""
+    """Tracks held tokens for a single fork group at a row_union barrier."""
 
     branches: dict[str, _BranchEntry]  # branch_name -> entry
     first_arrival: float  # Timeout anchor (oldest member's arrival)
@@ -159,7 +162,7 @@ class RowUnionExecutor:
 
         self._settings: dict[str, RowUnionSettings] = {}
         self._node_ids: dict[str, NodeID] = {}
-        # Pending groups: (row_union_name, row_id) -> _PendingRowUnion
+        # Pending groups: (row_union_name, fork_group_id) -> _PendingRowUnion
         self._pending: dict[tuple[str, str], _PendingRowUnion] = {}
         # Completed groups (released OR failed): bounded FIFO cache backed by
         # the Landscape fallback in accept() — cache, not correctness.
@@ -170,10 +173,11 @@ class RowUnionExecutor:
         self._max_completed_keys = max_completed_keys
         # Recent branch losses for §E.5 replay dedup, bounded like the
         # completion cache. Durable storage remains the source of truth.
-        # (row_union_name, row_id, branch_name)
+        # (row_union_name, fork_group_id, branch_name)
         self._recorded_losses: OrderedDict[tuple[str, str, str], None] = OrderedDict()
-        # Group-level recent-loss cache. Durable point reads preserve
-        # correctness after an entry leaves this bounded resident index.
+        # Group-level recent-loss cache: (row_union_name, fork_group_id).
+        # Durable point reads preserve correctness after an entry leaves
+        # this bounded resident index.
         self._recorded_loss_groups: OrderedDict[tuple[str, str], None] = OrderedDict()
 
     # ------------------------------------------------------------------
@@ -225,17 +229,23 @@ class RowUnionExecutor:
             branch_name = entry.token.branch_name
             if branch_name is None:
                 raise OrchestrationInvariantError(f"Cannot restore row_union token {entry.token.token_id}: branch_name is None")
+            fork_group_id = entry.token.fork_group_id
+            if fork_group_id is None:
+                raise OrchestrationInvariantError(
+                    f"Cannot restore row_union token {entry.token.token_id}: has branch_name={branch_name!r} "
+                    "but no fork_group_id — lineage corruption (branch and group ride one frame)."
+                )
             settings = self._settings[entry.row_union_name]
             if branch_name not in settings.branches:
                 raise OrchestrationInvariantError(
                     f"Cannot restore branch '{branch_name}' into row_union '{entry.row_union_name}'; "
                     f"expected one of {list(settings.branches)}"
                 )
-            key = (entry.row_union_name, entry.token.row_id)
+            key = (entry.row_union_name, fork_group_id)
             pending = restored.setdefault(key, _PendingRowUnion(branches={}, first_arrival=entry.arrival_time))
             if branch_name in pending.branches:
                 raise OrchestrationInvariantError(
-                    f"Duplicate restored branch '{branch_name}' for row_union '{entry.row_union_name}', row {entry.token.row_id}"
+                    f"Duplicate restored branch '{branch_name}' for row_union '{entry.row_union_name}', fork group {fork_group_id!r}"
                 )
             if entry.state_id is None:
                 raise OrchestrationInvariantError(f"Cannot restore row_union token {entry.token.token_id} without an OPEN node state")
@@ -259,10 +269,10 @@ class RowUnionExecutor:
         for key in restored:
             if key in self._completed_keys or self._check_landscape_for_completion(key[0], key[1]):
                 closed_keys[key] = self._completed_keys.get(key, _CLOSED_BY_RELEASE)
-            elif key in self._recorded_loss_groups or self._barrier_restore_reads.has_branch_loss_for_group(
+            elif key in self._recorded_loss_groups or self._barrier_restore_reads.has_group_loss(
                 run_id=self._run_id,
-                barrier_name=key[0],
-                row_id=key[1],
+                closer_name=key[0],
+                group_id=key[1],
             ):
                 durable_loss_keys.append(key)
 
@@ -285,12 +295,12 @@ class RowUnionExecutor:
 
     def restore_branch_losses(self, losses: Sequence[tuple[str, str, str]]) -> None:
         """Restore the durable lost-branch index before pending groups reopen."""
-        for row_union_name, row_id, branch_name in losses:
+        for row_union_name, fork_group_id, branch_name in losses:
             if row_union_name not in self._settings:
                 raise OrchestrationInvariantError(f"Cannot restore loss for unknown row_union '{row_union_name}'")
             if branch_name not in self._settings[row_union_name].branches:
                 raise OrchestrationInvariantError(f"Cannot restore loss for branch '{branch_name}' in row_union '{row_union_name}'")
-            self._remember_branch_loss(row_union_name, row_id, branch_name)
+            self._remember_branch_loss(row_union_name, fork_group_id, branch_name)
 
     def reconcile_released_group(
         self,
@@ -307,16 +317,21 @@ class RowUnionExecutor:
         if not entries:
             raise OrchestrationInvariantError("Cannot reconcile an empty row_union release")
         row_union_name = entries[0].row_union_name
-        row_id = entries[0].token.row_id
-        key = (row_union_name, row_id)
+        fork_group_id = entries[0].token.fork_group_id
+        if fork_group_id is None:
+            raise OrchestrationInvariantError(
+                f"Cannot reconcile row_union token {entries[0].token.token_id}: has branch_name="
+                f"{entries[0].token.branch_name!r} but no fork_group_id — lineage corruption."
+            )
+        key = (row_union_name, fork_group_id)
         if row_union_name not in self._settings:
             raise OrchestrationInvariantError(f"Cannot reconcile unknown row_union '{row_union_name}'")
         if key in self._pending or key in self._completed_keys or key in self._recorded_loss_groups:
-            raise OrchestrationInvariantError(f"Cannot reconcile non-pristine row_union group {row_union_name}/{row_id}")
+            raise OrchestrationInvariantError(f"Cannot reconcile non-pristine row_union group {row_union_name}/{fork_group_id}")
 
         by_branch: dict[str, RowUnionRestoreEntry] = {}
         for entry in entries:
-            if entry.row_union_name != row_union_name or entry.token.row_id != row_id:
+            if entry.row_union_name != row_union_name or entry.token.fork_group_id != fork_group_id:
                 raise OrchestrationInvariantError("Row_union release reconciliation mixed group identities")
             branch_name = entry.token.branch_name
             if branch_name is None or branch_name in by_branch:
@@ -326,7 +341,7 @@ class RowUnionExecutor:
         settings = self._settings[row_union_name]
         if set(by_branch) != set(settings.branches):
             raise OrchestrationInvariantError(
-                f"Row_union release reconciliation for {row_union_name}/{row_id} has branches "
+                f"Row_union release reconciliation for {row_union_name}/{fork_group_id} has branches "
                 f"{sorted(by_branch)}; expected {list(settings.branches)}"
             )
 
@@ -381,10 +396,16 @@ class RowUnionExecutor:
                 f"Token branch '{token.branch_name}' not in expected branches for row_union '{row_union_name}': {list(settings.branches)}"
             )
 
-        key = (row_union_name, token.row_id)
+        fork_group_id = token.fork_group_id
+        if fork_group_id is None:
+            raise OrchestrationInvariantError(
+                f"Token {token.token_id} has branch_name={token.branch_name!r} but no fork_group_id — "
+                "lineage corruption (branch and group ride one frame)."
+            )
+        key = (row_union_name, fork_group_id)
         now = arrival_time if arrival_time is not None else self._clock.monotonic()
 
-        if key in self._completed_keys or self._check_landscape_for_completion(row_union_name, token.row_id):
+        if key in self._completed_keys or self._check_landscape_for_completion(row_union_name, fork_group_id):
             return self._fail_late_arrival(
                 token,
                 settings,
@@ -392,8 +413,8 @@ class RowUnionExecutor:
                 step,
                 closed_reason=self._completed_keys.get(key, _CLOSED_BY_RELEASE),
             )
-        if key in self._recorded_loss_groups or self._barrier_restore_reads.has_branch_loss_for_group(
-            run_id=self._run_id, barrier_name=row_union_name, row_id=token.row_id
+        if key in self._recorded_loss_groups or self._barrier_restore_reads.has_group_loss(
+            run_id=self._run_id, closer_name=row_union_name, group_id=fork_group_id
         ):
             self._mark_completed(key, _CLOSED_BY_BRANCH_LOSS)
             return self._fail_late_arrival(
@@ -634,14 +655,14 @@ class RowUnionExecutor:
             outcomes.append(self._fail_pending(settings, key, "row_union_incomplete_at_flush"))
         return outcomes
 
-    def has_recorded_branch_loss(self, row_union_name: str, row_id: str, branch_name: str) -> bool:
+    def has_recorded_branch_loss(self, row_union_name: str, fork_group_id: str, branch_name: str) -> bool:
         """Recent-cache idempotency check for §E.5 branch-loss replay dedup."""
-        return (row_union_name, row_id, branch_name) in self._recorded_losses
+        return (row_union_name, fork_group_id, branch_name) in self._recorded_losses
 
     def notify_branch_lost(
         self,
         row_union_name: str,
-        row_id: str,
+        fork_group_id: str,
         lost_branch: str,
         reason: str,
     ) -> RowUnionOutcome | None:
@@ -661,10 +682,10 @@ class RowUnionExecutor:
         """
         if row_union_name not in self._settings:
             raise OrchestrationInvariantError(f"row_union '{row_union_name}' not registered")
-        key = (row_union_name, row_id)
-        if key in self._completed_keys or self._check_landscape_for_completion(row_union_name, row_id):
+        key = (row_union_name, fork_group_id)
+        if key in self._completed_keys or self._check_landscape_for_completion(row_union_name, fork_group_id):
             return None
-        self._remember_branch_loss(row_union_name, row_id, lost_branch)
+        self._remember_branch_loss(row_union_name, fork_group_id, lost_branch)
         if key not in self._pending:
             # Nothing held yet: mark the group dead so future arrivals
             # fail closed instead of holding forever.
@@ -672,7 +693,7 @@ class RowUnionExecutor:
             slog.info(
                 "row_union branch lost before any sibling arrived; group marked dead",
                 row_union=row_union_name,
-                row_id=row_id,
+                fork_group_id=fork_group_id,
                 lost_branch=lost_branch,
                 reason=reason,
             )
@@ -684,7 +705,7 @@ class RowUnionExecutor:
     # Internals
     # ------------------------------------------------------------------
 
-    def _check_landscape_for_completion(self, row_union_name: str, row_id: str) -> bool:
+    def _check_landscape_for_completion(self, row_union_name: str, fork_group_id: str) -> bool:
         """Landscape fallback for late-arrival detection (cache-miss path).
 
         A completed state alone does not prove a release: _fail_pending's
@@ -694,15 +715,15 @@ class RowUnionExecutor:
         if row_union_name not in self._node_ids:
             return False
         node_id = self._node_ids[row_union_name]
-        if not self._barrier_restore_reads.has_completed_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id):
+        if not self._barrier_restore_reads.has_completed_group_for_node(run_id=self._run_id, node_id=str(node_id), group_id=fork_group_id):
             return False
-        key = (row_union_name, row_id)
-        if self._barrier_restore_reads.has_released_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id):
+        key = (row_union_name, fork_group_id)
+        if self._barrier_restore_reads.has_released_group_for_node(run_id=self._run_id, node_id=str(node_id), group_id=fork_group_id):
             closed_reason = _CLOSED_BY_RELEASE
-        elif key in self._recorded_loss_groups or self._barrier_restore_reads.has_branch_loss_for_group(
+        elif key in self._recorded_loss_groups or self._barrier_restore_reads.has_group_loss(
             run_id=self._run_id,
-            barrier_name=row_union_name,
-            row_id=row_id,
+            closer_name=row_union_name,
+            group_id=fork_group_id,
         ):
             closed_reason = _CLOSED_BY_BRANCH_LOSS
         else:
@@ -716,10 +737,10 @@ class RowUnionExecutor:
         while len(self._completed_keys) > self._max_completed_keys:
             self._completed_keys.popitem(last=False)
 
-    def _remember_branch_loss(self, row_union_name: str, row_id: str, branch_name: str) -> None:
+    def _remember_branch_loss(self, row_union_name: str, fork_group_id: str, branch_name: str) -> None:
         """Cache recent loss identities for replay dedup and fast group checks."""
-        loss_key = (row_union_name, row_id, branch_name)
-        group_key = (row_union_name, row_id)
+        loss_key = (row_union_name, fork_group_id, branch_name)
+        group_key = (row_union_name, fork_group_id)
         self._recorded_losses[loss_key] = None
         self._recorded_losses.move_to_end(loss_key)
         self._recorded_loss_groups[group_key] = None

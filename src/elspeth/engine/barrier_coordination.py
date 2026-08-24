@@ -854,11 +854,11 @@ class BarrierIntakeCoordinator:
                         f"Durable group loss {loss.loss_id!r} targets row_union {loss.closer_name!r}, "
                         "but no row_union executor/completion seam is configured."
                     )
-                if self._row_union_executor.has_recorded_branch_loss(loss.closer_name, row_id, loss.member_key):
+                if self._row_union_executor.has_recorded_branch_loss(loss.closer_name, loss.group_id, loss.member_key):
                     continue
                 row_union_outcome = self._row_union_executor.notify_branch_lost(
                     row_union_name=loss.closer_name,
-                    row_id=row_id,
+                    fork_group_id=loss.group_id,
                     lost_branch=loss.member_key,
                     reason=loss.reason,
                 )
@@ -1537,6 +1537,27 @@ class BarrierRecoveryCoordinator:
         row_union_holdless_items: list[TokenWorkItem] = []
         row_union_released_groups: list[list[TokenWorkItem]] = []
         if row_union_items:
+            # F-1 (elspeth-14660ce1c0): the holdless-reconcile below groups by
+            # fork_group_id, not row_id — two sibling fork groups can share a
+            # row_id at one row_union node (spec §5, arch-M1, ruled authorable
+            # ahead of this fix), and a row-keyed grouping would let a
+            # released sibling group misclassify a still-pending sibling's
+            # holdless item. TokenWorkItem carries lineage_path directly (no
+            # derived accessor the way TokenInfo does), so this dict is
+            # computed once and every "group identity" comparison below reads
+            # from it — never `item.row_id` (that stays reserved for
+            # `scope_row_id`, a genuinely different, row-scoped concept).
+            fork_group_id_by_token_id: dict[str, str] = {}
+            for item in row_union_items:
+                group_id = path_fork_group_id(item.lineage_path)
+                if group_id is None:
+                    raise AuditIntegrityError(
+                        f"Restore reconcile: row_union journal item for token {item.token_id!r} at "
+                        f"{item.barrier_key!r} (run {self._run_id!r}) has no innermost FORK frame — "
+                        "only forked branch tokens block at a row_union barrier; journal corruption."
+                    )
+                fork_group_id_by_token_id[item.token_id] = group_id
+
             row_union_state_ids = self._barrier_restore_reads.get_open_node_state_ids(
                 self._run_id,
                 node_ids=[str(node_id) for node_id in self._row_union_node_ids.values()],
@@ -1552,16 +1573,18 @@ class BarrierRecoveryCoordinator:
                 # resume. Failed-closure holdless rows fall through to the
                 # intake-pending reset below and fail closed as late arrivals
                 # on re-accept.
-                released_pairs = self._barrier_restore_reads.get_released_row_ids_for_nodes(
+                released_pairs = self._barrier_restore_reads.get_released_group_ids_for_nodes(
                     self._run_id,
                     frozenset(node_id_to_row_union_name),
                 )
                 released_group_keys = {
-                    (node_id_to_row_union_name[node_id], row_id)
-                    for node_id, row_id in released_pairs
+                    (node_id_to_row_union_name[node_id], group_id)
+                    for node_id, group_id in released_pairs
                     if node_id in node_id_to_row_union_name
                 }
-                released_candidates = [item for item in holdless if (str(item.barrier_key), item.row_id) in released_group_keys]
+                released_candidates = [
+                    item for item in holdless if (str(item.barrier_key), fork_group_id_by_token_id[item.token_id]) in released_group_keys
+                ]
                 # Token-scoped membership (§E.3a residuals): release evidence
                 # proves the KEY released, not that THIS token was in the
                 # released group. A surplus branch token that failed late
@@ -1631,13 +1654,18 @@ class BarrierRecoveryCoordinator:
                         item.row_id,
                         self._run_id,
                     )
-                member_keys = {(str(item.barrier_key), item.row_id) for item in released_candidates if item.token_id in member_token_ids}
+                member_keys = {
+                    (str(item.barrier_key), fork_group_id_by_token_id[item.token_id])
+                    for item in released_candidates
+                    if item.token_id in member_token_ids
+                }
                 for released_key in sorted(member_keys):
                     row_union_released_groups.append(
                         [
                             item
                             for item in row_union_items
-                            if (str(item.barrier_key), item.row_id) == released_key and item.token_id not in residual_token_ids
+                            if (str(item.barrier_key), fork_group_id_by_token_id[item.token_id]) == released_key
+                            and item.token_id not in residual_token_ids
                         ]
                     )
                 # A residual without a recorded terminal outcome (crash before
@@ -1649,13 +1677,14 @@ class BarrierRecoveryCoordinator:
                 row_union_holdless_items = [
                     item
                     for item in holdless
-                    if (str(item.barrier_key), item.row_id) not in released_group_keys
+                    if (str(item.barrier_key), fork_group_id_by_token_id[item.token_id]) not in released_group_keys
                     or (item.token_id in residual_token_ids and item.token_id not in residual_terminal_ids)
                 ]
                 row_union_items = [
                     item
                     for item in row_union_items
-                    if item.token_id in row_union_state_ids and (str(item.barrier_key), item.row_id) not in member_keys
+                    if item.token_id in row_union_state_ids
+                    and (str(item.barrier_key), fork_group_id_by_token_id[item.token_id]) not in member_keys
                 ]
 
             if row_union_holdless_items:
@@ -1711,17 +1740,16 @@ class BarrierRecoveryCoordinator:
         # accept() never wrote the PENDING hold node_state (the leader died
         # between steps 1 and 2 of the coalesce intake adoption).
         #
-        # Two sub-cases, identified by whether the row's (coalesce_name,
-        # row_id) key is Landscape-completed via get_completed_row_ids_
-        # for_nodes. This is deliberately NOT the group-keyed
-        # get_completed_group_ids_for_nodes sibling that _pending and the
-        # checkpoint scalars now use (WS4 Task 8-10, a195a3512) — this
-        # crash-window classification still reads literal row_id. Flagged,
-        # not changed, in that commit's checkpoint report: under the
-        # arch-M1 shape (two sibling fork groups sharing one row_id), a
-        # completed sibling group could make this row-id check misclassify
-        # a still-pending sibling's holdless item. Verify against that
-        # report before touching this wording or logic again.
+        # Two sub-cases, identified by whether the group's (coalesce_name,
+        # fork_group_id) key is Landscape-completed via
+        # get_completed_group_ids_for_nodes — re-keyed (elspeth-14660ce1c0,
+        # F-1): the a195a3512 checkpoint report flagged this classification
+        # as still row_id-keyed and exposed to arch-M1 (two sibling fork
+        # groups sharing one row_id, a completed sibling misclassifying a
+        # still-pending sibling's holdless item). Authorability of that
+        # shared-row_id sibling-group shape was adjudicated (comment on the
+        # ticket) as YES — real, builder-validated topology, not a
+        # theoretical concern — so the ruling is re-key, not pin-as-safe.
         #
         # a. Key completed (late-arrival crash §E.3a): the group already
         #    resolved; journal-release the row here at restore exactly like the
@@ -1770,20 +1798,34 @@ class BarrierRecoveryCoordinator:
 
             holdless = [item for item in coalesce_items if item.token_id not in coalesce_state_ids]
             if holdless:
-                # Resolve the Landscape completed set once for all holdless rows.
+                # Group identity for classification (F-1): derived from each
+                # item's innermost FORK frame, not row_id. scope_row_id below
+                # stays item.row_id deliberately — a different, row-scoped
+                # concept, same split as the coalesce/row_union live paths.
+                coalesce_fork_group_id_by_token_id: dict[str, str] = {}
+                for item in holdless:
+                    group_id = path_fork_group_id(item.lineage_path)
+                    if group_id is None:
+                        raise AuditIntegrityError(
+                            f"Restore reconcile: coalesce journal item for token {item.token_id!r} at "
+                            f"{item.barrier_key!r} (run {self._run_id!r}) has no innermost FORK frame — "
+                            "only forked branch tokens block at a coalesce barrier; journal corruption."
+                        )
+                    coalesce_fork_group_id_by_token_id[item.token_id] = group_id
+                # Resolve the Landscape completed set once for all holdless groups.
                 node_id_to_coalesce_name: dict[str, str] = {str(nid): str(name) for name, nid in self._coalesce_node_ids.items()}
-                completed_pairs = self._barrier_restore_reads.get_completed_row_ids_for_nodes(
+                completed_pairs = self._barrier_restore_reads.get_completed_group_ids_for_nodes(
                     self._run_id,
                     frozenset(node_id_to_coalesce_name.keys()),
                 )
                 completed_keys_set: frozenset[tuple[str, str]] = frozenset(
-                    (node_id_to_coalesce_name[node_id_str], row_id)
-                    for node_id_str, row_id in completed_pairs
+                    (node_id_to_coalesce_name[node_id_str], group_id)
+                    for node_id_str, group_id in completed_pairs
                     if node_id_str in node_id_to_coalesce_name
                 )
                 for item in holdless:
                     coalesce_name_str = item.coalesce_name or item.barrier_key
-                    key = (str(coalesce_name_str), item.row_id)
+                    key = (str(coalesce_name_str), coalesce_fork_group_id_by_token_id[item.token_id])
                     if key in completed_keys_set:
                         # §E.3a at restore: adopted-but-unreleased late row
                         # against a completed key — journal-release it now.

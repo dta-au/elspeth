@@ -3536,7 +3536,7 @@ class RowProcessor:
             return []
         outcome = self._row_union_executor.notify_branch_lost(
             row_union_name=str(row_union_name),
-            row_id=current_token.row_id,
+            fork_group_id=frame.group_id,
             lost_branch=frame.member_key,
             reason=reason,
         )

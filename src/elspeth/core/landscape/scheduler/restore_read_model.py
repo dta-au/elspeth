@@ -566,11 +566,16 @@ class BarrierRestoreReadModel:
         run_id: str,
         node_ids: frozenset[str],
     ) -> set[tuple[str, str]]:
-        """Status-COMPLETED ``(node_id, row_id)`` pairs for row_union restore.
+        """Status-COMPLETED ``(node_id, row_id)`` pairs, row-keyed.
 
         Released-only sibling of :meth:`get_completed_row_ids_for_nodes`: a
-        FAILED closure has ``completed_at`` set too, so restore's
-        released-group classification must filter on status.
+        FAILED closure has ``completed_at`` set too, so a released-group
+        classification must filter on status. WS4 Task 12: row_union's
+        crash-window holdless-reconcile — the last row-keyed production
+        caller — moved onto the group-keyed sibling
+        :meth:`get_released_group_ids_for_nodes` (arch-M1). This row-keyed
+        method currently has no production caller; it stays a public,
+        directly-tested read-model primitive pending a ruling on removal.
         """
         if not node_ids:
             return set()
@@ -593,6 +598,46 @@ class BarrierRestoreReadModel:
         )
         rows = self._ops.execute_fetchall(query)
         return {(row.node_id, row.row_id) for row in rows}
+
+    def get_released_group_ids_for_nodes(
+        self,
+        run_id: str,
+        node_ids: frozenset[str],
+    ) -> set[tuple[str, str]]:
+        """Status-COMPLETED ``(node_id, group_id)`` pairs -- the group-keyed
+        released sweep (F-1, elspeth-14660ce1c0).
+
+        Group-keyed sibling of :meth:`get_released_row_ids_for_nodes`, same
+        relationship as :meth:`get_completed_group_ids_for_nodes` is to
+        :meth:`get_completed_row_ids_for_nodes`: two sibling fork groups can
+        share a row_id at one row_union node (spec §5, arch-M1), so the
+        crash-window holdless-reconcile's release probe must discriminate by
+        GROUP, not row. DEPTH-AGNOSTIC (I-6) like its completed-pairs
+        sibling: a token whose lineage path carries multiple group_ids
+        emits one ``(node_id, group_id)`` pair per depth once it releases at
+        that node.
+        """
+        if not node_ids:
+            return set()
+        query = (
+            select(node_states_table.c.node_id, token_lineage_frames_table.c.group_id)
+            .select_from(
+                node_states_table.join(
+                    token_lineage_frames_table,
+                    (node_states_table.c.token_id == token_lineage_frames_table.c.token_id)
+                    & (node_states_table.c.run_id == token_lineage_frames_table.c.run_id),
+                )
+            )
+            .where(
+                node_states_table.c.run_id == run_id,
+                node_states_table.c.node_id.in_(node_ids),
+                node_states_table.c.completed_at.isnot(None),
+                node_states_table.c.status == NodeStateStatus.COMPLETED.value,
+            )
+            .distinct()
+        )
+        rows = self._ops.execute_fetchall(query)
+        return {(row.node_id, row.group_id) for row in rows}
 
     def has_released_row_for_node(self, *, run_id: str, node_id: str, row_id: str) -> bool:
         """Return whether one row completed as COMPLETED at one node in one run."""
@@ -630,29 +675,22 @@ class BarrierRestoreReadModel:
         row = self._ops.execute_fetchone(query)
         return None if row is None else str(row.row_id)
 
-    def has_branch_loss_for_group(self, *, run_id: str, barrier_name: str, row_id: str) -> bool:
-        """Return whether the durable ledger records any loss for one barrier group.
+    def has_group_loss(self, *, run_id: str, closer_name: str, group_id: str) -> bool:
+        """Return whether the unified ledger records any loss for one bound group.
 
-        ``group_losses`` carries no ``row_id`` (spec §6.2 unification) — the
-        join through ``tokens`` on ``(token_id, run_id)`` recovers the same
-        "any durable loss for this barrier+row" semantics the retired
-        ``coalesce_branch_losses`` query answered directly.
+        WS4 Task 12 re-key: replaces ``has_branch_loss_for_group`` (retired —
+        that method joined through ``tokens`` to recover a row_id the
+        unified ``group_losses`` ledger never needed in the first place;
+        ``group_losses`` carries ``group_id`` directly, spec §6.2
+        unification). No dual read — the join predecessor is gone, not kept
+        alongside this as a second path.
         """
         query = (
             select(group_losses_table.c.loss_id)
-            .select_from(
-                group_losses_table.join(
-                    tokens_table,
-                    and_(
-                        group_losses_table.c.token_id == tokens_table.c.token_id,
-                        group_losses_table.c.run_id == tokens_table.c.run_id,
-                    ),
-                )
-            )
             .where(
                 group_losses_table.c.run_id == run_id,
-                group_losses_table.c.closer_name == barrier_name,
-                tokens_table.c.row_id == row_id,
+                group_losses_table.c.closer_name == closer_name,
+                group_losses_table.c.group_id == group_id,
             )
             .limit(1)
         )

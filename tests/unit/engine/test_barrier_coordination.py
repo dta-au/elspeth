@@ -165,7 +165,7 @@ class RecordingCoalesceExecutor:
         self.accepted.append(token.token_id)
         return self.outcome
 
-    def has_recorded_branch_loss(self, coalesce_name: str, row_id: str, branch_name: str) -> bool:
+    def has_recorded_branch_loss(self, coalesce_name: str, fork_group_id: str, branch_name: str) -> bool:
         return True
 
     def notify_branch_lost(self, **kwargs: object) -> CoalesceOutcome | None:
@@ -177,7 +177,7 @@ class RecordingRowUnionExecutor:
         self.outcome = outcome
         self.notifications: list[dict[str, object]] = []
 
-    def has_recorded_branch_loss(self, row_union_name: str, row_id: str, branch_name: str) -> bool:
+    def has_recorded_branch_loss(self, row_union_name: str, fork_group_id: str, branch_name: str) -> bool:
         return False
 
     def notify_branch_lost(self, **kwargs: object) -> RowUnionOutcome | None:
@@ -510,7 +510,7 @@ class TestRowUnionLossReplay:
         assert row_union.notifications == [
             {
                 "row_union_name": "variant_union",
-                "row_id": "row-1",
+                "fork_group_id": "fg-barrier-coordination-test",
                 "lost_branch": "control",
                 "reason": "error_routed",
             }
@@ -704,8 +704,8 @@ class TestLineageJournalConsistencyWiring:
         scheduler.list_group_losses.return_value = []
         reads = Mock(spec=BarrierRestoreReadModel)
         reads.find_duplicate_live_buffered_acceptances.return_value = []
-        reads.has_completed_row_for_node.return_value = False
-        reads.has_branch_loss_for_group.return_value = False
+        reads.has_completed_group_for_node.return_value = False
+        reads.has_group_loss.return_value = False
         row_union = Mock(spec=RowUnionExecutor)
         row_union.restore_from_journal.return_value = ()
         coordinator = BarrierRecoveryCoordinator(
@@ -843,7 +843,7 @@ class TestRowUnionRecovery:
         reads.get_open_node_state_ids.return_value = {}
         # Adoption crash: accept() never ran, so no terminal outcome exists.
         reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset()
-        reads.get_released_row_ids_for_nodes.return_value = frozenset()
+        reads.get_released_group_ids_for_nodes.return_value = frozenset()
         row_union = Mock(spec=RowUnionExecutor)
         row_union.restore_from_journal.return_value = ()
 
@@ -895,7 +895,7 @@ class TestRowUnionRecovery:
         reads.get_open_node_state_ids.return_value = {}
         reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset()
         # FAILED closures are completed_at-stamped but not released.
-        reads.get_released_row_ids_for_nodes.return_value = frozenset()
+        reads.get_released_group_ids_for_nodes.return_value = frozenset()
         row_union = Mock(spec=RowUnionExecutor)
         row_union.restore_from_journal.return_value = ()
 
@@ -945,7 +945,7 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 1 for row in rows}
         reads.get_open_node_state_ids.return_value = {}
-        reads.get_released_row_ids_for_nodes.return_value = frozenset()
+        reads.get_released_group_ids_for_nodes.return_value = frozenset()
         reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
         row_union = Mock(spec=RowUnionExecutor)
         row_union.restore_from_journal.return_value = ()
@@ -997,7 +997,7 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 1 for row in rows}
         reads.get_open_node_state_ids.return_value = {}
-        reads.get_released_row_ids_for_nodes.return_value = frozenset()
+        reads.get_released_group_ids_for_nodes.return_value = frozenset()
         reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-control"})
         row_union = Mock(spec=RowUnionExecutor)
         row_union.restore_from_journal.return_value = ()
@@ -1048,7 +1048,7 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 1}
         reads.get_open_node_state_ids.return_value = {}
-        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "row-1")})
+        reads.get_released_group_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "fg-barrier-coordination-test")})
         reads.find_released_node_state_token_ids.return_value = frozenset()
         reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-late"})
         row_union = Mock(spec=RowUnionExecutor)
@@ -1102,7 +1102,7 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 1}
         reads.get_open_node_state_ids.return_value = {}
-        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "row-1")})
+        reads.get_released_group_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "fg-barrier-coordination-test")})
         reads.find_released_node_state_token_ids.return_value = frozenset()
         reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset()
         row_union = Mock(spec=RowUnionExecutor)
@@ -1146,11 +1146,17 @@ class TestRowUnionRecovery:
             _blocked_row(barrier_key="variant_union", token_id="tok-control", branch_name="control", adopted_epoch=1),
             _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
         ]
+        # WS4 Task 12: the residual must carry its OWN fork_group_id, not
+        # just its own row_id -- group_rows and residual now partition on
+        # group identity (arch-M1), and both default to the same fork frame
+        # otherwise (row_id stays distinct too, since scope_row_id below is
+        # a genuinely separate, still row-scoped concept).
         residual = _blocked_row(
             barrier_key="variant_union",
             token_id="tok-late",
             row_id="row-2",
             branch_name="control",
+            fork_group_id="fg-residual",
             adopted_epoch=1,
         )
         rows = [*group_rows, residual]
@@ -1162,8 +1168,8 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 0 for row in rows}
         reads.get_open_node_state_ids.return_value = {}
-        reads.get_released_row_ids_for_nodes.return_value = frozenset(
-            {("row_union::variant_union", "row-1"), ("row_union::variant_union", "row-2")}
+        reads.get_released_group_ids_for_nodes.return_value = frozenset(
+            {("row_union::variant_union", "fg-barrier-coordination-test"), ("row_union::variant_union", "fg-residual")}
         )
         reads.find_released_node_state_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
         reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-late"})
@@ -1226,7 +1232,7 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 1}
         reads.get_open_node_state_ids.return_value = {}
-        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::union_b", "row-1")})
+        reads.get_released_group_ids_for_nodes.return_value = frozenset({("row_union::union_b", "fg-barrier-coordination-test")})
 
         def _members_at(run_id: str, *, node_ids: list[str], token_ids: list[str]) -> frozenset[str]:
             # tok-chained's COMPLETED state lives at upstream union A only.
@@ -1278,7 +1284,7 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 0 for row in rows}
         reads.get_open_node_state_ids.return_value = {}
-        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "row-1")})
+        reads.get_released_group_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "fg-barrier-coordination-test")})
         reads.find_released_node_state_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
         row_union = Mock(spec=RowUnionExecutor)
         restored_tokens = tuple(token_from_journal_item(row, attempt_offset=1, resume_checkpoint_id="ckpt-1") for row in rows)
@@ -1338,7 +1344,7 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 0 for row in rows}
         reads.get_open_node_state_ids.return_value = {}
-        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "row-1")})
+        reads.get_released_group_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "fg-barrier-coordination-test")})
         reads.find_released_node_state_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
         row_union = Mock(spec=RowUnionExecutor)
         row_union.restore_from_journal.return_value = ()
@@ -1387,7 +1393,7 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 0 for row in rows}
         reads.get_open_node_state_ids.return_value = {}
-        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "row-1")})
+        reads.get_released_group_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "fg-barrier-coordination-test")})
         reads.find_released_node_state_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
         row_union = RowUnionExecutor(
             Mock(spec=ExecutionRepository),
@@ -1427,7 +1433,7 @@ class TestRowUnionRecovery:
         )
 
         scheduler.list_group_losses.assert_not_called()
-        assert row_union.has_recorded_branch_loss("variant_union", "row-1", "treatment") is False
+        assert row_union.has_recorded_branch_loss("variant_union", "fg-barrier-coordination-test", "treatment") is False
         assert len(completions) == 1
         assert {token.token_id for token in completions[0]["consumed_tokens"]} == {"tok-control", "tok-treatment"}
 
@@ -1439,11 +1445,11 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 0}
         reads.get_open_node_state_ids.return_value = {row.token_id: "state-1"}
-        reads.has_branch_loss_for_group.return_value = True
+        reads.has_group_loss.return_value = True
         # The group never closed: no completed rows exist at the union node,
         # so restore's closed-key classification must fall through to the
         # durable-loss point read.
-        reads.has_completed_row_for_node.return_value = False
+        reads.has_completed_group_for_node.return_value = False
         execution = Mock(spec=ExecutionRepository)
         data_flow = Mock(spec=DataFlowRepository)
         row_union = RowUnionExecutor(
@@ -1485,10 +1491,10 @@ class TestRowUnionRecovery:
         )
 
         scheduler.list_group_losses.assert_not_called()
-        reads.has_branch_loss_for_group.assert_called_once_with(
+        reads.has_group_loss.assert_called_once_with(
             run_id="run-1",
-            barrier_name="variant_union",
-            row_id="row-1",
+            closer_name="variant_union",
+            group_id="fg-barrier-coordination-test",
         )
         assert len(completions) == 1
         assert emitted == [(row.token_id, TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
@@ -1508,9 +1514,9 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 0}
         reads.get_open_node_state_ids.return_value = {row.token_id: "state-1"}
-        reads.has_branch_loss_for_group.return_value = False
-        reads.has_completed_row_for_node.return_value = True
-        reads.has_released_row_for_node.return_value = True
+        reads.has_group_loss.return_value = False
+        reads.has_completed_group_for_node.return_value = True
+        reads.has_released_group_for_node.return_value = True
         execution = Mock(spec=ExecutionRepository)
         data_flow = Mock(spec=DataFlowRepository)
         row_union = RowUnionExecutor(

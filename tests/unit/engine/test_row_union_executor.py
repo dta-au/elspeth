@@ -1,11 +1,14 @@
 # tests/unit/engine/test_row_union_executor.py
 """Unit tests for RowUnionExecutor (elspeth-a5b86149d4 v1 contract).
 
-The row_union barrier holds fork-branch tokens per (row_union_name, row_id)
-and releases the ORIGINAL tokens as one indivisible group in declared branch
-order once every declared branch has arrived. v1 is require_all with no
-partial release: timeouts, lost branches, and end-of-source flushes fail the
-whole pending group closed.
+The row_union barrier holds fork-branch tokens per (row_union_name,
+fork_group_id) — re-keyed WS4 Task 12, spec §5 arch-M1: sibling EXPAND
+members share row_id but fork into distinct concurrent FORK groups, so the
+group id, not the row id, is the collision-free key — and releases the
+ORIGINAL tokens as one indivisible group in declared branch order once every
+declared branch has arrived. v1 is require_all with no partial release:
+timeouts, lost branches, and end-of-source flushes fail the whole pending
+group closed.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ from __future__ import annotations
 import itertools
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 
@@ -26,16 +29,12 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.config import RowUnionSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.engine.clock import MockClock
 from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome, RowUnionRestoreEntry
 from elspeth.testing import make_field, make_row
 
 _state_counter = itertools.count(1)
-
-
-def _branch_loss_lookup(*, run_id: str, barrier_name: str, row_id: str) -> bool:
-    """Callable spec for the durable branch-loss point-read port."""
-    return False
 
 
 def _next_state_id() -> str:
@@ -81,9 +80,20 @@ def _make_executor(
 ) -> tuple[RowUnionExecutor, MagicMock, MagicMock, MockClock]:
     execution = MagicMock(spec=ExecutionRepository)
     execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=_next_state_id())
-    execution.get_completed_row_ids_for_nodes.return_value = set()
-    execution.has_completed_row_for_node.return_value = False
-    execution.has_released_row_for_node.return_value = False
+    # has_completed_group_for_node / has_released_group_for_node / has_group_loss
+    # live on BarrierRestoreReadModel, not ExecutionRepository (spec-checked
+    # here) — a fully autospec'd read-model INSTANCE (not a bare `spec=` on
+    # an unbound function, which would require every call site to also pass
+    # `self`) gives correctly bound-method-shaped mocks. WS4 Task 12 re-key:
+    # the live accept()/notify/restore paths query only the group-keyed
+    # siblings now — no row-keyed dual read kept alongside these.
+    _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+    execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+    execution.has_completed_group_for_node.return_value = False
+    execution.has_released_group_for_node = _read_model_autospec.has_released_group_for_node
+    execution.has_released_group_for_node.return_value = False
+    execution.has_group_loss = _read_model_autospec.has_group_loss
+    execution.has_group_loss.return_value = False
     data_flow = MagicMock(spec=DataFlowRepository)
     if clock is None:
         clock = MockClock(start=100.0)
@@ -96,13 +106,9 @@ def _make_executor(
         data_flow=data_flow,
         max_completed_keys=max_completed_keys,
         barrier_restore_reads=SimpleNamespace(
-            get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
-            has_completed_row_for_node=execution.has_completed_row_for_node,
-            has_released_row_for_node=execution.has_released_row_for_node,
-            has_branch_loss_for_group=MagicMock(
-                spec=_branch_loss_lookup,
-                return_value=False,
-            ),
+            has_completed_group_for_node=execution.has_completed_group_for_node,
+            has_released_group_for_node=execution.has_released_group_for_node,
+            has_group_loss=execution.has_group_loss,
         ),
     )
     return executor, execution, data_flow, clock
@@ -178,6 +184,32 @@ class TestAcceptHoldAndRelease:
             executor.accept(_make_token(branch_name="ghost_branch"), "variant_union")
 
 
+class TestSiblingForkGroupsShareRowId:
+    def test_sibling_fork_groups_sharing_row_id_release_independently(self) -> None:
+        # WS4 Task 12 discriminator (elspeth-14660ce1c0, spec §5 arch-M1):
+        # EXPAND siblings share row_id but fork into distinct concurrent
+        # FORK groups. Under the pre-Task-12 row_id key, group g-b's first
+        # arrival (b1, branch_a) would collide with group g-a's already-held
+        # branch_a entry (a1) as a "Duplicate arrival" crash — both share
+        # row_id="row-1" and branch_name="branch_a". Keying on fork_group_id
+        # keeps g-a and g-b independent: b1 holds cleanly, and g-a still
+        # releases as soon as its own second branch (a2) arrives.
+        executor, _execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        a1 = _make_token(row_id="row-1", token_id="t-a1", branch_name="branch_a", fork_group_id="g-a")
+        a2 = _make_token(row_id="row-1", token_id="t-a2", branch_name="branch_b", fork_group_id="g-a")
+        b1 = _make_token(row_id="row-1", token_id="t-b1", branch_name="branch_a", fork_group_id="g-b")
+
+        assert executor.accept(a1, "variant_union").held is True
+        assert executor.accept(b1, "variant_union").held is True
+
+        released = executor.accept(a2, "variant_union")
+
+        assert released.held is False
+        assert {t.token_id for t in released.released_tokens} == {"t-a1", "t-a2"}
+        assert ("variant_union", "g-b") in executor._pending
+
+
 class TestLateArrival:
     def test_late_arrival_after_release_fails_closed(self) -> None:
         executor, _execution, data_flow, _clock = _make_executor()
@@ -220,8 +252,8 @@ class TestLateArrival:
     def test_landscape_fallback_distinguishes_released_from_failed_closure(self) -> None:
         executor, execution, _data_flow, _clock = _make_executor()
         _register(executor)
-        execution.has_completed_row_for_node.return_value = True
-        execution.has_released_row_for_node.return_value = False
+        execution.has_completed_group_for_node.return_value = True
+        execution.has_released_group_for_node.return_value = False
 
         late = executor.accept(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union")
 
@@ -233,25 +265,25 @@ class TestLateArrival:
     def test_landscape_failed_closure_preserves_durable_branch_loss_reason(self) -> None:
         executor, execution, _data_flow, _clock = _make_executor()
         _register(executor)
-        execution.has_completed_row_for_node.return_value = True
-        execution.has_released_row_for_node.return_value = False
-        executor._barrier_restore_reads.has_branch_loss_for_group.return_value = True
+        execution.has_completed_group_for_node.return_value = True
+        execution.has_released_group_for_node.return_value = False
+        execution.has_group_loss.return_value = True
 
         late = executor.accept(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union")
 
         assert late.late_arrival is True
         assert late.failure_reason == "row_union_branch_lost"
-        executor._barrier_restore_reads.has_branch_loss_for_group.assert_called_once_with(
+        execution.has_group_loss.assert_called_once_with(
             run_id="run_1",
-            barrier_name="variant_union",
-            row_id="row_1",
+            closer_name="variant_union",
+            group_id="fg-row-union-test",
         )
 
     def test_landscape_fallback_released_closure_is_late_arrival_after_release(self) -> None:
         executor, execution, _data_flow, _clock = _make_executor()
         _register(executor)
-        execution.has_completed_row_for_node.return_value = True
-        execution.has_released_row_for_node.return_value = True
+        execution.has_completed_group_for_node.return_value = True
+        execution.has_released_group_for_node.return_value = True
 
         late = executor.accept(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union")
 
@@ -321,7 +353,7 @@ class TestBranchLoss:
         executor.accept(tok_a, "variant_union")
         outcome = executor.notify_branch_lost(
             row_union_name="variant_union",
-            row_id="row_1",
+            fork_group_id="fg-row-union-test",
             lost_branch="branch_b",
             reason="diverted_to_error_sink",
         )
@@ -329,14 +361,14 @@ class TestBranchLoss:
         assert outcome.failure_reason == "row_union_branch_lost"
         assert outcome.consumed_tokens == (tok_a,)
         data_flow.record_token_outcome.assert_called_once()
-        assert executor.has_recorded_branch_loss("variant_union", "row_1", "branch_b") is True
+        assert executor.has_recorded_branch_loss("variant_union", "fg-row-union-test", "branch_b") is True
 
     def test_lost_branch_with_no_pending_marks_group_dead(self) -> None:
         executor, _execution, _data_flow, _clock = _make_executor()
         _register(executor)
         outcome = executor.notify_branch_lost(
             row_union_name="variant_union",
-            row_id="row_1",
+            fork_group_id="fg-row-union-test",
             lost_branch="branch_b",
             reason="diverted_to_error_sink",
         )
@@ -364,13 +396,13 @@ class TestBranchLoss:
 
         outcome = executor.notify_branch_lost(
             row_union_name="variant_union",
-            row_id="row_1",
+            fork_group_id="fg-row-union-test",
             lost_branch="branch_a",
             reason="routed_to_sink",
         )
 
         assert outcome is None
-        assert executor.has_recorded_branch_loss("variant_union", "row_1", "branch_a") is False
+        assert executor.has_recorded_branch_loss("variant_union", "fg-row-union-test", "branch_a") is False
         data_flow.record_token_outcome.assert_not_called()
         # 2026-08-24 re-review R2 (comment corrected re-review round 2 — the
         # prior wording implied an ordering dependency that does not
@@ -389,38 +421,42 @@ class TestBranchLoss:
     def test_lost_branch_after_evicted_release_uses_durable_completion_before_recording(self) -> None:
         executor, execution, _data_flow, _clock = _make_executor(max_completed_keys=1)
         _register(executor)
+        # WS4 Task 12: sibling groups now collide on row_id (arch-M1), so
+        # each "row" here needs its own fork_group_id to stay independent —
+        # row_id is retained only as a token-identity label.
         for row_id in ("row_1", "row_2"):
-            executor.accept(_make_token(row_id=row_id, token_id=f"{row_id}-a", branch_name="branch_a"), "variant_union")
-            executor.accept(_make_token(row_id=row_id, token_id=f"{row_id}-b", branch_name="branch_b"), "variant_union")
-        execution.has_completed_row_for_node.reset_mock()
-        execution.has_completed_row_for_node.return_value = True
-        execution.has_released_row_for_node.return_value = True
+            fg = f"fg-{row_id}"
+            executor.accept(_make_token(row_id=row_id, token_id=f"{row_id}-a", branch_name="branch_a", fork_group_id=fg), "variant_union")
+            executor.accept(_make_token(row_id=row_id, token_id=f"{row_id}-b", branch_name="branch_b", fork_group_id=fg), "variant_union")
+        execution.has_completed_group_for_node.reset_mock()
+        execution.has_completed_group_for_node.return_value = True
+        execution.has_released_group_for_node.return_value = True
 
         outcome = executor.notify_branch_lost(
             row_union_name="variant_union",
-            row_id="row_1",
+            fork_group_id="fg-row_1",
             lost_branch="branch_a",
             reason="routed_to_sink",
         )
 
         assert outcome is None
-        assert executor.has_recorded_branch_loss("variant_union", "row_1", "branch_a") is False
-        execution.has_completed_row_for_node.assert_called_once_with(
+        assert executor.has_recorded_branch_loss("variant_union", "fg-row_1", "branch_a") is False
+        execution.has_completed_group_for_node.assert_called_once_with(
             run_id="run_1",
             node_id="node_union",
-            row_id="row_1",
+            group_id="fg-row_1",
         )
 
     def test_recorded_loss_indexes_are_bounded_with_durable_fallback_after_eviction(self) -> None:
-        executor, _execution, _data_flow, _clock = _make_executor(max_completed_keys=1)
+        executor, execution, _data_flow, _clock = _make_executor(max_completed_keys=1)
         _register(executor)
-        executor._barrier_restore_reads.has_branch_loss_for_group.side_effect = (  # white-box cache regression
-            lambda *, run_id, barrier_name, row_id: run_id == "run_1" and barrier_name == "variant_union" and row_id == "row_1"
+        execution.has_group_loss.side_effect = (  # white-box cache regression
+            lambda *, run_id, closer_name, group_id: run_id == "run_1" and closer_name == "variant_union" and group_id == "fg-row_1"
         )
         for row_id in ("row_1", "row_2"):
             executor.notify_branch_lost(
                 row_union_name="variant_union",
-                row_id=row_id,
+                fork_group_id=f"fg-{row_id}",
                 lost_branch="branch_b",
                 reason="diverted_to_error_sink",
             )
@@ -428,16 +464,16 @@ class TestBranchLoss:
         assert len(executor._recorded_losses) <= 1  # resident-memory bound is the contract
         assert len(executor._recorded_loss_groups) <= 1  # resident-memory bound is the contract
         late = executor.accept(
-            _make_token(row_id="row_1", token_id="tok_a", branch_name="branch_a"),
+            _make_token(row_id="row_1", token_id="tok_a", branch_name="branch_a", fork_group_id="fg-row_1"),
             "variant_union",
         )
 
         assert late.held is False
         assert late.failure_reason == "row_union_branch_lost"
-        executor._barrier_restore_reads.has_branch_loss_for_group.assert_called_once_with(
+        execution.has_group_loss.assert_called_once_with(
             run_id="run_1",
-            barrier_name="variant_union",
-            row_id="row_1",
+            closer_name="variant_union",
+            group_id="fg-row_1",
         )
 
     def test_durable_release_precedes_a_recent_branch_loss_hint(self) -> None:
@@ -445,33 +481,33 @@ class TestBranchLoss:
         _register(executor)
         executor.notify_branch_lost(
             row_union_name="variant_union",
-            row_id="row_1",
+            fork_group_id="fg-row_1",
             lost_branch="branch_b",
             reason="error_routed",
         )
-        # Close a different group to evict row_1 from the completion cache
+        # Close a different group to evict fg-row_1 from the completion cache
         # while leaving its recent branch-loss hint resident.
-        executor.accept(_make_token(row_id="row_2", token_id="tok_2a", branch_name="branch_a"), "variant_union")
-        executor.accept(_make_token(row_id="row_2", token_id="tok_2b", branch_name="branch_b"), "variant_union")
-        execution.has_completed_row_for_node.return_value = True
-        execution.has_released_row_for_node.return_value = True
+        executor.accept(_make_token(row_id="row_2", token_id="tok_2a", branch_name="branch_a", fork_group_id="fg-row_2"), "variant_union")
+        executor.accept(_make_token(row_id="row_2", token_id="tok_2b", branch_name="branch_b", fork_group_id="fg-row_2"), "variant_union")
+        execution.has_completed_group_for_node.return_value = True
+        execution.has_released_group_for_node.return_value = True
 
         late = executor.accept(
-            _make_token(row_id="row_1", token_id="tok_late", branch_name="branch_a"),
+            _make_token(row_id="row_1", token_id="tok_late", branch_name="branch_a", fork_group_id="fg-row_1"),
             "variant_union",
         )
 
         assert late.held is False
         assert late.failure_reason == "late_arrival_after_release"
-        execution.has_released_row_for_node.assert_called_once()
+        execution.has_released_group_for_node.assert_called_once()
 
 
 class TestRestoreFromJournal:
     def test_durable_loss_point_read_fails_pending_sibling_instead_of_reopening_group(self) -> None:
-        executor, _execution, data_flow, _clock = _make_executor()
+        executor, execution, data_flow, _clock = _make_executor()
         _register(executor)
         restored = _make_token(token_id="tok_a", branch_name="branch_a")
-        executor._barrier_restore_reads.has_branch_loss_for_group.return_value = True
+        execution.has_group_loss.return_value = True
 
         outcomes = executor.restore_from_journal(entries=(RowUnionRestoreEntry(restored, "variant_union", "state-a", 90.0),))
 
@@ -479,18 +515,22 @@ class TestRestoreFromJournal:
         assert outcomes[0].failure_reason == "row_union_branch_lost"
         assert outcomes[0].consumed_tokens == (restored,)
         data_flow.record_token_outcome.assert_called_once()
-        executor._barrier_restore_reads.has_branch_loss_for_group.assert_called_once_with(
+        execution.has_group_loss.assert_called_once_with(
             run_id="run_1",
-            barrier_name="variant_union",
-            row_id="row_1",
+            closer_name="variant_union",
+            group_id="fg-row-union-test",
         )
 
     def test_all_durable_loss_reads_finish_before_any_recovery_state_mutation(self) -> None:
         executor, execution, data_flow, _clock = _make_executor()
         _register(executor)
-        restored_a = _make_token(row_id="row_1", token_id="tok_a", branch_name="branch_a")
-        restored_b = _make_token(row_id="row_2", token_id="tok_b", branch_name="branch_a")
-        executor._barrier_restore_reads.has_branch_loss_for_group.side_effect = (
+        # Distinct fork_group_id per entry: both share branch_name="branch_a",
+        # so without a distinct group id they'd collide as a duplicate
+        # restored branch within one group (arch-M1 — this is exactly the
+        # sibling-fork-group shape the re-key exists to keep independent).
+        restored_a = _make_token(row_id="row_1", token_id="tok_a", branch_name="branch_a", fork_group_id="fg-a")
+        restored_b = _make_token(row_id="row_2", token_id="tok_b", branch_name="branch_a", fork_group_id="fg-b")
+        execution.has_group_loss.side_effect = (
             True,
             RuntimeError("second durable loss read failed"),
         )
@@ -515,7 +555,7 @@ class TestRestoreFromJournal:
         # evidence) rather than expect reconcile to tolerate them.
         executor, _execution, _data_flow, _clock = _make_executor()
         _register(executor)
-        executor.restore_branch_losses((("variant_union", "row_1", "branch_b"),))
+        executor.restore_branch_losses((("variant_union", "fg-row-union-test", "branch_b"),))
 
         with pytest.raises(OrchestrationInvariantError, match="non-pristine"):
             executor.reconcile_released_group(
@@ -594,8 +634,8 @@ class TestRestoreFromJournal:
         # timeout/EOF flush under an untruthful reason.
         executor, execution, data_flow, _clock = _make_executor()
         _register(executor)
-        execution.has_completed_row_for_node.return_value = True
-        execution.has_released_row_for_node.return_value = True
+        execution.has_completed_group_for_node.return_value = True
+        execution.has_released_group_for_node.return_value = True
         residual = _make_token(token_id="tok_late", branch_name="branch_a")
 
         outcomes = executor.restore_from_journal(entries=(RowUnionRestoreEntry(residual, "variant_union", "state-late", 90.0),))
@@ -620,8 +660,8 @@ class TestRestoreFromJournal:
         # like the live late-arrival arm's cache-miss path.
         executor, execution, _data_flow, _clock = _make_executor()
         _register(executor)
-        execution.has_completed_row_for_node.return_value = True
-        execution.has_released_row_for_node.return_value = False
+        execution.has_completed_group_for_node.return_value = True
+        execution.has_released_group_for_node.return_value = False
 
         outcomes = executor.restore_from_journal(
             entries=(RowUnionRestoreEntry(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union", "state-late", 90.0),)
@@ -637,9 +677,9 @@ class TestRestoreFromJournal:
         # once, with the loss reason.
         executor, execution, data_flow, _clock = _make_executor()
         _register(executor)
-        execution.has_completed_row_for_node.return_value = True
-        execution.has_released_row_for_node.return_value = False
-        executor._barrier_restore_reads.has_branch_loss_for_group.return_value = True
+        execution.has_completed_group_for_node.return_value = True
+        execution.has_released_group_for_node.return_value = False
+        execution.has_group_loss.return_value = True
 
         outcomes = executor.restore_from_journal(
             entries=(RowUnionRestoreEntry(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union", "state-late", 90.0),)
@@ -654,10 +694,13 @@ class TestRestoreFromJournal:
         # not disturb a genuinely-open group restored in the same call.
         executor, execution, _data_flow, _clock = _make_executor()
         _register(executor)
-        execution.has_completed_row_for_node.side_effect = lambda *, run_id, node_id, row_id: row_id == "row_1"
-        execution.has_released_row_for_node.return_value = True
-        residual = _make_token(row_id="row_1", token_id="tok_late", branch_name="branch_a")
-        open_hold = _make_token(row_id="row_2", token_id="tok_open", branch_name="branch_a")
+        # Both tokens share branch_name="branch_a" — WS4 Task 12: only a
+        # distinct fork_group_id keeps them as independent groups now that
+        # grouping no longer keys on row_id (arch-M1).
+        execution.has_completed_group_for_node.side_effect = lambda *, run_id, node_id, group_id: group_id == "fg-1"
+        execution.has_released_group_for_node.return_value = True
+        residual = _make_token(row_id="row_1", token_id="tok_late", branch_name="branch_a", fork_group_id="fg-1")
+        open_hold = _make_token(row_id="row_2", token_id="tok_open", branch_name="branch_a", fork_group_id="fg-2")
 
         outcomes = executor.restore_from_journal(
             entries=(
@@ -668,7 +711,7 @@ class TestRestoreFromJournal:
 
         assert [outcome.failure_reason for outcome in outcomes] == ["late_arrival_after_release"]
         assert outcomes[0].consumed_tokens == (residual,)
-        assert ("variant_union", "row_2") in executor._pending
+        assert ("variant_union", "fg-2") in executor._pending
 
 
 class TestOutcomeInvariants:

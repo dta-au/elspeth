@@ -16,9 +16,10 @@ RESTORE_NODE_STATE_READ_METHODS = {
     "get_max_node_state_attempts_for_node",  # WS4 T7: node-scoped sibling (META-14.1 opener attempt)
     "get_open_node_state_ids",
     "get_released_row_ids_for_nodes",
+    "get_released_group_ids_for_nodes",  # WS4 T12/F-1: group-keyed sibling of get_released_row_ids_for_nodes
     "get_settled_member_token_ids",  # WS4 T7: settled-token twin of has_completed_group_for_node (META-20b)
     "resolve_group_collector_node",  # WS4 T7: durable node-resolution family anchor (META-22)
-    "has_branch_loss_for_group",
+    "has_group_loss",  # WS4 T12: renamed from has_branch_loss_for_group -- queries group_losses directly by group_id
     "has_completed_row_for_node",
     "has_completed_group_for_node",  # WS4 T2: group-keyed sibling of has_completed_row_for_node
     "has_released_row_for_node",

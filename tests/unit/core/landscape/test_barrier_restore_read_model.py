@@ -135,28 +135,33 @@ def test_barrier_restore_read_model_finds_one_durable_group_loss_by_closer() -> 
         )
 
     reads = setup.factory.barrier_restore
-    assert reads.has_branch_loss_for_group(
+    # WS4 Task 12 re-key: has_group_loss (retired has_branch_loss_for_group)
+    # queries the unified group_losses ledger directly by group_id — no
+    # tokens-table join needed, since the ledger row carries group_id itself
+    # (spec §6.2 unification).
+    assert reads.has_group_loss(
         run_id=setup.run_id,
-        barrier_name="variant_union",
-        row_id="row-lost",
+        closer_name="variant_union",
+        group_id="eg_1",
     )
-    assert not reads.has_branch_loss_for_group(
+    assert not reads.has_group_loss(
         run_id=setup.run_id,
-        barrier_name="variant_union",
-        row_id="other-row",
+        closer_name="variant_union",
+        group_id="other-group",
     )
-    assert not reads.has_branch_loss_for_group(
+    assert not reads.has_group_loss(
         run_id=setup.run_id,
-        barrier_name="other-union",
-        row_id="row-lost",
+        closer_name="other-union",
+        group_id="eg_1",
     )
-    assert not reads.has_branch_loss_for_group(
+    assert not reads.has_group_loss(
         run_id="other-run",
-        barrier_name="variant_union",
-        row_id="row-lost",
+        closer_name="variant_union",
+        group_id="eg_1",
     )
-    # Transitional row_id resolution (spec §5/§6.2): the ledger row carries no
-    # row_id — row_id_for_token recovers it from the token the loss names.
+    # row_id_for_token is unrelated to the loss ledger — a separate, still
+    # row-scoped accessor (e.g. for scope_row_id derivation) — untouched by
+    # the re-key.
     assert reads.row_id_for_token(run_id=setup.run_id, token_id="token-lost") == "row-lost"
     assert reads.row_id_for_token(run_id=setup.run_id, token_id="no-such-token") is None
 
@@ -354,6 +359,48 @@ def test_get_completed_group_ids_for_nodes_pairs() -> None:
 
     pairs = setup.factory.barrier_restore.get_completed_group_ids_for_nodes(setup.run_id, frozenset({node_id}))
     assert pairs == {(node_id, "g-fork-1")}
+
+
+def test_get_released_group_ids_for_nodes_pairs_and_discriminates_from_failed() -> None:
+    # WS4 Task 12 / F-1 (elspeth-14660ce1c0): group-keyed sibling of
+    # get_released_row_ids_for_nodes, needed by the row_union crash-window
+    # holdless-reconcile. Both tokens share row_id -- the sibling-fork-group
+    # collision this workstream exists for -- and only the COMPLETED one may
+    # appear; a mutant deleting the ``status == COMPLETED`` predicate would
+    # let the FAILED sibling's group through too (completed_at is set on a
+    # FAILED state as well).
+    from elspeth.contracts.errors import ExecutionError
+
+    setup = make_recorder_with_run(run_id="run-restore-group-released-pairs")
+    node_id = register_test_node(setup.factory.data_flow, setup.run_id, "row_union_x")
+    row = setup.factory.data_flow.create_row(
+        setup.run_id,
+        setup.source_node_id,
+        0,
+        {"id": 1},
+        source_row_index=0,
+        ingest_sequence=0,
+        row_id="row-1",
+    )
+    released_token = setup.factory.data_flow.create_token(
+        row_id=row.row_id,
+        token_id="token-released",
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-released", member_key="left"),),
+    )
+    released_state = setup.factory.execution.begin_node_state(released_token.token_id, node_id, setup.run_id, 1, {"id": 1})
+    setup.factory.execution.complete_node_state(released_state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+
+    failed_token = setup.factory.data_flow.create_token(
+        row_id=row.row_id,
+        token_id="token-failed",
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-failed", member_key="left"),),
+    )
+    failed_state = setup.factory.execution.begin_node_state(failed_token.token_id, node_id, setup.run_id, 1, {"id": 1})
+    error = ExecutionError(exception="boom", exception_type="ValueError")
+    setup.factory.execution.complete_node_state(failed_state.state_id, NodeStateStatus.FAILED, error=error, duration_ms=1.0)
+
+    pairs = setup.factory.barrier_restore.get_released_group_ids_for_nodes(setup.run_id, frozenset({node_id}))
+    assert pairs == {(node_id, "g-fork-released")}
     assert setup.factory.barrier_restore.get_completed_group_ids_for_nodes("other-run", frozenset({node_id})) == set()
 
 
