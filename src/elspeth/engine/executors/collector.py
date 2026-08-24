@@ -373,7 +373,6 @@ class CollectorExecutor:
         """require_all group failure: engine-performed, plugin never invoked (spec §6.4)."""
         group_id = key[1]
         consumed = tuple(entry.token for entry in sorted(pending.arrived.values(), key=lambda e: e.ordinal))
-        error_hash = compute_error_hash(failure_reason)
         now = self._clock.monotonic()
         error = ExecutionError(
             exception=f"Collector group {group_id!r} failed: lost members {sorted(pending.lost)!r} under require_all",
@@ -381,17 +380,14 @@ class CollectorExecutor:
             phase="collector_flush",
         )
         for entry in pending.arrived.values():
+            # Close out THIS token's own accept()-time hold (canon item 11) —
+            # an audit-trail bookkeeping concern, not a terminal-disposition
+            # write, so it stays here regardless of who writes the outcome.
             self._execution.complete_node_state(
                 state_id=entry.state_id,
                 status=NodeStateStatus.FAILED,
                 error=error,
                 duration_ms=(now - entry.arrival_time) * 1000,
-            )
-            self._data_flow.record_token_outcome(
-                ref=TokenRef(token_id=entry.token.token_id, run_id=self._run_id),
-                outcome=TerminalOutcome.FAILURE,
-                path=TerminalPath.UNROUTED,
-                error_hash=error_hash,
             )
         del self._pending[key]
         self._mark_completed(key)
@@ -401,16 +397,25 @@ class CollectorExecutor:
             group_id=group_id,
             consumed_tokens=consumed,
             failure_reason=failure_reason,
-            outcomes_recorded=True,
+            outcomes_recorded=False,
         )
 
-    # NOTE for the WS3 integration reviewer: `_fail_group`'s direct
-    # `record_token_outcome` writes are the collector's engine-performed
-    # disposition for ARRIVED members; the group verdict itself (escalation
-    # vs quarantine per `scope.on_group_failure`, survivor termination as
-    # `scope_group_failed`) is staged by the WS3 settle-member seam consuming
-    # this `CollectorOutcome` — the executor renders, WS3 settles. Do not add
-    # escalation logic here.
+    # NOTE for the WS3 integration reviewer: `_fail_group` no longer writes
+    # ARRIVED members' terminal disposition itself (META-11.2 fix-round
+    # correction — this write used to sit here, matching what
+    # CoalesceExecutor's OWN require_all-shaped merge-failure write looked
+    # like before Task 6/Ruling 37 removed it: "the executor never records a
+    # consumed sibling's terminal outcome itself anymore — the caller always
+    # does, through the settlement channel" (test_processor.py's
+    # test_coalesce_failure_always_records_through_settlement_channel).
+    # `outcomes_recorded=False` on this return means the WS3 settle-member
+    # seam (CloserKind.COLLECTOR, wired at integration) MUST record
+    # `consumed_tokens`' terminal disposition — it is not optional. The group
+    # verdict itself (escalation vs quarantine per `scope.on_group_failure`,
+    # survivor termination as `scope_group_failed`) is staged by that same
+    # seam consuming this `CollectorOutcome` — the executor renders, WS3
+    # settles. Do not add escalation logic here, and do not reintroduce a
+    # direct `record_token_outcome` call for arrived members in this method.
 
     def _execute_flush(self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, ctx: PluginContext) -> CollectorOutcome:
         """end_of_group flush: opener-ordinal order, transform-only, audit-guarded."""

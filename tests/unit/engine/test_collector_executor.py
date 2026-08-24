@@ -344,7 +344,14 @@ class TestLosses:
         assert mid is None  # roster not closed yet
         final = env.executor.accept(members[2], "stitch")  # closure
         assert final.failure_reason == "collector_missing_members"
-        assert final.outcomes_recorded is True
+        # META-11.2 fix-round: the executor no longer writes ARRIVED members'
+        # terminal disposition itself (matches CoalesceExecutor's Task
+        # 6/Ruling 37 removal of the same class of write) — outcomes_recorded
+        # is False, signalling the WS3 settle-member seam MUST record
+        # consumed_tokens' terminal outcomes.
+        assert final.outcomes_recorded is False
+        assert env.factory.data_flow.get_token_outcome(members[0].token_id) is None
+        assert env.factory.data_flow.get_token_outcome(members[2].token_id) is None
 
     def test_duplicate_loss_dedup(self, collector_env: _CollectorEnv) -> None:
         env = collector_env
