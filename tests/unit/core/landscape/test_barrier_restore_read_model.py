@@ -4,11 +4,17 @@ from datetime import UTC, datetime
 
 from elspeth.contracts import NodeStateStatus, NodeType
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalPath
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import GroupLossSpec
+from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape.database import begin_write
 from elspeth.core.landscape.scheduler_repository import record_group_loss
 from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+
+# Minimal contract for tests that only care about token/group lifecycle, not
+# contract content (mirrors test_token_recording.py's _MINIMAL_CONTRACT).
+_MINIMAL_CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
 
 
 def test_barrier_restore_read_model_reports_duplicate_live_buffered_acceptances() -> None:
@@ -243,3 +249,109 @@ def test_barrier_restore_read_model_reports_completed_coalesce_row_ids() -> None
         )
         is False
     )
+
+
+def test_group_member_reads_roster_from_frames_and_group_record() -> None:
+    # Opener token expands into 2 members (ordinals 0, 1). WS1a's production
+    # expand write mints group_records(member_count=2) and one
+    # token_lineage_frames row per member (kind='expand', member_key=child
+    # token_id) -- frames and group records are seeded through the real
+    # writer, never raw INSERTs into the new tables.
+    setup = make_recorder_with_run(run_id="run-restore-group-roster")
+    row = setup.factory.data_flow.create_row(
+        setup.run_id,
+        setup.source_node_id,
+        0,
+        {"id": 1},
+        source_row_index=0,
+        ingest_sequence=0,
+        row_id="row-roster",
+    )
+    opener = setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-opener")
+    children, expand_group_id = setup.factory.data_flow.expand_token(
+        parent_ref=TokenRef(token_id=opener.token_id, run_id=setup.run_id),
+        row_id=row.row_id,
+        child_payloads=[{"item": 0}, {"item": 1}],
+        output_contract=_MINIMAL_CONTRACT,
+    )
+    reads = setup.factory.barrier_restore
+
+    record = reads.get_group_record(run_id=setup.run_id, group_id=expand_group_id)
+    assert record is not None
+    assert record.kind == "expand"
+    assert record.member_count == 2
+    assert record.opener_token_id == opener.token_id
+
+    keys = reads.get_group_member_keys(run_id=setup.run_id, group_id=expand_group_id)
+    assert keys == frozenset(child.token_id for child in children)
+
+    ordinals = reads.get_group_member_ordinals(run_id=setup.run_id, opener_token_id=opener.token_id)
+    assert ordinals == {children[0].token_id: 0, children[1].token_id: 1}
+
+
+def test_get_group_record_returns_none_for_unknown_group() -> None:
+    setup = make_recorder_with_run(run_id="run-restore-group-unknown")
+    assert setup.factory.barrier_restore.get_group_record(run_id=setup.run_id, group_id="no-such") is None
+
+
+def test_has_completed_group_for_node_discriminates_sibling_groups_on_one_row() -> None:
+    # THE collision this workstream exists for: two sibling fork groups share
+    # row_id at one coalesce node; completing one must not mark the other.
+    # create_token's lineage_path is the crafted-token seam (docstring:
+    # "crafted-token seam for tests and recovery tooling") -- used here only
+    # to stack a chosen FORK frame directly, not to bypass any strict-pop
+    # invariant (no coalesce/collect release is exercised in this test).
+    setup = make_recorder_with_run(run_id="run-restore-group-sibling")
+    node_id = register_test_node(setup.factory.data_flow, setup.run_id, "merge_x")
+    row = setup.factory.data_flow.create_row(
+        setup.run_id,
+        setup.source_node_id,
+        0,
+        {"id": 1},
+        source_row_index=0,
+        ingest_sequence=0,
+        row_id="row-1",
+    )
+    g1_token = setup.factory.data_flow.create_token(
+        row_id=row.row_id,
+        token_id="token-g1-left",
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-1", member_key="left"),),
+    )
+    setup.factory.data_flow.create_token(
+        row_id=row.row_id,
+        token_id="token-g2-left",
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-2", member_key="left"),),
+    )
+    state = setup.factory.execution.begin_node_state(g1_token.token_id, node_id, setup.run_id, 1, {"id": 1})
+    setup.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+
+    reads = setup.factory.barrier_restore
+    assert reads.has_completed_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-fork-1") is True
+    assert reads.has_completed_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-fork-2") is False
+    assert reads.has_released_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-fork-1") is True
+    assert reads.has_released_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-fork-2") is False
+
+
+def test_get_completed_group_ids_for_nodes_pairs() -> None:
+    setup = make_recorder_with_run(run_id="run-restore-group-pairs")
+    node_id = register_test_node(setup.factory.data_flow, setup.run_id, "merge_x")
+    row = setup.factory.data_flow.create_row(
+        setup.run_id,
+        setup.source_node_id,
+        0,
+        {"id": 1},
+        source_row_index=0,
+        ingest_sequence=0,
+        row_id="row-1",
+    )
+    g1_token = setup.factory.data_flow.create_token(
+        row_id=row.row_id,
+        token_id="token-g1-left",
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-1", member_key="left"),),
+    )
+    state = setup.factory.execution.begin_node_state(g1_token.token_id, node_id, setup.run_id, 1, {"id": 1})
+    setup.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+
+    pairs = setup.factory.barrier_restore.get_completed_group_ids_for_nodes(setup.run_id, frozenset({node_id}))
+    assert pairs == {(node_id, "g-fork-1")}
+    assert setup.factory.barrier_restore.get_completed_group_ids_for_nodes("other-run", frozenset({node_id})) == set()

@@ -8,6 +8,7 @@ writer so the persistence layer does not own restore policy.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
 
@@ -41,6 +42,7 @@ from elspeth.core.landscape.schema import (
     coalesce_effect_members_table,
     coalesce_effects_table,
     group_losses_table,
+    group_records_table,
     node_states_table,
     token_lineage_frames_table,
     token_outcomes_table,
@@ -50,6 +52,17 @@ from elspeth.core.landscape.schema import (
 )
 
 _TOKEN_ID_CHUNK_SIZE = 500
+
+
+@dataclass(frozen=True, slots=True)
+class GroupRecordRow:
+    """One durable group roster-authority row (spec §4.3)."""
+
+    run_id: str
+    group_id: str
+    kind: str
+    opener_token_id: str
+    member_count: int
 
 
 class BarrierRestoreReadModel:
@@ -228,6 +241,132 @@ class BarrierRestoreReadModel:
             .limit(1)
         )
         return self._ops.execute_fetchone(query) is not None
+
+    def get_group_record(self, *, run_id: str, group_id: str) -> GroupRecordRow | None:
+        """Durable roster authority for one group (spec §5 'minted')."""
+        query = select(
+            group_records_table.c.run_id,
+            group_records_table.c.group_id,
+            group_records_table.c.kind,
+            group_records_table.c.opener_token_id,
+            group_records_table.c.member_count,
+        ).where(
+            group_records_table.c.run_id == run_id,
+            group_records_table.c.group_id == group_id,
+        )
+        row = self._ops.execute_fetchone(query)
+        if row is None:
+            return None
+        return GroupRecordRow(
+            run_id=row.run_id,
+            group_id=row.group_id,
+            kind=row.kind,
+            opener_token_id=row.opener_token_id,
+            member_count=row.member_count,
+        )
+
+    def get_group_member_keys(self, *, run_id: str, group_id: str) -> frozenset[str]:
+        """DISTINCT member identities minted into one group (identity set, never a count)."""
+        query = (
+            select(token_lineage_frames_table.c.member_key)
+            .where(
+                token_lineage_frames_table.c.run_id == run_id,
+                token_lineage_frames_table.c.group_id == group_id,
+            )
+            .distinct()
+        )
+        rows = self._ops.execute_fetchall(query)
+        return frozenset(row.member_key for row in rows)
+
+    def get_group_member_ordinals(self, *, run_id: str, opener_token_id: str) -> dict[str, int]:
+        """member token_id -> opener expansion ordinal (spec §5 flush order, decision 11).
+
+        Resolved from the OPENER's ``token_parents`` rows -- never from an
+        arriving token's own parent chain (a member whose subtree
+        forked-and-coalesced arrives as a merged token with a fresh token_id).
+        """
+        query = select(token_parents_table.c.token_id, token_parents_table.c.ordinal).where(
+            token_parents_table.c.run_id == run_id,
+            token_parents_table.c.parent_token_id == opener_token_id,
+        )
+        rows = self._ops.execute_fetchall(query)
+        return {row.token_id: row.ordinal for row in rows}
+
+    def has_completed_group_for_node(self, *, run_id: str, node_id: str, group_id: str) -> bool:
+        """Group-keyed sibling of has_completed_row_for_node.
+
+        Two sibling groups can share a row_id at one closer node (spec §5,
+        arch M1), so completion must be tested per GROUP: any completed
+        node_state at the node whose token carries a lineage frame in the
+        group.
+        """
+        query = (
+            select(node_states_table.c.state_id)
+            .select_from(
+                node_states_table.join(
+                    token_lineage_frames_table,
+                    (node_states_table.c.token_id == token_lineage_frames_table.c.token_id)
+                    & (node_states_table.c.run_id == token_lineage_frames_table.c.run_id),
+                )
+            )
+            .where(
+                node_states_table.c.run_id == run_id,
+                node_states_table.c.node_id == node_id,
+                token_lineage_frames_table.c.group_id == group_id,
+                node_states_table.c.completed_at.isnot(None),
+            )
+            .limit(1)
+        )
+        return self._ops.execute_fetchone(query) is not None
+
+    def has_released_group_for_node(self, *, run_id: str, node_id: str, group_id: str) -> bool:
+        """Status-COMPLETED variant (row_union release discrimination)."""
+        query = (
+            select(node_states_table.c.state_id)
+            .select_from(
+                node_states_table.join(
+                    token_lineage_frames_table,
+                    (node_states_table.c.token_id == token_lineage_frames_table.c.token_id)
+                    & (node_states_table.c.run_id == token_lineage_frames_table.c.run_id),
+                )
+            )
+            .where(
+                node_states_table.c.run_id == run_id,
+                node_states_table.c.node_id == node_id,
+                token_lineage_frames_table.c.group_id == group_id,
+                node_states_table.c.completed_at.isnot(None),
+                node_states_table.c.status == NodeStateStatus.COMPLETED.value,
+            )
+            .limit(1)
+        )
+        return self._ops.execute_fetchone(query) is not None
+
+    def get_completed_group_ids_for_nodes(
+        self,
+        run_id: str,
+        node_ids: frozenset[str],
+    ) -> set[tuple[str, str]]:
+        """Completed ``(node_id, group_id)`` pairs -- the group-keyed restore sweep."""
+        if not node_ids:
+            return set()
+        query = (
+            select(node_states_table.c.node_id, token_lineage_frames_table.c.group_id)
+            .select_from(
+                node_states_table.join(
+                    token_lineage_frames_table,
+                    (node_states_table.c.token_id == token_lineage_frames_table.c.token_id)
+                    & (node_states_table.c.run_id == token_lineage_frames_table.c.run_id),
+                )
+            )
+            .where(
+                node_states_table.c.run_id == run_id,
+                node_states_table.c.node_id.in_(node_ids),
+                node_states_table.c.completed_at.isnot(None),
+            )
+            .distinct()
+        )
+        rows = self._ops.execute_fetchall(query)
+        return {(row.node_id, row.group_id) for row in rows}
 
     def get_released_row_ids_for_nodes(
         self,
