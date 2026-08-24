@@ -3206,15 +3206,21 @@ class RowProcessor:
              token's frames.
           2. `CoalesceExecutor`'s direct `record_token_outcome(FAILURE,
              UNROUTED)` write in `_execute_merge`'s except-cleanup arm
-             (`coalesce_executor.py:~1279`) — a crash-and-reraise path with
-             no live caller to hand a settlement-channel record to; audit
-             completeness for that arm is the executor's own responsibility.
-             Task 6 retired the other two direct writes (late arrival,
-             `_fail_pending`'s group-failure arm): callers now route their
-             consumed siblings through `_record_group_member_terminals`,
-             which both records the terminal AND runs this walk again over
-             each sibling's REMAINING lineage (spec §6.1 — what makes
-             escalation, Task 8, observable).
+             (`coalesce_executor.py:~1264`) — KEPT deliberately (Ruling 36,
+             not an oversight): this is crash-path cleanup ahead of a
+             `raise` nothing catches, so the run aborts before any claim
+             transaction could carry a staged GroupLossSpec durably; audit
+             completeness for that arm stays the executor's own
+             responsibility. No group loss is ever staged for a token
+             consumed on this arm — WS5/6 resume sees only its direct
+             terminal, and Task 8 escalation must NOT expect a loss from
+             this specific site. Task 6 retired the OTHER two direct writes
+             (late arrival, `_fail_pending`'s group-failure arm): callers
+             now route their consumed siblings through
+             `_record_group_member_terminals`, which both records the
+             terminal AND runs this walk again over each sibling's
+             REMAINING lineage (spec §6.1 — what makes escalation, Task 8,
+             observable, for those two sites).
         Within its actual scope — a disposition that COULD carry a member
         loss — ruling 25 makes exactly one shape unreachable, not absent:
         the non-empty aggregation flush's QUARANTINED_AT_SOURCE disposition

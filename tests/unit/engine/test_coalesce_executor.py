@@ -1228,6 +1228,13 @@ class TestUnionMerge:
         but never calls record_token_outcome(FAILED). Without terminal outcomes:
         - Recovery treats the row as incomplete (key remains in _pending)
         - Lineage resolution can't find a terminal token
+
+        WS3 Task 6, Ruling 36: this merge-exception cleanup arm is the ONE
+        direct-write site Task 6 deliberately keeps (crash-path cleanup
+        ahead of a re-raise nothing catches — no live caller to hand a
+        settlement-channel record to). This test pins BOTH halves: every
+        consumed token gets a durable FAILED terminal by SET EQUALITY
+        (not just no-duplicates), and the exception still propagates.
         """
         executor, _, data_flow, _, _ = _make_executor()
         s = _settings(

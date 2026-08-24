@@ -132,19 +132,25 @@ def _terminalize_swept_coalesce_failure(
     barrier_key: str,
     consumed_tokens: tuple[TokenInfo, ...],
     failure_reason: str,
+    counters: ExecutionCounters,
+    pending_tokens: PendingTokenMap,
 ) -> None:
     """Record a timeout/flush sweep's consumed tokens' terminals (spec §6.1,
     Task 6): the coalesce executor no longer writes them itself — reconcile
     both the Landscape terminal AND the durable scheduler barrier row here.
 
-    The settlement channel's remaining-path walk can, in principle, escalate
-    a loss to an enclosing bound frame — but no nested bound-region topology
-    (fork-in-fork / expand-in-fork) is buildable today, so no currently
-    reachable run can produce a non-empty cascade from a sweep failure. Fail
-    loudly instead of silently mishandling one if that ever changes: this
-    sweep layer has no drain seam to continue a cascaded child item, and
-    folding a cascaded RowResult into this function's caller's hand-rolled
-    counters would double-count against TERMINAL_PAIR_COUNTER_EFFECTS.
+    The settlement channel's remaining-path walk can escalate a loss to an
+    enclosing bound frame. Any cascaded RowResults fold into `counters` /
+    `pending_tokens` through the same `accumulate_row_outcomes` every other
+    disposition uses (Ruling 34: fold, don't drop). A cascaded child_item
+    (a continuation this sweep layer would need to DRAIN — e.g. an outer
+    coalesce merge triggered by the escalation) has no seam here at all:
+    this function has no drain loop, unlike the live intake/notify paths.
+    That specific shape is provably unreachable today — no nested
+    bound-region topology (fork-in-fork / expand-in-fork) is buildable, so
+    the remaining-path walk can only ever resolve to a FAILURE result here,
+    never a fresh merge — but if it ever does fire, failing loudly is the
+    honest response (Ruling 34: NEEDS_CONTEXT, not a silent discard).
     """
     if not consumed_tokens:
         return
@@ -154,13 +160,15 @@ def _terminalize_swept_coalesce_failure(
         failure_reason=failure_reason,
         child_items=child_items,
     )
-    if cascaded or child_items:
+    if child_items:
         raise OrchestrationInvariantError(
             f"Coalesce barrier {barrier_key!r} sweep failure escalated to an enclosing bound "
-            f"frame ({len(cascaded)} cascaded result(s), {len(child_items)} child item(s)) — no "
-            "nested bound-region topology is buildable today, and this sweep layer has no seam "
-            "to drain a cascaded continuation. Investigate before extending nesting support."
+            f"frame with {len(child_items)} child item(s) to continue — no nested bound-region "
+            "topology is buildable today, and this sweep layer has no drain seam for a cascaded "
+            "continuation. Investigate before extending nesting support."
         )
+    if cascaded:
+        accumulate_row_outcomes(cascaded, counters, pending_tokens)
     _mark_barrier_tokens_terminal(processor, barrier_key=barrier_key, consumed_tokens=consumed_tokens)
 
 
@@ -445,6 +453,8 @@ def handle_coalesce_timeouts(
                     barrier_key=str(coalesce_name),
                     consumed_tokens=consumed_tokens,
                     failure_reason=outcome.failure_reason,
+                    counters=counters,
+                    pending_tokens=pending_tokens,
                 )
                 counters.rows_coalesce_failed += 1
                 counters.rows_failed += len(consumed_tokens)
@@ -567,6 +577,8 @@ def flush_coalesce_pending(
                     barrier_key=str(outcome.coalesce_name),
                     consumed_tokens=tuple(outcome.consumed_tokens),
                     failure_reason=outcome.failure_reason,
+                    counters=counters,
+                    pending_tokens=pending_tokens,
                 )
             counters.rows_coalesce_failed += 1
             counters.rows_failed += len(outcome.consumed_tokens)

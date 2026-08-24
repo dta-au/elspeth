@@ -1261,9 +1261,16 @@ class CoalesceExecutor:
                     raise OrchestrationInvariantError(
                         "CoalesceExecutor.data_flow is None but token outcome recording requires DataFlowRepository"
                     ) from merge_exc
-                # DIRECT terminal write — bypasses RowProcessor._notify_barrier_of_lost_branch:
-                # a held sibling fails here with NO branch loss staged for any enclosing
-                # barrier. Retired into the WS3 settle-member seam (barrier-scopes spec §6.1 item 1).
+                # DIRECT terminal write, KEPT (WS3 Task 6, Ruling 36 — deliberate,
+                # not an oversight). This is crash-path cleanup ahead of a `raise`
+                # nothing catches: the run aborts. A staged GroupLossSpec has no
+                # claim transaction to ride here, so the settlement channel cannot
+                # make anything durable on this path — retiring this write would
+                # swap a durable fail-closed audit record for in-memory staging
+                # that dies with the process. Consequence: no group loss is staged
+                # for this token here, so WS5/6 resume sees only these terminals
+                # (no replayable loss), and Task 8 escalation must NOT expect one
+                # from this arm.
                 self._data_flow.record_token_outcome(
                     ref=TokenRef(token_id=entry.token.token_id, run_id=self._run_id),
                     outcome=TerminalOutcome.FAILURE,
