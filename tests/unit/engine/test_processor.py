@@ -64,7 +64,7 @@ from elspeth.contracts.results import FailureInfo, GateResult
 from elspeth.contracts.routing import RoutingAction
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
-from elspeth.contracts.types import BranchName, CoalesceName, GateName, NodeID, RowUnionName, SinkName
+from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, GateName, NodeID, RowUnionName, SinkName
 from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
 from elspeth.core.config import AggregationSettings, GateSettings
 from elspeth.core.dag.group_bindings import GroupBindingRegistry
@@ -10599,6 +10599,12 @@ class TestReadyEmissionEnqueueParity:
             # column as NULL and the parity assertion passes while a drop site
             # ships (elspeth-a5b86149d4 remediation).
             "row_union_cursor",
+            # collector-cursor item: the fourth barrier kind (WS4 Task 6).
+            # Same "a NULL-vs-NULL match masks a drop site" risk the
+            # row_union_cursor comment above names — without a flavor that
+            # sets collector_name non-None, the parity assertion would pass
+            # trivially even if _ready_work_item_values silently dropped it.
+            "collector_cursor",
         ],
     )
     def test_ready_emission_mirrors_enqueue_work_item_fields(self, flavor: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -10654,6 +10660,20 @@ class TestReadyEmissionEnqueueParity:
                 current_node_id=continue_node,
                 row_union_node_id=NodeID("row_union::variants"),
                 row_union_name=RowUnionName("variants"),
+                on_success_sink="merged_sink",
+            )
+        elif flavor == "collector_cursor":
+            token = TokenInfo(
+                row_id="row-1",
+                token_id="token-merged-1",
+                row_data=make_pipeline_row({"value": 42}),
+                lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="token-merged-1"),),
+            )
+            _persist_token_for_scheduler(factory, token)
+            item = WorkItem(
+                token=token,
+                current_node_id=continue_node,
+                collector_name=CollectorName("stitch"),
                 on_success_sink="merged_sink",
             )
         else:
@@ -10723,7 +10743,11 @@ class TestReadyEmissionEnqueueParity:
         # the two builders (or to the mapper) must force this pin to be
         # revisited rather than silently desync the reconciliation contract.
         # Epoch 35 flip: tri-column lineage retirement (31 -> 28).
-        assert len(values_from_emission) == 28
+        # WS4 Task 6: collector_name cursor column (28 -> 29). The mapper
+        # emits it as None until the enqueue_ready facade forwards the
+        # emission's value (WS4 held-hunk item 3) — that hunk must extend
+        # this mirror call with collector_name=emission.collector_name.
+        assert len(values_from_emission) == 29
 
         # Spot-check the per-flavor derived keys so a failure localizes.
         if flavor == "coalesce_cursor":
@@ -10746,6 +10770,29 @@ class TestReadyEmissionEnqueueParity:
             emitted_path = lineage_path_from_json(values_from_emission["lineage_path_json"])
             assert path_branch_name(emitted_path) == "path_a"
             assert path_fork_group_id(emitted_path) == "fork-1"
+        elif flavor == "collector_cursor":
+            # WS4 Task 6: processor.py/scheduler_drain.py are NOT wired to
+            # collector dispatch yet (META-4/META-14.3 deferred that to the
+            # WS3+WS4 integration item) — neither _queue_key_for_blocked_item
+            # nor _barrier_key_for_blocked_item know about collector_name, so
+            # a collector-bound item derives EXACTLY like a plain structural-
+            # queue item today. collector_name itself is None on BOTH sides
+            # here even though the input WorkItem set it: scheduler_drain.py's
+            # enqueue_work_item computes fields.collector_name via the codec
+            # but never forwards it into the enqueue_ready/enqueue_ready_claimed
+            # call kwargs (a forwarding gap in the SAME class as the already-
+            # tracked held-hunk item 3, one layer up the stack — flagged
+            # separately, not fixed here). Once that forwarding lands, this
+            # branch's collector_name assertions must flip to "== 'stitch'",
+            # which is exactly the point of pinning them now: that flip will
+            # force this test to be revisited rather than silently staying green.
+            assert values_from_emission["queue_key"] == str(continue_node)
+            assert values_from_emission["barrier_key"] is None
+            assert values_from_emission["coalesce_node_id"] is None
+            assert values_from_emission["coalesce_name"] is None
+            assert values_from_emission["row_union_name"] is None
+            assert values_from_emission["collector_name"] is None
+            assert values_from_enqueue["collector_name"] is None
         else:
             assert values_from_emission["queue_key"] == str(continue_node)
             assert values_from_emission["barrier_key"] is None
