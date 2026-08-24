@@ -29,7 +29,7 @@ from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import CollectorSettings, ScopeSettings
 from elspeth.core.landscape.scheduler.group_losses import record_group_loss
-from elspeth.core.landscape.schema import group_records_table, node_states_table
+from elspeth.core.landscape.schema import group_records_table, node_states_table, token_parents_table
 from elspeth.engine.executors.collector import CollectorExecutor, CollectorOutcome
 from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_field
@@ -223,6 +223,21 @@ class _CollectorEnv:
                 .values(member_count=member_count)
             )
 
+    def delete_token_parents_row(self, *, token_id: str) -> None:
+        """Corrupt the OTHER durable authority: leaves token_id's roster
+        membership (token_lineage_frames) intact but removes its
+        token_parents row, so get_group_member_ordinals can no longer
+        resolve its flush ordinal — the genuinely-fallible cross-table
+        inconsistency FIX 1 (I-5 residual, fix round 3) targets."""
+        from sqlalchemy import delete
+
+        with self.db.write_connection() as conn:
+            conn.execute(
+                delete(token_parents_table)
+                .where(token_parents_table.c.run_id == self.run_id)
+                .where(token_parents_table.c.token_id == token_id)
+            )
+
     def open_hold_token_ids(self, *, node: str) -> list[str]:
         assert node == "stitch"
         result = self.factory.barrier_restore.get_open_node_state_ids(
@@ -372,6 +387,45 @@ class TestArrivals:
         env.corrupt_group_record_member_count(group_id=group_id, member_count=3)
         with pytest.raises(AuditIntegrityError):
             env.executor.accept(members[0], "stitch")
+
+    def test_ordinal_mismatch_leaves_no_phantom_entry_and_no_orphaned_node_state(self, collector_env: _CollectorEnv) -> None:
+        # FIX 1 / I-5 residual (fix round 3, META-20a). pending.roster comes
+        # from get_group_member_keys (token_lineage_frames); pending.ordinals
+        # comes from get_group_member_ordinals (token_parents) — two
+        # different tables, so a member can hold a valid roster frame with
+        # no token_parents row under the opener. That is a genuine audit
+        # inconsistency (the raise is honest and must stay), but the OLD
+        # ordering opened a durable node_state (begin_node_state) BEFORE
+        # resolving the ordinal that then aborted the arrival — the
+        # node_state's state_id lived only in a local variable and was
+        # never stored into a _MemberEntry, so it became permanently
+        # orphaned: _fail_group/_execute_flush only ever complete holds
+        # reachable through pending.arrived, and _roster_settled can never
+        # be satisfied for a group missing this member from both arrived
+        # and lost, so neither close path is ever reached for this group.
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        env.delete_token_parents_row(token_id=members[0].token_id)
+
+        with pytest.raises(AuditIntegrityError, match="has no token_parents ordinal"):
+            env.executor.accept(members[0], "stitch")
+
+        # Mechanism, not symptom: no phantom _pending entry (assertion 1)...
+        assert env.executor._executor._pending == {}
+        # ...AND zero open node_states at the collector node (assertion 2)
+        # — the assertion that distinguishes a real fix from a reorder that
+        # only moved the install and left begin_node_state before the check.
+        assert env.open_hold_token_ids(node="stitch") == []
+
+        # A follow-up arrival for a DIFFERENT, valid member of the same
+        # group still opens the group and accepts cleanly (assertion 3) —
+        # the aborted attempt left no poisoned state behind. (The group
+        # itself can never fully settle — member[0]'s token_parents row is
+        # durably gone — but that is the underlying audit inconsistency's
+        # own consequence, not a defect this fix is responsible for.)
+        outcome = env.executor.accept(members[1], "stitch")
+        assert outcome.held is True
+        assert env.open_hold_token_ids(node="stitch") == [members[1].token_id]
 
     def test_collector_bound_to_a_non_expand_group_crashes_at_open(self, collector_env: _CollectorEnv) -> None:
         # I-6 (fix round 2): Task 2's group_records reads are deliberately

@@ -131,10 +131,22 @@ class CollectorExecutor:
         # closure time (I-3, fix round 2): lets accept() distinguish a
         # same-token post-closure redelivery (CAS-fenced idempotent skip,
         # spec §5) from a genuinely distinct post-closure arrival (engine
-        # bug). Empty for closures this process only DISCOVERED durably
-        # (_check_landscape_for_completion) rather than performed itself —
-        # reconstructing that history from durable state on takeover is
-        # Task 7's restore-mechanism scope, not this executor's.
+        # bug). The settled set reads as empty in TWO cases (fix round 3,
+        # META-20b — documented rather than fixed in-memory): (1) closures
+        # this process only DISCOVERED durably (_check_landscape_for_completion)
+        # rather than performed itself, and (2) a closure THIS process DID
+        # perform, whose key was later evicted by the max_completed_keys
+        # FIFO below — the settled set lives INSIDE this same
+        # OrderedDict, so eviction discards it along with the key, and a
+        # legitimate same-token redelivery arriving after eviction falls
+        # through to the AuditIntegrityError exactly like the durable-
+        # discovery case. Both are the same class of gap and the honest
+        # fix is a durable one: a takeover has case (1) regardless, and
+        # Task 7's restore mechanism must already reconstruct this memory
+        # from durable state — a second in-memory structure with its own
+        # bound would close the eviction half while leaving the takeover
+        # half open, closing half the gap while appearing to close all of
+        # it. Deliberately not attempted here; carried into Task 7's scope.
         self._completed_keys: OrderedDict[tuple[str, str], frozenset[str]] = OrderedDict()
         self._max_completed_keys = max_completed_keys
 
@@ -175,6 +187,17 @@ class CollectorExecutor:
         now = arrival_time if arrival_time is not None else self._clock.monotonic()
         node_id = self._node_ids[collector_name]
 
+        # META-20b (fix round 3): operand order is LOAD-BEARING. `or`
+        # short-circuits, so when the key is already in _completed_keys
+        # (the common case — this process performed the closure and its
+        # settled set has not been evicted), _check_landscape_for_completion
+        # never runs and can never re-mark this key with the default-empty
+        # settled set below. Reversing the operands, splitting into two
+        # statements that both evaluate, or rewriting as any([...]) would
+        # clobber a POPULATED settled set with an empty one on every single
+        # post-closure arrival, not just after eviction — silently
+        # re-breaking the I-3 skip everywhere. Any future change to this
+        # condition must preserve the short-circuit shape exactly.
         if key in self._completed_keys or self._check_landscape_for_completion(collector_name, group_id):
             # I-3 (fix round 2): the old message claimed "the pending-entry
             # check below" skips same-token redelivery, but closure DELETES
@@ -224,8 +247,6 @@ class CollectorExecutor:
                 f"Token {token.token_id} claims member {member_key!r} of group {group_id!r} "
                 f"at collector '{collector_name}' but the durable roster is {sorted(pending.roster)!r}."
             )
-        if key not in self._pending:
-            self._pending[key] = pending
         existing = pending.arrived.get(member_key)
         if existing is not None:
             if existing.token.token_id == token.token_id:
@@ -252,6 +273,30 @@ class CollectorExecutor:
                 f"lost at collector '{collector_name}' — a token cannot both arrive and be error-routed."
             )
 
+        # I-5 residual (fix round 3, META-20a): the ordinal lookup must be
+        # resolved and validated BEFORE begin_node_state, not just before
+        # the self._pending install above. The old order (begin_node_state
+        # then ordinal-check) opened a durable node_state whose state_id
+        # lived only in the local `state` variable — if the ordinal check
+        # then raised, that node_state was never stored into a
+        # _MemberEntry and became permanently orphaned: _fail_group and
+        # _execute_flush only ever complete holds reachable through
+        # pending.arrived, and _roster_settled can never true for a group
+        # missing this member from both arrived and lost, so the group
+        # (and its orphaned node_state) could never close by any path.
+        # ordinals.get(member_key) returning None is a genuine audit
+        # inconsistency (pending.roster comes from token_lineage_frames,
+        # pending.ordinals from token_parents — two different tables, and
+        # a member can hold a frame with no token_parents row under the
+        # opener) — NOT defensive padding, so the raise stays; only its
+        # position relative to the durable write moves.
+        ordinal = pending.ordinals.get(member_key)
+        if ordinal is None:
+            raise AuditIntegrityError(
+                f"Member {member_key!r} of group {group_id!r} has no token_parents ordinal "
+                f"under opener {pending.opener_token_id!r} — expansion audit inconsistency."
+            )
+
         step = self._step_resolver(node_id)
         state = self._execution.begin_node_state(
             token_id=token.token_id,
@@ -262,12 +307,15 @@ class CollectorExecutor:
             attempt=token.resume_attempt_offset,
             resume_checkpoint_id=token.resume_checkpoint_id,
         )
-        ordinal = pending.ordinals.get(member_key)
-        if ordinal is None:
-            raise AuditIntegrityError(
-                f"Member {member_key!r} of group {group_id!r} has no token_parents ordinal "
-                f"under opener {pending.opener_token_id!r} — expansion audit inconsistency."
-            )
+        # I-5 (fix round 2) + residual (fix round 3): the install moves all
+        # the way down here, after every validation AND the durable write
+        # that can still fail this arrival — a fresh _PendingGroup is only
+        # ever made reachable via self._pending once an arrival has fully
+        # succeeded through it. Existing groups (pending already installed
+        # by an earlier member's successful arrival) re-assign the same
+        # object, a harmless no-op.
+        if key not in self._pending:
+            self._pending[key] = pending
         pending.arrived[member_key] = _MemberEntry(token=token, arrival_time=now, state_id=state.state_id, ordinal=ordinal)
 
         if self._roster_settled(pending):
@@ -335,6 +383,14 @@ class CollectorExecutor:
         if collector_name not in self._settings:
             raise OrchestrationInvariantError(f"Collector '{collector_name}' not registered")
         key = (collector_name, group_id)
+        # META-20b (fix round 3): same load-bearing operand order as
+        # accept()'s identical condition — see the comment there. Even
+        # though this method only branches on the result (both arms return
+        # None either way), _check_landscape_for_completion's side effect
+        # (re-marking with the default-empty settled set) would still
+        # clobber a populated one in self._completed_keys if the
+        # short-circuit were lost, corrupting state accept() later depends
+        # on for the SAME key.
         if key in self._completed_keys or self._check_landscape_for_completion(collector_name, group_id):
             return None
         pending = self._pending.get(key)
