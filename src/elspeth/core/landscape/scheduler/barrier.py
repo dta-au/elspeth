@@ -24,8 +24,8 @@ from elspeth.contracts.scheduler import (
     BarrierTerminalOutcomeSpec,
     BatchMembershipSpec,
     BlockedPendingSinkHandoff,
-    BranchLossSpec,
     BufferedOutcomeSpec,
+    GroupLossSpec,
     SchedulerEventType,
     TokenWorkItem,
     TokenWorkStatus,
@@ -34,9 +34,9 @@ from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_gu
 from elspeth.core.landscape.database import Tier1Engine, begin_write
 from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
-from elspeth.core.landscape.scheduler.branch_losses import record_coalesce_branch_loss
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
 from elspeth.core.landscape.scheduler.fencing import fenced_write, require_coordination_token
+from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 from elspeth.core.landscape.scheduler.payload_codec import scrubbed_row_payload_json
 from elspeth.core.landscape.scheduler.work_items import (
     insert_work_item,
@@ -93,7 +93,7 @@ class BarrierJournalRepository:
         release_context: Mapping[str, object] | None = None,
         coordination_token: CoordinationToken,
         pending_sink_lease_owner: str | None = None,
-        branch_losses: Sequence[BranchLossSpec] = (),
+        group_losses: Sequence[GroupLossSpec] = (),
         terminal_outcomes: Sequence[BarrierTerminalOutcomeSpec] = (),
     ) -> int:
         """Complete a barrier atomically: consume BLOCKED inputs and emit outputs.
@@ -130,11 +130,12 @@ class BarrierJournalRepository:
         late-arrival journal-release call sites. ``None`` preserves the
         pinned ``{"barrier_key"}``-only legacy context.
 
-        ``branch_losses`` (§E.5): durable branch-loss records riding THIS
-        completion — a flush whose empty emission lossy-disposes fork-lineage
-        branches feeding a coalesce records each loss in the SAME transaction
-        as the consumption that disposes the branch tokens (record-then-notify
-        uniformity rule; idempotent on the natural key).
+        ``group_losses`` (spec §6.2: losses staged by the settle-member seam
+        for any bound closer kind): durable loss records riding THIS
+        completion — a flush whose empty emission lossy-disposes bound frame
+        members records each loss in the SAME transaction as the consumption
+        that disposes those tokens (record-then-notify uniformity rule;
+        idempotent on the natural key).
 
         ONE journal transaction (F1, elspeth-ae5183307b) performs:
 
@@ -477,18 +478,18 @@ class BarrierJournalRepository:
                     now=now,
                     claim_order_at=claim_order_at,
                 )
-            for loss in branch_losses:
-                # §E.5 record-then-notify: the durable loss record commits iff
-                # this barrier completion (the branch's disposition) commits.
-                record_coalesce_branch_loss(
+            for spec in group_losses:
+                # §E.5 record-then-notify carried: the durable loss record
+                # commits iff this barrier completion (the member's
+                # disposition) commits. GroupLossSpec carries no recorded_by
+                # (unlike the retired BranchLossSpec) — the leader's own
+                # coordination-token worker identity is the in-scope
+                # attribution here.
+                record_group_loss(
                     conn,
                     run_id=run_id,
-                    coalesce_name=loss.coalesce_name,
-                    row_id=loss.row_id,
-                    branch_name=loss.branch_name,
-                    token_id=loss.token_id,
-                    reason=loss.reason,
-                    recorded_by=loss.recorded_by,
+                    spec=spec,
+                    recorded_by=coordination_token.worker_id,
                     now=now,
                 )
         return terminalized

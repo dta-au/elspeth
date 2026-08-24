@@ -17,12 +17,12 @@ from sqlalchemy.engine import Connection, RowMapping
 
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError
-from elspeth.contracts.scheduler import BarrierEmission, BranchLossSpec, SchedulerEventType, TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.scheduler import BarrierEmission, GroupLossSpec, SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.database import Tier1Engine, begin_write
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
-from elspeth.core.landscape.scheduler.branch_losses import record_coalesce_branch_loss
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
 from elspeth.core.landscape.scheduler.fencing import fenced_write
+from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 from elspeth.core.landscape.scheduler.payload_codec import scrubbed_row_payload_json
 from elspeth.core.landscape.scheduler.work_items import (
     insert_work_item_idempotent,
@@ -100,15 +100,15 @@ class SchedulerDispositionRepository:
         work_item_id: str,
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Mark a leased work item terminal.
 
-        ``branch_loss`` (§E.5): a non-failure lossy disposition of a
-        fork-lineage branch feeding a coalesce (filter-drop / gate-discard)
-        records its durable loss in the SAME transaction (record-then-notify
-        uniformity rule).
+        ``group_losses`` (spec §6.2: losses staged by the settle-member seam
+        for any bound closer kind): a non-failure lossy disposition of a
+        bound frame member (filter-drop / gate-discard) records its durable
+        loss in the SAME transaction (record-then-notify uniformity rule).
 
         ``worker_id`` (optional): membership-fence identity (ADR-030 §G
         parity, filigree elspeth-ba7b2cc25d). When supplied, the disposition
@@ -123,7 +123,7 @@ class SchedulerDispositionRepository:
             status=TokenWorkStatus.TERMINAL,
             expected_lease_owner=expected_lease_owner,
             fenced_worker_id=worker_id,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             row_payload_json=scrubbed_row_payload_json(work_item_id),
             lease_owner=None,
             lease_expires_at=None,
@@ -136,7 +136,7 @@ class SchedulerDispositionRepository:
         emitted_ready: Sequence[BarrierEmission],
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
         """Atomically enqueue child continuations and terminalize their parent.
@@ -152,7 +152,7 @@ class SchedulerDispositionRepository:
             now=now,
             status=TokenWorkStatus.TERMINAL,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             fenced_worker_id=worker_id,
             row_payload_json=scrubbed_row_payload_json(work_item_id),
             lease_owner=None,
@@ -165,14 +165,15 @@ class SchedulerDispositionRepository:
         work_item_id: str,
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Mark a leased work item failed after retries are exhausted.
 
-        ``branch_loss`` (§E.5): when the failed item is a fork-lineage branch
-        feeding a coalesce, the durable loss record commits in the SAME
-        transaction as this disposition (record-then-notify uniformity rule).
+        ``group_losses`` (spec §6.2: losses staged by the settle-member seam
+        for any bound closer kind): when the failed item is a bound frame
+        member, the durable loss record commits in the SAME transaction as
+        this disposition (record-then-notify uniformity rule).
 
         ``worker_id`` (optional): membership-fence identity — see
         :meth:`mark_terminal`.
@@ -183,7 +184,7 @@ class SchedulerDispositionRepository:
             status=TokenWorkStatus.FAILED,
             expected_lease_owner=expected_lease_owner,
             fenced_worker_id=worker_id,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             row_payload_json=scrubbed_row_payload_json(work_item_id),
             lease_owner=None,
             lease_expires_at=None,
@@ -196,7 +197,7 @@ class SchedulerDispositionRepository:
         emitted_ready: Sequence[BarrierEmission],
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
         """Atomically enqueue child continuations and fail their parent."""
@@ -206,7 +207,7 @@ class SchedulerDispositionRepository:
             now=now,
             status=TokenWorkStatus.FAILED,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             fenced_worker_id=worker_id,
             row_payload_json=scrubbed_row_payload_json(work_item_id),
             lease_owner=None,
@@ -225,7 +226,7 @@ class SchedulerDispositionRepository:
         error_message: str | None,
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Move a claimed item to a durable sink handoff state.
@@ -241,15 +242,16 @@ class SchedulerDispositionRepository:
         CASes strictly on that owner; the historical NULL park forced a
         NULL-acceptance arm there that a takeover could slip through.
 
-        ``branch_loss`` (§E.5): a divert arm that lossy-disposes a
-        fork-lineage branch records its durable loss in the SAME transaction.
+        ``group_losses`` (spec §6.2: losses staged by the settle-member seam
+        for any bound closer kind): a divert arm that lossy-disposes a bound
+        frame member records its durable loss in the SAME transaction.
         """
         return self._transition(
             work_item_id=work_item_id,
             now=now,
             status=TokenWorkStatus.PENDING_SINK,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             fenced_worker_id=worker_id,
             require_complete_pending_sink_bundle=True,
             row_payload_json=row_payload_json,
@@ -275,7 +277,7 @@ class SchedulerDispositionRepository:
         error_message: str | None,
         now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
         """Atomically enqueue children and durably park their parent for a sink."""
@@ -285,7 +287,7 @@ class SchedulerDispositionRepository:
             now=now,
             status=TokenWorkStatus.PENDING_SINK,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             fenced_worker_id=worker_id,
             require_complete_pending_sink_bundle=True,
             row_payload_json=row_payload_json,
@@ -642,7 +644,7 @@ class SchedulerDispositionRepository:
         status: TokenWorkStatus,
         expected_statuses: tuple[TokenWorkStatus, ...] = (TokenWorkStatus.LEASED,),
         expected_lease_owner: str | None = None,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         fenced_worker_id: str | None = None,
         require_complete_pending_sink_bundle: bool = False,
         **values: object,
@@ -655,7 +657,7 @@ class SchedulerDispositionRepository:
                 status=status,
                 expected_statuses=expected_statuses,
                 expected_lease_owner=expected_lease_owner,
-                branch_loss=branch_loss,
+                group_losses=group_losses,
                 fenced_worker_id=fenced_worker_id,
                 require_complete_pending_sink_bundle=require_complete_pending_sink_bundle,
                 values=values,
@@ -670,7 +672,7 @@ class SchedulerDispositionRepository:
         now: datetime,
         status: TokenWorkStatus,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None,
+        group_losses: tuple[GroupLossSpec, ...],
         fenced_worker_id: str | None,
         require_complete_pending_sink_bundle: bool = False,
         **values: object,
@@ -695,7 +697,7 @@ class SchedulerDispositionRepository:
                 now=now,
                 status=status,
                 expected_lease_owner=expected_lease_owner,
-                branch_loss=branch_loss,
+                group_losses=group_losses,
                 fenced_worker_id=fenced_worker_id,
                 require_complete_pending_sink_bundle=require_complete_pending_sink_bundle,
                 values=values,
@@ -790,7 +792,7 @@ class SchedulerDispositionRepository:
         status: TokenWorkStatus,
         expected_statuses: tuple[TokenWorkStatus, ...] = (TokenWorkStatus.LEASED,),
         expected_lease_owner: str | None = None,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         fenced_worker_id: str | None = None,
         require_complete_pending_sink_bundle: bool = False,
         values: Mapping[str, object],
@@ -916,18 +918,14 @@ class SchedulerDispositionRepository:
             to_lease_expires_at=next_lease_expires_at,
             caller_owner=expected_lease_owner,
         )
-        if branch_loss is not None:
-            # §E.5 record-then-notify: the durable loss record commits iff
-            # this disposition and every child enqueue commit.
-            record_coalesce_branch_loss(
+        for spec in group_losses:
+            # §E.5 record-then-notify carried: each durable loss record
+            # commits iff this disposition and every child enqueue commit.
+            record_group_loss(
                 conn,
                 run_id=before["run_id"],
-                coalesce_name=branch_loss.coalesce_name,
-                row_id=branch_loss.row_id,
-                branch_name=branch_loss.branch_name,
-                token_id=branch_loss.token_id,
-                reason=branch_loss.reason,
-                recorded_by=branch_loss.recorded_by,
+                spec=spec,
+                recorded_by=expected_lease_owner if expected_lease_owner is not None else "<unfenced>",
                 now=now,
             )
         return after
