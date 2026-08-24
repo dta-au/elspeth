@@ -15,7 +15,7 @@ durable roster authority instead (declared FORK roster, or an EXPAND
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import insert
@@ -209,6 +209,32 @@ def test_takeover_read_returns_full_table_regardless_of_adopted_epoch(seeded_run
     repo.adopt_group_losses(run_id=run_id, loss_ids=[unadopted[0].loss_id], now=_NOW, coordination_token=seat_token)
     assert len(repo.list_unadopted_group_losses(run_id=run_id)) == 1
     assert len(repo.list_group_losses(run_id=run_id)) == 2  # FULL table
+
+
+def test_adopt_group_losses_does_not_remark_an_already_adopted_row_under_a_new_epoch(seeded_run, seat_token):
+    """§E.5 CAS fence: ``adopt_group_losses``'s ``adopted_epoch IS NULL``
+    predicate is what makes the mark idempotent across a leader takeover.
+    Adopt once under epoch 1, then adopt the SAME loss_id again under a
+    genuinely new epoch (a real seat takeover, not a hand-built token) — the
+    second call must mark 0 rows. Kills the fence-removed mutant: without
+    the predicate the second UPDATE has no WHERE clause stopping it and
+    happily re-marks the already-adopted row under the new epoch."""
+    db, run_id = seeded_run
+    repo = GroupLossRepository(db.engine)
+    with db.engine.begin() as conn:
+        record_group_loss(conn, run_id=run_id, spec=_spec(), recorded_by="w1", now=_NOW)
+    unadopted = repo.list_unadopted_group_losses(run_id=run_id)
+    loss_id = unadopted[0].loss_id
+    marked_first = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], now=_NOW, coordination_token=seat_token)
+    assert marked_first == 1
+
+    later = _NOW + timedelta(seconds=200)  # past seat_token's 80s heartbeat window
+    new_epoch_token = RunCoordinationRepository(db.engine).acquire_run_leadership(
+        run_id=run_id, worker_id=f"{WORKER}-takeover", now=later, window_seconds=80.0
+    )
+    assert new_epoch_token.leader_epoch != seat_token.leader_epoch
+    marked_second = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], now=later, coordination_token=new_epoch_token)
+    assert marked_second == 0
 
 
 def test_authenticate_adoption_loss_fork_accepts_declared_branch(seeded_run):
