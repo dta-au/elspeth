@@ -482,28 +482,31 @@ class BarrierIntakeCoordinator:
             # the same drain iteration, with forensic late-arrival context.
             # The executor no longer records the FAILURE outcome itself
             # (Task 6, spec §6.1) — terminalized below through the
-            # settlement channel, which also walks the late token's
-            # REMAINING lineage for an enclosing bound frame (escalation).
+            # settlement channel.
+            #
+            # Final review F1: a late arrival is a MEMBER terminal against
+            # a group whose verdict was already rendered when it closed —
+            # it is not a group failure, so it neither parks a FAIL note
+            # nor escalates (`group_failed=False`). If the group MERGED, the
+            # merged token is carrying the enclosing member forward and an
+            # escalated loss against it would be semantically false; if the
+            # group FAILED, its own failure arm already parked the note and
+            # escalated through its consumed siblings, and the intake pass's
+            # `_stage_pending_escalations` settles the roster once this
+            # straggler's terminal lands. The producer's own fact
+            # (`outcome.late_arrival`) is what selects this arm.
             #
             # Fix round 3 (Ruling 43): the settlement channel runs BEFORE
             # the durable scheduler release (mirroring Ruling 39's sweep-path
-            # ordering) so any escalated loss it stages is drained and
-            # threaded into THIS SAME mark_blocked_barrier_terminal call —
-            # the existing group_losses channel WS3 Tasks 1-4 already
-            # threaded through complete_barrier, not a new write path. This
-            # intake pass is out-of-claim (no take_claim_group_losses call
-            # ever runs here), so without this the staged spec would be
-            # orphaned exactly like the sweep path was before Ruling 39.
-            self._note_coalesce_group_failed_from_token(
-                closer_name=str(coalesce_name),
-                token=token,
-                reason=outcome.failure_reason or "late_arrival_after_merge",
-            )
+            # ordering); with no escalation here the drained group_losses
+            # are always empty, but the ordering and the single
+            # mark_blocked_barrier_terminal transaction stay the one channel.
             late_child_items: list[WorkItem] = []
             late_cascaded_results = self._record_group_member_terminals(
                 tuple(outcome.consumed_tokens),
                 failure_reason=outcome.failure_reason or "late_arrival_after_merge",
                 child_items=late_child_items,
+                group_failed=False,
             )
             late_group_losses = self._take_pending_group_losses()
             released = self._scheduler.mark_blocked_barrier_terminal(
@@ -562,6 +565,7 @@ class BarrierIntakeCoordinator:
                 tuple(outcome.consumed_tokens),
                 failure_reason=error_msg,
                 child_items=cascade_child_items,
+                group_failed=True,
             )
             # Group failure completed by this arrival: every consumed branch
             # (this one included) holds a BLOCKED row — release them all.
@@ -932,6 +936,7 @@ class BarrierIntakeCoordinator:
                     tuple(outcome.consumed_tokens),
                     failure_reason=outcome.failure_reason,
                     child_items=replay_child_items,
+                    group_failed=True,
                 )
                 self._mark_coalesce_consumed_terminal(
                     coalesce_name=coalesce_name,
@@ -1088,24 +1093,48 @@ class BarrierIntakeCoordinator:
                 "witness — the ledger references a group the audit trail never minted."
             )
         full_path = self._data_flow.load_lineage_paths(self._run_id, [witness_token_id])[witness_token_id]
-        own_frame_index = next(i for i, frame in enumerate(full_path) if frame.group_id == group_id)
-        for frame in reversed(full_path[:own_frame_index]):
+        own_frame_indexes = [i for i, frame in enumerate(full_path) if frame.group_id == group_id]
+        if not own_frame_indexes:
+            raise AuditIntegrityError(
+                f"Escalation for group {group_id!r} (run {self._run_id!r}): witness token {witness_token_id!r} was "
+                f"selected BY membership of that group, yet its loaded lineage path carries no frame for it "
+                f"({full_path!r}) — token_lineage_frames disagrees with itself."
+            )
+        for frame in reversed(full_path[: own_frame_indexes[0]]):
             binding = self._group_bindings.binding_for(frame)
             if binding is not None:
                 return frame, binding
         return None
 
-    def _opener_token_id_for_group(self, group_id: str) -> str:
-        """The failed group's opener token (spec §6.3 item 4, ratified):
-        `group_records.opener_token_id` — rows exist for BOTH FORK and EXPAND
-        openers, so there is no fallback path."""
-        record = self._execution.get_group_record(run_id=self._run_id, group_id=group_id)
+    def _escalated_member_token_id(self, *, failed_group_id: str, enclosing: LineageFrame) -> str:
+        """The ONE token identity an escalated loss is recorded against
+        (final review F1): the LIVE token at the enclosing frame, resolved by
+        the same `resolve_group_member_token` the in-claim escalated walk
+        uses (`RowProcessor._resolve_member_token_id`, Ruling 42) — so the
+        two escalation write sites cannot disagree on a natural key and trip
+        `record_group_loss`'s same-key-different-token Tier-1 check.
+
+        Cross-checked against `group_records.opener_token_id` (spec §6.3
+        item 4): the failed group's opener IS the enclosing member it
+        consumed, and a group that FAILED minted no successor, so the two
+        must coincide. A mismatch means a successor was minted at that frame
+        by a group the ledger says failed — lineage corruption, fail closed."""
+        record = self._execution.get_group_record(run_id=self._run_id, group_id=failed_group_id)
         if record is None:
             raise AuditIntegrityError(
-                f"Escalation for group {group_id!r} (run {self._run_id!r}) has no group_records row — "
+                f"Escalation for group {failed_group_id!r} (run {self._run_id!r}) has no group_records row — "
                 "the ledger references a group the audit trail never minted."
             )
-        return record.opener_token_id
+        resolved = self._execution.resolve_group_member_token(
+            run_id=self._run_id, kind=enclosing.kind, group_id=enclosing.group_id, member_key=enclosing.member_key
+        )
+        if resolved != record.opener_token_id:
+            raise AuditIntegrityError(
+                f"Escalation for failed group {failed_group_id!r} (run {self._run_id!r}): the live token at the "
+                f"enclosing frame {enclosing!r} is {resolved!r}, but the failed group's opener is "
+                f"{record.opener_token_id!r} — a successor was minted at that frame by a group the ledger says failed."
+            )
+        return resolved
 
     def _stage_escalation_loss(self, spec: GroupLossSpec, *, frame_kind: FrameKind, binding: GroupBinding) -> None:
         """Durable escalation write (spec §6.3): authenticate against the
@@ -1168,7 +1197,7 @@ class BarrierIntakeCoordinator:
                 closer_name=binding.closer_name,
                 group_id=frame.group_id,
                 member_key=frame.member_key,
-                token_id=self._opener_token_id_for_group(group_id),
+                token_id=self._escalated_member_token_id(failed_group_id=group_id, enclosing=frame),
                 reason=GROUP_FAILED_REASON,
             )
             self._stage_escalation_loss(spec, frame_kind=frame.kind, binding=binding)

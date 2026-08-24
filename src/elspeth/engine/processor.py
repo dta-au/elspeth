@@ -3208,11 +3208,16 @@ class RowProcessor:
     def _resolve_member_token_id(self, frame: LineageFrame) -> str:
         """The honest `GroupLossSpec.token_id` for an ESCALATED loss (fix
         round 2, Ruling 42): the token that WAS the lost outer member — the
-        one whose OWN lineage path terminates at `frame` — not whichever
-        inner sibling's failure happened to discover the loss. Existing
-        machinery only: `ExecutionRepository.resolve_group_member_token`
-        reads `token_lineage_frames` via its existing group/member index; no
-        new schema, no new walk."""
+        LIVE token at `frame` — not whichever inner sibling's failure
+        happened to discover the loss. `ExecutionRepository.
+        resolve_group_member_token` resolves it structurally (final review
+        F1): among the tokens whose own lineage terminates at `frame`, a
+        successor minted by an earlier successful closer supersedes the
+        token it consumed (via `token_parents`), so a sequential
+        fork→merge→fork→merge chain resolves to the latest merged token.
+        `BarrierIntakeCoordinator._escalated_member_token_id` derives the
+        intake-path identity through the SAME call, which is what keeps the
+        two escalation write sites on one token per natural key."""
         return self._execution.resolve_group_member_token(
             run_id=self._run_id,
             kind=frame.kind,
@@ -3386,6 +3391,7 @@ class RowProcessor:
         *,
         failure_reason: str,
         child_items: list[WorkItem],
+        group_failed: bool,
     ) -> list[RowResult]:
         """Terminalize a closer's consumed members through the standard
         channel (spec §6.1: no closer writes token terminals directly —
@@ -3393,12 +3399,27 @@ class RowProcessor:
         `record_token_outcome` writes for held siblings it consumes on a
         failure arm).
 
-        This ALSO runs the settlement walk ONCE over the consumed tokens'
-        shared REMAINING lineage — the frames OUTSIDE the closer frame that
-        just consumed all of them, innermost of THAT to the first bound
-        frame — so a loss inside a nested bound region reaches its
-        enclosing region instead of stopping at the closer that happened to
-        notice it first (what makes escalation, Task 8, observable). ONCE,
+        ``group_failed`` (final review F1) is the caller's statement of
+        WHICH closure this is: ``True`` when this call IS the group's
+        failure (the consumed tokens are the held members a require_all/
+        quorum/timeout failure took down — every failure arm), ``False``
+        when the group had ALREADY closed and the consumed token is a late
+        arrival being terminalized on its own (`CoalesceOutcome.late_arrival`).
+        Only a group FAILURE consumes the enclosing member; a late arrival
+        after a successful merge leaves the merged token carrying that
+        member forward, so escalating it would stage a semantically false
+        outer loss (and a late arrival after a FAILED closure finds the
+        escalation already owned by the failure arm plus the intake pass's
+        roster-settled staging). With ``group_failed=False`` this method
+        writes the terminals and returns without walking.
+
+        When ``group_failed`` this ALSO runs the settlement walk ONCE over
+        the consumed tokens' shared REMAINING lineage — the frames OUTSIDE
+        the closer frame that just consumed all of them, innermost of THAT
+        to the first bound frame — so a loss inside a nested bound region
+        reaches its enclosing region instead of stopping at the closer that
+        happened to notice it first (what makes escalation, Task 8,
+        observable). ONCE,
         not once per consumed token (fix round 1, Ruling 38 / C1): consumed
         siblings SHARE their enclosing frame by construction — that is what
         makes them siblings — so running the walk per token stages the same
@@ -3466,6 +3487,8 @@ class RowProcessor:
                 error_hash=error_hash,
             )
 
+        if not group_failed:
+            return []
         remaining_token = replace(consumed_tokens[0], lineage_path=remaining_path)
         return self._settle_member_losses(remaining_token, failure_reason, child_items, escalated=True)
 
@@ -3475,6 +3498,7 @@ class RowProcessor:
         *,
         failure_reason: str,
         child_items: list[WorkItem],
+        group_failed: bool,
     ) -> list[RowResult]:
         """Public surface for `_record_group_member_terminals` (spec §6.1
         Task 6): the CoalesceCompletionPort / BarrierIntakeCoordinator
@@ -3482,7 +3506,9 @@ class RowProcessor:
         `mark_coalesce_consumed_terminal` are already threaded to callers
         outside this class.
         """
-        return self._record_group_member_terminals(consumed_tokens, failure_reason=failure_reason, child_items=child_items)
+        return self._record_group_member_terminals(
+            consumed_tokens, failure_reason=failure_reason, child_items=child_items, group_failed=group_failed
+        )
 
     def _notify_closer_of_loss(
         self,
@@ -3708,6 +3734,7 @@ class RowProcessor:
                 tuple(outcome.consumed_tokens),
                 failure_reason=outcome.failure_reason,
                 child_items=child_items,
+                group_failed=True,
             )
             sibling_results: list[RowResult] = []
             for consumed_token in outcome.consumed_tokens:

@@ -248,6 +248,7 @@ def _make_coordinator(
         *,
         failure_reason: str,
         child_items: list[WorkItem],
+        group_failed: bool,
     ) -> list[RowResult]:
         if record_group_member_terminals_calls is not None:
             record_group_member_terminals_calls.append(
@@ -255,6 +256,7 @@ def _make_coordinator(
                     "consumed_tokens": consumed_tokens,
                     "failure_reason": failure_reason,
                     "child_items": child_items,
+                    "group_failed": group_failed,
                 }
             )
         return []

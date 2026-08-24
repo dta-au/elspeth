@@ -100,6 +100,7 @@ from elspeth.core.landscape.schema import (
     node_states_table,
     token_lineage_frames_table,
     token_outcomes_table,
+    token_parents_table,
     tokens_table,
 )
 
@@ -411,23 +412,38 @@ class ExecutionRepository:
         return None if row is None else str(row.row_id)
 
     def resolve_group_member_token(self, *, run_id: str, kind: FrameKind, group_id: str, member_key: str) -> str:
-        """Resolve the ONE token whose OWN lineage path terminates at one
-        frame (WS3 Task 6 fix round 2, Ruling 42).
+        """Resolve the LIVE token at one frame — the token that currently
+        carries this group member (WS3 Task 6 fix round 2, Ruling 42; final
+        review F1).
 
         The honest identity for an ESCALATED group loss is the token that
         WAS the lost outer member — not whichever inner sibling's failure
-        happened to notice the loss first. That token is the one minted by
-        the fork/expand that opened this frame's group, whose OWN lineage
-        path never gained a frame beyond this one (a descendant that forked
+        happened to notice the loss first. Candidates are the tokens whose
+        OWN lineage path terminates at this frame: a descendant that forked
         again carries this SAME frame too, but at a depth strictly less than
-        its own deepest frame — the ``NOT EXISTS`` below excludes it). Reads
-        `token_lineage_frames` via its existing `ix_token_lineage_frames_group`
-        index; mints no new schema.
+        its own deepest frame, and the ``NOT EXISTS`` below excludes it.
 
-        Raises `AuditIntegrityError` if zero or more than one token matches —
-        both are lineage corruption for a frame `_first_bound_frame` resolved
-        against the group-binding registry, which requires the frame to have
-        actually been minted.
+        More than one token can legitimately terminate at a frame: every
+        successful inner closer MINTS a successor whose lineage is the
+        popped remaining path (`coalesce_tokens` / `collect_tokens` in
+        data_flow/tokens.py), so after an inner merge inside branch ``b``
+        both the original branch token and the merged token terminate at
+        ``b``'s frame — and a sequential fork→merge→fork→merge chain in one
+        branch stacks a successor per merge. The member is then carried by
+        the LATEST successor, and that succession is a structural fact the
+        closer itself recorded: the merged token's `token_parents` rows lead
+        back through the consumed members to the token it superseded. A
+        candidate that is an ANCESTOR of another candidate has therefore
+        been consumed at this frame and is dropped; exactly one candidate
+        must remain. Two candidates with no ancestry between them are
+        genuinely ambiguous and still fail closed. Reads
+        `token_lineage_frames` via `ix_token_lineage_frames_group` plus a
+        bounded upward `token_parents` walk; mints no new schema.
+
+        Raises `AuditIntegrityError` if zero or more than one live token
+        remains — both are lineage corruption for a frame
+        `_first_bound_frame` resolved against the group-binding registry,
+        which requires the frame to have actually been minted.
         """
         deeper = token_lineage_frames_table.alias("deeper")
         outer = token_lineage_frames_table.alias("outer")
@@ -444,14 +460,36 @@ class ExecutionRepository:
                 )
             ),
         )
-        rows = self._ops.execute_fetchall(query)
-        if len(rows) != 1:
+        terminating = sorted(str(row.token_id) for row in self._ops.execute_fetchall(query))
+        superseded = self._ancestors_among(run_id=run_id, token_ids=terminating) if len(terminating) > 1 else set()
+        live = [token_id for token_id in terminating if token_id not in superseded]
+        if len(live) != 1:
             raise AuditIntegrityError(
-                f"resolve_group_member_token: expected exactly one token whose own lineage path "
+                f"resolve_group_member_token: expected exactly one live token whose own lineage path "
                 f"terminates at group_id={group_id!r} member_key={member_key!r} (run_id={run_id!r}), "
-                f"found {len(rows)}: {[str(row.token_id) for row in rows]!r}"
+                f"found {len(live)}: {live!r} (terminating={terminating!r}, superseded={sorted(superseded)!r})"
             )
-        return str(rows[0].token_id)
+        return live[0]
+
+    def _ancestors_among(self, *, run_id: str, token_ids: Sequence[str]) -> set[str]:
+        """The subset of ``token_ids`` that is an ANCESTOR (via
+        `token_parents`, transitively) of another member of ``token_ids``.
+        One upward walk from the whole set; every hop is a fork or a closer
+        mint, so the walk is bounded by lineage depth."""
+        candidates = set(token_ids)
+        visited: set[str] = set()
+        ancestors: set[str] = set()
+        frontier = set(candidates)
+        while frontier:
+            visited |= frontier
+            query = select(token_parents_table.c.parent_token_id).where(
+                token_parents_table.c.run_id == run_id,
+                token_parents_table.c.token_id.in_(sorted(frontier)),
+            )
+            parents = {str(row.parent_token_id) for row in self._ops.execute_fetchall(query)}
+            ancestors |= parents
+            frontier = parents - visited
+        return candidates & ancestors
 
     def get_group_record(self, *, run_id: str, group_id: str) -> GroupRecord | None:
         """Read one ``group_records`` row (spec §4.3: mints for BOTH FORK and

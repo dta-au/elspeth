@@ -2597,7 +2597,7 @@ class TestResolveGroupMemberToken:
         setup = make_recorder_with_run(run_id="run-1")
         factory = setup.factory
 
-        with pytest.raises(AuditIntegrityError, match="expected exactly one token"):
+        with pytest.raises(AuditIntegrityError, match="expected exactly one live token"):
             factory.execution.resolve_group_member_token(
                 run_id="run-1", kind=FrameKind.FORK, group_id="fg-nonexistent", member_key="outer_a"
             )
@@ -2626,7 +2626,88 @@ class TestResolveGroupMemberToken:
             frames=[("fg-outer", "outer_a"), ("fg-inner", "inner_a1")],
         )
 
-        with pytest.raises(AuditIntegrityError, match="expected exactly one token"):
+        with pytest.raises(AuditIntegrityError, match="expected exactly one live token"):
+            factory.execution.resolve_group_member_token(run_id="run-1", kind=FrameKind.FORK, group_id="fg-outer", member_key="outer_a")
+
+    def _row(self, setup) -> str:
+        setup.factory.data_flow.create_row(
+            run_id="run-1",
+            source_node_id=setup.source_node_id,
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            row_id="row-1",
+            data={},
+        )
+        return "row-1"
+
+    def _merge(self, factory: RecorderFactory, children, row_id: str):
+        from elspeth.contracts.audit import TokenRef
+        from elspeth.contracts.schema_contract import SchemaContract
+
+        return factory.data_flow.coalesce_tokens(
+            parent_refs=[TokenRef(token_id=child.token_id, run_id="run-1") for child in children],
+            row_id=row_id,
+            merged_payload={"merged": True},
+            merged_contract=SchemaContract(mode="OBSERVED", fields=(), locked=True),
+        )
+
+    def test_successful_inner_merge_supersedes_the_consumed_branch_token(self) -> None:
+        """Final review F1: after an inner closer MERGES, both the original
+        branch token and the merged token terminate at the outer frame. The
+        merged token is a `token_parents` descendant of the branch token —
+        the closer's own record of the succession — so it is the live
+        member; the consumed branch token is superseded, never a second
+        candidate. A sequential fork→merge→fork→merge chain resolves to the
+        LATEST merged token by the same rule."""
+        from elspeth.contracts.audit import TokenRef
+
+        setup = make_recorder_with_run(run_id="run-1")
+        factory = setup.factory
+        row_id = self._row(setup)
+        root = factory.data_flow.create_token(row_id)
+        (branch_a, branch_b), outer_group = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=root.token_id, run_id="run-1"), row_id=row_id, branches=["a", "b"]
+        )
+        inner_children, _ = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=branch_b.token_id, run_id="run-1"),
+            row_id=row_id,
+            branches=["b1", "b2"],
+            parent_lineage_path=branch_b.lineage_path,
+        )
+        merged_1 = self._merge(factory, inner_children, row_id)
+
+        resolve = lambda: factory.execution.resolve_group_member_token(  # noqa: E731
+            run_id="run-1", kind=FrameKind.FORK, group_id=outer_group, member_key="b"
+        )
+        assert resolve() == merged_1.token_id
+        # The untouched sibling branch still resolves to its own token.
+        assert (
+            factory.execution.resolve_group_member_token(run_id="run-1", kind=FrameKind.FORK, group_id=outer_group, member_key="a")
+            == branch_a.token_id
+        )
+
+        # Sequential nesting: fork the merged token again and merge again.
+        second_children, _ = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=merged_1.token_id, run_id="run-1"),
+            row_id=row_id,
+            branches=["c1", "c2"],
+            parent_lineage_path=merged_1.lineage_path,
+        )
+        merged_2 = self._merge(factory, second_children, row_id)
+        assert resolve() == merged_2.token_id
+
+    def test_two_unrelated_tokens_at_one_frame_still_fail_closed(self) -> None:
+        """Supersession is structural, not positional: two tokens that
+        terminate at the same frame with NO `token_parents` ancestry between
+        them are genuinely ambiguous and must still raise, not pick one."""
+        setup = make_recorder_with_run(run_id="run-1")
+        factory = setup.factory
+        self._row(setup)
+        self._mint(factory, run_id="run-1", row_id="row-1", token_id="tok-outer-a", frames=[("fg-outer", "outer_a")])
+        self._mint(factory, run_id="run-1", row_id="row-1", token_id="tok-outer-a-twin", frames=[("fg-outer", "outer_a")])
+
+        with pytest.raises(AuditIntegrityError, match=r"expected exactly one live token .* found 2"):
             factory.execution.resolve_group_member_token(run_id="run-1", kind=FrameKind.FORK, group_id="fg-outer", member_key="outer_a")
 
 

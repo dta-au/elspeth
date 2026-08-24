@@ -167,12 +167,14 @@ class _FakeProcessor:
         *,
         failure_reason: str,
         child_items: list[Any],
+        group_failed: bool,
     ) -> list[_FakeRowResult]:
         self.record_group_member_terminals_calls.append(
             {
                 "consumed_tokens": consumed_tokens,
                 "failure_reason": failure_reason,
                 "child_items": child_items,
+                "group_failed": group_failed,
             }
         )
         return list(self.record_group_member_terminals_result)
@@ -190,8 +192,11 @@ class _FakeProcessorWithUndrainableChildItem(_FakeProcessor):
         *,
         failure_reason: str,
         child_items: list[Any],
+        group_failed: bool,
     ) -> list[_FakeRowResult]:
-        super().record_group_member_terminals(consumed_tokens, failure_reason=failure_reason, child_items=child_items)
+        super().record_group_member_terminals(
+            consumed_tokens, failure_reason=failure_reason, child_items=child_items, group_failed=group_failed
+        )
         child_items.append(object())
         return []
 

@@ -598,3 +598,248 @@ def test_nested_row_union_branch_is_unauthorable_by_design(tmp_path: Path) -> No
         case_dir.mkdir()
         with pytest.raises(GraphValidationError, match=re.escape(message_fragment)):
             _build_and_run(yaml_template, case_dir)
+
+
+# ===== Final review F1: successors minted by successful inner closers =====
+# Every fixture above nests on exactly ONE branch and FAILS the inner group,
+# so no merged token ever shares a terminating frame with a branch token.
+# The three fixtures below are the shapes where one does (a successful inner
+# merge mints a successor whose popped lineage terminates at the enclosing
+# frame): sibling nested regions with one healthy, a late arrival after a
+# successful merge, and sequential nesting inside one branch.
+
+_SIBLING_NESTED_REGIONS_YAML = """
+sources:
+  primary:
+    plugin: csv
+    on_success: outer_fork_input
+    options:
+      path: {input_path}
+      on_validation_failure: discard
+      schema: {{mode: fixed, fields: ["id: int", "value: int"]}}
+concurrency:
+  max_workers: 1
+gates:
+  - name: outer_fork
+    input: outer_fork_input
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [outer_a, outer_b]
+  - name: inner_fork_a
+    input: outer_a
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [inner_a1, inner_a2]
+  - name: inner_fork_b
+    input: outer_b
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [inner_b1, inner_b2]
+transforms:
+  - name: lose_inner_a2
+    plugin: dag_corpus_branch_loss
+    input: inner_a2
+    on_success: inner_a2_out
+    on_error: discard
+    options:
+      schema: {{mode: observed}}
+coalesce:
+  - name: merge_inner_a
+    branches: {{inner_a1: inner_a1, inner_a2: inner_a2_out}}
+    policy: require_all
+    merge: nested
+  - name: merge_inner_b
+    branches: {{inner_b1: inner_b1, inner_b2: inner_b2}}
+    policy: require_all
+    merge: nested
+  - name: merge_outer
+    branches: {{outer_a: merge_inner_a, outer_b: merge_inner_b}}
+    policy: require_all
+    merge: nested
+    on_success: output
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {output_path}
+      format: jsonl
+      schema: {{mode: observed}}
+"""
+
+_LATE_ARRIVAL_AFTER_INNER_MERGE_YAML = """
+sources:
+  primary:
+    plugin: csv
+    on_success: outer_fork_input
+    options:
+      path: {input_path}
+      on_validation_failure: discard
+      schema: {{mode: fixed, fields: ["id: int", "value: int"]}}
+concurrency:
+  max_workers: 1
+gates:
+  - name: outer_fork
+    input: outer_fork_input
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [outer_a, outer_b]
+  - name: inner_fork_b
+    input: outer_b
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [inner_b1, inner_b2]
+coalesce:
+  - name: merge_inner_b
+    branches: {{inner_b1: inner_b1, inner_b2: inner_b2}}
+    policy: first
+    merge: nested
+  - name: merge_outer
+    branches: {{outer_a: outer_a, outer_b: merge_inner_b}}
+    policy: require_all
+    merge: nested
+    on_success: output
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {output_path}
+      format: jsonl
+      schema: {{mode: observed}}
+"""
+
+_SEQUENTIAL_NESTING_YAML = """
+sources:
+  primary:
+    plugin: csv
+    on_success: outer_fork_input
+    options:
+      path: {input_path}
+      on_validation_failure: discard
+      schema: {{mode: fixed, fields: ["id: int", "value: int"]}}
+concurrency:
+  max_workers: 1
+gates:
+  - name: outer_fork
+    input: outer_fork_input
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [outer_a, outer_b]
+  - name: first_fork_a
+    input: outer_a
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [first_a1, first_a2]
+  - name: second_fork_a
+    input: merge_first_a
+    condition: "True"
+    routes: {{"true": fork, "false": discard}}
+    fork_to: [second_a1, second_a2]
+transforms:
+  - name: lose_second_a2
+    plugin: dag_corpus_branch_loss
+    input: second_a2
+    on_success: second_a2_out
+    on_error: discard
+    options:
+      schema: {{mode: observed}}
+coalesce:
+  - name: merge_first_a
+    branches: {{first_a1: first_a1, first_a2: first_a2}}
+    policy: require_all
+    merge: nested
+  - name: merge_second_a
+    branches: {{second_a1: second_a1, second_a2: second_a2_out}}
+    policy: require_all
+    merge: nested
+  - name: merge_outer
+    branches: {{outer_a: merge_second_a, outer_b: outer_b}}
+    policy: require_all
+    merge: nested
+    on_success: output
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {output_path}
+      format: jsonl
+      schema: {{mode: observed}}
+"""
+
+_SUCCESSOR_TOPOLOGIES: dict[str, str] = {
+    "sibling_nested_regions_one_healthy": _SIBLING_NESTED_REGIONS_YAML,
+    "late_arrival_after_inner_merge": _LATE_ARRIVAL_AFTER_INNER_MERGE_YAML,
+    "sequential_nesting_second_group_fails": _SEQUENTIAL_NESTING_YAML,
+}
+
+
+def _merged_token_ids(result: PipelineResult) -> set[str]:
+    """Tokens minted by a coalesce writer: `tokens.join_group_id` is set only
+    by `coalesce_tokens` (the merge-event column), never by fork/create."""
+    with result._connect() as conn:
+        return set(conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.join_group_id.is_not(None))).scalars().all())
+
+
+@pytest.fixture
+def run_successor_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    install_corpus_plugin_manager(monkeypatch)
+
+    def _run(topology_name: str) -> PipelineResult:
+        case_dir = tmp_path / topology_name
+        case_dir.mkdir()
+        db_path, result_data, output_rows = _build_and_run(_SUCCESSOR_TOPOLOGIES[topology_name], case_dir, input_csv="id,value\n1,10\n")
+        return PipelineResult(db_path=db_path, result_data=result_data, output_rows=output_rows, outer_closer="merge_outer")
+
+    return _run
+
+
+def test_sibling_nested_regions_settle_when_the_healthy_sibling_merged(run_successor_pipeline) -> None:
+    """Final review F1 (reproduced BLOCKER): nested regions on BOTH outer
+    branches, inner_a fails (require_all, one branch lost), inner_b MERGES.
+    The merged inner_b token and the outer_b branch token both terminate at
+    the outer frame; `_group_roster_settled`'s check of outer_b must resolve
+    the merged token as the live member (the consumed branch token is its
+    `token_parents` ancestor) instead of crashing Tier-1 "found 2".
+    Ledger: ONE escalated loss (merge_outer, outer_a); NOTHING against
+    outer_b, which was never lost; every token terminal."""
+    result = run_successor_pipeline("sibling_nested_regions_one_healthy")
+    escalated = result.escalated_losses()
+    assert [(loss.closer_name, loss.member_key) for loss in escalated] == [("merge_outer", "outer_a")]
+    assert [loss for loss in result.ledger() if loss.member_key == "outer_b"] == []
+    assert [loss.closer_name for loss in result.ledger() if loss.closer_name != "merge_outer"] == ["merge_inner_a"]
+    assert result.non_terminal_tokens() == []
+    assert result.output_rows == []  # merge_outer is require_all: the outer group fails
+
+
+def test_late_arrival_after_a_successful_inner_merge_stages_no_outer_loss(run_successor_pipeline) -> None:
+    """Final review F1 manifestation 1: inner_b is policy `first`, so its
+    first arrival MERGES and the sibling lands as a late arrival. The
+    straggler is a member terminal against an already-closed group — it is
+    NOT a group failure: no FAIL note, no escalated walk, no `group_failed`
+    row against outer_b (the merged token is carrying that member forward).
+    merge_outer therefore merges and the row reaches the sink."""
+    result = run_successor_pipeline("late_arrival_after_inner_merge")
+    assert result.ledger() == []
+    assert len(result.output_rows) == 1
+    assert result.non_terminal_tokens() == []
+    # The straggler's own terminal still lands (zero-write completeness
+    # above), and it is the ONLY failure in the run.
+    assert len(result.consumed_member_ids) == 1
+
+
+def test_sequential_nesting_records_one_escalated_loss_against_the_merged_successor(run_successor_pipeline) -> None:
+    """Final review F1 manifestation 2: fork→merge→fork→merge inside outer_a,
+    the SECOND group fails. Both escalation write sites (the in-claim
+    escalated walk and `_stage_pending_escalations`) must name ONE token for
+    the outer_a loss — the first merge's SUCCESSOR, which opened the failed
+    group and is the live token at the outer frame — or `record_group_loss`'s
+    same-key-different-token check crashes the run. Pinned by asserting
+    exactly one escalated row whose token is a coalesce-minted token."""
+    result = run_successor_pipeline("sequential_nesting_second_group_fails")
+    escalated = result.escalated_losses()
+    assert [(loss.closer_name, loss.member_key) for loss in escalated] == [("merge_outer", "outer_a")]
+    assert escalated[0].token_id in _merged_token_ids(result)
+    assert [loss.closer_name for loss in result.ledger() if loss.closer_name != "merge_outer"] == ["merge_second_a"]
+    assert result.non_terminal_tokens() == []

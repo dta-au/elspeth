@@ -184,6 +184,7 @@ def _terminalize_swept_coalesce_failure(
         consumed_tokens,
         failure_reason=failure_reason,
         child_items=child_items,
+        group_failed=True,
     )
     if child_items:
         raise OrchestrationInvariantError(

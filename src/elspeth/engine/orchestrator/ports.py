@@ -189,11 +189,14 @@ class CoalesceCompletionPort(Protocol):
         *,
         failure_reason: str,
         child_items: list[WorkItem],
+        group_failed: bool,
     ) -> list[RowResult]:
         """Terminalize a closer's consumed members (spec §6.1, Task 6) — the
-        executor no longer writes their outcomes itself. Also walks each
-        member's REMAINING lineage for an enclosing bound frame; any
-        cascaded RowResults/child_items surface via the out params."""
+        executor no longer writes their outcomes itself. When
+        ``group_failed`` (this call IS the group's failure, never a late
+        arrival against an already-closed group) it also walks the members'
+        REMAINING lineage for an enclosing bound frame; any cascaded
+        RowResults/child_items surface via the out params."""
         raise NotImplementedError
 
     def take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
