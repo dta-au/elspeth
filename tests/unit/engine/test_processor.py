@@ -10758,6 +10758,14 @@ class TestReadyEmissionEnqueueParity:
         assert {k: v for k, v in values_from_emission.items() if k != "collector_name"} == {
             k: v for k, v in values_from_enqueue.items() if k != "collector_name"
         }
+        # M-1 (fix-round-3 review): NOT redundant with the exclusion above —
+        # this is the FORCING mechanism. The exclusion only stops the
+        # blanket equality from failing; this line is what actually fails
+        # (flips from None to "stitch") the moment scheduler_drain.py starts
+        # forwarding collector_name, which is exactly the signal that must
+        # trigger flipping this pin to a real-value assertion. Removing it
+        # as "redundant, the exclusion covers it" would delete the only
+        # thing watching for that forwarding gap closing.
         assert values_from_enqueue["collector_name"] is None
         # Pin the projected column count: adding a journal column to ONE of
         # the two builders (or to the mapper) must force this pin to be

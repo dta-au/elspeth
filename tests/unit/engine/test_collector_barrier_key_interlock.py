@@ -13,13 +13,14 @@ property into an EXPLICIT, pinned interlock (the accidental interlock
 "becomes EXPLICIT" per the META-14 ruling):
 
 1. test_no_production_writer_of_collector_barrier_keys_exists_yet — a
-   whole-tree canary retargeted (I-2, fix round) at CALLS to
-   collector_barrier_key rather than bare-literal/f-string pattern
-   matching, since the latter is trivially evaded by a helper call,
-   string concatenation, or .format(). Fails loudly the moment a future
-   commit calls the helper from src/elspeth/, so that commit is forced to
-   also address (2) rather than silently reaching a code path this repo
-   has never exercised.
+   whole-tree canary. I-2 (fix round) added a scan for CALLS to
+   collector_barrier_key, since a helper call, however the arguments are
+   computed, evades the ORIGINAL literal/f-string pattern match below. I-1
+   (fix-round-3 review): that addition must not have REPLACED the literal
+   scan — an inline f"collector:{name}:{group_id}" assigned to a
+   barrier_key-named target is exactly what the original scan caught, and
+   a helper-call-only scan misses it entirely. Both scans run; either
+   shape trips the canary.
 2. test_orphan_collector_barrier_key_is_the_current_fail_closed_state pins
    that IF such a row existed today, BarrierIntakeCoordinator's intake
    classifier (barrier_coordination.py's run_intake_pass, WS3-owned — this
@@ -76,10 +77,9 @@ def _call_target_name(func: ast.expr) -> str | None:
 
     Structural narrowing (isinstance over ast.expr's closed subclass set),
     not a dynamic-attribute probe — mirrors _assignment_target_name's
-    reasoning in the sibling scan this replaces (removed, I-2): only
-    ast.Name.id (bare `collector_barrier_key(...)`) and ast.Attribute.attr
-    (`work_items.collector_barrier_key(...)`) are read, each after the
-    node's own type confirms the field exists.
+    reasoning below: only ast.Name.id (bare `collector_barrier_key(...)`)
+    and ast.Attribute.attr (`work_items.collector_barrier_key(...)`) are
+    read, each after the node's own type confirms the field exists.
     """
     if isinstance(func, ast.Name):
         return func.id
@@ -88,21 +88,66 @@ def _call_target_name(func: ast.expr) -> str | None:
     return None
 
 
-def test_no_production_writer_of_collector_barrier_keys_exists_yet() -> None:
-    """Scans every src/elspeth/**/*.py for a CALL to collector_barrier_key.
+def _is_collector_prefixed_string(node: ast.expr) -> bool:
+    """True for a literal or f-string node whose value starts with 'collector:'."""
+    if isinstance(node, ast.JoinedStr) and node.values:
+        first = node.values[0]
+        return isinstance(first, ast.Constant) and isinstance(first.value, str) and first.value.startswith("collector:")
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value.startswith("collector:")
+    return False
 
-    I-2 (fix round): retargeted from bare-literal/f-string pattern matching
-    (the original shape) to watching the named construction site itself —
-    a helper call, however the collector_name/group_id arguments are
-    computed, cannot evade a call-site scan the way string concatenation
-    or .format() could evade a literal-shape scan.
+
+def _assignment_target_name(target: ast.expr) -> str | None:
+    """The bound name for a simple or attribute assignment target, else None.
+
+    Structural narrowing (isinstance over ast.expr's closed subclass set),
+    not a dynamic-attribute probe: ast.Name.id and ast.Attribute.attr are
+    each accessed directly only after the node's own type confirms the
+    field exists. Subscript/Tuple/List/Starred targets (none of which are a
+    plausible "variable literally named barrier_key" shape for this
+    search's purpose) fall through to None rather than being probed.
+    """
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return None
+
+
+def test_no_production_writer_of_collector_barrier_keys_exists_yet() -> None:
+    """Scans every src/elspeth/**/*.py for EITHER shape of a collector
+    barrier_key construction: a CALL to collector_barrier_key (I-2, catches
+    a helper call however its arguments are computed), OR a barrier_key=
+    call-keyword / assignment built from a "collector:"-prefixed literal or
+    f-string (the ORIGINAL scan shape, restored ADDITIVELY per I-1,
+    fix-round-3 review — the call-site scan alone missed an inline
+    f"collector:{name}:{group_id}" assigned straight to a barrier_key-named
+    target, which is exactly the shape the original scan existed to catch).
+    The literal scan is deliberately narrow — core/dag/builder.py:723
+    legitimately builds an unrelated schema-error owner label
+    (f"collector:{collector_name}", not a barrier_key) that a naive
+    whole-string scan would false-positive on; only assignments/kwargs
+    literally named barrier_key count.
     """
     hits: list[tuple[str, int]] = []
     for path in sorted((REPO_ROOT / "src" / "elspeth").rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and _call_target_name(node.func) == _HELPER_NAME:
-                hits.append((str(path.relative_to(REPO_ROOT)), node.lineno))
+            if isinstance(node, ast.Call):
+                if _call_target_name(node.func) == _HELPER_NAME:
+                    hits.append((str(path.relative_to(REPO_ROOT)), node.lineno))
+                    continue
+                for kw in node.keywords:
+                    if kw.arg == "barrier_key" and _is_collector_prefixed_string(kw.value):
+                        hits.append((str(path.relative_to(REPO_ROOT)), node.lineno))
+            elif isinstance(node, ast.Assign | ast.AnnAssign):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                value = node.value
+                if value is not None and _is_collector_prefixed_string(value):
+                    for target in targets:
+                        if _assignment_target_name(target) == "barrier_key":
+                            hits.append((str(path.relative_to(REPO_ROOT)), node.lineno))
     assert hits == [], (
         "A production writer of collector barrier_keys now exists "
         f"({hits!r}) — this interlock test's whole premise (no writer exists "
