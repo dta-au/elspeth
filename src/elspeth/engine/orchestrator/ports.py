@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.events import TelemetryEvent
     from elspeth.contracts.plugin_context import PluginContext
+    from elspeth.contracts.scheduler import GroupLossSpec
     from elspeth.contracts.schema_contract import PipelineRow
     from elspeth.contracts.types import CoalesceName, NodeID
     from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
@@ -160,7 +161,13 @@ class BarrierIntakePort(RunIdentityPort, Protocol):
 class CoalesceCompletionPort(Protocol):
     """Processor surface for durable coalesce barrier completion."""
 
-    def mark_blocked_barrier_terminal(self, barrier_key: str, token_ids: tuple[str, ...]) -> int:
+    def mark_blocked_barrier_terminal(
+        self,
+        barrier_key: str,
+        token_ids: tuple[str, ...],
+        *,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> int:
         """Mark durable scheduler work consumed by a barrier as terminal."""
         ...
 
@@ -187,6 +194,14 @@ class CoalesceCompletionPort(Protocol):
         executor no longer writes their outcomes itself. Also walks each
         member's REMAINING lineage for an enclosing bound frame; any
         cascaded RowResults/child_items surface via the out params."""
+        raise NotImplementedError
+
+    def take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
+        """Drain any group losses staged (but not yet durably committed) by
+        the caller's own prior work (Ruling 39): the out-of-claim sweep
+        counterpart to `take_claim_group_losses`. The caller must commit the
+        drained spec(s) durably in the same transaction as its own
+        disposition (e.g. `mark_blocked_barrier_terminal(group_losses=...)`)."""
         raise NotImplementedError
 
 

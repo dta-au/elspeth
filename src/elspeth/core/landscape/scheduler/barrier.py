@@ -857,6 +857,7 @@ class BarrierJournalRepository:
         now: datetime,
         coordination_token: CoordinationToken,
         release_context: Mapping[str, object] | None = None,
+        group_losses: Sequence[GroupLossSpec] = (),
     ) -> int:
         """Mark BLOCKED work consumed by a resolved barrier as terminal.
 
@@ -871,6 +872,15 @@ class BarrierJournalRepository:
         ``{"late_arrival": True, "reason": ..., "released_by": ...,
         "scope_row_id": ...}``. ``None`` (every pre-§E.3a caller) preserves
         the pinned ``{"barrier_key"}``-only legacy context exactly.
+
+        ``group_losses`` (WS3 Task 6 fix round 1, Ruling 39): an
+        out-of-claim caller (a timeout/EOF sweep, which has no claim whose
+        ``take_claim_group_losses`` drain would otherwise commit a staged
+        escalation loss) passes its own staged spec(s) here so they commit
+        durably via :meth:`complete_barrier`'s existing
+        ``record_group_loss`` write, in the SAME transaction as this
+        terminalization — not a new write path, the same one every in-claim
+        disposition already uses.
         """
         coordination_token = require_coordination_token(
             coordination_token,
@@ -892,6 +902,7 @@ class BarrierJournalRepository:
             require_exhaustive_release=False,
             coordination_token=coordination_token,
             release_context=release_context,
+            group_losses=group_losses,
         )
 
     def adopt_blocked_barrier_item(

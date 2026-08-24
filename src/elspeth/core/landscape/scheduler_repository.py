@@ -723,6 +723,7 @@ class TokenSchedulerRepository:
         now: datetime,
         coordination_token: CoordinationToken,
         release_context: Mapping[str, object] | None = None,
+        group_losses: Sequence[GroupLossSpec] = (),
     ) -> int:
         """Mark BLOCKED work consumed by a resolved barrier as terminal."""
         return self.barriers.mark_blocked_barrier_terminal(
@@ -732,6 +733,7 @@ class TokenSchedulerRepository:
             now=now,
             coordination_token=coordination_token,
             release_context=release_context,
+            group_losses=group_losses,
         )
 
     def adopt_blocked_barrier_item(

@@ -33,6 +33,7 @@ from elspeth.engine.orchestrator.types import ExecutionCounters
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.contracts.results import RowResult
+    from elspeth.contracts.scheduler import GroupLossSpec
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
     from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome
     from elspeth.engine.work_items import WorkItem
@@ -103,6 +104,7 @@ def _mark_barrier_tokens_terminal(
     *,
     barrier_key: str,
     consumed_tokens: tuple[TokenInfo, ...],
+    group_losses: tuple[GroupLossSpec, ...] = (),
 ) -> None:
     """Reconcile a FAILED coalesce outcome with durable scheduler terminalization.
 
@@ -110,6 +112,10 @@ def _mark_barrier_tokens_terminal(
     emission, on the legacy partial-release wrapper. Successful merges go
     through ``processor.complete_coalesce_merge`` — ONE atomic journal
     transition that consumes the branches and emits the merged child (F1/D6).
+
+    ``group_losses`` (Ruling 39): an escalation loss staged by the SAME
+    sweep call, drained and passed through so it commits durably in this
+    SAME transaction — see `_terminalize_swept_coalesce_failure`.
     """
     token_ids = tuple(token.token_id for token in consumed_tokens)
     if not token_ids:
@@ -118,7 +124,7 @@ def _mark_barrier_tokens_terminal(
     if expected_count != len(token_ids):
         raise AuditIntegrityError(f"Coalesce barrier {barrier_key!r} consumed duplicate token_ids: {token_ids!r}")
 
-    terminalized_count = processor.mark_blocked_barrier_terminal(barrier_key, token_ids)
+    terminalized_count = processor.mark_blocked_barrier_terminal(barrier_key, token_ids, group_losses=group_losses)
     if expected_count and terminalized_count != expected_count:
         raise AuditIntegrityError(
             f"Coalesce barrier {barrier_key!r} live consumed {expected_count} token(s), "
@@ -140,17 +146,36 @@ def _terminalize_swept_coalesce_failure(
     both the Landscape terminal AND the durable scheduler barrier row here.
 
     The settlement channel's remaining-path walk can escalate a loss to an
-    enclosing bound frame. Any cascaded RowResults fold into `counters` /
-    `pending_tokens` through the same `accumulate_row_outcomes` every other
-    disposition uses (Ruling 34: fold, don't drop). A cascaded child_item
-    (a continuation this sweep layer would need to DRAIN — e.g. an outer
-    coalesce merge triggered by the escalation) has no seam here at all:
-    this function has no drain loop, unlike the live intake/notify paths.
-    That specific shape is provably unreachable today — no nested
-    bound-region topology (fork-in-fork / expand-in-fork) is buildable, so
-    the remaining-path walk can only ever resolve to a FAILURE result here,
-    never a fresh merge — but if it ever does fire, failing loudly is the
-    honest response (Ruling 34: NEEDS_CONTEXT, not a silent discard).
+    enclosing bound frame, and DOES so in reachable topologies: fork-in-fork
+    with a nested coalesce is buildable and runs end-to-end today
+    (`tests/integration/core/dag/test_nested_fork_coalesce.py`) — a fix-round-1
+    correction (I1) of an earlier claim here that nested bound regions were
+    build-rejected; only nested collector/scope regions are (WS4). Ruling
+    38/C1 is what makes firing this walk safe (the escalation is
+    deduplicated per resolved enclosing member, not run once per consumed
+    sibling); Ruling 39/C2 is what makes its staged loss durable, below.
+
+    Any cascaded RowResults fold into `counters` / `pending_tokens` through
+    the same `accumulate_row_outcomes` every other disposition uses (Ruling
+    34: fold, don't drop). A cascaded child_item (a continuation this sweep
+    layer would need to DRIVE through the traversal engine — e.g. a fresh
+    merge the escalation triggers) has no seam here: this function has no
+    drain loop, unlike the live intake/notify paths. Failing loudly is the
+    honest response if that shape is ever reached (Ruling 34: NEEDS_CONTEXT,
+    not a silent discard).
+
+    Any escalation loss the walk stages has no claim to ride durable via the
+    normal `take_claim_group_losses` path — sweeps run outside any claim
+    (Ruling 39/C2) — so it is drained here and committed through the SAME
+    `mark_blocked_barrier_terminal` transaction as this sweep's own
+    consumed-token terminalization: the existing `record_group_loss` write
+    `complete_barrier` already performs for every in-claim disposition, not
+    a new write path. Ordering (M2): the settlement channel runs BEFORE
+    that durable reconciliation, so a raise from the channel (the
+    child-item placeholder above) leaves the durable BLOCKED scheduler rows
+    for THIS call unterminalized — fail-closed overall (the run's own
+    unresolved-scheduler-work invariant would catch it), but called out
+    explicitly rather than left as an implicit ordering accident.
     """
     if not consumed_tokens:
         return
@@ -163,13 +188,18 @@ def _terminalize_swept_coalesce_failure(
     if child_items:
         raise OrchestrationInvariantError(
             f"Coalesce barrier {barrier_key!r} sweep failure escalated to an enclosing bound "
-            f"frame with {len(child_items)} child item(s) to continue — no nested bound-region "
-            "topology is buildable today, and this sweep layer has no drain seam for a cascaded "
-            "continuation. Investigate before extending nesting support."
+            f"frame with {len(child_items)} child item(s) to continue — this sweep layer has no "
+            "drain seam for a cascaded continuation. Investigate before extending nesting support."
         )
     if cascaded:
         accumulate_row_outcomes(cascaded, counters, pending_tokens)
-    _mark_barrier_tokens_terminal(processor, barrier_key=barrier_key, consumed_tokens=consumed_tokens)
+    pending_losses = processor.take_pending_group_losses()
+    _mark_barrier_tokens_terminal(
+        processor,
+        barrier_key=barrier_key,
+        consumed_tokens=consumed_tokens,
+        group_losses=pending_losses,
+    )
 
 
 def reconcile_sink_write_diversions(
@@ -456,6 +486,13 @@ def handle_coalesce_timeouts(
                     counters=counters,
                     pending_tokens=pending_tokens,
                 )
+                # M1 (known, not fixed this round — see task-6-report.md):
+                # counts only THIS coalesce's own failure. If the escalation
+                # walk inside _terminalize_swept_coalesce_failure ALSO fails
+                # an enclosing coalesce, that second group failure reaches
+                # rows_failed (via accumulate_row_outcomes) but is never
+                # separately counted here — pre-existing gap in how a
+                # cascaded failure is attributed, not introduced this round.
                 counters.rows_coalesce_failed += 1
                 counters.rows_failed += len(consumed_tokens)
                 _emit_failed_coalesce_telemetry(ctx, consumed_tokens)
@@ -580,6 +617,8 @@ def flush_coalesce_pending(
                     counters=counters,
                     pending_tokens=pending_tokens,
                 )
+            # M1 (known, not fixed this round — see task-6-report.md): see
+            # the matching comment in handle_coalesce_timeouts above.
             counters.rows_coalesce_failed += 1
             counters.rows_failed += len(outcome.consumed_tokens)
             _emit_failed_coalesce_telemetry(ctx, outcome.consumed_tokens)

@@ -112,10 +112,13 @@ class _FakeProcessor:
     complete_coalesce_merge_side_effect: BaseException | None = None
     mark_blocked_barrier_terminal_result: int = 1
     record_group_member_terminals_result: list[_FakeRowResult] = field(default_factory=list)
+    take_pending_group_losses_result: tuple[Any, ...] = ()
     process_token_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = field(default_factory=list)
     complete_coalesce_merge_calls: list[dict[str, Any]] = field(default_factory=list)
     mark_blocked_barrier_terminal_calls: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+    mark_blocked_barrier_terminal_group_losses_calls: list[tuple[Any, ...]] = field(default_factory=list)
     record_group_member_terminals_calls: list[dict[str, Any]] = field(default_factory=list)
+    take_pending_group_losses_calls: int = 0
 
     def process_token(self, *args: Any, **kwargs: Any) -> list[_FakeRowResult]:
         self.process_token_calls.append((args, kwargs))
@@ -143,9 +146,20 @@ class _FakeProcessor:
             raise self.complete_coalesce_merge_side_effect
         return list(self.complete_coalesce_merge_results)
 
-    def mark_blocked_barrier_terminal(self, barrier_key: str, token_ids: tuple[str, ...]) -> int:
+    def mark_blocked_barrier_terminal(
+        self,
+        barrier_key: str,
+        token_ids: tuple[str, ...],
+        *,
+        group_losses: tuple[Any, ...] = (),
+    ) -> int:
         self.mark_blocked_barrier_terminal_calls.append((barrier_key, token_ids))
+        self.mark_blocked_barrier_terminal_group_losses_calls.append(group_losses)
         return self.mark_blocked_barrier_terminal_result
+
+    def take_pending_group_losses(self) -> tuple[Any, ...]:
+        self.take_pending_group_losses_calls += 1
+        return self.take_pending_group_losses_result
 
     def record_group_member_terminals(
         self,
@@ -187,6 +201,7 @@ def _assert_no_processor_work(processor: _FakeProcessor) -> None:
     assert processor.complete_coalesce_merge_calls == []
     assert processor.mark_blocked_barrier_terminal_calls == []
     assert processor.record_group_member_terminals_calls == []
+    assert processor.take_pending_group_losses_calls == 0
 
 
 def _make_result(

@@ -59,14 +59,6 @@ class CoalesceOutcome:
         coalesce_metadata: Audit metadata about the merge (branches, policy, etc.)
         failure_reason: Reason for failure if merge failed (timeout, missing branches)
         coalesce_name: Name of the coalesce point that produced this outcome
-        outcomes_recorded: True if terminal outcomes were already recorded by executor.
-            When True, caller MUST NOT record outcomes again (Bug 9z8 fix).
-            WS3 Task 6 (spec §6.1) retired every failure arm that used to
-            set this True on a returned outcome — the executor no longer
-            records a consumed sibling's terminal itself and this is always
-            False for a failure_reason outcome today; the field stays for
-            the contract (a future returning arm can still set it) rather
-            than being torn out with its one remaining reader gone.
         late_arrival: True when this failure outcome is the late-arrival arm —
             the token arrived after its group already merged/failed (ADR-030
             §E.3a): the journal-first intake releases the token's BLOCKED row
@@ -82,7 +74,6 @@ class CoalesceOutcome:
     coalesce_metadata: CoalesceMetadata | None = None
     failure_reason: str | None = None
     coalesce_name: str | None = None
-    outcomes_recorded: bool = False
     late_arrival: bool = False
     join_group_id: str | None = None
 
@@ -854,8 +845,7 @@ class CoalesceExecutor:
             # arm no longer calls record_token_outcome directly. The caller
             # terminalizes the late token through the settlement channel
             # (RowProcessor._record_group_member_terminals), which also
-            # walks its REMAINING lineage for an enclosing bound frame —
-            # outcomes_recorded=False below is what tells the caller to do so.
+            # walks its REMAINING lineage for an enclosing bound frame.
 
             # Return failure outcome
             return CoalesceOutcome(
@@ -867,7 +857,6 @@ class CoalesceExecutor:
                     reason="Siblings already merged/failed, this token arrived too late",
                 ),
                 coalesce_name=coalesce_name,
-                outcomes_recorded=False,
                 late_arrival=True,
             )
 
@@ -1035,9 +1024,9 @@ class CoalesceExecutor:
                 the default CoalesceMetadata.for_failure() construction.
 
         Returns:
-            CoalesceOutcome with failure_reason set and outcomes_recorded=False
-            (Task 6, spec §6.1: the caller terminalizes consumed_tokens
-            through the settlement channel, not this method).
+            CoalesceOutcome with failure_reason set. The caller terminalizes
+            consumed_tokens through the settlement channel (Task 6, spec
+            §6.1), not this method.
         """
         coalesce_name = key[0]
         pending = self._pending[key]
@@ -1087,7 +1076,6 @@ class CoalesceExecutor:
             consumed_tokens=consumed_tokens,
             coalesce_metadata=metadata,
             coalesce_name=coalesce_name,
-            outcomes_recorded=False,
         )
 
     def _execute_merge(

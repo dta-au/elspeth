@@ -384,7 +384,6 @@ class TestCoalesceIntakeTaxonomy:
             CoalesceOutcome(
                 held=False,
                 failure_reason="late_arrival_after_merge",
-                outcomes_recorded=True,
                 late_arrival=True,
             )
         )

@@ -3274,6 +3274,31 @@ class RowProcessor:
                 )
         self._pending_group_losses.append(spec)
 
+    def _take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
+        """Drain whatever is currently staged in `_pending_group_losses`
+        (Ruling 39 / C2 fix): the out-of-claim sweep counterpart to
+        `SchedulerDrainCoordinator.take_claim_group_losses`. No
+        frame-authentication against a claimed token — there is no claimed
+        token in sweep context, and the spec's own provenance is already
+        authoritative (it came from `_first_bound_frame`'s binding-registry
+        lookup, inside the SAME synchronous call that staged it, immediately
+        before this drains it). The caller commits the drained spec(s)
+        durably in the same transaction as its own disposition (e.g.
+        `mark_blocked_barrier_terminal(group_losses=...)`), never leaving
+        anything behind here.
+        """
+        if not self._pending_group_losses:
+            return ()
+        staged = tuple(self._pending_group_losses)
+        self._pending_group_losses.clear()
+        return staged
+
+    def take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
+        """Public surface for `_take_pending_group_losses` (Ruling 39): the
+        `CoalesceCompletionPort` injection point for out-of-claim sweep
+        callers."""
+        return self._take_pending_group_losses()
+
     def _record_group_member_terminals(
         self,
         consumed_tokens: tuple[TokenInfo, ...],
@@ -3287,22 +3312,71 @@ class RowProcessor:
         `record_token_outcome` writes for held siblings it consumes on a
         failure arm).
 
-        For each consumed token this ALSO runs the settlement walk over the
-        token's REMAINING lineage — the frames OUTSIDE the closer frame that
-        just consumed it, innermost of THAT to the first bound frame — so a
-        loss inside a nested bound region reaches its enclosing region
-        instead of stopping at the closer that happened to notice it first
-        (what makes escalation, Task 8, observable). A consumed token's own
-        innermost frame is by construction the FORK frame this closer
-        itself closes (bound-region SESE nesting guarantees it — the token
-        could not have arrived here otherwise); `pop_closer_frame` both
-        strips it and crashes loudly if that construction invariant is
-        ever violated, rather than silently walking a wrong path. Reuses
+        This ALSO runs the settlement walk ONCE over the consumed tokens'
+        shared REMAINING lineage — the frames OUTSIDE the closer frame that
+        just consumed all of them, innermost of THAT to the first bound
+        frame — so a loss inside a nested bound region reaches its
+        enclosing region instead of stopping at the closer that happened to
+        notice it first (what makes escalation, Task 8, observable). ONCE,
+        not once per consumed token (fix round 1, Ruling 38 / C1): consumed
+        siblings SHARE their enclosing frame by construction — that is what
+        makes them siblings — so running the walk per token stages the same
+        enclosing (group_id, member_key) N times and trips
+        `_stage_group_loss`'s duplicate guard on a topology that builds and
+        runs today (nested fork-in-fork; see
+        `tests/integration/core/dag/test_nested_fork_coalesce.py`).
+
+        The pop itself mirrors the two ratified siblings doing the same
+        strict pop over the same kind of token set — `TokenManager.
+        coalesce_tokens` and the durable Tier-1 twin in
+        `core/landscape/data_flow/tokens.py` (Ruling 41 / I3): derive the
+        expected group id from an ANCHOR (the first consumed token's own
+        innermost FORK frame — by construction the frame this closer
+        itself closes; bound-region SESE nesting guarantees it, the token
+        could not have arrived here otherwise), pop EVERY consumed token
+        against that SAME shared id (never each token's own observed
+        group_id, which would make `pop_closer_frame`'s group check
+        unfalsifiable), and collapse the results into a set: more than one
+        distinct remaining path means the siblings disagree about their
+        enclosing frame, which is lineage corruption, not a config shape —
+        crash loudly rather than silently walk one of them. Reuses
         `_settle_member_losses` — the ONE settlement walk in this module —
         rather than re-deriving frame resolution here.
+
+        Ordering (M3): the pop-and-agreement-check runs FIRST, over every
+        consumed token, before any terminal is written — a lineage
+        disagreement (or a missing FORK frame) now crashes before a single
+        write, not after some. Once that passes, every consumed token's
+        terminal is written, THEN the single escalation walk runs — so a
+        raise from the walk (an enclosing-frame duplicate, or any other
+        `_settle_member_losses` failure) never hides a token's own recorded
+        terminal. The remaining risk is a `record_token_outcome` write
+        itself raising mid-loop, leaving earlier tokens in this call
+        recorded and later ones not — audit-first is the accepted trade
+        over the alternative (write nothing until every token is written),
+        which would leave a genuinely-failed token with NO terminal at all
+        on the exact same class of failure.
         """
+        if not consumed_tokens:
+            return []
+        anchor = consumed_tokens[0].lineage_path
+        if not anchor or anchor[-1].kind is not FrameKind.FORK:
+            raise OrchestrationInvariantError(
+                f"_record_group_member_terminals: consumed token {consumed_tokens[0].token_id!r} has no "
+                f"innermost FORK frame to pop (lineage_path={anchor!r})"
+            )
+        shared_group_id = anchor[-1].group_id
+        remaining_paths = {
+            pop_closer_frame(consumed.lineage_path, kind=FrameKind.FORK, group_id=shared_group_id) for consumed in consumed_tokens
+        }
+        if len(remaining_paths) != 1:
+            raise OrchestrationInvariantError(
+                f"_record_group_member_terminals: consumed tokens do not share their remaining lineage "
+                f"path after the pop (group={shared_group_id!r}); {len(remaining_paths)} distinct paths."
+            )
+        remaining_path = remaining_paths.pop()
+
         error_hash = compute_error_hash(failure_reason)
-        cascaded: list[RowResult] = []
         for consumed in consumed_tokens:
             self._data_flow.record_token_outcome(
                 ref=TokenRef(token_id=consumed.token_id, run_id=self._run_id),
@@ -3310,14 +3384,9 @@ class RowProcessor:
                 path=TerminalPath.UNROUTED,
                 error_hash=error_hash,
             )
-            remaining_path = pop_closer_frame(
-                consumed.lineage_path,
-                kind=FrameKind.FORK,
-                group_id=consumed.lineage_path[-1].group_id if consumed.lineage_path else "",
-            )
-            remaining_token = replace(consumed, lineage_path=remaining_path)
-            cascaded.extend(self._settle_member_losses(remaining_token, failure_reason, child_items))
-        return cascaded
+
+        remaining_token = replace(consumed_tokens[0], lineage_path=remaining_path)
+        return self._settle_member_losses(remaining_token, failure_reason, child_items)
 
     def record_group_member_terminals(
         self,
@@ -3716,8 +3785,20 @@ class RowProcessor:
         """Return grouped unresolved scheduler work for invariant diagnostics."""
         return self._scheduler.summarize_unresolved_work(run_id=self._run_id)
 
-    def mark_blocked_barrier_terminal(self, barrier_key: str, token_ids: tuple[str, ...]) -> int:
-        """Mark durable scheduler work consumed by a barrier as terminal."""
+    def mark_blocked_barrier_terminal(
+        self,
+        barrier_key: str,
+        token_ids: tuple[str, ...],
+        *,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> int:
+        """Mark durable scheduler work consumed by a barrier as terminal.
+
+        ``group_losses`` (Ruling 39): passed straight through to
+        `complete_barrier`'s existing durable write — the out-of-claim sweep
+        caller's own drained-and-not-otherwise-committed stage. See
+        `take_pending_group_losses`.
+        """
         expected_count = len(frozenset(token_ids))
         if not token_ids:
             raise AuditIntegrityError(f"Scheduler barrier terminalization for barrier_key={barrier_key!r} requires live token_ids.")
@@ -3731,6 +3812,7 @@ class RowProcessor:
             token_ids=token_ids,
             now=self._clock.now_utc(),
             coordination_token=self._require_coordination_token(),
+            group_losses=group_losses,
         )
         if expected_count and terminalized_count != expected_count:
             raise AuditIntegrityError(

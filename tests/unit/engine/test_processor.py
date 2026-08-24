@@ -8195,9 +8195,10 @@ class TestMaybeCoalesceToken:
     def test_coalesce_failure_always_records_through_settlement_channel(self) -> None:
         """Task 6 (spec §6.1): the executor never records a consumed sibling's
         terminal outcome itself anymore — the caller always does, through the
-        settlement channel, regardless of what outcomes_recorded says on the
-        returned outcome (a stale True from the executor no longer suppresses
-        it; there is structurally only one write site now).
+        settlement channel; there is structurally only one write site now.
+        Fix round 1 (Ruling 37) deleted `CoalesceOutcome.outcomes_recorded`
+        entirely — it was constant-False with zero consumers once this task
+        landed — so this outcome no longer carries the field at all.
 
         Slice 3 re-pin (ADR-030 §E.2): the accept-time failure surfaces from
         the journal-first intake (the arrival blocked first, then the
@@ -8216,7 +8217,6 @@ class TestMaybeCoalesceToken:
             merged_token=None,
             failure_reason="merge_failed:path_b_lost",
             consumed_tokens=(token,),
-            outcomes_recorded=True,
         )
         processor = _make_processor(
             factory,
@@ -8434,7 +8434,6 @@ class TestMaybeCoalesceToken:
             held=False,
             merged_token=None,
             failure_reason=None,
-            outcomes_recorded=False,
             late_arrival=False,
         )
         processor = _make_processor(

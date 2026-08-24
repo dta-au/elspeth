@@ -365,7 +365,6 @@ class TestCoalesceExecutorPipelineRow:
         assert "contract_type_conflict" in outcome.failure_reason
         assert outcome.held is False
         assert outcome.merged_token is None
-        assert outcome.outcomes_recorded is True  # Tokens properly terminated
 
     def test_first_policy_merges_immediately(self) -> None:
         """Coalesce with "first" policy should merge on first arrival.

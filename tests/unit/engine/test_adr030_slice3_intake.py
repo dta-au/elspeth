@@ -206,7 +206,6 @@ class TestLateArrivalRelease:
             held=False,
             failure_reason="late_arrival_after_merge",
             consumed_tokens=(late_token,),
-            outcomes_recorded=True,
             late_arrival=True,
         )
         db, factory = _make_factory()
@@ -279,7 +278,6 @@ class TestGroupLossHandOff:
             held=False,
             failure_reason="branch_lost:path_b",
             consumed_tokens=(held_token,),
-            outcomes_recorded=True,
         )
         db, factory = _make_factory()
         processor = self._forked_processor(factory, coalesce)
