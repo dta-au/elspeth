@@ -1175,6 +1175,7 @@ class SchedulerDrainCoordinator:
                 coalesce_node_id=fields.coalesce_node_id,
                 coalesce_name=fields.coalesce_name,
                 row_union_name=fields.row_union_name,
+                collector_name=fields.collector_name,
                 lease_owner=self._scheduler_lease_owner,
                 lease_seconds=self._scheduler_lease_seconds,
                 now=available_at,
@@ -1197,6 +1198,7 @@ class SchedulerDrainCoordinator:
                 coalesce_node_id=fields.coalesce_node_id,
                 coalesce_name=fields.coalesce_name,
                 row_union_name=fields.row_union_name,
+                collector_name=fields.collector_name,
                 # Membership fence (ADR-030 §G, slice 5): thread the registered
                 # worker identity so an evicted RowProcessor cannot enqueue READY
                 # items that no active worker will claim. The fence is active only

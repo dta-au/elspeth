@@ -60,7 +60,7 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.contracts.types import NodeID
+from elspeth.contracts.types import CollectorName, NodeID
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
@@ -113,6 +113,7 @@ class _RecordingScheduler:
             "heartbeat_lease",
             "enqueue_ready_claimed",
             "enqueue_ready_claimed_legacy_unfenced",
+            "enqueue_ready",
         }
     )
 
@@ -170,10 +171,11 @@ class _RecordingScheduler:
         self._record("enqueue_ready_claimed_legacy_unfenced", kwargs)
         return self._inner.enqueue_ready_claimed_legacy_unfenced(*args, **kwargs)
 
-    # -- unrecorded members the drain paths still reach ------------------
-
     def enqueue_ready(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("enqueue_ready", kwargs)
         return self._inner.enqueue_ready(*args, **kwargs)
+
+    # -- unrecorded members the drain paths still reach ------------------
 
     # The atomic disposition-plus-child-enqueue verbs are deliberately NOT in
     # ``_RECORDED``: several tests assert ``calls_for("mark_terminal") == []``
@@ -310,7 +312,7 @@ def _enqueue_ready(
     return item.work_item_id, token_info
 
 
-def _unscheduled_work_item(setup: RecorderSetup, *, sequence: int) -> WorkItem:
+def _unscheduled_work_item(setup: RecorderSetup, *, sequence: int, collector_name: CollectorName | None = None) -> WorkItem:
     row, token = setup.data_flow.create_row_with_token(
         run_id=setup.run_id,
         source_node_id=setup.source_node_id,
@@ -322,6 +324,7 @@ def _unscheduled_work_item(setup: RecorderSetup, *, sequence: int) -> WorkItem:
     return WorkItem(
         token=TokenInfo(row_id=row.row_id, token_id=token.token_id, row_data=PipelineRow({"id": sequence}, _CONTRACT)),
         current_node_id=NodeID(NODE_ID),
+        collector_name=collector_name,
     )
 
 
@@ -1231,6 +1234,44 @@ def test_immediate_enqueue_routes_registered_worker_to_strict_and_unregistered_t
     assert legacy_item.status is TokenWorkStatus.LEASED
     assert legacy_spy.verbs() == ["enqueue_ready_claimed_legacy_unfenced"]
     assert legacy_item.work_item_id in legacy_pending
+
+
+def test_enqueue_work_item_forwards_collector_name_claimed() -> None:
+    """WS3 drain-forwarding pin: a WorkItem carrying collector_name survives
+    the REAL enqueue_work_item -> enqueue_ready_claimed call (:1178). This
+    drives the actual coordinator method (no monkeypatch of enqueue_work_item
+    or _process_single_token) and spies at the scheduler boundary, unlike the
+    existing ready-emission parity test whose enqueue capture is behind a
+    monkeypatched drain call and so cannot see a forwarding gap here."""
+    processor, spy, setup, _clock = _build(lease_owner=LEADER_OWNER)
+    pending: dict[str, WorkItem] = {}
+    spy.calls.clear()
+
+    processor._scheduler_drain.enqueue_work_item(
+        _unscheduled_work_item(setup, sequence=30, collector_name=CollectorName("intake")),
+        pending,
+        claim_immediately=True,
+    )
+
+    [kwargs] = spy.calls_for("enqueue_ready_claimed")
+    assert kwargs["collector_name"] == "intake"
+
+
+def test_enqueue_work_item_forwards_collector_name_unclaimed() -> None:
+    """Same pin as above for the claim_immediately=False branch (:1201's
+    plain enqueue_ready call)."""
+    processor, spy, setup, _clock = _build(lease_owner=LEADER_OWNER)
+    pending: dict[str, WorkItem] = {}
+    spy.calls.clear()
+
+    processor._scheduler_drain.enqueue_work_item(
+        _unscheduled_work_item(setup, sequence=31, collector_name=CollectorName("intake")),
+        pending,
+        claim_immediately=False,
+    )
+
+    [kwargs] = spy.calls_for("enqueue_ready")
+    assert kwargs["collector_name"] == "intake"
 
 
 def test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinned() -> None:
