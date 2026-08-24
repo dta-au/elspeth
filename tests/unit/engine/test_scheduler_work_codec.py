@@ -125,6 +125,26 @@ def _make_item(**overrides) -> WorkItem:
     return WorkItem(**defaults)
 
 
+def _make_collector_item(**overrides) -> WorkItem:
+    """A collector-bound item: no coalesce_name/coalesce_node_id (mutually
+    exclusive with collector_name — WorkItem.__post_init__ refuses both)."""
+    token = TokenInfo(
+        row_id="row-1",
+        token_id="tok-1",
+        row_data=PipelineRow({"id": 1, "name": "alpha"}, _CONTRACT),
+        lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="tok-1"),),
+    )
+    defaults = {
+        "token": token,
+        "current_node_id": NodeID("normalize"),
+        "collector_name": CollectorName("stitch"),
+        "on_success_sink": "default-sink",
+        "join_group_id": "join-1",
+    }
+    defaults.update(overrides)
+    return WorkItem(**defaults)
+
+
 def _scheduler_row_from_fields(fields: ScheduledWorkFields) -> TokenWorkItem:
     """Materialize the durable row exactly as the repository persists the bundle."""
     return TokenWorkItem(
@@ -148,6 +168,8 @@ def _scheduler_row_from_fields(fields: ScheduledWorkFields) -> TokenWorkItem:
         lineage_path=fields.lineage_path,
         coalesce_node_id=fields.coalesce_node_id,
         coalesce_name=fields.coalesce_name,
+        row_union_name=fields.row_union_name,
+        collector_name=fields.collector_name,
     )
 
 
@@ -174,6 +196,29 @@ class TestReadyFieldsRoundTrip:
         assert rehydrated.coalesce_node_id == item.coalesce_node_id
         assert rehydrated.coalesce_name == item.coalesce_name
         assert rehydrated.on_success_sink == item.on_success_sink
+
+    def test_collector_name_round_trips_through_scheduler_row(self) -> None:
+        """META-19: collector_name's codec bijection — durable TokenWorkItem
+        -> WorkItem -> durable TokenWorkItem carries the field intact in both
+        directions, no dropped field anywhere in the mapping (WorkItem gained
+        collector_name with the ready_fields/ready_emission/
+        work_item_from_scheduler mappings all threading it through, matching
+        row_union_name's shape one column over)."""
+        codec = _make_codec()
+        item = _make_collector_item()
+
+        fields = codec.ready_fields(item)
+        assert fields.collector_name == "stitch"
+        assert fields.coalesce_name is None
+        assert fields.row_union_name is None
+
+        emission = codec.ready_emission(item)
+        assert emission.collector_name == "stitch"
+
+        rehydrated = codec.work_item_from_scheduler(_scheduler_row_from_fields(fields))
+        assert rehydrated.collector_name == item.collector_name
+        assert rehydrated.coalesce_name is None
+        assert rehydrated.row_union_name is None
 
     def test_derived_fields_match_resolvers(self) -> None:
         codec = _make_codec()

@@ -38,21 +38,33 @@ class WorkItem:
     at most one group: a token can be a fork branch AND an expand child at
     once. A new barrier kind gets a cursor pair here only if work items
     actually block at it; its binding lives in the builder registry, never
-    on this dataclass. WS4 Task 6: collector_name earns a place here because a
+    on this dataclass.
+
+    WS4 Task 6 / META-19: collector_name's cursor pair landed here because a
     collector member IS such a case — an EXPAND member released from an
     enclosing barrier still carries a bound collector destination forward
     through BarrierEmission the same way a released fork branch carries a
     bound coalesce/row_union destination (dispositions.py's
     _insert_ready_emission_on projects BarrierEmission.collector_name onto
-    the durable row exactly like row_union_name). Unlike coalesce/row_union,
-    collector carries NO node-id companion and no WorkItemNavigation
-    resolver: adding one would extend the WorkItemNavigation Protocol, and
-    its sole production implementer (processor.py's DAGNavigator, WS3-owned,
-    outside this task's lane) does not yet provide it — confirmed by a
-    whole-tree mypy run before landing this shape. barrier_key's compound
-    "collector:<name>:<group_id>" address is name-based, not node-id-based,
-    so the bare name is sufficient until the WS3+WS4 integration item wires a
-    resolver and this comment can be revisited.
+    the durable row exactly like row_union_name; the codec's ready_fields/
+    ready_emission/work_item_from_scheduler round-trip it in full, no dropped
+    field anywhere in the mapping). The trap's rule stays intact: this is the
+    BLOCKED/READY-continuation cursor address, not a binding — the
+    group→collector binding still lives in the builder registry, never here.
+    Unlike coalesce/row_union, collector carries NO node-id companion and no
+    WorkItemNavigation resolver: adding one would extend the
+    WorkItemNavigation Protocol, and its sole production implementer
+    (processor.py's DAGNavigator, WS3-owned, outside this task's lane) does
+    not yet provide it — confirmed by a whole-tree mypy run before landing
+    this shape. barrier_key's compound "collector:<name>:<group_id>" address
+    is name-based, not node-id-based, so the bare name is sufficient.
+    There are ZERO production writers of this field until the WS3+WS4
+    integration item wires the first dispatch call that sets it
+    (integration worklist item 1) — META-14.2's no-writer invariant test
+    (test_collector_barrier_key_interlock.py) pins the durable barrier_key
+    half of that same fact and self-destructs the moment a real writer
+    lands, which is when this comment (and a resolver, if the integration
+    item's design needs one) should be revisited.
     """
 
     token: TokenInfo
