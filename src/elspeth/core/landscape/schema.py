@@ -1043,35 +1043,6 @@ Index(
     run_coordination_events_table.c.seq,
 )
 
-coalesce_branch_losses_table = Table(
-    "coalesce_branch_losses",
-    metadata,
-    # §E.5: durable cross-worker branch-loss hand-off. Table only at epoch 21;
-    # record/replay verbs land in slice 3.
-    Column("loss_id", String(64), primary_key=True),
-    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
-    Column("coalesce_name", String(128), nullable=False),
-    Column("row_id", String(64), nullable=False),
-    Column("branch_name", String(128), nullable=False),
-    Column("token_id", String(64), nullable=False),
-    Column("reason", String(64), nullable=False),  # failed / quarantined / error_routed / ...
-    Column("recorded_by", String(128), nullable=False),  # worker_id
-    Column("recorded_at", DateTime(timezone=True), nullable=False),
-    Column("adopted_epoch", Integer),  # NULL = not yet replayed into leader memory
-)
-# Natural-key idempotency (design §G: record_coalesce_branch_loss is
-# "idempotent on the natural key"). Named unique Index rather than a
-# UniqueConstraint for _REQUIRED_INDEXES verifiability; doubles as the hot
-# lookup index (replay scans by run_id + coalesce_name prefix).
-Index(
-    "uq_coalesce_branch_losses_natural",
-    coalesce_branch_losses_table.c.run_id,
-    coalesce_branch_losses_table.c.coalesce_name,
-    coalesce_branch_losses_table.c.row_id,
-    coalesce_branch_losses_table.c.branch_name,
-    unique=True,
-)
-
 # === Unified lineage (epoch 34, barrier-scopes spec rev 3.2 §4.3) ===
 
 token_lineage_frames_table = Table(
@@ -1136,8 +1107,20 @@ group_losses_table = Table(
     Column("recorded_by", String(128), nullable=False),
     Column("recorded_at", DateTime(timezone=True), nullable=False),
     Column("adopted_epoch", Integer),  # NULL = not yet replayed into leader memory (§E.5 cursor)
-    UniqueConstraint("run_id", "closer_name", "group_id", "member_key", name="uq_group_losses_natural"),
     ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+# Natural-key idempotency (record_group_loss is idempotent on the natural
+# key). Named unique Index rather than a UniqueConstraint for
+# _REQUIRED_INDEXES verifiability — matches the retired
+# coalesce_branch_losses precedent; doubles as the hot lookup index (replay
+# scans by run_id + closer_name prefix).
+Index(
+    "uq_group_losses_natural",
+    group_losses_table.c.run_id,
+    group_losses_table.c.closer_name,
+    group_losses_table.c.group_id,
+    group_losses_table.c.member_key,
+    unique=True,
 )
 
 

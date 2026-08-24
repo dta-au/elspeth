@@ -69,39 +69,18 @@ class BufferedOutcomeSpec:
 
 
 @dataclass(frozen=True)
-class BranchLossSpec:
-    """Durable branch-loss record riding a lossy disposition (§E.5).
-
-    Passed to ``mark_failed`` / ``mark_pending_sink`` when the disposed item
-    is a fork-lineage branch feeding a coalesce: the loss row commits in the
-    SAME lease-fenced transaction as the disposition (record-then-notify
-    uniformity rule, design §E.5).
-    """
-
-    coalesce_name: str
-    row_id: str
-    branch_name: str
-    token_id: str
-    reason: str
-    recorded_by: str
-
-
-@dataclass(frozen=True)
 class GroupLossSpec:
     """Durable group-loss record riding a lossy disposition (spec §6.2, rev 3.2).
 
-    The unified replacement for ``BranchLossSpec``: one loss names one member
-    of one group at one closer. Natural key = (run_id, closer_name, group_id,
-    member_key) — group-scoped, so the rev-2 ledger key collision is
-    structurally impossible. ``token_id`` is recorded for lineage-corruption
-    detection (same-key different-token raises Tier-1). ``reason`` stays
-    within the categorical branch-loss vocabulary — bare shared tokens, never
-    prose. ``recorded_by`` deliberately does NOT ride the spec: the staging
-    repository verb stamps the lease owner it already holds (WS3).
-
-    WS1a defines the type; WS3 lands the writer, the frame-authenticated
-    guard, and the ``BranchLossSpec`` retirement. Until then nothing
-    constructs this outside tests.
+    The unified replacement for the retired ``BranchLossSpec``: one loss
+    names one member of one group at one closer. Natural key = (run_id,
+    closer_name, group_id, member_key) — group-scoped, so the rev-2 ledger
+    key collision is structurally impossible. ``token_id`` is recorded for
+    lineage-corruption detection (same-key different-token raises Tier-1).
+    ``reason`` stays within the categorical branch-loss vocabulary — bare
+    shared tokens, never prose. ``recorded_by`` deliberately does NOT ride
+    the spec: the staging repository verb stamps the lease owner it already
+    holds.
     """
 
     closer_name: str

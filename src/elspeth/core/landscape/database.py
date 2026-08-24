@@ -473,16 +473,6 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("run_coordination_events", "leader_epoch"),
     ("run_coordination_events", "recorded_at"),
     ("run_coordination_events", "context_json"),
-    ("coalesce_branch_losses", "loss_id"),
-    ("coalesce_branch_losses", "run_id"),
-    ("coalesce_branch_losses", "coalesce_name"),
-    ("coalesce_branch_losses", "row_id"),
-    ("coalesce_branch_losses", "branch_name"),
-    ("coalesce_branch_losses", "token_id"),
-    ("coalesce_branch_losses", "reason"),
-    ("coalesce_branch_losses", "recorded_by"),
-    ("coalesce_branch_losses", "recorded_at"),
-    ("coalesce_branch_losses", "adopted_epoch"),
 )
 
 _EPOCH_26_REQUIRED_TABLES = (
@@ -525,7 +515,6 @@ _REQUIRED_FOREIGN_KEYS: tuple[tuple[str, str, str], ...] = (
     ("run_coordination", "run_id", "runs"),
     ("run_workers", "run_id", "runs"),
     ("run_coordination_events", "run_id", "runs"),
-    ("coalesce_branch_losses", "run_id", "runs"),
     ("operations", "sink_effect_id", "sink_effects"),
     ("audit_export_snapshot_chunks", "snapshot_id", "audit_export_snapshots"),
     ("sink_effect_export_snapshots", "snapshot_id", "audit_export_snapshots"),
@@ -753,7 +742,7 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("run_workers", "ix_run_workers_liveness"),
     ("run_coordination_events", "uq_run_coordination_events_event_id"),
     ("run_coordination_events", "ix_run_coordination_events_run"),
-    ("coalesce_branch_losses", "uq_coalesce_branch_losses_natural"),
+    ("group_losses", "uq_group_losses_natural"),
     ("runs", "uq_runs_export_witness"),
     ("tokens", "uq_tokens_identity_row_run"),
     ("tokens", "uq_tokens_coalesce_result_identity"),
