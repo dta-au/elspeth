@@ -229,7 +229,6 @@ class TestLateArrival:
         # A FAILED closure found through the Landscape point read must not be
         # reported as a release.
         assert late.failure_reason == "row_union_group_failed"
-        assert executor.is_group_released("variant_union", "row_1") is False
 
     def test_landscape_failed_closure_preserves_durable_branch_loss_reason(self) -> None:
         executor, execution, _data_flow, _clock = _make_executor()
@@ -258,7 +257,6 @@ class TestLateArrival:
 
         assert late.late_arrival is True
         assert late.failure_reason == "late_arrival_after_release"
-        assert executor.is_group_released("variant_union", "row_1") is True
 
 
 class TestTimeouts:
@@ -356,7 +354,6 @@ class TestBranchLoss:
         _register(executor)
         executor.accept(_make_token(token_id="tok_a", branch_name="branch_a"), "variant_union")
         executor.accept(_make_token(token_id="tok_b", branch_name="branch_b"), "variant_union")
-        assert executor.is_group_released("variant_union", "row_1") is True
 
         outcome = executor.notify_branch_lost(
             row_union_name="variant_union",
@@ -368,9 +365,6 @@ class TestBranchLoss:
         assert outcome is None
         assert executor.has_recorded_branch_loss("variant_union", "row_1", "branch_a") is False
         data_flow.record_token_outcome.assert_not_called()
-        # The released closure survives untouched: a genuine straggler for
-        # this key is still reported against the release, not a branch loss.
-        assert executor.is_group_released("variant_union", "row_1") is True
 
     def test_lost_branch_after_evicted_release_uses_durable_completion_before_recording(self) -> None:
         executor, execution, _data_flow, _clock = _make_executor(max_completed_keys=1)
@@ -396,19 +390,6 @@ class TestBranchLoss:
             node_id="node_union",
             row_id="row_1",
         )
-        assert executor.is_group_released("variant_union", "row_1") is True
-
-    def test_is_group_released_false_for_failure_closed_group(self) -> None:
-        executor, _execution, _data_flow, _clock = _make_executor()
-        _register(executor)
-        executor.accept(_make_token(token_id="tok_a", branch_name="branch_a"), "variant_union")
-        executor.notify_branch_lost(
-            row_union_name="variant_union",
-            row_id="row_1",
-            lost_branch="branch_b",
-            reason="diverted_to_error_sink",
-        )
-        assert executor.is_group_released("variant_union", "row_1") is False
 
     def test_recorded_loss_indexes_are_bounded_with_durable_fallback_after_eviction(self) -> None:
         executor, _execution, _data_flow, _clock = _make_executor(max_completed_keys=1)
@@ -611,7 +592,6 @@ class TestRestoreFromJournal:
         data_flow.record_token_outcome.assert_called_once()
         assert data_flow.record_token_outcome.call_args.kwargs["outcome"] is TerminalOutcome.FAILURE
         assert executor._pending == {}
-        assert executor.is_group_released("variant_union", "row_1") is True
 
     def test_restored_entry_at_failed_closed_key_carries_conservative_failure_reason(self) -> None:
         # The key closed by _fail_pending (timeout / EOF flush); the original

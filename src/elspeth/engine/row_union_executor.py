@@ -638,15 +638,6 @@ class RowUnionExecutor:
         """Recent-cache idempotency check for §E.5 branch-loss replay dedup."""
         return (row_union_name, row_id, branch_name) in self._recorded_losses
 
-    def is_group_released(self, row_union_name: str, row_id: str) -> bool:
-        """Whether this group's in-memory closure reason is a release.
-
-        Leader fast path for the processor's post-release divert
-        discrimination; followers and post-resume processes fall back to the
-        durable status-COMPLETED node state read.
-        """
-        return self._completed_keys.get((row_union_name, row_id)) == _CLOSED_BY_RELEASE
-
     def notify_branch_lost(
         self,
         row_union_name: str,

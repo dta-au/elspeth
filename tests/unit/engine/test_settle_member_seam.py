@@ -246,20 +246,40 @@ def test_leader_notify_dispatches_to_coalesce_executor(processor_with_bindings, 
     assert recording_coalesce_executor.notified == [("merge_inner", "row-1", "path_a", "quarantined")]
 
 
-def test_quarantined_batch_member_reaches_the_seam(aggregation_flush_processor) -> None:
-    """Bypass site 2 (spec §6.1 item 2): the non-empty flush's
-    QUARANTINED_AT_SOURCE members now call the seam exactly as the
-    empty-flush path always did — same reason vocabulary, staged not
-    notified in memory."""
+def test_quarantined_batch_member_with_a_bound_frame_fails_fast_not_staged(aggregation_flush_processor) -> None:
+    """Bypass site 2 (spec §6.1 item 2), corrected per review I1
+    (2026-08-24): a quarantined batch member carrying a BOUND frame is a
+    ruling-25 violation (aggregators are banned inside every bound region,
+    enforced at build time — bound_regions.py::validate_no_aggregations_in_regions),
+    unreachable in a buildable graph. `_route_transform_results` has no
+    consumer for `_pending_group_losses` the way the empty-flush path's
+    `complete_barrier` does — staging a spec here would orphan it until some
+    LATER, unrelated claim's guard trips on it. The non-empty flush therefore
+    fails FAST at this site instead of calling the settle-member seam,
+    naming ruling 25 in the message, rather than staging a loss this path
+    cannot commit."""
     proc, flush = aggregation_flush_processor(
         quarantined_indices={0},
         member_paths=[(INNER_FORK,), ()],
         bindings={("fg_inner", "path_a"): coalesce_binding("merge_inner")},
     )
+    with pytest.raises(OrchestrationInvariantError, match="Ruling 25"):
+        flush()
+    assert proc._pending_group_losses == []
+
+
+def test_quarantined_batch_member_with_an_unbound_frame_is_a_structural_noop(aggregation_flush_processor) -> None:
+    """The common case: no binding registered at all (matches ruling 25's
+    actual production shape — an aggregation's buffered tokens are never
+    inside a bound region) — the flush proceeds normally, nothing staged,
+    nothing raised."""
+    proc, flush = aggregation_flush_processor(
+        quarantined_indices={0},
+        member_paths=[(INNER_FORK,), ()],
+        bindings={},
+    )
     flush()
-    (spec,) = proc._pending_group_losses
-    assert spec.reason == "quarantined"
-    assert spec.member_key == "path_a"
+    assert proc._pending_group_losses == []
 
 
 def test_stage_group_loss_rejects_a_second_loss_for_the_same_bound_frame(processor_with_bindings) -> None:

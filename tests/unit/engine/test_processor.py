@@ -9288,7 +9288,6 @@ class TestRowUnionBranchLossTelemetry:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
         )
         row_union_executor = create_autospec(RowUnionExecutor, instance=True)
-        row_union_executor.is_group_released.return_value = False
         row_union_executor.notify_branch_lost.return_value = RowUnionOutcome(
             held=False,
             consumed_tokens=(held_sibling,),
@@ -9314,26 +9313,42 @@ class TestRowUnionBranchLossTelemetry:
         assert event.outcome is TerminalOutcome.FAILURE
         assert event.path is TerminalPath.UNROUTED
 
-    def test_released_group_stages_nothing_once_the_fork_frame_is_popped(self) -> None:
+    def test_released_group_settles_nothing_once_its_fork_frame_is_popped(self) -> None:
         """WS3 retires `_row_union_group_released` (spec :240) as structurally
         unneeded, not merely redundant: ruling 27 pops a released group's FORK
         frame off every released token
         (`RowUnionExecutor._pop_released_group`, pinned directly by
         `tests/unit/engine/test_token_lineage_path.py`'s
-        `TestPopReleasedGroupFrame` — a real post-release token's
-        lineage_path never carries this union's FORK frame again). Once
-        popped, `binding_for` cannot resolve the walk back to this union at
-        all, so a post-release terminal settles nothing — structurally, with
-        no explicit release check, and identically whether or not this
-        worker holds a coalesce/row_union executor. This replaces the former
-        leader/follower pair, which pinned an is_group_released / durable-
-        COMPLETED discriminator that no longer exists in the walk.
+        `TestRowUnionReleasePop` — a real post-release token's lineage_path
+        never carries this union's FORK frame again; that class's
+        `test_pops_the_fork_frame_from_beneath_a_surviving_expand_frame`
+        pins the exact shape used here: a mid-branch expand's EXPAND frame
+        survives the pop, stacked where the popped FORK frame used to sit).
+        Once popped, `binding_for` cannot resolve the walk back to this
+        union at all, so a post-release terminal settles nothing —
+        structurally, with no explicit release check, and identically
+        whether or not this worker holds a coalesce/row_union executor.
+
+        A non-empty lineage_path is load-bearing here, not decorative: an
+        empty path (this test's earlier shape) settles nothing under ANY
+        implementation, including a deleted walk — indistinguishable from
+        `test_root_token_settles_nothing` in the seam suite. The surviving
+        EXPAND frame forces the walk to actually inspect a real frame and
+        correctly find no binding for it (registry.binding_for is 2-armed:
+        FORK frames key on member_key, EXPAND on group_id — this exercises
+        the EXPAND arm specifically), while the registered `variants`
+        row_union binding proves the registry itself is not just empty.
         """
         _, factory = _make_factory()
         released_token = make_token_info(
             row_id="row-1",
             token_id="released-token",
-            lineage_path=(),  # popped by the union's release, same as a real post-release token
+            # The union's own FORK frame is popped by release; a frame from
+            # a mid-branch expand the token passed through BEFORE reaching
+            # the union survives above it (test_pops_the_fork_frame_from_beneath_a_surviving_expand_frame's
+            # shape) — an ordinary unbound EXPAND frame, not registered
+            # against any closer here.
+            lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="eg-survivor", member_key="tok-child-1"),),
         )
         row_union_executor = create_autospec(RowUnionExecutor, instance=True)
         processor = _make_processor(

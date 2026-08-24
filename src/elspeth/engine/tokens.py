@@ -73,14 +73,15 @@ class TokenManager:
             group_bindings: The unified FORK/EXPAND group-binding registry (barrier-scopes
                 spec §3). WS3's mint-path call site (spec §4.2, ``graph.py:883``'s freeze
                 note): ``expand_token`` registers each runtime-minted EXPAND group id on
-                this SAME registry instance, unconditionally, via
-                ``register_expand_group`` — a declared scope opener records its binding,
-                an undeclared expand no-ops (registered under an opener_name the
-                registry has no binding for). None (e.g. CoalesceExecutor's own internal
-                TokenManager, which never calls ``expand_token``) disables registration
-                entirely; ``by_opener_node()`` is resolved ONCE here, not per mint —
-                ``bindings`` is build-time immutable, only the registry's own
-                ``_expand_groups`` index mutates.
+                this SAME registry instance — attempted at every mint, pre-filtered via
+                the cached ``by_opener_node()`` index (below), so a declared scope
+                opener's node_id calls ``register_expand_group`` and an undeclared
+                expand's node_id simply is not one of its keys and never calls it at
+                all. None (e.g. CoalesceExecutor's own internal TokenManager, which
+                never calls ``expand_token``) disables registration entirely;
+                ``by_opener_node()`` is resolved ONCE here, not per mint — ``bindings``
+                is build-time immutable, only the registry's own ``_expand_groups``
+                index mutates.
         """
         self._data_flow = data_flow
         self._step_resolver = step_resolver
@@ -483,12 +484,12 @@ class TokenManager:
         )
 
         # WS3 mint-path wiring (spec §4.2, graph.py:883's freeze note): register
-        # this runtime-minted EXPAND group id on the group-binding registry,
-        # unconditionally — register_expand_group itself decides declared vs
-        # undeclared. opener_name is resolved via the registry's own
-        # by_opener_node() index (cached at construction): node_id is a
-        # declared scope opener only if it appears there: an ordinary
-        # (non-scope) multi-row node_id is simply absent, and this is a no-op.
+        # this runtime-minted EXPAND group id on the group-binding registry.
+        # Attempted at every expand_token call, regardless of caller (2026-08-24
+        # review M5 correction: pre-filtered HERE via the cached
+        # by_opener_node() index, not inside register_expand_group — node_id
+        # is a declared scope opener only if it appears there; an ordinary
+        # (non-scope) multi-row node_id is simply absent, and this is a no-op).
         if self._group_bindings is not None:
             opener_binding = self._opener_binding_by_node_id.get(node_id)
             if opener_binding is not None:
@@ -521,7 +522,13 @@ class TokenManager:
         return child_infos, expand_group_id
 
     def record_empty_expansion(self, parent_token: TokenInfo, run_id: str) -> str:
-        """Durable member_count=0 group record for a zero-row expansion (spec §4.3)."""
+        """Durable member_count=0 group record for a zero-row expansion (spec §4.3).
+
+        Deliberately does NOT call `register_expand_group`: a zero-row
+        expansion mints zero children, so no `lineage_path` anywhere in the
+        system can ever carry this group_id's EXPAND frame — nothing can
+        call `binding_for` on it. Registering would be inert bookkeeping.
+        """
         return self._data_flow.record_empty_expansion(TokenRef(token_id=parent_token.token_id, run_id=run_id))
 
     # NOTE: Step resolution is handled by the injected StepResolver, which

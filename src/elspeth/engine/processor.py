@@ -1713,19 +1713,40 @@ class RowProcessor:
             # Expansion atomically recorded every parent's terminal disposition;
             # emit the matching telemetry and construct the triggering RowResult.
             #
-            # Spec §6.1 item 2: the quarantined batch member now settles through
-            # the same seam as the empty-flush path — the QUARANTINED_AT_SOURCE
-            # asymmetry (this non-empty flush path used to notify no barrier at
-            # all for these terminals, unlike EMPTY-emission's
-            # _route_empty_emission_results) is retired. After WS2's ruling-25
-            # ban on aggregators inside bound regions, this stages nothing inside
-            # bound regions (aggregators cannot sit there); for unbound frames
-            # the seam is a structural no-op. Uniformity is the point.
+            # Spec §6.1 item 2 / ruling 25 (2026-08-24 review I1): a quarantined
+            # batch member's lineage_path can carry a BOUND frame only if
+            # ruling 25's aggregator-inside-bound-region ban
+            # (bound_regions.py::validate_no_aggregations_in_regions, wired at
+            # build time via builder.py, covering COALESCE/ROW_UNION/EXPAND
+            # regions alike) has somehow been bypassed — no buildable graph can
+            # reach this flush with a bound frame, since an aggregation node
+            # inside ANY bound region is a GraphValidationError at construction.
+            # Fail fast HERE, at cause, rather than calling the settle-member
+            # seam: this non-empty flush path has no committed consumer for a
+            # staged GroupLossSpec (unlike the empty-flush path, which drains
+            # _pending_group_losses into complete_barrier's own transaction —
+            # see _route_empty_emission_results / complete_barrier below) — a
+            # spec staged here would survive until some LATER, unrelated
+            # claim's take_claim_group_losses guard, and wedge that claim
+            # instead of this one.
             for i, token in enumerate(fctx.buffered_tokens):
                 if i in quarantined_index_set:
                     outcome = TerminalOutcome.FAILURE
                     path = TerminalPath.QUARANTINED_AT_SOURCE
-                    results.extend(self._settle_member_losses(token, "quarantined", child_items, notify_in_memory=False))
+                    resolved = self._first_bound_frame(token)
+                    if resolved is not None:
+                        frame, binding = resolved
+                        raise OrchestrationInvariantError(
+                            f"Quarantined batch member {token.token_id!r} carries lineage frame "
+                            f"(group_id={frame.group_id!r}, member_key={frame.member_key!r}) bound to "
+                            f"closer {binding.closer_name!r}, inside a non-empty aggregation flush. "
+                            f"Ruling 25 (spec §7 rule 6) bans aggregators inside every bound region "
+                            f"precisely to prevent this: a bound region's roster must never lose a "
+                            f"member through a batch consume it cannot see. This graph should have "
+                            f"failed GraphValidationError at build time (validate_no_aggregations_in_regions) — "
+                            f"reaching this state at runtime is a processor/builder integrity bug, not a "
+                            f"row-level failure."
+                        )
                 else:
                     outcome = TerminalOutcome.TRANSIENT
                     path = TerminalPath.BATCH_CONSUMED
@@ -3145,6 +3166,22 @@ class RowProcessor:
         )
         return True, None
 
+    def _first_bound_frame(self, current_token: TokenInfo) -> tuple[LineageFrame, GroupBinding] | None:
+        """The settle-member walk's frame resolver (spec §6.1): the failing
+        token's lineage_path, INNERMOST frame outward, to the FIRST BOUND
+        frame. Inert frames — no closer bound — are pure provenance and are
+        skipped (spec §2). Shared by `_settle_member_losses` (stage + notify)
+        and the fail-fast check at the non-empty aggregation flush's
+        quarantined loop (ruling 25 makes a bound frame unreachable there in
+        a buildable graph; the check exists to fail AT that impossible state
+        rather than stage a loss the flush has no consumer for).
+        """
+        for frame in reversed(current_token.lineage_path):
+            binding = self._group_bindings.binding_for(frame)
+            if binding is not None:
+                return frame, binding
+        return None
+
     def _settle_member_losses(
         self,
         current_token: TokenInfo,
@@ -3166,23 +3203,30 @@ class RowProcessor:
         only; the in-memory notify is leader-only (each closer-kind arm
         no-ops without its executor — see `_notify_closer_of_loss`).
         """
-        for frame in reversed(current_token.lineage_path):
-            binding = self._group_bindings.binding_for(frame)
-            if binding is None:
-                continue  # inert frame: no roster watching (spec §2)
-            self._stage_group_loss(
-                GroupLossSpec(
-                    closer_name=binding.closer_name,
-                    group_id=frame.group_id,
-                    member_key=frame.member_key,
-                    token_id=current_token.token_id,
-                    reason=reason,
-                )
+        resolved = self._first_bound_frame(current_token)
+        if resolved is None:
+            return []
+        frame, binding = resolved
+        # 2026-08-24 review M2: resolve the coalesce node id BEFORE staging
+        # when the COALESCE arm will need it (notify_in_memory and this
+        # closer kind — the only arm with an unconditional dict lookup). A
+        # missing entry then raises the plain KeyError itself, here, rather
+        # than leaving a GroupLossSpec staged that only surfaces later — as
+        # a masking claim-guard error against a later, unrelated claim.
+        if notify_in_memory and binding.closer_kind is CloserKind.COALESCE:
+            _ = self._coalesce_node_ids[CoalesceName(binding.closer_name)]
+        self._stage_group_loss(
+            GroupLossSpec(
+                closer_name=binding.closer_name,
+                group_id=frame.group_id,
+                member_key=frame.member_key,
+                token_id=current_token.token_id,
+                reason=reason,
             )
-            if not notify_in_memory:
-                return []
-            return self._notify_closer_of_loss(binding, frame, current_token, reason, child_items)
-        return []
+        )
+        if not notify_in_memory:
+            return []
+        return self._notify_closer_of_loss(binding, frame, current_token, reason, child_items)
 
     def _stage_group_loss(self, spec: GroupLossSpec) -> None:
         for staged in self._pending_group_losses:
@@ -3697,6 +3741,16 @@ class RowProcessor:
                     ),
                     lineage_path=(
                         *parent_item.lineage_path,
+                        # 2026-08-24 review I3: this EXPAND frame's group_id
+                        # is never registered on self._group_bindings — the
+                        # only production register_expand_group call is
+                        # TokenManager.expand_token's mint path, which this
+                        # resume-path reconstruction bypasses entirely. If a
+                        # scope opener's residual is ever rebuilt here (not
+                        # reachable today — collector graphs are
+                        # build-rejected until WS4), the rebuilt frame stays
+                        # inert; re-registering on residual rebuild is
+                        # WS4/WS5-6 work (see group_bindings.py's docstring).
                         LineageFrame(kind=FrameKind.EXPAND, group_id=child.expand_group_id, member_key=child.token_id),
                     ),
                 )

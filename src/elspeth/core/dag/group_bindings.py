@@ -15,9 +15,24 @@ FORK frames resolve statically — a FORK frame's ``member_key`` IS the
 declared branch name (spec §4.1), and rosters are member-disjoint. EXPAND
 group ids are runtime-minted (``generate_id()``), so the opener's mint path
 registers each new group via ``register_expand_group`` (WS3 wires the
-single TokenManager call site; on takeover/resume the index re-derives
-from ``group_records``, which carries the opener). An unregistered frame
-is inert — ``None``, nothing staged, no roster watching (spec §2).
+single TokenManager call site). An unregistered frame is inert — ``None``,
+nothing staged, no roster watching (spec §2).
+
+**``_expand_groups`` is mint-local and process-local (2026-08-24 review
+I3-corrected).** There is no re-derivation from ``group_records`` today —
+``register_expand_group`` has exactly one production caller (the mint
+site), and nothing else writes this index. A follower that did not
+personally run the opener, or any process after a crash/resume, resolves
+every EXPAND frame to ``None`` (inert) regardless of whether the group is
+genuinely bound — FORK frames are immune (static roster, identical on
+every worker's build), EXPAND frames are not. This is latent rather than
+live today: an EXPAND binding only exists when ``scope_settings`` names a
+collector closer, and any graph with a collector node is refused before
+execution (``graph_registration.py``, WS4 not yet landed) — so
+``_expand_binding_by_opener`` is empty in every executable run and this
+gap cannot fire yet. Closing it (follower/resume EXPAND re-derivation from
+the durable ``group_records`` table, which does carry the opener) is
+carried as WS4/WS5-6 work, not implemented here.
 """
 
 from __future__ import annotations
@@ -148,12 +163,20 @@ class GroupBindingRegistry:
     def register_expand_group(self, group_id: str, *, opener_name: str) -> GroupBinding | None:
         """Associate a runtime-minted EXPAND group id with its scope binding.
 
-        Called unconditionally from the opener's mint path (WS3 wires the
-        TokenManager call site): a declared scope opener returns (and
-        records) its binding; an undeclared expand returns None and records
-        nothing — its frames stay inert forever. Idempotent per group id;
-        re-registering one group under a DIFFERENT opener is an integrity
-        violation (group ids are unique per mint).
+        A declared scope opener returns (and records) its binding; an
+        undeclared expand — `opener_name` not in `_expand_binding_by_opener`
+        — returns None and records nothing, so its frames stay inert
+        forever. Idempotent per group id; re-registering one group under a
+        DIFFERENT opener is an integrity violation (group ids are unique
+        per mint).
+
+        Corrected 2026-08-24 review M5: this method's own undeclared-opener
+        branch above is defensive, not exercised in practice — the single
+        production caller (`TokenManager.expand_token`'s mint path, WS3)
+        PRE-FILTERS via the cached `by_opener_node()` index and only calls
+        this at all when the minting node_id already resolves to a known
+        opener binding. An undeclared expand's mint path never reaches this
+        method; it is simply never called for one.
         """
         if opener_name not in self._expand_binding_by_opener:
             return None
