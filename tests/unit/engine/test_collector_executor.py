@@ -1127,6 +1127,72 @@ class TestRestore:
             )
         assert fresh._executor._pending == {}  # validate-before-mutate
 
+    def _park_complete_group(self, env: _CollectorEnv, fresh: _EnvExecutor, count: int = 2) -> tuple[list[TokenInfo], str]:
+        """Seed a group, complete it durably outside the live executor, and
+        return it ready to be restored as a parked complete roster."""
+        members, group_id = env.seed_group(count=count)
+        env.executor.accept(members[0], "stitch")
+        for member in members[1:]:
+            env.factory.execution.begin_node_state(
+                token_id=member.token_id,
+                node_id=str(env.node_id),
+                run_id=env.run_id,
+                step_index=1,
+                input_data=member.row_data.to_dict(),
+                attempt=0,
+                resume_checkpoint_id=None,
+            )
+        return members, group_id
+
+    def test_flush_sweep_resumes_after_a_plugin_exception_on_a_later_group(self, collector_env: _CollectorEnv) -> None:
+        # Fix round 3 (I-1): two parked groups, the plugin raises on the
+        # SECOND. The first group's close is durable and its outcome must
+        # still reach the caller; the second stays parked; the retry sweep
+        # delivers the first outcome and closes the second. The earlier
+        # shape (clear the parked list, then close in one loop) left the
+        # second group installed-but-unparked and the retry returning () —
+        # the permanently-unflushable wedge the sweep exists to prevent.
+        env = collector_env
+        fresh = env.fresh_executor()
+        members_a, group_a = self._park_complete_group(env, fresh)
+        members_b, group_b = self._park_complete_group(env, fresh)
+        items = [env.blocked_item_for(m, collector_name="stitch") for m in (*members_a, *members_b)]
+        fresh.restore_from_journal(
+            items=items,
+            state_ids=env.state_ids_for(items),
+            attempt_offsets={m.token_id: 0 for m in (*members_a, *members_b)},
+            resume_checkpoint_id="ckpt-1",
+        )
+        assert fresh._executor._restored_complete_keys == [("stitch", group_a), ("stitch", group_b)]
+
+        calls = {"n": 0}
+        original_process = fresh.transform.process
+
+        def raise_on_second(rows: list[PipelineRow], ctx: PluginContext) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("boom on group b")
+            return original_process(rows, ctx)
+
+        fresh.transform.process = raise_on_second  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="boom on group b"):
+            fresh.flush_restored_complete_groups(ctx=env.ctx)
+        # Mutant P-1 (un-park BEFORE the close): group b would be gone from
+        # the parked list here and the retry would return () with b still
+        # installed. Group a closed durably; b stays parked and installed.
+        assert fresh._executor._restored_complete_keys == [("stitch", group_b)]
+        assert ("stitch", group_b) in fresh._executor._pending
+        assert ("stitch", group_a) not in fresh._executor._pending
+        assert env.open_hold_token_ids(node="stitch") == sorted(m.token_id for m in members_b)
+
+        outcomes = fresh.flush_restored_complete_groups(ctx=env.ctx)
+        assert [o.group_id for o in outcomes] == [group_a, group_b]
+        assert all(o.held is False for o in outcomes)
+        assert fresh._executor._restored_complete_keys == []
+        assert fresh.buffered_member_count() == 0
+        assert env.open_hold_token_ids(node="stitch") == []
+        assert fresh.flush_restored_complete_groups(ctx=env.ctx) == ()
+
     def test_flush_sweep_refuses_a_parked_group_that_is_no_longer_roster_complete(self, collector_env: _CollectorEnv) -> None:
         # The sweep's guard is for genuinely inconsistent rosters only:
         # nothing between restore and the sweep may legitimately close or

@@ -171,6 +171,9 @@ class CollectorExecutor:
         # flush_restored_complete_groups to close — the post-restore
         # flush-trigger sweep the resume path must run after restore.
         self._restored_complete_keys: list[tuple[str, str]] = []
+        # Outcomes the sweep closed durably but could not return because a
+        # later group's close raised (I-1): delivered first on the retry.
+        self._undelivered_sweep_outcomes: list[CollectorOutcome] = []
 
     def register_collector(
         self,
@@ -489,7 +492,7 @@ class CollectorExecutor:
         if member_key in pending.lost:
             raise OrchestrationInvariantError(
                 f"Member {member_key!r} already marked lost at collector '{collector_name}' — "
-                f"duplicate loss notification (dedup with has_recorded_member_loss first)."
+                f"duplicate loss notification (the replay must dedup with has_replayed_member_loss first)."
             )
         pending.lost[member_key] = reason
         if self._roster_settled(pending):
@@ -712,15 +715,27 @@ class CollectorExecutor:
         """Post-restore flush-trigger sweep (I-8): close every group
         :meth:`restore_from_journal` installed with an already-complete roster.
 
-        The ``PluginContext``-bearing follow-up restore itself cannot be.
-        Call once per resume, after ``restore_from_journal`` and after WS3's
-        group-loss replay (I-7 order), from the same resume path — the
-        returned outcomes carry the same ``consumed_tokens`` a live closing
-        ``accept()`` would have produced and must reach the settle-member
-        seam exactly as a live outcome does. Idempotent: the parked keys are
-        consumed, so a second call returns ``()``. A group is closed through
-        ``_close_group``, so the require_all-with-losses and every other
-        verdict arm apply unchanged.
+        The ``PluginContext``-bearing follow-up call that restore itself
+        cannot make. Call once per resume, after ``restore_from_journal``
+        and after WS3's group-loss replay (I-7 order), from the same resume
+        path — the returned outcomes carry the same ``consumed_tokens`` a
+        live closing ``accept()`` would have produced and must reach the
+        settle-member seam exactly as a live outcome does. Idempotent: the
+        parked keys are consumed, so a second call returns ``()``. A group
+        is closed through ``_close_group``, so the require_all-with-losses
+        and every other verdict arm apply unchanged.
+
+        Resumable (fix round 3, I-1): every parked key is validated BEFORE
+        any group is closed, and a key is un-parked only AFTER its close
+        succeeds. A plugin exception mid-sweep therefore propagates with the
+        failed group and every later one still parked, and the outcomes of
+        the groups closed before it stashed for delivery — the next call
+        returns those first, then resumes closing. The earlier shape
+        (clear the parked list up front, close in one loop) turned a plugin
+        exception on the second group into the exact wedge this method
+        exists to prevent: group one closed durably with its outcome
+        discarded, group two installed but no longer parked, the retry
+        returning ``()``.
 
         Raises:
             OrchestrationInvariantError: If a parked key no longer names an
@@ -730,17 +745,23 @@ class CollectorExecutor:
                 is itself an invariant error), so its absence is a
                 genuinely inconsistent roster, not a race to tolerate.
         """
-        keys, self._restored_complete_keys = self._restored_complete_keys, []
-        outcomes: list[CollectorOutcome] = []
-        for key in keys:
-            collector_name, group_id = key
+        for collector_name, group_id in self._restored_complete_keys:
+            key = (collector_name, group_id)
             if key not in self._pending or not self._roster_settled(self._pending[key]):
                 raise OrchestrationInvariantError(
                     f"Collector group {group_id!r} at '{collector_name}' was restored with a "
                     "COMPLETE roster but is no longer installed roster-complete at the "
                     "post-restore flush sweep — nothing may close or reopen it in between."
                 )
-            outcomes.append(self._close_group(collector_name, key, self._pending[key], ctx))
+        outcomes, self._undelivered_sweep_outcomes = self._undelivered_sweep_outcomes, []
+        try:
+            while self._restored_complete_keys:
+                key = self._restored_complete_keys[0]
+                outcomes.append(self._close_group(key[0], key, self._pending[key], ctx))
+                del self._restored_complete_keys[0]
+        except BaseException:
+            self._undelivered_sweep_outcomes = outcomes
+            raise
         return tuple(outcomes)
 
     def _check_landscape_for_completion(self, collector_name: str, group_id: str) -> bool:
@@ -886,6 +907,17 @@ class CollectorExecutor:
         # an identity that cannot already be open. Per-member completion
         # below (the entries loop) is the actual "member-hold completion in
         # the style of coalesce's _execute_merge" the plan calls for.
+        #
+        # Fix round 3 (I-1): this invocation CONSUMES its attempt before the
+        # guard opens. On success or a failure RESULT the group leaves
+        # self._pending and the bump is moot; on a plugin EXCEPTION the
+        # guard auto-fails this attempt durably and the group stays
+        # installed, so the post-restore sweep's retry must open the NEXT
+        # attempt — the in-process twin of _open_group's max_attempt + 1
+        # derivation across a takeover (UniqueConstraint(token_id,
+        # step_index, attempt) rejects a re-open at the consumed attempt).
+        flush_attempt = pending.flush_attempt
+        pending.flush_attempt = flush_attempt + 1
         with NodeStateGuard(
             self._execution,
             token_id=pending.opener_token_id,
@@ -899,7 +931,7 @@ class CollectorExecutor:
             # (UniqueConstraint(token_id, node_id, attempt)). Both fields
             # now come from _PendingGroup, derived once by _open_group from
             # the opener's own durable node_state history at this node.
-            attempt=pending.flush_attempt,
+            attempt=flush_attempt,
             resume_checkpoint_id=pending.flush_resume_checkpoint_id,
             auto_fail_phase="collector_flush",
         ) as guard:
