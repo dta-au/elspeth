@@ -266,7 +266,15 @@ class BarrierRestoreReadModel:
         )
 
     def get_group_member_keys(self, *, run_id: str, group_id: str) -> frozenset[str]:
-        """DISTINCT member identities minted into one group (identity set, never a count)."""
+        """DISTINCT member identities minted into one group (identity set, never a count).
+
+        CAVEAT (M-3): an empty ``frozenset()`` is ambiguous between "no such
+        group_id exists" and "a legal M=0 group exists with zero members"
+        (record_empty_expansion / collect_tokens M=0 both mint the latter).
+        Callers that must distinguish the two cases need ``get_group_record``
+        first — its ``None`` vs a real row with ``member_count == 0`` makes
+        the distinction this method cannot.
+        """
         query = (
             select(token_lineage_frames_table.c.member_key)
             .where(
@@ -284,6 +292,18 @@ class BarrierRestoreReadModel:
         Resolved from the OPENER's ``token_parents`` rows -- never from an
         arriving token's own parent chain (a member whose subtree
         forked-and-coalesced arrives as a merged token with a fresh token_id).
+
+        CAVEAT (M-4): keyed on ``parent_token_id`` alone, with no group
+        discrimination. Task 3's collect_tokens makes a MEMBER token the
+        parent of its own release children (``token_parents.parent_token_id
+        = representative.token_id``) -- if the same token_id ever both opens
+        a roster (this method's ``opener_token_id`` sense) AND receives
+        release children as a collect representative, their ordinals would
+        collide in the result. ``uq_group_records_opener`` blocks a token
+        from opening two groups today, which prevents this in practice, but
+        that guarantee is not enforced HERE -- see also the schema comment on
+        ``uq_group_records_opener`` for the collect-release opener's
+        weaker (eventually-sustained) invariant.
         """
         query = select(token_parents_table.c.token_id, token_parents_table.c.ordinal).where(
             token_parents_table.c.run_id == run_id,
@@ -299,6 +319,16 @@ class BarrierRestoreReadModel:
         arch M1), so completion must be tested per GROUP: any completed
         node_state at the node whose token carries a lineage frame in the
         group.
+
+        DEPTH-AGNOSTIC (I-6): the join matches ``group_id`` at ANY frame
+        depth on the token's lineage path, not only its innermost frame. A
+        token whose path carries an ENCLOSING group_id (e.g. an inner
+        collect release nested inside an outer expand) reports that outer
+        group as "completed" too, once the inner one completes at this node
+        -- this is intentional (an enclosing group's membership includes
+        every token descended from it, at any depth), not a bug, but it means
+        this method answers "did SOME token carrying this group_id complete
+        here", not "did THIS group's own closer complete here".
         """
         query = (
             select(node_states_table.c.state_id)
@@ -320,7 +350,15 @@ class BarrierRestoreReadModel:
         return self._ops.execute_fetchone(query) is not None
 
     def has_released_group_for_node(self, *, run_id: str, node_id: str, group_id: str) -> bool:
-        """Status-COMPLETED variant (row_union release discrimination)."""
+        """Status-COMPLETED variant (row_union release discrimination).
+
+        Same DEPTH-AGNOSTIC join as ``has_completed_group_for_node`` (I-6):
+        matches ``group_id`` at any frame depth, not only innermost. The
+        additional ``status == COMPLETED`` predicate is what discriminates
+        this from the plain-completion variant -- a FAILED or other
+        terminal-but-non-COMPLETED node_state with ``completed_at`` set
+        satisfies ``has_completed_group_for_node`` but not this method.
+        """
         query = (
             select(node_states_table.c.state_id)
             .select_from(
@@ -346,7 +384,15 @@ class BarrierRestoreReadModel:
         run_id: str,
         node_ids: frozenset[str],
     ) -> set[tuple[str, str]]:
-        """Completed ``(node_id, group_id)`` pairs -- the group-keyed restore sweep."""
+        """Completed ``(node_id, group_id)`` pairs -- the group-keyed restore sweep.
+
+        DEPTH-AGNOSTIC (I-6): same any-depth join as
+        ``has_completed_group_for_node``. A token whose lineage path carries
+        MULTIPLE group_ids (nested groups) emits one ``(node_id, group_id)``
+        pair PER depth once it completes at that node -- an enclosing
+        group's id appears here alongside its nested group's id, not just
+        the innermost one.
+        """
         if not node_ids:
             return set()
         query = (

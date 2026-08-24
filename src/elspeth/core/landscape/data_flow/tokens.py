@@ -1683,16 +1683,34 @@ class RowTokenRepository:
         output_payloads: Sequence[Mapping[str, object]],
         output_contracts: Sequence[SchemaContract],
         step_in_pipeline: int | None = None,
+        member_lineage_paths: Mapping[str, tuple[LineageFrame, ...]] | None = None,
     ) -> CommittedCollect:
         """Close a bound EXPAND group: strict-pop the closer's frame, mint the release.
 
         The durable Tier-1 twin of ``TokenManager.collect_tokens`` (spec
-        §4.2/§4.4; WS1a's single-frame-write-path guard, spec §11): every
+        §4.2/§4.4; WS1a's single-frame-write-path guard, spec §11). Every
         member's innermost frame must be ``(EXPAND, group_id, <own
-        token_id>)`` — re-derived here from the STORED frames (never trusted
-        from the caller), popped via the shared ``pop_closer_frame`` strict-pop
+        token_id>)``, popped via the shared ``pop_closer_frame`` strict-pop
         contract, and cross-checked for a shared remaining path exactly like
         ``coalesce_tokens``' FORK pop above.
+
+        ``member_lineage_paths`` (decision D8, keyed by token_id, mirroring
+        ``coalesce_tokens``/``expand_token``): when supplied, each member's
+        CURRENT path is cross-checked against its durable mint frames via
+        ``_assert_parent_lineage`` and used — not the mint frames — to compute
+        the pop. This is load-bearing, not cosmetic: a row_union-released
+        member's current path can differ from its mint frames by one popped
+        FORK frame (ruling 27), reachable via
+        ``expand → member → fork → row_union release → collector``. Re-deriving
+        the pop from mint frames alone (the pre-fix behaviour) silently
+        accepts a stale path in that shape. ``None`` (no caller context) falls
+        back to mint frames with no cross-check, the same fallback
+        coalesce_tokens/expand_token use.
+
+        The pop — and the replay-frame check in ``_reconcile_collect_replay``
+        below — run on EVERY drive, replay included (spec §4.4 names collector
+        replay explicitly): the existing-group short-circuit sits AFTER the
+        pop, never before it.
 
         Idempotency mirrors expand_token/fork_token's opener-uniqueness
         discipline (``uq_group_records_opener``): the release group's opener
@@ -1702,11 +1720,19 @@ class RowTokenRepository:
         ``collector_node_id`` identifies the caller for error messages only —
         ``group_records`` carries no node column (a group_id is globally
         unique per run, spec §5).
+
+        M=0 (``output_payloads`` empty) is a LEGAL close, not an arity error:
+        spec §4.3/§5 requires an empty release to leave the same durable
+        footprint a non-empty one does (``record_empty_expansion``'s
+        already-opened-group guard shape, mirrored below) — zero footprint on
+        M=0 is the rev-2 bug class ``group_records`` exists to kill. The
+        arity guard below is deliberately narrower than that: it only refuses
+        a caller that hands mismatched payload/contract list lengths, which is
+        a programming error in the caller (like ``expand_token``'s arity
+        guards), not an audit-completeness question.
         """
         if not member_refs:
             raise AuditIntegrityError("collect_tokens requires at least one member token")
-        if not output_payloads:
-            raise ValueError("collect_tokens requires at least 1 output payload")
         if len(output_payloads) != len(output_contracts):
             raise ValueError("collect_tokens requires output_payloads and output_contracts to align one-for-one")
         ordered_member_ids = tuple(ref.token_id for ref in member_refs)
@@ -1716,12 +1742,14 @@ class RowTokenRepository:
                 f"collect_tokens received duplicate member tokens for collector {collector_node_id!r}; "
                 f"a group roster requires distinct members: {duplicate_member_ids!r}"
             )
-        if self._payload_store is None:
+        if output_payloads and self._payload_store is None:
             raise AuditIntegrityError(
                 "collect_tokens requires a configured payload store — each released child's "
                 "payload must be persisted for resume correctness (epoch 11 invariant). "
                 "Pass payload_store= to DataFlowRepository or RecorderFactory."
             )
+        if self._outcomes is None:
+            raise RuntimeError("collect_tokens requires the token-outcome repository capability")
 
         representative = member_refs[0]
         row_id, run_id = self._ownership.resolve_token_ownership(representative.token_id)
@@ -1744,22 +1772,14 @@ class RowTokenRepository:
         output_data_refs = [sha256(envelope).hexdigest() for envelope in output_envelopes]
 
         with self._db.write_connection() as conn:
-            existing = conn.execute(
-                select(group_records_table.c.group_id, group_records_table.c.member_count)
-                .where(group_records_table.c.run_id == run_id)
-                .where(group_records_table.c.opener_token_id == representative.token_id)
-            ).one_or_none()
-            if existing is not None:
-                return self._reconcile_collect_replay(
-                    conn,
-                    representative=representative,
-                    run_id=run_id,
-                    release_group_id=str(existing.group_id),
-                    committed_member_count=int(existing.member_count),
-                    output_data_refs=output_data_refs,
-                )
+            self._outcomes.lock_token_outcome_dependencies(member_refs, conn=conn)
 
-            member_paths = {ref.token_id: self._load_lineage_frames(conn, token_id=ref.token_id, run_id=run_id) for ref in member_refs}
+            if member_lineage_paths is None:
+                member_paths = {ref.token_id: self._load_lineage_frames(conn, token_id=ref.token_id, run_id=run_id) for ref in member_refs}
+            else:
+                for ref in member_refs:
+                    self._assert_parent_lineage(conn, parent_ref=ref, supplied=member_lineage_paths[ref.token_id])
+                member_paths = {ref.token_id: member_lineage_paths[ref.token_id] for ref in member_refs}
             base_paths: set[tuple[LineageFrame, ...]] = set()
             for ref in member_refs:
                 try:
@@ -1775,6 +1795,46 @@ class RowTokenRepository:
                 )
             base_path = base_paths.pop()
 
+            existing = conn.execute(
+                select(group_records_table.c.group_id, group_records_table.c.member_count)
+                .where(group_records_table.c.run_id == run_id)
+                .where(group_records_table.c.opener_token_id == representative.token_id)
+            ).one_or_none()
+            if existing is not None:
+                return self._reconcile_collect_replay(
+                    conn,
+                    representative=representative,
+                    run_id=run_id,
+                    base_path=base_path,
+                    release_group_id=str(existing.group_id),
+                    committed_member_count=int(existing.member_count),
+                    output_data_refs=output_data_refs,
+                )
+
+            if not output_payloads:
+                # M=0 durable footprint (spec §4.3/§5 authority; mirrors
+                # record_empty_expansion's already-opened-group guard shape,
+                # keyed on the representative member rather than a single
+                # expansion parent). No children, no lineage frames to write —
+                # the empty group_records row IS the release.
+                release_group_id = generate_id()
+                result = conn.execute(
+                    group_records_table.insert().values(
+                        run_id=run_id,
+                        group_id=release_group_id,
+                        kind=FrameKind.EXPAND.value,
+                        opener_token_id=representative.token_id,
+                        member_count=0,
+                        created_at=now(),
+                    )
+                )
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(
+                        f"collect_tokens: empty-release group_records INSERT affected zero rows (group_id={release_group_id})"
+                    )
+                return CommittedCollect(release_group_id=release_group_id, children=())
+
+            assert self._payload_store is not None  # guarded above whenever output_payloads is non-empty
             stored_refs = [self._payload_store.store(envelope) for envelope in output_envelopes]
             if stored_refs != output_data_refs:
                 raise AuditIntegrityError(
@@ -1839,24 +1899,53 @@ class RowTokenRepository:
         *,
         representative: TokenRef,
         run_id: str,
+        base_path: tuple[LineageFrame, ...],
         release_group_id: str,
         committed_member_count: int,
         output_data_refs: Sequence[str],
     ) -> CommittedCollect:
-        """Return a previously committed exact collect release or refuse divergence."""
+        """Return a previously committed exact collect release or refuse divergence.
+
+        Spec §4.4 names collector replay explicitly: a replay asserts the same
+        strict-pop invariant a fresh drive does (the caller already computed
+        ``base_path`` before branching here) and additionally verifies each
+        committed child's PERSISTED frame equals ``base_path`` plus the
+        release EXPAND frame — the same discipline
+        ``_reconcile_fork_replay``/``_reconcile_expansion_replay`` apply to
+        their own children. A pre-fix version of this method skipped that
+        frame check entirely, silently accepting a replay whose caller-derived
+        base_path had drifted from what was actually minted.
+        """
+        if committed_member_count == 0:
+            if output_data_refs:
+                raise AuditIntegrityError(
+                    f"collect_tokens: divergent collect replay for opener token {representative.token_id!r}; "
+                    "the committed release was an empty (M=0) close but this drive requests output"
+                )
+            return CommittedCollect(release_group_id=release_group_id, children=())
+        if not output_data_refs:
+            raise AuditIntegrityError(
+                f"collect_tokens: divergent collect replay for opener token {representative.token_id!r}; "
+                "the committed release had output but this drive requests an empty (M=0) close"
+            )
         children = self._load_children_for_parent(conn, parent_ref=representative)
+        child_paths = self.load_lineage_paths(run_id, [child.token_id for child, _ordinal in children], conn=conn)
         exact = (
             committed_member_count == len(output_data_refs)
             and len(children) == len(output_data_refs)
             and all(
-                child.run_id == run_id and child.token_data_ref == expected_ref and ordinal == expected_ordinal
+                child.run_id == run_id
+                and child.token_data_ref == expected_ref
+                and ordinal == expected_ordinal
+                and child_paths[child.token_id]
+                == _expected_child_frames(base_path, kind=FrameKind.EXPAND, group_id=release_group_id, member_key=child.token_id)
                 for expected_ordinal, ((child, ordinal), expected_ref) in enumerate(zip(children, output_data_refs, strict=True))
             )
         )
         if not exact:
             raise AuditIntegrityError(
                 f"collect_tokens: divergent collect replay for opener token {representative.token_id!r}; "
-                "the requested outputs do not match the committed release"
+                "the requested outputs or persisted lineage frames do not match the committed release"
             )
         return CommittedCollect(
             release_group_id=release_group_id,

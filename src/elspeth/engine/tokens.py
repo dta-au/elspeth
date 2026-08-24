@@ -434,7 +434,9 @@ class TokenManager:
         ``path[-1]`` matches kind+group_id exactly (empty paths included).
         The emission is RATIFIED (2026-08-22 synthesis): the aggregation-flush
         precedent — outputs form a fresh EXPAND group over the popped base
-        path (inert unless bound).
+        path (inert unless bound). An empty ``output_rows`` (M=0) still mints
+        a durable, idempotent empty release group (fix-round ruling 1, spec
+        §4.3/§5) — only the engine-visible return is trivially ``()``.
         """
         if not members:
             raise OrchestrationInvariantError("collect_tokens requires at least one member token")
@@ -449,9 +451,11 @@ class TokenManager:
                     f"remaining path after the strict pop of EXPAND group {group_id!r} — "
                     f"{popped!r} != {base_path!r} (spec §4.2). Engine/validation bug."
                 )
-        if not output_rows:
-            return ()
-
+        # The durable half is called unconditionally, including M=0: spec
+        # §4.3/§5 requires an empty release to leave the same durable
+        # footprint a non-empty one does (fix-round ruling 1, overriding the
+        # plan's "mint nothing" text). The engine-visible return stays ()
+        # either way — ``committed.children`` is empty when output_rows is.
         step = self._step_resolver(node_id)
         committed = self._data_flow.collect_tokens(
             member_refs=[TokenRef(token_id=m.token_id, run_id=run_id) for m in members],
@@ -460,6 +464,7 @@ class TokenManager:
             output_payloads=[row.to_dict() for row in output_rows],
             output_contracts=[row.contract for row in output_rows],
             step_in_pipeline=step,
+            member_lineage_paths={m.token_id: m.lineage_path for m in members},
         )
         release_frames = tuple(
             (*base_path, LineageFrame(kind=FrameKind.EXPAND, group_id=committed.release_group_id, member_key=child.token_id))

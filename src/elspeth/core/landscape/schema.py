@@ -1079,10 +1079,25 @@ group_records_table = Table(
     CheckConstraint(_enum_in_check("kind", FrameKind), name="ck_group_records_kind"),
     ForeignKeyConstraint(["opener_token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
 )
-# One token opens at most one group: every opener records a terminal parent
-# disposition (FORK_PARENT / EXPAND_PARENT / BATCH_CONSUMED / FILTER_DROPPED)
-# in the same claim, so a second open is unreachable. This uniqueness is what
-# makes the empty-expansion mint idempotent under re-driven claims.
+# One token opens at most one group. For fork/expand openers: every opener
+# records a terminal parent disposition (FORK_PARENT / EXPAND_PARENT /
+# BATCH_CONSUMED / FILTER_DROPPED) in the same claim, so a second open is
+# unreachable — this uniqueness is what makes the empty-expansion mint
+# idempotent under re-driven claims.
+#
+# For a COLLECT release's opener (a group MEMBER token, not an "opener" in
+# the fork/expand sense): collect_tokens writes no terminal disposition for
+# the representative member in the same claim (WS4 fix-round ruling + B-2
+# amendment — collector member terminals ride the WS3 settlement seam by
+# design, the same "closers stop writing token terminals" split fork/expand
+# openers already follow). The uniqueness invariant for this case is
+# EVENTUALLY-sustained via that settlement seam once the WS4 integration item
+# wires CloserKind.COLLECTOR dispatch into it; before that lands there is a
+# crash window in which a representative could theoretically be claimed a
+# second time without its terminal write having landed, and any takeover
+# replay across that window must tolerate it via collect_tokens' idempotent
+# replay skip (the existing group_records row short-circuits the re-drive
+# rather than re-minting).
 Index(
     "uq_group_records_opener",
     group_records_table.c.run_id,

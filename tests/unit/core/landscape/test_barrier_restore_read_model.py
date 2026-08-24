@@ -355,3 +355,81 @@ def test_get_completed_group_ids_for_nodes_pairs() -> None:
     pairs = setup.factory.barrier_restore.get_completed_group_ids_for_nodes(setup.run_id, frozenset({node_id}))
     assert pairs == {(node_id, "g-fork-1")}
     assert setup.factory.barrier_restore.get_completed_group_ids_for_nodes("other-run", frozenset({node_id})) == set()
+
+
+def test_group_completion_joins_match_any_frame_depth_not_only_innermost() -> None:
+    """I-6: the three group_id-keyed joins (has_completed_group_for_node,
+    has_released_group_for_node, get_completed_group_ids_for_nodes) match a
+    frame at ANY depth on the token's lineage path, not only its innermost
+    frame -- this is intentional (an enclosing group's membership includes
+    every descendant token, at any depth) but was previously undocumented
+    and untested. Pin it: a token whose path carries TWO group_ids (an
+    outer FORK wrapping an inner EXPAND) reports BOTH as completed/released
+    once the token completes at the node, and get_completed_group_ids_for_nodes
+    emits one pair PER depth."""
+    setup = make_recorder_with_run(run_id="run-restore-group-nested-depth")
+    node_id = register_test_node(setup.factory.data_flow, setup.run_id, "merge_x")
+    row = setup.factory.data_flow.create_row(
+        setup.run_id,
+        setup.source_node_id,
+        0,
+        {"id": 1},
+        source_row_index=0,
+        ingest_sequence=0,
+        row_id="row-1",
+    )
+    nested_token = setup.factory.data_flow.create_token(
+        row_id=row.row_id,
+        token_id="token-nested",
+        lineage_path=(
+            LineageFrame(kind=FrameKind.FORK, group_id="g-outer-fork", member_key="left"),
+            LineageFrame(kind=FrameKind.EXPAND, group_id="g-inner-expand", member_key="token-nested"),
+        ),
+    )
+    state = setup.factory.execution.begin_node_state(nested_token.token_id, node_id, setup.run_id, 1, {"id": 1})
+    setup.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+
+    reads = setup.factory.barrier_restore
+    assert reads.has_completed_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-outer-fork") is True
+    assert reads.has_completed_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-inner-expand") is True
+    assert reads.has_released_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-outer-fork") is True
+    assert reads.has_released_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-inner-expand") is True
+
+    pairs = reads.get_completed_group_ids_for_nodes(setup.run_id, frozenset({node_id}))
+    assert pairs == {(node_id, "g-outer-fork"), (node_id, "g-inner-expand")}
+
+
+def test_has_released_group_for_node_discriminates_completed_from_failed() -> None:
+    """M-2: the only prior test for has_released_group_for_node used a
+    COMPLETED state throughout, so a mutant deleting the ``status ==
+    COMPLETED`` predicate would survive (has_completed_group_for_node's
+    weaker completed_at-only check gives the same answer). Pin the
+    discrimination with a FAILED state, which sets completed_at but is not
+    COMPLETED."""
+    from elspeth.contracts.errors import ExecutionError
+
+    setup = make_recorder_with_run(run_id="run-restore-group-failed-vs-completed")
+    node_id = register_test_node(setup.factory.data_flow, setup.run_id, "merge_x")
+    row = setup.factory.data_flow.create_row(
+        setup.run_id,
+        setup.source_node_id,
+        0,
+        {"id": 1},
+        source_row_index=0,
+        ingest_sequence=0,
+        row_id="row-1",
+    )
+    failed_token = setup.factory.data_flow.create_token(
+        row_id=row.row_id,
+        token_id="token-failed",
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-failed", member_key="left"),),
+    )
+    state = setup.factory.execution.begin_node_state(failed_token.token_id, node_id, setup.run_id, 1, {"id": 1})
+    error = ExecutionError(exception="boom", exception_type="ValueError")
+    setup.factory.execution.complete_node_state(state.state_id, NodeStateStatus.FAILED, error=error, duration_ms=1.0)
+
+    reads = setup.factory.barrier_restore
+    # completed_at IS set on a FAILED state -- the weaker check reports True.
+    assert reads.has_completed_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-fork-failed") is True
+    # status != COMPLETED -- the release check must NOT.
+    assert reads.has_released_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-fork-failed") is False

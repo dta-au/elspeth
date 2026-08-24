@@ -115,10 +115,15 @@ class TestCollectTokensPathAlgebra:
                 group_id=group_a,
             )
 
-    def test_empty_output_mints_nothing(self) -> None:
+    def test_empty_output_mints_nothing_engine_side_but_mints_a_durable_empty_release(self) -> None:
+        """Ruling 1 (fix-round): the engine-visible return stays () for M=0,
+        but the durable half must NOT be skipped — an empty release still
+        needs the same idempotent group_records footprint a non-empty one
+        gets (spec §4.3/§5), the exact rev-2 bug class group_records exists
+        to kill."""
         from elspeth.contracts import SourceRow
 
-        manager, _factory, run_id, source_node_id = _make_manager_context()
+        manager, factory, run_id, source_node_id = _make_manager_context()
         initial = manager.create_initial_token(
             run_id=run_id,
             source_node_id=source_node_id,
@@ -143,6 +148,11 @@ class TestCollectTokensPathAlgebra:
             group_id=group_id,
         )
         assert released == ()
+
+        records = factory.data_flow.get_group_records_for_run(run_id)
+        empty_releases = [r for r in records if r["opener_token_id"] == members[0].token_id and r["group_id"] != group_id]
+        assert len(empty_releases) == 1
+        assert empty_releases[0]["member_count"] == 0
 
     def test_requires_at_least_one_member(self) -> None:
         manager, _factory, run_id, _source_node_id = _make_manager_context()

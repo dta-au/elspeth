@@ -412,6 +412,7 @@ class DataFlowRepository:
         output_payloads: Sequence[Mapping[str, object]],
         output_contracts: Sequence[SchemaContract],
         step_in_pipeline: int | None = None,
+        member_lineage_paths: Mapping[str, tuple[LineageFrame, ...]] | None = None,
     ) -> CommittedCollect:
         """Close a bound EXPAND group: strict-pop the closer's frame, mint the release."""
         return self.tokens.collect_tokens(
@@ -421,6 +422,7 @@ class DataFlowRepository:
             output_payloads,
             output_contracts,
             step_in_pipeline=step_in_pipeline,
+            member_lineage_paths=member_lineage_paths,
         )
 
     def record_empty_expansion(self, parent_ref: TokenRef) -> str:
