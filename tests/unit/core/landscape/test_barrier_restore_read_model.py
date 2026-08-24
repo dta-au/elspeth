@@ -166,96 +166,6 @@ def test_barrier_restore_read_model_finds_one_durable_group_loss_by_closer() -> 
     assert reads.row_id_for_token(run_id=setup.run_id, token_id="no-such-token") is None
 
 
-def test_barrier_restore_read_model_reports_completed_coalesce_row_ids() -> None:
-    setup = make_recorder_with_run(run_id="run-restore-completed")
-    node_id = register_test_node(setup.factory.data_flow, setup.run_id, "coalesce-node")
-    other_node_id = register_test_node(setup.factory.data_flow, setup.run_id, "other-coalesce-node")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
-        setup.source_node_id,
-        0,
-        {"id": 1},
-        source_row_index=0,
-        ingest_sequence=0,
-        row_id="row-done",
-    )
-    token = setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-done")
-    open_row = setup.factory.data_flow.create_row(
-        setup.run_id,
-        setup.source_node_id,
-        1,
-        {"id": 2},
-        source_row_index=1,
-        ingest_sequence=1,
-        row_id="row-open",
-    )
-    open_token = setup.factory.data_flow.create_token(row_id=open_row.row_id, token_id="token-open")
-    state = setup.factory.execution.begin_node_state(
-        token.token_id,
-        node_id,
-        setup.run_id,
-        1,
-        {"id": 1},
-    )
-    setup.factory.execution.complete_node_state(
-        state.state_id,
-        NodeStateStatus.COMPLETED,
-        output_data={"id": 1},
-        duration_ms=1.0,
-    )
-    setup.factory.execution.begin_node_state(
-        open_token.token_id,
-        node_id,
-        setup.run_id,
-        1,
-        {"id": 2},
-    )
-
-    assert setup.factory.barrier_restore.get_completed_row_ids_for_nodes(
-        setup.run_id,
-        frozenset({node_id, other_node_id}),
-    ) == {(node_id, "row-done")}
-    assert (
-        setup.factory.barrier_restore.get_completed_row_ids_for_nodes(
-            "other-run",
-            frozenset({node_id}),
-        )
-        == set()
-    )
-    assert (
-        setup.factory.barrier_restore.has_completed_row_for_node(
-            run_id=setup.run_id,
-            node_id=node_id,
-            row_id="row-done",
-        )
-        is True
-    )
-    assert (
-        setup.factory.barrier_restore.has_completed_row_for_node(
-            run_id=setup.run_id,
-            node_id=other_node_id,
-            row_id="row-done",
-        )
-        is False
-    )
-    assert (
-        setup.factory.barrier_restore.has_completed_row_for_node(
-            run_id="other-run",
-            node_id=node_id,
-            row_id="row-done",
-        )
-        is False
-    )
-    assert (
-        setup.factory.barrier_restore.has_completed_row_for_node(
-            run_id=setup.run_id,
-            node_id=node_id,
-            row_id="row-open",
-        )
-        is False
-    )
-
-
 def test_group_member_reads_roster_from_frames_and_group_record() -> None:
     # Opener token expands into 2 members (ordinals 0, 1). WS1a's production
     # expand write mints group_records(member_count=2) and one
@@ -362,9 +272,8 @@ def test_get_completed_group_ids_for_nodes_pairs() -> None:
 
 
 def test_get_released_group_ids_for_nodes_pairs_and_discriminates_from_failed() -> None:
-    # WS4 Task 12 / F-1 (elspeth-14660ce1c0): group-keyed sibling of
-    # get_released_row_ids_for_nodes, needed by the row_union crash-window
-    # holdless-reconcile. Both tokens share row_id -- the sibling-fork-group
+    # WS4 Task 12 / F-1 (elspeth-14660ce1c0): the group-keyed released sweep
+    # the row_union crash-window holdless-reconcile needs. Both tokens share row_id -- the sibling-fork-group
     # collision this workstream exists for -- and only the COMPLETED one may
     # appear; a mutant deleting the ``status == COMPLETED`` predicate would
     # let the FAILED sibling's group through too (completed_at is set on a

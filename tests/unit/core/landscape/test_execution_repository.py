@@ -575,87 +575,13 @@ class TestCompleteNodeStateCrashPaths:
         assert isinstance(result_f, NodeStateFailed)
 
 
-class TestCompletedRowLookup:
-    """Exact completed-row lookup for coalesce late-arrival detection."""
+class TestReleasedTokenLookup:
+    """Released-only (status COMPLETED) token-scoped read for row_union restore.
 
-    def test_has_completed_row_for_node_scopes_by_run_node_and_row(self) -> None:
-        _db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        fac.data_flow.create_token("row-2", token_id="tok-2")
-
-        first = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
-        second = repo.begin_node_state("tok-2", "transform-1", "run-1", 1, {"name": "second"})
-        repo.complete_node_state(first.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
-        repo.complete_node_state(second.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
-
-        assert repo.has_completed_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-1") is True
-        assert repo.has_completed_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-2") is True
-        assert repo.has_completed_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-missing") is False
-        assert repo.has_completed_row_for_node(run_id="run-1", node_id="sink-0", row_id="row-1") is False
-        assert repo.has_completed_row_for_node(run_id="run-missing", node_id="transform-1", row_id="row-1") is False
-
-    def test_has_completed_row_for_node_ignores_open_state(self) -> None:
-        _db, repo, _fac, tok = _make_repo_with_token()
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
-
-        assert repo.has_completed_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-1") is False
-
-
-class TestReleasedRowLookup:
-    """Released-only (status COMPLETED) row reads for row_union restore.
-
-    A FAILED closure has completed_at set too, so the completed reads see it;
-    the released reads must not — a failure-closed row_union group is not a
-    released one.
+    A FAILED closure has completed_at set too, so completion evidence alone
+    cannot discriminate — a failure-closed row_union group is not a released
+    one.
     """
-
-    def test_released_reads_exclude_failed_closures(self) -> None:
-        _db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        fac.data_flow.create_token("row-2", token_id="tok-2")
-
-        released = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
-        failed = repo.begin_node_state("tok-2", "transform-1", "run-1", 1, {"name": "second"})
-        repo.complete_node_state(released.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
-        repo.complete_node_state(
-            failed.state_id,
-            NodeStateStatus.FAILED,
-            error=ExecutionError(exception="group failed", exception_type="ValueError"),
-            duration_ms=1.0,
-        )
-
-        assert repo.get_completed_row_ids_for_nodes("run-1", frozenset({"transform-1"})) == {
-            ("transform-1", "row-1"),
-            ("transform-1", "row-2"),
-        }
-        assert repo.get_released_row_ids_for_nodes("run-1", frozenset({"transform-1"})) == {("transform-1", "row-1")}
-        assert repo.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-1") is True
-        assert repo.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-2") is False
-        assert repo.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-missing") is False
-
-    def test_restore_read_model_released_reads_exclude_failed_closures(self) -> None:
-        _db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        fac.data_flow.create_token("row-2", token_id="tok-2")
-
-        released = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
-        failed = repo.begin_node_state("tok-2", "transform-1", "run-1", 1, {"name": "second"})
-        repo.complete_node_state(released.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
-        repo.complete_node_state(
-            failed.state_id,
-            NodeStateStatus.FAILED,
-            error=ExecutionError(exception="group failed", exception_type="ValueError"),
-            duration_ms=1.0,
-        )
-
-        reads = fac.barrier_restore
-        assert reads.get_completed_row_ids_for_nodes("run-1", frozenset({"transform-1"})) == {
-            ("transform-1", "row-1"),
-            ("transform-1", "row-2"),
-        }
-        assert reads.get_released_row_ids_for_nodes("run-1", frozenset({"transform-1"})) == {("transform-1", "row-1")}
-        assert reads.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-1") is True
-        assert reads.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-2") is False
 
     def test_find_released_node_state_token_ids_is_token_scoped(self) -> None:
         # The residual shape: two tokens share ONE row at the union node — the
@@ -676,7 +602,6 @@ class TestReleasedRowLookup:
         )
 
         reads = fac.barrier_restore
-        assert reads.get_released_row_ids_for_nodes("run-1", frozenset({"transform-1"})) == {("transform-1", "row-1")}
         assert reads.find_released_node_state_token_ids(
             "run-1",
             node_ids=["transform-1"],
@@ -2869,12 +2794,6 @@ class TestDelegationSignatureAlignment:
             id="complete_node_states_completed_many",
         ),
         pytest.param(
-            "get_completed_row_ids_for_nodes",
-            lambda execution: execution.get_completed_row_ids_for_nodes,
-            ExecutionRepository.get_completed_row_ids_for_nodes,
-            id="get_completed_row_ids_for_nodes",
-        ),
-        pytest.param(
             "get_max_node_state_attempts",
             lambda execution: execution.get_max_node_state_attempts,
             ExecutionRepository.get_max_node_state_attempts,
@@ -2885,24 +2804,6 @@ class TestDelegationSignatureAlignment:
             lambda execution: execution.get_open_node_state_ids,
             ExecutionRepository.get_open_node_state_ids,
             id="get_open_node_state_ids",
-        ),
-        pytest.param(
-            "get_released_row_ids_for_nodes",
-            lambda execution: execution.get_released_row_ids_for_nodes,
-            ExecutionRepository.get_released_row_ids_for_nodes,
-            id="get_released_row_ids_for_nodes",
-        ),
-        pytest.param(
-            "has_completed_row_for_node",
-            lambda execution: execution.has_completed_row_for_node,
-            ExecutionRepository.has_completed_row_for_node,
-            id="has_completed_row_for_node",
-        ),
-        pytest.param(
-            "has_released_row_for_node",
-            lambda execution: execution.has_released_row_for_node,
-            ExecutionRepository.has_released_row_for_node,
-            id="has_released_row_for_node",
         ),
         pytest.param(
             "row_id_for_token",

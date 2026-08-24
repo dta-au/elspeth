@@ -372,37 +372,13 @@ class ExecutionRepository:
         """Outstanding (OPEN) node_state hold ids per token at the given nodes."""
         return self.node_states.get_open_node_state_ids(run_id, node_ids=node_ids, token_ids=token_ids)
 
-    def get_completed_row_ids_for_nodes(
-        self,
-        run_id: str,
-        node_ids: frozenset[str],
-    ) -> set[tuple[str, str]]:
-        """Get (node_id, row_id) pairs where a node_state has been completed."""
-        return self.node_states.get_completed_row_ids_for_nodes(run_id, node_ids)
-
-    def has_completed_row_for_node(self, *, run_id: str, node_id: str, row_id: str) -> bool:
-        """Return whether one row completed at one node in one run."""
-        return self.node_states.has_completed_row_for_node(run_id=run_id, node_id=node_id, row_id=row_id)
-
-    def get_released_row_ids_for_nodes(
-        self,
-        run_id: str,
-        node_ids: frozenset[str],
-    ) -> set[tuple[str, str]]:
-        """Get (node_id, row_id) pairs where a node_state completed as COMPLETED."""
-        return self.node_states.get_released_row_ids_for_nodes(run_id, node_ids)
-
-    def has_released_row_for_node(self, *, run_id: str, node_id: str, row_id: str) -> bool:
-        """Return whether one row completed as COMPLETED at one node in one run."""
-        return self.node_states.has_released_row_for_node(run_id=run_id, node_id=node_id, row_id=row_id)
-
     def row_id_for_token(self, *, run_id: str, token_id: str) -> str | None:
         """Return the durable row_id for one token, or None if it never minted.
 
-        Transitional resolution (spec §5/§6.2): mirrors
-        :meth:`BarrierRestoreReadModel.row_id_for_token` for callers that
-        construct the barrier-intake/recovery coordinators with this
-        compatibility facade instead of the narrower read model.
+        Mirrors :meth:`BarrierRestoreReadModel.row_id_for_token` for callers
+        that construct the barrier-intake coordinator with this compatibility
+        facade instead of the narrower read model; it resolves the row-scoped
+        ``scope_row_id`` for a coalesce merge fire (spec §5/§6.2).
         """
         query = select(tokens_table.c.row_id).where(
             tokens_table.c.token_id == token_id,

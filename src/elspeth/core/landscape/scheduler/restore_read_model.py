@@ -257,53 +257,6 @@ class BarrierRestoreReadModel:
                 result[row.token_id] = row.state_id
         return result
 
-    def get_completed_row_ids_for_nodes(
-        self,
-        run_id: str,
-        node_ids: frozenset[str],
-    ) -> set[tuple[str, str]]:
-        """Completed ``(node_id, row_id)`` pairs for coalesce restore."""
-        if not node_ids:
-            return set()
-
-        query = (
-            select(node_states_table.c.node_id, tokens_table.c.row_id)
-            .select_from(
-                node_states_table.join(
-                    tokens_table,
-                    node_states_table.c.token_id == tokens_table.c.token_id,
-                )
-            )
-            .where(
-                node_states_table.c.run_id == run_id,
-                node_states_table.c.node_id.in_(node_ids),
-                node_states_table.c.completed_at.isnot(None),
-            )
-            .distinct()
-        )
-        rows = self._ops.execute_fetchall(query)
-        return {(row.node_id, row.row_id) for row in rows}
-
-    def has_completed_row_for_node(self, *, run_id: str, node_id: str, row_id: str) -> bool:
-        """Return whether one coalesce row completed at one node in one run."""
-        query = (
-            select(node_states_table.c.state_id)
-            .select_from(
-                node_states_table.join(
-                    tokens_table,
-                    node_states_table.c.token_id == tokens_table.c.token_id,
-                )
-            )
-            .where(
-                node_states_table.c.run_id == run_id,
-                node_states_table.c.node_id == node_id,
-                tokens_table.c.row_id == row_id,
-                node_states_table.c.completed_at.isnot(None),
-            )
-            .limit(1)
-        )
-        return self._ops.execute_fetchone(query) is not None
-
     def get_group_record(self, *, run_id: str, group_id: str) -> GroupRecordRow | None:
         """Durable roster authority for one group (spec §5 'minted')."""
         query = select(
@@ -375,12 +328,12 @@ class BarrierRestoreReadModel:
         return {row.token_id: row.ordinal for row in rows}
 
     def has_completed_group_for_node(self, *, run_id: str, node_id: str, group_id: str) -> bool:
-        """Group-keyed sibling of has_completed_row_for_node.
+        """Return whether one group completed at one node in one run.
 
         Two sibling groups can share a row_id at one closer node (spec §5,
-        arch M1), so completion must be tested per GROUP: any completed
-        node_state at the node whose token carries a lineage frame in the
-        group.
+        arch M1), so completion is tested per GROUP, never per row: any
+        completed node_state at the node whose token carries a lineage frame
+        in the group.
 
         DEPTH-AGNOSTIC (I-6): the join matches ``group_id`` at ANY frame
         depth on the token's lineage path, not only its innermost frame. A
@@ -561,44 +514,6 @@ class BarrierRestoreReadModel:
         rows = self._ops.execute_fetchall(query)
         return {(row.node_id, row.group_id) for row in rows}
 
-    def get_released_row_ids_for_nodes(
-        self,
-        run_id: str,
-        node_ids: frozenset[str],
-    ) -> set[tuple[str, str]]:
-        """Status-COMPLETED ``(node_id, row_id)`` pairs, row-keyed.
-
-        Released-only sibling of :meth:`get_completed_row_ids_for_nodes`: a
-        FAILED closure has ``completed_at`` set too, so a released-group
-        classification must filter on status. WS4 Task 12: row_union's
-        crash-window holdless-reconcile — the last row-keyed production
-        caller — moved onto the group-keyed sibling
-        :meth:`get_released_group_ids_for_nodes` (arch-M1). This row-keyed
-        method currently has no production caller; it stays a public,
-        directly-tested read-model primitive pending a ruling on removal.
-        """
-        if not node_ids:
-            return set()
-
-        query = (
-            select(node_states_table.c.node_id, tokens_table.c.row_id)
-            .select_from(
-                node_states_table.join(
-                    tokens_table,
-                    node_states_table.c.token_id == tokens_table.c.token_id,
-                )
-            )
-            .where(
-                node_states_table.c.run_id == run_id,
-                node_states_table.c.node_id.in_(node_ids),
-                node_states_table.c.completed_at.isnot(None),
-                node_states_table.c.status == NodeStateStatus.COMPLETED.value,
-            )
-            .distinct()
-        )
-        rows = self._ops.execute_fetchall(query)
-        return {(row.node_id, row.row_id) for row in rows}
-
     def get_released_group_ids_for_nodes(
         self,
         run_id: str,
@@ -607,12 +522,12 @@ class BarrierRestoreReadModel:
         """Status-COMPLETED ``(node_id, group_id)`` pairs -- the group-keyed
         released sweep (F-1, elspeth-14660ce1c0).
 
-        Group-keyed sibling of :meth:`get_released_row_ids_for_nodes`, same
-        relationship as :meth:`get_completed_group_ids_for_nodes` is to
-        :meth:`get_completed_row_ids_for_nodes`: two sibling fork groups can
+        Released-only sibling of :meth:`get_completed_group_ids_for_nodes`:
+        a FAILED closure has ``completed_at`` set too, so a released-group
+        classification must filter on status. Two sibling fork groups can
         share a row_id at one row_union node (spec §5, arch-M1), so the
-        crash-window holdless-reconcile's release probe must discriminate by
-        GROUP, not row. DEPTH-AGNOSTIC (I-6) like its completed-pairs
+        crash-window holdless-reconcile's release probe discriminates by
+        GROUP, never by row. DEPTH-AGNOSTIC (I-6) like its completed-pairs
         sibling: a token whose lineage path carries multiple group_ids
         emits one ``(node_id, group_id)`` pair per depth once it releases at
         that node.
@@ -639,34 +554,14 @@ class BarrierRestoreReadModel:
         rows = self._ops.execute_fetchall(query)
         return {(row.node_id, row.group_id) for row in rows}
 
-    def has_released_row_for_node(self, *, run_id: str, node_id: str, row_id: str) -> bool:
-        """Return whether one row completed as COMPLETED at one node in one run."""
-        query = (
-            select(node_states_table.c.state_id)
-            .select_from(
-                node_states_table.join(
-                    tokens_table,
-                    node_states_table.c.token_id == tokens_table.c.token_id,
-                )
-            )
-            .where(
-                node_states_table.c.run_id == run_id,
-                node_states_table.c.node_id == node_id,
-                tokens_table.c.row_id == row_id,
-                node_states_table.c.completed_at.isnot(None),
-                node_states_table.c.status == NodeStateStatus.COMPLETED.value,
-            )
-            .limit(1)
-        )
-        return self._ops.execute_fetchone(query) is not None
-
     def row_id_for_token(self, *, run_id: str, token_id: str) -> str | None:
         """Return the durable row_id for one token, or None if it never minted.
 
-        Transitional resolution (spec §5/§6.2): the unified ``group_losses``
-        ledger carries no ``row_id`` — callers that still key on
-        ``(closer_name, row_id)`` resolve it from the token's own durable
-        row here.
+        The unified ``group_losses`` ledger carries no ``row_id`` (spec
+        §5/§6.2); the barrier intake coordinator resolves the row-scoped
+        ``scope_row_id`` for a coalesce merge fire from the token's own
+        durable row here. Every group-keyed executor call takes
+        ``loss.group_id`` directly and never needs this.
         """
         query = select(tokens_table.c.row_id).where(
             tokens_table.c.token_id == token_id,
@@ -1342,11 +1237,11 @@ class BarrierRestoreReadModel:
     ) -> frozenset[str]:
         """Token ids holding a status-COMPLETED node_state at the given nodes.
 
-        Token-scoped sibling of :meth:`get_released_row_ids_for_nodes`: release
-        evidence for a (node, row) key proves the GROUP released, but a
-        late-arrival residual shares that key while its own closure at the
-        barrier node is FAILED. Restore's released-group reconstruction must
-        admit only tokens the release itself completed.
+        Token-scoped sibling of :meth:`get_released_group_ids_for_nodes`:
+        release evidence for a (node, group) key proves the GROUP released,
+        but a late-arrival residual shares that key while its own closure at
+        the barrier node is FAILED. Restore's released-group reconstruction
+        must admit only tokens the release itself completed.
         """
         if not node_ids:
             return frozenset()

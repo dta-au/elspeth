@@ -1727,8 +1727,8 @@ class TestForkRecoveryInvariant:
         #   5. branch tokens' COALESCED outcomes (path='coalesced', jgid=join_group_id)
         #   6. branch tokens' COMPLETED node_states at the coalesce node —
         #      CoalesceExecutor._check_landscape_for_completion queries
-        #      get_completed_row_ids_for_nodes which joins node_states→tokens and
-        #      checks completed_at IS NOT NULL; if these remain, accept() sees
+        #      has_completed_group_for_node which joins node_states→lineage
+        #      frames and checks completed_at IS NOT NULL; if these remain, accept() sees
         #      "already completed" and records a spurious UNROUTED outcome instead
         #      of holding/merging the re-driven branch tokens.
         #

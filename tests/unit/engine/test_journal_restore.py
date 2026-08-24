@@ -115,7 +115,6 @@ def _coalesce_restorer(
     clock: MockClock | None = None,
 ) -> CoalesceJournalRestorer:
     execution = MagicMock(spec=ExecutionRepository)
-    execution.get_completed_row_ids_for_nodes.return_value = set()
     # get_completed_group_ids_for_nodes lives on BarrierRestoreReadModel, not
     # ExecutionRepository (spec-checked here) — a fully autospec'd read-model
     # INSTANCE (not a bare `spec=` on the unbound function, which would
@@ -128,7 +127,6 @@ def _coalesce_restorer(
         settings=settings if settings is not None else {"merge": _coalesce_settings()},
         node_ids=node_ids if node_ids is not None else {"merge": NodeID("co-1")},
         barrier_restore_reads=SimpleNamespace(
-            get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
             get_completed_group_ids_for_nodes=execution.get_completed_group_ids_for_nodes,
         ),
         run_id="run_1",
@@ -421,8 +419,6 @@ class TestCoalesceFacadeValidateBeforeMutate:
 
     def _make_executor(self, settings: CoalesceSettings | None = None) -> CoalesceExecutor:
         execution = MagicMock(spec=ExecutionRepository)
-        execution.get_completed_row_ids_for_nodes.return_value = set()
-        execution.has_completed_row_for_node.return_value = False
         # has_completed_group_for_node/get_completed_group_ids_for_nodes live
         # on BarrierRestoreReadModel, not ExecutionRepository (spec-checked
         # here). A fully autospec'd read-model INSTANCE (not a bare `spec=`
@@ -446,8 +442,6 @@ class TestCoalesceFacadeValidateBeforeMutate:
             data_flow=MagicMock(spec=DataFlowRepository),
             clock=MockClock(start=100.0),
             barrier_restore_reads=SimpleNamespace(
-                get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
-                has_completed_row_for_node=execution.has_completed_row_for_node,
                 has_completed_group_for_node=execution.has_completed_group_for_node,
                 get_completed_group_ids_for_nodes=execution.get_completed_group_ids_for_nodes,
             ),

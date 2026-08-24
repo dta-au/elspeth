@@ -86,12 +86,6 @@ class _FakeExecutionRepository:
     def complete_node_state(self, **_: Any) -> None:
         return None
 
-    def get_completed_row_ids_for_nodes(self, **_: Any) -> list[str]:
-        return []
-
-    def has_completed_row_for_node(self, **_: Any) -> bool:
-        return False
-
     def has_completed_group_for_node(self, **_: Any) -> bool:
         return False
 
@@ -204,8 +198,6 @@ def make_mock_executor(clock: MockClock | None = None) -> _TestCoalesceExecutor:
         clock=clock or MockClock(start=0.0),
         data_flow=data_flow,
         barrier_restore_reads=SimpleNamespace(
-            get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
-            has_completed_row_for_node=execution.has_completed_row_for_node,
             has_completed_group_for_node=execution.has_completed_group_for_node,
         ),
     )

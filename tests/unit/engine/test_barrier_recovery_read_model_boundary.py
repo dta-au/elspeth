@@ -10,20 +10,16 @@ RESTORE_READ_METHODS = {
 }
 RESTORE_NODE_STATE_READ_METHODS = {
     "find_released_node_state_token_ids",
-    "get_completed_row_ids_for_nodes",
-    "get_completed_group_ids_for_nodes",  # WS4 T2: group-keyed sibling of get_completed_row_ids_for_nodes
+    "get_completed_group_ids_for_nodes",  # WS4 T2: group-keyed completed sweep
     "get_max_node_state_attempts",
     "get_max_node_state_attempts_for_node",  # WS4 T7: node-scoped sibling (META-14.1 opener attempt)
     "get_open_node_state_ids",
-    "get_released_row_ids_for_nodes",
-    "get_released_group_ids_for_nodes",  # WS4 T12/F-1: group-keyed sibling of get_released_row_ids_for_nodes
+    "get_released_group_ids_for_nodes",  # WS4 T12/F-1: group-keyed released sweep
     "get_settled_member_token_ids",  # WS4 T7: settled-token twin of has_completed_group_for_node (META-20b)
     "resolve_group_collector_node",  # WS4 T7: durable node-resolution family anchor (META-22)
     "has_group_loss",  # WS4 T12: renamed from has_branch_loss_for_group -- queries group_losses directly by group_id
-    "has_completed_row_for_node",
-    "has_completed_group_for_node",  # WS4 T2: group-keyed sibling of has_completed_row_for_node
-    "has_released_row_for_node",
-    "has_released_group_for_node",  # WS4 T2: group-keyed sibling of has_released_row_for_node
+    "has_completed_group_for_node",  # WS4 T2: group-keyed completed point lookup
+    "has_released_group_for_node",  # WS4 T2: group-keyed released point lookup
 }
 
 REPO_ROOT = Path(__file__).resolve().parents[3]

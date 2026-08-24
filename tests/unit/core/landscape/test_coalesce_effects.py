@@ -371,3 +371,89 @@ def test_sibling_fork_groups_sharing_row_id_commit_independent_residuals() -> No
     assert set(residual_b.member_token_ids) == {ref.token_id for ref in b_refs}
     assert residual_a.result_token_id == merged_a.token_id
     assert residual_b.result_token_id == merged_b.token_id
+
+
+def test_nested_fork_effect_records_the_closing_group_not_the_enclosing_one() -> None:
+    """META-26 review M-2 (mutant #4): the persisted ``group_id`` must be the
+    CLOSING fork group, captured pre-pop. The flat fixture above cannot tell
+    that apart from a re-derivation over the merged token's remaining frames
+    (``path_fork_group_id(merged_frames)``), because with a single FORK frame
+    both spellings agree. Here every parent carries an ENCLOSING fork frame
+    (``g-outer``) beneath the closing one (``g-inner``): after the closer pops
+    ``g-inner`` the merged path's innermost FORK frame is ``g-outer``, so the
+    re-derivation mutant persists the enclosing group and this test goes red."""
+    setup = make_recorder_with_run(run_id=_RUN_ID)
+    register_test_node(
+        setup.data_flow,
+        setup.run_id,
+        _COALESCE_NODE_ID,
+        node_type=NodeType.COALESCE,
+        plugin_name="coalesce",
+    )
+    row = setup.data_flow.create_row(
+        run_id=setup.run_id,
+        source_node_id=setup.source_node_id,
+        row_index=0,
+        source_row_index=0,
+        ingest_sequence=0,
+        data={"source": True},
+    )
+    enclosing = LineageFrame(kind=FrameKind.FORK, group_id="g-outer", member_key="outer-left")
+    parents = [
+        setup.data_flow.create_token(
+            row.row_id,
+            lineage_path=(enclosing, LineageFrame(kind=FrameKind.FORK, group_id="g-inner", member_key=branch)),
+        )
+        for branch in ("inner-a", "inner-b")
+    ]
+    refs = tuple(TokenRef(token_id=token.token_id, run_id=setup.run_id) for token in parents)
+    completions = []
+    for ordinal, ref in enumerate(refs):
+        state = setup.execution.begin_node_state(
+            token_id=ref.token_id,
+            node_id=_COALESCE_NODE_ID,
+            run_id=setup.run_id,
+            step_index=4,
+            input_data={"ordinal": ordinal},
+        )
+        completions.append(CoalesceParentCompletion(parent_ref=ref, state_id=state.state_id, duration_ms=1.0, context_after=None))
+
+    merged = setup.data_flow.coalesce_tokens(
+        parent_refs=list(refs),
+        row_id=row.row_id,
+        coalesce_node_id=_COALESCE_NODE_ID,
+        parent_state_ids=[item.state_id for item in completions],
+        merged_payload={"merged": "nested"},
+        merged_contract=_CONTRACT,
+        step_in_pipeline=4,
+    )
+    setup.data_flow.finalize_coalesce_effect(merged=merged, parent_completions=tuple(completions))
+
+    # The closer popped exactly its own frame: the merged token now sits
+    # directly inside the enclosing fork group.
+    assert merged.lineage_path == (enclosing,)
+    with setup.db.connection() as conn:
+        effect = conn.execute(select(coalesce_effects_table)).mappings().one()
+    assert effect["group_id"] == "g-inner"
+    assert effect["group_id"] != "g-outer"
+
+    reads = setup.factory.barrier_restore
+    residual = reads.get_committed_coalesce_residual(
+        setup.run_id,
+        coalesce_node_id=_COALESCE_NODE_ID,
+        coalesce_name="merge",
+        group_id="g-inner",
+        blocked_token_ids=tuple(ref.token_id for ref in refs),
+    )
+    assert residual is not None
+    assert residual.result_token_id == merged.token_id
+    assert (
+        reads.get_committed_coalesce_residual(
+            setup.run_id,
+            coalesce_node_id=_COALESCE_NODE_ID,
+            coalesce_name="merge",
+            group_id="g-outer",
+            blocked_token_ids=tuple(ref.token_id for ref in refs),
+        )
+        is None
+    )

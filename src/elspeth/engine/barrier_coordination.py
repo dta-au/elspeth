@@ -805,13 +805,15 @@ class BarrierIntakeCoordinator:
         )
 
     def _row_id_for_loss(self, loss: GroupLoss) -> str:
-        """Resolve the transitional executor key's row_id from the loss's token.
+        """Resolve the row-scoped ``scope_row_id`` for a coalesce merge fire.
 
-        The unified ``group_losses`` ledger row no longer carries ``row_id``,
-        but the executors' in-memory notify is still keyed
-        ``(closer_name, row_id)`` until WS4 re-keys them (spec §5). The
-        durable ``tokens`` row is the resolution source: an intake-path DB
-        read (leader, once per unadopted loss) — NOT the hot accounting
+        The unified ``group_losses`` ledger row carries no ``row_id``, and
+        every executor call in ``_replay_group_losses`` is already keyed on
+        ``loss.group_id`` (WS4 re-keyed them; nothing transitional remains).
+        The one consumer left is ``_fire_coalesce_merge``'s ``scope_row_id``
+        — a genuinely row-scoped concept the ledger cannot supply — so this
+        resolves it from the token's durable ``tokens`` row: an intake-path
+        DB read (leader, once per unadopted loss), NOT the hot accounting
         path, so the pinned "never a DB query" commitment (§4.1) is
         untouched.
         """

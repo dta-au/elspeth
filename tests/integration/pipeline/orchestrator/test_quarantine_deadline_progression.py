@@ -463,8 +463,6 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
 
         execution = MagicMock(spec=ExecutionRepository)
         execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=f"cs-{uuid4().hex[:8]}")
-        execution.get_completed_row_ids_for_nodes.return_value = set()
-        execution.has_completed_row_for_node.return_value = False
         # has_completed_group_for_node lives on BarrierRestoreReadModel, not
         # ExecutionRepository (spec-checked here). A fully autospec'd
         # read-model INSTANCE (not a bare `spec=` on the unbound function,
@@ -486,8 +484,6 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
             clock=clock,
             data_flow=data_flow,
             barrier_restore_reads=SimpleNamespace(
-                get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
-                has_completed_row_for_node=execution.has_completed_row_for_node,
                 has_completed_group_for_node=execution.has_completed_group_for_node,
             ),
             resolutions=resolutions,

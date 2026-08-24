@@ -92,8 +92,6 @@ def _next_state_id() -> str:
 
 def _restore_reads_from_execution_double(execution: MagicMock) -> SimpleNamespace:
     return SimpleNamespace(
-        get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
-        has_completed_row_for_node=execution.has_completed_row_for_node,
         # WS4 Task 8: _check_landscape_for_completion now queries the
         # group-keyed sibling. SimpleNamespace has no auto-attribute
         # creation, so a production call the double doesn't bind raises
@@ -232,12 +230,10 @@ def _make_executor(
     execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=_next_state_id())
     # Default: Landscape returns no completed coalesces (unit tests don't have a real DB).
     # Tests that exercise Landscape-based restoration override this per-test.
-    execution.get_completed_row_ids_for_nodes.return_value = set()
-    execution.has_completed_row_for_node.return_value = False
     # has_completed_group_for_node/get_completed_group_ids_for_nodes live on
     # BarrierRestoreReadModel, not on ExecutionRepository (spec-checked
-    # here), so they cannot be pulled off `execution` the way
-    # has_completed_row_for_node is. A fully autospec'd read-model INSTANCE
+    # here), so they cannot be pulled off `execution` as spec-generated
+    # attributes. A fully autospec'd read-model INSTANCE
     # (not a bare `spec=` on the unbound function, which would require every
     # call site to also pass `self`) gives correctly bound-method-shaped
     # mocks — assign the bound methods explicitly (spec=, unlike spec_set=,
@@ -281,12 +277,10 @@ def _make_raw_executor(
     """Build the production CoalesceExecutor without the test on_success shim."""
     execution = MagicMock(spec=ExecutionRepository)
     execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=_next_state_id())
-    execution.get_completed_row_ids_for_nodes.return_value = set()
-    execution.has_completed_row_for_node.return_value = False
     # has_completed_group_for_node/get_completed_group_ids_for_nodes live on
     # BarrierRestoreReadModel, not on ExecutionRepository (spec-checked
-    # here), so they cannot be pulled off `execution` the way
-    # has_completed_row_for_node is. A fully autospec'd read-model INSTANCE
+    # here), so they cannot be pulled off `execution` as spec-generated
+    # attributes. A fully autospec'd read-model INSTANCE
     # (not a bare `spec=` on the unbound function, which would require every
     # call site to also pass `self`) gives correctly bound-method-shaped
     # mocks — assign the bound methods explicitly (spec=, unlike spec_set=,
@@ -2962,11 +2956,7 @@ class TestLandscapeCompletedKeys:
 
         # Late arrival for evicted row_0 — exact Landscape fallback should catch it
         # without materializing every completed group for node_1. Asserts
-        # WHICH read-model method fired (WS4 Task 8): a mutant that renames
-        # _check_landscape_for_completion's parameter to fork_group_id but
-        # leaves the body calling has_completed_row_for_node would pass a
-        # same-typed positional str and produce no crash — only this
-        # which-method assertion catches it.
+        # WHICH read-model method fired (WS4 Task 8) and with which key.
         execution.reset_mock()
         # has_completed_group_for_node is an autospec'd BarrierRestoreReadModel
         # instance's bound method assigned onto `execution` (mock-discipline
@@ -2981,8 +2971,6 @@ class TestLandscapeCompletedKeys:
         assert outcome.held is False
         assert outcome.failure_reason == "late_arrival_after_merge"
         execution.has_completed_group_for_node.assert_called_once_with(run_id="run_1", node_id="node_1", group_id="row_0")
-        execution.has_completed_row_for_node.assert_not_called()
-        execution.get_completed_row_ids_for_nodes.assert_not_called()
         # Key should now be in the FIFO cache (backfilled from Landscape)
         assert ("merge", "row_0") in executor._completed_keys
 
