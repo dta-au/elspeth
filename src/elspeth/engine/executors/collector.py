@@ -165,6 +165,12 @@ class CollectorExecutor:
         # it. Deliberately not attempted here; carried into Task 7's scope.
         self._completed_keys: OrderedDict[tuple[str, str], frozenset[str]] = OrderedDict()
         self._max_completed_keys = max_completed_keys
+        # Groups restore_from_journal installed with an ALREADY-complete
+        # roster (I-8 under journal-before-dispatch): restore has no
+        # PluginContext, so it parks them here for
+        # flush_restored_complete_groups to close — the post-restore
+        # flush-trigger sweep the resume path must run after restore.
+        self._restored_complete_keys: list[tuple[str, str]] = []
 
     def register_collector(
         self,
@@ -414,7 +420,17 @@ class CollectorExecutor:
         _pending entry carries no history before a group opens, after it
         closes, or across a takeover, so a resumed worker consulting only
         _pending would see every previously-adopted loss as unrecorded and
-        risk a duplicate notify_member_lost call."""
+        risk a duplicate notify_member_lost call.
+
+        NOT the replay predicate. The journal-first group-loss replay
+        (``_replay_group_losses``, per-iteration intake AND full-table
+        takeover restore) must consult :meth:`has_replayed_member_loss`
+        instead: every loss it replays is BY CONSTRUCTION already in the
+        durable ledger (the replay reads the ledger), so this method's
+        durable fallback answers True for all of them and a takeover's
+        replay would re-stage nothing, forever — the lost members never
+        reach the rebuilt in-memory roster and the group can never settle.
+        """
         key = (collector_name, group_id)
         pending = self._pending.get(key)
         if pending is not None and member_key in pending.lost:
@@ -422,6 +438,22 @@ class CollectorExecutor:
         return self._barrier_restore_reads.has_group_member_loss(
             run_id=self._run_id, closer_name=collector_name, group_id=group_id, member_key=member_key
         )
+
+    def has_replayed_member_loss(self, collector_name: str, group_id: str, member_key: str) -> bool:
+        """Whether this member loss is already in executor MEMORY (§E.5 replay dedup).
+
+        The collector twin of ``CoalesceExecutor.has_recorded_branch_loss``
+        / ``RowUnionExecutor.has_recorded_branch_loss``: in-memory only,
+        never the durable ledger. At N=1 the producer already notified
+        in-claim (record-then-notify), so the per-iteration replay finds the
+        loss in ``pending.lost`` and skips; on takeover the rebuilt executor
+        holds nothing, so the full-table replay re-stages every loss exactly
+        once, and a second replay in the same process is the no-op. A
+        completed/unknown key returns False — ``notify_member_lost``'s own
+        completed-keys check makes that replay a no-op.
+        """
+        key = (collector_name, group_id)
+        return key in self._pending and member_key in self._pending[key].lost
 
     def notify_member_lost(
         self, collector_name: str, group_id: str, member_key: str, reason: str, ctx: PluginContext
@@ -558,30 +590,25 @@ class CollectorExecutor:
                 mid-guard, on the re-derived flush guard's own resume
                 provenance.
 
+        Complete rosters (I-8): integration ratified journal-before-dispatch
+        (ADR-030 §E.2 — every barrier arrival is journaled BLOCKED before
+        the intake accept that may complete the roster), so a crash between
+        the last adoption and ``collect_tokens`` committing leaves a roster
+        that is COMPLETE in the journal. That is the ordinary crash-mid-flush
+        shape, not an edge case. This method has no ``PluginContext`` and so
+        cannot flush; it installs such a group like any other and parks its
+        key for :meth:`flush_restored_complete_groups`, the post-restore
+        flush-trigger sweep the resume path MUST call after this method
+        (and after WS3's loss replay, I-7). Nothing else re-evaluates a
+        group whose roster already satisfies ``_roster_settled`` — a resume
+        path that restores and never sweeps leaves a silent, permanently-
+        unflushable wedge.
+
         Raises:
             OrchestrationInvariantError: If ``self._pending`` is non-empty
                 (I-7's ordering guard — mirrors
                 ``RowUnionExecutor.restore_from_journal``'s identical
-                "restore requires an empty executor" precedent), or if any
-                restored group's roster is ALREADY complete (I-8): this
-                method has no ``PluginContext`` and so cannot itself
-                trigger ``_execute_flush`` the way a live ``accept()``
-                would, and nothing else re-evaluates a group whose roster
-                already satisfies ``_roster_settled`` — leaving it
-                installed would be a silent, permanently-unflushable wedge.
-                Integration must add a post-restore flush-trigger sweep
-                (a ``PluginContext``-bearing follow-up call) before this
-                case can be resolved instead of refused. This disposition
-                ASSUMES the closing arrival (the one that completes a
-                roster) is never itself journaled BLOCKED — there is no
-                production dispatch path yet to verify that against
-                (I-4/META-4: ``processor.collector_executor`` does not
-                exist). If integration's dispatch instead journals every
-                arrival BEFORE processing it, a genuinely complete-in-the-
-                journal roster becomes reachable on the ordinary crash-mid-
-                flush path (not just this narrower edge case), and this
-                raise must become a flush-trigger call instead — flagged
-                for ratification, not a settled fact.
+                "restore requires an empty executor" precedent).
             AuditIntegrityError: On any journal/audit disagreement — see
                 :meth:`CollectorJournalRestorer.restore`, plus the I-6
                 roster/ordinal cross-checks below.
@@ -606,6 +633,7 @@ class CollectorExecutor:
 
         restore_now = self._clock.monotonic()
         built_groups: list[tuple[tuple[str, str], _PendingGroup]] = []
+        complete_keys: list[tuple[str, str]] = []
         for group in restored.pending_groups:
             collector_name, group_id = group.key
             pending = self._open_group(collector_name, group_id, first_arrival=restore_now, resume_checkpoint_id=resume_checkpoint_id)
@@ -635,19 +663,10 @@ class CollectorExecutor:
                     token=member.token, arrival_time=restore_now, state_id=member.state_id, ordinal=ordinal
                 )
             if self._roster_settled(pending):
-                # I-8 (complete-roster restore): fail closed rather than
-                # silently wedge. See the Raises section above.
-                raise OrchestrationInvariantError(
-                    f"Collector group {group_id!r} at '{collector_name}' restored with a "
-                    f"COMPLETE roster (all {len(pending.roster)} members already arrived per "
-                    "the journal) — flushing requires a PluginContext this restore path does "
-                    "not have. Refusing rather than leaving a silently unflushable group in "
-                    "memory; integration must add a post-restore flush-trigger sweep. This "
-                    "raise aborts the ENTIRE restore_from_journal call, not just this group — "
-                    "validate-before-mutate means no group from this call is installed, "
-                    "including any already built before this one; the caller must retry the "
-                    "whole call, not skip and retry per-group."
-                )
+                # I-8 (complete-roster restore, journal-before-dispatch):
+                # park for the post-restore flush-trigger sweep — see the
+                # docstring. Never flushed here: no PluginContext.
+                complete_keys.append(group.key)
             built_groups.append((group.key, pending))
 
         # Install only after every group in this restore call validated
@@ -656,15 +675,52 @@ class CollectorExecutor:
         # empty as the guard above found it, not partially populated.
         for key, pending in built_groups:
             self._pending[key] = pending
+        self._restored_complete_keys = complete_keys
 
         slog.info(
             "collector_journal_restored",
             pending_groups=len(built_groups),
+            complete_pending_flush=len(complete_keys),
             completed_groups=len(restored.completed_groups),
             token_count=restored.token_count,
             run_id=self._run_id,
             resume_checkpoint_id=resume_checkpoint_id,
         )
+
+    def flush_restored_complete_groups(self, ctx: PluginContext) -> tuple[CollectorOutcome, ...]:
+        """Post-restore flush-trigger sweep (I-8): close every group
+        :meth:`restore_from_journal` installed with an already-complete roster.
+
+        The ``PluginContext``-bearing follow-up restore itself cannot be.
+        Call once per resume, after ``restore_from_journal`` and after WS3's
+        group-loss replay (I-7 order), from the same resume path — the
+        returned outcomes carry the same ``consumed_tokens`` a live closing
+        ``accept()`` would have produced and must reach the settle-member
+        seam exactly as a live outcome does. Idempotent: the parked keys are
+        consumed, so a second call returns ``()``. A group is closed through
+        ``_close_group``, so the require_all-with-losses and every other
+        verdict arm apply unchanged.
+
+        Raises:
+            OrchestrationInvariantError: If a parked key no longer names an
+                installed, roster-complete group — nothing between restore
+                and this sweep may legitimately remove it (a redelivered
+                member is an idempotent skip; a loss for an arrived member
+                is itself an invariant error), so its absence is a
+                genuinely inconsistent roster, not a race to tolerate.
+        """
+        keys, self._restored_complete_keys = self._restored_complete_keys, []
+        outcomes: list[CollectorOutcome] = []
+        for key in keys:
+            collector_name, group_id = key
+            if key not in self._pending or not self._roster_settled(self._pending[key]):
+                raise OrchestrationInvariantError(
+                    f"Collector group {group_id!r} at '{collector_name}' was restored with a "
+                    "COMPLETE roster but is no longer installed roster-complete at the "
+                    "post-restore flush sweep — nothing may close or reopen it in between."
+                )
+            outcomes.append(self._close_group(collector_name, key, self._pending[key], ctx))
+        return tuple(outcomes)
 
     def _check_landscape_for_completion(self, collector_name: str, group_id: str) -> bool:
         # M-3 (fix round 2): the `collector_name not in self._node_ids` guard

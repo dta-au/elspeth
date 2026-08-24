@@ -134,6 +134,12 @@ class _EnvExecutor:
     def has_recorded_member_loss(self, collector_name: str, group_id: str, member_key: str) -> bool:
         return self._executor.has_recorded_member_loss(collector_name, group_id, member_key)
 
+    def has_replayed_member_loss(self, collector_name: str, group_id: str, member_key: str) -> bool:
+        return self._executor.has_replayed_member_loss(collector_name, group_id, member_key)
+
+    def flush_restored_complete_groups(self, *, ctx: PluginContext | None = None) -> tuple[CollectorOutcome, ...]:
+        return self._executor.flush_restored_complete_groups(ctx if ctx is not None else self._default_ctx)
+
     def buffered_member_count(self) -> int:
         return self._executor.buffered_member_count()
 
@@ -619,6 +625,50 @@ class TestLosses:
         assert env.executor.has_recorded_member_loss("stitch", group_id, members[0].token_id) is True
         assert env.executor.has_recorded_member_loss("stitch", group_id, members[1].token_id) is False
 
+    def test_takeover_loss_replay_restages_once_then_dedups_in_memory(self, collector_env: _CollectorEnv) -> None:
+        # WS4 fix round 2 (b): the journal-first loss replay reads the durable
+        # ledger, so every loss it replays is in that ledger BY CONSTRUCTION.
+        # A replay that dedups through has_recorded_member_loss (whose I-4
+        # fallback consults that same ledger) therefore skips every takeover
+        # loss forever: the rebuilt executor never learns the member is lost
+        # and the group never settles. The replay predicate is the in-memory
+        # has_replayed_member_loss — mirroring CoalesceExecutor /
+        # RowUnionExecutor.has_recorded_branch_loss — so a takeover re-stages
+        # each loss exactly once and the second replay in the same process is
+        # the no-op.
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        with env.db.write_connection() as conn:
+            record_group_loss(
+                conn,
+                run_id=env.run_id,
+                spec=GroupLossSpec(
+                    closer_name="stitch",
+                    group_id=group_id,
+                    member_key=members[0].token_id,
+                    token_id=members[0].token_id,
+                    reason="quarantined",
+                ),
+                recorded_by="crashed-worker",
+                now=datetime.now(UTC),
+            )
+        fresh = env.fresh_executor()
+        # The durable guard already says True (the trap) ...
+        assert fresh.has_recorded_member_loss("stitch", group_id, members[0].token_id) is True
+        # ... but nothing has been replayed into THIS process, so replay must proceed.
+        assert fresh.has_replayed_member_loss("stitch", group_id, members[0].token_id) is False
+        assert fresh.notify_member_lost("stitch", group_id, members[0].token_id, "quarantined") is None
+        assert fresh._executor._pending[("stitch", group_id)].lost == {members[0].token_id: "quarantined"}
+        # Second replay in the same process: the in-memory marker dedups it.
+        assert fresh.has_replayed_member_loss("stitch", group_id, members[0].token_id) is True
+        with pytest.raises(OrchestrationInvariantError, match="duplicate loss notification"):
+            fresh.notify_member_lost("stitch", group_id, members[0].token_id, "quarantined")
+        # The re-staged loss is live roster state: the surviving member's
+        # arrival settles the group (require_all -> fails on the loss).
+        outcome = fresh.accept(members[1], "stitch", ctx=env.ctx)
+        assert outcome.held is False
+        assert outcome.failure_reason == "collector_missing_members"
+
     def test_loss_for_a_member_outside_the_roster_crashes(self, collector_env: _CollectorEnv) -> None:
         env = collector_env
         _members, group_id = env.seed_group(count=2)
@@ -833,6 +883,9 @@ class TestRestore:
             resume_checkpoint_id="ckpt-1",
         )
         assert fresh.buffered_member_count() == 2
+        # An INCOMPLETE restored roster is not the flush sweep's to close.
+        assert fresh.flush_restored_complete_groups(ctx=env.ctx) == ()
+        assert fresh.transform.seen_rows == []
         outcome = fresh.accept(members[0], "stitch", ctx=env.ctx)
         assert outcome.held is False
         assert fresh.transform.seen_rows == [m.row_data.to_dict() for m in members]  # ordinal order
@@ -934,19 +987,69 @@ class TestRestore:
                 resume_checkpoint_id="ckpt-1",
             )
 
-    def test_restore_of_a_complete_roster_fails_closed_pending_a_flush_trigger(self, collector_env: _CollectorEnv) -> None:
-        # I-8: a journal that (rarely — the ordinary closing arrival is
-        # never itself journaled, see the takeover-reflush test below) holds
-        # a COMPLETE roster leaves restore with no PluginContext to flush
-        # it. Fail closed rather than silently wedge a permanently-unflushable
-        # group into self._pending.
+    def test_restore_of_a_complete_roster_flushes_through_the_post_restore_trigger(self, collector_env: _CollectorEnv) -> None:
+        # I-8 under journal-before-dispatch (integration plan B7, WS4 fix
+        # round 2 (a)): every arrival is journaled BLOCKED before the accept
+        # that completes the roster, so a crash between the last adoption
+        # and collect_tokens committing leaves a roster COMPLETE in the
+        # journal on the ORDINARY crash-mid-flush path. Restore has no
+        # PluginContext: it installs the group and parks it for the
+        # post-restore flush sweep, which closes it exactly as a live closing
+        # accept() would (ordinal order, holds completed, settled memory).
         env = collector_env
-        members, _group_id = env.seed_group(count=2)
+        members, group_id = env.seed_group(count=2)
         env.executor.accept(members[0], "stitch")
-        # Simulate the second member's own accept()-time durable hold write
-        # succeeding without going through the live executor at all (the
-        # only way to reach "both members durably OPEN, roster complete"
-        # without letting the live API auto-flush it away).
+        # The second member's own accept()-time durable hold, written
+        # without the live executor (which would auto-flush the roster away).
+        env.factory.execution.begin_node_state(
+            token_id=members[1].token_id,
+            node_id=str(env.node_id),
+            run_id=env.run_id,
+            step_index=1,
+            input_data=members[1].row_data.to_dict(),
+            attempt=0,
+            resume_checkpoint_id=None,
+        )
+        items = [env.blocked_item_for(m, collector_name="stitch") for m in reversed(members)]
+        state_ids = env.state_ids_for(items)
+        fresh = env.fresh_executor()
+        fresh.restore_from_journal(
+            items=items,
+            state_ids=state_ids,
+            attempt_offsets={m.token_id: 0 for m in members},
+            resume_checkpoint_id="ckpt-1",
+        )
+        # Restore installs but never flushes (no PluginContext here).
+        assert fresh.buffered_member_count() == 2
+        assert fresh.transform.seen_rows == []
+        assert env.open_hold_token_ids(node="stitch") == sorted(m.token_id for m in members)
+
+        outcomes = fresh.flush_restored_complete_groups(ctx=env.ctx)
+
+        # Mutant R-1 (restore parks nothing / the sweep closes nothing):
+        # the sweep must produce the closing outcome itself.
+        assert len(outcomes) == 1
+        assert outcomes[0].held is False
+        assert outcomes[0].group_id == group_id
+        assert [t.token_id for t in outcomes[0].consumed_tokens] == [m.token_id for m in members]
+        assert fresh.transform.seen_rows == [m.row_data.to_dict() for m in members]  # ordinal order
+        assert fresh.buffered_member_count() == 0
+        assert env.open_hold_token_ids(node="stitch") == []
+        # Idempotent: the parked keys were consumed.
+        assert fresh.flush_restored_complete_groups(ctx=env.ctx) == ()
+        # The settled memory a post-closure redelivery needs was recorded by
+        # the close path, same as a live closure.
+        assert fresh.accept(members[0], "stitch", ctx=env.ctx).held is True
+        assert fresh.transform.seen_rows == [m.row_data.to_dict() for m in members]  # no second flush
+
+    def test_flush_sweep_refuses_a_parked_group_that_is_no_longer_roster_complete(self, collector_env: _CollectorEnv) -> None:
+        # The sweep's guard is for genuinely inconsistent rosters only:
+        # nothing between restore and the sweep may legitimately close or
+        # reopen a parked group, so a parked key that no longer names an
+        # installed, complete group is an invariant violation, not a race.
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
         env.factory.execution.begin_node_state(
             token_id=members[1].token_id,
             node_id=str(env.node_id),
@@ -957,40 +1060,30 @@ class TestRestore:
             resume_checkpoint_id=None,
         )
         items = [env.blocked_item_for(m, collector_name="stitch") for m in members]
-        state_ids = env.state_ids_for(items)
         fresh = env.fresh_executor()
-        with pytest.raises(OrchestrationInvariantError, match="COMPLETE"):
-            fresh.restore_from_journal(
-                items=items,
-                state_ids=state_ids,
-                attempt_offsets={m.token_id: 0 for m in members},
-                resume_checkpoint_id="ckpt-1",
-            )
-        # Validate-before-mutate: a failed restore leaves _pending exactly
-        # as empty as it found it — nothing partially installed.
-        assert fresh._executor._pending == {}
+        fresh.restore_from_journal(
+            items=items,
+            state_ids=env.state_ids_for(items),
+            attempt_offsets={m.token_id: 0 for m in members},
+            resume_checkpoint_id="ckpt-1",
+        )
+        del fresh._executor._pending[("stitch", group_id)]  # corrupt: the parked group vanished
+        with pytest.raises(OrchestrationInvariantError, match="no longer installed roster-complete"):
+            fresh.flush_restored_complete_groups(ctx=env.ctx)
 
     def test_takeover_reflush_after_crash_mid_flush_uses_a_distinct_attempt(self, collector_env: _CollectorEnv) -> None:
         # C-1 / META-14.1's exact required trace: "crash mid-flush ->
         # takeover -> re-flush green at attempt=1." Constructed by hand (two
-        # accept() calls plus a manual begin_node_state for the opener), NOT
-        # read off a real dispatch path — processor.collector_executor does
-        # not exist yet (I-4/META-4), so there is no production code to
-        # verify "the CLOSING arrival is never itself journaled" against.
-        # ASSUMES a held=False outcome parks nothing (it goes straight into
-        # _execute_flush, whose opener-anchored guard opens attempt=0, OPEN,
-        # before the crash), so restore sees only the N-1 EARLIER arrivals'
-        # journal rows (roster genuinely incomplete from the journal's own
-        # perspective) and I-8's complete-roster guard does not fire here.
-        # This is a DECISION about integration's future dispatch shape, not
-        # a verified fact — if integration journals every arrival before
-        # dispatch (BLOCKED-then-processed rather than processed-then-maybe-
-        # BLOCKED), this test's premise breaks and I-8's raise must become a
-        # flush-trigger instead (see collector.py's restore_from_journal
-        # docstring and the task-7-report.md write-up, both flagged for
-        # ratification). A later LIVE arrival for the missing member must
-        # re-flush at a DISTINCT attempt, not collide with the
-        # orphaned attempt=0 state.
+        # accept() calls plus a manual begin_node_state for the opener).
+        # Integration ratified journal-before-dispatch (plan B7), so the
+        # closing arrival IS journaled BLOCKED in production and the
+        # crash-mid-flush roster is complete in the journal — that shape is
+        # the complete-roster test above (restore + post-restore flush
+        # sweep). This test keeps the OTHER half of the trace: the closing
+        # member's journal row was lost/never written, restore sees the N-1
+        # earlier arrivals only, and a later LIVE arrival for the missing
+        # member must re-flush at a DISTINCT attempt, not collide with the
+        # orphaned attempt=0 flush-guard state.
         env = collector_env
         members, group_id = env.seed_group(count=3)
         env.executor.accept(members[1], "stitch")
