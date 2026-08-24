@@ -262,6 +262,26 @@ def test_quarantined_batch_member_reaches_the_seam(aggregation_flush_processor) 
     assert spec.member_key == "path_a"
 
 
+def test_stage_group_loss_rejects_a_second_loss_for_the_same_bound_frame(processor_with_bindings) -> None:
+    """Two tokens sharing the same bound frame staged within one claim (spec
+    §6.1: at most one loss per bound frame per claim) is a processor bug.
+    Ruling 25 bans aggregators inside bound regions, so two BUFFERED members
+    of one aggregation flush sharing a bound frame should be unreachable via
+    a real, ruling-25-compliant graph — but `_stage_group_loss` cannot see
+    that invariant (it is a build-time graph-validation concern, not this
+    runtime seam's job), so it fails closed rather than silently dropping
+    or double-counting a loss. Pin the guard fires through the REAL seam,
+    not just the drain's separate claim-guard
+    (test_group_loss_claim_guard.py's `test_guard_rejects_two_losses_for_one_frame`
+    pins a different guard, at a different site, over hand-built specs)."""
+    proc = processor_with_bindings({("fg_inner", "path_a"): coalesce_binding("merge_inner")})
+    token_a = make_token(lineage_path=(INNER_FORK,), token_id="tok-a")
+    token_b = make_token(lineage_path=(INNER_FORK,), token_id="tok-b")
+    proc._settle_member_losses(token_a, "quarantined", [], notify_in_memory=False)
+    with pytest.raises(OrchestrationInvariantError, match="at most one loss per bound frame"):
+        proc._settle_member_losses(token_b, "quarantined", [], notify_in_memory=False)
+
+
 # ---------------------------------------------------------------------------
 # Collector arm: WS2 forbids building collector bindings until WS4's
 # executor registers, so this is unreachable in a built pipeline today — the
