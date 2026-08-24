@@ -518,6 +518,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "mark_pending_sink_terminal_many",
         "reconcile_source_completions_from_scheduler",
         "recover_expired_leases",
+        "stage_escalation_loss",
         "terminalize_pending_sinks_with_terminal_outcomes",
         "update_run_status",
     }
@@ -580,6 +581,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "recover_expired_leases": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_recover_expired_leases_refused",
+        ),
+        "stage_escalation_loss": (
+            "tests/e2e/recovery/test_suspended_winner_fences.py",
+            "test_stale_stage_escalation_loss_refused",
         ),
         "terminalize_pending_sinks_with_terminal_outcomes": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",

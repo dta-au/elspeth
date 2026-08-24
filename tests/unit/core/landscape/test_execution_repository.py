@@ -2853,6 +2853,24 @@ class TestDelegationSignatureAlignment:
             ExecutionRepository.record_completed_node_state_on,
             id="record_completed_node_state_on",
         ),
+        pytest.param(
+            "get_group_record",
+            lambda execution: execution.get_group_record,
+            ExecutionRepository.get_group_record,
+            id="get_group_record",
+        ),
+        pytest.param(
+            "any_member_token_for_group",
+            lambda execution: execution.any_member_token_for_group,
+            ExecutionRepository.any_member_token_for_group,
+            id="any_member_token_for_group",
+        ),
+        pytest.param(
+            "member_keys_for_group",
+            lambda execution: execution.member_keys_for_group,
+            ExecutionRepository.member_keys_for_group,
+            id="member_keys_for_group",
+        ),
     )
 
     def test_delegation_table_covers_every_public_repository_method(self) -> None:

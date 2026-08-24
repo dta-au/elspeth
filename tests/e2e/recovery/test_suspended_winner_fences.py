@@ -46,6 +46,7 @@ from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts import PipelineRow, RunStatus
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
@@ -537,6 +538,61 @@ class TestSuspendedWinnerFences:
         assert crashed.repo.list_unadopted_group_losses(run_id=crashed.run_id) == []
         full = crashed.repo.list_group_losses(run_id=crashed.run_id)
         assert [loss_row.adopted_epoch for loss_row in full] == [current.leader_epoch]
+        _assert_seat_extended(crashed, seat_before)
+        crashed.db.close()
+
+    def test_stale_stage_escalation_loss_refused(self, tmp_path: Path) -> None:
+        """WS3 Task 8 (spec §6.3): a deposed leader cannot stage an escalated
+        group-loss row. ``stage_escalation_loss`` shares ``adopt_group_losses``'s
+        exact ``fenced_leader_transaction`` wrapper — there is no claimed
+        token at intake time for either verb, so both fence the same way."""
+        crashed, token_old = _takeover_image(tmp_path)
+        row = crashed.factory.data_flow.create_row(
+            run_id=crashed.run_id,
+            source_node_id=crashed.source_node_id,
+            row_index=98,
+            data={"id": 98},
+            source_row_index=98,
+            ingest_sequence=98,
+        )
+        token = crashed.factory.data_flow.create_token(row_id=row.row_id, token_id="token-outer-a")
+        current = _usurp(crashed)
+        seat_before = _coordination_row(crashed.db, crashed.run_id)
+
+        spec = GroupLossSpec(
+            closer_name="outer_closer",
+            group_id="fg_outer",
+            member_key="outer_a",
+            token_id=token.token_id,
+            reason="group_failed",
+        )
+
+        def _stage(coordination_token: CoordinationToken) -> bool:
+            return crashed.repo.stage_escalation_loss(
+                run_id=crashed.run_id,
+                spec=spec,
+                frame_kind=FrameKind.FORK,
+                declared_roster=("outer_a",),
+                recorded_by=WORKER_OLD,
+                now=crashed.clock.now_utc(),
+                coordination_token=coordination_token,
+            )
+
+        with pytest.raises(RunLeadershipLostError) as exc_info:
+            _stage(token_old)
+        assert not isinstance(exc_info.value, AuditIntegrityError)
+
+        assert crashed.repo.list_group_losses(run_id=crashed.run_id) == [], "no row staged under the stale token"
+        _assert_refusal_contract(crashed, verb="stage_escalation_loss", stale_epoch=token_old.leader_epoch, seat_before=seat_before)
+
+        # Positive control: the current leader stages the same escalation.
+        inserted = _stage(current)
+        assert inserted is True
+        (loss,) = crashed.repo.list_group_losses(run_id=crashed.run_id)
+        assert loss.closer_name == "outer_closer"
+        assert loss.group_id == "fg_outer"
+        assert loss.member_key == "outer_a"
+        assert loss.adopted_epoch is None, "staging appends the loss row; a separate adopt_group_losses call moves the cursor"
         _assert_seat_extended(crashed, seat_before)
         crashed.db.close()
 
