@@ -66,6 +66,7 @@ the explicit-route and omitted-on_error pipelines — pinned below."""
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -197,15 +198,38 @@ class PipelineResult:
             rows = conn.execute(select(token_outcomes_table.c.outcome, token_outcomes_table.c.path)).all()
         return sorted((row.outcome, row.path) for row in rows)
 
-    def closer_work_items(self, node_id_like: str) -> set[tuple[str, str]]:
+    def closer_work_items(self, node_id_like: str) -> Counter[tuple[str, str]]:
         """Set-equality pin (spec §7 rule 9 brief): every (node_id, status)
         work-item row whose node_id CONTAINS ``node_id_like`` (node ids are
-        content-hash-suffixed, e.g. ``coalesce_merge_c2005cad0813``) — the
-        FULL set, not a sampled absence check, so a pseudo-member row
-        enqueued at the closer via the error route cannot hide."""
+        content-hash-suffixed, e.g. ``coalesce_merge_c2005cad0813``) — as a
+        MULTISET (9b review finding 1): a plain set deduped a pseudo-member
+        row whose status already appeared, so an injected extra row at the
+        closer passed unseen; counts make any extra row change the value.
+        (token_id itself cannot join a cross-run twin comparison — it is
+        run-scoped — so the per-token half of the pin lives in
+        ``failed_token_ids_with_work_items_at``.)"""
         with self._connect() as conn:
             rows = conn.execute(select(token_work_items_table.c.node_id, token_work_items_table.c.status)).all()
-        return {(row.node_id, row.status) for row in rows if node_id_like in row.node_id}
+        return Counter((row.node_id, row.status) for row in rows if node_id_like in row.node_id)
+
+    def error_route_token_ids_with_work_items_at(self, node_id_like: str, *, error_paths: frozenset[str]) -> set[str]:
+        """Per-run structural pin (9b review finding 1): token_ids whose
+        terminal PATH is one of ``error_paths`` (the error-disposed tokens —
+        quarantined_at_source for a transform's on_error, gate_error_discarded
+        for a gate's) AND that own a work-item row at the matching node.
+        Must be EMPTY at the closer: an error-disposed token arriving there
+        as a pseudo-member via the DIVERT edge is exactly the rule-9
+        violation the brief demands this module catch. Held sibling members
+        (FAILURE/UNROUTED) legitimately hold closer work items — they
+        arrived as REAL members before the group failed — so the filter is
+        on the error-route paths, not on failure outcomes generally."""
+        with self._connect() as conn:
+            error_disposed = {
+                row.token_id
+                for row in conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.path.in_(error_paths))).all()
+            }
+            item_rows = conn.execute(select(token_work_items_table.c.token_id, token_work_items_table.c.node_id)).all()
+        return {row.token_id for row in item_rows if node_id_like in row.node_id and row.token_id in error_disposed}
 
 
 # ===== Transform arm: explicit on_error: <closer> vs the omitted ("discard") twin =====
@@ -309,7 +333,12 @@ def test_transform_explicit_on_error_to_closer_settles_like_the_omitted_twin(tmp
     # live work item).
     explicit_closer_items = explicit.closer_work_items("coalesce_merge")
     omitted_closer_items = omitted.closer_work_items("coalesce_merge")
-    assert explicit_closer_items == omitted_closer_items == {("coalesce_merge_c2005cad0813", "terminal")}
+    assert explicit_closer_items == omitted_closer_items == Counter({("coalesce_merge_c2005cad0813", "terminal"): 3})
+    # Per-run half of the pin (9b review finding 1): no ERROR-DISPOSED token
+    # owns a work item at the closer — the pseudo-member-via-error-route check.
+    _tx_error_paths = frozenset({"quarantined_at_source"})
+    assert explicit.error_route_token_ids_with_work_items_at("coalesce_merge", error_paths=_tx_error_paths) == set()
+    assert omitted.error_route_token_ids_with_work_items_at("coalesce_merge", error_paths=_tx_error_paths) == set()
 
 
 # ===== Gate arm: same equivalence pin, over handle_gate_error_outcome =====
@@ -390,7 +419,10 @@ def test_gate_explicit_on_error_to_closer_settles_like_the_omitted_twin(tmp_path
 
     explicit_closer_items = explicit.closer_work_items("coalesce_merge")
     omitted_closer_items = omitted.closer_work_items("coalesce_merge")
-    assert explicit_closer_items == omitted_closer_items == {("coalesce_merge_c2005cad0813", "terminal")}
+    assert explicit_closer_items == omitted_closer_items == Counter({("coalesce_merge_c2005cad0813", "terminal"): 3})
+    _gate_error_paths = frozenset({"gate_error_discarded"})
+    assert explicit.error_route_token_ids_with_work_items_at("coalesce_merge", error_paths=_gate_error_paths) == set()
+    assert omitted.error_route_token_ids_with_work_items_at("coalesce_merge", error_paths=_gate_error_paths) == set()
 
 
 # ===== Out-of-region control: build rejection must still fire (T9 lesson: match=) =====
