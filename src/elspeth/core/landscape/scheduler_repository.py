@@ -29,6 +29,7 @@ from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
 )
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import (
     BarrierEmission,
@@ -824,6 +825,28 @@ class TokenSchedulerRepository:
         return self.group_losses.adopt_group_losses(
             run_id=run_id,
             loss_ids=loss_ids,
+            now=now,
+            coordination_token=coordination_token,
+        )
+
+    def stage_escalation_loss(
+        self,
+        *,
+        run_id: str,
+        spec: GroupLossSpec,
+        frame_kind: FrameKind,
+        declared_roster: tuple[str, ...] | None,
+        recorded_by: str,
+        now: datetime,
+        coordination_token: CoordinationToken,
+    ) -> bool:
+        """Fenced escalation staging (spec §6.3, Task 8): authenticate + append."""
+        return self.group_losses.stage_escalation_loss(
+            run_id=run_id,
+            spec=spec,
+            frame_kind=frame_kind,
+            declared_roster=declared_roster,
+            recorded_by=recorded_by,
             now=now,
             coordination_token=coordination_token,
         )
