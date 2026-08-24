@@ -511,6 +511,30 @@ class BarrierRestoreReadModel:
         )
         return self._ops.execute_fetchone(query) is not None
 
+    def has_group_member_loss(self, *, run_id: str, closer_name: str, group_id: str, member_key: str) -> bool:
+        """Return whether the durable group_losses ledger records THIS member's loss.
+
+        Unlike ``has_branch_loss_for_group`` (row+closer_name-keyed, a
+        retired-table compatibility shape), ``group_losses`` carries
+        ``group_id`` and ``member_key`` directly (spec §6.2 unification) —
+        no join through ``tokens`` needed. WS4 fix-round 2 (I-4): the
+        collector's in-memory ``has_recorded_member_loss`` consults this as
+        its durable fallback, since a resumed worker's in-memory
+        ``_pending`` state carries no history of losses recorded before
+        open, after close, or across a takeover.
+        """
+        query = (
+            select(group_losses_table.c.loss_id)
+            .where(
+                group_losses_table.c.run_id == run_id,
+                group_losses_table.c.closer_name == closer_name,
+                group_losses_table.c.group_id == group_id,
+                group_losses_table.c.member_key == member_key,
+            )
+            .limit(1)
+        )
+        return self._ops.execute_fetchone(query) is not None
+
     def find_failed_unrouted_terminal_token_ids(self, run_id: str, token_ids: Sequence[str]) -> frozenset[str]:
         """Token ids holding terminal ``(FAILURE, UNROUTED)`` outcomes.
 

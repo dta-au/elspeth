@@ -12,6 +12,7 @@ the plan's illustrative "g-1" literals, not a behavioural change).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,12 +20,15 @@ import pytest
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, PluginContractViolation
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import CollectorSettings, ScopeSettings
+from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 from elspeth.core.landscape.schema import group_records_table, node_states_table
 from elspeth.engine.executors.collector import CollectorExecutor, CollectorOutcome
 from elspeth.engine.tokens import TokenManager
@@ -55,6 +59,7 @@ class _FakeCollectorTransform:
         self.quarantine_indices: list[int] = []
         self.return_empty_success = False
         self.return_zero_rows = False
+        self.return_error = False
         self.echo_rows = False
         self.raise_on_process: BaseException | None = None
         self.seen_rows: list[dict[str, Any]] = []
@@ -74,15 +79,24 @@ class _FakeCollectorTransform:
             return SimpleNamespace(status="success", row=None, rows=None, reason=None, success_reason={"action": "noop"})
         from elspeth.contracts import TransformResult
 
+        if self.return_error:
+            # I-2 (fix round 2): a real "transform returned status=error"
+            # failure — distinct from raise_on_process, which propagates
+            # past NodeStateGuard entirely and never reaches _fail_group.
+            return TransformResult.error(reason={"reason": "collector_plugin_declared_failure"})
+
         success_reason: dict[str, Any] = {"action": "collected"}
+        if self.quarantine_indices:
+            success_reason["metadata"] = {"quarantined_indices": list(self.quarantine_indices)}
         if self.return_zero_rows:
             # B-4: the auditable "intentionally emitted nothing" shape
             # (results.py:438-457) — NOT success_multi([]), which raises
             # ValueError (rows must not be empty). rows=() here, distinct
             # from return_empty_success's row=None/rows=None duck-type above.
-            return TransformResult.success_empty(success_reason={"action": "collected_empty"})
-        if self.quarantine_indices:
-            success_reason["metadata"] = {"quarantined_indices": list(self.quarantine_indices)}
+            # Composes with quarantine_indices (I-1, fix round 2): a plugin
+            # that quarantines every member AND legitimately emits nothing —
+            # the metadata must still carry the indices even though rows=().
+            return TransformResult.success_empty(success_reason=dict(success_reason, action="collected_empty"))
         if self.echo_rows:
             out_rows = tuple(rows)
         else:
@@ -247,6 +261,31 @@ class _CollectorEnv:
             )
         return str(json.loads(row["error_json"])["phase"])
 
+    def node_state_error_exception_for_token(self, *, node: str, token_id: str) -> str:
+        """The error_json['exception'] text for THIS token's own hold state —
+        disambiguates from the flush guard's separate opener-anchored state,
+        which shares the same node_id but a different token_id."""
+        import json
+
+        from sqlalchemy import select
+
+        assert node == "stitch"
+        with self.db.connection() as conn:
+            row = (
+                conn.execute(
+                    select(node_states_table.c.error_json)
+                    .where(node_states_table.c.run_id == self.run_id)
+                    .where(node_states_table.c.node_id == str(self.node_id))
+                    .where(node_states_table.c.token_id == token_id)
+                    .where(node_states_table.c.error_json.is_not(None))
+                    .order_by(node_states_table.c.completed_at.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .one()
+            )
+        return str(json.loads(row["error_json"])["exception"])
+
 
 @pytest.fixture
 def collector_env() -> _CollectorEnv:
@@ -297,6 +336,28 @@ class TestArrivals:
         with pytest.raises(AuditIntegrityError):
             env.executor.accept(impostor, "stitch")
 
+    def test_post_closure_same_token_redelivery_is_a_cas_fenced_idempotent_skip(self, collector_env: _CollectorEnv) -> None:
+        # I-3 (fix round 2): spec §5's "duplicate arrival of the SAME token
+        # for a settled member is a CAS-fenced idempotent skip" — closure
+        # deletes the pending entry, so the OLD code's claimed "pending-entry
+        # check below" was unreachable and every post-closure arrival raised.
+        # settled_token_ids (recorded at every in-process close) makes the
+        # same-token-vs-distinct-token distinction directly instead.
+        env = collector_env
+        members, _group_id = env.seed_group(count=1)
+        first = env.executor.accept(members[0], "stitch")
+        assert first.held is False  # closes on the single arrival
+        redelivered = env.executor.accept(members[0], "stitch")
+        assert redelivered.held is True
+
+    def test_post_closure_distinct_token_arrival_is_still_an_integrity_error(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        members, _group_id = env.seed_group(count=1)
+        env.executor.accept(members[0], "stitch")  # closes
+        impostor = env.reissue_with_new_token_id(members[0])
+        with pytest.raises(AuditIntegrityError, match="not among the members"):
+            env.executor.accept(impostor, "stitch")
+
     def test_arriving_token_whose_innermost_frame_is_not_expand_crashes(self, collector_env: _CollectorEnv) -> None:
         env = collector_env
         stray = env.plain_token()  # lineage_path == ()
@@ -311,6 +372,34 @@ class TestArrivals:
         env.corrupt_group_record_member_count(group_id=group_id, member_count=3)
         with pytest.raises(AuditIntegrityError):
             env.executor.accept(members[0], "stitch")
+
+    def test_collector_bound_to_a_non_expand_group_crashes_at_open(self, collector_env: _CollectorEnv) -> None:
+        # I-6 (fix round 2): Task 2's group_records reads are deliberately
+        # kind-agnostic (a group_id is globally unique per run regardless of
+        # kind), so without this assertion a collector mis-bound to a FORK
+        # group (a scope/binding-registry defect, not something a real token
+        # would ever legitimately carry) would proceed with a roster of
+        # branch names and ordinals keyed by token_ids, surfacing later as a
+        # confusing "expansion audit inconsistency" instead of the real
+        # binding error at its source. Craft a token whose OWN frame claims
+        # an EXPAND arrival at a group_id that was actually durably opened
+        # via fork_token — accept()'s own frame-kind check only validates
+        # the token's claim, not the durable record it points at.
+        env = collector_env
+        opener = env._seed_opener()
+        (branch,), fork_group_id = env.factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=opener.token_id, run_id=env.run_id),
+            row_id=opener.row_id,
+            branches=["path-a"],
+        )
+        mismatched = TokenInfo(
+            row_id=opener.row_id,
+            token_id=branch.token_id,
+            row_data=PipelineRow({"item": 0}, env.contract),
+            lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=fork_group_id, member_key=branch.token_id),),
+        )
+        with pytest.raises(AuditIntegrityError, match="not 'expand'"):
+            env.executor.accept(mismatched, "stitch")
 
     def test_every_arrival_journals_a_durable_hold(self, collector_env: _CollectorEnv) -> None:
         # RATIFIED pin (2026-08-22 synthesis, canon item 11): collector arrivals
@@ -346,10 +435,12 @@ class TestLosses:
         assert final.failure_reason == "collector_missing_members"
         # META-11.2 fix-round: the executor no longer writes ARRIVED members'
         # terminal disposition itself (matches CoalesceExecutor's Task
-        # 6/Ruling 37 removal of the same class of write) — outcomes_recorded
-        # is False, signalling the WS3 settle-member seam MUST record
-        # consumed_tokens' terminal outcomes.
-        assert final.outcomes_recorded is False
+        # 6/Ruling 37 removal of the same class of write) — the WS3
+        # settle-member seam must record consumed_tokens' terminal outcomes.
+        # META-17 (fix round 2, I-7): CollectorOutcome.outcomes_recorded was
+        # deleted entirely rather than carried as a boolean the seam would
+        # need to consult; pin the mechanism directly instead — no durable
+        # terminal write exists for either arrived member.
         assert env.factory.data_flow.get_token_outcome(members[0].token_id) is None
         assert env.factory.data_flow.get_token_outcome(members[2].token_id) is None
 
@@ -361,11 +452,60 @@ class TestLosses:
         with pytest.raises(OrchestrationInvariantError):
             env.executor.notify_member_lost("stitch", group_id, members[0].token_id, "quarantined")
 
+    def test_has_recorded_member_loss_consults_the_durable_ledger_with_no_in_memory_state(self, collector_env: _CollectorEnv) -> None:
+        # I-4 (fix round 2): a resumed worker's in-memory _pending carries no
+        # history before a group opens, after it closes, or across a
+        # takeover — WS3's durable group_losses ledger must be consulted
+        # too, not just self._pending. No accept()/notify_member_lost() call
+        # precedes this: self._pending has zero entries for this group.
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        with env.db.write_connection() as conn:
+            record_group_loss(
+                conn,
+                run_id=env.run_id,
+                spec=GroupLossSpec(
+                    closer_name="stitch",
+                    group_id=group_id,
+                    member_key=members[0].token_id,
+                    token_id=members[0].token_id,
+                    reason="quarantined",
+                ),
+                recorded_by="test-worker",
+                now=datetime.now(UTC),
+            )
+        assert env.executor._executor._pending == {}
+        assert env.executor.has_recorded_member_loss("stitch", group_id, members[0].token_id) is True
+        assert env.executor.has_recorded_member_loss("stitch", group_id, members[1].token_id) is False
+
     def test_loss_for_a_member_outside_the_roster_crashes(self, collector_env: _CollectorEnv) -> None:
         env = collector_env
         _members, group_id = env.seed_group(count=2)
         with pytest.raises(OrchestrationInvariantError):
             env.executor.notify_member_lost("stitch", group_id, "tok-not-a-member", "quarantined")
+        # I-5 (fix round 2): the rejected loss notification must not leave a
+        # phantom _pending entry behind — self._pending was installed
+        # BEFORE the roster-membership check in the pre-fix code.
+        assert env.executor._executor._pending == {}
+
+    def test_invalid_member_key_arrival_leaves_no_phantom_pending_entry(self, collector_env: _CollectorEnv) -> None:
+        # I-5 (fix round 2): same install-after-validate fix on the accept()
+        # side. A rejected arrival for a bogus member_key must not leave a
+        # ghost _PendingGroup that WS5's satisfiability gate would count.
+        env = collector_env
+        members, group_id = env.seed_group(count=1)
+        bogus = TokenInfo(
+            row_id=members[0].row_id,
+            token_id="bogus-token",
+            row_data=members[0].row_data,
+            lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=group_id, member_key="not-a-real-member"),),
+        )
+        with pytest.raises(AuditIntegrityError):
+            env.executor.accept(bogus, "stitch")
+        assert env.executor._executor._pending == {}
+        # The real member still settles normally afterward — no ghost blocked it.
+        outcome = env.executor.accept(members[0], "stitch")
+        assert outcome.held is False
 
 
 class TestFlush:
@@ -413,6 +553,22 @@ class TestFlush:
         with pytest.raises(OrchestrationInvariantError, match="all group members were quarantined"):
             env.executor.accept(members[1], "stitch")
 
+    def test_all_quarantined_without_output_is_an_invariant_violation(self, collector_env: _CollectorEnv) -> None:
+        # I-1 (fix round 2): the pre-fix guard only checked `output_rows and
+        # not surviving`, so an all-quarantined flush that ALSO emits zero
+        # rows (success_empty() + quarantine metadata covering everyone)
+        # fell through to collect_tokens(members=(), …) and died two layers
+        # down on its own generic "requires at least one member token"
+        # guard — a confusing crash site for what is the SAME collector-level
+        # invariant violation as the "with output" case above.
+        env = collector_env
+        env.transform.quarantine_indices = [0, 1]
+        env.transform.return_zero_rows = True
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        with pytest.raises(OrchestrationInvariantError, match="all group members were quarantined"):
+            env.executor.accept(members[1], "stitch")
+
     def test_success_with_neither_row_nor_rows_is_a_contract_violation(self, collector_env: _CollectorEnv) -> None:
         # aggregation.py:527-532 guard, replicated with the same semantics.
         env = collector_env
@@ -421,7 +577,7 @@ class TestFlush:
         with pytest.raises(PluginContractViolation, match="neither row nor rows"):
             env.executor.accept(members[0], "stitch")
 
-    def test_passthrough_quarantine_is_prohibited(self, collector_env: _CollectorEnv) -> None:
+    def test_passthrough_quarantine_goes_through_ordinary_transform_mode_handling(self, collector_env: _CollectorEnv) -> None:
         # Collectors are transform-only; a plugin returning per-row passthrough
         # shape (rows out == rows in) still goes through ordinary transform-mode
         # quarantine handling — pinned via a plugin with len(rows)==len(members).
@@ -433,6 +589,22 @@ class TestFlush:
         outcome = env.executor.accept(members[1], "stitch")
         assert outcome.held is False
         assert env.quarantined_token_ids() == [members[0].token_id]
+
+    def test_transform_error_message_does_not_misattribute_lost_members_under_require_all(self, best_effort_env: _CollectorEnv) -> None:
+        # I-2 (fix round 2): _fail_group is shared by the require_all-loss
+        # arm AND the collector_transform_error arm; the OLD message
+        # hardcoded "lost members ... under require_all" for both, even
+        # though a transform-error failure under best_effort with no losses
+        # has neither a require_all policy nor any lost members. The durable
+        # audit record must not claim a cause it didn't have.
+        env = best_effort_env
+        env.transform.return_error = True
+        members, _group_id = env.seed_group(count=1)
+        outcome = env.executor.accept(members[0], "stitch")
+        assert outcome.failure_reason == "collector_transform_error"
+        exception_text = env.node_state_error_exception_for_token(node="stitch", token_id=members[0].token_id)
+        assert "under require_all" not in exception_text
+        assert "collector_transform_error" in exception_text
 
     def test_empty_group_close_never_invokes_plugin(self, collector_env: _CollectorEnv, best_effort_env: _CollectorEnv) -> None:
         for env, expect_failure in ((collector_env, True), (best_effort_env, False)):
