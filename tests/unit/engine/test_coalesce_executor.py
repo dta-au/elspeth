@@ -1138,7 +1138,14 @@ class TestUnionMerge:
     # ------------------------------------------------------------------
 
     def test_union_collision_policy_fail_raises_on_collision(self):
-        """fail: CoalesceCollisionError raised with redacted metadata attached."""
+        """fail: CoalesceCollisionError raised with redacted metadata attached.
+
+        Propagation only — see the sibling
+        test_union_collision_policy_fail_records_every_consumed_terminal_and_still_raises
+        below for the paired WS3 Task 6 (Ruling 36) pin: every consumed
+        token's durable terminal by set equality, in the SAME test as this
+        exception's propagation.
+        """
         executor, _, _, _, _ = _make_executor()
         s = _settings(
             branches=["a", "b"],
@@ -1221,7 +1228,7 @@ class TestUnionMerge:
         assert md.union_field_origins is not None
         assert md.union_field_origins["shared"] == "b"
 
-    def test_union_collision_policy_fail_records_terminal_failed_outcomes(self):
+    def test_union_collision_policy_fail_records_every_consumed_terminal_and_still_raises(self):
         """union_collision_policy=fail must record FAILURE/UNROUTED for consumed tokens.
 
         Bug: The exception handler in _execute_merge only calls complete_node_state(FAILED)
@@ -1232,9 +1239,12 @@ class TestUnionMerge:
         WS3 Task 6, Ruling 36: this merge-exception cleanup arm is the ONE
         direct-write site Task 6 deliberately keeps (crash-path cleanup
         ahead of a re-raise nothing catches — no live caller to hand a
-        settlement-channel record to). This test pins BOTH halves: every
-        consumed token gets a durable FAILED terminal by SET EQUALITY
-        (not just no-duplicates), and the exception still propagates.
+        settlement-channel record to). This test pins BOTH halves in ONE
+        test, as the ruling's condition requires: every consumed token gets
+        a durable FAILED terminal by SET EQUALITY (not just no-duplicates,
+        not just presence), AND the exception still propagates — the
+        assertions below only execute because pytest.raises caught exactly
+        the expected exception from the same call whose writes they check.
         """
         executor, _, data_flow, _, _ = _make_executor()
         s = _settings(
