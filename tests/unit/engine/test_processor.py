@@ -67,6 +67,7 @@ from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import BranchName, CoalesceName, GateName, NodeID, RowUnionName, SinkName
 from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
 from elspeth.core.config import AggregationSettings, GateSettings
+from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
@@ -325,6 +326,76 @@ def _register_test_worker(
         )
 
 
+def _synthesize_group_bindings_from_legacy_maps(
+    *,
+    branch_to_coalesce: dict[BranchName, CoalesceName] | None,
+    coalesce_node_ids: dict[CoalesceName, NodeID] | None,
+    branch_to_row_union: dict[BranchName, RowUnionName] | None,
+    row_union_node_ids: dict[RowUnionName, NodeID] | None,
+) -> GroupBindingRegistry:
+    """Build a real GroupBindingRegistry from the legacy per-branch maps this
+    test module's callers already pass, so `_settle_member_losses` (which
+    reads ONLY `self._group_bindings`, never the legacy maps) resolves the
+    same bindings the hundreds of pre-WS3 tests here already set up via
+    `branch_to_coalesce`/`branch_to_row_union` — without editing each of
+    them individually. Only `_make_processor` synthesizes; RowProcessor
+    itself never falls back to the legacy maps (see its `group_bindings`
+    docstring). `member_roster` must be REAL (not `()`) — GroupBindingRegistry
+    keys `binding_for`'s FORK resolution off it.
+    """
+    from elspeth.core.dag.group_bindings import CloserKind, GroupBinding
+
+    bindings: list[GroupBinding] = []
+    coalesce_members: dict[CoalesceName, list[str]] = {}
+    for branch, coalesce_name in (branch_to_coalesce or {}).items():
+        coalesce_members.setdefault(coalesce_name, []).append(str(branch))
+    for coalesce_name, members in coalesce_members.items():
+        # .get with a synthetic fallback, not direct indexing: callers that
+        # set branch_to_coalesce without coalesce_node_ids already exercise
+        # a path that never reads _coalesce_node_ids (e.g. a token without a
+        # branch, or one whose branch resolves to no bound frame), so the
+        # synthesized registry must not require an entry the real production
+        # wiring wouldn't either.
+        closer_node_id = (coalesce_node_ids or {}).get(coalesce_name, NodeID(f"__synth_closer__coalesce__{coalesce_name}"))
+        bindings.append(
+            GroupBinding(
+                kind=FrameKind.FORK,
+                opener_node_id=NodeID(f"__synth_opener__coalesce__{coalesce_name}"),
+                opener_name=f"__synth_opener__coalesce__{coalesce_name}",
+                closer_node_id=closer_node_id,
+                closer_name=str(coalesce_name),
+                closer_kind=CloserKind.COALESCE,
+                policy="require_all",
+                on_group_failure=None,
+                member_roster=tuple(members),
+            )
+        )
+    row_union_members: dict[RowUnionName, list[str]] = {}
+    for branch, row_union_name in (branch_to_row_union or {}).items():
+        row_union_members.setdefault(row_union_name, []).append(str(branch))
+    for row_union_name, members in row_union_members.items():
+        # .get with a synthetic fallback (see the coalesce loop above): the
+        # old _row_union_group_released already tolerated a missing
+        # row_union_node_ids entry (defensive `if row_union_name not in
+        # self._row_union_node_ids: return False`), so several pre-WS3 tests
+        # here set branch_to_row_union without row_union_node_ids.
+        closer_node_id = (row_union_node_ids or {}).get(row_union_name, NodeID(f"__synth_closer__row_union__{row_union_name}"))
+        bindings.append(
+            GroupBinding(
+                kind=FrameKind.FORK,
+                opener_node_id=NodeID(f"__synth_opener__row_union__{row_union_name}"),
+                opener_name=f"__synth_opener__row_union__{row_union_name}",
+                closer_node_id=closer_node_id,
+                closer_name=str(row_union_name),
+                closer_kind=CloserKind.ROW_UNION,
+                policy="require_all",
+                on_group_failure=None,
+                member_roster=tuple(members),
+            )
+        )
+    return GroupBindingRegistry(bindings=tuple(bindings))
+
+
 def _make_processor(
     factory: RecorderFactory,
     *,
@@ -344,6 +415,7 @@ def _make_processor(
     row_union_executor: Any = None,
     row_union_node_ids: dict[RowUnionName, NodeID] | None = None,
     branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
+    group_bindings: GroupBindingRegistry | None = None,
     branch_to_sink: dict[BranchName, str] | None = None,
     node_step_map: dict[NodeID, int] | None = None,
     coalesce_on_success_map: dict[CoalesceName, str] | None = None,
@@ -471,6 +543,16 @@ def _make_processor(
         branch_to_coalesce=branch_to_coalesce,
         row_union_executor=row_union_executor,
         branch_to_row_union=branch_to_row_union,
+        group_bindings=(
+            group_bindings
+            if group_bindings is not None
+            else _synthesize_group_bindings_from_legacy_maps(
+                branch_to_coalesce=branch_to_coalesce,
+                coalesce_node_ids=coalesce_node_ids,
+                branch_to_row_union=branch_to_row_union,
+                row_union_node_ids=row_union_node_ids,
+            )
+        ),
         branch_to_sink={BranchName(k): SinkName(v) for k, v in (branch_to_sink or {}).items()},
         coalesce_on_success_map=coalesce_on_success_map,
         barrier_restore=barrier_restore,
@@ -3988,6 +4070,20 @@ class TestProcessRowMultiRowOutput:
         otherwise touch — out of scope for a processor-level plumbing
         witness; flagging rather than forcing a mock of it, per the
         controller's own instruction.
+
+        WS3 Task 5 supersession note: this pins ``token_traversal.py:260-282``
+        (the SUCCESSFUL, non-empty expansion branch — child WorkItems get
+        ``row_union_name``/``coalesce_name`` threaded via
+        ``_work_items.create_continuation``). It is companion to, not
+        rewritten by, the settle-member seam: `_settle_member_losses` only
+        fires on the ADJACENT empty-expansion branch a few lines earlier
+        (``token_traversal.py:224``, the `TransformResult.success_empty()`
+        path — a plain filter/deaggregation-to-nothing, not a lost fork
+        branch). The mechanism this test pins — binding survives a
+        SUCCESSFUL expansion so the barrier can later adjudicate it — is
+        unchanged by Task 5's fold of the four branch-loss notifiers;
+        mutation-verified green after that fold with no edits needed here
+        beyond this note.
         """
         _db, factory = _make_factory()
         ctx = make_context(landscape=factory.plugin_audit_writer())
@@ -8590,12 +8686,18 @@ class TestResumeIncompleteToken:
 
 
 # =============================================================================
-# _notify_coalesce_of_lost_branch
+# _settle_member_losses (COALESCE arm) — WS3 Task 5 settle-member seam.
+# Pre-WS3 these called the retired _notify_coalesce_of_lost_branch directly;
+# renamed onto the unified seam, unchanged args (_make_processor synthesizes
+# a GroupBindingRegistry from the legacy branch_to_coalesce/coalesce_node_ids
+# kwargs these tests already pass — see test_settle_member_seam.py for the
+# seam's own walk/dispatch tests against a real registry).
 # =============================================================================
 
 
 class TestNotifyCoalesceOfLostBranch:
-    """Tests for the branch loss notification to coalesce executor."""
+    """Tests for the branch loss notification to coalesce executor, exercised
+    through `_settle_member_losses` (spec §6.1)."""
 
     def test_empty_aggregation_commit_failure_cannot_fire_terminal_coalesce(self) -> None:
         """Fork loss stays staged when the owning aggregation transaction fails."""
@@ -8696,7 +8798,7 @@ class TestNotifyCoalesceOfLostBranch:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             [],
@@ -8715,7 +8817,7 @@ class TestNotifyCoalesceOfLostBranch:
             row_data=make_row({}),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             [],
@@ -8739,7 +8841,7 @@ class TestNotifyCoalesceOfLostBranch:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-unmapped_branch", member_key="unmapped_branch"),),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             [],
@@ -8779,7 +8881,7 @@ class TestNotifyCoalesceOfLostBranch:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             [],
@@ -8817,7 +8919,7 @@ class TestNotifyCoalesceOfLostBranch:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             [],
@@ -8855,7 +8957,7 @@ class TestNotifyCoalesceOfLostBranch:
         )
 
         with pytest.raises(OrchestrationInvariantError, match="Coalesce 'merge' not in on_success map"):
-            processor._notify_coalesce_of_lost_branch(
+            processor._settle_member_losses(
                 token,
                 "quarantined:bad_value",
                 [],
@@ -8912,7 +9014,7 @@ class TestNotifyCoalesceOfLostBranch:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             child_items,
@@ -9162,7 +9264,7 @@ class TestRowUnionBranchLossTelemetry:
             branch_to_row_union={BranchName("control"): RowUnionName("variants")},
         )
 
-        assert processor._notify_row_union_of_lost_branch(lost_token, "error_routed") == []
+        assert processor._settle_member_losses(lost_token, "error_routed", []) == []
 
         claimed = _make_claimed_work_item(token_id="lost-token", lineage_path=lost_token.lineage_path)
         losses = processor._take_claim_group_losses(claimed)
@@ -9203,7 +9305,7 @@ class TestRowUnionBranchLossTelemetry:
         )
 
         with patch.object(processor, "_complete_row_union_fire"):
-            results = processor._notify_row_union_of_lost_branch(lost_token, "error_routed")
+            results = processor._settle_member_losses(lost_token, "error_routed", [])
 
         assert [result.token.token_id for result in results] == ["held-token"]
         telemetry.handle_event.assert_called_once()
@@ -9212,53 +9314,37 @@ class TestRowUnionBranchLossTelemetry:
         assert event.outcome is TerminalOutcome.FAILURE
         assert event.path is TerminalPath.UNROUTED
 
-    def test_released_group_stages_no_durable_loss_leader(self) -> None:
-        # Released row_union tokens keep branch_name, so a terminal divert
-        # downstream of the union re-enters the loss path; a released group
-        # must not stage a durable pre-barrier loss record.
+    def test_released_group_stages_nothing_once_the_fork_frame_is_popped(self) -> None:
+        """WS3 retires `_row_union_group_released` (spec :240) as structurally
+        unneeded, not merely redundant: ruling 27 pops a released group's FORK
+        frame off every released token
+        (`RowUnionExecutor._pop_released_group`, pinned directly by
+        `tests/unit/engine/test_token_lineage_path.py`'s
+        `TestPopReleasedGroupFrame` — a real post-release token's
+        lineage_path never carries this union's FORK frame again). Once
+        popped, `binding_for` cannot resolve the walk back to this union at
+        all, so a post-release terminal settles nothing — structurally, with
+        no explicit release check, and identically whether or not this
+        worker holds a coalesce/row_union executor. This replaces the former
+        leader/follower pair, which pinned an is_group_released / durable-
+        COMPLETED discriminator that no longer exists in the walk.
+        """
         _, factory = _make_factory()
         released_token = make_token_info(
             row_id="row-1",
             token_id="released-token",
-            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
+            lineage_path=(),  # popped by the union's release, same as a real post-release token
         )
         row_union_executor = create_autospec(RowUnionExecutor, instance=True)
-        row_union_executor.is_group_released.return_value = True
         processor = _make_processor(
             factory,
             row_union_executor=row_union_executor,
             branch_to_row_union={BranchName("control"): RowUnionName("variants")},
         )
 
-        assert processor._notify_row_union_of_lost_branch(released_token, "routed_to_sink") == []
+        assert processor._settle_member_losses(released_token, "routed_to_sink", []) == []
 
         row_union_executor.notify_branch_lost.assert_not_called()
-        claimed = _make_claimed_work_item(token_id="released-token", lineage_path=released_token.lineage_path)
-        assert processor._take_claim_group_losses(claimed) == ()
-
-    def test_released_group_stages_no_durable_loss_follower(self) -> None:
-        # Followers have no executor; the durable status-COMPLETED node state
-        # committed by the release is the discriminator.
-        _, factory = _make_factory()
-        union_node = NodeID("row_union::variants")
-        processor = _make_processor(
-            factory,
-            row_union_executor=None,
-            row_union_node_ids={RowUnionName("variants"): union_node},
-            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
-        )
-        factory.data_flow.create_row("test-run", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="released-token")
-        state = factory.execution.begin_node_state("released-token", str(union_node), "test-run", 1, {"a": 1})
-        factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"a": 1}, duration_ms=1.0)
-        released_token = make_token_info(
-            row_id="row-1",
-            token_id="released-token",
-            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
-        )
-
-        assert processor._notify_row_union_of_lost_branch(released_token, "routed_to_sink") == []
-
         claimed = _make_claimed_work_item(token_id="released-token", lineage_path=released_token.lineage_path)
         assert processor._take_claim_group_losses(claimed) == ()
 
@@ -9288,7 +9374,7 @@ class TestRowUnionBranchLossTelemetry:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
         )
 
-        assert processor._notify_row_union_of_lost_branch(lost_token, "error_routed") == []
+        assert processor._settle_member_losses(lost_token, "error_routed", []) == []
 
         claimed = _make_claimed_work_item(token_id="failed-token", lineage_path=lost_token.lineage_path)
         losses = processor._take_claim_group_losses(claimed)
@@ -9655,7 +9741,7 @@ class TestGateSinkRoutingNotifiesCoalesce:
     paths (max retries, quarantine, error-routed)."""
 
     def test_gate_sink_route_notifies_coalesce_of_lost_branch(self) -> None:
-        """Gate routing a fork-branch token to a sink must call _notify_coalesce_of_lost_branch.
+        """Gate routing a fork-branch token to a sink must call _settle_member_losses.
 
         Before fix: gate sink routing returned immediately without notifying coalesce,
         causing sibling branches to remain held until timeout/end-of-source.

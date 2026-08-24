@@ -9,6 +9,16 @@ allowed_external_types:
   # DAG validation warnings stay with graph construction; web validation only projects them
   # into API-facing ValidationWarning rows and does not own their construction semantics.
   - "core/dag/models:GraphValidationWarning"
+  # Unified FORK/EXPAND group-binding registry (barrier-scopes spec §3). Built
+  # once at graph-construction time (core/dag/builder.py) and stored on the
+  # ExecutionGraph; WS3's settle-member seam (spec §6.1) reads it at runtime
+  # from RowProcessor/TokenManager (engine/processor.py, engine/tokens.py) via
+  # graph.get_group_bindings() — same instance, never copied (graph.py's
+  # set_group_bindings docstring). Not a serializable L0 contract DTO: its
+  # runtime _expand_groups index mutates after the build-metadata freeze
+  # (register_expand_group, WS3's mint-path call site).
+  - "core/dag/group_bindings:GroupBinding"
+  - "core/dag/group_bindings:GroupBindingRegistry"
   # Plugin bundle type shared between runtime construction, CLI, and web preflight
   - "plugins/infrastructure/runtime_factory:PluginBundle"
   # SSRF safety type - security infrastructure, tightly coupled to validation logic

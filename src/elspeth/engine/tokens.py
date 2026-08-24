@@ -20,6 +20,7 @@ from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.identity import pop_closer_frame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID, StepResolver
+from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 
 
@@ -61,6 +62,7 @@ class TokenManager:
         data_flow: DataFlowRepository,
         *,
         step_resolver: StepResolver,
+        group_bindings: GroupBindingRegistry | None = None,
     ) -> None:
         """Initialize with data flow repository and step resolver.
 
@@ -68,9 +70,22 @@ class TokenManager:
             data_flow: DataFlowRepository for audit trail
             step_resolver: Callable that resolves NodeID to 1-indexed audit step position.
                 The canonical implementation is RowProcessor._resolve_audit_step_for_node.
+            group_bindings: The unified FORK/EXPAND group-binding registry (barrier-scopes
+                spec §3). WS3's mint-path call site (spec §4.2, ``graph.py:883``'s freeze
+                note): ``expand_token`` registers each runtime-minted EXPAND group id on
+                this SAME registry instance, unconditionally, via
+                ``register_expand_group`` — a declared scope opener records its binding,
+                an undeclared expand no-ops (registered under an opener_name the
+                registry has no binding for). None (e.g. CoalesceExecutor's own internal
+                TokenManager, which never calls ``expand_token``) disables registration
+                entirely; ``by_opener_node()`` is resolved ONCE here, not per mint —
+                ``bindings`` is build-time immutable, only the registry's own
+                ``_expand_groups`` index mutates.
         """
         self._data_flow = data_flow
         self._step_resolver = step_resolver
+        self._group_bindings = group_bindings
+        self._opener_binding_by_node_id: dict[NodeID, GroupBinding] = group_bindings.by_opener_node() if group_bindings is not None else {}
 
     def create_initial_token(
         self,
@@ -466,6 +481,18 @@ class TokenManager:
             aggregation_parent_dispositions=aggregation_parent_dispositions,
             parent_lineage_path=parent_token.lineage_path,
         )
+
+        # WS3 mint-path wiring (spec §4.2, graph.py:883's freeze note): register
+        # this runtime-minted EXPAND group id on the group-binding registry,
+        # unconditionally — register_expand_group itself decides declared vs
+        # undeclared. opener_name is resolved via the registry's own
+        # by_opener_node() index (cached at construction): node_id is a
+        # declared scope opener only if it appears there: an ordinary
+        # (non-scope) multi-row node_id is simply absent, and this is a no-op.
+        if self._group_bindings is not None:
+            opener_binding = self._opener_binding_by_node_id.get(node_id)
+            if opener_binding is not None:
+                self._group_bindings.register_expand_group(expand_group_id, opener_name=opener_binding.opener_name)
 
         # Use output_contract (post-transform schema) for all expanded children
         # This ensures downstream transforms can access newly added/renamed fields

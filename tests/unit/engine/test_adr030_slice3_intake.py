@@ -296,7 +296,7 @@ class TestGroupLossHandOff:
             row_data=make_row({}),
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_b"),),
         )
-        sibling_results = processor._notify_coalesce_of_lost_branch(losing_token, "quarantined:boom", [])
+        sibling_results = processor._settle_member_losses(losing_token, "quarantined:boom", [])
         assert len(sibling_results) == 1  # must-fail within the same drain step
         assert sibling_results[0].token.token_id == "tok-held"
 

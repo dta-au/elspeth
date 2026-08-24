@@ -206,6 +206,12 @@ def build_row_processor(
     coalesce_node_map: dict[CoalesceName, NodeID] = graph.get_coalesce_id_map()
     branch_to_row_union: dict[BranchName, RowUnionName] = graph.get_branch_to_row_union_map()
     row_union_node_map: dict[RowUnionName, NodeID] = graph.get_row_union_id_map()
+    # THE settle-member walk's frame resolver (spec §6.1) — stored by
+    # reference on the graph (graph.py:877's docstring), never copied, so
+    # this same instance is also threaded to the processor's own
+    # TokenManager (via RowProcessor.__init__) for register_expand_group's
+    # mint-path writes (WS3 Task 5 step 3b) to stay visible to this read.
+    group_bindings = graph.get_group_bindings()
 
     # Build traversal context BEFORE CoalesceExecutor/TokenManager so that
     # node_step_map is available for the step_resolver closure they require.
@@ -367,6 +373,7 @@ def build_row_processor(
         branch_to_coalesce=branch_to_coalesce,
         row_union_executor=row_union_executor,
         branch_to_row_union=branch_to_row_union,
+        group_bindings=group_bindings,
         branch_to_sink=branch_to_sink,
         unbound_branch_first_node=unbound_branch_first_node,
         sink_names=frozenset(config.sinks),

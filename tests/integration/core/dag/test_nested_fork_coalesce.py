@@ -208,7 +208,9 @@ def test_nested_fork_in_fork_builds_and_runs_to_completion(tmp_path: Path) -> No
 
 # ===== F1: loss-triggered nested merge (THIRD merge-release path) =====
 #
-# _notify_coalesce_of_lost_branch is a merge-release path distinct from
+# _notify_coalesce_closer_of_loss (WS3 Task 5 renamed this from
+# _notify_coalesce_of_lost_branch, same body, called via the unified
+# _settle_member_losses seam) is a merge-release path distinct from
 # _fire_coalesce_merge (live arrival) and complete_coalesce_merge
 # (timeout/EOF sweep): under a partial-merge policy (quorum/best_effort/
 # first), a branch LOSS can itself trigger CoalesceAction.MERGE, not only a
@@ -284,7 +286,7 @@ def test_loss_triggered_nested_merge_holds_at_the_enclosing_barrier(tmp_path: Pa
 
     Regression (elspeth-0bd2cde19a round-2 F1): merge_inner is best_effort;
     losing inner_a2 with inner_a1 already arrived is itself a merge trigger
-    (RowProcessor._notify_coalesce_of_lost_branch -> CoalesceExecutor's
+    (RowProcessor._notify_coalesce_closer_of_loss -> CoalesceExecutor's
     quorum/best_effort/first evaluation can emit CoalesceAction.MERGE on a
     LOSS, not only an arrival). Before the fix this released continuation
     carried no barrier context and sailed past merge_outer, terminating

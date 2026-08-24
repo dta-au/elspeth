@@ -112,7 +112,8 @@ class TestResolveMergedBranchBarrier:
 
         One contract for all three call sites (round-2 F1 correction:
         measured control-vs-patched byte-identical at
-        _notify_coalesce_of_lost_branch too, scratchpad/p8_flat_lossmerge.py
+        _notify_coalesce_closer_of_loss too (WS3 Task 5 renamed this from
+        _notify_coalesce_of_lost_branch, same body), scratchpad/p8_flat_lossmerge.py
         — that site's own earlier terminal/non-terminal split means this
         value is load-bearing only at complete_coalesce_merge/
         _fire_coalesce_merge's terminal-coalesce check, but is harmless

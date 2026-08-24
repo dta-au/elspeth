@@ -154,6 +154,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
 from elspeth.core.checkpoint.serialization import checkpoint_loads
 from elspeth.core.config import AggregationSettings, GateSettings
+from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.errors import LandscapeRecordError
@@ -407,6 +408,7 @@ class RowProcessor:
         branch_to_coalesce: dict[BranchName, CoalesceName] | None = None,
         row_union_executor: RowUnionExecutor | None = None,
         branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
+        group_bindings: GroupBindingRegistry | None = None,
         branch_to_sink: dict[BranchName, SinkName] | None = None,
         unbound_branch_first_node: dict[BranchName, NodeID] | None = None,
         sink_names: frozenset[str] | None = None,
@@ -445,6 +447,15 @@ class RowProcessor:
             retry_manager: Optional retry manager for transform execution
             coalesce_executor: Optional coalesce executor for fork/join operations
             branch_to_coalesce: Map of branch_name -> coalesce_name for fork/join routing
+            group_bindings: The unified FORK/EXPAND group-binding registry (barrier-scopes
+                spec §3, §6.1). ``_settle_member_losses`` walks a failing token's
+                ``lineage_path`` against ``group_bindings.binding_for(frame)`` to find
+                the first bound frame — THE settlement seam. Defaults to an empty
+                registry (every frame resolves inert) rather than None, so the walk
+                never needs a None branch. Also threaded to this processor's own
+                TokenManager so ``expand_token`` can register runtime-minted EXPAND
+                group ids on the SAME registry instance the walk reads (identity
+                matters: a copy would make registration permanently invisible).
             unbound_branch_first_node: Map of branch_name -> first node id for
                 fork branches with no barrier (spec §7 E2): consumed by
                 exactly one ordinary downstream transform/gate, pure fan-out.
@@ -530,6 +541,10 @@ class RowProcessor:
         self._row_union_executor = row_union_executor
         self._row_union_node_ids: dict[RowUnionName, NodeID] = dict(traversal.row_union_node_map)
         self._branch_to_row_union: dict[BranchName, RowUnionName] = branch_to_row_union or {}
+        # THE settle-member walk's frame resolver (spec §6.1). Defaults to an
+        # empty registry — every frame is inert, nothing staged — rather than
+        # None, so _settle_member_losses never needs a None branch.
+        self._group_bindings: GroupBindingRegistry = group_bindings if group_bindings is not None else GroupBindingRegistry(bindings=())
         self._branch_to_sink: dict[BranchName, SinkName] = branch_to_sink or {}
         self._unbound_branch_first_node: dict[BranchName, NodeID] = unbound_branch_first_node or {}
         overlap = set(self._branch_to_coalesce.keys()) & set(self._branch_to_sink.keys())
@@ -582,6 +597,7 @@ class RowProcessor:
         self._token_manager = TokenManager(
             data_flow,
             step_resolver=self._step_resolver,
+            group_bindings=self._group_bindings,
         )
         self._transform_executor = TransformExecutor(
             execution,
@@ -700,7 +716,7 @@ class RowProcessor:
         # RowProcessor is single-threaded per row, so no concurrent access.
         self._live_barrier_holds: dict[str, _LiveBarrierHold] = {}
         # §6.2 record-then-notify: GroupLossSpecs accumulated by
-        # `_notify_coalesce_of_lost_branch` during the current claim/flush;
+        # `_settle_member_losses`/`_stage_group_loss` during the current claim/flush;
         # consumed by the disposition that commits the member's terminal state
         # (the drain's mark_failed/mark_pending_sink/mark_terminal, or the
         # flush's complete_barrier) so the durable loss record rides the SAME
@@ -1496,7 +1512,7 @@ class RowProcessor:
                 )
             )
             results.extend(
-                self._notify_barrier_of_lost_branch(
+                self._settle_member_losses(
                     token,
                     loss_reason,
                     child_items,
@@ -1697,18 +1713,19 @@ class RowProcessor:
             # Expansion atomically recorded every parent's terminal disposition;
             # emit the matching telemetry and construct the triggering RowResult.
             #
-            # ASYMMETRY (verified 2026-08-21): this non-empty flush path notifies NO
-            # barrier — the buffered tokens' (TRANSIENT, BATCH_CONSUMED) and
-            # (FAILURE, QUARANTINED_AT_SOURCE) terminals were recorded inside
-            # expand_token with no _notify_barrier_of_lost_branch call, while the
-            # EMPTY-emission path (_route_empty_emission_results) notifies for every
-            # buffered token. Inside a fork branch, a coalesce roster is blind to
-            # these losses; ruling 25 (barrier-scopes spec §7 rule 6) bans aggregators
-            # in bound regions and the WS3 settle-member seam retires this path.
+            # Spec §6.1 item 2: the quarantined batch member now settles through
+            # the same seam as the empty-flush path — the QUARANTINED_AT_SOURCE
+            # asymmetry (this non-empty flush path used to notify no barrier at
+            # all for these terminals, unlike EMPTY-emission's
+            # _route_empty_emission_results) is retired. After WS2's ruling-25
+            # ban on aggregators inside bound regions, this stages nothing inside
+            # bound regions (aggregators cannot sit there); for unbound frames
+            # the seam is a structural no-op. Uniformity is the point.
             for i, token in enumerate(fctx.buffered_tokens):
                 if i in quarantined_index_set:
                     outcome = TerminalOutcome.FAILURE
                     path = TerminalPath.QUARANTINED_AT_SOURCE
+                    results.extend(self._settle_member_losses(token, "quarantined", child_items, notify_in_memory=False))
                 else:
                     outcome = TerminalOutcome.TRANSIENT
                     path = TerminalPath.BATCH_CONSUMED
@@ -2822,11 +2839,11 @@ class RowProcessor:
         """Build the terminal-coalesce RowResult (SUCCESS/COALESCED routed to the coalesce sink).
 
         Single source of truth for the three terminal-coalesce sites (barrier-fire in
-        _maybe_coalesce_token, lost-branch in _notify_coalesce_of_lost_branch, and resume
+        _maybe_coalesce_token, lost-branch in _notify_coalesce_closer_of_loss, and resume
         re-drive in resume_incomplete_token) so the audit RowResult shape cannot drift between them.
 
         This constructs ONLY the RowResult — it does NOT emit telemetry or record outcomes.
-        Each call site retains its own telemetry handling (e.g. _notify_coalesce_of_lost_branch
+        Each call site retains its own telemetry handling (e.g. _notify_coalesce_closer_of_loss
         deliberately does not emit TokenCompleted here, deferring to accumulate_row_outcomes).
         """
         sink_name = self._nav.resolve_coalesce_sink(coalesce_name, context=context)
@@ -3128,61 +3145,109 @@ class RowProcessor:
         )
         return True, None
 
-    def _notify_row_union_of_lost_branch(
+    def _settle_member_losses(
         self,
         current_token: TokenInfo,
         reason: str,
+        child_items: list[WorkItem],
         *,
         notify_in_memory: bool = True,
     ) -> list[RowResult]:
-        """Notify the row_union executor that a forked branch was diverted.
+        """THE single settlement seam (spec §6.1) — now actually single.
 
-        v1 is fail-closed with no partial release, so a lost branch fails the
-        whole pending group immediately. The durable loss record is staged
-        before the in-memory notify, including on followers; the leader
-        replays it during barrier intake.
-
-        A terminal divert DOWNSTREAM of the union (gate-to-sink route, drop,
-        error) can re-enter this helper on the diverting token's OWN branch
-        identity (unrelated to whether the union already released — ruling 27
-        pops the FORK frame only off the RELEASED tokens the union itself
-        returns, never off a live token still traversing downstream of it). A
-        group that already released is not a pre-barrier loss — staging one
-        would persist a false group_losses record on a healthy run.
-        A genuine pre-barrier loss can never coincide with a released group
-        (release requires every
-        branch to arrive), so the guard changes no legitimate loss.
+        Every terminal-disposition path calls this. It walks the failing
+        token's lineage_path from the INNERMOST frame outward to the FIRST
+        BOUND frame and stages exactly one GroupLossSpec for that frame's
+        member (record-then-notify: staged unconditionally, before any
+        in-memory notify; the staged record rides this claim's disposition
+        transaction via take_claim_group_losses, or the flush's
+        complete_barrier). Inert frames — no closer bound — are pure
+        provenance and are skipped. Followers stage the innermost bound loss
+        only; the in-memory notify is leader-only (each closer-kind arm
+        no-ops without its executor — see `_notify_closer_of_loss`).
         """
-        if current_token.branch_name is None:
-            return []
-        branch_name = BranchName(current_token.branch_name)
-        if branch_name not in self._branch_to_row_union:
-            return []
-        row_union_name = self._branch_to_row_union[branch_name]
-        if self._row_union_group_released(row_union_name, current_token.row_id):
-            return []
-        # Minimal WS3 conversion (Task 5 rewrites this via a lineage-path
-        # walk): key on the token's innermost FORK frame. fork_group_id is
-        # derived from the same lineage_path as branch_name (both read the
-        # innermost FORK frame), so it is non-None whenever branch_name is
-        # (the guard above already returned on branch_name is None).
-        fork_group_id = current_token.fork_group_id
-        assert fork_group_id is not None, "fork_group_id is derived from the same frame as branch_name, checked above"
-        self._pending_group_losses.append(
-            GroupLossSpec(
-                closer_name=str(row_union_name),
-                group_id=fork_group_id,
-                member_key=str(branch_name),
-                token_id=current_token.token_id,
-                reason=reason,
+        for frame in reversed(current_token.lineage_path):
+            binding = self._group_bindings.binding_for(frame)
+            if binding is None:
+                continue  # inert frame: no roster watching (spec §2)
+            self._stage_group_loss(
+                GroupLossSpec(
+                    closer_name=binding.closer_name,
+                    group_id=frame.group_id,
+                    member_key=frame.member_key,
+                    token_id=current_token.token_id,
+                    reason=reason,
+                )
             )
-        )
-        if self._row_union_executor is None or not notify_in_memory:
+            if not notify_in_memory:
+                return []
+            return self._notify_closer_of_loss(binding, frame, current_token, reason, child_items)
+        return []
+
+    def _stage_group_loss(self, spec: GroupLossSpec) -> None:
+        for staged in self._pending_group_losses:
+            if (staged.group_id, staged.member_key) == (spec.group_id, spec.member_key):
+                raise OrchestrationInvariantError(
+                    f"Settlement staged a second loss for group {spec.group_id!r} member "
+                    f"{spec.member_key!r} within one claim; at most one loss per bound frame "
+                    "per claim. Processor bug."
+                )
+        self._pending_group_losses.append(spec)
+
+    def _notify_closer_of_loss(
+        self,
+        binding: GroupBinding,
+        frame: LineageFrame,
+        current_token: TokenInfo,
+        reason: str,
+        child_items: list[WorkItem],
+    ) -> list[RowResult]:
+        """Leader-only in-memory notify, dispatched on the bound frame's closer kind.
+
+        Called only after `_settle_member_losses` has already staged the
+        durable loss for `frame` (record-then-notify, spec §6.2). A follower
+        reaches here too — `notify_in_memory` defaults True at every live
+        call site — but each arm below no-ops without its own executor; the
+        durable record staged above is what the leader's next journal-intake
+        replays.
+        """
+        if binding.closer_kind is CloserKind.COALESCE:
+            return self._notify_coalesce_closer_of_loss(binding, frame, current_token, reason, child_items)
+        if binding.closer_kind is CloserKind.ROW_UNION:
+            return self._notify_row_union_closer_of_loss(binding, frame, current_token, reason)
+        if binding.closer_kind is CloserKind.COLLECTOR:
+            raise OrchestrationInvariantError(
+                f"Collector closer {binding.closer_name!r} has no executor wired; collector settlement lands in WS4 integration."
+            )
+        raise OrchestrationInvariantError(
+            f"Unhandled closer kind {binding.closer_kind!r} for closer {binding.closer_name!r}"
+        )  # pragma: no cover
+
+    def _notify_row_union_closer_of_loss(
+        self,
+        binding: GroupBinding,
+        frame: LineageFrame,
+        current_token: TokenInfo,
+        reason: str,
+    ) -> list[RowResult]:
+        """ROW_UNION arm of `_notify_closer_of_loss` (spec §6.1).
+
+        Body of the retired `_notify_row_union_of_lost_branch`, after its
+        staging block (now unconditionally done by `_settle_member_losses`
+        before this is ever reached) and minus the deleted released-group
+        guard: ruling 27 pops a released group's FORK frame
+        (`RowUnionExecutor._pop_released_group`), so a post-release
+        terminal's lineage_path no longer carries the frame the walk needs
+        to resolve back to this union — the guard is structurally
+        impossible to need now, not merely redundant.
+        """
+        row_union_name = RowUnionName(binding.closer_name)
+        if self._row_union_executor is None:
             return []
         outcome = self._row_union_executor.notify_branch_lost(
             row_union_name=str(row_union_name),
             row_id=current_token.row_id,
-            lost_branch=current_token.branch_name,
+            lost_branch=frame.member_key,
             reason=reason,
         )
         if outcome is None or not outcome.consumed_tokens:
@@ -3214,104 +3279,27 @@ class RowProcessor:
             for consumed in outcome.consumed_tokens
         ]
 
-    def _row_union_group_released(self, row_union_name: RowUnionName, row_id: str) -> bool:
-        """Whether the (row_union, row) group already released.
-
-        Leaders read the executor's in-memory closure reason; followers (no
-        executor) and post-resume processes fall back to the durable
-        status-COMPLETED node state at the union node. A release always
-        commits its COMPLETED states before the released tokens route
-        downstream, so the durable read is race-free.
-
-        Staleness hazard (ruling 27): once a group releases, its tokens'
-        innermost FORK frame is POPPED (RowUnionExecutor._pop_released_group).
-        A caller holding a pre-release in-memory token whose frame has since
-        been popped durably can no longer use that frame to authenticate a
-        §6.2 group loss for THIS union — check release status here first.
-        """
-        if self._row_union_executor is not None and self._row_union_executor.is_group_released(str(row_union_name), row_id):
-            return True
-        if row_union_name not in self._row_union_node_ids:
-            return False
-        node_id = self._row_union_node_ids[row_union_name]
-        return self._barrier_restore_reads.has_released_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id)
-
-    def _notify_barrier_of_lost_branch(
+    def _notify_coalesce_closer_of_loss(
         self,
+        binding: GroupBinding,
+        frame: LineageFrame,
         current_token: TokenInfo,
         reason: str,
         child_items: list[WorkItem],
-        *,
-        notify_in_memory: bool = True,
     ) -> list[RowResult]:
-        """Notify the barrier (if any) bound to this token's fork branch that
-        the branch was lost.
+        """COALESCE arm of `_notify_closer_of_loss` (spec §6.1).
 
-        Dispatches to the coalesce arm, then the row_union arm, so an
-        early-exit path names no barrier kind directly. It is NOT a single seam:
-        verified 2026-08-21, these terminal dispositions never reach
-        this method —
-
-        1. (TRANSIENT, BATCH_CONSUMED) for every non-representative buffered
-           token of a transform-mode aggregation flush, recorded atomically
-           inside expand_token by _route_transform_results. That is the
-           NORMAL SUCCESS path: an aggregation inside a fork branch consumes
-           branch tokens no coalesce roster ever hears about.
-        2. (FAILURE, QUARANTINED_AT_SOURCE) inside a NON-EMPTY aggregation
-           flush (same method). The EMPTY-emission path notifies per
-           buffered token via _route_empty_emission_results; the non-empty
-           path does not.
-        3. Held-sibling failures the CoalesceExecutor writes directly via
-           record_token_outcome(FAILURE, UNROUTED) — three sites in
-           engine/coalesce_executor.py.
-
-        Any design assuming "every terminal disposition notifies the
-        barrier" is wrong in the direction that wedges a run. The unified
-        settle-member seam retires this method and the bypasses above
-        (docs/superpowers/specs/2026-08-21-barrier-scopes-full-nesting-spec.md
-        §6.1).
-
-        Arm exclusivity: a fork branch joins at most one of
-        coalesce/row_union (pairwise checks in RowProcessor.__init__), so at
-        most one arm stages a loss for the FORK identity — but a token can
-        simultaneously be a fork branch AND an expand child, so "one group
-        per token" is false and an arm keyed on expand membership would
-        legitimately co-fire with a fork arm. Do not extend this dispatcher
-        on a one-arm assumption.
-        """
-        results = self._notify_coalesce_of_lost_branch(
-            current_token,
-            reason,
-            child_items,
-            notify_in_memory=notify_in_memory,
-        )
-        results.extend(
-            self._notify_row_union_of_lost_branch(
-                current_token,
-                reason,
-                notify_in_memory=notify_in_memory,
-            )
-        )
-        return results
-
-    def _notify_coalesce_of_lost_branch(
-        self,
-        current_token: TokenInfo,
-        reason: str,
-        child_items: list[WorkItem],
-        *,
-        notify_in_memory: bool = True,
-    ) -> list[RowResult]:
-        """Notify the coalesce executor that a forked branch was diverted.
-
-        Called when a forked token exits the pipeline early (error-routed,
-        quarantined, or failed). The coalesce executor re-evaluates merge
-        conditions and may trigger an immediate merge or failure for held
-        sibling tokens.
+        Body of the retired `_notify_coalesce_of_lost_branch`, after its
+        staging block (now unconditionally done by `_settle_member_losses`
+        before this is ever reached). `lost_branch=frame.member_key`: the
+        walk resolves the FIRST BOUND frame outward from innermost, which in
+        a nested-fork shape need not be the token's own immediate branch —
+        this is the ratified WS3 replacement for the old dispatcher's
+        implicit "own branch only" framing (its "do not extend on a
+        one-arm assumption" warning is retired with it: this arm always
+        settles exactly the ONE frame the walk resolved to).
 
         Args:
-            current_token: The forked token being diverted
-            reason: Machine-readable reason for the diversion
             child_items: Mutable work queue — merged tokens are appended here
 
         Returns:
@@ -3319,53 +3307,20 @@ class RowProcessor:
             of the branch loss, or a COALESCED RowResult if the merge triggered
             at a terminal coalesce step. Empty if no consequences yet.
         """
-        if current_token.branch_name is None:
-            return []
-
-        branch_name = BranchName(current_token.branch_name)
-        if branch_name not in self._branch_to_coalesce:
-            return []
-        coalesce_name = self._branch_to_coalesce[branch_name]
-
+        coalesce_name = CoalesceName(binding.closer_name)
         coalesce_node_id = self._coalesce_node_ids[coalesce_name]
-        # §6.2 record-then-notify: stage the durable loss record BEFORE the
-        # in-memory notify, and UNCONDITIONALLY (regardless of whether this
-        # worker has a coalesce_executor). A follower has no in-process
-        # CoalesceExecutor, but it MUST still write the durable group-loss row
-        # in the same transaction as its mark_failed/divert so the leader's
-        # next journal-intake can see the loss (design §6.2).
-        # The spec rides the branch token's own disposition transaction (the
-        # drain's mark_failed / mark_pending_sink / mark_terminal for the
-        # claimed token, or the flush's complete_barrier for empty-emission
-        # losses) — committed iff the disposition commits, idempotent on the
-        # natural key.
-        # Minimal WS3 conversion (Task 5 rewrites this via a lineage-path
-        # walk): key on the token's innermost FORK frame. fork_group_id is
-        # derived from the same lineage_path as branch_name (both read the
-        # innermost FORK frame), so it is non-None whenever branch_name is
-        # (the guard above already returned on branch_name is None).
-        fork_group_id = current_token.fork_group_id
-        assert fork_group_id is not None, "fork_group_id is derived from the same frame as branch_name, checked above"
-        self._pending_group_losses.append(
-            GroupLossSpec(
-                closer_name=str(coalesce_name),
-                group_id=fork_group_id,
-                member_key=str(branch_name),
-                token_id=current_token.token_id,
-                reason=reason,
-            )
-        )
 
         # In-memory notify: only possible when this worker has a coalesce
-        # executor (leader).  Followers skip the in-memory notify; the durable
-        # record above is sufficient for the leader's next intake.
-        if self._coalesce_executor is None or not notify_in_memory:
+        # executor (leader). Followers skip the in-memory notify; the durable
+        # record staged by `_settle_member_losses` is sufficient for the
+        # leader's next intake.
+        if self._coalesce_executor is None:
             return []
 
         outcome = self._coalesce_executor.notify_branch_lost(
             coalesce_name=coalesce_name,
             row_id=current_token.row_id,
-            lost_branch=current_token.branch_name,
+            lost_branch=frame.member_key,
             reason=reason,
         )
 
@@ -4042,7 +3997,7 @@ class RowProcessor:
         member, including the trigger arrival, is a consumed BLOCKED row.
 
         §E.5: branch-loss records staged by empty-emission routing
-        (``_route_empty_emission_results`` -> ``_notify_coalesce_of_lost_branch``)
+        (``_route_empty_emission_results`` -> ``_settle_member_losses``)
         ride this completion transaction.
 
         Returns the results (sink-handoff results tagged

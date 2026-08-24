@@ -22,9 +22,9 @@ Three proofs, in dependency order:
    pinning that the column contract the guard mirrors is genuinely
    enforced by the dialect (the fact the whole defect hinged on).
 
-Proof (1) depends on the settle-member seam (WS3 Task 5, out of THIS
-session's scope) rewriting the processor staging sites onto full
-``GroupLossSpec`` production; it stays skipped here.
+Proof (1) depends on the settle-member seam (WS3 Task 5) rewriting the
+processor staging sites onto full ``GroupLossSpec`` production — it lands
+here, unskipped, now that the seam is live.
 """
 
 from __future__ import annotations
@@ -40,7 +40,9 @@ from testcontainers.postgres import PostgresContainer  # type: ignore[import-unt
 from tests.unit.engine.test_processor import _make_factory, _make_processor, _persist_token_for_scheduler
 
 from elspeth.contracts import NodeType, TokenInfo, TransformResult
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID
 from elspeth.core.landscape.database import LandscapeDB, begin_write
@@ -138,7 +140,7 @@ def _produce_quarantine_group_loss_spec() -> GroupLossSpec:
         row_id="row-1",
         token_id="tok-branch-a",
         row_data=make_row({"price": 29.99}),
-        branch_name="path_a",
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
     )
     _persist_token_for_scheduler(factory, token)
     processor._handle_transform_error_status(
@@ -150,13 +152,18 @@ def _produce_quarantine_group_loss_spec() -> GroupLossSpec:
     return processor._pending_group_losses.pop()
 
 
-@pytest.mark.skip(reason="settle-member lands in WS3 Task 5")
 @pytest.mark.timeout(120)
 def test_battery_quarantine_payload_records_on_postgres(pg_db: LandscapeDB, tmp_path: Path) -> None:
     """The g03-s3 battery scenario: quarantine detail >64 chars, loss recorded."""
     _seed_run(pg_db, RUN_ID, tmp_path)
     spec = _produce_quarantine_group_loss_spec()
     assert spec.reason == "quarantined"
+    # The producer stages the spec against its OWN isolated in-memory
+    # RecorderFactory (dialect-independent by design, per the helper's
+    # docstring) — the token it names (spec.token_id) needs a matching row
+    # in the REAL postgres run too, or the group_losses FK on (token_id,
+    # run_id) rejects the INSERT below regardless of the reason column fix.
+    _seed_row_and_token(pg_db, run_id=RUN_ID, row_id="row-1", token_id=spec.token_id)
 
     with begin_write(pg_db.engine) as conn:
         assert record_group_loss(

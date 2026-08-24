@@ -162,7 +162,7 @@ class TokenTraversalEngine:
                 path=TerminalPath.UNROUTED,
             )
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_barrier_of_lost_branch(
+            sibling_results = self._processor._settle_member_losses(
                 current_token,
                 "max_retries_exceeded",
                 child_items,
@@ -221,7 +221,7 @@ class TokenTraversalEngine:
                     outcome=TerminalOutcome.SUCCESS,
                     path=TerminalPath.FILTER_DROPPED,
                 )
-                sibling_results = self._processor._notify_barrier_of_lost_branch(
+                sibling_results = self._processor._settle_member_losses(
                     current_token,
                     "dropped_by_filter",
                     child_items,
@@ -344,7 +344,7 @@ class TokenTraversalEngine:
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
             )
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_barrier_of_lost_branch(
+            sibling_results = self._processor._settle_member_losses(
                 current_token,
                 branch_loss_reason,
                 child_items,
@@ -378,7 +378,7 @@ class TokenTraversalEngine:
         error_detail = str(transform_result.reason)
         branch_loss_reason = "max_retries_exceeded" if transform_result.reason["reason"] == "retry_exhausted" else "error_routed"
 
-        sibling_results = self._processor._notify_barrier_of_lost_branch(
+        sibling_results = self._processor._settle_member_losses(
             current_token,
             branch_loss_reason,
             child_items,
@@ -472,7 +472,7 @@ class TokenTraversalEngine:
             # Notify coalesce if this is a forked branch
             # Category token only (String(64) audit column, elspeth-74b795208f):
             # the sink name is durably recorded on the ROUTED token outcome.
-            sibling_results = self._processor._notify_barrier_of_lost_branch(
+            sibling_results = self._processor._settle_member_losses(
                 current_token,
                 "gate_routed_to_sink",
                 child_items,
@@ -506,7 +506,7 @@ class TokenTraversalEngine:
                     outcome=TerminalOutcome.SUCCESS,
                     path=TerminalPath.GATE_DISCARDED,
                 )
-            sibling_results = self._processor._notify_barrier_of_lost_branch(
+            sibling_results = self._processor._settle_member_losses(
                 current_token,
                 "gate_discarded",
                 child_items,
@@ -616,7 +616,7 @@ class TokenTraversalEngine:
             # Category token only (String(64) audit column, elspeth-74b795208f):
             # exception class names are plugin-defined and unbounded; the
             # failure detail is hashed onto the token outcome above.
-            sibling_results = self._processor._notify_barrier_of_lost_branch(
+            sibling_results = self._processor._settle_member_losses(
                 current_token,
                 "gate_error_discarded",
                 child_items,
@@ -636,7 +636,7 @@ class TokenTraversalEngine:
             raise OrchestrationInvariantError("Gate DIVERT outcome requires a named error sink or discarded=True")
         # Category token only (String(64) audit column, elspeth-74b795208f);
         # the FailureInfo on the routed result carries the detail.
-        sibling_results = self._processor._notify_barrier_of_lost_branch(
+        sibling_results = self._processor._settle_member_losses(
             current_token,
             "gate_error_routed",
             child_items,
@@ -863,7 +863,7 @@ class TokenTraversalEngine:
         """
         current_token = token
         # MUTATION CONTRACT: child_items is passed by reference to _handle_transform_node(),
-        # _handle_gate_node(), _notify_coalesce_of_lost_branch(), and _maybe_coalesce_token().
+        # _handle_gate_node(), _settle_member_losses(), and _maybe_coalesce_token().
         # These methods append child WorkItems (fork paths, deaggregation, coalesce merges)
         # directly into this list. The caller returns child_items alongside the RowResult.
         # Do NOT replace with return-value-based patterns without updating all call sites.

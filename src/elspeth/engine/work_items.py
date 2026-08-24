@@ -89,11 +89,11 @@ def resolve_merged_branch_barrier(
       identity of its own, so ``completed_coalesce_name`` is returned
       UNCHANGED, preserving the pre-nesting contract at every call site
       (``_fire_coalesce_merge``, ``complete_coalesce_merge``,
-      ``_notify_coalesce_of_lost_branch``). This value is load-bearing at
+      ``_notify_coalesce_closer_of_loss``). This value is load-bearing at
       the first two: ``process_single_token``'s ``coalesce_node_id_for_name
       == current_node_id and resolve_next_node(...) is None`` check (the
       TERMINAL-coalesce on_success-sink resolution) depends on it staying
-      set to the just-completed barrier. At ``_notify_coalesce_of_lost_branch``
+      set to the just-completed barrier. At ``_notify_coalesce_closer_of_loss``
       it is NOT load-bearing for correctness — that call site only reaches
       this helper from its already-non-terminal branch (its own earlier
       ``resolve_next_node(coalesce_node_id) is None`` check routes the
