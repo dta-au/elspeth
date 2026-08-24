@@ -54,6 +54,7 @@ class _FakeCollectorTransform:
         self.name = name
         self.quarantine_indices: list[int] = []
         self.return_empty_success = False
+        self.return_zero_rows = False
         self.echo_rows = False
         self.raise_on_process: BaseException | None = None
         self.seen_rows: list[dict[str, Any]] = []
@@ -74,6 +75,12 @@ class _FakeCollectorTransform:
         from elspeth.contracts import TransformResult
 
         success_reason: dict[str, Any] = {"action": "collected"}
+        if self.return_zero_rows:
+            # B-4: the auditable "intentionally emitted nothing" shape
+            # (results.py:438-457) — NOT success_multi([]), which raises
+            # ValueError (rows must not be empty). rows=() here, distinct
+            # from return_empty_success's row=None/rows=None duck-type above.
+            return TransformResult.success_empty(success_reason={"action": "collected_empty"})
         if self.quarantine_indices:
             success_reason["metadata"] = {"quarantined_indices": list(self.quarantine_indices)}
         if self.echo_rows:
@@ -436,6 +443,37 @@ class TestFlush:
         assert outcome is not None
         assert outcome.closed_without_plugin == "all_members_lost"
         assert env.transform.call_count == 0
+
+    def test_plugin_emitting_zero_rows_flushes_the_contract_guard_and_mints_an_empty_release_durably(
+        self, collector_env: _CollectorEnv
+    ) -> None:
+        """B-4: a plugin that intentionally emits nothing (TransformResult.success_empty(),
+        rows=()) still DOES invoke the plugin (unlike notify_empty_group/all_members_lost,
+        which close without ever calling it) — it must pass the "neither row nor rows"
+        contract guard (rows=() is not None, so this is not the return_empty_success
+        duck-typed shape), skip the all-quarantined guard entirely (output_rows is empty,
+        so there's nothing to check members against), and mint the M=0 durable release
+        group via collect_tokens (T3 fix-round ruling 1) rather than silently no-op'ing.
+
+        (The addendum's literal "success_multi([])" is invalid — success_multi requires
+        at least one row (results.py:422-424); success_empty() is the actual auditable
+        zero-emission shape and is what a real plugin would return here.)
+        """
+        env = collector_env
+        env.transform.return_zero_rows = True
+        members, group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        outcome = env.executor.accept(members[1], "stitch")
+
+        assert outcome.held is False
+        assert outcome.released_tokens == ()
+        assert outcome.consumed_tokens == tuple(members)
+        assert env.transform.call_count == 1  # the plugin WAS invoked, unlike an engine-closed empty/all-lost group
+
+        records = env.factory.data_flow.get_group_records_for_run(env.run_id)
+        release_records = [r for r in records if r["group_id"] != group_id and r["kind"] == "expand"]
+        assert len(release_records) == 1
+        assert release_records[0]["member_count"] == 0
 
 
 def test_collector_flush_plugin_exception_autofails_with_phase(collector_env: _CollectorEnv) -> None:
