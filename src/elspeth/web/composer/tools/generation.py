@@ -536,6 +536,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "before the enclosing group's closer (coalesce/row_union/collector).",
     ),
     (
+        r"bound_region_unbound_fork|Fork gate '(.+)' inside bound region '(.+)' is unbound",
+        "A fork sits inside a bound group (a scope, or a fork→coalesce/row_union region) without a coalesce or "
+        "row_union of its own, so its branches multiply the group's members with no roster accounting for them "
+        "(spec §7 rule 5).",
+        "Close the fork at a coalesce/row_union inside the group before the group's closer, or move the fork outside the group.",
+    ),
+    (
         r"bound_region_aggregation_invalid",
         "An aggregation sits inside a bound group (fork→coalesce, fork→row_union, or scope). A batch flush "
         "consumes members the group's roster must account for, so losses inside the batch would be invisible.",

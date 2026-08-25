@@ -2105,6 +2105,23 @@ sites:
     The twin itself is untouched, per the plan''s "the row_union twin already exists and stays." Scope/collector
     regions: not yet composer-authorable at all (Task 12), so uncovered by construction, not a gap — this
     disposition covers coalesce and row_union only.'
+- key: 8690ed0e601cb2fd
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: validate_openers_bound_in_region
+  exception: GraphValidationError
+  message: 'Fork gate ''{}'' inside bound region ''{}'' is unbound: its branches reach ''{}'' with no
+    coalesce or row_union of their own. Inside a bound region a shape change mus'
+  ordinal: 0
+  disposition: unmirrored
+  note: 'Spec §7 rule 5 (ruling 28), FORK arm (META-38 commit 3, 2026-08-25): an UNBOUND fork gate inside
+    a bound region — its branches reach the enclosing closer with no coalesce/row_union of their own (the
+    "fourth shape" the earlier docstring said could not exist; falsifier S1 built it with the real builder,
+    both the 2-branch and the 1-branch variant). Authorable: fork gates, scopes and collectors are all
+    NodeSpec-authorable (collector hard refusal lifted at C4), and Stage 1 has ZERO predicate for rule
+    5. Same mirror work as the sibling undeclared-opener limb (key 54e4545d6795d37c): UNMIRRORED_CEILING
+    raised 11->12 (tests/unit/scripts/cicd/test_runtime_rejection_parity_gate.py) under the same ticket
+    elspeth-239500195b (Stage-1 rule-5 mirror) — ratchet back when it lands. Stage 2 preview_pipeline
+    translates the runtime message meanwhile (bound_region_unbound_fork catalogue entry, generation.py).'
 - key: 54e4545d6795d37c
   path: src/elspeth/core/dag/bound_regions.py
   qualname: validate_openers_bound_in_region

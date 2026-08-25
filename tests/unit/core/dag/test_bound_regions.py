@@ -1584,7 +1584,7 @@ def _build_scope_closing_outside_region() -> None:
         depth=1,
     )
     multi_row_node_ids = {NodeID("branch_a"): "branch_a_expand"}
-    validate_openers_bound_in_region(graph, (fork_region,), registry, multi_row_node_ids)
+    validate_openers_bound_in_region(graph, (fork_region,), registry, multi_row_node_ids, frozenset())
 
 
 def _build_plain_expand_pipeline() -> ExecutionGraph:
@@ -2220,3 +2220,104 @@ class TestRule7RosterAuthorityIsStructural:
         # all: group_bindings.py hardcodes policy="require_all" for every
         # ROW_UNION binding, and RowUnionSettings carries no policy field.
         assert "policy" not in RowUnionSettings.model_fields
+
+
+# ---------------------------------------------------------------------------
+# §7 rule 5 FORK arm (META-38 commit 3): an UNBOUND fork inside a bound region
+# ---------------------------------------------------------------------------
+
+
+def _build_unbound_fork_inside_scope(fork_to: list[str]) -> ExecutionGraph:
+    """The META-38 structural counterexample (falsifier S1): source -> expand
+    (declared scope opener) -> gate fork_to ``fork_to`` UNBOUND -> one
+    ordinary transform per branch -> declared queue 'merged' -> collector
+    (the scope's closer) -> sink. Rule 2 needs a bound branch, E2 lets an
+    unbound branch feed a transform, rule 4's sink-inside never fires and the
+    builder's rule-5 census excludes gates — so before the FORK arm this
+    BUILT, in both the 2-branch shape (roster N, arrivals 2N) and the
+    1-branch shape (roster N == arrivals N, provenance silently dropped)."""
+    obs = SchemaConfig(mode="observed", fields=None)
+    source = _BoundRegionMockSource()
+    opener = _BoundRegionMultiRowTransform(name="expand", output_schema_config=obs)
+    collector = _BoundRegionCollectorPlugin(name="stitcher", output_schema_config=obs)
+    transforms = [
+        WiredTransform(
+            plugin=opener,  # type: ignore[arg-type]
+            settings=TransformSettings(
+                name="expand", plugin=opener.name, input="source_out", on_success="pages", on_error="discard", options={}
+            ),
+        )
+    ]
+    for branch in fork_to:
+        plugin = _BoundRegionTransform(name=f"t_{branch}", output_schema_config=obs)
+        transforms.append(
+            WiredTransform(
+                plugin=plugin,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name=f"t_{branch}", plugin=plugin.name, input=branch, on_success="merged", on_error="discard", options={}
+                ),
+            )
+        )
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[dict-item]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=transforms,
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[GateSettings(name="fanout", input="pages", condition="'all'", routes={"all": "fork"}, fork_to=fork_to)],
+        queues={"merged": QueueSettings()},
+        collectors={"stitcher": (collector, CollectorSettings(name="stitcher", plugin="stitch_pages", input="merged", on_success="out"))},  # type: ignore[dict-item]
+        scope_settings=[ScopeSettings(name="doc_pages", opener="expand", closer="stitcher", policy="require_all")],
+    )
+
+
+def _build_bound_fork_inside_scope() -> ExecutionGraph:
+    """The well-nested sibling: the same fork closes at an IN-REGION coalesce
+    before the collector — legal, must keep building."""
+    obs = SchemaConfig(mode="observed", fields=None)
+    source = _BoundRegionMockSource()
+    opener = _BoundRegionMultiRowTransform(name="expand", output_schema_config=obs)
+    t_pa = _BoundRegionTransform(name="t_pa", output_schema_config=obs)
+    t_pb = _BoundRegionTransform(name="t_pb", output_schema_config=obs)
+    collector = _BoundRegionCollectorPlugin(name="stitcher", output_schema_config=obs)
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[dict-item]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=opener,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="expand", plugin=opener.name, input="source_out", on_success="pages", on_error="discard", options={}
+                ),
+            ),
+            WiredTransform(
+                plugin=t_pa,  # type: ignore[arg-type]
+                settings=TransformSettings(name="t_pa", plugin=t_pa.name, input="pa", on_success="pa_out", on_error="discard", options={}),
+            ),
+            WiredTransform(
+                plugin=t_pb,  # type: ignore[arg-type]
+                settings=TransformSettings(name="t_pb", plugin=t_pb.name, input="pb", on_success="pb_out", on_error="discard", options={}),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[GateSettings(name="fanout", input="pages", condition="'all'", routes={"all": "fork"}, fork_to=["pa", "pb"])],
+        coalesce_settings=[CoalesceSettings(name="merge", branches={"pa": "pa_out", "pb": "pb_out"}, policy="require_all", merge="union")],
+        # The collector consumes the coalesce BY NAME (the oracle's
+        # section_merge -> page_stitcher shape).
+        collectors={"stitcher": (collector, CollectorSettings(name="stitcher", plugin="stitch_pages", input="merge", on_success="out"))},  # type: ignore[dict-item]
+        scope_settings=[ScopeSettings(name="doc_pages", opener="expand", closer="stitcher", policy="require_all")],
+    )
+
+
+class TestRule5ForkArm:
+    @pytest.mark.parametrize("fork_to", [["pa", "pb"], ["pa"]], ids=["two-branches", "single-branch"])
+    def test_unbound_fork_inside_a_bound_region_is_refused(self, fork_to: list[str]) -> None:
+        with pytest.raises(GraphValidationError, match=r"Fork gate 'fanout' inside bound region 'stitcher' is unbound") as excinfo:
+            _build_unbound_fork_inside_scope(fork_to)
+        assert (excinfo.value.component_id, excinfo.value.component_type) == ("fanout", "gate")
+
+    def test_bound_fork_inside_a_bound_region_still_builds(self) -> None:
+        graph = _build_bound_fork_inside_scope()
+        regions = graph.get_bound_regions()
+        assert {r.binding.closer_name for r in regions} == {"stitcher", "merge"}

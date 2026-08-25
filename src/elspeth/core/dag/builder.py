@@ -1921,7 +1921,11 @@ def build_execution_graph(
             if collector_transform.creates_tokens
         }
     )
-    validate_openers_bound_in_region(graph, regions, registry, multi_row_node_ids)
+    # META-38 commit 3: rule 5's FORK arm census — every gate with a fork_to,
+    # node-id keyed; the validator refuses any that sits inside a bound
+    # region without a FORK binding of its own.
+    fork_gate_node_ids = frozenset(config_gate_ids[GateName(gate_config.name)] for gate_config in gates if gate_config.fork_to)
+    validate_openers_bound_in_region(graph, regions, registry, multi_row_node_ids, fork_gate_node_ids)
     validate_no_aggregations_in_regions(graph, regions, {aid: str(name) for name, aid in aggregation_ids.items()})
     # rule 7 (roster authority, standing ruling) is structural: the policy
     # vocabularies are closed per closer kind (spec §2) — ScopeSettings.policy

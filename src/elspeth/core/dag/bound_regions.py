@@ -26,7 +26,7 @@ from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
 from elspeth.core.dag.models import GraphValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Collection, Mapping
 
     from elspeth.core.dag.graph import ExecutionGraph
 
@@ -393,6 +393,7 @@ def validate_openers_bound_in_region(
     regions: tuple[BoundRegion, ...],
     registry: GroupBindingRegistry,
     multi_row_node_ids: Mapping[NodeID, str],
+    fork_gate_node_ids: Collection[NodeID],
 ) -> None:
     """§7 rule 5 (ruling 28): a shape change inside a group must itself be a group.
 
@@ -422,14 +423,26 @@ def validate_openers_bound_in_region(
     limb below (a collector cannot open its own scope), which is the
     correct fail-closed outcome.
 
-    In-region FORK gates need no arm here: a fork inside a bound region
-    either closes at an in-region coalesce/row_union (well-nested, legal —
-    rule 3 enforces the nesting, rule 4 the SESE shape), closes outside the
+    In-region FORK gates have FOUR shapes, and this rule owns the fourth
+    (META-38 commit 3, 2026-08-25): a fork inside a bound region either
+    closes at an in-region coalesce/row_union (well-nested, legal — rule 3
+    enforces the nesting, rule 4 the SESE shape), closes outside the
     enclosing region (rule 3's partial-overlap rejection already fires,
-    before this function ever runs), or fans out to sinks (pure fan-out,
-    unbound — rule 4's sink-inside check already rejects a sink reached
-    from within a bound region). There is no fourth shape for a FORK
-    binding to "complete" here.
+    before this function ever runs), fans out to sinks (pure fan-out —
+    rule 4's sink-inside check already rejects a sink reached from within
+    a bound region), or — the shape the earlier version of this docstring
+    said could not exist — fans out to ordinary transforms that reach the
+    ENCLOSING closer with no coalesce/row_union of their own (rule 2 needs
+    a bound branch to bind, E2 lets an unbound branch feed a transform,
+    the builder's rule-5 census excludes gates). Such an UNBOUND fork
+    inside a bound region is refused here: its branches multiply the
+    region's members without a group of their own (roster N, arrivals
+    N x branches — and with a single branch, roster N == arrivals N with
+    the fork's provenance silently dropped at the closer's truncation),
+    which is exactly the "shape change must itself be a group" rule 5
+    states. The runtime truncation guard (``truncate_at_closer_frame``)
+    still raises on the frame it would leave above the closer's own — a
+    fail-closed defense, not the enforcement point; this is.
 
     The "closer closes outside" limb below is a DEFENSIVE invariant, not a
     reachable rejection: whenever an opener node is genuinely a member of
@@ -449,19 +462,39 @@ def validate_openers_bound_in_region(
     `BoundRegion`/`GroupBindingRegistry` test that exercises it bypasses
     `compute_bound_regions` entirely for exactly this reason.
 
-    ``graph`` is unused in this function's body (kept for signature
-    symmetry with the other §7 validators, which all take the built graph);
-    every fact this rule needs — region membership, the opener index, the
-    multi-row roster — is already materialized in its other parameters.
+    ``fork_gate_node_ids`` is the builder's census of gates with a
+    ``fork_to`` (the FORK arm's roster, node-id keyed like
+    ``multi_row_node_ids``); a gate in it is UNBOUND when the registry holds
+    no FORK binding keyed on its node (``by_opener_node`` — a bound gate's
+    branches resolve to a declared coalesce/row_union closer). ``graph``
+    names the offending gate for the message (its configured gate name via
+    ``get_config_gate_id_map``; the raw node id when a hand-built graph set
+    no map). Every other fact this rule needs — region membership, the
+    opener index, the multi-row roster — is already materialized in its
+    other parameters.
 
     Raises:
         GraphValidationError: a multi-row transform inside a bound region is
-            not a declared scope opener, or (defensively; see above) its
+            not a declared scope opener, an UNBOUND fork gate sits inside a
+            bound region, or (defensively; see above) a scope opener's
             collector closes outside the enclosing region.
     """
     bound_openers = registry.by_opener_node()
+    gate_name_by_node_id = {node_id: str(name) for name, node_id in graph.get_config_gate_id_map().items()}
     for region in regions:
         binding = region.binding
+        for gate_node_id in sorted(fork_gate_node_ids):
+            if gate_node_id not in region.member_node_ids or gate_node_id in bound_openers:
+                continue
+            gate_name = gate_name_by_node_id[gate_node_id] if gate_node_id in gate_name_by_node_id else str(gate_node_id)
+            raise GraphValidationError(
+                f"Fork gate '{gate_name}' inside bound region '{binding.closer_name}' is unbound: its branches "
+                f"reach '{binding.closer_name}' with no coalesce or row_union of their own. Inside a bound region "
+                f"a shape change must itself be a group (spec §7 rule 5, ruling 28): close the fork at an "
+                f"in-region coalesce/row_union before '{binding.closer_name}', or move the fork outside the region.",
+                component_id=gate_name,
+                component_type="gate",
+            )
         for node_id in sorted(multi_row_node_ids):
             transform_name = multi_row_node_ids[node_id]
             if node_id not in region.member_node_ids:

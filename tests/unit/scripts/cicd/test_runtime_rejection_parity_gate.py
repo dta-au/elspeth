@@ -51,7 +51,12 @@ from scripts.cicd.runtime_rejection_parity import (
 # reclassified build-rejection test is the live proof), Stage 1 has zero rule-5
 # predicate. Tracked as elspeth-239500195b (Stage-1 rule-5 mirror via probe
 # plumbing); ratchet back to 10 when that ticket lands.
-UNMIRRORED_CEILING = 11
+# 12 (2026-08-25, META-38 commit 3): + spec §7 rule 5 FORK arm (same function,
+# key 8690ed0e601cb2fd) — an UNBOUND fork inside a bound region, the shape the
+# falsifier built with the real builder; authorable (fork gates, scopes and
+# collectors are NodeSpec-authorable since C4), Stage 1 still has zero rule-5
+# predicate. Same ticket elspeth-239500195b; ratchet back to 10 when it lands.
+UNMIRRORED_CEILING = 12
 
 
 # --------------------------------------------------------------------------
