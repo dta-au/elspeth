@@ -7,7 +7,7 @@ group; rows reach it in opener-ordinal order; one released token per output;
 every member hold completed; a group_records row exists for each release
 group; run status COMPLETED. COMPLETED alone is the vacuous pass (a collector
 pipeline can finalize clean with the plugin never invoked), which is why the
-invocation count and the release groups are asserted first.
+invocation count and the release groups are what make it the gate.
 """
 
 from __future__ import annotations
@@ -164,13 +164,18 @@ def test_collector_pipeline_runs_end_to_end(tmp_path: Path, monkeypatch: Any) ->
     db_path, result_data, output_rows = _build_and_run(tmp_path)
 
     # 1 + 2. The plugin ran exactly once per group, over the members in
-    # opener-ordinal order (the authored list order; the executor's own unit
-    # pin, test_flush_orders_members_by_opener_ordinal_not_arrival_order, is
-    # the arrival-vs-ordinal discriminator — a single-worker run arrives in
-    # ordinal order by construction).
+    # opener-ordinal order — the authored list order. This fixture's ARRIVAL
+    # order differs from ordinal even single-worker (the scheduler drains
+    # expanded children in a non-authored order; the reviewer's sort-by-
+    # arrival mutant yields [[1, 3, 2], [5, 7]]), so this assertion
+    # discriminates on its own; the executor's unit pin
+    # (test_flush_orders_members_by_opener_ordinal_not_arrival_order) is the
+    # narrower, deterministic discriminator at the mechanism.
     assert invocations == [[3, 1, 2], [5, 7]]
 
-    # 6. Run status COMPLETED.
+    # 6. Run status COMPLETED — asserted early only because a failed run
+    # makes every later audit assertion moot; on its own it is the vacuous
+    # pass (see the module docstring), never the evidence.
     assert result_data["status"] == RunStatus.COMPLETED.value
 
     # 3. One released token per output: one stats row per group at the sink.
