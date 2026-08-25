@@ -59,6 +59,7 @@ class _StubRenderer:
                     width_px=page.width_px,
                     height_px=page.height_px,
                     size_bytes=len(data),
+                    text=page.text,
                 )
                 for page, data in zip(self._result.rendered, self._png_bytes, strict=True)
             )
@@ -79,8 +80,8 @@ class _StubRenderer:
         self.closed = True
 
 
-def _page(number: int) -> RenderedPage:
-    return RenderedPage(page_number=number, png_path=Path("unset"), width_px=200, height_px=100, size_bytes=0)
+def _page(number: int, text: str | None = "") -> RenderedPage:
+    return RenderedPage(page_number=number, png_path=Path("unset"), width_px=200, height_px=100, size_bytes=0, text=text)
 
 
 class _EscapingPathRenderer:
@@ -96,7 +97,7 @@ class _EscapingPathRenderer:
     def render(self, pdf_bytes: bytes) -> tuple[RasterizeResponse, Path]:
         del pdf_bytes
         output_dir = Path(tempfile.mkdtemp(prefix="escaping-rasterize-"))
-        page = RenderedPage(page_number=1, png_path=self._escape_path, width_px=10, height_px=10, size_bytes=4)
+        page = RenderedPage(page_number=1, png_path=self._escape_path, width_px=10, height_px=10, size_bytes=4, text="")
         return RasterizeResponse(page_count=1, rendered=(page,), refused=()), output_dir
 
     def discard(self, output_dir: Path | None) -> None:
@@ -119,7 +120,7 @@ class _LyingSizeRenderer:
         output_dir = Path(tempfile.mkdtemp(prefix="lying-size-rasterize-"))
         png_path = output_dir / "page-1.png"
         png_path.write_bytes(self._real_bytes)
-        page = RenderedPage(page_number=1, png_path=png_path, width_px=10, height_px=10, size_bytes=self._claimed_size)
+        page = RenderedPage(page_number=1, png_path=png_path, width_px=10, height_px=10, size_bytes=self._claimed_size, text="")
         return RasterizeResponse(page_count=1, rendered=(page,), refused=()), output_dir
 
     def discard(self, output_dir: Path | None) -> None:
@@ -326,6 +327,19 @@ def test_real_renderer_end_to_end(store: FilesystemPayloadStore) -> None:
     assert result.status == "success"
     assert [row["page_number"] for row in result.rows] == [1, 2]
     assert store.retrieve(result.rows[0]["page_blob_ref"])[:8] == b"\x89PNG\r\n\x1a\n"
+    assert [row["page_text"] for row in result.rows] == ["Page 1", "Page 2"]
+
+
+def test_real_renderer_extract_text_false_omits_page_text(store: FilesystemPayloadStore) -> None:
+    ref = store.store(minimal_pdf(1))
+    transform = PDFRasterize({"schema": {"mode": "observed"}, "dpi": 72, "extract_text": False})
+    transform.on_start(_FakeLifecycleContext(store))
+    try:
+        result = transform.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    finally:
+        transform.close()
+    assert result.status == "success"
+    assert "page_text" not in result.rows[0].to_dict()
 
 
 def test_importing_pdf_rasterize_does_not_pull_in_pypdfium2() -> None:
@@ -377,9 +391,30 @@ class TestConfig:
     def test_declares_created_fields_and_probe(self) -> None:
         transform = PDFRasterize(PDFRasterize.probe_config())
         assert transform.declared_output_fields == frozenset(
-            {"page_blob_ref", "page_number", "document_id", "page_mime_type", "page_size_bytes", "page_width_px", "page_height_px"}
+            {
+                "page_blob_ref",
+                "page_number",
+                "document_id",
+                "page_mime_type",
+                "page_size_bytes",
+                "page_width_px",
+                "page_height_px",
+                "page_text",
+            }
         )
         assert PDFRasterize.creates_tokens is True and PDFRasterize.passes_through_input is True
+
+    def test_page_text_field_may_not_collide_with_another_emitted_field(self) -> None:
+        with pytest.raises(PluginConfigError, match="distinct"):
+            PDFRasterize({"schema": {"mode": "observed"}, "page_text_field": "document_id"})
+
+    def test_blob_ref_field_may_not_name_page_text_field(self) -> None:
+        with pytest.raises(PluginConfigError, match="page_text"):
+            PDFRasterize({"schema": {"mode": "observed"}, "blob_ref_field": "page_text"})
+
+    def test_extract_text_false_omits_declared_field(self) -> None:
+        transform = PDFRasterize({"schema": {"mode": "observed"}, "extract_text": False})
+        assert "page_text" not in transform.declared_output_fields
 
 
 def test_registers_via_builtin_discovery() -> None:

@@ -170,6 +170,7 @@ class TestPDFRasterizePipeline:
         for row in pages:
             png_bytes = payload_store.retrieve(row["page_blob_ref"])
             assert png_bytes[:8] == PNG_MAGIC
+            assert row["page_text"] == f"Page {row['page_number']}"
 
     def test_errors_sink_holds_the_two_bad_documents(self, pipeline_result: PipelineRunArtifacts) -> None:
         _, _, _, errors_path = pipeline_result

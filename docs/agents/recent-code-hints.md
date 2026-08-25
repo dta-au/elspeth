@@ -1201,6 +1201,14 @@ sequentially per worktree.
     the summed whole-catalog payload. Verify that test explicitly after
     editing any `usage_when_not_to_use` or `summary`, even a one-clause
     addition; do not assume "it's just prose" is free.
+  - **2026-08-25 follow-up — per-page text extraction landed (pdfium text
+    layer, no OCR): `extract_text: bool = True` and `page_text_field`.** The
+    frozen `usage_when_not_to_use` string still opens "Not a text extractor"
+    — left AS-IS deliberately (the byte-budget note above had single-digit
+    bytes of headroom, none to spend correcting it) — so it is now stale
+    relative to the plugin's actual behaviour. The corrective information
+    lives in `composer_hints` instead (free of the cap). Anyone freeing
+    budget in a later pass should fix that opening clause first.
 
 - **2026-08-17 — worker-pool admission follows the WORKER's lifetime, and the
   preflight coordinator owns the caller's budget** (elspeth-5269b43bca /

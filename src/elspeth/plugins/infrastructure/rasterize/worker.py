@@ -133,8 +133,22 @@ def _render_page(document: object, index: int, page_number: int, scale: float, r
                 kind=PageRefusalKind.OVERSIZE_BYTES,
                 detail=f"encoded page is {len(png)} bytes; max_page_bytes is {request.max_page_bytes}",
             )
+        text: str | None = None
+        if request.extract_text:
+            try:
+                textpage = page.get_textpage()
+            except PdfiumError as exc:
+                return RefusedPage(page_number=page_number, kind=PageRefusalKind.RENDER_ERROR, detail=str(exc))
+            try:
+                text = textpage.get_text_range()
+            except PdfiumError as exc:
+                return RefusedPage(page_number=page_number, kind=PageRefusalKind.RENDER_ERROR, detail=str(exc))
+            finally:
+                textpage.close()
         png_path = request.output_dir / f"page-{page_number}.png"
         png_path.write_bytes(png)
-        return RenderedPage(page_number=page_number, png_path=png_path, width_px=bitmap.width, height_px=bitmap.height, size_bytes=len(png))
+        return RenderedPage(
+            page_number=page_number, png_path=png_path, width_px=bitmap.width, height_px=bitmap.height, size_bytes=len(png), text=text
+        )
     finally:
         page.close()

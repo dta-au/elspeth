@@ -15,8 +15,10 @@ source ─(pdf_manifest)─> rasterize ─┬─(pages)──────> pages
 - `report.pdf` is a valid 3-page mock PDF. `pdf_rasterize` renders it into 3
   PNG page rows, each carrying `page_blob_ref` (the rendered page's
   payload-store hash), `page_number`, `document_id` (the source PDF's hash),
-  `page_mime_type`, `page_size_bytes`, `page_width_px`, and `page_height_px`,
-  alongside the manifest's original fields.
+  `page_mime_type`, `page_size_bytes`, `page_width_px`, `page_height_px`, and
+  `page_text` (the page's text extracted via pdfium's text layer — no OCR,
+  fully offline; `report.pdf`'s three pages yield `"Page 1"`, `"Page 2"`, and
+  `"Page 3"`), alongside the manifest's original fields.
 - `broken.pdf` is a malformed PDF (a header with no valid xref table).
   `pdf_rasterize` refuses the whole row with reason `pdf_malformed` and
   `on_error` routes it to the quarantine sink — the row keeps only its

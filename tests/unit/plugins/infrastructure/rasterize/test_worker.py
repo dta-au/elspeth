@@ -17,8 +17,14 @@ from tests.fixtures.pdf_documents import ENCRYPTED_PDF_PATH, MALFORMED_PDF, NOT_
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-def _request(pdf: bytes, tmp_path: Path, **overrides: int) -> RasterizeRequest:
-    values = {"dpi": 72, "max_pages": 10, "max_page_pixels": 1_000_000, "max_page_bytes": 5 * 1024 * 1024}
+def _request(pdf: bytes, tmp_path: Path, **overrides: int | bool) -> RasterizeRequest:
+    values: dict[str, int | bool] = {
+        "dpi": 72,
+        "max_pages": 10,
+        "max_page_pixels": 1_000_000,
+        "max_page_bytes": 5 * 1024 * 1024,
+        "extract_text": True,
+    }
     values.update(overrides)
     return RasterizeRequest(pdf_bytes=pdf, output_dir=tmp_path, **values)
 
@@ -35,6 +41,18 @@ def test_renders_every_page_to_png_files_in_order(tmp_path: Path) -> None:
         assert page.size_bytes == len(data)
         assert (page.width_px, page.height_px) == (200, 100)  # 200x100 pt at 72 dpi
         assert page.png_path.parent == tmp_path
+
+
+def test_extracts_each_pages_text_via_the_pdfium_text_layer(tmp_path: Path) -> None:
+    result = rasterize_document(_request(minimal_pdf(3), tmp_path))
+    assert type(result) is RasterizeResponse
+    assert [page.text for page in result.rendered] == ["Page 1", "Page 2", "Page 3"]
+
+
+def test_extract_text_false_leaves_text_none(tmp_path: Path) -> None:
+    result = rasterize_document(_request(minimal_pdf(2), tmp_path, extract_text=False))
+    assert type(result) is RasterizeResponse
+    assert [page.text for page in result.rendered] == [None, None]
 
 
 def test_dpi_scales_geometry_by_ceil(tmp_path: Path) -> None:

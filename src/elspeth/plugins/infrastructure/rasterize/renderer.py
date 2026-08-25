@@ -36,6 +36,7 @@ class RenderLimits:
     max_page_bytes: int
     render_timeout_seconds: int
     worker_memory_limit_bytes: int
+    extract_text: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +129,7 @@ class PoolRenderer:
             max_page_pixels=self._limits.max_page_pixels,
             max_page_bytes=self._limits.max_page_bytes,
             output_dir=output_dir,
+            extract_text=self._limits.extract_text,
         )
         pool = self._ensure_pool()
         try:

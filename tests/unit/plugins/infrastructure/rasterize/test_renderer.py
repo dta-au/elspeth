@@ -11,14 +11,15 @@ from elspeth.testing.rasterize_fakes import crashing_worker, raising_worker, sle
 from tests.fixtures.pdf_documents import ENCRYPTED_PDF_PATH, minimal_pdf
 
 
-def _limits(**overrides: int) -> RenderLimits:
-    values = {
+def _limits(**overrides: int | bool) -> RenderLimits:
+    values: dict[str, int | bool] = {
         "dpi": 72,
         "max_pages": 10,
         "max_page_pixels": 1_000_000,
         "max_page_bytes": 5 * 1024 * 1024,
         "render_timeout_seconds": 20,
         "worker_memory_limit_bytes": 2 * 1024**3,
+        "extract_text": True,
     }
     values.update(overrides)
     return RenderLimits(**values)

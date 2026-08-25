@@ -150,6 +150,21 @@ class PDFRasterizeConfig(TransformDataConfig):
         title="Page height field",
         description="Output field receiving the rendered page height in pixels.",
     )
+    extract_text: bool = Field(
+        default=True,
+        title="Extract page text",
+        description=(
+            "Extract each page's text via pdfium's text layer (no OCR, fully offline) alongside the rendered PNG. "
+            "A page with no text layer yields an empty string, not a refusal. When false, page_text_field is not emitted."
+        ),
+    )
+    page_text_field: str = Field(
+        default="page_text",
+        min_length=1,
+        max_length=256,
+        title="Page text field",
+        description="Output field receiving the page's extracted text when extract_text is true; not emitted when false.",
+    )
     dpi: int = Field(
         default=DEFAULT_DPI,
         ge=MIN_DPI,
@@ -219,6 +234,7 @@ class PDFRasterizeConfig(TransformDataConfig):
             self.page_size_bytes_field,
             self.page_width_field,
             self.page_height_field,
+            self.page_text_field,
         )
         for name in (self.blob_ref_field, *emitted):
             if not name.strip() or not name.isidentifier():
@@ -235,7 +251,7 @@ class PDFRasterizeConfig(TransformDataConfig):
 
 
 def _pdf_rasterize_added_output_fields(cfg: PDFRasterizeConfig) -> tuple[FieldDefinition, ...]:
-    return (
+    fields = [
         FieldDefinition(name=cfg.page_blob_ref_field, field_type="str", required=True),
         FieldDefinition(name=cfg.page_number_field, field_type="int", required=True),
         FieldDefinition(name=cfg.document_id_field, field_type="str", required=True),
@@ -243,7 +259,10 @@ def _pdf_rasterize_added_output_fields(cfg: PDFRasterizeConfig) -> tuple[FieldDe
         FieldDefinition(name=cfg.page_size_bytes_field, field_type="int", required=True),
         FieldDefinition(name=cfg.page_width_field, field_type="int", required=True),
         FieldDefinition(name=cfg.page_height_field, field_type="int", required=True),
-    )
+    ]
+    if cfg.extract_text:
+        fields.append(FieldDefinition(name=cfg.page_text_field, field_type="str", required=True))
+    return tuple(fields)
 
 
 def _build_pdf_rasterize_output_schema_config(schema_config: SchemaConfig, cfg: PDFRasterizeConfig) -> SchemaConfig:
@@ -289,12 +308,18 @@ class _InvariantPayloadStore:
 class _InvariantRenderer:
     """Hermetic renderer seam for the invariant probe: always renders one page."""
 
+    def __init__(self, extract_text: bool) -> None:
+        self._extract_text = extract_text
+
     def render(self, pdf_bytes: bytes) -> tuple[RasterizeResponse, Path]:
         del pdf_bytes
         output_dir = Path(tempfile.mkdtemp(prefix="pdf-rasterize-invariant-probe-"))
         png_path = output_dir / "page-1.png"
         png_path.write_bytes(_INVARIANT_PROBE_PNG)
-        page = RenderedPage(page_number=1, png_path=png_path, width_px=1, height_px=1, size_bytes=len(_INVARIANT_PROBE_PNG))
+        # Mirrors _INVARIANT_PROBE_PDF's own content stream (`(Page 1) Tj`), which is
+        # what a real pdfium text-layer extraction over that document would return.
+        text = "Page 1" if self._extract_text else None
+        page = RenderedPage(page_number=1, png_path=png_path, width_px=1, height_px=1, size_bytes=len(_INVARIANT_PROBE_PNG), text=text)
         return RasterizeResponse(page_count=1, rendered=(page,), refused=()), output_dir
 
     def discard(self, output_dir: Path | None) -> None:
@@ -317,12 +342,13 @@ class PDFRasterize(BaseTransform):
             "page_size_bytes_field",
             "page_width_field",
             "page_height_field",
+            "page_text_field",
         }
     )
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:98c4ead2961c0fbb"
+    source_file_hash: str | None = "sha256:b2e8c320f994a75f"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -364,6 +390,8 @@ class PDFRasterize(BaseTransform):
         self._page_size_bytes_field = cfg.page_size_bytes_field
         self._page_width_field = cfg.page_width_field
         self._page_height_field = cfg.page_height_field
+        self._extract_text = cfg.extract_text
+        self._page_text_field = cfg.page_text_field
         self._max_input_bytes = cfg.max_input_bytes
         self._max_pages = cfg.max_pages
         self._on_page_failure = cfg.on_page_failure
@@ -375,6 +403,7 @@ class PDFRasterize(BaseTransform):
             max_page_bytes=cfg.max_page_bytes,
             render_timeout_seconds=cfg.render_timeout_seconds,
             worker_memory_limit_bytes=cfg.worker_memory_limit_bytes,
+            extract_text=cfg.extract_text,
         )
         self._renderer: Any = PoolRenderer(self._limits)  # pool is created lazily on first render
 
@@ -401,6 +430,8 @@ class PDFRasterize(BaseTransform):
                     "emits the surviving pages and records the refused page numbers in the run audit.",
                     "Every page row carries document_id (the PDF's payload hash) and a 1-based page_number for "
                     "grouping and ordering downstream.",
+                    "extract_text (default true) also emits page_text: each page's text via pdfium's text layer, "
+                    "no OCR — empty string for a page with no text layer, not a refusal. Set extract_text: false to skip it.",
                 ),
             )
         return None
@@ -431,7 +462,7 @@ class PDFRasterize(BaseTransform):
             original_renderer = self.__dict__["_renderer"]
         try:
             self.__dict__["_payload_store"] = _InvariantPayloadStore()
-            self.__dict__["_renderer"] = _InvariantRenderer()
+            self.__dict__["_renderer"] = _InvariantRenderer(self._extract_text)
             return super().execute_forward_invariant_probe(probe_rows, ctx)
         finally:
             if had_payload_store:
@@ -635,6 +666,13 @@ class PDFRasterize(BaseTransform):
             output[self._page_size_bytes_field] = len(data)
             output[self._page_width_field] = page.width_px
             output[self._page_height_field] = page.height_px
+            if self._extract_text:
+                if type(page.text) is not str:
+                    raise FrameworkBugError(
+                        f"pdf_rasterize worker returned page {page.page_number} with extract_text enabled but text is "
+                        f"{page.text!r} — the worker must always populate text when RasterizeRequest.extract_text is True."
+                    )
+                output[self._page_text_field] = page.text
             output_rows.append(output)
 
         first_keys = set(output_rows[0])

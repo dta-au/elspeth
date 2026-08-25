@@ -93,6 +93,24 @@
         "required": false
       },
       {
+        "default": true,
+        "description": "Extract each page's text via pdfium's text layer (no OCR, fully offline) alongside the rendered PNG. A page with no text layer yields an empty string, not a refusal. When false, page_text_field is not emitted.",
+        "kind": "checkbox",
+        "label": "Extract page text",
+        "name": "extract_text",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "page_text",
+        "description": "Output field receiving the page's extracted text when extract_text is true; not emitted when false.",
+        "kind": "text",
+        "label": "Page text field",
+        "name": "page_text_field",
+        "nullable": false,
+        "required": false
+      },
+      {
         "default": 150,
         "description": "Raster resolution; 150 keeps a Letter/A4 page comfortably under the 5 MiB per-page bound.",
         "kind": "number-int",

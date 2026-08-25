@@ -37,6 +37,7 @@ class RasterizeRequest:
     max_page_pixels: int
     max_page_bytes: int
     output_dir: Path  # parent-owned temp dir; worker writes page-<n>.png files here
+    extract_text: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,7 @@ class RenderedPage:
     width_px: int
     height_px: int
     size_bytes: int
+    text: str | None  # None when extraction disabled; "" is a real page with no text layer
 
 
 @dataclass(frozen=True, slots=True)

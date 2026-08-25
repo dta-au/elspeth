@@ -15,10 +15,12 @@ from elspeth.plugins.infrastructure.rasterize.protocol import (
 
 
 def test_messages_round_trip_through_pickle() -> None:
-    request = RasterizeRequest(pdf_bytes=b"%PDF-", dpi=72, max_pages=1, max_page_pixels=10, max_page_bytes=10, output_dir=Path("/tmp/x"))
+    request = RasterizeRequest(
+        pdf_bytes=b"%PDF-", dpi=72, max_pages=1, max_page_pixels=10, max_page_bytes=10, output_dir=Path("/tmp/x"), extract_text=True
+    )
     response = RasterizeResponse(
         page_count=2,
-        rendered=(RenderedPage(page_number=1, png_path=Path("/tmp/x/page-1.png"), width_px=1, height_px=1, size_bytes=70),),
+        rendered=(RenderedPage(page_number=1, png_path=Path("/tmp/x/page-1.png"), width_px=1, height_px=1, size_bytes=70, text="hello"),),
         refused=(RefusedPage(page_number=2, kind=PageRefusalKind.RENDER_ERROR, detail="boom"),),
     )
     refusal = DocumentRefusal(kind=DocumentRefusalKind.ENCRYPTED, detail="password", page_count=None)
