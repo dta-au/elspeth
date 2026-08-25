@@ -7328,6 +7328,12 @@ sinks:
             nodes=[
                 {"id": "transform_node", "node_type": "transform", "plugin": "missing_transform"},
                 {"id": "aggregation_node", "node_type": "aggregation", "plugin": "missing_aggregation"},
+                # Collector: plugin-bearing (batch-transform contract, ADR-042).
+                # Regression: the walker raised "unknown node_type 'collector'"
+                # on every collector-bearing persisted state, turning GET
+                # /state into a 500 (found live by the 2026-08-26 S1-S5
+                # battery round).
+                {"id": "collector_node", "node_type": "collector", "plugin": "missing_collector"},
                 {"id": "gate_node", "node_type": "gate", "plugin": None},
                 {"id": "coalesce_node", "node_type": "coalesce", "plugin": None},
                 {"id": "row_union_node", "node_type": "row_union", "plugin": None},
@@ -7348,6 +7354,7 @@ sinks:
             ("source", "source:missing_source", "plugin_not_installed"),
             ("transform_node", "transform:missing_transform", "plugin_not_installed"),
             ("aggregation_node", "transform:missing_aggregation", "plugin_not_installed"),
+            ("collector_node", "transform:missing_collector", "plugin_not_installed"),
             ("missing_output", "sink:missing_sink", "plugin_not_installed"),
         ]
 

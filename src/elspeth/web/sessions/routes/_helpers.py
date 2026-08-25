@@ -779,7 +779,10 @@ def _plugin_policy_findings(
         if "plugin" not in node:
             raise AuditIntegrityError(f"persisted plugin policy {node_type} node {component_id!r} has no plugin")
         plugin_name = node["plugin"]
-        if node_type == "transform" or node_type == "aggregation":
+        if node_type in ("transform", "aggregation", "collector"):
+            # Collectors are plugin-bearing: the EXPAND-group closer reuses
+            # the batch-transform plugin contract (ADR-042), so its policy
+            # lookup kind is "transform" like an aggregation's.
             if type(plugin_name) is not str or plugin_name == "":
                 raise AuditIntegrityError(f"persisted plugin policy {node_type} node {component_id!r} plugin must be a non-empty string")
             components.append((component_id, PluginId("transform", plugin_name)))
