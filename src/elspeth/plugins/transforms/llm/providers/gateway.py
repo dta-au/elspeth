@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import httpx
 import structlog
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -74,8 +74,10 @@ from elspeth.plugins.llm.config_validation import (
     validate_gateway_capabilities,
     validate_gateway_contract_major,
     validate_gateway_endpoint,
+    validate_gateway_structured_output_capability,
 )
 from elspeth.plugins.transforms.llm.base import LLMConfig
+from elspeth.plugins.transforms.llm.multi_query import ResponseFormat, resolve_queries
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult, ParsedFinishReason, parse_finish_reason
 from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
 
@@ -161,6 +163,21 @@ class GatewayConfig(LLMConfig):
     @classmethod
     def _validate_required_capabilities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return validate_gateway_capabilities(value)
+
+    @model_validator(mode="after")
+    def _validate_structured_output_capability(self) -> GatewayConfig:
+        """Reject a structured query the declared gateway cannot be trusted to serve.
+
+        ``response_format`` is a per-query field, so single-query mode
+        (``queries is None``) can never reach structured output and needs no
+        check. Resolving the queries here mirrors what ``LLMConfig``'s own
+        validators already do.
+        """
+        if self.queries is None:
+            return self
+        structured = tuple(spec.name for spec in resolve_queries(self.queries) if spec.response_format is ResponseFormat.STRUCTURED)
+        validate_gateway_structured_output_capability(structured, self.required_capabilities)
+        return self
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,10 @@ BEDROCK_VALUE_SOURCES: tuple[ValueSource, ...] = ()
 GATEWAY_VERSIONED_BASE = "/v1"
 GATEWAY_LOOPBACK_HOST = "127.0.0.1"
 GATEWAY_SUPPORTED_CAPABILITIES = frozenset({"text", "tools", "json_object", "json_schema", "seed", "usage"})
+#: The capability a ``response_format="structured"`` query consumes. Standard
+#: mode asks only for ``json_object``; structured mode sends an API-native
+#: JSON Schema the gateway must be able to enforce.
+GATEWAY_STRUCTURED_OUTPUT_CAPABILITY = "json_schema"
 GATEWAY_SUPPORTED_CONTRACT_MAJORS = frozenset({1})
 GATEWAY_MODEL_MIN_LENGTH = 1
 GATEWAY_MODEL_MAX_LENGTH = 512
@@ -215,6 +219,40 @@ def validate_gateway_capabilities(value: tuple[str, ...]) -> tuple[str, ...]:
     return value
 
 
+def validate_gateway_structured_output_capability(
+    structured_query_names: tuple[str, ...],
+    required_capabilities: tuple[str, ...],
+) -> None:
+    """Require the structured-output capability when any query is structured.
+
+    ``LLMTransform`` lowers a structured query's ``output_fields`` into an
+    API-native ``{"type": "json_schema", ...}`` response format and the gateway
+    provider forwards it verbatim. A gateway that never declared the capability
+    cannot honor that payload, so the run fails on the first completion call —
+    after rows have been read and the call has been billed.
+
+    ``required_capabilities`` is the operator's declaration of what the gateway
+    must offer, and the readiness probe already refuses a gateway that does not
+    report every declared capability. Tying the two together moves the failure
+    from mid-run to configuration time, where the operator can act on it.
+
+    Takes plain names rather than query objects so this module stays free of a
+    dependency on the multi-query authoring models.
+    """
+    if not structured_query_names:
+        return
+    if GATEWAY_STRUCTURED_OUTPUT_CAPABILITY in required_capabilities:
+        return
+    names = ", ".join(repr(name) for name in structured_query_names)
+    raise ValueError(
+        f"queries {names} set response_format='structured', which sends an API-native "
+        f"{GATEWAY_STRUCTURED_OUTPUT_CAPABILITY!r} response format the gateway must be able to "
+        f"enforce, but required_capabilities does not declare {GATEWAY_STRUCTURED_OUTPUT_CAPABILITY!r}. "
+        f"Add {GATEWAY_STRUCTURED_OUTPUT_CAPABILITY!r} to required_capabilities so readiness rejects an "
+        "incapable gateway before the run starts, or set response_format='standard' on those queries."
+    )
+
+
 __all__ = [
     "AZURE_MODEL_VALUE_SOURCES",
     "BEDROCK_MODEL_MAX_LENGTH",
@@ -228,6 +266,7 @@ __all__ = [
     "GATEWAY_MAX_TOKENS_MIN_EXCLUSIVE",
     "GATEWAY_MODEL_MAX_LENGTH",
     "GATEWAY_MODEL_MIN_LENGTH",
+    "GATEWAY_STRUCTURED_OUTPUT_CAPABILITY",
     "GATEWAY_SUPPORTED_CAPABILITIES",
     "GATEWAY_SUPPORTED_CONTRACT_MAJORS",
     "GATEWAY_TIMEOUT_MAX_SECONDS",
@@ -244,5 +283,6 @@ __all__ = [
     "validate_gateway_capabilities",
     "validate_gateway_contract_major",
     "validate_gateway_endpoint",
+    "validate_gateway_structured_output_capability",
     "validate_openrouter_base_url",
 ]

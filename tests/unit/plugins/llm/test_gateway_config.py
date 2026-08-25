@@ -324,3 +324,76 @@ class TestGatewayPrivateOptionsCoverage:
     def test_security_sensitive_fields_are_private(self, field_name: str) -> None:
         assert field_name in _LLM_PRIVATE_OPTIONS
         assert field_name in GatewayConfig.model_fields
+
+
+# ---------------------------------------------------------------------------
+# response_format="structured" must declare the json_schema capability
+# ---------------------------------------------------------------------------
+
+
+def _structured_query(response_format: str) -> dict[str, Any]:
+    return {
+        "input_fields": {"content": "content"},
+        "response_format": response_format,
+        "output_fields": [{"suffix": "score", "type": "integer"}],
+    }
+
+
+def _gateway_with_queries(queries: dict[str, Any], **overrides: Any) -> GatewayConfig:
+    """Build a multi-query gateway config.
+
+    ``required_input_fields`` is mandatory once a template references a row
+    field, so it is declared here rather than in every case below.
+    """
+    return _make_gateway_config(queries=queries, required_input_fields=["content"], **overrides)
+
+
+class TestGatewayStructuredOutputCapability:
+    """A structured query sends an API-native ``json_schema`` response_format.
+
+    ``LLMTransform`` builds ``{"type": "json_schema", ...}`` from a query's
+    ``output_fields`` and hands it to the provider, which forwards it verbatim
+    to the gateway. A gateway that never declared ``json_schema`` cannot honor
+    it, so the run fails on the first completion call — after rows have been
+    read and the call has been billed. ``required_capabilities`` is the
+    operator's declaration of what the gateway must offer, and the readiness
+    probe already rejects a gateway that does not report every declared
+    capability; this validator is what connects the two, so an incapable
+    gateway is caught at readiness rather than mid-run.
+    """
+
+    def test_structured_query_requires_declared_json_schema_capability(self) -> None:
+        with pytest.raises(ValidationError, match="json_schema"):
+            _gateway_with_queries({"clarity": _structured_query("structured")})
+
+    def test_structured_query_accepted_when_capability_declared(self) -> None:
+        config = _gateway_with_queries(
+            {"clarity": _structured_query("structured")},
+            required_capabilities=("json_schema",),
+        )
+        assert config.required_capabilities == ("json_schema",)
+
+    def test_standard_query_needs_no_json_schema_capability(self) -> None:
+        """Standard mode sends ``{"type": "json_object"}`` and embeds the field
+        contract in the prompt, so it makes no ``json_schema`` demand."""
+        config = _gateway_with_queries({"clarity": _structured_query("standard")})
+        assert config.required_capabilities == ()
+
+    def test_single_query_mode_needs_no_json_schema_capability(self) -> None:
+        """``response_format`` is a per-query field only — ``SingleQueryStrategy``
+        has no structured mode, so ``queries=None`` can never demand the
+        capability."""
+        config = _make_gateway_config()
+        assert config.queries is None
+        assert config.required_capabilities == ()
+
+    def test_rejection_names_the_offending_queries(self) -> None:
+        """The message must name the queries the operator has to edit, not just
+        the capability — a multi-query node may mix both formats."""
+        with pytest.raises(ValidationError, match="clarity"):
+            _gateway_with_queries(
+                {
+                    "tone": _structured_query("standard"),
+                    "clarity": _structured_query("structured"),
+                }
+            )
