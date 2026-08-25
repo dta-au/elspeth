@@ -18,7 +18,6 @@ import csv
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any
 
 import pytest
 import yaml
@@ -27,6 +26,7 @@ from sqlalchemy import select
 from elspeth.cli_helpers import instantiate_plugins_from_config
 from elspeth.contracts import RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.identity import path_expand_group_id
+from elspeth.contracts.run_result import RunResult
 from elspeth.core.config import load_settings, resolve_config
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
@@ -35,6 +35,8 @@ from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine import Orchestrator, PipelineConfig
 from tests.fixtures.landscape import make_factory
 from tests.fixtures.pdf_documents import ENCRYPTED_PDF_PATH, MALFORMED_PDF, minimal_pdf
+
+PipelineRunArtifacts = tuple[RunResult, LandscapeDB, Path, Path]
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -45,8 +47,8 @@ def payload_store(tmp_path: Path) -> FilesystemPayloadStore:
 
 
 @pytest.fixture
-def pipeline_result(tmp_path: Path, payload_store: FilesystemPayloadStore) -> tuple[Any, LandscapeDB]:
-    """Stage 4 documents (2 good, 2 bad), run the real pipeline, return (RunResult, db)."""
+def pipeline_result(tmp_path: Path, payload_store: FilesystemPayloadStore) -> PipelineRunArtifacts:
+    """Stage 4 documents (2 good, 2 bad), run the real pipeline, return (result, db, pages_path, errors_path)."""
     doc_two_pages = payload_store.store(minimal_pdf(2))
     doc_three_pages = payload_store.store(minimal_pdf(3))
     doc_malformed = payload_store.store(MALFORMED_PDF)
@@ -148,12 +150,12 @@ def pipeline_result(tmp_path: Path, payload_store: FilesystemPayloadStore) -> tu
 class TestPDFRasterizePipeline:
     """5 rendered page rows across 2 documents, 2 documents quarantined."""
 
-    def test_run_completes_with_failures(self, pipeline_result: tuple[Any, ...]) -> None:
+    def test_run_completes_with_failures(self, pipeline_result: PipelineRunArtifacts) -> None:
         result, *_ = pipeline_result
         assert result.status is RunStatus.COMPLETED_WITH_FAILURES
 
     def test_pages_sink_holds_five_rows_grouped_and_sequenced(
-        self, pipeline_result: tuple[Any, ...], payload_store: FilesystemPayloadStore
+        self, pipeline_result: PipelineRunArtifacts, payload_store: FilesystemPayloadStore
     ) -> None:
         _, _, pages_path, _ = pipeline_result
         pages = json.loads(pages_path.read_text())
@@ -169,13 +171,13 @@ class TestPDFRasterizePipeline:
             png_bytes = payload_store.retrieve(row["page_blob_ref"])
             assert png_bytes[:8] == PNG_MAGIC
 
-    def test_errors_sink_holds_the_two_bad_documents(self, pipeline_result: tuple[Any, ...]) -> None:
+    def test_errors_sink_holds_the_two_bad_documents(self, pipeline_result: PipelineRunArtifacts) -> None:
         _, _, _, errors_path = pipeline_result
         errors = json.loads(errors_path.read_text())
         assert len(errors) == 2, f"Expected 2 quarantined rows, got {len(errors)}"
         assert {row["doc_name"] for row in errors} == {"doc_bad_malformed", "doc_bad_encrypted"}
 
-    def test_error_reasons_are_pdf_malformed_and_pdf_encrypted(self, pipeline_result: tuple[Any, ...]) -> None:
+    def test_error_reasons_are_pdf_malformed_and_pdf_encrypted(self, pipeline_result: PipelineRunArtifacts) -> None:
         result, db, _, _ = pipeline_result
         with db.engine.connect() as conn:
             error_rows = conn.execute(select(transform_errors_table).where(transform_errors_table.c.run_id == result.run_id)).all()
@@ -183,7 +185,7 @@ class TestPDFRasterizePipeline:
         reasons = {json.loads(row.error_details_json)["reason"] for row in error_rows}
         assert reasons == {"pdf_malformed", "pdf_encrypted"}
 
-    def test_landscape_records_five_expanded_tokens_grouped_two_and_three(self, pipeline_result: tuple[Any, ...]) -> None:
+    def test_landscape_records_five_expanded_tokens_grouped_two_and_three(self, pipeline_result: PipelineRunArtifacts) -> None:
         result, db, _, _ = pipeline_result
         factory = make_factory(db)
         rows = factory.query.get_rows(result.run_id)
@@ -193,18 +195,22 @@ class TestPDFRasterizePipeline:
         # 4 source tokens + 5 expanded page tokens = 9
         assert len(all_tokens) == 9, f"Expected 9 tokens, got {len(all_tokens)}"
 
-        parent_count = sum(len(factory.query.get_token_parents(token.token_id)) for token in all_tokens)
-        assert parent_count == 5, f"Expected 5 parent relationships (one per expanded page token), got {parent_count}"
+        parent_counts = {token.token_id: len(factory.query.get_token_parents(token.token_id)) for token in all_tokens}
+        tokens_with_one_parent = sum(1 for count in parent_counts.values() if count == 1)
+        assert tokens_with_one_parent == 5, f"Expected 5 tokens each with exactly one token_parents row, got {tokens_with_one_parent}"
+        assert all(count in (0, 1) for count in parent_counts.values()), f"No token should have more than one parent: {parent_counts}"
 
-        lineage_paths = factory.data_flow.load_lineage_paths(result.run_id, [token.token_id for token in all_tokens])
-        expand_group_ids = [path_expand_group_id(lineage_paths.get(token.token_id, ())) for token in all_tokens]
+        token_ids = [token.token_id for token in all_tokens]
+        lineage_paths = factory.data_flow.load_lineage_paths(result.run_id, token_ids)
+        assert set(lineage_paths) == set(token_ids), "load_lineage_paths must return an entry for every requested token"
+        expand_group_ids = [path_expand_group_id(lineage_paths[token_id]) for token_id in token_ids]
         non_none_group_ids = [group_id for group_id in expand_group_ids if group_id is not None]
         assert len(non_none_group_ids) == 5, f"Expected 5 tokens with expand_group_id set, got {len(non_none_group_ids)}"
 
         group_sizes = sorted(Counter(non_none_group_ids).values())
         assert group_sizes == [2, 3], f"Expected expand groups of size 2 and 3, got {group_sizes}"
 
-    def test_bad_documents_carry_terminal_failure_routed_to_errors(self, pipeline_result: tuple[Any, ...]) -> None:
+    def test_bad_documents_carry_terminal_failure_routed_to_errors(self, pipeline_result: PipelineRunArtifacts) -> None:
         result, db, _, _ = pipeline_result
         with db.engine.connect() as conn:
             outcomes = conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.run_id == result.run_id)).all()
