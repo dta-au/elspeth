@@ -21,7 +21,7 @@ import pytest
 
 from elspeth.contracts import RowResult, TokenInfo
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import OrchestrationInvariantError, SchedulerLeaseLostError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import GroupLossSpec
@@ -507,19 +507,22 @@ class _SweepExecutor:
 
 class TestPostRestoreFlushSweep:
     """META-31: a resumed processor's parked complete rosters are closed by
-    the PluginContext-bearing sweep on the first intake pass, AFTER the loss
-    replay, and disposed through the seam like a live outcome."""
+    the PluginContext-bearing sweep on the first intake pass after the
+    restore and disposed through the seam like a live outcome. The sweep's
+    position relative to the loss replay in that pass is NOT a contract
+    (22ce94253 review M-1): the restore rebuilds losses from the full
+    ledger, so the replay never reaches a parked key either way."""
 
-    def _failure(self) -> CollectorOutcome:
+    def _failure(self, group_id: str = "eg-1", token_id: str = "tok-a") -> CollectorOutcome:
         return CollectorOutcome(
             held=False,
-            consumed_tokens=(_member("tok-a"),),
+            consumed_tokens=(_member(token_id),),
             collector_name="stitch",
-            group_id="eg-1",
+            group_id=group_id,
             failure_reason="collector_missing_members",
         )
 
-    def test_sweep_runs_once_after_replay_and_disposes_through_the_seam(self) -> None:
+    def test_sweep_runs_once_and_disposes_through_the_seam(self) -> None:
         executor = _SweepExecutor(script=[(self._failure(),)])
         recorder = _Recorder(release=CollectorRelease(items=(), sink_results=()))
         scheduler = RecordingScheduler(pending=[], losses=[])
@@ -563,6 +566,85 @@ class TestPostRestoreFlushSweep:
         retry = coordinator.run_intake_pass(ctx)
         assert len(executor.calls) == 2
         assert [d.kind for d in retry.dispositions] == [BarrierIntakeDispositionKind.TERMINAL]
+
+    def test_a_raising_disposition_holds_the_remaining_swept_outcomes_for_the_retry(self) -> None:
+        """22ce94253 review I-1: the executor has durably closed every swept
+        group by the time it returns; an outcome whose disposition raises,
+        and every outcome after it, must survive to the next pass."""
+        outcomes = (self._failure("eg-1", "tok-a"), self._failure("eg-2", "tok-b"), self._failure("eg-3", "tok-c"))
+        executor = _SweepExecutor(script=[outcomes])
+        recorder = _Recorder(release=CollectorRelease(items=(), sink_results=()))
+        seam = recorder.record_group_member_terminals
+        armed = [True]
+
+        def raising_seam(consumed_tokens: tuple[TokenInfo, ...], **kwargs: object) -> list[RowResult]:
+            if armed[0] and consumed_tokens[0].token_id == "tok-b":
+                armed[0] = False
+                raise LandscapeRecordError("terminal write failed")
+            return seam(consumed_tokens, **kwargs)
+
+        recorder.record_group_member_terminals = raising_seam  # type: ignore[method-assign]
+        scheduler = RecordingScheduler(pending=[])
+        coordinator = _coordinator(
+            scheduler=scheduler, executor=executor, recorder=recorder, data_flow=_RecordingDataFlow(), resume_checkpoint_id="ckpt-1"
+        )
+        ctx = PluginContext(run_id="run-1", config={}, landscape=None)
+
+        with pytest.raises(LandscapeRecordError, match="terminal write failed"):
+            coordinator.run_intake_pass(ctx)
+
+        assert [c["consumed"] for c in recorder.seam_calls] == [("tok-a",)]
+        held = [o.group_id for o in coordinator._undisposed_sweep_outcomes]
+        assert (coordinator._collector_restore_sweep_owed, held) == (True, ["eg-2", "eg-3"])
+
+        retry = coordinator.run_intake_pass(ctx)
+
+        assert executor.calls == [ctx], "the executor returned normally; the retry resumes from the held list"
+        assert [c["consumed"] for c in recorder.seam_calls] == [("tok-a",), ("tok-b",), ("tok-c",)]
+        assert [d.kind for d in retry.dispositions] == [BarrierIntakeDispositionKind.TERMINAL] * 2
+        assert (coordinator._collector_restore_sweep_owed, coordinator._undisposed_sweep_outcomes) == (False, [])
+        assert scheduler.calls == ["list_pending", "release", "list_pending", "release", "release"]
+        assert coordinator.run_intake_pass(ctx).dispositions == ()
+
+    def test_a_lost_lease_inside_a_disposition_keeps_the_sweep_owed(self) -> None:
+        """The reviewer's reachable raise: ``mark_blocked_barrier_terminal``
+        -> ``SchedulerLeaseLostError`` AFTER the seam wrote eg-2's terminals.
+        The retry re-disposes eg-2 from the held list (the seam's own
+        missing-terminal skip / duplicate detection covers the re-run) and
+        then eg-3; nothing is dropped and eg-1 is never disposed twice."""
+        outcomes = (self._failure("eg-1", "tok-a"), self._failure("eg-2", "tok-b"), self._failure("eg-3", "tok-c"))
+        executor = _SweepExecutor(script=[outcomes])
+        recorder = _Recorder(release=CollectorRelease(items=(), sink_results=()))
+
+        class _LeaseLosingScheduler(RecordingScheduler):
+            def __init__(self) -> None:
+                super().__init__(pending=[])
+                self.armed = True
+
+            def mark_blocked_barrier_terminal(self, *, token_ids: Any, release_context: Any = None, **kwargs: object) -> int:
+                if self.armed and tuple(token_ids) == ("tok-b",):
+                    self.armed = False
+                    raise SchedulerLeaseLostError(work_item_id="wi-b", lease_owner="leader-1", run_id="run-1")
+                return super().mark_blocked_barrier_terminal(token_ids=token_ids, release_context=release_context, **kwargs)
+
+        scheduler = _LeaseLosingScheduler()
+        coordinator = _coordinator(
+            scheduler=scheduler, executor=executor, recorder=recorder, data_flow=_RecordingDataFlow(), resume_checkpoint_id="ckpt-1"
+        )
+        ctx = PluginContext(run_id="run-1", config={}, landscape=None)
+
+        with pytest.raises(SchedulerLeaseLostError):
+            coordinator.run_intake_pass(ctx)
+        held = [o.group_id for o in coordinator._undisposed_sweep_outcomes]
+        assert (coordinator._collector_restore_sweep_owed, held) == (True, ["eg-2", "eg-3"])
+
+        retry = coordinator.run_intake_pass(ctx)
+
+        assert executor.calls == [ctx]
+        assert [c["consumed"] for c in recorder.seam_calls] == [("tok-a",), ("tok-b",), ("tok-b",), ("tok-c",)]
+        assert [d.kind for d in retry.dispositions] == [BarrierIntakeDispositionKind.TERMINAL] * 2
+        assert [r["scope_row_id"] for r in scheduler.release_contexts] == ["row-1"] * 3
+        assert (coordinator._collector_restore_sweep_owed, coordinator._undisposed_sweep_outcomes) == (False, [])
 
 
 class TestCollectorMemberCountersMeta32:

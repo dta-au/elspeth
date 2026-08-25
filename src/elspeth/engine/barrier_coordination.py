@@ -284,10 +284,15 @@ class BarrierIntakeCoordinator:
         self._merged_continuation_cursor = merged_continuation_cursor
         # META-31: a resumed processor's collector restore installs any
         # roster that is already complete as PARKED (WS4 fix-round #2/#3);
-        # only the PluginContext-bearing sweep below can close it, and it
-        # must run AFTER the loss replay (I-7 order) — which is exactly this
-        # intake pass. Owed until the sweep call returns without raising.
+        # only a PluginContext-bearing sweep AFTER that restore can close
+        # it, and the first intake pass is the earliest such point. Owed
+        # until every swept outcome has been DISPOSED (22ce94253 review
+        # I-1): the executor closes those groups durably before returning
+        # them, so an outcome it has handed over is held below until its
+        # own disposition succeeds — clearing the flag on the executor
+        # call alone lost every outcome after a raising disposition.
         self._collector_restore_sweep_owed: bool = resume_checkpoint_id is not None and collector_executor is not None
+        self._undisposed_sweep_outcomes: list[CollectorOutcome] = []
         # spec §6.3 (Task 8): parked closer FAIL verdicts awaiting settlement,
         # keyed on (closer_name, group_id). In-memory only — re-derivable at
         # takeover because replaying the durable losses re-fires the closer's
@@ -814,30 +819,52 @@ class BarrierIntakeCoordinator:
         return self._dispose_collector_outcome(outcome, scope_row_id=row.row_id)
 
     def _flush_restored_collector_groups(self, ctx: PluginContext) -> list[BarrierIntakeDisposition]:
-        """META-31: the post-restore flush sweep, once per resume, after the loss replay.
+        """META-31: the post-restore flush sweep, once per resume, after the restore.
 
         ``CollectorExecutor.flush_restored_complete_groups(ctx)`` closes
         every group the restore parked with an already-complete roster —
         completed by journaled arrivals, by ledger-rebuilt losses, or both —
         and returns their outcomes, which are disposed exactly like a live
-        arrival's. The executor validates every parked key before closing
-        any, un-parks each only after its close succeeds, and STASHES the
-        outcomes already produced when a later close raises: on an
-        exception this method disposes nothing extra and propagates, the
-        sweep stays owed, and the next intake pass's retry delivers the
-        stashed outcomes first. Restore-without-sweep is the wedge the WS4
-        fix-round named — a parked group never settles otherwise.
+        arrival's. Restore-without-sweep is the wedge the WS4 fix-round
+        named — a parked group never settles otherwise. The sweep's only
+        ordering constraint is that it follows the restore that parked the
+        keys: it is independent of the loss replay in the same pass, because
+        the restore rebuilds every restored group's losses from the FULL
+        ledger, so the replay dedups those via ``has_replayed_member_loss``
+        and never reaches a parked key.
+
+        Resumable at both handoffs. Executor -> coordinator (408d48ed4): the
+        executor un-parks each key only after its close succeeds and stashes
+        the outcomes already produced when a later close raises, so a raise
+        from the executor call propagates with nothing disposed here and the
+        retry's executor call delivers the stash first. Coordinator ->
+        disposition (22ce94253 review I-1): the executor has closed those
+        groups DURABLY by the time they are returned, so each outcome is
+        held in ``_undisposed_sweep_outcomes`` and dropped only after its
+        own disposition succeeds; a raising disposition propagates with the
+        failed outcome and every later one still held, the sweep stays owed,
+        and the next intake pass resumes disposing from the held list
+        without calling the executor again (it returned normally, so it
+        holds nothing). The owed flag clears only once the list is empty.
+        Clearing it on the executor call alone turned a lease loss inside
+        one disposition into groups closed in the Landscape whose member
+        terminals were never written and whose continuation never emitted,
+        with no retry and no later resume able to see them (a closed group
+        is not restored as pending).
         """
         if not self._collector_restore_sweep_owed or self._collector_executor is None:
             return []
-        outcomes = self._collector_executor.flush_restored_complete_groups(ctx)
-        self._collector_restore_sweep_owed = False
+        if not self._undisposed_sweep_outcomes:
+            self._undisposed_sweep_outcomes.extend(self._collector_executor.flush_restored_complete_groups(ctx))
         dispositions: list[BarrierIntakeDisposition] = []
-        for outcome in outcomes:
+        while self._undisposed_sweep_outcomes:
+            outcome = self._undisposed_sweep_outcomes[0]
             scope_row_id = outcome.consumed_tokens[0].row_id if outcome.consumed_tokens else ""
             disposition = self._dispose_collector_outcome(outcome, scope_row_id=scope_row_id)
+            del self._undisposed_sweep_outcomes[0]
             if disposition is not None:
                 dispositions.append(disposition)
+        self._collector_restore_sweep_owed = False
         return dispositions
 
     def _unterminalized(self, tokens: Sequence[TokenInfo]) -> tuple[TokenInfo, ...]:
@@ -2424,8 +2451,8 @@ class BarrierRecoveryCoordinator:
             # The executor rebuilds each group's losses from the FULL ledger
             # itself (WS4 fix-round #2) and parks any roster that is already
             # complete; BarrierIntakeCoordinator._flush_restored_collector_groups
-            # closes those on the first intake pass, after the loss replay
-            # (META-31, I-7 order). The crash-between-collect_tokens-and-
+            # closes those on the first intake pass after this restore
+            # (META-31). The crash-between-collect_tokens-and-
             # complete_barrier residual completion (the coalesce/aggregation
             # residual seams' collector twin) is Phase 2 and is NOT wired here.
             collector_state_ids = self._barrier_restore_reads.get_open_node_state_ids(
