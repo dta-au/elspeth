@@ -838,6 +838,7 @@ class LandscapeExporter:
                 "opener_token_id": group_record.opener_token_id,
                 "member_count": group_record.member_count,
                 "created_at": group_record.created_at.isoformat(),
+                "closes_group_id": group_record.closes_group_id,
             }
             yield group_record_record
 

@@ -1093,6 +1093,13 @@ group_records_table = Table(
     # the durable referent the require_all empty-group failure needs.
     Column("member_count", Integer, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
+    # META-38: the WRITTEN release fact. A collector RELEASE group (minted by
+    # collect_tokens when a bound EXPAND group closes) records the id of the
+    # group it closed; a real fork/expand opener leaves it NULL. This is the
+    # ONE discriminator `is_release_group` reads — no derivation from
+    # lineage shape, terminal-path vocabulary, or binding config, none of
+    # which survive nesting or a durable-twin reader with no config in hand.
+    Column("closes_group_id", String(64), nullable=True),
     CheckConstraint("member_count >= 0", name="ck_group_records_member_count_nonneg"),
     CheckConstraint(_enum_in_check("kind", FrameKind), name="ck_group_records_kind"),
     ForeignKeyConstraint(["opener_token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),

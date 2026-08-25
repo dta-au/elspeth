@@ -85,3 +85,41 @@ def test_fork_coalesce_export_round_trips_lineage_path_and_group_records() -> No
 
     group_records = [r for r in records if r["record_type"] == "group_record"]
     assert any(g["group_id"] == fork_group_id and g["kind"] == "fork" and g["member_count"] == 2 for g in group_records)
+    # META-38: a real fork opener carries no release fact.
+    assert [g["closes_group_id"] for g in group_records if g["group_id"] == fork_group_id] == [None]
+
+
+def test_collect_release_export_carries_the_written_release_fact() -> None:
+    """META-38: the exported group_record for a collector RELEASE group
+    names the group it closed (closes_group_id); the closed expand group's
+    own record carries None."""
+    from elspeth.contracts.audit import TokenRef
+    from elspeth.contracts.schema_contract import SchemaContract
+    from elspeth.core.landscape.exporter import LandscapeExporter
+    from tests.fixtures.landscape import make_recorder_with_run
+
+    setup = make_recorder_with_run(run_id="run-export-2", source_node_id="source-0", source_plugin_name="csv")
+    db, factory = setup.db, setup.factory
+    row = factory.data_flow.create_row(
+        run_id=setup.run_id, source_node_id="source-0", row_index=0, data={"col": "val"}, source_row_index=0, ingest_sequence=0
+    )
+    token = factory.data_flow.create_token(row.row_id)
+    contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
+    members, expand_group_id = factory.data_flow.expand_token(
+        parent_ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+        row_id=row.row_id,
+        child_payloads=[{"i": 0}, {"i": 1}],
+        output_contract=contract,
+    )
+    committed = factory.data_flow.collect_tokens(
+        member_refs=[TokenRef(token_id=m.token_id, run_id=setup.run_id) for m in members],
+        group_id=expand_group_id,
+        collector_node_id="collector-0",
+        output_payloads=[{"assembled": True}],
+        output_contracts=[contract],
+    )
+
+    records = list(LandscapeExporter(db)._iter_records(setup.run_id))
+    by_group = {g["group_id"]: g for g in records if g["record_type"] == "group_record"}
+    assert by_group[committed.release_group_id]["closes_group_id"] == expand_group_id
+    assert by_group[expand_group_id]["closes_group_id"] is None

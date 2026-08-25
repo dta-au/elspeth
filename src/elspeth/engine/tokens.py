@@ -87,6 +87,26 @@ class TokenManager:
         self._step_resolver = step_resolver
         self._group_bindings = group_bindings
         self._opener_binding_by_node_id: dict[NodeID, GroupBinding] = group_bindings.by_opener_node() if group_bindings is not None else {}
+        # META-38: per-(run_id, group_id) memo of the durable release fact.
+        # Populated ONLY by is_release_group's durable read — never seeded
+        # from a CommittedCollect at mint time, which would give the minting
+        # leader an answer a follower/resumed process could not reproduce
+        # (the asymmetry this fact exists to remove). A group's release-ness
+        # is immutable once minted, so the memo never invalidates.
+        self._release_group_memo: dict[tuple[str, str], bool] = {}
+
+    def is_release_group(self, run_id: str, group_id: str) -> bool:
+        """Whether ``group_id`` is a collector RELEASE group (META-38 written fact).
+
+        One durable read per (run, group) per process, through
+        ``DataFlowRepository.is_release_group``; the repository raises
+        ``AuditIntegrityError`` for a group with no ``group_records`` row
+        (fail closed), and that raise is NOT memoised.
+        """
+        key = (run_id, group_id)
+        if key not in self._release_group_memo:
+            self._release_group_memo[key] = self._data_flow.is_release_group(run_id=run_id, group_id=group_id)
+        return self._release_group_memo[key]
 
     def create_initial_token(
         self,

@@ -204,6 +204,9 @@ class GroupRecordExportRecord(TypedDict):
     opener_token_id: str
     member_count: int
     created_at: str
+    # META-38: the group a collector RELEASE group closed; None for a real
+    # fork/expand opener.
+    closes_group_id: str | None
 
 
 class GroupLossExportRecord(TypedDict):

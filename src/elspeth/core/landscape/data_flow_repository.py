@@ -429,6 +429,10 @@ class DataFlowRepository:
         """Mint the durable member_count=0 group record for a zero-row expansion."""
         return self.tokens.record_empty_expansion(parent_ref)
 
+    def is_release_group(self, *, run_id: str, group_id: str) -> bool:
+        """META-38: whether ``group_id`` is a collector RELEASE group (durable fact)."""
+        return self.tokens.is_release_group(run_id=run_id, group_id=group_id)
+
     def get_group_records_for_run(self, run_id: str) -> list[Any]:
         """All group_records rows for a run (export surface)."""
         return self.tokens.get_group_records_for_run(run_id)

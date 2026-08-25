@@ -50,7 +50,19 @@ def test_unified_lineage_tables_exist_with_exact_keys() -> None:
     assert [c.name for c in token_lineage_frames_table.primary_key.columns] == ["token_id", "run_id", "depth"]
     assert {c.name for c in token_lineage_frames_table.columns} == {"token_id", "run_id", "depth", "kind", "group_id", "member_key"}
     assert [c.name for c in group_records_table.primary_key.columns] == ["run_id", "group_id"]
-    assert {c.name for c in group_records_table.columns} == {"run_id", "group_id", "kind", "opener_token_id", "member_count", "created_at"}
+    assert {c.name for c in group_records_table.columns} == {
+        "run_id",
+        "group_id",
+        "kind",
+        "opener_token_id",
+        "member_count",
+        "created_at",
+        "closes_group_id",
+    }
+    # META-38: the written release fact is nullable (real openers leave it
+    # NULL) and is a startup-verified required column at epoch 36.
+    assert group_records_table.c.closes_group_id.nullable is True
+    assert ("group_records", "closes_group_id") in set(_REQUIRED_COLUMNS)
     assert {c.name for c in group_losses_table.columns} == {
         "loss_id",
         "run_id",

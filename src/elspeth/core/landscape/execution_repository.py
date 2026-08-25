@@ -120,6 +120,9 @@ class GroupRecord:
     kind: FrameKind
     opener_token_id: str
     member_count: int
+    # META-38: the group this RELEASE group closed; None for a real
+    # fork/expand opener. The written release fact (`is_release_group`).
+    closes_group_id: str | None
 
 
 class ExecutionRepository:
@@ -476,6 +479,7 @@ class ExecutionRepository:
             group_records_table.c.kind,
             group_records_table.c.opener_token_id,
             group_records_table.c.member_count,
+            group_records_table.c.closes_group_id,
         ).where(
             group_records_table.c.run_id == run_id,
             group_records_table.c.group_id == group_id,
@@ -483,7 +487,12 @@ class ExecutionRepository:
         row = self._ops.execute_fetchone(query)
         if row is None:
             return None
-        return GroupRecord(kind=FrameKind(row.kind), opener_token_id=str(row.opener_token_id), member_count=int(row.member_count))
+        return GroupRecord(
+            kind=FrameKind(row.kind),
+            opener_token_id=str(row.opener_token_id),
+            member_count=int(row.member_count),
+            closes_group_id=None if row.closes_group_id is None else str(row.closes_group_id),
+        )
 
     def any_member_token_for_group(self, *, run_id: str, group_id: str) -> str | None:
         """An arbitrary token whose lineage passes through ``group_id``

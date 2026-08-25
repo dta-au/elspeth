@@ -164,3 +164,107 @@ class TestCollectTokensPathAlgebra:
                 run_id=run_id,
                 group_id="g-exp-1",
             )
+
+
+class TestReleaseFactMeta38:
+    """META-38: the WRITTEN release fact. collect_tokens records
+    ``group_records.closes_group_id`` = the group it closed on BOTH release
+    insert arms (M>0 and the M=0 empty release); real fork/expand openers
+    leave it NULL. ``is_release_group`` reads that fact and nothing else."""
+
+    def _expand(self, manager: TokenManager, run_id: str, source_node_id: str) -> tuple[list[Any], str]:
+        from elspeth.contracts import SourceRow
+
+        initial = manager.create_initial_token(
+            run_id=run_id,
+            source_node_id=source_node_id,
+            row_index=0,
+            source_row=SourceRow.valid({"original": "data"}, contract=_make_observed_contract("original"), source_row_index=0),
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        return manager.expand_token(
+            parent_token=initial,
+            expanded_rows=[{"item": 0}, {"item": 1}],
+            output_contract=_make_observed_contract("item"),
+            node_id=NodeID("expand_node"),
+            run_id=run_id,
+        )
+
+    def test_release_row_writes_closes_group_id_and_openers_leave_it_null(self) -> None:
+        manager, factory, run_id, source_node_id = _make_manager_context()
+        members, group_id = self._expand(manager, run_id, source_node_id)
+        [child] = manager.collect_tokens(
+            members=members,
+            output_rows=[_make_pipeline_row({"combined": True})],
+            node_id=NodeID("collector_node"),
+            run_id=run_id,
+            group_id=group_id,
+        )
+        release_group_id = child.lineage_path[-1].group_id
+
+        rows = {str(r["group_id"]): r for r in factory.data_flow.get_group_records_for_run(run_id)}
+        assert rows[release_group_id]["closes_group_id"] == group_id
+        assert rows[group_id]["closes_group_id"] is None
+
+    def test_empty_release_writes_the_fact_too(self) -> None:
+        manager, factory, run_id, source_node_id = _make_manager_context()
+        members, group_id = self._expand(manager, run_id, source_node_id)
+        assert (
+            manager.collect_tokens(members=members, output_rows=[], node_id=NodeID("collector_node"), run_id=run_id, group_id=group_id)
+            == ()
+        )
+        rows = [r for r in factory.data_flow.get_group_records_for_run(run_id) if r["closes_group_id"] == group_id]
+        assert [int(r["member_count"]) for r in rows] == [0]
+
+    def test_is_release_group_reads_the_durable_fact_and_fails_closed_on_a_missing_row(self) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        manager, factory, run_id, source_node_id = _make_manager_context()
+        members, group_id = self._expand(manager, run_id, source_node_id)
+        [child] = manager.collect_tokens(
+            members=members,
+            output_rows=[_make_pipeline_row({"combined": True})],
+            node_id=NodeID("collector_node"),
+            run_id=run_id,
+            group_id=group_id,
+        )
+        release_group_id = child.lineage_path[-1].group_id
+
+        assert factory.data_flow.is_release_group(run_id=run_id, group_id=release_group_id) is True
+        assert factory.data_flow.is_release_group(run_id=run_id, group_id=group_id) is False
+        with pytest.raises(AuditIntegrityError, match="never minted"):
+            factory.data_flow.is_release_group(run_id=run_id, group_id="never-minted")
+
+    def test_token_manager_memo_is_populated_only_by_the_durable_read(self) -> None:
+        """The minting leader learns the fact the SAME way a follower or a
+        resumed process does — through the durable read, never from the
+        CommittedCollect it just received; one read per (run, group); a
+        fail-closed raise is not memoised."""
+        from unittest.mock import patch
+
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        manager, factory, run_id, source_node_id = _make_manager_context()
+        members, group_id = self._expand(manager, run_id, source_node_id)
+        [child] = manager.collect_tokens(
+            members=members,
+            output_rows=[_make_pipeline_row({"combined": True})],
+            node_id=NodeID("collector_node"),
+            run_id=run_id,
+            group_id=group_id,
+        )
+        release_group_id = child.lineage_path[-1].group_id
+        assert manager._release_group_memo == {}, "the mint must not seed the memo"
+
+        with patch.object(factory.data_flow, "is_release_group", wraps=factory.data_flow.is_release_group) as durable_read:
+            assert manager.is_release_group(run_id, release_group_id) is True
+            assert manager.is_release_group(run_id, release_group_id) is True
+            assert manager.is_release_group(run_id, group_id) is False
+            assert durable_read.call_count == 2
+            with pytest.raises(AuditIntegrityError):
+                manager.is_release_group(run_id, "never-minted")
+            with pytest.raises(AuditIntegrityError):
+                manager.is_release_group(run_id, "never-minted")
+            assert durable_read.call_count == 4
+        assert manager._release_group_memo == {(run_id, release_group_id): True, (run_id, group_id): False}

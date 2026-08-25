@@ -76,6 +76,35 @@ def _expected_child_frames(
     return (*parent_path, LineageFrame(kind=kind, group_id=group_id, member_key=member_key))
 
 
+def is_release_group(conn: Connection, *, run_id: str, group_id: str) -> bool:
+    """THE release-group predicate (META-38), defined once, read from the durable fact.
+
+    A collector release group is the EXPAND group ``collect_tokens`` mints
+    for the released children; its ``group_records.closes_group_id`` names
+    the group it closed. A real fork/expand opener's row carries NULL. This
+    is the only discriminator — a WRITTEN fact, never derived from lineage
+    shape, terminal-path vocabulary, or binding config (none of which a
+    durable-twin reader holds, and none of which survive nesting).
+
+    Fail-closed: a ``group_id`` with NO ``group_records`` row is an audit
+    inconsistency (every group is minted with its row in the same
+    transaction as its frames), so it raises rather than answering False —
+    a False here would let a closer silently truncate past a frame nobody
+    minted.
+    """
+    row = conn.execute(
+        select(group_records_table.c.closes_group_id).where(
+            group_records_table.c.run_id == run_id,
+            group_records_table.c.group_id == group_id,
+        )
+    ).one_or_none()
+    if row is None:
+        raise AuditIntegrityError(
+            f"is_release_group: group {group_id!r} (run {run_id!r}) has no group_records row — a lineage frame names a group the audit trail never minted."
+        )
+    return row.closes_group_id is not None
+
+
 class RowTokenRepository:
     """Source row and token lifecycle writes: create, fork, coalesce, expand.
 
@@ -1832,6 +1861,8 @@ class RowTokenRepository:
                         opener_token_id=representative.token_id,
                         member_count=0,
                         created_at=now(),
+                        # META-38: the written release fact (see is_release_group).
+                        closes_group_id=group_id,
                     )
                 )
                 if result.rowcount == 0:
@@ -1892,6 +1923,9 @@ class RowTokenRepository:
                     opener_token_id=representative.token_id,
                     member_count=len(output_data_refs),
                     created_at=now(),
+                    # META-38: the written release fact (see is_release_group) —
+                    # committed in the SAME transaction as the release frames.
+                    closes_group_id=group_id,
                 )
             )
             if result.rowcount == 0:
@@ -1957,6 +1991,14 @@ class RowTokenRepository:
             release_group_id=release_group_id,
             children=tuple(CommittedChild(token_id=child.token_id) for child, _ordinal in children),
         )
+
+    def is_release_group(self, *, run_id: str, group_id: str) -> bool:
+        """Durable read of the META-38 release fact — see the module-level
+        :func:`is_release_group` (the one definition; this opens the read
+        connection for out-of-transaction callers, e.g. the engine's
+        ``TokenManager`` memo, which is populated ONLY through this read)."""
+        with self._db.connection() as conn:
+            return is_release_group(conn, run_id=run_id, group_id=group_id)
 
     def get_group_records_for_run(self, run_id: str) -> list[RowMapping]:
         """All group_records rows for a run, ordered by group_id (export surface)."""

@@ -2090,7 +2090,7 @@ _DURABLE_EXPORT_PARITY_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]
     (
         "group_record",
         ("group_id",),
-        ("kind", "opener_token_id", "member_count"),
+        ("kind", "opener_token_id", "member_count", "closes_group_id"),
     ),
     (
         "group_loss",
@@ -2685,7 +2685,7 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
         # opener (spec §4.3), plus the WS3-owned group-loss ledger. Both must
         # be present durably for the parity check below to match the
         # exporter's own group_record/group_loss records.
-        group_record_fields = ("run_id", "group_id", "kind", "opener_token_id", "member_count")
+        group_record_fields = ("run_id", "group_id", "kind", "opener_token_id", "member_count", "closes_group_id")
         records.extend(
             project("group_record", row, group_record_fields)
             for row in fetch(group_records_table, group_record_fields, group_records_table.c.group_id)

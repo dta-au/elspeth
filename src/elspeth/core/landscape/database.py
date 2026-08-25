@@ -288,6 +288,8 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     # Epoch 35 flip: lineage lives on token_lineage_frames + group_records now.
     ("token_lineage_frames", "member_key"),
     ("group_records", "member_count"),
+    # META-38 (epoch 36, pre-release: no migration): the written release fact.
+    ("group_records", "closes_group_id"),
     # Added for run ownership — prevents cross-run contamination of token-linked records
     ("tokens", "run_id"),
     # Token ancestry belongs to exactly one run; both endpoints are composite-FK scoped.
