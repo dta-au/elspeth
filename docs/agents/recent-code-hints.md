@@ -1171,9 +1171,11 @@ sequentially per worktree.
     reduction below the 5 MiB default but never a raise). A composer-authored
     pipeline can set `max_page_bytes` above a lower configured
     `max_document_bytes`, and every page then gets rejected at the
-    downstream node with no config-time warning. Open ticket; the interim
-    mitigation is the composer hint telling the planner to keep
-    `max_page_bytes` at or below the downstream `max_document_bytes`.
+    downstream node with no config-time warning. Open ticket
+    `elspeth-cc2e6dc8b9`, which also covers Textract's unmodeled 10,000
+    px/side dimension limit; the interim mitigation is the composer hint
+    telling the planner to keep `max_page_bytes` at or below the downstream
+    `max_document_bytes`.
   - The graph builder accepts a `trigger: {}` count trigger immediately
     downstream of an EXPAND-group transform (e.g. `pdf_rasterize`,
     `json_explode`) with no error, while rejecting the structurally

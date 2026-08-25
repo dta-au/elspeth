@@ -47,8 +47,10 @@ declares exactly one `document_format`, and the runtime rejects any
 signature/format disagreement fail-closed. To analyze several formats, stage
 and run one format at a time (or author a branched pipeline with one
 transform instance per format). A multipage PDF is not a supported input to
-this script — rasterize it into per-page PNGs with `pdf_rasterize` first,
-then stage the rendered pages the same way.
+this script — `prepare_document_blobs.py` only stages documents ready to
+analyze as-is. To process a multipage PDF, wire `pdf_rasterize` in-pipeline
+between `blob_rows` and `aws_textract_inline_analysis` instead, as described
+above (`blob_ref_field: page_blob_ref`, `document_format: png`).
 
 Row-level failures (provider rejections, page count other than one, malformed
 responses) land in `output/textract_failures.jsonl` with sanitized,

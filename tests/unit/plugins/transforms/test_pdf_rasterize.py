@@ -83,6 +83,53 @@ def _page(number: int) -> RenderedPage:
     return RenderedPage(page_number=number, png_path=Path("unset"), width_px=200, height_px=100, size_bytes=0)
 
 
+class _EscapingPathRenderer:
+    """Returns a rendered page whose png_path escapes its own output_dir.
+
+    Stands in for a compromised worker that names an arbitrary readable path
+    instead of a file inside the render output directory it was given.
+    """
+
+    def __init__(self, escape_path: Path) -> None:
+        self._escape_path = escape_path
+
+    def render(self, pdf_bytes: bytes) -> tuple[RasterizeResponse, Path]:
+        del pdf_bytes
+        output_dir = Path(tempfile.mkdtemp(prefix="escaping-rasterize-"))
+        page = RenderedPage(page_number=1, png_path=self._escape_path, width_px=10, height_px=10, size_bytes=4)
+        return RasterizeResponse(page_count=1, rendered=(page,), refused=()), output_dir
+
+    def discard(self, output_dir: Path | None) -> None:
+        if output_dir is not None:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    def close(self) -> None:
+        pass
+
+
+class _LyingSizeRenderer:
+    """Returns a rendered page whose claimed size_bytes does not match the real file."""
+
+    def __init__(self, real_bytes: bytes, claimed_size: int) -> None:
+        self._real_bytes = real_bytes
+        self._claimed_size = claimed_size
+
+    def render(self, pdf_bytes: bytes) -> tuple[RasterizeResponse, Path]:
+        del pdf_bytes
+        output_dir = Path(tempfile.mkdtemp(prefix="lying-size-rasterize-"))
+        png_path = output_dir / "page-1.png"
+        png_path.write_bytes(self._real_bytes)
+        page = RenderedPage(page_number=1, png_path=png_path, width_px=10, height_px=10, size_bytes=self._claimed_size)
+        return RasterizeResponse(page_count=1, rendered=(page,), refused=()), output_dir
+
+    def discard(self, output_dir: Path | None) -> None:
+        if output_dir is not None:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    def close(self) -> None:
+        pass
+
+
 def _transform(store: FilesystemPayloadStore, renderer: Any, **options: Any) -> PDFRasterize:
     transform = PDFRasterize({"schema": {"mode": "observed"}, **options})
     transform.on_start(_FakeLifecycleContext(store))
@@ -114,6 +161,37 @@ def test_emits_one_row_per_page_with_page_metadata_and_parent_fields(store: File
     assert result.success_reason["metadata"]["page_count"] == 2
     assert result.success_reason["metadata"]["refused_pages"] == []
     assert renderer.discarded and renderer.discarded[0] is not None and not renderer.discarded[0].exists()
+
+
+def test_page_png_path_outside_output_dir_raises_containment_error(store: FilesystemPayloadStore, tmp_path: Path) -> None:
+    """A worker-returned png_path outside its own render output_dir is a containment
+
+    breach, not a document problem: the parent must refuse to read and publish it
+    rather than trust an arbitrary readable path (e.g. a credentials file) named by a
+    compromised worker.
+    """
+    ref = store.store(minimal_pdf(1))
+    escape_target = tmp_path / "not-the-output-dir" / "page-1.png"
+    escape_target.parent.mkdir()
+    escape_target.write_bytes(b"attacker-controlled-bytes")
+    transform = _transform(store, _EscapingPathRenderer(escape_target))
+    with pytest.raises(RuntimeError, match="containment breach"):
+        transform.process(make_pipeline_row({"blob_ref": ref}), make_context())
+
+
+def test_emitted_page_size_is_the_real_byte_length_not_the_workers_claim(store: FilesystemPayloadStore) -> None:
+    """page_size_bytes must reflect the bytes actually read from disk, never a
+
+    worker-claimed size_bytes value — the worker's claim about its own output is not
+    trustworthy any more than the path it names.
+    """
+    ref = store.store(minimal_pdf(1))
+    real_bytes = PNG + b"extra-bytes-the-worker-did-not-count-in-its-claim"
+    transform = _transform(store, _LyingSizeRenderer(real_bytes, claimed_size=1))
+    result = transform.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "success"
+    assert result.rows[0]["page_size_bytes"] == len(real_bytes)
+    assert store.retrieve(result.rows[0]["page_blob_ref"]) == real_bytes
 
 
 def test_encrypted_document_is_a_typed_row_error_not_a_crash(store: FilesystemPayloadStore) -> None:
@@ -248,6 +326,31 @@ def test_real_renderer_end_to_end(store: FilesystemPayloadStore) -> None:
     assert result.status == "success"
     assert [row["page_number"] for row in result.rows] == [1, 2]
     assert store.retrieve(result.rows[0]["page_blob_ref"])[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_importing_pdf_rasterize_does_not_pull_in_pypdfium2() -> None:
+    """``pypdfium2`` must stay WORKER-ONLY (spawned render subprocess), never imported
+
+    at module scope by ``pdf_rasterize.py`` or the modules it imports at import time
+    (``renderer.py``, ``protocol.py``) — otherwise every process that merely imports
+    the plugin (discovery, the main engine process, test collection) pays the native
+    library's import cost and inherits its failure modes. Run in a fresh subprocess:
+    the current test session may have already imported ``pypdfium2`` via an earlier,
+    unrelated real-renderer test, which would hide the leak if checked in-process.
+    """
+    import os
+    import subprocess
+    import sys
+
+    repo_root = Path(__file__).resolve().parents[4]
+    code = (
+        "import sys\n"
+        "import elspeth.plugins.transforms.pdf_rasterize\n"
+        "assert 'pypdfium2' not in sys.modules, sorted(m for m in sys.modules if 'pypdfium2' in m)\n"
+    )
+    env = dict(os.environ, PYTHONPATH=str(repo_root / "src"))
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120)
+    assert result.returncode == 0, result.stderr
 
 
 class TestConfig:

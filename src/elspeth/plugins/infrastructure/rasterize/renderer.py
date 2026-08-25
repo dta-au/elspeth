@@ -78,6 +78,14 @@ class PoolRenderer:
     def _drop_pool(self) -> None:
         self._pool = None
 
+    def _shutdown_and_drop_pool(self) -> None:
+        # BrokenProcessPool / generic-Exception paths: the pool is unusable but its
+        # executor (and any worker process it still owns) is not torn down by simply
+        # dropping our reference to it — shut it down explicitly so it does not leak.
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        self._drop_pool()
+
     def _kill_pool(self, future: Future[RasterizeOutcome]) -> None:
         # Copied from query.py:143-159 verbatim: future.cancel() only prevents a QUEUED
         # task from starting — it cannot kill a worker already executing native code.
@@ -122,7 +130,13 @@ class PoolRenderer:
             output_dir=output_dir,
         )
         pool = self._ensure_pool()
-        future = pool.submit(self._worker, request)
+        try:
+            future = pool.submit(self._worker, request)
+        except Exception:
+            # submit() itself raised before handing back a future to await: no caller
+            # will ever receive this output_dir to discard it, so it must not leak here.
+            self.discard(output_dir)
+            raise
         if on_submitted is not None:
             on_submitted(self.live_worker_pids())
         try:
@@ -131,7 +145,7 @@ class PoolRenderer:
             self._kill_pool(future)
             return RenderTimedOut(timeout_seconds=self._limits.render_timeout_seconds), output_dir
         except BrokenProcessPool as exc:
-            self._drop_pool()
+            self._shutdown_and_drop_pool()
             raise RuntimeError(
                 "pdf_rasterize worker died outside its result protocol — this is a code bug, not a document problem"
             ) from exc
@@ -151,7 +165,7 @@ class PoolRenderer:
         except Exception as exc:  # narrow in effect: every typed worker exception is handled
             # above; anything else escaping the worker is OUR code's bug, not a document
             # problem, and must crash loudly rather than be swallowed.
-            self._drop_pool()
+            self._shutdown_and_drop_pool()
             raise RuntimeError(
                 "pdf_rasterize worker raised outside its result protocol — this is a code bug, not a document problem"
             ) from exc

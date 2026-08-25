@@ -322,7 +322,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b0eeeb93b2971cb8"
+    source_file_hash: str | None = "sha256:98c4ead2961c0fbb"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -509,11 +509,11 @@ class PDFRasterize(BaseTransform):
 
         result, output_dir = self._renderer.render(body)
         try:
-            return self._map_document_result(result, blob_ref=blob_ref, row=row)
+            return self._map_document_result(result, blob_ref=blob_ref, row=row, output_dir=output_dir)
         finally:
             self._renderer.discard(output_dir)
 
-    def _map_document_result(self, result: RenderResult, *, blob_ref: str, row: PipelineRow) -> TransformResult:
+    def _map_document_result(self, result: RenderResult, *, blob_ref: str, row: PipelineRow, output_dir: Path | None) -> TransformResult:
         if isinstance(result, DocumentRefusal):
             return self._map_document_refusal(result, blob_ref=blob_ref)
         if isinstance(result, RenderTimedOut):
@@ -526,7 +526,11 @@ class PDFRasterize(BaseTransform):
                 },
                 retryable=False,
             )
-        return self._map_rasterize_response(result, blob_ref=blob_ref, row=row)
+        if output_dir is None:
+            raise FrameworkBugError(
+                "PDFRasterize renderer returned rendered pages with no output_dir — cannot verify page path containment."
+            )
+        return self._map_rasterize_response(result, blob_ref=blob_ref, row=row, output_dir=output_dir)
 
     def _map_document_refusal(self, result: DocumentRefusal, *, blob_ref: str) -> TransformResult:
         field_name = self._blob_ref_field
@@ -561,7 +565,7 @@ class PDFRasterize(BaseTransform):
             }
         return TransformResult.error(reason, retryable=False)
 
-    def _map_rasterize_response(self, response: RasterizeResponse, *, blob_ref: str, row: PipelineRow) -> TransformResult:
+    def _map_rasterize_response(self, response: RasterizeResponse, *, blob_ref: str, row: PipelineRow, output_dir: Path) -> TransformResult:
         field_name = self._blob_ref_field
         refused_entries: list[dict[str, Any]] = [
             {"page_number": refused.page_number, "kind": refused.kind.value, "detail": refused.detail} for refused in response.refused
@@ -609,14 +613,26 @@ class PDFRasterize(BaseTransform):
 
         base = row.to_dict()
         output_rows: list[dict[str, Any]] = []
+        resolved_output_dir = output_dir.resolve()
         for page in response.rendered:
-            page_ref = self._payload_store.store(page.png_path.read_bytes())
+            resolved_png_path = page.png_path.resolve()
+            if not resolved_png_path.is_relative_to(resolved_output_dir):
+                # The spawn worker parses hostile PDF bytes; a compromised worker returning
+                # an arbitrary readable path (e.g. a credentials file) must never be trusted
+                # to name what gets read and published into the payload store. This is our
+                # code's own containment invariant, not a document-shaped row error.
+                raise RuntimeError(
+                    f"pdf_rasterize worker returned page {page.page_number} at path {page.png_path!r}, "
+                    f"outside its own render output directory {output_dir!r} — worker containment breach"
+                )
+            data = resolved_png_path.read_bytes()
+            page_ref = self._payload_store.store(data)
             output = copy.deepcopy(base)
             output[self._page_blob_ref_field] = page_ref
             output[self._page_number_field] = page.page_number
             output[self._document_id_field] = blob_ref
             output[self._page_mime_type_field] = PAGE_MIME_TYPE
-            output[self._page_size_bytes_field] = page.size_bytes
+            output[self._page_size_bytes_field] = len(data)
             output[self._page_width_field] = page.width_px
             output[self._page_height_field] = page.height_px
             output_rows.append(output)

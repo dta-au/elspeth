@@ -516,8 +516,10 @@ TransformErrorCategory = Literal[
     # PDF rasterization (Tier 2 - document bytes that did not survive rendering)
     "pdf_encrypted",  # password/security-protected PDF; no password path exists
     "pdf_malformed",  # pdfium could not parse the document
-    "pdf_page_render_failed",  # one or more pages refused (render error / memory) under on_page_failure=fail_document
-    "pdf_page_too_large",  # a page exceeded max_page_pixels or max_page_bytes under on_page_failure=fail_document
+    "pdf_page_render_failed",  # page(s) refused for render error, memory exhaustion, or invalid geometry; fires under
+    # on_page_failure=fail_document, and unconditionally when zero pages survive regardless of on_page_failure
+    "pdf_page_too_large",  # a page exceeded max_page_pixels or max_page_bytes; fires under on_page_failure=fail_document,
+    # and unconditionally when zero pages survive regardless of on_page_failure
     "render_timeout",  # the document exceeded render_timeout_seconds (wall clock or CPU budget)
     # Template errors
     "template_rendering_failed",
