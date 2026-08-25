@@ -828,10 +828,17 @@ class BarrierIntakeCoordinator:
         arrival's. Restore-without-sweep is the wedge the WS4 fix-round
         named — a parked group never settles otherwise. The sweep's only
         ordering constraint is that it follows the restore that parked the
-        keys: it is independent of the loss replay in the same pass, because
-        the restore rebuilds every restored group's losses from the FULL
-        ledger, so the replay dedups those via ``has_replayed_member_loss``
-        and never reaches a parked key.
+        keys: it is independent of the loss replay in the same pass. Replay
+        first: the restore rebuilds every restored group's losses from the
+        FULL ledger, so the replay dedups those via
+        ``has_replayed_member_loss`` and never reaches a parked key. Sweep
+        first: the close removes the group from the executor's pending map,
+        so that predicate no longer sees it — what makes this order safe is
+        ``notify_member_lost``'s opening ``_completed_keys`` /
+        ``_check_landscape_for_completion`` short-circuit, whose in-memory
+        half is FIFO-evicted at ``_max_completed_keys`` and whose durable
+        half (``has_completed_group_for_node``) therefore carries it on a
+        busy resume.
 
         Resumable at both handoffs. Executor -> coordinator (408d48ed4): the
         executor un-parks each key only after its close succeeds and stashes
