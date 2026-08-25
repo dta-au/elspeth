@@ -129,9 +129,28 @@ def test_outcome_analysis_fork_and_join_counts_read_lineage_frames_and_tokens() 
         sink_name="sink-0",
     )
 
+    # One expand group with two members — expand_operations counts DISTINCT
+    # expand-kind frame groups the same way fork_operations counts fork ones.
+    member_1 = setup.data_flow.create_token(
+        row.row_id,
+        lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="m1"),),
+    )
+    member_2 = setup.data_flow.create_token(
+        row.row_id,
+        lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="m2"),),
+    )
+    for token in (member_1, member_2):
+        setup.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+            sink_name="sink-0",
+        )
+
     setup.run_lifecycle.complete_run(setup.run_id, RunStatus.COMPLETED)
 
     outcome_analysis = get_outcome_analysis(setup.db, setup.factory, setup.run_id)
     assert "error" not in outcome_analysis
     assert outcome_analysis["summary"]["fork_operations"] == 2
     assert outcome_analysis["summary"]["join_operations"] == 1
+    assert outcome_analysis["summary"]["expand_operations"] == 1

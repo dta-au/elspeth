@@ -102,6 +102,40 @@ class TokenRecord(TypedDict):
     created_at: str | None
 
 
+class GroupRecordEntry(TypedDict):
+    """A group roster record as returned by ``list_group_records``.
+
+    Minted at the opening operation for EVERY expansion, empty ones
+    included (spec §4.3); deliberately binding-blind — boundness is a
+    config fact, never a durable column.
+    """
+
+    group_id: str
+    kind: str
+    opener_token_id: str
+    member_count: int
+    created_at: str | None
+
+
+class GroupLossEntry(TypedDict):
+    """A group-loss ledger row as returned by ``list_group_losses``.
+
+    The ledger is append-only; ``adopted_epoch`` is a leader replay
+    cursor, never a truth filter (spec §6.2) — the projection surfaces
+    adopted and unadopted rows alike.
+    """
+
+    loss_id: str
+    closer_name: str
+    group_id: str
+    member_key: str
+    token_id: str
+    reason: str
+    recorded_by: str
+    recorded_at: str | None
+    adopted_epoch: int | None
+
+
 class TokenChildRecord(TypedDict):
     """Forward lineage record: what child tokens were created from a parent.
 
@@ -454,6 +488,7 @@ class OutcomeSummary(TypedDict):
     non_terminal_tokens: int
     fork_operations: int
     join_operations: int
+    expand_operations: int
 
 
 class OutcomeAnalysisReport(TypedDict):

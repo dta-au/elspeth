@@ -201,6 +201,33 @@ _TOOLS: dict[str, _ToolDef] = {
             "limit": {"type": "integer", "description": "Max tokens (default 100)", "default": 100},
         },
     ),
+    "list_group_records": _ToolDef(
+        description="List group roster records (fork/expand openings) for a run — the audit authority for group membership counts",
+        args=_ArgSpec(required_str=("run_id",), optional_str=("kind",)),
+        handler=lambda a, args: a.list_group_records(run_id=args["run_id"], kind=args["kind"]),
+        schema_properties={
+            "run_id": {"type": "string", "description": "Run ID to query"},
+            "kind": {"type": ["string", "null"], "description": "Optional group kind filter", "enum": ["fork", "expand", None]},
+        },
+    ),
+    "list_group_losses": _ToolDef(
+        description="List the group-loss ledger for a run: which member of which group was lost, why, and who recorded it",
+        args=_ArgSpec(required_str=("run_id",), optional_str=("group_id",)),
+        handler=lambda a, args: a.list_group_losses(run_id=args["run_id"], group_id=args["group_id"]),
+        schema_properties={
+            "run_id": {"type": "string", "description": "Run ID to query"},
+            "group_id": {"type": ["string", "null"], "description": "Optional group ID to filter by"},
+        },
+    ),
+    "get_token_lineage": _ToolDef(
+        description="A token's full lineage path (outermost frame first): every fork branch and expansion membership it carries",
+        args=_ArgSpec(required_str=("run_id", "token_id")),
+        handler=lambda a, args: a.get_token_lineage(run_id=args["run_id"], token_id=args["token_id"]),
+        schema_properties={
+            "run_id": {"type": "string", "description": "Run ID to query"},
+            "token_id": {"type": "string", "description": "Token ID whose lineage to read"},
+        },
+    ),
     "get_token_children": _ToolDef(
         description="Get child tokens created from a parent (forward lineage) — trace what a COALESCED token merged into",
         args=_ArgSpec(required_str=("parent_token_id",)),

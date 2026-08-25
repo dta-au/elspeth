@@ -229,6 +229,8 @@ class TestOutcomeAnalysisCompleted:
                     _QueryResult(fetchall_rows=[]),
                     _QueryResult(scalar_value=0),
                     _QueryResult(scalar_value=0),
+                    # expand_operations (ADR-042 D3 / WS6 Task 7)
+                    _QueryResult(scalar_value=0),
                 ]
             )
         )
@@ -271,6 +273,8 @@ class TestOutcomeAnalysisCompleted:
                     ),
                     _QueryResult(fetchall_rows=[]),
                     _QueryResult(scalar_value=0),
+                    _QueryResult(scalar_value=0),
+                    # expand_operations (ADR-042 D3 / WS6 Task 7)
                     _QueryResult(scalar_value=0),
                 ]
             )

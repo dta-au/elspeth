@@ -725,6 +725,15 @@ def get_outcome_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id:
             or 0
         )
 
+        expand_count = (
+            conn.execute(
+                select(func.count(func.distinct(token_lineage_frames_table.c.group_id)))
+                .select_from(token_lineage_frames_table)
+                .where((token_lineage_frames_table.c.run_id == run_id) & (token_lineage_frames_table.c.kind == FrameKind.EXPAND.value))
+            ).scalar()
+            or 0
+        )
+
     outcomes = [
         {
             "outcome": row.outcome,
@@ -747,6 +756,7 @@ def get_outcome_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id:
             "non_terminal_tokens": non_terminal_count,
             "fork_operations": fork_count,
             "join_operations": join_count,
+            "expand_operations": expand_count,
         },
         "outcome_distribution": outcomes,  # type: ignore[typeddict-item]  # structurally correct dict literals
         "sink_distribution": sinks,  # type: ignore[typeddict-item]  # SA Row attr types

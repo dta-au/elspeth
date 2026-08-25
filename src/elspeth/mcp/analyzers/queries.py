@@ -30,6 +30,9 @@ from elspeth.mcp.types import (
     CollisionFieldRecord,
     CollisionRecord,
     CollisionValueFingerprint,
+    GroupLossEntry,
+    GroupRecordEntry,
+    LineageFrameEntry,
     NodeDetail,
     NodeStateRecord,
     OperationCallRecord,
@@ -215,6 +218,92 @@ def list_tokens(
             "created_at": row.created_at.isoformat() if row.created_at else None,
         }
         for row in rows
+    ]
+
+
+def list_group_records(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str, kind: str | None = None) -> list[GroupRecordEntry]:
+    """List group roster records (fork/expand openings) for a run.
+
+    The audit authority for group membership counts (spec §4.3): one row
+    per opened group, empty expansions included (member_count=0).
+    """
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.schema import group_records_table
+
+    with db.connection() as conn:
+        query = (
+            select(group_records_table)
+            .where(group_records_table.c.run_id == run_id)
+            .order_by(group_records_table.c.created_at, group_records_table.c.group_id)
+        )
+        if kind is not None:
+            query = query.where(group_records_table.c.kind == kind)
+        rows = conn.execute(query).fetchall()
+    return [
+        {
+            "group_id": row.group_id,
+            "kind": row.kind,
+            "opener_token_id": row.opener_token_id,
+            "member_count": int(row.member_count),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
+
+
+def list_group_losses(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str, group_id: str | None = None) -> list[GroupLossEntry]:
+    """List the group-loss ledger for a run (append-only; adopted or not).
+
+    §6.2 full-table-read discipline applies on the wire too: adoption is a
+    leader replay cursor, so no ``adopted_epoch`` filter exists here.
+    """
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.schema import group_losses_table
+
+    with db.connection() as conn:
+        query = (
+            select(group_losses_table)
+            .where(group_losses_table.c.run_id == run_id)
+            .order_by(group_losses_table.c.recorded_at, group_losses_table.c.loss_id)
+        )
+        if group_id is not None:
+            query = query.where(group_losses_table.c.group_id == group_id)
+        rows = conn.execute(query).fetchall()
+    return [
+        {
+            "loss_id": row.loss_id,
+            "closer_name": row.closer_name,
+            "group_id": row.group_id,
+            "member_key": row.member_key,
+            "token_id": row.token_id,
+            "reason": row.reason,
+            "recorded_by": row.recorded_by,
+            "recorded_at": row.recorded_at.isoformat() if row.recorded_at else None,
+            "adopted_epoch": int(row.adopted_epoch) if row.adopted_epoch is not None else None,
+        }
+        for row in rows
+    ]
+
+
+def get_token_lineage(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str, token_id: str) -> list[LineageFrameEntry]:
+    """A token's full lineage path, outermost (depth 0) first."""
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.schema import token_lineage_frames_table
+
+    with db.connection() as conn:
+        rows = conn.execute(
+            select(token_lineage_frames_table)
+            .where(
+                token_lineage_frames_table.c.run_id == run_id,
+                token_lineage_frames_table.c.token_id == token_id,
+            )
+            .order_by(token_lineage_frames_table.c.depth)
+        ).fetchall()
+    return [
+        {"depth": int(row.depth), "kind": str(row.kind), "group_id": str(row.group_id), "member_key": str(row.member_key)} for row in rows
     ]
 
 
