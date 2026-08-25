@@ -54,12 +54,16 @@ class _CollectorExecutorDouble:
 
 
 def _collector_processor(factory: RecorderFactory, *, collector_executor: Any = None) -> RowProcessor:
-    return _make_processor(
+    processor = _make_processor(
         factory,
         node_step_map={NodeID("source-0"): 0, _COLLECTOR_NODE: 1},
         node_to_next={NodeID("source-0"): _COLLECTOR_NODE, _COLLECTOR_NODE: None},
-        collector_executor=collector_executor,
     )
+    # The shared builder does not thread a collector executor; bind the
+    # double behind the read-only ``collector_executor`` property directly.
+    # The EOF drain reads ONLY that property and ``buffered_member_count()``.
+    processor._collector_executor = collector_executor
+    return processor
 
 
 def _member_token(ordinal: int) -> Any:
