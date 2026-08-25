@@ -8,9 +8,12 @@ transform retrieves the bytes by content hash, verifies the declared format's
 byte signature, and sends them to one audited `AnalyzeDocument` call per row.
 
 This is the CLI twin of the Web Composer flow (upload/paste a document →
-`set_source_from_blobs` → analyze). Documents already stored in S3, multipage
-PDFs, or files over 5 MiB belong to the asynchronous
-`aws_textract_document_analysis` plugin instead.
+`set_source_from_blobs` → analyze). Documents already stored in S3 or over
+5 MiB belong to the asynchronous `aws_textract_document_analysis` plugin. A
+multipage PDF can instead be split by the `pdf_rasterize` transform into one
+PNG page per row and analyzed inline page by page (set
+`blob_ref_field: page_blob_ref` and `document_format: png` on the analysis
+node).
 
 ## Prerequisites
 
@@ -43,7 +46,11 @@ The prepare script verifies each document's byte signature, enforces the
 declares exactly one `document_format`, and the runtime rejects any
 signature/format disagreement fail-closed. To analyze several formats, stage
 and run one format at a time (or author a branched pipeline with one
-transform instance per format).
+transform instance per format). A multipage PDF is not a supported input to
+this script — `prepare_document_blobs.py` only stages documents ready to
+analyze as-is. To process a multipage PDF, wire `pdf_rasterize` in-pipeline
+between `blob_rows` and `aws_textract_inline_analysis` instead, as described
+above (`blob_ref_field: page_blob_ref`, `document_format: png`).
 
 Row-level failures (provider rejections, page count other than one, malformed
 responses) land in `output/textract_failures.jsonl` with sanitized,

@@ -1036,7 +1036,8 @@ _SET_SOURCE_FROM_BLOBS_DECLARATION = ToolDeclaration(
         "carrying its payload hash and bounded metadata, in the given order. Every entry field "
         "is resolved from the session's authoritative records — never pass document content. "
         "Use this for pasted/uploaded binary documents (jpeg/png/pdf) feeding "
-        "aws_textract_inline_analysis; mixed formats need one homogeneous source per format."
+        "aws_textract_inline_analysis (directly, or via pdf_rasterize for multipage PDFs); "
+        "mixed formats need one homogeneous source per format."
     ),
     json_schema={
         "type": "object",

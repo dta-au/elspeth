@@ -643,6 +643,8 @@ def test_block_count_over_limit_fails_as_too_many_blocks() -> None:
     assert result.reason["reason"] == "too_many_blocks"
 
 
+# Also the pdf_rasterize case: a rasterized page whose response reports Pages != 1 must
+# still fail — the guard validates the provider RESPONSE and is not relaxed by the exploder.
 def test_multi_page_response_fails_page_count_policy() -> None:
     blocks = [*_basic_blocks(page=1), {"BlockType": "PAGE", "Id": "page-2", "Page": 2}]
     client = FakeInlineClient(result=InlineAnalysisResult(semantic_response=_analyze_response(blocks=blocks, page_count=2), sdk_attempts=1))
@@ -811,14 +813,16 @@ def test_forward_invariant_probe_runs_the_production_path_offline() -> None:
     assert transform._row_clients == {}
 
 
-def test_assistance_names_the_authority_boundaries() -> None:
+def test_assistance_names_the_authority_boundaries_and_the_multipage_on_ramp() -> None:
     assistance = AWSTextractInlineAnalysis.get_agent_assistance()
-
     assert assistance is not None
     hints = " ".join(assistance.composer_hints)
-    assert "blob_rows" in hints
-    assert "jpeg" in hints
-    assert "single-page" in hints
-    assert "aws_textract_document_analysis" in hints
-    assert "billable" in hints
+    for required in ("blob_rows", "jpeg", "single-page", "aws_textract_document_analysis", "billable"):
+        assert required in hints
+    # A multipage PDF reaches this plugin only through pdf_rasterize; the hint must say so
+    # AND name the two options the downstream node must set (a declaration test pins
+    # existence, a claim test pins the advice).
+    on_ramp = [hint for hint in assistance.composer_hints if "pdf_rasterize" in hint]
+    assert len(on_ramp) == 1
+    assert "blob_ref_field: page_blob_ref" in on_ramp[0] and "document_format: png" in on_ramp[0]
     assert AWSTextractInlineAnalysis.get_agent_assistance(issue_code="anything") is None

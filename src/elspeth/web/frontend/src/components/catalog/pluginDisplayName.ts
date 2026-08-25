@@ -31,6 +31,7 @@ const ACRONYMS: ReadonlySet<string> = new Set([
   "io",
   "json",
   "llm",
+  "pdf",
   "rag",
   "sql",
   "url",

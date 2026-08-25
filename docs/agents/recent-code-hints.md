@@ -586,7 +586,7 @@ is a working document under the normal delivery posture.
     `ruff format` — the pre-commit formatter rewraps lines and restales a hash
     computed first. The computation normalises the hash line itself, so it is
     stable once written.
-  - `plugin_version` is a STATIC declaration. All 41 builtins sit at `1.0.0`
+  - `plugin_version` is a STATIC declaration. All 52 builtins sit at `1.0.0`
     and none has ever been changed in place (verified over the whole history,
     2026-08-20) — do not invent a bump for a behaviour change, and do not read
     an unbumped version as an oversight.
@@ -1247,6 +1247,34 @@ new TRANSFORM the full list (all hit while landing
 - pin `source_file_hash` LAST (ruff/format edits restale it), via
   `scripts/cicd/plugin_hash.py`.
 
+Sites missed on a first pass landing `pdf_rasterize` (2026-08-25) — add these
+to the checklist above:
+
+- `tests/unit/web/catalog/test_service.py:60` — the serialized-summary total
+  is a bare `sum(...) == N` int literal, easy to miss next to the per-kind
+  counts;
+- `tests/unit/architecture/test_state_engine_catalog_contract.py:35`
+  `V2_CATALOG_SHA256` — a whole-catalog proof hash. Rotate it LAST, only
+  after every other v2/v3 catalog pin for the new plugin has landed (`:174-175`
+  is what it pins against) — rotating early just means rotating twice;
+- `tests/invariants/test_input_schema_config_is_captured.py:80-87`
+  `_EXPECTED_MUTATION_REJECTIONS` and
+  `tests/invariants/test_transform_input_contract_is_satisfiable.py:85-92`
+  `_EXPECTED_ARMING_REJECTIONS` — two separate allowlists, both subset-asserted
+  against the live registry; an unlisted rejection HARD-FAILS rather than
+  silently passing, so a new plugin whose config rejects the synthetic
+  mutation/arming probe must be added to BOTH;
+- `config/cicd/contracts-whitelist.yaml` needs entries in both the
+  `probe_config:return` block (`:173-177`) AND the constructor block
+  (`:216-222`) — the constructor entry's trailing segment must match the
+  ACTUAL parameter name of `__init__` (e.g. `options`, not the generic
+  `config` used elsewhere in this doc);
+- the Python↔TS acronym mirror has NO parity test between the two files —
+  each must be hand-edited: `web/composer/guided/_display.py` `_ACRONYMS`
+  and `web/frontend/src/components/catalog/pluginDisplayName.ts` `ACRONYMS`.
+  Missing an entry (e.g. `"pdf"`) humanises the plugin name wrong
+  ("Pdf Rasterize" instead of "PDF Rasterize") with no test catching it.
+
 Sources have the same shape (see 0ec120e2d for the blob_rows list: source
 count/names, registry, catalog, golden, contracts whitelist).
 
@@ -1267,6 +1295,98 @@ corrupt each other's authenticated state. Run every Playwright suite
 sequentially per worktree.
 
 ## Recent conventions (prune when archived)
+
+- **2026-08-25 — pdf_rasterize / out-of-process render seam.** First plugin in
+  the tree to load a native library and to use `setrlimit`; both traps are
+  reusable for the next native-dependency plugin:
+  - `pypdfium2` initialises libpdfium as an IMPORT side effect
+    (`pypdfium2/__init__.py` → `_library_scope.init_lib()` at module scope,
+    plus an `atexit` teardown). The import must stay WORKER-ONLY — inside the
+    spawned render subprocess — never at module scope in
+    `pdf_rasterize.py` itself, or every process that merely imports the
+    plugin (discovery, the main engine process, test collection) pays the
+    native-library cost and inherits its failure modes.
+  - `plugins/infrastructure/rasterize/worker.py` is the first use of
+    `setrlimit` in this tree. Two things are load-bearing, not incidental:
+    `RLIMIT_AS` is catchable as a plain `MemoryError` ONLY because
+    pypdfium2's default bitmap maker (`PdfBitmap.new_native`) allocates the
+    pixel buffer via ctypes on the Python side — switching bitmap makers
+    silently breaks the memory guard. A BARE `RLIMIT_CPU` (no handler)
+    poisons the whole `ProcessPoolExecutor`: the default SIGXCPU action
+    kills the worker and the pool comes back `BrokenProcessPool`, unusable
+    for the next submission — the initializer's `SIGXCPU` handler (which
+    raises a typed exception instead of dying) is what keeps the pool
+    reusable across renders. The timeout/orphan-kill sequence follows the
+    `rag/query.py` precedent: `future.result(timeout=)`, then on timeout
+    `future.cancel()` + `shutdown(wait=False, cancel_futures=True)` +
+    `.kill()` any still-alive process + rebuild the pool — skip any step and
+    a timed-out render either hangs the interpreter at exit or leaves the
+    pool unusable.
+  - `max_page_bytes` has NO cross-node validation against a downstream
+    `aws_textract_inline_analysis`'s `max_document_bytes` (which permits
+    reduction below the 5 MiB default but never a raise). A composer-authored
+    pipeline can set `max_page_bytes` above a lower configured
+    `max_document_bytes`, and every page then gets rejected at the
+    downstream node with no config-time warning. Open ticket
+    `elspeth-cc2e6dc8b9`, which also covers Textract's unmodeled 10,000
+    px/side dimension limit; the interim mitigation is the composer hint
+    telling the planner to keep `max_page_bytes` at or below the downstream
+    `max_document_bytes`.
+  - The graph builder accepts a `trigger: {}` count trigger immediately
+    downstream of an EXPAND-group transform (e.g. `pdf_rasterize`,
+    `json_explode`) with no error, while rejecting the structurally
+    identical hazard downstream of a row_union (`builder.py:1344-1400`).
+    This gap predates `pdf_rasterize` and is not fixed by it — landing a
+    second expand-group producer only widens its blast radius (any pipeline
+    author can now reach it two ways instead of one). Tracked as spec §4
+    Medium in `docs/superpowers/specs/2026-08-21-pdf-explode-stitch-risk-assessment.md`;
+    the guard is universal batch-lane work, not owned by this plugin.
+  - **Every plugin's `usage_when_not_to_use` and `summary` (not
+    `usage_when_to_use`, not `composer_hints`) is embedded verbatim in the
+    composer's initial scaffolding request, against a global, whole-catalog
+    96 KiB cap.** Editing ANY plugin's `not_for`/summary prose — not just
+    pdf_rasterize's — spends from that one shared budget; there is no
+    per-plugin allowance. Landing this plugin's own prose plus a few
+    sentences of cross-references in sibling plugins' `usage_when_not_to_use`
+    strings (textract inline/document, for the multipage on-ramp) took the
+    live headroom from comfortable to single-digit bytes. The only local
+    signal is a failing
+    `tests/unit/web/composer/test_pipeline_planner.py::test_initial_request_declares_supplied_information_and_omits_redundant_discovery`
+    — nothing in the plugin's own test file or the catalogue-metadata gates
+    catches it, because they check substrings and lengths per-plugin, never
+    the summed whole-catalog payload. Verify that test explicitly after
+    editing any `usage_when_not_to_use` or `summary`, even a one-clause
+    addition; do not assume "it's just prose" is free.
+  - **2026-08-25 follow-up — per-page text extraction landed (pdfium text
+    layer, no OCR): `extract_text: bool = True` and `page_text_field`.**
+    `usage_when_not_to_use` originally opened "Not a text extractor", which
+    the new feature made false; it was reworded THE SAME DAY (not deferred —
+    a planner-facing falsehood outweighs the freeze, the freeze was about
+    budget, not immutability) to "Not an OCR text extractor: only the PDF
+    text layer is read, empty on scans — OCR needs
+    aws_textract_inline_analysis...", which is both accurate and keeps the
+    `_REQUIRED_GUIDANCE["pdf_rasterize"]` substrings ("text extractor", "s3")
+    intact. It fit the ~36-byte headroom only by shrinking the S3 sentence
+    elsewhere in the SAME string (dropping "already"/"which handles... "
+    verbosity) — net growth was +21 bytes. `composer_hints` (uncapped) still
+    carries the fuller `extract_text`/`page_text` explanation.
+    - **Fix round (same day).** Three review findings: (1) `minimal_pdf()`
+      gained a `textless_pages: frozenset[int]` kwarg (default empty, so
+      every existing call — including the committed
+      `examples/pdf_rasterize` fixtures — stays byte-identical) to construct
+      a real page with an empty content stream, proving a genuinely
+      text-layer-less page yields `""`, not an untested code path. (2) The
+      `type(page.text) is not str` `FrameworkBugError` guard
+      (`pdf_rasterize.py`, row-mapping loop) is now pinned by a stub-renderer
+      test. (3) A new `max_page_text_bytes` config knob (default 1 MiB,
+      ceiling 5 MiB, same shape as `max_page_pixels`/`max_page_bytes`) caps
+      the UTF-8-encoded extracted text; the worker enforces it AFTER
+      extraction (only when `extract_text` is true — never evaluated when
+      false) and folds the new `PageRefusalKind.OVERSIZE_TEXT` into the
+      existing size-refusal set, so the `pdf_page_too_large` vs
+      `pdf_page_render_failed` rule reads "ALL refusals are a size kind" —
+      one worked example of extending that rule without touching its
+      call sites.
 
 - **2026-08-17 — worker-pool admission follows the WORKER's lifetime, and the
   preflight coordinator owns the caller's budget** (elspeth-5269b43bca /

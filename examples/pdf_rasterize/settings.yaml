@@ -1,0 +1,71 @@
+# PDF Rasterize Example — multipage PDF to PNG page rows, with quarantine
+#
+# Demonstrates the pdf_rasterize transform: rows carrying a payload-store PDF
+# reference are exploded into one PNG page row per page (an expand group). A
+# malformed document is refused whole and routed to a quarantine sink via
+# on_error, rather than silently dropped.
+#
+# DAG topology:
+#
+#   source ─(pdf_manifest)─> rasterize ─┬─(pages)──────> pages sink
+#                                        └─(on_error)───> quarantine sink
+#
+# Run via ./examples/pdf_rasterize/run.sh — it stages the two committed mock
+# PDFs into the isolated payload store before executing this file.
+
+sources:
+  primary:
+    plugin: csv
+    on_success: pdf_manifest
+    options:
+      path: examples/pdf_rasterize/input/pdf_manifest.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'manifest_index: int'
+        - 'document_name: str'
+        - 'blob_ref: str'
+      on_validation_failure: discard
+
+transforms:
+- name: rasterize
+  plugin: pdf_rasterize
+  input: pdf_manifest
+  on_success: pages
+  on_error: quarantine
+  options:
+    blob_ref_field: blob_ref
+    dpi: 150
+    max_pages: 200
+    on_page_failure: fail_document
+    schema:
+      mode: fixed
+      fields:
+      - 'manifest_index: int'
+      - 'document_name: str'
+      - 'blob_ref: str'
+
+sinks:
+  pages:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/pdf_rasterize/output/pages.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/pdf_rasterize/output/quarantine.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/pdf_rasterize/runs/audit.db
+
+payload_store:
+  backend: filesystem
+  base_path: examples/pdf_rasterize/payloads/offline

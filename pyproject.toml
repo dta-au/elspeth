@@ -88,6 +88,7 @@ dependencies = [
     "chromadb>=1.5,<2",  # backs chroma_sink + rag_retrieval plugins
     "html2text>=2024.2.26",  # backs web_scrape + web_scrape_extraction transforms
     "beautifulsoup4>=4.14,<5",  # paired with html2text in web_scrape
+    "pypdfium2>=5.13,<6",  # backs the pdf_rasterize transform (imported only inside its worker subprocess)
 ]
 
 [project.optional-dependencies]
@@ -374,6 +375,10 @@ module = [
     "ijson.*",
     "ddtrace.*",
     "sqlcipher3.*",
+    "pypdfium2",
+    "pypdfium2.*",
+    "pypdfium2_raw",
+    "pypdfium2_raw.*",
 ]
 ignore_missing_imports = true
 

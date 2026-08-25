@@ -346,6 +346,16 @@ _TRANSFORM_REJECTION_CASES = [
         "row_index_field.*collides",
         id="blob_csv_expand-row-index-blob-ref-collision",
     ),
+    # ── pdf_rasterize ────────────────────────────────────────────────────
+    pytest.param(
+        "pdf_rasterize",
+        {
+            "schema": _make_observed_schema(),
+            "page_number_field": "document_id",  # collides with document_id_field output name
+        },
+        "distinct",
+        id="pdf_rasterize-emitted-field-collision",
+    ),
     # ── report_assemble ───────────────────────────────────────────────────
     pytest.param(
         "report_assemble",
