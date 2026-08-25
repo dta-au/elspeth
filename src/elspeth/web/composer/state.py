@@ -1037,17 +1037,14 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
 
 
 def _collector_scope_topology_errors(nodes: tuple[NodeSpec, ...]) -> list[ValidationEntry]:
-    """Cross-collector scope checks (spec §7 rules 1 and 8, parse-time half).
+    """Cross-collector scope checks (spec §7 rule 1, parse-time half).
 
     Mirrors ``ElspethSettings._validate_scope_bindings``' authorable rejections
     — "Scope name '{}' is declared twice" and "Transform '{}' opens two scopes
-    — one scope per opener" — plus the decidable half of §7 rule 8
-    (``validate_escalation_targets``): escalate with provably no enclosing
-    bound group. Stage 1 does not compute bound regions (established
-    abstention), so the rule-8 mirror fires only when the draft holds NO other
-    barrier at all — with another coalesce/row_union/collector present,
-    membership needs the real builder and Stage 2 owns the verdict
-    (accepting is the safe drift direction).
+    — one scope per opener". The former rule-8 mirror (escalate with provably
+    no enclosing bound group) is deleted with ``on_group_failure`` itself
+    (ADR-042 §6): group-failure handling is structural, so there is no
+    declarable escalation target left to check.
     """
     errors: list[ValidationEntry] = []
     _err = ValidationEntry

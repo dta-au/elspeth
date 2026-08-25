@@ -126,7 +126,9 @@ is a working document under the normal delivery posture.
   traps, the first four from the campaign plan, the rest measured while
   landing Tasks 12–13:
   - (a) The scope-binding config keys (`scope_name`/`scope_opener`/
-    `scope_policy`/`scope_on_group_failure`) exist ONLY on collector nodes and
+    `scope_policy`; `scope_on_group_failure` existed then but is DELETED as of
+    709e4abb3 — ADR-042 §6, group-failure handling is structural) exist ONLY
+    on collector nodes and
     serialise omitted-when-None. Adding any new key to an EXISTING node type's
     serialisation moves every canonical topology hash in
     `tests/unit/core/dag/canonical_hash_corpus.json` and every stored
