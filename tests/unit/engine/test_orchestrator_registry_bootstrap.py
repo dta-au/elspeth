@@ -503,11 +503,22 @@ def test_resume_calls_prepare_for_run() -> None:
             sinks={"output": as_sink(CollectSink("output"))},
         )
 
+        # WS5 Task 2 (spec §8): the entry guard's group-satisfiability arm
+        # also runs BEFORE prepare_for_run, and it reads the graph's binding
+        # registry — so the graph stub must model that contract (no bound
+        # groups). A bare object() here fails the guard with AttributeError
+        # before the bootstrap ordering under test is ever reached.
+        from elspeth.core.dag.group_bindings import GroupBindingRegistry
+
+        class _EmptyBindingGraph:
+            def get_group_bindings(self) -> GroupBindingRegistry:
+                return GroupBindingRegistry(bindings=())
+
         with pytest.raises(ReconstructReached):
             orchestrator.resume(
                 resume_point=resume_point,
                 config=config,
-                graph=object(),  # type: ignore[arg-type]
+                graph=_EmptyBindingGraph(),  # type: ignore[arg-type]
                 payload_store=MockPayloadStore(),
             )
     finally:
