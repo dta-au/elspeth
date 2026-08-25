@@ -278,7 +278,7 @@ class TestSingleQueryProcessing:
         assert mock_provider.execute_query.call_count == 1
         call_kwargs = mock_provider.execute_query.call_args
         messages = call_kwargs.kwargs.get("messages") or call_kwargs[0][0]
-        user_message = messages[-1]["content"]
+        user_message = messages[-1].content
         assert "45yo male" in user_message
 
     def test_process_row_parses_json_response(self) -> None:
@@ -700,7 +700,7 @@ class TestRowProcessingWithPipelining:
             # Verify provider was called with rendered template containing the data
             call_kwargs = provider.execute_query.call_args
             messages = call_kwargs.kwargs.get("messages") or call_kwargs[0][0]
-            user_message = messages[-1]["content"]
+            user_message = messages[-1].content
             assert "Alice Smith" in user_message
         finally:
             transform.close()

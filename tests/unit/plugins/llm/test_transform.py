@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.errors import RuntimePreflightFailedError
 from elspeth.contracts.results import TransformResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -791,7 +792,7 @@ class TestTemplateTierPolicy:
 
         # Verify the custom per-query template was used, not the default
         call_messages = mock_provider.execute_query.call_args.args[0]
-        assert call_messages == [{"role": "user", "content": "Custom: hello"}]
+        assert call_messages == [ChatMessage(role="user", content="Custom: hello")]
 
     def test_render_undefined_variable_is_row_error_not_structural(self) -> None:
         """A render-time UndefinedError must produce TransformResult.error,
@@ -940,7 +941,7 @@ class TestMultiQueryJSONExtraction:
         assert result.row is not None
         assert result.row["q1_llm_response"] == "override result"
         call_messages = mock_provider.execute_query.call_args.args[0]
-        assert call_messages == [{"role": "user", "content": "Override OVERRIDE: hello"}]
+        assert call_messages == [ChatMessage(role="user", content="Override OVERRIDE: hello")]
 
     def test_per_query_template_override_preserves_lookup_audit_metadata(self) -> None:
         """Per-query template overrides should keep lookup provenance fields."""
@@ -1706,7 +1707,7 @@ class TestResponseFormatPassthrough:
         # Verify response_format was passed to provider
         call_messages = mock_provider.execute_query.call_args.args[0]
         call_kwargs = mock_provider.execute_query.call_args.kwargs
-        assert call_messages == [{"role": "user", "content": "Evaluate: hello"}]
+        assert call_messages == [ChatMessage(role="user", content="Evaluate: hello")]
         assert call_kwargs["response_format"] == {
             "type": "json_schema",
             "json_schema": {
@@ -1772,8 +1773,8 @@ class TestResponseFormatPassthrough:
         )
         expected_messages = []
         if system_prompt:
-            expected_messages.append({"role": "system", "content": system_prompt})
-        expected_messages.append({"role": "user", "content": augmented_prompt})
+            expected_messages.append(ChatMessage(role="system", content=system_prompt))
+        expected_messages.append(ChatMessage(role="user", content=augmented_prompt))
 
         assert result.status == "success"
         assert result.row is not None
@@ -1785,8 +1786,8 @@ class TestResponseFormatPassthrough:
         trace_kwargs = mock_tracer.record_success.call_args.kwargs
         traced_messages = []
         if trace_kwargs["system_prompt"] is not None:
-            traced_messages.append({"role": "system", "content": trace_kwargs["system_prompt"]})
-        traced_messages.append({"role": "user", "content": trace_kwargs["prompt"]})
+            traced_messages.append(ChatMessage(role="system", content=trace_kwargs["system_prompt"]))
+        traced_messages.append(ChatMessage(role="user", content=trace_kwargs["prompt"]))
         assert traced_messages == expected_messages
 
     @pytest.mark.parametrize("system_prompt", ["", "Follow the authored rubric exactly."])
@@ -1855,8 +1856,8 @@ class TestResponseFormatPassthrough:
         trace_kwargs = mock_tracer.record_error.call_args.kwargs
         traced_messages = []
         if trace_kwargs["system_prompt"] is not None:
-            traced_messages.append({"role": "system", "content": trace_kwargs["system_prompt"]})
-        traced_messages.append({"role": "user", "content": trace_kwargs["prompt"]})
+            traced_messages.append(ChatMessage(role="system", content=trace_kwargs["system_prompt"]))
+        traced_messages.append(ChatMessage(role="user", content=trace_kwargs["prompt"]))
         assert traced_messages == provider_messages
         assert "required output contract" in trace_kwargs["prompt"]
         assert result.status == "error"
@@ -1921,7 +1922,7 @@ class TestResponseFormatPassthrough:
 
         call_messages = mock_provider.execute_query.call_args.args[0]
         call_kwargs = mock_provider.execute_query.call_args.kwargs
-        assert call_messages == [{"role": "user", "content": "Classify: hello"}]
+        assert call_messages == [ChatMessage(role="user", content="Classify: hello")]
         # No response_format constraint when output_fields is None
         assert call_kwargs.get("response_format") is None
 

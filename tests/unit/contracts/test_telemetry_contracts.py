@@ -37,6 +37,7 @@ from elspeth.contracts import (
     Determinism,
 )
 from elspeth.contracts.audit_protocols import CallRecorder
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.enums import RunStatus, TelemetryGranularity
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.core.landscape import LandscapeDB
@@ -188,7 +189,7 @@ class TestAuditedLLMClientTelemetryContract:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # CONTRACT: Must emit exactly one ExternalCallCompleted
@@ -238,7 +239,7 @@ class TestAuditedLLMClientTelemetryContract:
         with pytest.raises(LLMClientError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         # CONTRACT: Must emit ExternalCallCompleted even on error
@@ -573,7 +574,7 @@ class TestPluginTelemetryThroughAuditedClients:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # CONTRACT: ExternalCallCompleted must be emitted
@@ -663,7 +664,7 @@ class TestTelemetryEmissionOrderContract:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # CONTRACT: Landscape must be recorded BEFORE telemetry is emitted
@@ -732,7 +733,7 @@ class TestTelemetryEmissionOrderContract:
         with pytest.raises(Exception, match="Database error"):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         # CONTRACT: No telemetry should be emitted when Landscape fails
@@ -775,7 +776,7 @@ class TestTelemetryFailureIsolationContract:
         # CONTRACT: Call should succeed despite telemetry failure
         response = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         assert response.content == "Hello!"

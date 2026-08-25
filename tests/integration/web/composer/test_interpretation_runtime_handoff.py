@@ -57,6 +57,7 @@ from sqlalchemy import insert, select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.schema import SchemaConfig
@@ -380,7 +381,7 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
 
     response = client.chat_completion(
         model="stub-model",
-        messages=[{"role": "user", "content": resolved_template}],
+        messages=[ChatMessage(role="user", content=resolved_template)],
         resolved_prompt_template_hash=session_hash,
     )
     assert response.content == "7 / 10"
@@ -482,7 +483,7 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
     monkeypatch.setattr("elspeth.plugins.infrastructure.clients.http.httpx.Client", _FakeHTTPXClient)
 
     result = provider.execute_query(
-        messages=[{"role": "user", "content": "Rate how modern this is."}],
+        messages=[ChatMessage(role="user", content="Rate how modern this is.")],
         model="openrouter/test-model",
         temperature=0.0,
         max_tokens=100,
@@ -569,7 +570,7 @@ async def test_runtime_handoff_none_hash_records_null() -> None:
     # interpretation event).
     client.chat_completion(
         model="stub-model",
-        messages=[{"role": "user", "content": "plain"}],
+        messages=[ChatMessage(role="user", content="plain")],
     )
 
     with db.connection() as conn:

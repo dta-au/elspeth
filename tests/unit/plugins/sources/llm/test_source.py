@@ -13,6 +13,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from elspeth.contracts import Determinism, SourceRow
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.events import ResourceCleanupFailed
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
@@ -71,7 +72,7 @@ def test_load_calls_provider_once_and_emits_one_transform_compatible_row(
     operation_id = source_context.operation_id
     assert operation_id is not None
     assert provider.audit_parents == [LLMAuditParent.for_operation(operation_id=operation_id)]
-    assert provider.messages == [[{"role": "user", "content": "Summarise the audit topic."}]]
+    assert provider.messages == [[ChatMessage(role="user", content="Summarise the audit topic.")]]
     assert provider.runtime_preflight_calls == 0
     assert len(rows) == 1
     assert rows[0].source_row_index == 0
@@ -727,10 +728,10 @@ def test_cleanup_telemetry_and_fallback_logs_exclude_all_llm_source_payload_sent
     assert row.row["answer"] == response_sentinel
     assert provider.messages == [
         [
-            {
-                "role": "user",
-                "content": f"{prompt_sentinel}: {secret_reference_sentinel}",
-            }
+            ChatMessage(
+                role="user",
+                content=f"{prompt_sentinel}: {secret_reference_sentinel}",
+            )
         ]
     ]
 

@@ -30,6 +30,7 @@ from pydantic import Field as PydanticField
 
 from elspeth.contracts import Determinism, TransformErrorReason, TransformResult, propagate_contract
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.freeze import freeze_fields
@@ -284,10 +285,10 @@ class SingleQueryStrategy:
             return TransformResult.error(error_reason)
 
         # 2. Build messages
-        messages: list[dict[str, str]] = []
+        messages: list[ChatMessage] = []
         if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": rendered.prompt})
+            messages.append(ChatMessage(role="system", content=self.system_prompt))
+        messages.append(ChatMessage(role="user", content=rendered.prompt))
 
         if _shutdown_event_is_set(shutdown_event):
             return _shutdown_requested_result()
@@ -604,10 +605,10 @@ class MultiQueryStrategy:
                 )
 
         # Build messages
-        messages: list[dict[str, str]] = []
+        messages: list[ChatMessage] = []
         if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": provider_prompt})
+            messages.append(ChatMessage(role="system", content=self.system_prompt))
+        messages.append(ChatMessage(role="user", content=provider_prompt))
         # Langfuse reconstructs the outbound messages from these separate
         # values. Match the provider's truthy inclusion rule so an explicitly
         # empty system prompt is omitted from both records.
@@ -1157,7 +1158,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:120c19ed831930a3"
+    source_file_hash: str | None = "sha256:2374f7e805c5462f"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1317,7 +1318,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         class _InvariantProvider:
             def execute_query(
                 self,
-                messages: list[dict[str, str]],
+                messages: Sequence[ChatMessage],
                 *,
                 model: str,
                 temperature: float,

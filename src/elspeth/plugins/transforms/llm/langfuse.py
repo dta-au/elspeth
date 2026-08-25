@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 import structlog
 
+from elspeth.contracts.chat_parts import ChatMessage, audit_messages
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.tracing import LangfuseTracingConfig, TracingConfig
@@ -141,10 +142,10 @@ class ActiveLangfuseTracer:
             update_kwargs["metadata"] = {"latency_ms": latency_ms}
 
         # Build the full message list — include system prompt if present
-        messages: list[dict[str, str]] = []
+        messages: list[ChatMessage] = []
         if system_prompt is not None:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+            messages.append(ChatMessage(role="system", content=system_prompt))
+        messages.append(ChatMessage(role="user", content=prompt))
 
         # Langfuse SDK calls (EXTERNAL boundary — catch SDK/transport errors)
         try:
@@ -158,7 +159,7 @@ class ActiveLangfuseTracer:
                     as_type="generation",
                     name="llm_call",
                     model=model,
-                    input=messages,
+                    input=audit_messages(messages),  # bytes-free — tracing is an audit-adjacent boundary
                 ) as generation,
             ):
                 generation.update(**update_kwargs)
@@ -192,10 +193,10 @@ class ActiveLangfuseTracer:
             update_kwargs["metadata"] = {"latency_ms": latency_ms}
 
         # Build the full message list — include system prompt if present
-        messages: list[dict[str, str]] = []
+        messages: list[ChatMessage] = []
         if system_prompt is not None:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+            messages.append(ChatMessage(role="system", content=system_prompt))
+        messages.append(ChatMessage(role="user", content=prompt))
 
         # Langfuse SDK calls (EXTERNAL boundary — catch SDK/transport errors)
         try:
@@ -209,7 +210,7 @@ class ActiveLangfuseTracer:
                     as_type="generation",
                     name="llm_call",
                     model=model,
-                    input=messages,
+                    input=audit_messages(messages),  # bytes-free — tracing is an audit-adjacent boundary
                 ) as generation,
             ):
                 generation.update(**update_kwargs)

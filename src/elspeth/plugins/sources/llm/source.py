@@ -15,6 +15,7 @@ from pydantic import Field as PydanticField
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import Determinism, PluginSchema, SourceRow
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.contexts import LifecycleContext, SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder
 from elspeth.contracts.errors import FrameworkBugError
@@ -118,7 +119,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e95b0198a9af819f"
+    source_file_hash: str | None = "sha256:63b8738c13136224"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -313,10 +314,10 @@ class LLMSource(BaseSource):
         if not rendered.prompt.strip():
             raise LLMClientError("LLM source rendered an empty prompt", retryable=False)
 
-        messages: list[dict[str, str]] = []
+        messages: list[ChatMessage] = []
         if self._system_prompt:
-            messages.append({"role": "system", "content": self._system_prompt})
-        messages.append({"role": "user", "content": rendered.prompt})
+            messages.append(ChatMessage(role="system", content=self._system_prompt))
+        messages.append(ChatMessage(role="user", content=rendered.prompt))
         trace_parent = LLMAuditParent.for_operation(operation_id=operation_id)
         started_at = time.monotonic()
         try:

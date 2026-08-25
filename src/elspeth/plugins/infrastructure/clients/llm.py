@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -16,6 +16,7 @@ import structlog
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import CallPayload, LLMCallError, LLMCallRequest, LLMCallResponse, RawCallPayload
+from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
 from elspeth.contracts.errors import PluginRetryableError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.freeze import deep_freeze
@@ -259,7 +260,7 @@ class AuditedLLMClient(AuditedClientBase):
 
         response = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
         print(response.content)
     """
@@ -356,7 +357,7 @@ class AuditedLLMClient(AuditedClientBase):
     def chat_completion(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
@@ -367,7 +368,9 @@ class AuditedLLMClient(AuditedClientBase):
 
         Args:
             model: Model identifier (e.g., "gpt-4", "gpt-3.5-turbo")
-            messages: List of message dicts with "role" and "content"
+            messages: Ordered chat messages. The SDK sees the wire projection
+                (base64 image data URIs); the audit trail sees the bytes-free
+                projection.
             temperature: Sampling temperature (default: 0.0 for determinism)
             max_tokens: Maximum tokens to generate (optional)
             resolved_prompt_template_hash: Phase 5b Task 9 cross-DB anchor.
@@ -398,7 +401,7 @@ class AuditedLLMClient(AuditedClientBase):
         # DTO stays alive for typed telemetry payload; dict form used for Landscape hashing.
         request_dto = LLMCallRequest(
             model=model,
-            messages=messages,
+            messages=audit_messages(messages),  # bytes-free audit form
             temperature=temperature,
             provider=self._provider,
             max_tokens=max_tokens,
@@ -410,7 +413,7 @@ class AuditedLLMClient(AuditedClientBase):
         # serializing as JSON null (which can trigger provider validation errors)
         sdk_kwargs: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": wire_messages(messages),  # wire form to the SDK only
             "temperature": temperature,
             **kwargs,
         }

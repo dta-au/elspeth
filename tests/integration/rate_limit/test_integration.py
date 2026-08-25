@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from elspeth.contracts import Determinism, TransformResult
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.config.runtime import RuntimeRateLimitConfig
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.plugin_context import PluginContext
@@ -426,7 +427,7 @@ class TestAuditedClientRateLimiting:
             # Make a call
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
             # Verify limiter.acquire() was called
@@ -435,7 +436,7 @@ class TestAuditedClientRateLimiting:
             # Make another call
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "World"}],
+                messages=[ChatMessage(role="user", content="World")],
             )
 
             # Verify acquire called again
@@ -510,7 +511,7 @@ class TestAuditedClientRateLimiting:
         # Make a call - should not raise
         response = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         assert response.content == "Hello!"
