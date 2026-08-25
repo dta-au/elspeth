@@ -173,6 +173,7 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "line_explode": Determinism.DETERMINISTIC,
     "llm": Determinism.NON_DETERMINISTIC,  # manual curation (LLM API boundary)
     "passthrough": Determinism.DETERMINISTIC,
+    "pdf_rasterize": Determinism.IO_READ,
     "rag_retrieval": Determinism.EXTERNAL_CALL,
     "report_assemble": Determinism.DETERMINISTIC,
     "truncate": Determinism.DETERMINISTIC,

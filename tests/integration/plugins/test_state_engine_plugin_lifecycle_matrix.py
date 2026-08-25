@@ -48,6 +48,7 @@ from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransf
 from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle, instantiate_plugins_from_config
 from elspeth.plugins.sinks.database_sink import database_effect_ledger_table
+from tests.fixtures.pdf_documents import minimal_pdf
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 PLUGIN_MATRIX = REPOSITORY_ROOT / "tests/golden/state_engine/plugin_lifecycle_matrix.json"
@@ -141,6 +142,7 @@ def _rows_for(plugin_key: str) -> list[dict[str, object]]:
         "transform:keyword_filter": [{"notes": "public material"}],
         "transform:line_explode": [{"content": "alpha\nbeta"}],
         "transform:passthrough": [{"value": "kept"}],
+        "transform:pdf_rasterize": [{"blob_ref": "filled-by-harness"}],
         "transform:report_assemble": [{"line": "alpha"}, {"line": "beta"}],
         "transform:truncate": [{"notes": "brief"}],
         "transform:type_coerce": [{"price": "2.5", "quantity": "3", "in_stock": "true"}],
@@ -208,6 +210,8 @@ def _materialize_pipeline(
     if kind in {"transform", "sink"}:
         if case.plugin_key == "transform:blob_csv_expand":
             rows[0]["blob_ref"] = store.store(b"ignored\n1,hello\n")
+        if case.plugin_key == "transform:pdf_rasterize":
+            rows[0]["blob_ref"] = store.store(minimal_pdf(1))
         if case.plugin_key in {"transform:blob_fetch", "transform:web_scrape"}:
             served = tmp_path / "served"
             served.mkdir(exist_ok=True)
@@ -388,7 +392,7 @@ def _stop_server(server: multiprocessing.Process | None) -> None:
 
 def test_local_lifecycle_cases_cover_the_exact_reviewed_subject_set() -> None:
     assert tuple(case.plugin_key for case in LOCAL_LIFECYCLE_CASES) == _reviewed_local_subjects()
-    assert len(LOCAL_LIFECYCLE_CASES) == 34
+    assert len(LOCAL_LIFECYCLE_CASES) == 35
     assert {case.profile_case for case in LOCAL_LIFECYCLE_CASES} == {SQLITE_SINGLE_LEADER}
 
 

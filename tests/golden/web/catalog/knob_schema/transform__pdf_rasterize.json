@@ -1,0 +1,175 @@
+{
+  "knob_schema": {
+    "fields": [
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true
+      },
+      {
+        "default": null,
+        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Required Input Fields",
+        "name": "required_input_fields",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": "blob_ref",
+        "description": "Input row field containing the payload-store SHA-256 content hash of the PDF bytes.",
+        "kind": "text",
+        "label": "PDF reference field",
+        "name": "blob_ref_field",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "page_blob_ref",
+        "description": "Output field receiving the payload-store content hash of each rendered PNG page.",
+        "kind": "text",
+        "label": "Page image reference field",
+        "name": "page_blob_ref_field",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "page_number",
+        "description": "Output field receiving the 1-based page number.",
+        "kind": "text",
+        "label": "Page number field",
+        "name": "page_number_field",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "document_id",
+        "description": "Output field receiving the source PDF's payload-store content hash, identical on every page row.",
+        "kind": "text",
+        "label": "Document id field",
+        "name": "document_id_field",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "page_mime_type",
+        "description": "Output field receiving the page image MIME type (always image/png).",
+        "kind": "text",
+        "label": "Page MIME type field",
+        "name": "page_mime_type_field",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "page_size_bytes",
+        "description": "Output field receiving the encoded PNG byte length.",
+        "kind": "text",
+        "label": "Page size field",
+        "name": "page_size_bytes_field",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "page_width_px",
+        "description": "Output field receiving the rendered page width in pixels.",
+        "kind": "text",
+        "label": "Page width field",
+        "name": "page_width_field",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "page_height_px",
+        "description": "Output field receiving the rendered page height in pixels.",
+        "kind": "text",
+        "label": "Page height field",
+        "name": "page_height_field",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 150,
+        "description": "Raster resolution; 150 keeps a Letter/A4 page comfortably under the 5 MiB per-page bound.",
+        "kind": "number-int",
+        "label": "Render DPI",
+        "name": "dpi",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 52428800,
+        "description": "Maximum accepted size of the source PDF retrieved from the payload store.",
+        "kind": "number-int",
+        "label": "Maximum input bytes",
+        "name": "max_input_bytes",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 200,
+        "description": "Refuse the whole document (too_many_rows) when its page count exceeds this ceiling.",
+        "kind": "number-int",
+        "label": "Maximum pages",
+        "name": "max_pages",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 25000000,
+        "description": "Refuse a page whose declared size at the configured dpi exceeds this many pixels, before any bitmap is allocated.",
+        "kind": "number-int",
+        "label": "Maximum page pixels",
+        "name": "max_page_pixels",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 5242880,
+        "description": "Maximum encoded PNG bytes per page; may be reduced but never raised above the 5 MiB downstream provider bound.",
+        "kind": "number-int",
+        "label": "Maximum page bytes",
+        "name": "max_page_bytes",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 120,
+        "description": "Wall-clock and CPU budget for rendering one document in the worker subprocess.",
+        "kind": "number-int",
+        "label": "Render timeout seconds",
+        "name": "render_timeout_seconds",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 2147483648,
+        "description": "RLIMIT_AS applied to the render worker subprocess.",
+        "kind": "number-int",
+        "label": "Worker memory limit bytes",
+        "name": "worker_memory_limit_bytes",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "fail_document",
+        "description": "fail_document: any refused page fails the whole row (typed error routed via on_error). emit_rendered: emit the pages that rendered and record the refused page numbers in the success metadata; zero survivors is still a row error.",
+        "enum": [
+          "fail_document",
+          "emit_rendered"
+        ],
+        "kind": "enum",
+        "label": "Page failure policy",
+        "name": "on_page_failure",
+        "nullable": false,
+        "required": false
+      }
+    ]
+  },
+  "plugin_kind": "transform",
+  "plugin_name": "pdf_rasterize"
+}
