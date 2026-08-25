@@ -323,6 +323,7 @@ def build_execution_graph(
             config=source_node_config,
             output_schema=source_instance.output_schema,  # SourceProtocol requires this
             output_schema_config=source_schema_config,
+            observed_value_type=source_instance.observed_value_type,
         )
 
     # Add sinks
@@ -422,6 +423,7 @@ def build_execution_graph(
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
             removed_input_fields=transform.removed_input_fields,
+            preserves_input_values=transform.preserves_input_values,
         )
 
     graph.set_transform_id_map(transform_ids_by_seq)

@@ -197,6 +197,13 @@ class SourceProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # Set from the source's effective SchemaConfig guarantees at construction.
     declared_guaranteed_fields: frozenset[str]
 
+    # Structural observed-cell type (elspeth-e6e552ce34). Non-None means every
+    # cell this source emits under an OBSERVED schema has this SchemaConfig
+    # base type by construction of the parsed format (csv: "str"). Sources
+    # whose observed values carry format-native types (json, database) stay
+    # None. Consumed by resolve_guaranteed_field_type's structural source arm.
+    observed_value_type: str | None
+
     # Plugin-computed output contract, recorded by
     # BaseSource._initialize_declared_guaranteed_fields(). The DAG builder
     # prefers this over re-parsing raw options so source-specific schema
@@ -408,6 +415,15 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # about WHICH rows are emitted. Read only by walk_definite_emitted_fields.
     forwards_input_fields: bool
     removed_input_fields: frozenset[str]
+
+    # Value-preservation declaration (elspeth-e6e552ce34). The presence flags
+    # above say which fields survive; this one says the plugin never CHANGES a
+    # surviving field's value (adding new fields is fine). When True, the
+    # build-time type-resolution walk (resolve_guaranteed_field_type) may
+    # recurse through this transform even when its schema config declares no
+    # fields, instead of abstaining. Rewriting declarers (type_coerce,
+    # value_transform, truncate) must keep this False.
+    preserves_input_values: bool
 
     # ADR-012 empty-emission governance declaration.
     # True means the transform may intentionally emit zero rows on success.

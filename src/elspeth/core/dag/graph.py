@@ -161,6 +161,8 @@ class ExecutionGraph:
         passes_through_input: bool = False,
         forwards_input_fields: bool = False,
         removed_input_fields: frozenset[str] = frozenset(),
+        preserves_input_values: bool = False,
+        observed_value_type: str | None = None,
     ) -> None:
         """Add a node to the execution graph.
 
@@ -221,6 +223,18 @@ class ExecutionGraph:
                 that the `schema:` block never carries.
             removed_input_fields: The names forwards_input_fields subtracts.
                 Meaningless without that flag; NodeInfo guards the pairing.
+            preserves_input_values: For TRANSFORM nodes only — True iff
+                process() never changes the VALUE of a field present on the
+                input row (adding new fields is fine). Lets
+                resolve_guaranteed_field_type recurse through an undeclaring
+                pass-through instead of abstaining (elspeth-e6e552ce34).
+                NodeInfo guards against misuse.
+            observed_value_type: For SOURCE nodes only — the structural
+                SchemaConfig base type of every cell the source emits under an
+                OBSERVED schema (csv: "str"), or None when no such structural
+                fact holds. Consumed by resolve_guaranteed_field_type's
+                structural source arm (elspeth-e6e552ce34). NodeInfo guards
+                against misuse.
         """
         self._assert_build_metadata_mutable()
         resolved_config = config or {}
@@ -257,6 +271,8 @@ class ExecutionGraph:
             declared_output_fields=declared_output_fields,
             declared_input_fields=declared_input_fields,
             declared_string_input_fields=declared_string_input_fields,
+            preserves_input_values=preserves_input_values,
+            observed_value_type=observed_value_type,
             passes_through_input=passes_through_input,
             forwards_input_fields=forwards_input_fields,
             removed_input_fields=removed_input_fields,

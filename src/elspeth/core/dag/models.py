@@ -279,6 +279,26 @@ class NodeInfo:
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = field(default_factory=frozenset)
 
+    # Value-preservation declaration (elspeth-e6e552ce34). Populated only for
+    # TRANSFORM nodes by the builder from
+    # TransformProtocol.preserves_input_values. True means process() never
+    # changes the VALUE of a field present on the input row (adding NEW fields
+    # is fine) — the promise that lets resolve_guaranteed_field_type recurse
+    # through an undeclaring pass-through instead of abstaining. Deliberately
+    # NOT threaded for AGGREGATION/COLLECTOR nodes: the type-resolution walk's
+    # pass-through arm is TRANSFORM-scoped, so the fact would have no reader
+    # there (same scope argument as declared_output_fields).
+    preserves_input_values: bool = False
+
+    # Structural observed-cell type (elspeth-e6e552ce34). Populated only for
+    # SOURCE nodes by the builder from SourceProtocol.observed_value_type.
+    # Non-None means: under an OBSERVED schema this source emits every cell as
+    # this SchemaConfig base type by construction (csv: "str" — parsed cells
+    # are never coerced when no fields are declared). Consumed by
+    # resolve_guaranteed_field_type's structural source arm, which answers the
+    # type only for fields in the source's own guaranteed set.
+    observed_value_type: str | None = None
+
     def __post_init__(self) -> None:
         component_type = self.node_type.name.lower()
         component_id = self.node_id or None
@@ -381,6 +401,29 @@ class NodeInfo:
             raise GraphValidationError(
                 f"NodeInfo.passes_through_input is only meaningful for TRANSFORM, "
                 f"AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: preserves_input_values mirrors the
+        # declared_output_fields guard above and is TRANSFORM-only for the
+        # same reason — its only consumer, resolve_guaranteed_field_type's
+        # pass-through recursion arm, is scoped to TRANSFORM nodes
+        # (elspeth-e6e552ce34).
+        if self.preserves_input_values and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.preserves_input_values is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: observed_value_type is the structural
+        # observed-cell type of a SOURCE plugin; any other node type carrying
+        # it indicates misrouted attribute threading (elspeth-e6e552ce34).
+        if self.observed_value_type is not None and self.node_type != NodeType.SOURCE:
+            raise GraphValidationError(
+                f"NodeInfo.observed_value_type is only meaningful for SOURCE nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with observed_value_type={self.observed_value_type!r}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )

@@ -458,6 +458,33 @@ class BaseTransform(ABC):
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
 
+    # Value-preservation declaration (elspeth-e6e552ce34).
+    #
+    # `passes_through_input` and `forwards_input_fields` are PRESENCE
+    # contracts: they promise which fields survive, and say nothing about
+    # whether the plugin rewrote a surviving field's VALUE in place
+    # (type_coerce and value_transform both declare passes_through_input=True
+    # while doing exactly that). This flag carries the value half:
+    #
+    # True means process() NEVER changes the value of any field present on the
+    # input row — it may only ADD new fields (and, for row-filtering
+    # declarers, drop whole rows). Under that promise the build-time
+    # type-resolution walk (resolve_guaranteed_field_type,
+    # core/dag/guarantees.py) may recurse through this transform even when its
+    # schema config declares no fields (observed mode), instead of abstaining.
+    # That recursion is what lets a provably-wrong downstream type declaration
+    # fail at build rather than killing every row at the consumer's input
+    # preflight.
+    #
+    # Declare True only after checking process() end to end: any in-place
+    # mutation, coercion, truncation, or normalization of an input field's
+    # value makes True a LIE that manufactures false build-time rejections
+    # (and false acceptances) for downstream declarations. Fail-closed
+    # default: False costs only abstention — the historical per-row verdict.
+    # Truth-tested by the value-preservation probe in
+    # tests/invariants/test_pass_through_invariants.py for hostable declarers.
+    preserves_input_values: bool = False
+
     # Empty-emission governance declaration (ADR-012).
     # True means the transform may intentionally emit zero rows on success.
     # False means empty success output is governance-significant for
@@ -2085,6 +2112,22 @@ class BaseSource(ABC):
     discovery_secret_requirements: Mapping[str, tuple[str, ...]] = {}
     """Credential-bearing config fields that must have a configured secret ref
     before composer discovery advertises the plugin. See BaseTransform."""
+
+    # Structural observed-cell type (elspeth-e6e552ce34).
+    #
+    # Non-None means: under an OBSERVED schema (no declared fields, so no
+    # coercion targets) every cell this source emits has this SchemaConfig
+    # base type BY CONSTRUCTION of the format it parses. csv declares "str" —
+    # csv.reader yields strings and observed schemas preserve parsed cells
+    # untouched (see csv_source.py module docstring). Sources whose observed
+    # values carry format-native types (json, database rows) must stay None:
+    # the fact must hold for EVERY field on EVERY row, or build-time
+    # rejections built on it are unsound. Consumed by
+    # resolve_guaranteed_field_type's structural source arm, which answers
+    # only for fields in the source's own guaranteed set. Declared-fields
+    # modes (fixed/flexible) are unaffected — a declared field's type comes
+    # from the declaration, and sources coerce into it at ingest.
+    observed_value_type: ClassVar[str | None] = None
 
     # Config model — each subclass sets this to its Pydantic config class.
     # NullSource sets this to None (no config validation needed).
