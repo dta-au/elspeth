@@ -698,3 +698,166 @@ test.describe("tutorial reliability battery", () => {
     });
   }
 });
+
+// ── Collector-authoring scenario (WS6 guard lift; ADR-031 amendment 2026-08-25) ──
+//
+// NOT the tutorial: the tutorial's frozen prompt and script are UNTOUCHED
+// (Q8-1 ruling — amending them would reset the red-attribution baseline during
+// the riskiest window). This scenario drives an ORDINARY guided session with a
+// fixed collector-authoring prompt through the same backend, so the battery
+// covers the collector variant of the guided surface that the frozen tutorial
+// cannot exercise. Same doctrine as the tutorial walk: fixed input, no
+// improvisation — a red here is a machinery investigation.
+//
+// !! PENDING CALIBRATION — DO NOT GRADE YET !! The baseline of record is
+// tool-call counts + repair rounds per scenario, and those numbers do not
+// exist until John fires a calibration round (the battery is manual-fire ONLY;
+// never overlap rounds). Until COLLECTOR_BASELINE carries calibrated values
+// this scenario records observations into its RunRecord and asserts nothing
+// beyond completion. ADR-031 reconsideration triggers (2026-08-25 amendment):
+//   T1: any battery round where the collector scenario needs a repair round on
+//       the collector/scope step or exceeds its calibrated call count =
+//       suspected machinery defect; two consecutive → escalate to a standing
+//       live canary.
+//   T2: any collector-authoring defect found by a human/staging/downstream
+//       layer that the mocked spec or battery should have caught = immediate
+//       reconsideration, no threshold.
+//   T3: guided-authoring-path changes (planner skills, projection, guided
+//       backend) accumulating without a collector-covering battery round in
+//       the same slice = the cited control is inert; fire a round before the
+//       next guided-surface merge or upgrade.
+//
+// !! UNVERIFIED (operator-env blocked) !! Like driveGuidedWalk above, this
+// driver needs a live LLM-backed staging deploy. Named residuals for the
+// calibration round: the ordinary-session entry affordance (this driver
+// assumes goto "/" lands on a fresh guided-mode session once first-run is
+// consumed), and any schema_form stages the pump cannot fill.
+
+const COLLECTOR_SCENARIO_PROMPT =
+  "Read this synthetic multi-document JSON file, split each document into one " +
+  "row per section, have an LLM write a one-sentence gist of each section, " +
+  "then gather each document's section rows back together into a single " +
+  "batch per document (every section must make it back — fail the document " +
+  "if one is lost) and write one summary row per document to a JSON file.\n" +
+  "https://dta-au.github.io/elspeth/tutorial-site/multi-doc-sections.json";
+
+const COLLECTOR_BASELINE: {
+  max_provider_calls: number | null;
+  max_repair_turns: number | null;
+} = {
+  // PENDING CALIBRATION (Q8-1): filled from John's calibration round, never
+  // guessed. While null, the scenario records and does not grade.
+  max_provider_calls: null,
+  max_repair_turns: null,
+};
+
+async function driveCollectorScenarioWalk(page: Page): Promise<void> {
+  const runbookDeadline = Date.now() + 900_000;
+  const stepChat = page.getByRole("region", { name: "Describe what you want" });
+  const stepChatInput = stepChat.getByLabel("Message input");
+  const stepChatSend = stepChat.getByRole("button", { name: "Send message" });
+  const completion = page.getByRole("region", { name: /pipeline summary/i });
+  const drivenPhases = new Set(["Source", "Output", "Transforms"]);
+  const reviewWiring = page.getByRole("button", { name: "Review wiring", exact: true });
+  const primaries = [
+    page.getByRole("button", { name: "Confirm wiring", exact: true }),
+    reviewWiring,
+    page.getByRole("button", { name: "Continue", exact: true }),
+    page.getByRole("button", { name: "Looks right", exact: true }),
+    page.getByRole("button", { name: "Finish sources", exact: true }),
+    page.getByRole("button", { name: "Finish outputs", exact: true }),
+    page.getByRole("button", { name: "Let source decide (pass all fields through)", exact: true }),
+  ];
+  async function currentPhase(): Promise<string | null> {
+    const label = page.locator(".guided-workflow-step--current .guided-workflow-label").first();
+    const text = await label.textContent().catch(() => null);
+    return text ? text.trim() : null;
+  }
+  let lastDrivenPhase: string | null = null;
+  while (Date.now() < runbookDeadline) {
+    if (await completion.isVisible().catch(() => false)) return;
+    await resolveVisibleReviews(page);
+    let advanced = false;
+    for (const primary of primaries) {
+      // Send-first guard (same defect class as the tutorial walk's run-18
+      // fallback proposal): never accept a transforms proposal before the
+      // collector prompt has been sent this walk.
+      if (primary === reviewWiring && lastDrivenPhase !== "Transforms") continue;
+      if (
+        (await primary.count().catch(() => 0)) > 0 &&
+        (await primary.isEnabled().catch(() => false))
+      ) {
+        await primary.click().catch(() => {});
+        advanced = true;
+        break;
+      }
+    }
+    if (advanced) {
+      await page.waitForTimeout(750);
+      continue;
+    }
+    const phase = await currentPhase();
+    const canSend = await stepChatSend.isEnabled().catch(() => false);
+    if (canSend && phase !== null && drivenPhases.has(phase) && phase !== lastDrivenPhase) {
+      // Ordinary guided mode has no prelocked prompt: type the fixed scenario
+      // prompt, then Send — one drive per phase, like the tutorial walk.
+      await stepChatInput.fill(COLLECTOR_SCENARIO_PROMPT).catch(() => {});
+      await stepChatSend.click().catch(() => {});
+      lastDrivenPhase = phase;
+      await page.waitForTimeout(2_000);
+      continue;
+    }
+    await page.waitForTimeout(1_000);
+  }
+  throw new Error("collector scenario walk never reached completion before the deadline");
+}
+
+test.describe("collector-authoring scenario (ordinary guided surface)", () => {
+  // Manual-fire opt-in on top of the battery's own manual-fire status, so a
+  // tutorial round never silently spends provider budget on this scenario and
+  // the two are never graded as one population.
+  test.skip(
+    process.env.HARNESS_COLLECTOR !== "1",
+    "PENDING CALIBRATION (Q8-1): John fires the calibration round manually (HARNESS_COLLECTOR=1); baselines are recorded, not guessed.",
+  );
+
+  test("collector scenario run", async ({ page }) => {
+    let sessionId: string | null = null;
+    page.on("response", (resp) => {
+      const m = resp.url().match(/\/api\/sessions\/([0-9a-f-]{36})\//i);
+      if (m && !sessionId) sessionId = m[1];
+    });
+
+    await page.goto("/");
+    await expect(page.getByLabel(/guided composer/i)).toBeVisible({ timeout: 60_000 });
+    await driveCollectorScenarioWalk(page);
+
+    const ctx = await harnessCtx();
+    const audit = sessionId === null ? null : await fetchPlannerAuditEvidence(ctx, sessionId).catch(() => null);
+    const efficiency = audit === null
+      ? unavailablePlannerEfficiency("planner audit evidence unavailable")
+      : classifyPlannerEfficiency(audit, true);
+    const record = {
+      scenario: "collector-authoring",
+      prompt: COLLECTOR_SCENARIO_PROMPT,
+      session_id: sessionId,
+      efficiency,
+      baseline: COLLECTOR_BASELINE,
+      calibrated: COLLECTOR_BASELINE.max_provider_calls !== null,
+    };
+    const dir = `tests/e2e/.harness-results/${BATCH_ID}`;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(`${dir}/collector-run.json`, JSON.stringify(record, null, 2));
+    await ctx.dispose();
+
+    // Grade ONLY once calibrated (T1 lives here): a repair round on the
+    // collector/scope step or a call count above baseline is a suspected
+    // machinery defect, not model variance (ADR-031 §4).
+    if (COLLECTOR_BASELINE.max_provider_calls !== null && efficiency.provider_calls !== null) {
+      expect(efficiency.provider_calls).toBeLessThanOrEqual(COLLECTOR_BASELINE.max_provider_calls);
+    }
+    if (COLLECTOR_BASELINE.max_repair_turns !== null && efficiency.repair_turns !== null) {
+      expect(efficiency.repair_turns).toBeLessThanOrEqual(COLLECTOR_BASELINE.max_repair_turns);
+    }
+  });
+});
