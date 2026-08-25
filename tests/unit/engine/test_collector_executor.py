@@ -300,13 +300,16 @@ class _CollectorEnv:
         wrapped.transform = transform  # type: ignore[attr-defined]  # test-only convenience handle
         return wrapped
 
-    def blocked_item_for(self, member: TokenInfo, *, collector_name: str) -> TokenWorkItem:
+    def blocked_item_for(self, member: TokenInfo, *, collector_name: str, group_id: str | None = None) -> TokenWorkItem:
         """Build a BLOCKED journal row for `member` as list_blocked_barrier_items
         would return it (Task 7) — mirrors test_coalesce_executor.py's
         `_blocked_item` precedent, collector-shaped: barrier_key is the
         COMPOUND collector:<name>:<group_id> form (spec §4.3), not a bare
         name, and lineage_path carries member's real innermost EXPAND frame
         (never synthesised) since restore's I-6 cross-check depends on it.
+        ``group_id`` names the member's OWN group when its innermost frame is
+        a collector release-group frame (META-38: the real writer keys the
+        barrier through the guarded walk, not ``[-1]``).
         """
         frame = member.lineage_path[-1]
         return TokenWorkItem(
@@ -323,7 +326,7 @@ class _CollectorEnv:
             available_at=_JOURNAL_T0,
             created_at=_JOURNAL_T0,
             updated_at=_JOURNAL_T0,
-            barrier_key=collector_barrier_key(collector_name, frame.group_id),
+            barrier_key=collector_barrier_key(collector_name, group_id if group_id is not None else frame.group_id),
             lineage_path=member.lineage_path,
             collector_name=collector_name,
             barrier_blocked_at=_JOURNAL_T0,
@@ -1556,3 +1559,58 @@ class TestSurvivorHoldCarriesCauseAndDispositionMeta40:
                 "lost_members": [lost_key],
                 "member_disposition": GroupSettlementReason.SCOPE_GROUP_FAILED.value,
             }
+
+
+class TestCollectorInCollectorReleaseRestoresUnderTheOuterGroupMeta38:
+    """META-38 site 10 (journal restore, the reviewer's revert probe): a
+    collector-in-collector release BLOCKED at the OUTER collector when the
+    process dies must restore under the OUTER group — its own release-group
+    frame is innermost on the journal row's lineage — so the outer roster
+    fills and closes on the fresh process. Keyed on ``[-1]`` the restorer
+    parked it under the release group: a silent post-crash wedge."""
+
+    def test_release_blocked_at_the_outer_collector_restores_under_the_outer_group(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        outer_members, outer_group_id = env.seed_group(count=2)
+        page_a, page_b = outer_members
+        # Page B's inner scope closes at an inner collector and releases ONE
+        # token back into the outer group's membership (page B's member key).
+        inner_children, inner_group_id = env.factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=page_b.token_id, run_id=env.run_id),
+            row_id=page_b.row_id,
+            child_payloads=[{"s": 0}],
+            output_contract=env.contract,
+        )
+        committed = env.factory.data_flow.collect_tokens(
+            member_refs=[TokenRef(token_id=inner_children[0].token_id, run_id=env.run_id)],
+            group_id=inner_group_id,
+            collector_node_id="collector-inner",
+            output_payloads=[{"item": "assembled"}],
+            output_contracts=[env.contract],
+        )
+        [release] = committed.children
+        lineage = env.factory.data_flow.load_lineage_paths(env.run_id, [release.token_id])[release.token_id]
+        release_token = TokenInfo(row_id=page_b.row_id, token_id=release.token_id, row_data=page_b.row_data, lineage_path=lineage)
+        assert lineage[-1].group_id == committed.release_group_id  # the release frame IS innermost
+
+        # Live arrival before the crash: held (roster 2, one arrived), OPEN hold journaled.
+        assert env.executor.accept(release_token, "stitch").held is True
+        item = env.blocked_item_for(release_token, collector_name="stitch", group_id=outer_group_id)
+        state_ids = env.state_ids_for([item])
+        assert state_ids, "the live accept must have left an OPEN hold to restore"
+
+        fresh = env.fresh_executor()
+        fresh.restore_from_journal(
+            items=[item], state_ids=state_ids, attempt_offsets={release_token.token_id: 0}, resume_checkpoint_id="ckpt-1"
+        )
+
+        pending_keys = list(fresh._executor._pending)  # test-only peek at the rebuilt roster
+        assert pending_keys == [("stitch", outer_group_id)], pending_keys
+        assert ("stitch", committed.release_group_id) not in pending_keys
+        assert set(fresh._executor._pending[("stitch", outer_group_id)].arrived) == {lineage[0].member_key}
+
+        # The outer roster then fills and closes on the fresh process.
+        outcome = fresh.accept(page_a, "stitch", ctx=env.ctx)
+        assert outcome.held is False
+        assert outcome.group_id == outer_group_id
+        assert {t.token_id for t in outcome.consumed_tokens} == {page_a.token_id, release_token.token_id}

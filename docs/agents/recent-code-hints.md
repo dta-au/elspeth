@@ -199,6 +199,22 @@ is a working document under the normal delivery posture.
   a reason string feeds `compute_error_hash`, so the corpus's frozen
   `error_hash` and `projection_sha256` move even when every count is
   unchanged. 532f037fe shipped green on a 13-suite selection that excluded it.
+  META-41 (2026-08-25, same authority): SEVEN `fork-coalesce-policies` movers
+  re-frozen for META-40 — five cases' `projection_sha256` re-pinned in the
+  manifest (`member_disposition` appears in the coalesce failure /
+  late-arrival hold payloads: first-nested, first-select, first-union,
+  require-all-lost-c, quorum-impossible-lost-c), PLUS the two frozen oracle
+  snapshots (require-all-lost-c, quorum-impossible-lost-c) re-frozen: one
+  survivor terminal per case moved from the seam-written executor cause
+  (`branch_lost:path_c` / `quorum_impossible:need=3,max_possible=2`) to
+  `scope_group_failed`. Each lost-c case has TWO failure survivors — the
+  late-arrival one was already `scope_group_failed` since META-39, but the
+  seam-settled one still carried the cause until META-40; an earlier claim
+  that "the snapshots did not move" reasoned only from the late-arrival arm
+  and was disproved from a clean export. Those snapshots are the corpus's
+  ONLY pin on the seam's terminal vocabulary (the semantic projection
+  excludes terminal `error_hash`), so reverting the META-40 seam write
+  fails exactly them and nothing else in the family.
 
 - **2026-08-23 — a NEW corpus case fails the WS1 frozen-oracle gate closed, and
   the fix is a scoped write, never a full regenerate.** `tests/integration/core/

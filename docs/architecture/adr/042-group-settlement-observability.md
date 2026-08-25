@@ -163,6 +163,16 @@ continuation's path alone. Pass-through closers (row_union, `pop_fork_frame`)
 are unchanged: they release the ORIGINAL tokens and preserve every other
 frame, release frames included.
 
+**Survivor-hold payload shape differs by closer kind (META-40/41).** A
+collector survivor's hold nests the group-failure cause under the
+`ExecutionError` context (`error.context` carries `failure_reason`,
+`lost_members`, `member_disposition`), while a coalesce survivor's hold
+carries `member_disposition` top-level in the `CoalesceFailureReason`
+payload beside `failure_reason` — a legitimate DTO difference between the
+two executors' hold records, not drift to reconcile. Readers must not fail
+open on a missing top-level `error["member_disposition"]` for collector
+survivors; read each hold via the documented shape for its closer kind.
+
 ### 4. Resume protection (cross-reference)
 
 The same three tables feed the fail-closed group-satisfiability resume gate
