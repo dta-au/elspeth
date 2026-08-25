@@ -86,6 +86,11 @@ class _RecorderDouble:
         self.coalesce_tokens = _CallRecorder()
         self.create_token = _CallRecorder()
 
+    def is_release_group(self, *, run_id: str, group_id: str) -> bool:
+        """META-38 written-fact read: the crafted FORK frames here are
+        ordinary fork groups, never collector releases."""
+        return False
+
 
 def _make_recorder() -> _RecorderDouble:
     """Create an ExecutionRepository double."""

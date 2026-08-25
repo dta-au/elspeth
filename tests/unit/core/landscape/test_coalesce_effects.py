@@ -23,6 +23,7 @@ from elspeth.core.landscape.schema import (
     token_parents_table,
     tokens_table,
 )
+from tests.fixtures.group_lineage import ensure_fork_group_record
 from tests.fixtures.landscape import make_recorder_with_run, register_test_node
 
 _RUN_ID = "run-1"
@@ -59,6 +60,9 @@ def _setup():
         )
         for branch in ("a", "b")
     ]
+    # META-38: the crafted group gets the group_records row a real fork mints
+    # (coalesce_tokens reads the written release fact for the frame it closes).
+    ensure_fork_group_record(setup.factory, run_id=setup.run_id, group_id="coalesce-effects-fork-grp", opener_token_id=parents[0].token_id)
     refs = tuple(TokenRef(token_id=token.token_id, run_id=setup.run_id) for token in parents)
     completions: list[CoalesceParentCompletion] = []
     for ordinal, ref in enumerate(refs):
@@ -103,6 +107,7 @@ def _setup_sibling_group(setup, row, *, group_id: str, branches: tuple[str, str]
         )
         for branch in branches
     ]
+    ensure_fork_group_record(setup.factory, run_id=setup.run_id, group_id=group_id, opener_token_id=parents[0].token_id)
     refs = tuple(TokenRef(token_id=token.token_id, run_id=setup.run_id) for token in parents)
     completions: list[CoalesceParentCompletion] = []
     for ordinal, ref in enumerate(refs):
@@ -406,6 +411,7 @@ def test_nested_fork_effect_records_the_closing_group_not_the_enclosing_one() ->
         )
         for branch in ("inner-a", "inner-b")
     ]
+    ensure_fork_group_record(setup.factory, run_id=setup.run_id, group_id="g-inner", opener_token_id=parents[0].token_id)
     refs = tuple(TokenRef(token_id=token.token_id, run_id=setup.run_id) for token in parents)
     completions = []
     for ordinal, ref in enumerate(refs):

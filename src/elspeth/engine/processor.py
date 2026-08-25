@@ -35,7 +35,7 @@ from elspeth.contracts.audit_evidence import AuditEvidenceBase
 from elspeth.contracts.barrier_scalars import BarrierScalars, CoalescePendingScalars
 from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS
 from elspeth.contracts.freeze import deep_freeze
-from elspeth.contracts.identity import LineageFrame, pop_closer_frame
+from elspeth.contracts.identity import LineageFrame, innermost_own_frame, truncate_at_closer_frame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName, SinkName, StepResolver
 from elspeth.engine._best_effort import best_effort
@@ -3282,12 +3282,21 @@ class RowProcessor:
         """
         if collector_name is None or current_node_id != self._collector_node_for_cursor(collector_name):
             return False, None
-        frame = current_token.lineage_path[-1] if current_token.lineage_path else None
+        # META-38 amendment 1: the member's OWN group frame via the guarded
+        # walk — a collector-in-collector release carries its release-group
+        # frame above the outer group's frame; keying the barrier on [-1]
+        # would hold it under the release group and the outer roster would
+        # never fill.
+        own = innermost_own_frame(
+            current_token.lineage_path, is_release_group=lambda gid: self._token_manager.is_release_group(self._run_id, gid)
+        )
+        frame = None if own is None else own[1]
         if frame is None or frame.kind is not FrameKind.EXPAND:
             raise OrchestrationInvariantError(
                 f"Token {current_token.token_id!r} arrived at collector {collector_name!r} (node {current_node_id!r}) "
-                f"without an innermost EXPAND frame (lineage_path={current_token.lineage_path!r}); a collector "
-                "member's innermost frame is always its own group's (spec §7 rule 5)."
+                f"without an innermost EXPAND frame (lineage_path={current_token.lineage_path!r}, searched below "
+                "collector release-group frames); a collector member's innermost non-release frame is always its "
+                "own group's (spec §7 rule 5)."
             )
         if self._collector_executor is None:
             logger.debug(
@@ -3612,6 +3621,7 @@ class RowProcessor:
         self,
         consumed_tokens: tuple[TokenInfo, ...],
         *,
+        group_id: str,
         failure_reason: str,
         child_items: list[WorkItem],
         group_failed: bool,
@@ -3676,7 +3686,7 @@ class RowProcessor:
         itself closes; bound-region SESE nesting guarantees it, the token
         could not have arrived here otherwise), pop EVERY consumed token
         against that SAME shared id (never each token's own observed
-        group_id, which would make `pop_closer_frame`'s group check
+        group_id, which would make `truncate_at_closer_frame`'s group check
         unfalsifiable), and collapse the results into a set: more than one
         distinct remaining path means the siblings disagree about their
         enclosing frame, which is lineage corruption, not a config shape —
@@ -3700,15 +3710,31 @@ class RowProcessor:
         """
         if not consumed_tokens:
             return []
-        anchor = consumed_tokens[0].lineage_path
-        if not anchor or anchor[-1].kind is not frame_kind:
+
+        # META-38: the closer's own group id is the CALLER's fact (every
+        # caller holds it — the collector outcome's group_id, the arriving
+        # token's FORK frame, the replayed loss's group_id), never re-derived
+        # from a consumed token's innermost frame: a consumed member that is
+        # itself a collector release carries its own release-group EXPAND
+        # frame above the frame this closer closes. Every token is truncated
+        # PER TOKEN through release-group frames only (the written
+        # closes_group_id fact, memoised on the token manager) before the
+        # shared-path agreement check; the innermost-frame case never reads.
+        first = consumed_tokens[0]
+        if not any(frame.kind is frame_kind and frame.group_id == group_id for frame in first.lineage_path):
             raise OrchestrationInvariantError(
-                f"_record_group_member_terminals: consumed token {consumed_tokens[0].token_id!r} has no "
-                f"innermost {frame_kind.name} frame to pop (lineage_path={anchor!r})"
+                f"_record_group_member_terminals: consumed token {first.token_id!r} has no innermost {frame_kind.name} "
+                f"frame to close for group {group_id!r} (searched below collector release-group frames; "
+                f"lineage_path={first.lineage_path!r})"
             )
-        shared_group_id = anchor[-1].group_id
+        shared_group_id = group_id
+
+        def is_release_group(candidate_group_id: str) -> bool:
+            return self._token_manager.is_release_group(self._run_id, candidate_group_id)
+
         remaining_paths = {
-            pop_closer_frame(consumed.lineage_path, kind=frame_kind, group_id=shared_group_id) for consumed in consumed_tokens
+            truncate_at_closer_frame(consumed.lineage_path, kind=frame_kind, group_id=shared_group_id, is_release_group=is_release_group)
+            for consumed in consumed_tokens
         }
         if len(remaining_paths) != 1:
             raise OrchestrationInvariantError(
@@ -3735,6 +3761,7 @@ class RowProcessor:
         self,
         consumed_tokens: tuple[TokenInfo, ...],
         *,
+        group_id: str,
         failure_reason: str,
         child_items: list[WorkItem],
         group_failed: bool,
@@ -3750,6 +3777,7 @@ class RowProcessor:
         """
         return self._record_group_member_terminals(
             consumed_tokens,
+            group_id=group_id,
             failure_reason=failure_reason,
             child_items=child_items,
             group_failed=group_failed,
@@ -3989,6 +4017,7 @@ class RowProcessor:
             # lineage for an enclosing bound frame (escalation).
             cascaded_results = self._record_group_member_terminals(
                 tuple(outcome.consumed_tokens),
+                group_id=frame.group_id,
                 failure_reason=outcome.failure_reason,
                 child_items=child_items,
                 group_failed=True,

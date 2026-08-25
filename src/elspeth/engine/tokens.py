@@ -17,7 +17,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.identity import LineageFrame, pop_closer_frame
+from elspeth.contracts.identity import LineageFrame, innermost_own_frame, truncate_at_closer_frame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
@@ -383,17 +383,36 @@ class TokenManager:
 
         step = self._step_resolver(node_id)
 
-        # Strict pop (rulings 24/28) via contracts.identity.pop_closer_frame: a
-        # closer pops exactly its own innermost FORK frame; §7 rule 5 (WS2)
-        # makes any other shape unbuildable, so a violation here is an
-        # engine/validation bug, not a config shape.
-        anchor = parents[0].lineage_path
-        if not anchor or anchor[-1].kind is not FrameKind.FORK:
+        # Guarded truncation (rulings 24/28 as amended by META-38) via
+        # contracts.identity.truncate_at_closer_frame: a closer closes
+        # exactly its own FORK frame — the anchor is the first parent's
+        # innermost FORK frame, which a collector release inside the branch
+        # carries BELOW its own release-group EXPAND frame. Truncation runs
+        # PER PARENT, passing only release-group frames (the written
+        # group_records.closes_group_id fact, memoised on this manager); any
+        # other frame above the FORK frame raises. The cross-parent
+        # remaining-path equality check is load-bearing: it is what catches
+        # parents that disagree about their enclosing scope after each has
+        # been truncated independently.
+        # Anchor (amendment 1 B): the first parent's OWN frame via the guarded
+        # walk — never innermost_fork_frame, which would skip an unreleased
+        # scope's EXPAND frame, exactly the shape the guard must reject.
+        own = innermost_own_frame(parents[0].lineage_path, is_release_group=lambda gid: self.is_release_group(run_id, gid))
+        if own is None or own[1].kind is not FrameKind.FORK:
             raise OrchestrationInvariantError(
-                f"coalesce_tokens: parent token {parents[0].token_id!r} has no innermost FORK frame to pop (lineage_path={anchor!r})"
+                f"coalesce_tokens: parent token {parents[0].token_id!r} has no innermost FORK frame to close "
+                f"(searched below collector release-group frames; lineage_path={parents[0].lineage_path!r})"
             )
-        shared_group_id = anchor[-1].group_id
-        remaining_paths = {pop_closer_frame(parent.lineage_path, kind=FrameKind.FORK, group_id=shared_group_id) for parent in parents}
+        shared_group_id = own[1].group_id
+        remaining_paths = {
+            truncate_at_closer_frame(
+                parent.lineage_path,
+                kind=FrameKind.FORK,
+                group_id=shared_group_id,
+                is_release_group=lambda gid: self.is_release_group(run_id, gid),
+            )
+            for parent in parents
+        }
         if len(remaining_paths) != 1:
             raise OrchestrationInvariantError("coalesce_tokens: parents do not share their remaining lineage path after the pop")
         merged_path = remaining_paths.pop()
@@ -446,12 +465,16 @@ class TokenManager:
     ) -> tuple[TokenInfo, ...]:
         """Close a bound EXPAND group: strict-pop the closer's frame, mint outputs.
 
-        spec §4.2 (ruling 24 as amended by 28): every member's innermost frame
-        MUST be the closer's own EXPAND frame and all members share the
-        remaining path — §7 rule 5 makes violation a genuine engine invariant.
-        The pop is the SHARED ``pop_closer_frame`` (contracts/identity.py,
-        WS1a Task 1): it raises OrchestrationInvariantError unless
-        ``path[-1]`` matches kind+group_id exactly (empty paths included).
+        spec §4.2 (ruling 24 as amended by 28 and META-38): every member
+        carries the closer's own EXPAND frame — innermost, or below its own
+        collector release-group frame(s) when the member is itself a
+        collector release (collector-in-collector) — and all members share
+        the remaining path; §7 rule 5 makes any other shape a genuine engine
+        invariant. The truncation is the SHARED ``truncate_at_closer_frame``
+        (contracts/identity.py): it raises OrchestrationInvariantError unless
+        a frame matches kind+group_id (empty paths included) and every frame
+        above it is a release group (the written ``closes_group_id`` fact,
+        memoised on this manager).
         The emission is RATIFIED (2026-08-22 synthesis): the aggregation-flush
         precedent — outputs form a fresh EXPAND group over the popped base
         path (inert unless bound). An empty ``output_rows`` (M=0) still mints
@@ -460,11 +483,23 @@ class TokenManager:
         """
         if not members:
             raise OrchestrationInvariantError("collect_tokens requires at least one member token")
-        # pop_closer_frame owns the innermost-frame validation (kind, group_id,
-        # non-empty path); this method adds only the cross-member consistency check.
-        base_path = pop_closer_frame(members[0].lineage_path, kind=FrameKind.EXPAND, group_id=group_id)
+        # truncate_at_closer_frame owns the frame validation (kind, group_id,
+        # non-empty path, only release-group frames above); this method adds
+        # only the cross-member consistency check, PER MEMBER after each
+        # member's own truncation.
+        base_path = truncate_at_closer_frame(
+            members[0].lineage_path,
+            kind=FrameKind.EXPAND,
+            group_id=group_id,
+            is_release_group=lambda gid: self.is_release_group(run_id, gid),
+        )
         for member in members[1:]:
-            popped = pop_closer_frame(member.lineage_path, kind=FrameKind.EXPAND, group_id=group_id)
+            popped = truncate_at_closer_frame(
+                member.lineage_path,
+                kind=FrameKind.EXPAND,
+                group_id=group_id,
+                is_release_group=lambda gid: self.is_release_group(run_id, gid),
+            )
             if popped != base_path:
                 raise OrchestrationInvariantError(
                     f"collect_tokens: member {member.token_id} does not share the group's "

@@ -110,8 +110,8 @@ def resolve_merged_branch_barrier(
 ) -> tuple[CoalesceName | None, RowUnionName | None]:
     """Barrier context for a coalesce-completion's released continuation.
 
-    A merge's released token has just had its OWN closer's frame popped
-    (``coalesce_tokens``/``pop_closer_frame``). Two shapes:
+    A merge's released token has just had its OWN closer's frame closed
+    (``coalesce_tokens``/``truncate_at_closer_frame``). Two shapes:
 
     - ``merged_branch_name`` is None (spec §7's flat/unnested case — no
       ENCLOSING fork frame remains): the continuation carries no branch

@@ -348,7 +348,11 @@ def test_record_group_member_terminals_settles_once_not_per_consumed_token(proce
         patch.object(proc._data_flow, "record_token_outcome") as mock_record_token_outcome,
     ):
         proc._record_group_member_terminals(
-            consumed_tokens=(token_a, token_b), failure_reason="quarantined", child_items=[], group_failed=True
+            consumed_tokens=(token_a, token_b),
+            group_id=INNER_FORK.group_id,
+            failure_reason="quarantined",
+            child_items=[],
+            group_failed=True,
         )
 
     assert mock_settle.call_count == 1

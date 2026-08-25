@@ -169,6 +169,12 @@ class RecordingCollectorExecutor:
         self.accepted.append((token.token_id, collector_name, ctx, arrival_time))
         return self.outcome
 
+    def is_release_group(self, group_id: str) -> bool:
+        """META-38 written-fact predicate (the real executor's memoised durable
+        read): every group these dispatch-only fixtures craft is an ordinary
+        expand group, never a collector release."""
+        return False
+
     def notify_member_lost(self, *args: object, **kwargs: object) -> CollectorOutcome | None:
         raise AssertionError("not reached")
 

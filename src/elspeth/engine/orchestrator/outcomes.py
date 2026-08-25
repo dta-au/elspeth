@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from elspeth.contracts import PendingOutcome, TokenInfo
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
+from elspeth.contracts.identity import path_fork_group_id
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.orchestrator.counter_classification import TERMINAL_PAIR_COUNTER_EFFECTS, apply_counter_increments
@@ -180,9 +181,20 @@ def _terminalize_swept_coalesce_failure(
     """
     if not consumed_tokens:
         return
+    # META-38: the closer's own group id is the caller's fact — the consumed
+    # branches' FORK group, found by SEARCH (a collector release inside the
+    # branch carries its release-group frame above the FORK frame).
+    fork_group_id = path_fork_group_id(consumed_tokens[0].lineage_path)
+    if fork_group_id is None:
+        raise OrchestrationInvariantError(
+            f"Coalesce barrier {barrier_key!r} sweep: consumed token {consumed_tokens[0].token_id!r} carries no FORK "
+            f"frame anywhere in its lineage_path ({consumed_tokens[0].lineage_path!r}); a token cannot be held at a "
+            "coalesce barrier without one — lineage corruption."
+        )
     child_items: list[WorkItem] = []
     cascaded = processor.record_group_member_terminals(
         consumed_tokens,
+        group_id=fork_group_id,
         failure_reason=failure_reason,
         child_items=child_items,
         group_failed=True,

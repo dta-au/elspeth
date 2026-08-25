@@ -50,6 +50,7 @@ from elspeth.engine.spans import SpanFactory
 from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_row
 from tests.fixtures.factories import make_context
+from tests.fixtures.group_lineage import ensure_fork_group_record
 from tests.unit.engine.test_adr030_slice3_intake import (
     AGG_NODE,
     _agg_processor,
@@ -232,6 +233,9 @@ class TestCoalesceTimeoutInvariance:
         _persist_blocked_scheduler_work(
             factory, processor_a, token_a, node_id=COALESCE_NODE, barrier_key="merge", adopted=False, coalesce_name="merge"
         )
+        # META-38: the crafted FORK group needs the group_records row a real
+        # fork mints — the merge reads the written release fact for it.
+        ensure_fork_group_record(factory, run_id="test-run", group_id="fg-row-1", opener_token_id=token_a.token_id)
         processor_a._live_barrier_holds[token_a.token_id] = _LiveBarrierHold(token=token_a, barrier_key="merge")
         intake_results = processor_a.run_barrier_intake(ctx)
         assert intake_results == []

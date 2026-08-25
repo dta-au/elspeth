@@ -1,5 +1,6 @@
 """Tests for identity contracts."""
 
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from typing import Any
 
@@ -12,12 +13,14 @@ from elspeth.contracts.identity import (
     TokenInfo,
     innermost_expand_frame,
     innermost_fork_frame,
+    innermost_own_frame,
     lineage_path_from_json,
     lineage_path_to_json,
     path_branch_name,
     path_expand_group_id,
     path_fork_group_id,
-    pop_closer_frame,
+    pop_fork_frame,
+    truncate_at_closer_frame,
 )
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.testing import make_field
@@ -323,12 +326,49 @@ class TestLineageFrame:
         assert path_expand_group_id((outer_fork,)) is None
 
 
-class TestPopCloserFrame:
-    def test_pops_exactly_the_matching_innermost_frame(self) -> None:
-        outer = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1")
-        inner = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="a")
-        assert pop_closer_frame((outer, inner), kind=FrameKind.FORK, group_id="fg-1") == (outer,)
-        assert pop_closer_frame((outer,), kind=FrameKind.EXPAND, group_id="eg-1") == ()
+def _never_release(_group_id: str) -> bool:
+    raise AssertionError("is_release_group must not be consulted when the closer's frame is innermost")
+
+
+def _release_groups(*group_ids: str) -> Callable[[str], bool]:
+    return lambda group_id: group_id in group_ids
+
+
+class TestTruncateAtCloserFrame:
+    """META-38 guarded truncation: byte-identical to the old strict pop when
+    the closer's frame is innermost; passes through collector release-group
+    frames ONLY (the caller's written-fact predicate); everything else
+    refuses exactly as before."""
+
+    OUTER = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1")
+    FORK = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="a")
+    RELEASE_1 = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-1", member_key="r1")
+    RELEASE_2 = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-2", member_key="r2")
+
+    def test_innermost_match_is_the_old_strict_pop_and_never_consults_the_predicate(self) -> None:
+        assert truncate_at_closer_frame((self.OUTER, self.FORK), kind=FrameKind.FORK, group_id="fg-1", is_release_group=_never_release) == (
+            self.OUTER,
+        )
+        assert truncate_at_closer_frame((self.OUTER,), kind=FrameKind.EXPAND, group_id="eg-1", is_release_group=_never_release) == ()
+
+    def test_one_release_frame_above_the_closer_frame_is_truncated_through(self) -> None:
+        path = (self.OUTER, self.FORK, self.RELEASE_1)
+        assert truncate_at_closer_frame(path, kind=FrameKind.FORK, group_id="fg-1", is_release_group=_release_groups("rel-1")) == (
+            self.OUTER,
+        )
+
+    def test_two_stacked_release_frames_are_truncated_through(self) -> None:
+        # collector-in-collector: the inner release is itself released again.
+        path = (self.OUTER, self.RELEASE_1, self.RELEASE_2)
+        assert (
+            truncate_at_closer_frame(path, kind=FrameKind.EXPAND, group_id="eg-1", is_release_group=_release_groups("rel-1", "rel-2")) == ()
+        )
+
+    def test_a_non_release_frame_above_the_closer_frame_raises(self) -> None:
+        # An unclosed real scope inside the closing region is NOT skippable.
+        path = (self.OUTER, self.FORK, LineageFrame(kind=FrameKind.EXPAND, group_id="eg-open", member_key="t"))
+        with pytest.raises(OrchestrationInvariantError, match="not a collector release group"):
+            truncate_at_closer_frame(path, kind=FrameKind.FORK, group_id="fg-1", is_release_group=_release_groups("rel-1"))
 
     @pytest.mark.parametrize(
         ("path", "kind", "group_id"),
@@ -346,20 +386,23 @@ class TestPopCloserFrame:
                 "fg-1",
                 id="wrong-group",
             ),
-            pytest.param(
-                (
-                    LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="a"),
-                    LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="t"),
-                ),
-                FrameKind.FORK,
-                "fg-1",
-                id="matching-frame-buried-not-innermost",
-            ),
         ],
     )
-    def test_refuses_any_non_matching_innermost_frame(self, path: tuple[LineageFrame, ...], kind: FrameKind, group_id: str) -> None:
-        with pytest.raises(OrchestrationInvariantError, match="innermost"):
-            pop_closer_frame(path, kind=kind, group_id=group_id)
+    def test_refuses_an_absent_closer_frame(self, path: tuple[LineageFrame, ...], kind: FrameKind, group_id: str) -> None:
+        # The walk consults the predicate on a non-matching innermost frame
+        # (it must decide whether to skip it); nothing here is a release.
+        with pytest.raises(OrchestrationInvariantError, match="no matching"):
+            truncate_at_closer_frame(path, kind=kind, group_id=group_id, is_release_group=_release_groups())
+
+
+class TestPopForkFrameIsUnaffectedByReleaseFrames:
+    def test_pass_through_pop_preserves_a_release_frame_above_the_fork_frame(self) -> None:
+        # row_union's pop (ruling 27) searches for its FORK frame and keeps
+        # every other frame in place — a collector release-group frame
+        # stacked above it survives, exactly like a surviving EXPAND frame.
+        fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="a")
+        release = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-1", member_key="r1")
+        assert pop_fork_frame((fork, release), group_id="fg-1") == (release,)
 
 
 class TestTokenInfoExtraFields:
@@ -424,3 +467,27 @@ class TestTokenInfoExtraFields:
         assert result["amount"] == 100
         assert result["computed_field"] == "extra"
         assert result["nested"] == {"a": 1}
+
+
+class TestInnermostOwnFrame:
+    OUTER = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1")
+    FORK = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="a")
+    RELEASE_1 = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-1", member_key="r1")
+    RELEASE_2 = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-2", member_key="r2")
+
+    def test_innermost_non_release_frame_is_the_own_frame(self) -> None:
+        assert innermost_own_frame((self.OUTER, self.FORK), is_release_group=_release_groups()) == (1, self.FORK)
+
+    def test_a_run_of_release_frames_is_skipped(self) -> None:
+        # expand-of-a-release → close → two consecutive release frames.
+        path = (self.OUTER, self.RELEASE_1, self.RELEASE_2)
+        assert innermost_own_frame(path, is_release_group=_release_groups("rel-1", "rel-2")) == (0, self.OUTER)
+
+    def test_all_release_frames_or_empty_is_none(self) -> None:
+        assert innermost_own_frame((self.RELEASE_1,), is_release_group=_release_groups("rel-1")) is None
+        assert innermost_own_frame((), is_release_group=_never_release) is None
+
+    def test_an_unreleased_expand_is_the_own_frame_not_skipped(self) -> None:
+        # The shape innermost_fork_frame would wrongly skip.
+        open_scope = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-open", member_key="t")
+        assert innermost_own_frame((self.FORK, open_scope), is_release_group=_release_groups("rel-1")) == (1, open_scope)

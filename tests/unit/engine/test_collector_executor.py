@@ -1464,3 +1464,44 @@ class TestRestore:
             fresh.restore_from_journal(
                 items=[item], state_ids=state_ids, attempt_offsets={members[1].token_id: 0}, resume_checkpoint_id="ckpt-1"
             )
+
+
+class TestCollectorInCollectorArrivalMeta38:
+    """META-38 amendment 1: a collector-in-collector release arriving at the
+    OUTER collector is keyed on the OUTER group — the first frame inward-out
+    that is not a verified release group — never on its own release-group
+    frame ``[-1]``. Under ``[-1]`` the executor opened the release group
+    (member_count 1, roster = the release token itself) and silently closed
+    it; the outer roster never filled."""
+
+    def test_inner_release_fills_and_closes_the_outer_roster(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        # One outer page; its inner scope closes at an inner collector and
+        # releases ONE token back into the outer group's membership.
+        outer_members, outer_group_id = env.seed_group(count=1)
+        page = outer_members[0]
+        inner_children, inner_group_id = env.factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=page.token_id, run_id=env.run_id),
+            row_id=page.row_id,
+            child_payloads=[{"s": 0}, {"s": 1}],
+            output_contract=env.contract,
+        )
+        committed = env.factory.data_flow.collect_tokens(
+            member_refs=[TokenRef(token_id=c.token_id, run_id=env.run_id) for c in inner_children],
+            group_id=inner_group_id,
+            collector_node_id="collector-inner",
+            output_payloads=[{"item": "assembled"}],
+            output_contracts=[env.contract],
+        )
+        [release] = committed.children
+        lineage = env.factory.data_flow.load_lineage_paths(env.run_id, [release.token_id])[release.token_id]
+        assert [f.group_id for f in lineage] == [outer_group_id, committed.release_group_id]
+        assert lineage[0].member_key == page.lineage_path[-1].member_key
+        release_token = TokenInfo(row_id=page.row_id, token_id=release.token_id, row_data=page.row_data, lineage_path=lineage)
+
+        outcome = env.executor.accept(release_token, "stitch")
+
+        assert outcome.held is False
+        assert outcome.group_id == outer_group_id
+        assert outcome.released_tokens and outcome.consumed_tokens == (release_token,)
+        assert env.executor.buffered_member_count() == 0

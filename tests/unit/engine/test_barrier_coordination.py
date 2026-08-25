@@ -68,8 +68,15 @@ def _payload() -> str:
     return TokenSchedulerRepository.serialize_row_payload(PipelineRow({"id": 1}, _CONTRACT))
 
 
-def _token(token_id: str = "tok-1", row_id: str = "row-1") -> TokenInfo:
-    return TokenInfo(row_id=row_id, token_id=token_id, row_data=PipelineRow({"id": 1}, _CONTRACT))
+def _token(token_id: str = "tok-1", row_id: str = "row-1", *, lineage_path: tuple[LineageFrame, ...] = ()) -> TokenInfo:
+    return TokenInfo(row_id=row_id, token_id=token_id, row_data=PipelineRow({"id": 1}, _CONTRACT), lineage_path=lineage_path)
+
+
+def _branch_token(token_id: str = "tok-1", *, branch: str = "a") -> TokenInfo:
+    """A token held at a coalesce barrier carries its branch's FORK frame —
+    the group the settle seam and the FAIL-verdict park key on (META-38:
+    found by search, handed in by the caller)."""
+    return _token(token_id, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-barrier-coordination-test", member_key=branch),))
 
 
 def _blocked_row(
@@ -246,6 +253,7 @@ def _make_coordinator(
     def _record_group_member_terminals(
         consumed_tokens: tuple[TokenInfo, ...],
         *,
+        group_id: str,
         failure_reason: str,
         child_items: list[WorkItem],
         group_failed: bool,
@@ -254,6 +262,7 @@ def _make_coordinator(
             record_group_member_terminals_calls.append(
                 {
                     "consumed_tokens": consumed_tokens,
+                    "group_id": group_id,
                     "failure_reason": failure_reason,
                     "child_items": child_items,
                     "group_failed": group_failed,
@@ -410,7 +419,7 @@ class TestCoalesceIntakeTaxonomy:
                 late_arrival=True,
             )
         )
-        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE))}
+        holds = {row.token_id: _LiveBarrierHold(token=_branch_token(), barrier_key=str(_COALESCE))}
         coordinator = _make_coordinator(scheduler=scheduler, coalesce_executor=coalesce, live_holds=holds)
 
         outcome = coordinator.run_intake_pass(_ctx())

@@ -25,6 +25,7 @@ from elspeth.contracts.errors import (
     OrchestrationInvariantError,
     PluginContractViolation,
 )
+from elspeth.contracts.identity import innermost_own_frame
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.types import NodeID, StepResolver
@@ -198,16 +199,28 @@ class CollectorExecutor:
         """Total in-memory buffered members across open groups (EOF diagnostics)."""
         return sum(len(g.arrived) for g in self._pending.values())
 
+    def is_release_group(self, group_id: str) -> bool:
+        """META-38: the written release fact for ``group_id``, through this
+        executor's own TokenManager memo (durable read, once per group)."""
+        return self._token_manager.is_release_group(self._run_id, group_id)
+
     def accept(self, token: TokenInfo, collector_name: str, ctx: PluginContext, *, arrival_time: float | None = None) -> CollectorOutcome:
         if collector_name not in self._settings:
             raise OrchestrationInvariantError(f"Collector '{collector_name}' not registered")
-        if not token.lineage_path or token.lineage_path[-1].kind is not FrameKind.EXPAND:
+        # META-38 amendment 1: the member's OWN group frame is the innermost
+        # frame that is NOT a collector release group (the guarded walk) —
+        # a collector-in-collector release arriving here carries its own
+        # release-group frame above the outer group's frame, and keying on
+        # [-1] would open (and silently close) the release group instead.
+        own = innermost_own_frame(token.lineage_path, is_release_group=self.is_release_group)
+        if own is None or own[1].kind is not FrameKind.EXPAND:
             raise OrchestrationInvariantError(
                 f"Token {token.token_id} arrived at collector '{collector_name}' without an "
-                f"innermost EXPAND frame (path={token.lineage_path!r}). Under §7 rule 5 every "
-                f"member presents exactly one token whose innermost frame is the closer's own."
+                f"innermost EXPAND frame (path={token.lineage_path!r}, searched below collector release-group "
+                f"frames). Under §7 rule 5 every member presents exactly one token whose innermost non-release "
+                f"frame is the closer's own."
             )
-        frame = token.lineage_path[-1]
+        frame = own[1]
         group_id = frame.group_id
         member_key = frame.member_key
         key = (collector_name, group_id)
@@ -627,6 +640,7 @@ class CollectorExecutor:
             node_ids=self._node_ids,
             barrier_restore_reads=self._barrier_restore_reads,
             run_id=self._run_id,
+            is_release_group=self.is_release_group,
         ).restore(
             items=items,
             state_ids=state_ids,

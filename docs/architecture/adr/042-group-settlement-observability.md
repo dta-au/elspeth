@@ -129,6 +129,40 @@ what those tools may read (the three tables and the path-derived
 projections) and what they must never do (re-derive a binding from
 `group_records`, which is binding-blind by spec §4.3).
 
+### 3a. Collector release-group frames and merging closers (META-38, 2026-08-25)
+
+A collector release carries its own release-group EXPAND frame innermost
+for the rest of its life — a release group has no closer, so nothing ever
+pops that frame. Every MERGING closer downstream of a collector (a
+coalesce, an outer collector, the settle seam's consumed-token pop)
+therefore closes its own frame by **guarded truncation**
+(`contracts.identity.truncate_at_closer_frame`): it finds its frame by the
+single guarded walk (`innermost_own_frame` — innermost → outward, skipping
+only frames the written fact `group_records.closes_group_id` verifies as
+collector release groups) and continues with the path *below* it. A frame
+above the closer's own that is not a release group is an unclosed scope
+inside a closing region and is refused (spec §7 rule 5; the build refuses
+the buildable such shape, an unbound fork inside a bound region reaching
+the enclosing closer, at validation). Every "this token's own group"
+question — the collector arrival keying on the traversal, at intake
+adoption, in `CollectorExecutor.accept` and in the journal restore, and the
+coalesce anchor — uses that same walk; `lineage_path[-1]` is never the
+answer.
+
+**Deliberate, visible audit-shape change.** The merged continuation's
+exported `lineage_path` OMITS the release frame(s) a parent carried: a
+release token `(EXPAND outer, FORK a, EXPAND release)` merged at the fork's
+coalesce yields a continuation with path `(EXPAND outer,)`, not
+`(EXPAND outer, EXPAND release)`. Nothing is lost from the audit trail —
+the release frame stays on the parent's own `token_lineage_frames` rows,
+the continuation's `token_parents` rows name that parent, and the parent's
+release group's `group_records.closes_group_id` names the group it closed
+— but a reader reconstructing the continuation's full provenance must
+follow `token_parents` to the parent's frames rather than read the
+continuation's path alone. Pass-through closers (row_union, `pop_fork_frame`)
+are unchanged: they release the ORIGINAL tokens and preserve every other
+frame, release frames included.
+
 ### 4. Resume protection (cross-reference)
 
 The same three tables feed the fail-closed group-satisfiability resume gate

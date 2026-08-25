@@ -165,6 +165,7 @@ class _FakeProcessor:
         self,
         consumed_tokens: tuple[TokenInfo, ...],
         *,
+        group_id: str,
         failure_reason: str,
         child_items: list[Any],
         group_failed: bool,
@@ -190,12 +191,13 @@ class _FakeProcessorWithUndrainableChildItem(_FakeProcessor):
         self,
         consumed_tokens: tuple[TokenInfo, ...],
         *,
+        group_id: str,
         failure_reason: str,
         child_items: list[Any],
         group_failed: bool,
     ) -> list[_FakeRowResult]:
         super().record_group_member_terminals(
-            consumed_tokens, failure_reason=failure_reason, child_items=child_items, group_failed=group_failed
+            consumed_tokens, group_id=group_id, failure_reason=failure_reason, child_items=child_items, group_failed=group_failed
         )
         child_items.append(object())
         return []
@@ -248,6 +250,17 @@ def _make_merged_coalesce_outcome(
         coalesce_name=coalesce_name,
         consumed_tokens=consumed_tokens if consumed_tokens is not None else (make_token_info(token_id="consumed-token-1"),),
     )
+
+
+def _branch_token(token_id: str, *, row_id: str | None = None) -> TokenInfo:
+    """A token held at a coalesce barrier carries its branch's FORK frame —
+    the frame the settle seam closes (META-38: the caller hands the seam
+    that group id, found by search, so a lineage-free fake no longer models
+    the contract)."""
+    frame = LineageFrame(kind=FrameKind.FORK, group_id="fg-outcomes-test", member_key=token_id)
+    if row_id is None:
+        return make_token_info(token_id=token_id, lineage_path=(frame,))
+    return make_token_info(row_id=row_id, token_id=token_id, lineage_path=(frame,))
 
 
 def _make_failed_coalesce_outcome(
@@ -861,9 +874,9 @@ class TestCoalesceCountingOwnership:
         """
         merged_token = make_token_info(token_id="merged")
         consumed_tokens = (
-            make_token_info(token_id="token-a"),
-            make_token_info(token_id="token-b"),
-            make_token_info(token_id="token-c"),
+            _branch_token("token-a"),
+            _branch_token("token-b"),
+            _branch_token("token-c"),
         )
         outcome = _make_merged_coalesce_outcome(merged_token, consumed_tokens=consumed_tokens)
 
@@ -903,8 +916,8 @@ class TestCoalesceCountingOwnership:
         """
         merged_token = make_token_info(token_id="merged")
         consumed_tokens = (
-            make_token_info(token_id="token-a"),
-            make_token_info(token_id="token-b"),
+            _branch_token("token-a"),
+            _branch_token("token-b"),
         )
         outcome = _make_merged_coalesce_outcome(merged_token, consumed_tokens=consumed_tokens)
 
@@ -1174,9 +1187,9 @@ class TestHandleCoalesceTimeouts:
         outcome = _make_failed_coalesce_outcome(
             failure_reason="quorum_not_met",
             consumed_tokens=(
-                make_token_info(token_id="token-a"),
-                make_token_info(token_id="token-b"),
-                make_token_info(token_id="token-c"),
+                _branch_token("token-a"),
+                _branch_token("token-b"),
+                _branch_token("token-c"),
             ),
         )
 
@@ -1206,9 +1219,9 @@ class TestHandleCoalesceTimeouts:
         Completeness by set equality, not just no-duplicates (recent-code-hints
         2026-08-21: the zero-write direction has no automatic detection)."""
         tokens = (
-            make_token_info(token_id="token-a"),
-            make_token_info(token_id="token-b"),
-            make_token_info(token_id="token-c"),
+            _branch_token("token-a"),
+            _branch_token("token-b"),
+            _branch_token("token-c"),
         )
         outcome = _make_failed_coalesce_outcome(failure_reason="quorum_not_met", consumed_tokens=tokens)
 
@@ -1237,7 +1250,7 @@ class TestHandleCoalesceTimeouts:
         accumulate_row_outcomes — it must not be dropped on the floor."""
         outcome = _make_failed_coalesce_outcome(
             failure_reason="quorum_not_met",
-            consumed_tokens=(make_token_info(token_id="token-a"),),
+            consumed_tokens=(_branch_token("token-a"),),
         )
         cascaded_token = make_token_info(token_id="outer-sibling")
         cascaded_result = _make_result(TerminalOutcome.FAILURE, TerminalPath.UNROUTED, token=cascaded_token)
@@ -1267,7 +1280,7 @@ class TestHandleCoalesceTimeouts:
         go — fail loudly (NEEDS_CONTEXT-worthy), never a silent discard."""
         outcome = _make_failed_coalesce_outcome(
             failure_reason="quorum_not_met",
-            consumed_tokens=(make_token_info(token_id="token-a"),),
+            consumed_tokens=(_branch_token("token-a"),),
         )
 
         executor, processor, counters, pending, node_map = self._setup(
@@ -1314,8 +1327,8 @@ class TestHandleCoalesceTimeouts:
         outcome = _make_failed_coalesce_outcome(
             failure_reason="quorum_not_met",
             consumed_tokens=(
-                make_token_info(token_id="token-a"),
-                make_token_info(token_id="token-b"),
+                _branch_token("token-a"),
+                _branch_token("token-b"),
             ),
         )
 
@@ -1341,8 +1354,8 @@ class TestHandleCoalesceTimeouts:
     def test_failure_emits_token_completed_telemetry_for_each_consumed_token(self) -> None:
         """Timeout-driven coalesce failures must surface in telemetry once per token."""
         tokens = (
-            make_token_info(row_id="row-1", token_id="token-1"),
-            make_token_info(row_id="row-2", token_id="token-2"),
+            _branch_token("token-1", row_id="row-1"),
+            _branch_token("token-2", row_id="row-2"),
         )
         outcome = _make_failed_coalesce_outcome(failure_reason="quorum_not_met", consumed_tokens=tokens)
 
@@ -1493,8 +1506,8 @@ class TestFlushCoalescePending:
             failure_reason="incomplete_branches",
             coalesce_name="merge_1",
             consumed_tokens=(
-                make_token_info(token_id="token-a"),
-                make_token_info(token_id="token-b"),
+                _branch_token("token-a"),
+                _branch_token("token-b"),
             ),
         )
 
@@ -1523,8 +1536,8 @@ class TestFlushCoalescePending:
         the settlement channel, EVERY consumed token, exactly once.
         Completeness by set equality, not just no-duplicates."""
         tokens = (
-            make_token_info(token_id="token-a"),
-            make_token_info(token_id="token-b"),
+            _branch_token("token-a"),
+            _branch_token("token-b"),
         )
         outcome = _make_failed_coalesce_outcome(
             failure_reason="incomplete_branches",
@@ -1555,8 +1568,8 @@ class TestFlushCoalescePending:
     def test_failure_emits_token_completed_telemetry_for_each_consumed_token(self) -> None:
         """Flush-driven coalesce failures must surface in telemetry once per token."""
         tokens = (
-            make_token_info(row_id="row-1", token_id="token-1"),
-            make_token_info(row_id="row-2", token_id="token-2"),
+            _branch_token("token-1", row_id="row-1"),
+            _branch_token("token-2", row_id="row-2"),
         )
         outcome = _make_failed_coalesce_outcome(failure_reason="incomplete_branches", coalesce_name="merge_1", consumed_tokens=tokens)
 

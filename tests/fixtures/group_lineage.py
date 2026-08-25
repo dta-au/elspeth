@@ -223,3 +223,37 @@ def make_seeded_db_and_factory() -> tuple[LandscapeDB, RecorderFactory]:
     db = make_landscape_db()
     seed_run(db)
     return db, RecorderFactory(db)
+
+
+def ensure_fork_group_record(factory: RecorderFactory, *, run_id: str, group_id: str, opener_token_id: str, member_count: int = 2) -> None:
+    """Give a CRAFTED fork group (a lineage frame built by hand rather than by
+    ``fork_token``) the ``group_records`` row every real fork mints — idempotent
+    per ``(run_id, group_id)``.
+
+    META-38: every merging closer reads the written release fact
+    (``closes_group_id``) for the frames it walks, and a frame naming a group
+    with NO row fails closed. Crafted-frame fixtures that feed a real
+    coalesce/collector therefore seed the row (raw-seed precedent of this
+    module) rather than loosening the predicate. ``opener_token_id`` must be
+    an already-persisted token of the run (the first branch token the fixture
+    persisted is fine — only the FK and the NULL ``closes_group_id`` matter to
+    the readers; ``member_count`` is the fixture's declared branch count).
+    """
+    from sqlalchemy import select
+
+    with factory._db.engine.begin() as conn:
+        existing = conn.execute(
+            select(group_records_table.c.group_id).where(group_records_table.c.run_id == run_id, group_records_table.c.group_id == group_id)
+        ).one_or_none()
+        if existing is not None:
+            return
+        conn.execute(
+            insert(group_records_table).values(
+                run_id=run_id,
+                group_id=group_id,
+                kind=FrameKind.FORK.value,
+                opener_token_id=opener_token_id,
+                member_count=member_count,
+                created_at=NOW,
+            )
+        )

@@ -47,6 +47,7 @@ from tests.fixtures.base_classes import (
     as_transform,
 )
 from tests.fixtures.factories import wire_transforms
+from tests.fixtures.group_lineage import ensure_fork_group_record
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.plugins import (
     CollectSink,
@@ -1004,6 +1005,9 @@ class TestForkRecoveryInvariant:
             row_id=row.row_id,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-grp", member_key="b"),),
         )
+        # META-38: the crafted fork group needs the group_records row a real
+        # fork mints — coalesce_tokens reads the written release fact for it.
+        ensure_fork_group_record(factory, run_id=run.run_id, group_id="fork-join-balance-grp", opener_token_id=token_a.token_id)
 
         # Merged payload includes a datetime to verify type fidelity.
         # canonical_json would stringify datetime; checkpoint_dumps preserves it.
@@ -4182,6 +4186,7 @@ class TestForkRecoveryInvariant:
             row_id=row.row_id,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-domain-grp", member_key="y"),),
         )
+        ensure_fork_group_record(factory, run_id=run.run_id, group_id="fork-join-balance-domain-grp", opener_token_id=token_x.token_id)
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[
                 TokenRef(token_id=token_x.token_id, run_id=run.run_id),

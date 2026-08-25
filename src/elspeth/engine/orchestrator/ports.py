@@ -188,11 +188,15 @@ class CoalesceCompletionPort(Protocol):
         self,
         consumed_tokens: tuple[TokenInfo, ...],
         *,
+        group_id: str,
         failure_reason: str,
         child_items: list[WorkItem],
         group_failed: bool,
     ) -> list[RowResult]:
         """Terminalize a closer's consumed members (spec §6.1, Task 6) — the
+        caller names the closer's own group (``group_id``, META-38: never
+        re-derived from a consumed token's innermost frame, which may be a
+        collector release-group frame) and the
         executor no longer writes their outcomes itself. When
         ``group_failed`` (this call IS the group's failure, never a late
         arrival against an already-closed group) it also walks the members'

@@ -47,10 +47,19 @@ STITCH = CollectorName("stitch")
 
 
 class _HoldingCollectorExecutor:
-    """Executor double that holds every arrival and records the ctx it was fed."""
+    """Executor double that holds every arrival and records the ctx it was fed.
+
+    ``is_release_group`` models the real executor's contract (META-38): a
+    durable read of the written fact through the run's data_flow, wired by
+    ``_build`` once the recorder exists."""
 
     def __init__(self) -> None:
         self.accepted: list[tuple[str, str, PluginContext]] = []
+        self.setup: RecorderSetup | None = None
+
+    def is_release_group(self, group_id: str) -> bool:
+        assert self.setup is not None, "_build wires the recorder before any arrival"
+        return self.setup.data_flow.is_release_group(run_id=self.setup.run_id, group_id=group_id)
 
     def accept(self, token: TokenInfo, collector_name: str, ctx: PluginContext, *, arrival_time: float) -> CollectorOutcome:
         frame = token.lineage_path[-1]
@@ -77,6 +86,8 @@ def _build(
     ``with_union_before_collector`` adds source -> union -> after-union ->
     collector, the depth-2 shape a union INSIDE a scope releases into."""
     setup = make_recorder_with_run(run_id="run-collector-wiring", source_node_id=SOURCE_NODE, leader_worker_id=LEADER_OWNER)
+    if executor is not None:
+        executor.setup = setup
     register_test_node(setup.data_flow, setup.run_id, COLLECTOR_NODE)
     clock = MockClock(start=1_750_000_000.0)
     leader = mode is ProcessorMode.LEADER
@@ -124,8 +135,14 @@ def _build(
     return processor, setup, clock
 
 
-def _expand_member(setup: RecorderSetup, *, sequence: int, group_id: str) -> TokenInfo:
-    row, token = setup.data_flow.create_row_with_token(
+def _expand_member(setup: RecorderSetup, *, sequence: int) -> TokenInfo:
+    """A REAL one-member expansion (expand_token) — its group id is minted,
+    read back from the child's lineage. META-38: the collector arrival keying
+    reads the written release fact for the member's frame, so a crafted frame
+    naming an unminted group fails closed; the fixture mints, never the code."""
+    from elspeth.contracts.audit import TokenRef
+
+    row, parent = setup.data_flow.create_row_with_token(
         run_id=setup.run_id,
         source_node_id=setup.source_node_id,
         row_index=sequence,
@@ -133,12 +150,20 @@ def _expand_member(setup: RecorderSetup, *, sequence: int, group_id: str) -> Tok
         source_row_index=sequence,
         ingest_sequence=sequence,
     )
-    return TokenInfo(
+    contract = make_contract()
+    [child], _group_id = setup.data_flow.expand_token(
+        parent_ref=TokenRef(token_id=parent.token_id, run_id=setup.run_id),
         row_id=row.row_id,
-        token_id=token.token_id,
-        row_data=PipelineRow({"id": sequence}, make_contract()),
-        lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=group_id, member_key=token.token_id),),
+        child_payloads=[{"id": sequence}],
+        output_contract=contract,
     )
+    return TokenInfo(
+        row_id=row.row_id, token_id=child.token_id, row_data=PipelineRow({"id": sequence}, contract), lineage_path=child.lineage_path
+    )
+
+
+def _group_of(token: TokenInfo) -> str:
+    return token.lineage_path[-1].group_id
 
 
 def _ctx(setup: RecorderSetup) -> PluginContext:
@@ -152,7 +177,7 @@ class TestArrivalHoldIsTheDurableWriter:
         the executor receives the intake's own ctx unchanged."""
         executor = _HoldingCollectorExecutor()
         processor, setup, _clock = _build(mode=ProcessorMode.LEADER, executor=executor)
-        token = _expand_member(setup, sequence=1, group_id="g-1")
+        token = _expand_member(setup, sequence=1)
         item = WorkItem(token=token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
         ctx = _ctx(setup)
         scheduler = setup.factory.scheduler
@@ -171,11 +196,11 @@ class TestArrivalHoldIsTheDurableWriter:
         # The BLOCKED row the drain wrote, as the intake read it back (durable
         # row -> TokenWorkItem through list_pending_blocked_barrier_items).
         assert [(row.barrier_key, row.collector_name, row.status) for row in seen_pending] == [
-            (collector_barrier_key("stitch", "g-1"), "stitch", TokenWorkStatus.BLOCKED),
+            (collector_barrier_key("stitch", _group_of(token)), "stitch", TokenWorkStatus.BLOCKED),
         ]
         blocked = scheduler.list_blocked_barrier_items(run_id=setup.run_id)
         assert [(row.token_id, row.barrier_key, row.collector_name, row.barrier_adopted_epoch is not None) for row in blocked] == [
-            (token.token_id, collector_barrier_key("stitch", "g-1"), "stitch", True),
+            (token.token_id, collector_barrier_key("stitch", _group_of(token)), "stitch", True),
         ]
         assert [(token_id, name) for token_id, name, _ctx in executor.accepted] == [(token.token_id, "stitch")]
         assert executor.accepted[0][2] is ctx
@@ -184,25 +209,35 @@ class TestArrivalHoldIsTheDurableWriter:
         """Verification obligation 3: the collector_executor is None path."""
         processor, setup, _clock = _build(mode=ProcessorMode.FOLLOWER, executor=None)
         assert processor.collector_executor is None
-        token = _expand_member(setup, sequence=2, group_id="g-2")
+        token = _expand_member(setup, sequence=2)
 
         handled, result = processor._maybe_collector_token(token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
 
         assert (handled, result) == (True, None)
         assert processor._live_barrier_holds == {}
         item = WorkItem(token=token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
-        assert processor._barrier_key_for_blocked_item(item) == collector_barrier_key("stitch", "g-2")
+        assert processor._barrier_key_for_blocked_item(item) == collector_barrier_key("stitch", _group_of(token))
         assert processor._queue_key_for_blocked_item(item) is None
 
     def test_arrival_elsewhere_is_not_a_collector_hold(self) -> None:
         processor, setup, _clock = _build(mode=ProcessorMode.LEADER, executor=_HoldingCollectorExecutor())
-        token = _expand_member(setup, sequence=3, group_id="g-3")
+        token = _expand_member(setup, sequence=3)
         assert processor._maybe_collector_token(token, current_node_id=NodeID(SOURCE_NODE), collector_name=STITCH) == (False, None)
         assert processor._maybe_collector_token(token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=None) == (False, None)
 
     def test_collector_cursor_without_an_expand_frame_fails_closed(self) -> None:
-        processor, _setup, _clock = _build(mode=ProcessorMode.LEADER, executor=_HoldingCollectorExecutor())
-        token = make_token_info(data={"id": 9}, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg", member_key="a"),))
+        from elspeth.contracts.audit import TokenRef
+
+        processor, setup, _clock = _build(mode=ProcessorMode.LEADER, executor=_HoldingCollectorExecutor())
+        # A REAL fork child (minted FORK frame): the walk finds a non-release
+        # frame that is not EXPAND and refuses.
+        row, parent = setup.data_flow.create_row_with_token(
+            run_id=setup.run_id, source_node_id=setup.source_node_id, row_index=9, data={"id": 9}, source_row_index=9, ingest_sequence=9
+        )
+        [branch, _other], _fg = setup.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=parent.token_id, run_id=setup.run_id), row_id=row.row_id, branches=["a", "b"]
+        )
+        token = make_token_info(row_id=row.row_id, token_id=branch.token_id, data={"id": 9}, lineage_path=branch.lineage_path)
         with pytest.raises(OrchestrationInvariantError, match="without an innermost EXPAND frame"):
             processor._maybe_collector_token(token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
         item = WorkItem(token=token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
@@ -605,7 +640,7 @@ class TestCollectorCursorLookup:
         from elspeth.contracts.errors import AuditIntegrityError
 
         processor, setup, _clock = _build(mode=ProcessorMode.LEADER, executor=_HoldingCollectorExecutor())
-        token = _expand_member(setup, sequence=7, group_id="g-7")
+        token = _expand_member(setup, sequence=7)
         with pytest.raises(AuditIntegrityError, match="cursor names collector 'ghost'"):
             processor._maybe_collector_token(token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=CollectorName("ghost"))
         with pytest.raises(AuditIntegrityError, match="cursor names collector 'ghost'"):
@@ -635,12 +670,12 @@ class TestDepthTwoReleaseHoldsAtTheCollector:
                 ),
             )
         )
-        registry.register_expand_group("g-scope", opener_name="explode")
         executor = _HoldingCollectorExecutor()
         processor, setup, _clock = _build(
             mode=ProcessorMode.LEADER, executor=executor, with_union_before_collector=True, group_bindings=registry
         )
-        released = _expand_member(setup, sequence=11, group_id="g-scope")
+        released = _expand_member(setup, sequence=11)
+        registry.register_expand_group(_group_of(released), opener_name="explode")
 
         [item] = processor.released_row_union_items(row_union_name=RowUnionName("variants"), released_tokens=(released,))
         assert (item.current_node_id, item.collector_name) == (NodeID(AFTER_UNION), STITCH)
@@ -652,6 +687,6 @@ class TestDepthTwoReleaseHoldsAtTheCollector:
         # node_id is the enqueue-time cursor (after-union), never the barrier
         # owner; the compound key and the executor accept prove the journey.
         assert [(row.token_id, row.barrier_key, row.collector_name, row.node_id) for row in blocked] == [
-            (released.token_id, collector_barrier_key("stitch", "g-scope"), "stitch", AFTER_UNION),
+            (released.token_id, collector_barrier_key("stitch", _group_of(released)), "stitch", AFTER_UNION),
         ]
         assert [(token_id, name) for token_id, name, _ctx_seen in executor.accepted] == [(released.token_id, "stitch")]

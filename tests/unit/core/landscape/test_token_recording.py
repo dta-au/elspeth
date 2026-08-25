@@ -507,20 +507,19 @@ class TestForkToken:
             assert len(conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.token_id == token.token_id)).all()) == 1
 
 
-def _make_coalesce_parents(factory: RecorderFactory, row_id: str, branches: list[str], *, group_id: str = "coalesce-fork-grp"):
-    """Crafted sibling parents sharing one FORK lineage frame (the shape a real
-    fork_token would have produced), via the create_token(..., lineage_path=)
-    seam — coalesce_tokens' durable strict pop requires an innermost shared
-    FORK frame to pop (spec rulings 24/28); never weaken the pop to accommodate
+def _make_coalesce_parents(factory: RecorderFactory, row_id: str, branches: list[str], *, run_id: str = "run-1"):
+    """Sibling parents sharing one FORK lineage frame, minted by the REAL
+    fork_token writer — coalesce_tokens' durable strict truncation requires
+    a shared FORK frame to close (spec rulings 24/28) AND reads the written
+    release fact for every frame it walks (META-38: a crafted frame with no
+    group_records row fails closed); never weaken the closer to accommodate
     a fixture that models something a real fork never produces.
     """
-    return [
-        factory.data_flow.create_token(
-            row_id,
-            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=group_id, member_key=branch),),
-        )
-        for branch in branches
-    ]
+    parent = factory.data_flow.create_token(row_id)
+    children, _fork_group_id = factory.data_flow.fork_token(
+        parent_ref=TokenRef(token_id=parent.token_id, run_id=run_id), row_id=row_id, branches=branches
+    )
+    return children
 
 
 class TestCoalesceTokens:
@@ -2477,7 +2476,7 @@ class TestCrossRunContaminationPrevention:
             source_row_index=0,
             ingest_sequence=0,
         )
-        token_a, token_b = _make_coalesce_parents(factory, row_a.row_id, ["a", "b"], group_id="coalesce-fork-grp-cross-run")
+        token_a, token_b = _make_coalesce_parents(factory, row_a.row_id, ["a", "b"], run_id="run-A")
 
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-A"), TokenRef(token_id=token_b.token_id, run_id="run-A")],

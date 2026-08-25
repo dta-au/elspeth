@@ -8,6 +8,36 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-25 — META-38: merging closers TRUNCATE at their own frame;
+  `pop_closer_frame` is GONE (branch feature/unified-lineage).** A collector
+  release permanently carries its own release-group EXPAND frame innermost
+  (`collect_tokens` mints `(EXPAND, release_group_id, own token_id)`), so
+  "the closer's frame is `path[-1]`" is false for every closer downstream of
+  a collector. Conventions: (1) every MERGING closer (coalesce, collector,
+  the settle seam's consumed-token pop) calls
+  `contracts.identity.truncate_at_closer_frame(path, kind=, group_id=,
+  is_release_group=)` — scans innermost→outward for its frame, returns
+  `path[:index]`, and RAISES if any frame above the match is not a collector
+  release group; never re-implement the pop inline, never index `[-1]`.
+  (2) The release fact is WRITTEN, `group_records.closes_group_id`
+  (non-NULL only on release groups); the ONE predicate is
+  `data_flow/tokens.py::is_release_group(conn, run_id, group_id)` (missing
+  row → `AuditIntegrityError`), reached from the engine through
+  `TokenManager.is_release_group` (per-run memo filled ONLY by that durable
+  read — never seed it from a `CommittedCollect`). Do not derive release-ness
+  from lineage shape, member_count, terminal paths, or bindings. (3) The
+  closer's group id is the CALLER's fact: `_record_group_member_terminals`
+  takes a required `group_id` (collector outcome's group_id, the arriving
+  token's FORK frame via `path_fork_group_id`, the replayed loss's
+  group_id); the coalesce mints anchor on `innermost_fork_frame` (a search);
+  `_note_coalesce_group_failed_from_token` SEARCHES for the FORK frame like
+  its row_union twin. Never re-derive a closer's group from `path[-1]`. (4) Pass-through
+  closers (row_union, `pop_fork_frame`) are unchanged — they preserve every
+  other frame. (5) Crafted release tokens in tests must be minted through
+  the real `collect_tokens` so the written fact exists — a synthesized
+  release frame makes `is_release_group` fail closed, and the fix is the
+  fixture, never the predicate.
+
 - **2026-08-25 — resume now has a THIRD entry guard (group satisfiability), and
   two traps around it** (WS5 Tasks 1/2, spec §8). (a) Both resume surfaces —
   advisory `RecoveryManager.can_resume` and enforcing
@@ -168,7 +198,8 @@ is a working document under the normal delivery posture.
   WS1b flip is a dual-representation defect; the only sanctioned reads are
   the two strict-pop sites (engine `TokenManager.coalesce_tokens` and the
   durable twin in `data_flow/tokens.py`), both routed through
-  `contracts.identity.pop_closer_frame`. (2) Crafted-token tests that feed
+  `contracts.identity.pop_closer_frame` (since META-38, 2026-08-25:
+  `truncate_at_closer_frame` — see the entry above). (2) Crafted-token tests that feed
   `coalesce_tokens` MUST build real fork lineage via
   `create_token(..., lineage_frames=...)` (or a real `fork_token`) — the
   durable strict pop rejects frame-less parents and the fix is ALWAYS the

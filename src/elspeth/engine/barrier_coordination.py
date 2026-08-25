@@ -40,7 +40,7 @@ from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierSca
 from elspeth.contracts.enums import BatchStatus, FrameKind, GroupSettlementReason, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.freeze import deep_freeze
-from elspeth.contracts.identity import LineageFrame, path_fork_group_id
+from elspeth.contracts.identity import LineageFrame, innermost_own_frame, path_fork_group_id
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, GroupLossSpec, TokenWorkItem
 from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
@@ -554,6 +554,7 @@ class BarrierIntakeCoordinator:
             late_child_items: list[WorkItem] = []
             late_cascaded_results = self._record_group_member_terminals(
                 tuple(outcome.consumed_tokens),
+                group_id=self._arriving_fork_group_id(closer_name=str(coalesce_name), token=token),
                 failure_reason=late_reason,
                 child_items=late_child_items,
                 group_failed=False,
@@ -613,6 +614,7 @@ class BarrierIntakeCoordinator:
             cascade_child_items: list[WorkItem] = []
             cascaded_results = self._record_group_member_terminals(
                 tuple(outcome.consumed_tokens),
+                group_id=self._arriving_fork_group_id(closer_name=str(coalesce_name), token=token),
                 failure_reason=error_msg,
                 child_items=cascade_child_items,
                 group_failed=True,
@@ -795,11 +797,16 @@ class BarrierIntakeCoordinator:
             raise AuditIntegrityError(f"Intake collector row {row.work_item_id!r} has no collector_name cursor.")
         if self._collector_executor is None:
             raise OrchestrationInvariantError(f"Intake collector row for {row.barrier_key!r} but no CollectorExecutor is configured.")
-        frame = row.lineage_path[-1] if row.lineage_path else None
+        # META-38 amendment 1: the row's OWN group frame via the guarded walk
+        # (the executor's memoised written-fact predicate) — the same
+        # derivation the traversal used to write this row's barrier_key.
+        own = innermost_own_frame(row.lineage_path, is_release_group=self._collector_executor.is_release_group)
+        frame = None if own is None else own[1]
         if frame is None or frame.kind is not FrameKind.EXPAND:
             raise AuditIntegrityError(
                 f"Intake collector row for token {row.token_id!r} (run {self._run_id!r}) has no innermost EXPAND "
-                f"frame (lineage_path={row.lineage_path!r}); a collector member always carries its own group's frame."
+                f"frame (lineage_path={row.lineage_path!r}, searched below collector release-group frames); a "
+                "collector member always carries its own group's frame."
             )
         expected_key = collector_barrier_key(str(row.collector_name), frame.group_id)
         if row.barrier_key != expected_key:
@@ -935,6 +942,7 @@ class BarrierIntakeCoordinator:
             # land with the release mint, then the journal transition).
             self._record_group_member_terminals(
                 self._unterminalized(outcome.consumed_tokens),
+                group_id=group_id,
                 failure_reason="",
                 child_items=[],
                 group_failed=False,
@@ -973,6 +981,7 @@ class BarrierIntakeCoordinator:
             # terminal; the seam's own duplicate detection stands.
             cascaded_results = self._record_group_member_terminals(
                 consumed_tokens,
+                group_id=group_id,
                 failure_reason=outcome.failure_reason,
                 child_items=failure_child_items,
                 group_failed=True,
@@ -1281,6 +1290,7 @@ class BarrierIntakeCoordinator:
                 replay_child_items: list[WorkItem] = []
                 cascaded_replay_results = self._record_group_member_terminals(
                     tuple(outcome.consumed_tokens),
+                    group_id=loss.group_id,
                     failure_reason=outcome.failure_reason,
                     child_items=replay_child_items,
                     group_failed=True,
@@ -1342,23 +1352,46 @@ class BarrierIntakeCoordinator:
         self._failed_group_notes[(closer_name, group_id)] = reason
 
     def _note_coalesce_group_failed_from_token(self, *, closer_name: str, token: TokenInfo, reason: str) -> None:
-        """Park a FAIL verdict keyed on the arriving/consumed token's own
-        innermost lineage frame (spec §6.3). Sound to index ``[-1]`` here
-        ONLY because coalesce and fork are strictly LIFO-nested by
-        construction (`pop_closer_frame`'s own docstring,
-        `contracts/identity.py`) — a coalesce closer's own frame IS always
-        the token's innermost frame. Do NOT reuse this for row_union (see
-        `_note_row_union_group_failed_from_token`): unlike coalesce, a
-        row-multiplying transform inside a row_union branch can legally
-        stack a further frame on top of the branch's FORK frame before the
-        token reaches the union. Empty ``lineage_path`` is unreachable in
-        production (every fork child mints one) — tolerated as a silent
-        no-op here only because dispatch-only synthetic test fixtures build
-        lineage-free tokens on purpose, mirroring
-        `_record_group_member_terminals`'s own empty-input tolerance."""
+        """Park a FAIL verdict keyed on the arriving/consumed token's innermost
+        FORK frame (spec §6.3) — a SEARCH via ``path_fork_group_id``, never
+        ``[-1]``. Until META-38 this indexed ``[-1]`` on the argument that a
+        coalesce closer's own frame is always the token's innermost frame
+        (coalesce and fork are LIFO-nested). That is FALSE for a collector
+        RELEASE arriving from inside the branch: it carries its own
+        release-group EXPAND frame innermost, so ``[-1]`` parked the verdict
+        under the release group — a group no closer owns — and the
+        escalation staged against a phantom key. The same search
+        `_note_row_union_group_failed_from_token` uses (and the same one
+        ``truncate_at_closer_frame`` anchors on through
+        ``innermost_fork_frame``) resolves the branch's FORK frame wherever
+        it sits. Empty ``lineage_path`` is unreachable in production (every
+        fork child mints one) — tolerated as a silent no-op here only
+        because dispatch-only synthetic test fixtures build lineage-free
+        tokens on purpose, mirroring `_record_group_member_terminals`'s own
+        empty-input tolerance; a non-empty path with NO FORK frame at all
+        is lineage corruption and fails closed."""
         if not token.lineage_path:
             return
-        self.note_group_failed(closer_name=closer_name, group_id=token.lineage_path[-1].group_id, reason=reason)
+        self.note_group_failed(
+            closer_name=closer_name, group_id=self._arriving_fork_group_id(closer_name=closer_name, token=token), reason=reason
+        )
+
+    def _arriving_fork_group_id(self, *, closer_name: str, token: TokenInfo) -> str:
+        """The FORK group a token arriving at (or consumed by) coalesce
+        ``closer_name`` belongs to — its innermost FORK frame, SEARCHED via
+        ``path_fork_group_id`` (META-38: a collector release inside the
+        branch carries its release-group EXPAND frame above the FORK frame).
+        This is the closer's own group id, handed to the settle seam and to
+        the FAIL-verdict park. No FORK frame anywhere is lineage corruption
+        — a token cannot reach a coalesce closer without one."""
+        group_id = path_fork_group_id(token.lineage_path)
+        if group_id is None:
+            raise OrchestrationInvariantError(
+                f"coalesce closer {closer_name!r}: token {token.token_id!r} carries no FORK frame anywhere in its "
+                f"lineage_path ({token.lineage_path!r}); a token cannot reach a coalesce closer without one — "
+                "lineage corruption."
+            )
+        return group_id
 
     def _note_row_union_group_failed_from_token(self, *, closer_name: str, token: TokenInfo, reason: str) -> None:
         """Park a FAIL verdict using the token's innermost FORK frame (spec

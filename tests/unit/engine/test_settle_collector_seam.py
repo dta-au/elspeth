@@ -34,7 +34,7 @@ from elspeth.engine.clock import MockClock
 from elspeth.engine.executors.collector import CollectorOutcome
 from elspeth.engine.processor import CollectorRelease
 from elspeth.engine.work_items import WorkItem, WorkItemFactory
-from elspeth.testing import make_token_info
+from elspeth.testing import make_contract, make_token_info
 from tests.unit.engine.test_barrier_coordination import (
     FakeNav,
     RecordingAggregationExecutor,
@@ -74,6 +74,7 @@ class TestSeamCollectorArm:
         with patch.object(proc, "_settle_member_losses", return_value=[]) as walk:
             cascaded = proc._record_group_member_terminals(
                 members,
+                group_id=EXPAND.group_id,
                 failure_reason="",
                 child_items=[],
                 group_failed=False,
@@ -104,6 +105,7 @@ class TestSeamCollectorArm:
         with patch.object(proc, "_settle_member_losses", return_value=[]) as walk:
             proc._record_group_member_terminals(
                 members,
+                group_id=EXPAND.group_id,
                 failure_reason="collector_missing_members",
                 child_items=[],
                 group_failed=True,
@@ -133,6 +135,7 @@ class TestSeamCollectorArm:
         with patch.object(proc, "_resolve_member_token_id", return_value="tok-outer-left"):
             proc._record_group_member_terminals(
                 members,
+                group_id=EXPAND.group_id,
                 failure_reason="collector_missing_members",
                 child_items=[],
                 group_failed=True,
@@ -155,8 +158,11 @@ class TestSeamCollectorArm:
     def test_anchor_kind_must_match_the_closer_kind(self, frame_kind: FrameKind, innermost: LineageFrame) -> None:
         _factory, proc = _seam_processor()
         token = _member("tok-a", path=(innermost,))
+        closer_group = EXPAND.group_id if frame_kind is FrameKind.EXPAND else OUTER_FORK.group_id
         with pytest.raises(OrchestrationInvariantError, match=rf"has no innermost {frame_kind.name} frame"):
-            proc._record_group_member_terminals((token,), failure_reason="x", child_items=[], group_failed=False, frame_kind=frame_kind)
+            proc._record_group_member_terminals(
+                (token,), group_id=closer_group, failure_reason="x", child_items=[], group_failed=False, frame_kind=frame_kind
+            )
 
     def test_the_store_rejects_a_second_terminal_for_the_same_member(self) -> None:
         """Why the intake filters already-terminal members BEFORE the seam:
@@ -166,7 +172,13 @@ class TestSeamCollectorArm:
         factory, proc = _seam_processor()
         token = _member("tok-a")
         _persist_token_for_scheduler(factory, token)
-        write: dict[str, Any] = {"failure_reason": "", "child_items": [], "group_failed": False, "frame_kind": FrameKind.EXPAND}
+        write: dict[str, Any] = {
+            "group_id": EXPAND.group_id,
+            "failure_reason": "",
+            "child_items": [],
+            "group_failed": False,
+            "frame_kind": FrameKind.EXPAND,
+        }
         proc._record_group_member_terminals((token,), outcome=TerminalOutcome.SUCCESS, path=TerminalPath.COALESCED, **write)
         with pytest.raises(LandscapeRecordError):
             proc._record_group_member_terminals((token,), outcome=TerminalOutcome.SUCCESS, path=TerminalPath.COALESCED, **write)
@@ -315,6 +327,7 @@ class TestDispatchRelease:
         assert recorder.seam_calls == [
             {
                 "consumed": ("tok-a", "tok-b"),
+                "group_id": "eg-1",
                 "failure_reason": "",
                 "child_items": [],
                 "group_failed": False,
@@ -377,6 +390,7 @@ class TestDispatchFailure:
         assert recorder.seam_calls == [
             {
                 "consumed": ("tok-a", "tok-b"),
+                "group_id": "eg-1",
                 "failure_reason": "collector_missing_members",
                 "child_items": [],
                 "group_failed": True,
@@ -663,6 +677,7 @@ class TestCollectorMemberCountersMeta32:
             _persist_token_for_scheduler(factory, token)
         proc._record_group_member_terminals(
             members,
+            group_id=EXPAND.group_id,
             failure_reason="",
             child_items=[],
             group_failed=False,
@@ -687,3 +702,92 @@ class TestCollectorMemberCountersMeta32:
         with patch.object(run_status, "is_counted_coalesced_output", return_value=True):
             _status, mutated = run_status.derive_terminal_status_from_audit(factory, "test-run")
         assert (mutated.rows_succeeded, mutated.rows_coalesced) == (4, 3)
+
+
+class TestCoalesceFailVerdictKeyMeta38:
+    """META-38 sixth site: a collector release arriving at a coalesce carries
+    its release-group EXPAND frame innermost; the coalesce's FAIL verdict
+    must be parked under the BRANCH's FORK group (a search), never under
+    the release group ``[-1]`` names."""
+
+    def _coordinator(self) -> BarrierIntakeCoordinator:
+        recorder = _Recorder(release=CollectorRelease(items=(), sink_results=()))
+        return _coordinator(
+            scheduler=RecordingScheduler(pending=[]), executor=_SweepExecutor(script=[]), recorder=recorder, data_flow=_RecordingDataFlow()
+        )
+
+    def test_release_token_verdict_is_keyed_on_the_fork_group_not_the_release_group(self) -> None:
+        coordinator = self._coordinator()
+        fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="analysis")
+        release = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-1", member_key="tok-rel")
+        token = make_token_info(row_id="row-1", token_id="tok-rel", lineage_path=(OUTER_FORK, fork, release))
+
+        coordinator._note_coalesce_group_failed_from_token(closer_name="merge", token=token, reason="group_failed")
+
+        assert coordinator._failed_group_notes == {("merge", "fg-1"): "group_failed"}
+
+    def test_a_path_with_no_fork_frame_fails_closed(self) -> None:
+        coordinator = self._coordinator()
+        token = make_token_info(row_id="row-1", token_id="tok-x", lineage_path=(EXPAND,))
+        with pytest.raises(OrchestrationInvariantError, match="no FORK"):
+            coordinator._note_coalesce_group_failed_from_token(closer_name="merge", token=token, reason="group_failed")
+        assert coordinator._failed_group_notes == {}
+
+
+class TestSeamTruncatesThroughReleaseFramesMeta38:
+    """META-38 fifth site: the settle seam's consumed-token pop. A consumed
+    member that is itself a collector release (collector-in-collector)
+    carries its own release-group EXPAND frame ABOVE the frame the closer
+    closes; the seam truncates through it — the caller supplies the
+    closer's group id, the durable release fact is read, nothing is derived
+    from ``[-1]``."""
+
+    def test_release_member_of_the_outer_group_is_truncated_at_the_outer_frame(self) -> None:
+        from elspeth.contracts.audit import TokenRef
+
+        factory, proc = _seam_processor()
+        run_id = "test-run"
+        row = factory.data_flow.create_row(run_id, "source-0", 1, {"seed": 1}, source_row_index=1, ingest_sequence=1)
+        root = factory.data_flow.create_token(row_id=row.row_id)
+        contract = make_contract()
+        outer_members, outer_gid = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=root.token_id, run_id=run_id),
+            row_id=row.row_id,
+            child_payloads=[{"p": 0}],
+            output_contract=contract,
+        )
+        inner_members, inner_gid = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=outer_members[0].token_id, run_id=run_id),
+            row_id=row.row_id,
+            child_payloads=[{"s": 0}],
+            output_contract=contract,
+        )
+        committed = factory.data_flow.collect_tokens(
+            member_refs=[TokenRef(token_id=inner_members[0].token_id, run_id=run_id)],
+            group_id=inner_gid,
+            collector_node_id="collector-inner",
+            output_payloads=[{"assembled": True}],
+            output_contracts=[contract],
+        )
+        [release] = committed.children
+        lineage = factory.data_flow.load_lineage_paths(run_id, [release.token_id])[release.token_id]
+        release_token = make_token_info(row_id=row.row_id, token_id=release.token_id, lineage_path=lineage)
+        assert [f.group_id for f in lineage] == [outer_gid, committed.release_group_id]
+
+        with patch.object(proc, "_settle_member_losses", return_value=[]) as walk:
+            proc._record_group_member_terminals(
+                (release_token,),
+                group_id=outer_gid,
+                failure_reason="collector_missing_members",
+                child_items=[],
+                group_failed=True,
+                frame_kind=FrameKind.EXPAND,
+            )
+
+        # The escalation walk continues from the path BELOW the outer frame —
+        # the release-group frame is gone too, never left as a phantom.
+        (remaining_token, _reason, _items), _kwargs = walk.call_args
+        assert remaining_token.lineage_path == ()
+        # The walk read the fact for the release frame (skipped) and for the
+        # outer frame (its own group) — both from the durable row.
+        assert proc._token_manager._release_group_memo == {(run_id, committed.release_group_id): True, (run_id, outer_gid): False}

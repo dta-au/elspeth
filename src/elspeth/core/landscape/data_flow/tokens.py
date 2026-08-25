@@ -26,7 +26,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
-from elspeth.contracts.identity import LineageFrame, pop_closer_frame, pop_fork_frame
+from elspeth.contracts.identity import LineageFrame, innermost_own_frame, pop_fork_frame, truncate_at_closer_frame
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import canonical_json, stable_hash
@@ -86,11 +86,21 @@ def is_release_group(conn: Connection, *, run_id: str, group_id: str) -> bool:
     shape, terminal-path vocabulary, or binding config (none of which a
     durable-twin reader holds, and none of which survive nesting).
 
-    Fail-closed: a ``group_id`` with NO ``group_records`` row is an audit
+    Failure direction, pinned (META-38 amendment 2): True ONLY for a row
+    whose ``closes_group_id`` IS NOT NULL; a row with NULL is a real
+    opener's group — False, not skippable, so a merging closer's truncation
+    RAISES on it; a MISSING row raises ``AuditIntegrityError`` — an audit
     inconsistency (every group is minted with its row in the same
-    transaction as its frames), so it raises rather than answering False —
-    a False here would let a closer silently truncate past a frame nobody
-    minted.
+    transaction as its frames), never answered False, because a False
+    would let a closer silently truncate past a frame nobody minted.
+
+    Why a WRITTEN fact beats the two derived alternatives the panel found:
+    (1) deriving release-ness from ``token_outcomes`` paths is fail-OPEN —
+    an absent terminal reads as "release" and becomes truncatable — and it
+    depends on a four-value terminal-path vocabulary replicated in two
+    implementations; (2) the node_state-at-declared-opener derivation
+    (``RowProcessor._rederive_expand_binding``) is config-dependent and
+    cannot run in this durable twin, which holds no bindings.
     """
     row = conn.execute(
         select(group_records_table.c.closes_group_id).where(
@@ -983,20 +993,35 @@ class RowTokenRepository:
                 for ref in parent_refs:
                     self._assert_parent_lineage(conn, parent_ref=ref, supplied=parent_lineage_paths[ref.token_id])
                 parent_paths = [parent_lineage_paths[ref.token_id] for ref in parent_refs]
-            anchor = parent_paths[0]
-            if not anchor or anchor[-1].kind is not FrameKind.FORK:
+            # Anchor (META-38 amendment 1 B): the first parent's OWN frame via
+            # the guarded walk, reading the written fact in THIS transaction.
+            own = innermost_own_frame(parent_paths[0], is_release_group=lambda gid: is_release_group(conn, run_id=run_id, group_id=gid))
+            if own is None or own[1].kind is not FrameKind.FORK:
                 raise AuditIntegrityError(
                     f"coalesce_tokens: parent token {parent_refs[0].token_id!r} has no innermost FORK lineage frame "
-                    f"to pop (frames={anchor!r}); a closer pops exactly its own frame (spec rulings 24/28)"
+                    f"to close (searched below collector release-group frames; frames={parent_paths[0]!r}); a closer "
+                    "closes exactly its own frame (spec rulings 24/28)"
                 )
-            shared_group_id = anchor[-1].group_id
+            shared_group_id = own[1].group_id
             remaining_paths: set[tuple[LineageFrame, ...]] = set()
             for ref, path in zip(parent_refs, parent_paths, strict=True):
                 try:
-                    remaining_paths.add(pop_closer_frame(path, kind=FrameKind.FORK, group_id=shared_group_id))
+                    # META-38 guarded truncation, PER PARENT before the
+                    # equality check: only collector release-group frames
+                    # (the written closes_group_id fact, read in THIS
+                    # transaction) may sit above the FORK frame.
+                    remaining_paths.add(
+                        truncate_at_closer_frame(
+                            path,
+                            kind=FrameKind.FORK,
+                            group_id=shared_group_id,
+                            is_release_group=lambda gid: is_release_group(conn, run_id=run_id, group_id=gid),
+                        )
+                    )
                 except OrchestrationInvariantError as exc:
-                    # pop_closer_frame refuses empty paths, non-FORK innermost
-                    # frames, and cross-group parents in one place; this layer
+                    # truncate_at_closer_frame refuses empty paths, a missing
+                    # FORK frame, cross-group parents and a non-release frame
+                    # above the closer's frame in one place; this layer
                     # re-raises as the Tier-1 audit error it owes.
                     raise AuditIntegrityError(
                         f"coalesce_tokens: durable strict pop refused for parent token {ref.token_id!r}: {exc}"
@@ -1724,10 +1749,13 @@ class RowTokenRepository:
 
         The durable Tier-1 twin of ``TokenManager.collect_tokens`` (spec
         §4.2/§4.4; WS1a's single-frame-write-path guard, spec §11). Every
-        member's innermost frame must be ``(EXPAND, group_id, <own
-        token_id>)``, popped via the shared ``pop_closer_frame`` strict-pop
-        contract, and cross-checked for a shared remaining path exactly like
-        ``coalesce_tokens``' FORK pop above.
+        member must carry an ``(EXPAND, group_id, ...)`` frame — innermost,
+        or below only collector release-group frames (META-38) — closed via
+        the shared ``truncate_at_closer_frame`` contract and cross-checked
+        for a shared remaining path exactly like ``coalesce_tokens``' FORK
+        truncation above. The frame's ``member_key`` is NOT checked here
+        (it never was — the executor's roster cross-check owns member
+        identity); only kind and group_id are.
 
         ``member_lineage_paths`` (decision D8, keyed by token_id, mirroring
         ``coalesce_tokens``/``expand_token``): when supplied, each member's
@@ -1818,7 +1846,17 @@ class RowTokenRepository:
             base_paths: set[tuple[LineageFrame, ...]] = set()
             for ref in member_refs:
                 try:
-                    base_paths.add(pop_closer_frame(member_paths[ref.token_id], kind=FrameKind.EXPAND, group_id=group_id))
+                    # META-38 guarded truncation, PER MEMBER before the
+                    # equality check (a collector-in-collector member carries
+                    # its own release-group frame above this group's frame).
+                    base_paths.add(
+                        truncate_at_closer_frame(
+                            member_paths[ref.token_id],
+                            kind=FrameKind.EXPAND,
+                            group_id=group_id,
+                            is_release_group=lambda gid: is_release_group(conn, run_id=run_id, group_id=gid),
+                        )
+                    )
                 except OrchestrationInvariantError as exc:
                     raise AuditIntegrityError(
                         f"collect_tokens: durable strict pop refused for member token {ref.token_id!r}: {exc}"

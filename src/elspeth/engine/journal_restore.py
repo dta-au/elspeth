@@ -24,7 +24,7 @@ Both restorers share one design shape:
 """
 
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -36,6 +36,7 @@ from elspeth.contracts.barrier_scalars import AggregationNodeScalars, CoalescePe
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.identity import innermost_own_frame
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import CoalesceSettings, CollectorSettings
@@ -469,6 +470,7 @@ class CollectorJournalRestorer:
         node_ids: Mapping[str, NodeID],
         barrier_restore_reads: "BarrierRestoreReadModel",
         run_id: str,
+        is_release_group: Callable[[str], bool],
     ) -> None:
         """Initialize restorer.
 
@@ -479,11 +481,16 @@ class CollectorJournalRestorer:
                 Landscape and to scope the M-4 open-hold cross-check.
             barrier_restore_reads: Restore read model for Landscape audit reads.
             run_id: Run identifier for error context and audit queries.
+            is_release_group: META-38 written-fact predicate (the executor's
+                memoised durable read) — the guarded walk that finds each
+                journal row's OWN group frame skips only verified collector
+                release-group frames.
         """
         self._settings = settings
         self._node_ids = node_ids
         self._barrier_restore_reads = barrier_restore_reads
         self._run_id = run_id
+        self._is_release_group = is_release_group
 
     def restore(
         self,
@@ -531,13 +538,17 @@ class CollectorJournalRestorer:
                     f"{resume_checkpoint_id!r}) has NULL barrier_blocked_at — journal "
                     "corruption (every BLOCKED row is stamped at mark_blocked time)."
                 )
-            innermost = item.lineage_path[-1] if item.lineage_path else None
+            # META-38 amendment 1: the row's OWN group frame via the guarded
+            # walk — a collector-in-collector release blocked at the outer
+            # collector carries its release-group frame above the group frame.
+            own = innermost_own_frame(item.lineage_path, is_release_group=self._is_release_group)
+            innermost = None if own is None else own[1]
             if innermost is None or innermost.kind is not FrameKind.EXPAND:
                 raise AuditIntegrityError(
                     f"BLOCKED journal row for token {item.token_id!r} at collector "
                     f"{item.collector_name!r} (run {self._run_id!r}, resume checkpoint "
-                    f"{resume_checkpoint_id!r}) has no innermost EXPAND frame — only expansion "
-                    "members block at a collector barrier; journal corruption."
+                    f"{resume_checkpoint_id!r}) has no innermost EXPAND frame (searched below collector "
+                    "release-group frames) — only expansion members block at a collector barrier; journal corruption."
                 )
             if item.token_id in group_of:
                 raise AuditIntegrityError(

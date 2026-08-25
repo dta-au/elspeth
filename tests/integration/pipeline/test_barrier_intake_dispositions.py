@@ -67,6 +67,7 @@ from elspeth.engine.spans import SpanFactory
 from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_row
 from tests.fixtures.factories import make_context
+from tests.fixtures.group_lineage import ensure_fork_group_record
 from tests.unit.engine.test_processor import (
     _make_factory,
     _make_processor,
@@ -176,6 +177,9 @@ def _arrive_via_intake(factory: Any, processor: Any, token: TokenInfo, *, ingest
         ingest_sequence=ingest_sequence,
         coalesce_name="merge",
     )
+    # META-38: the crafted FORK frame's group gets the group_records row a real
+    # fork mints (the merge reads the written release fact for it).
+    ensure_fork_group_record(factory, run_id=RUN_ID, group_id=token.lineage_path[-1].group_id, opener_token_id=token.token_id)
     processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
     return processor.run_barrier_intake(ctx)
 
@@ -207,6 +211,7 @@ def _record_foreign_loss(db: LandscapeDB, clock: MockClock, factory: Any, *, bra
     so the loss row needs a real token to reference.
     """
     _persist_token_for_scheduler(factory, _branch_token(branch, token_id=token_id))
+    ensure_fork_group_record(factory, run_id=RUN_ID, group_id="fg-row-1", opener_token_id=token_id)
     with begin_write(db.engine) as conn:
         assert record_group_loss(
             conn,

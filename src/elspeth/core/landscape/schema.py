@@ -1104,10 +1104,14 @@ group_records_table = Table(
     CheckConstraint(_enum_in_check("kind", FrameKind), name="ck_group_records_kind"),
     ForeignKeyConstraint(["opener_token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
 )
-# One token opens at most one group. For fork/expand openers: every opener
-# records a terminal parent disposition (FORK_PARENT / EXPAND_PARENT /
-# BATCH_CONSUMED / FILTER_DROPPED) in the same claim, so a second open is
-# unreachable — this uniqueness is what makes the empty-expansion mint
+# One token opens at most one group. For fork/expand openers: a non-empty
+# opener records its terminal parent disposition (FORK_PARENT /
+# EXPAND_PARENT / BATCH_CONSUMED) in the same claim as its group_records
+# row; an EMPTY expansion is the measured exception (META-38 amendment 2):
+# record_empty_expansion writes only the member_count=0 row, and the
+# opener's FILTER_DROPPED terminal lands later from the traversal
+# (token_traversal.py) — that transactional gap is ticketed separately. A
+# second open is unreachable either way — this uniqueness is what makes the empty-expansion mint
 # idempotent under re-driven claims.
 #
 # For a COLLECT release's opener (a group MEMBER token, not an "opener" in

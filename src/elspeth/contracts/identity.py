@@ -6,6 +6,7 @@ These types answer: "How do we refer to things?"
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from elspeth.contracts.enums import FrameKind
@@ -101,30 +102,113 @@ def path_expand_group_id(path: tuple[LineageFrame, ...]) -> str | None:
     return None if frame is None else frame.group_id
 
 
-def pop_closer_frame(path: tuple[LineageFrame, ...], *, kind: FrameKind, group_id: str) -> tuple[LineageFrame, ...]:
-    """Strict pop (spec rulings 24/28): remove exactly the closer's own frame.
+def truncate_at_closer_frame(
+    path: tuple[LineageFrame, ...],
+    *,
+    kind: FrameKind,
+    group_id: str,
+    is_release_group: Callable[[str], bool],
+) -> tuple[LineageFrame, ...]:
+    """Guarded truncation at the closer's own frame (spec rulings 24/28 as amended by META-38).
 
-    The closer names the frame it is entitled to pop (kind + group_id).
-    Anything else — an empty path, a different innermost kind, a different
-    group — is lineage corruption, never a recoverable state. Both strict-pop
-    layers (engine coalesce_tokens and the durable Tier-1 twin) route through
-    this one function so the refusal semantics cannot drift.
+    A MERGING closer (coalesce, collector) consumes its members and mints a
+    successor whose lineage is the path BELOW the closer's frame. The closer
+    names the frame it is entitled to close (kind + group_id); this scans
+    innermost → outward for it and returns ``path[:index]``. Whenever that
+    frame IS innermost the result is byte-identical to the old strict pop.
+
+    Frames strictly ABOVE the match are allowed only if EVERY one is a
+    collector RELEASE group — ``is_release_group(frame.group_id)`` must
+    answer True for each. A release group is pure provenance: it has no
+    closer of its own, so its frame stays innermost on the release token
+    for the rest of that token's life and the enclosing closer legitimately
+    truncates through it (a release inside a fork reaching the coalesce; a
+    collector-in-collector release reaching the outer collector). ANY other
+    frame above the match — a real fork or expand scope that has not closed
+    — is an orchestration invariant violation (SESE nesting, spec §7 rule 5)
+    and raises; it is never skippable. The predicate is the caller's: the
+    engine memoises ``TokenManager.is_release_group``, the durable twin
+    reads the written ``group_records.closes_group_id`` fact in its own
+    transaction — this Tier-1 identity code holds no config and derives
+    nothing.
+
+    An absent frame — an empty path, no frame of that kind, a different
+    group — is lineage corruption, never a recoverable state (the old
+    refusal, unchanged). Every closer routes through this one function so
+    the refusal semantics cannot drift; ``pop_fork_frame`` (a pass-through
+    closer's pop) is deliberately separate.
     """
-    if not path or path[-1].kind is not kind or path[-1].group_id != group_id:
-        innermost = path[-1] if path else None
-        raise OrchestrationInvariantError(
-            f"pop_closer_frame: path has no matching innermost {kind.name} frame for group {group_id!r} "
-            f"(innermost={innermost!r}); a closer pops exactly its own frame (spec rulings 24/28)"
-        )
-    return path[:-1]
+    if path and path[-1].kind is kind and path[-1].group_id == group_id:
+        # The closer's own frame is innermost: the old strict pop, verbatim,
+        # with no predicate read — a closer's group is a declared scope or
+        # fork group and is never a release group.
+        return path[:-1]
+    own = innermost_own_frame(path, is_release_group=is_release_group)
+    if own is not None:
+        index, frame = own
+        if frame.kind is kind and frame.group_id == group_id:
+            return path[:index]
+        if any(deeper.kind is kind and deeper.group_id == group_id for deeper in path[:index]):
+            raise OrchestrationInvariantError(
+                f"truncate_at_closer_frame: {frame.kind.name} frame for group {frame.group_id!r} sits above the "
+                f"{kind.name} frame for group {group_id!r} and is not a collector release group — an unclosed "
+                f"scope inside a closing region is not skippable (spec §7 rule 5; path={path!r})"
+            )
+    innermost = path[-1] if path else None
+    raise OrchestrationInvariantError(
+        f"truncate_at_closer_frame: path has no matching innermost {kind.name} frame for group {group_id!r} "
+        f"(innermost={innermost!r}, searched below collector release-group frames); a closer closes exactly "
+        "its own frame (spec rulings 24/28)"
+    )
+
+
+def innermost_own_frame(
+    path: tuple[LineageFrame, ...],
+    *,
+    is_release_group: Callable[[str], bool],
+) -> tuple[int, LineageFrame] | None:
+    """THE guarded walk (META-38): a token's OWN group frame and its index.
+
+    Innermost → outward, skipping ONLY frames the caller's predicate
+    verifies as collector release groups (the written
+    ``group_records.closes_group_id`` fact), to the first frame that is not
+    one — the frame of the group the token is currently a member of. A
+    collector release carries its release-group frame(s) innermost, and a
+    release of a release carries a run of them (expand-of-a-release →
+    close → two consecutive release frames); every one is skipped, nothing
+    else is. ``None`` when the path is empty or every frame is a release
+    frame (a release whose own scope has fully closed — an ordinary
+    consumer or a sink awaits it).
+
+    The single derivation behind every "this token's group" question: the
+    merging closers' truncation (:func:`truncate_at_closer_frame`), the
+    collector arrival keying (barrier key, member key, roster lookup — on
+    the traversal, the intake adoption, the executor's ``accept`` and the
+    journal restore), and the coalesce anchor. Never index ``[-1]``, never
+    ``innermost_fork_frame`` for an anchor — the latter skips EVERY EXPAND
+    frame, including an unreleased scope's, which is exactly the shape the
+    guard must reject.
+    """
+    for index in range(len(path) - 1, -1, -1):
+        frame = path[index]
+        if is_release_group(frame.group_id):
+            continue
+        return index, frame
+    return None
 
 
 def pop_fork_frame(path: tuple[LineageFrame, ...], *, group_id: str) -> tuple[LineageFrame, ...]:
     """Remove the FORK frame identified by group_id, wherever it sits (ruling 27).
 
-    Unlike pop_closer_frame's strict-innermost pop (rulings 24/28, where a
-    closer's own frame IS the innermost frame by construction — coalesce and
-    fork are strictly LIFO-nested), a row_union release closes only the
+    The PASS-THROUGH closer's pop, as distinct from the MERGING closers'
+    :func:`truncate_at_closer_frame`: a row_union releases the ORIGINAL
+    tokens, so every frame other than the union's own FORK frame is
+    preserved in place (a surviving EXPAND frame, a collector release-group
+    frame); a merging closer mints a successor and truncates to the path
+    below its frame, passing through release-group frames only. Unlike the
+    strict-innermost pop (rulings 24/28, where a merging closer's own frame
+    IS the innermost frame by construction — coalesce and fork are strictly
+    LIFO-nested), a row_union release closes only the
     branch-selection scope. A row-multiplying transform inside the branch
     (e.g. an expand) may have stacked an EXPAND frame on top of the branch's
     FORK frame before the token reached the union — elspeth-a5b86149d4,
