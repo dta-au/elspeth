@@ -126,6 +126,25 @@ is a working document under the normal delivery posture.
     work, together with the proposal-projection/frontend parity sweep it
     describes. Do not remove the guard or extend the projection ahead of it.
 
+- **2026-08-25 — RULED exemption to "never regenerate the pre-flip oracle" (META-39),
+  and the rule that would have caught it earlier.** `fork-coalesce-policies`
+  `require-all-lost-c` + `quorum-impossible-lost-c` were re-frozen 2026-08-25
+  under ADR-042 (META-39): the old snapshots witnessed a failed-group survivor
+  labelled `late_arrival_after_merge`, which spec §2 rev 3.2 forbids — the
+  engine is right, the oracle pinned a locked-in-buggy label. The never-
+  regenerate rule guards ZERO-behaviour-delta checkpoints (WS1), not ruled
+  vocabulary changes; a ruled re-freeze is still a per-case
+  `ELSPETH_ORACLE_FREEZE=write …::test_frozen_oracle_surface[<scenario>--<case>]`
+  write from a CLEAN export (the live tree carries sibling WIP in `src/`),
+  plus those cases' `projection_sha256` in
+  `docs/architecture/dag/scenario-corpus/v1/manifest.yaml` — and `git status
+  --porcelain` must show only those files. RULE (learned the hard way): any
+  change touching disposition / terminal / settlement VOCABULARY bytes MUST
+  include `tests/integration/core/dag` in its export verification selection —
+  a reason string feeds `compute_error_hash`, so the corpus's frozen
+  `error_hash` and `projection_sha256` move even when every count is
+  unchanged. 532f037fe shipped green on a 13-suite selection that excluded it.
+
 - **2026-08-23 — a NEW corpus case fails the WS1 frozen-oracle gate closed, and
   the fix is a scoped write, never a full regenerate.** `tests/integration/core/
   dag/test_oracle_freeze.py::test_frozen_oracle_surface` (campaign instrument,
