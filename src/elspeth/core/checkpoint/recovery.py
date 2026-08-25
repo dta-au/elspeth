@@ -422,12 +422,10 @@ def check_group_satisfiability_resumable(
             )
             .distinct()
         ).fetchall()
-        fork_members_seen: dict[str, set[str]] = {}
-        for row in fork_rows:
-            fork_members_seen.setdefault(str(row.group_id), set()).add(str(row.member_key))
+        fork_member_pairs = [(str(row.group_id), str(row.member_key)) for row in fork_rows]
 
-        for group_id in sorted(fork_members_seen):
-            seen = fork_members_seen[group_id]
+        for group_id in sorted({pair_group_id for pair_group_id, _ in fork_member_pairs}):
+            seen = {member_key for pair_group_id, member_key in fork_member_pairs if pair_group_id == group_id}
             bound = {member for member in seen if member in bindings.fork_branch_closers}
             if not bound:
                 continue  # fully unbound fork: pure fan-out, no roster watching
