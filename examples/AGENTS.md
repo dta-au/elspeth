@@ -186,7 +186,7 @@ If a pipeline is interrupted, resume with the command shown in the output.
 
 | Example | Notes |
 |---------|-------|
-| `textract_inline` | Copy JPEG/PNG/single-page PDF files into `input/`, run `python examples/textract_inline/scripts/prepare_document_blobs.py` (stages blobs, writes `settings.generated.yaml`), then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute`. Each row is one billable `AnalyzeDocument` call. |
+| `textract_inline` | Copy JPEG/PNG/single-page PDF files into `input/`, run `python examples/textract_inline/scripts/prepare_document_blobs.py` (stages blobs, writes `settings.generated.yaml`), then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute`. Each row is one billable `AnalyzeDocument` call. A multipage PDF is not accepted by the prepare script — rasterize it into per-page PNGs with `pdf_rasterize` first. |
 
 ### Not a runnable pipeline
 

@@ -361,7 +361,7 @@ image without `DATABASE_URL` reports the database check as skipped:
     "database": {"status": "skip", "value": "DATABASE_URL not set"},
     "config_dir": {"status": "ok", "value": "/app/config"},
     "output_dir": {"status": "ok", "value": "/app/output"},
-    "plugins": {"status": "ok", "value": "7 sources, 31 transforms, 8 sinks"},
+    "plugins": {"status": "ok", "value": "9 sources, 34 transforms, 9 sinks"},
     "web": {"status": "skip", "value": "skipped via --skip-web"}
   }
 }

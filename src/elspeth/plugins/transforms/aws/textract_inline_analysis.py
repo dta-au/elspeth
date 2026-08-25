@@ -255,7 +255,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7beadca2550f4b0f"
+    source_file_hash: str | None = "sha256:ab7447e0bcddddf7"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -264,14 +264,15 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     capability_tags = ("aws", "textract", "ocr", "inline", "blob", "enrichment")
 
     usage_when_to_use = (
-        "Use when each row carries a payload-store content hash (from the blob_rows source) for a JPEG, PNG, or "
-        "single-page PDF document up to 5 MiB and you need synchronous Textract OCR, forms, tables, queries, "
-        "signatures, or layout enrichment. Extracted remote content remains untrusted before LLM consumption."
+        "Use when each row carries a payload-store content hash (from the blob_rows source, or one rasterized "
+        "page per row from pdf_rasterize) for a JPEG, PNG, or single-page PDF document up to 5 MiB and you need "
+        "synchronous Textract OCR, forms, tables, queries, signatures, or layout enrichment. Extracted remote "
+        "content remains untrusted before LLM consumption."
     )
     usage_when_not_to_use = (
-        "Not for multipage or larger documents, or documents already stored in S3 — use "
-        "aws_textract_document_analysis for those. AnalyzeDocument has no idempotency guarantee, so SDK "
-        "and engine retries can each repeat a billable provider call."
+        "Not for multipage or larger documents, or documents already stored in S3 — rasterize it with "
+        "pdf_rasterize first, or use aws_textract_document_analysis. AnalyzeDocument has no idempotency "
+        "guarantee, so SDK and engine retries can each repeat a billable provider call."
     )
     example_use = (
         "transform:\n"
@@ -724,8 +725,9 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 "Rows come from the blob_rows source; the default blob_ref_field matches its blob_ref output.",
                 "document_format is required and never inferred — spell JPEG as jpeg; the runtime rejects a "
                 "byte-signature mismatch fail-closed.",
-                "PDF support is single-page only; mixed formats need homogeneous sources or branches with one "
-                "transform instance per format.",
+                "PDF support is single-page only; a multipage PDF goes through pdf_rasterize first, and the "
+                "downstream node then sets blob_ref_field: page_blob_ref and document_format: png. Mixed formats "
+                "need homogeneous sources or branches with one transform instance per format.",
                 "Multipage, oversized, or already-S3 documents belong in aws_textract_document_analysis.",
                 "Synchronous AnalyzeDocument has no idempotency guarantee, so SDK and engine retries can each repeat a billable provider call.",
                 "For explicit AWS credentials, use ELSPETH markers such as {secret_ref: AWS_ACCESS_KEY_ID}.",

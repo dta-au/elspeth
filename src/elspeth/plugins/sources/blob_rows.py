@@ -4,9 +4,9 @@ A generic source for binary-document (and other payload-store) workflows:
 each configured entry becomes exactly one row carrying the blob's custody
 identity and bounded metadata. The source never parses, decodes, or copies
 blob content — ``blob_ref`` is the content-addressed ``PayloadStore``
-reference a consuming transform (e.g. ``aws_textract_inline_analysis``)
-uses for integrity-checked retrieval immediately before its external call
-(elspeth-0c6a343921).
+reference a consuming transform (e.g. ``aws_textract_inline_analysis`` or
+``pdf_rasterize``) uses for integrity-checked retrieval immediately before
+its external call (elspeth-0c6a343921).
 
 Authority boundaries: for web-authored pipelines every entry is populated
 by the trusted plural blob resolver (``set_source_from_blobs``), never
@@ -121,7 +121,7 @@ class BlobRowsSource(BaseSource):
     name = "blob_rows"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:083891225d454848"
+    source_file_hash: str | None = "sha256:30fac7a29eeb8e48"
     config_model = BlobRowsSourceConfig
     # DESIGN DEVIATION (recorded for adjudication): the approved design lists
     # ``creates_tokens = True``, but that attribute exists only on the
@@ -168,7 +168,8 @@ class BlobRowsSource(BaseSource):
                     "Bind blobs with set_source_from_blobs — never author or edit the blobs list directly.",
                     "Multiple blobs preserve their binding order as the source-row order.",
                     "Rows carry blob_ref (the payload hash) for downstream retrieval; they never contain document bytes.",
-                    "Mixed document formats need homogeneous sources or branches — one explicitly configured consumer per format.",
+                    "Mixed document formats need homogeneous sources or branches — one explicitly configured "
+                    "consumer per format; a multipage PDF can be split into PNG pages by pdf_rasterize.",
                 ),
             )
         return None
