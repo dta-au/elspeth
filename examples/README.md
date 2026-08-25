@@ -20,6 +20,7 @@ Some examples need setup or use multiple configurations:
 |---------|-----------------------|
 | `database_sink` | `./examples/database_sink/run.sh` |
 | `blob_transforms` (offline) | `./examples/blob_transforms/run.sh` |
+| `pdf_rasterize` | `./examples/pdf_rasterize/run.sh` |
 | `blob_transforms` (hosted fetch) | `./examples/blob_transforms/run_hosted_fetch.sh` |
 | `chroma_rag` | `./examples/chroma_rag/run.sh` |
 | `chroma_rag_qa` (OpenRouter) | `./examples/chroma_rag_qa/run.sh` |
@@ -57,6 +58,7 @@ These examples run locally with no credentials or external services.
 | [`checkpoint_resume`](checkpoint_resume/) | Crash recovery via checkpointing and `elspeth resume` |
 | [`retention_purge`](retention_purge/) | Payload retention lifecycle and `elspeth purge` |
 | [`blob_transforms`](blob_transforms/) | Blob-backed ingestion: offline CSV expansion via `run.sh`, plus opt-in hosted tutorial HTML fetch via `run_hosted_fetch.sh` |
+| [`pdf_rasterize`](pdf_rasterize/) | Multipage PDF to PNG page rows via `run.sh`, with a malformed-document quarantine |
 | [`audit_export`](audit_export/) | Export the Landscape audit trail to JSON |
 | [`landscape_journal`](landscape_journal/) | Event journaling for real-time audit monitoring |
 | [`multi_flow`](multi_flow/) | Two independent named source flows in one run |
@@ -146,6 +148,7 @@ Some examples deliberately exercise failure accounting:
 | Example or variant | Expected result |
 |--------------------|-----------------|
 | `deep_routing`, `error_routing` | `PARTIAL`, exit 1; packaged blocked-content rows reach quarantine |
+| `pdf_rasterize` | `PARTIAL`, exit 1; 1 malformed PDF is quarantined by design (3 page rows still succeed) |
 | `fork_coalesce/settings_union_fail.yaml` | `FAILED`, non-zero exit; the first field collision aborts the run |
 | `row_union_ab_experiment/settings_screened_at_settlement.yaml` | `PARTIAL`, exit 1; screened pairs fail closed and remain audited |
 | ChaosLLM / ChaosWeb realistic fault profiles | Stochastic `COMPLETED`, `PARTIAL`, or preflight failure depending on injected faults; verify every ingested row reached a result or error sink |
@@ -180,6 +183,7 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Aggregation (N to 1)** | [`batch_aggregation`](batch_aggregation/) — count triggers, group-by stats; [`report_assemble`](report_assemble/) — paginated markdown reports |
 | **Statistical batch QA** | [`statistical_batch_plugins`](statistical_batch_plugins/) — prompt/model score comparisons, classifier metrics, drift, outlier annotation, data quality, top-k, thresholds, and effect sizes |
 | **Deaggregation (1 to N)** | [`deaggregation`](deaggregation/), [`json_explode`](json_explode/), or [`blob_transforms`](blob_transforms/) |
+| **PDF to page images** | [`pdf_rasterize`](pdf_rasterize/) — one PNG page row per page, with malformed-document quarantine |
 | **Type normalization and derived fields** | [`transform_pipeline`](transform_pipeline/) — coerce CSV strings to typed values, then compute dependent fields |
 | **LLM as a source (no input rows)** | [`llm_source`](llm_source/) — one static authored prompt produces one generated row |
 | **LLM integration (quick start)** | [`openrouter_sentiment`](openrouter_sentiment/) — simplest real LLM pipeline |
