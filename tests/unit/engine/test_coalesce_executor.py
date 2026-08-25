@@ -23,7 +23,7 @@ import pytest
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.barrier_scalars import CoalescePendingScalars
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
-from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     CoalesceCollisionError,
@@ -4420,3 +4420,35 @@ class TestObservedUnionCoalesce:
         assert outcome.held is False
         assert outcome.merged_token is not None
         assert any(f.normalized_name == "y" for f in outcome.merged_token.row_data.contract.fields)
+
+
+class TestSurvivorHoldCarriesCauseAndDispositionMeta40:
+    """META-40 (spec §6.3): a survivor of a FAILING coalesce group keeps the
+    group's CAUSE (``failure_reason``) on its own hold node_state beside its
+    settlement disposition ``scope_group_failed`` — the closed vocabulary the
+    settle seam also writes on its terminal."""
+
+    def test_require_all_failure_payload_carries_cause_and_scope_group_failed(self):
+        executor, execution, _, _, clock = _make_executor()
+        s = _settings(policy="require_all", timeout_seconds=5.0)
+        executor.register_coalesce(s, "node_1")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        clock.advance(6.0)
+        executor.check_timeouts("merge")
+        fail_call = next(c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED)
+        error = fail_call.kwargs["error"]
+        assert error.failure_reason == "incomplete_branches"
+        assert error.member_disposition == GroupSettlementReason.SCOPE_GROUP_FAILED.value
+        assert error.to_dict()["member_disposition"] == "scope_group_failed"
+
+    def test_late_arrival_payload_disposition_is_its_own_settlement_reason(self):
+        executor, execution, _, _, _ = _make_executor()
+        s = _settings(policy="first")
+        executor.register_coalesce(s, "node_1")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        late = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        assert late.failure_reason == GroupSettlementReason.LATE_ARRIVAL_AFTER_MERGE.value
+        fail_call = next(c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED)
+        error = fail_call.kwargs["error"]
+        # A late arrival's failure_reason IS its disposition — carried on both fields.
+        assert (error.failure_reason, error.member_disposition) == (late.failure_reason, late.failure_reason)

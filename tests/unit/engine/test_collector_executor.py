@@ -20,7 +20,7 @@ import pytest
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalPath
+from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, PluginContractViolation
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
@@ -379,6 +379,32 @@ class _CollectorEnv:
                 .one()
             )
         return str(json.loads(row["error_json"])["phase"])
+
+    def node_state_error_for_token(self, *, node: str, token_id: str) -> dict[str, Any]:
+        """The full parsed error_json of THIS token's own hold state at the
+        collector node (META-40: the survivor's structured cause + disposition)."""
+        import json
+
+        from sqlalchemy import select
+
+        assert node == "stitch"
+        with self.db.connection() as conn:
+            row = (
+                conn.execute(
+                    select(node_states_table.c.error_json)
+                    .where(node_states_table.c.run_id == self.run_id)
+                    .where(node_states_table.c.node_id == str(self.node_id))
+                    .where(node_states_table.c.token_id == token_id)
+                    .where(node_states_table.c.error_json.is_not(None))
+                    .order_by(node_states_table.c.completed_at.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .one()
+            )
+        parsed = json.loads(row["error_json"])
+        assert isinstance(parsed, dict)
+        return parsed
 
     def node_state_error_exception_for_token(self, *, node: str, token_id: str) -> str:
         """The error_json['exception'] text for THIS token's own hold state —
@@ -1505,3 +1531,28 @@ class TestCollectorInCollectorArrivalMeta38:
         assert outcome.group_id == outer_group_id
         assert outcome.released_tokens and outcome.consumed_tokens == (release_token,)
         assert env.executor.buffered_member_count() == 0
+
+
+class TestSurvivorHoldCarriesCauseAndDispositionMeta40:
+    """META-40 (spec §6.3): a survivor of a FAILING group keeps the group's
+    CAUSE structurally on its own hold node_state, beside its settlement
+    disposition ``scope_group_failed`` — the closed vocabulary the settle
+    seam also writes on its terminal — not only in the message text."""
+
+    def test_require_all_loss_failure_writes_cause_and_disposition_on_every_survivor(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        members, group_id = env.seed_group(count=3)
+        env.executor.accept(members[0], "stitch")
+        env.executor.accept(members[1], "stitch")
+        lost_key = members[2].lineage_path[-1].member_key
+        outcome = env.executor.notify_member_lost("stitch", group_id, lost_key, "quarantined")
+
+        assert outcome is not None and outcome.failure_reason == "collector_missing_members"
+        for survivor in members[:2]:
+            error = env.node_state_error_for_token(node="stitch", token_id=survivor.token_id)
+            assert error["type"] == "CollectorGroupFailure"
+            assert error["context"] == {
+                "failure_reason": "collector_missing_members",
+                "lost_members": [lost_key],
+                "member_disposition": GroupSettlementReason.SCOPE_GROUP_FAILED.value,
+            }

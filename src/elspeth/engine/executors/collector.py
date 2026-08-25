@@ -837,10 +837,20 @@ class CollectorExecutor:
             exception_text = f"Collector group {group_id!r} failed ({failure_reason}): lost members {sorted(pending.lost)!r}"
         else:
             exception_text = f"Collector group {group_id!r} failed ({failure_reason})"
+        # META-40: every arrived member is a SURVIVOR of the failing group —
+        # its hold carries the group-level CAUSE (failure_reason, lost
+        # members) STRUCTURALLY beside its own settlement disposition
+        # (scope_group_failed, spec §6.3), not only in the message text; the
+        # settle seam writes the same disposition on the survivor's terminal.
         error = ExecutionError(
             exception=exception_text,
             exception_type="CollectorGroupFailure",
             phase="collector_flush",
+            context={
+                "failure_reason": failure_reason,
+                "lost_members": sorted(pending.lost),
+                "member_disposition": GroupSettlementReason.SCOPE_GROUP_FAILED.value,
+            },
         )
         for entry in pending.arrived.values():
             # Close out THIS token's own accept()-time hold (canon item 11) —

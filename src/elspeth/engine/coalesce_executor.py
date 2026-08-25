@@ -872,6 +872,8 @@ class CoalesceExecutor:
                 expected_branches=tuple(settings.branches),
                 branches_arrived=(),  # Late arrival — merge already happened
                 merge_policy=settings.merge,
+                # A late arrival's failure_reason IS its settlement disposition.
+                member_disposition=failure_reason,
             )
             self._execution.complete_node_state(
                 state_id=state.state_id,
@@ -1075,7 +1077,11 @@ class CoalesceExecutor:
         consumed_tokens = tuple(e.token for e in pending.branches.values())
         now = self._clock.monotonic()
 
-        # Complete pending node states with failure
+        # Complete pending node states with failure. META-40: every arrived
+        # branch is a SURVIVOR of the failing group — its hold carries the
+        # group-level CAUSE (failure_reason) beside its own settlement
+        # disposition (scope_group_failed, spec §6.3), the closed vocabulary
+        # the settle seam also writes on its terminal.
         error = CoalesceFailureReason(
             failure_reason=failure_reason,
             expected_branches=tuple(settings.branches),
@@ -1083,6 +1089,7 @@ class CoalesceExecutor:
             merge_policy=settings.merge,
             timeout_ms=int(settings.timeout_seconds * 1000) if is_timeout and settings.timeout_seconds is not None else None,
             select_branch=select_branch,
+            member_disposition=GroupSettlementReason.SCOPE_GROUP_FAILED.value,
         )
         for _branch_name, entry in pending.branches.items():
             self._execution.complete_node_state(

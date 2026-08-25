@@ -121,6 +121,7 @@ from elspeth.contracts.declaration_contracts import (
 )
 from elspeth.contracts.enums import (
     FrameKind,
+    GroupSettlementReason,
     NodeStateStatus,
     OutputMode,
     RoutingKind,
@@ -3743,7 +3744,18 @@ class RowProcessor:
             )
         remaining_path = remaining_paths.pop()
 
-        error_hash = compute_error_hash(failure_reason) if outcome is TerminalOutcome.FAILURE else None
+        # META-40 (spec §6.3 "survivors terminate scope_group_failed"): a
+        # member consumed by its group's FAILURE terminates under the closed
+        # settlement vocabulary, for every closer kind — never under the
+        # executor's cause. The cause is not lost: the executor wrote it
+        # structurally on each survivor's own hold node_state
+        # (CoalesceFailureReason.failure_reason / CollectorGroupFailure's
+        # context.failure_reason) beside this same disposition, and the
+        # escalation walk below still stages the bare "group_failed" for the
+        # enclosing frame. A non-group-failed FAILURE (the late-arrival arm)
+        # already passes its settlement reason as ``failure_reason``.
+        terminal_reason = GroupSettlementReason.SCOPE_GROUP_FAILED.value if group_failed else failure_reason
+        error_hash = compute_error_hash(terminal_reason) if outcome is TerminalOutcome.FAILURE else None
         for consumed in consumed_tokens:
             self._data_flow.record_token_outcome(
                 ref=TokenRef(token_id=consumed.token_id, run_id=self._run_id),

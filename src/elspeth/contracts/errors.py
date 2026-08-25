@@ -263,11 +263,18 @@ class CoalesceFailureReason:
     merge_policy: str  # Merge policy in effect
     timeout_ms: int | None = None  # Timeout that triggered failure (if applicable)
     select_branch: str | None = None  # Target branch for select policy (if applicable)
+    # META-40: the settlement disposition of the MEMBER whose hold this
+    # payload closes (a GroupSettlementReason value — "scope_group_failed"
+    # for a survivor of the failing group), carried BESIDE the group-level
+    # cause in ``failure_reason``. Omitted from the audit dict when None.
+    member_disposition: str | None = None
 
     def __post_init__(self) -> None:
         """Validate coalesce failure record invariants."""
         if not self.failure_reason:
             raise ValueError("CoalesceFailureReason.failure_reason must not be empty")
+        if self.member_disposition is not None and not self.member_disposition:
+            raise ValueError("CoalesceFailureReason.member_disposition must not be empty when set")
         if not self.merge_policy:
             raise ValueError("CoalesceFailureReason.merge_policy must not be empty")
         if not self.expected_branches:
@@ -291,6 +298,8 @@ class CoalesceFailureReason:
             d["timeout_ms"] = self.timeout_ms
         if self.select_branch is not None:
             d["select_branch"] = self.select_branch
+        if self.member_disposition is not None:
+            d["member_disposition"] = self.member_disposition
         return d
 
 

@@ -20,7 +20,7 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import RowResult, TokenInfo
-from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, GroupSettlementReason, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError, SchedulerLeaseLostError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
@@ -29,6 +29,7 @@ from elspeth.contracts.types import CoalesceName, CollectorName, NodeID
 from elspeth.core.dag.group_bindings import GroupBinding
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
+from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.barrier_coordination import BarrierIntakeCoordinator, BarrierIntakeDispositionKind
 from elspeth.engine.clock import MockClock
 from elspeth.engine.executors.collector import CollectorOutcome
@@ -121,7 +122,11 @@ class TestSeamCollectorArm:
             recorded = factory.data_flow.get_token_outcome(token.token_id)
             assert recorded is not None
             assert (recorded.outcome, recorded.path) == (TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
-            assert recorded.error_hash is not None
+            # META-40 (spec §6.3): a survivor of the FAILING group terminates
+            # under the closed settlement vocabulary, never the executor's
+            # cause (the cause lives on the survivor's own hold node_state).
+            assert recorded.error_hash == compute_error_hash(GroupSettlementReason.SCOPE_GROUP_FAILED.value)
+            assert recorded.error_hash != compute_error_hash("collector_missing_members")
 
     def test_failed_group_escalates_a_group_failed_loss_against_the_enclosing_bound_frame(self) -> None:
         """The walk for real: the members' remaining lineage is an OUTER fork
