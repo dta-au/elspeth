@@ -548,13 +548,12 @@ class CollectorExecutor:
     ) -> None:
         """Rebuild pending collector groups from journal BLOCKED rows (Task 7, F1 resume path).
 
-        Call EXACTLY ONCE per resume, and hold a FIXED order against WS3's
-        group-loss intake replay (I-7): whichever of {this call, that
-        replay} runs first, the order must be consistent, not accidental —
-        ``notify_member_lost`` calls ``_open_group`` itself when it sees a
-        group with no pending entry, and a subsequent
-        ``restore_from_journal`` call would then find a non-empty
-        ``self._pending`` and raise below.
+        Call EXACTLY ONCE per resume, on an EMPTY executor (the raise
+        below): the resume path runs it at processor construction, before
+        any intake pass — ``notify_member_lost`` calls ``_open_group`` itself
+        when it sees a group with no pending entry, so a restore that ran
+        after any live notify would find a non-empty ``self._pending`` and
+        refuse rather than clobber it.
 
         Validation (structural checks, completed-group discovery — which
         ALSO reconstructs the settled-token-id memory a post-closure
@@ -603,15 +602,15 @@ class CollectorExecutor:
         shape, not an edge case. This method has no ``PluginContext`` and so
         cannot flush; it installs such a group like any other and parks its
         key for :meth:`flush_restored_complete_groups`, the post-restore
-        flush-trigger sweep the resume path MUST call after this method
-        (and after WS3's loss replay, I-7). Nothing else re-evaluates a
+        flush-trigger sweep the resume path MUST call after this method,
+        from a ``PluginContext``-bearing intake pass. Nothing else re-evaluates a
         group whose roster already satisfies ``_roster_settled`` — a resume
         path that restores and never sweeps leaves a silent, permanently-
         unflushable wedge.
 
         Raises:
             OrchestrationInvariantError: If ``self._pending`` is non-empty
-                (I-7's ordering guard — mirrors
+                (the empty-executor guard — mirrors
                 ``RowUnionExecutor.restore_from_journal``'s identical
                 "restore requires an empty executor" precedent).
             AuditIntegrityError: On any journal/audit disagreement — see
@@ -716,9 +715,11 @@ class CollectorExecutor:
         :meth:`restore_from_journal` installed with an already-complete roster.
 
         The ``PluginContext``-bearing follow-up call that restore itself
-        cannot make. Call once per resume, after ``restore_from_journal``
-        and after WS3's group-loss replay (I-7 order), from the same resume
-        path — the returned outcomes carry the same ``consumed_tokens`` a
+        cannot make. Call once per resume, after the ``restore_from_journal``
+        that parked the keys, from a ctx-bearing intake pass (the order
+        against the group-loss replay is NOT load-bearing — a roster
+        completed by ledger-rebuilt losses is parked by restore itself) —
+        the returned outcomes carry the same ``consumed_tokens`` a
         live closing ``accept()`` would have produced and must reach the
         settle-member seam exactly as a live outcome does. Idempotent: the
         parked keys are consumed, so a second call returns ``()``. A group
