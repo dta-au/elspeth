@@ -57,6 +57,7 @@
     ]
   },
   "enabledPlugins": {
+    "yzmir-systems-thinking@foundryside-marketplace": true,
     "meta-sme-protocol@foundryside-marketplace": true,
     "axiom-python-engineering@foundryside-marketplace": true,
     "axiom-web-backend@foundryside-marketplace": true,
