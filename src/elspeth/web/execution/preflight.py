@@ -210,6 +210,10 @@ def _configured_plugin_ids(settings: ElspethSettings) -> tuple[PluginId, ...]:
         *(PluginId("source", source.plugin) for source in settings.sources.values()),
         *(PluginId("transform", transform.plugin) for transform in settings.transforms),
         *(PluginId("transform", aggregation.plugin) for aggregation in settings.aggregations),
+        # Collectors are plugin-bearing (batch-transform contract, ADR-042):
+        # omitting them let a policy-hidden batch plugin execute as an
+        # EXPAND-group closer after authoring (2026-08-26 systems review).
+        *(PluginId("transform", collector.plugin) for collector in settings.collectors),
         *(PluginId("sink", sink.plugin) for sink in settings.sinks.values()),
     )
 
@@ -495,6 +499,7 @@ def _audit_safe_plugin_configs(
     authored_sources = _authored_sources(audit_safe_settings)
     authored_transforms = _authored_named_components(audit_safe_settings, "transforms")
     authored_aggregations = _authored_named_components(audit_safe_settings, "aggregations")
+    authored_collectors = _authored_named_components(audit_safe_settings, "collectors")
     authored_sinks = _required_component_mapping(
         audit_safe_settings,
         "sinks",
@@ -532,6 +537,16 @@ def _audit_safe_plugin_configs(
                 aggregation_name,
                 PluginId("transform", aggregation_settings.plugin),
             )
+        # Latent today (no profiled plugin is batch-aware) but a profiled
+        # collector closer would otherwise snapshot its profile-lowered
+        # private config into the node audit instead of authored options.
+        for collector_name, (plugin, collector_settings) in bundle.collectors.items():
+            substitute(
+                plugin,
+                authored_collectors,
+                collector_name,
+                PluginId("transform", collector_settings.plugin),
+            )
         for sink_name, sink in bundle.sinks.items():
             substitute(sink, authored_sinks, sink_name, PluginId("sink", sink.name))
         yield
@@ -555,6 +570,7 @@ def audit_safe_resolved_config(
     authored_sources = _authored_sources(audit_safe_settings)
     authored_transforms = _authored_named_components(audit_safe_settings, "transforms")
     authored_aggregations = _authored_named_components(audit_safe_settings, "aggregations")
+    authored_collectors = _authored_named_components(audit_safe_settings, "collectors")
     authored_sinks = _required_component_mapping(
         audit_safe_settings,
         "sinks",
@@ -590,6 +606,14 @@ def audit_safe_resolved_config(
             cast(dict[str, Any], aggregation_component),
             authored_aggregations,
             aggregation_component["name"],
+            "transform",
+        )
+    resolved_collectors = _required_component_list(resolved, "collectors", owner="Resolved audit config")
+    for collector_component in resolved_collectors:
+        restore_options(
+            cast(dict[str, Any], collector_component),
+            authored_collectors,
+            collector_component["name"],
             "transform",
         )
     resolved_sinks = _required_component_mapping(resolved, "sinks", owner="Resolved audit config")

@@ -7307,6 +7307,50 @@ sinks:
         with pytest.raises(AuditIntegrityError, match=malformed_component):
             client.get(f"/api/sessions/{session.id}/state")
 
+    @pytest.mark.asyncio
+    async def test_get_state_succeeds_for_collector_bearing_persisted_state(self, tmp_path: Path) -> None:
+        """GET /state must serve a collector-bearing persisted state.
+
+        Regression (found live by the 2026-08-26 S1-S5 battery round): the
+        plugin-policy walker had no collector arm, so every read of a
+        collector-bearing state raised AuditIntegrityError -> HTTP 500 on the
+        composer's primary read path.
+        """
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Collector state read", "local")
+        await service.save_composition_state(
+            session.id,
+            CompositionStateData(
+                sources={
+                    "source": {
+                        "plugin": "csv",
+                        "on_success": "pages",
+                        "options": {},
+                        "on_validation_failure": "discard",
+                    }
+                },
+                nodes=[
+                    {
+                        "id": "page_stitcher",
+                        "node_type": "collector",
+                        "plugin": "batch_stats",
+                        "input": "pages",
+                        "on_success": "out",
+                    }
+                ],
+                outputs=[{"name": "out", "plugin": "json"}],
+                is_valid=False,
+            ),
+            provenance="session_seed",
+        )
+
+        response = client.get(f"/api/sessions/{session.id}/state")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert [n["id"] for n in body["nodes"] if n["node_type"] == "collector"] == ["page_stitcher"]
+
     def test_plugin_policy_projection_preserves_legacy_source_and_node_variants(self, tmp_path: Path) -> None:
         """The legacy source bridge is explicit; structural nodes are not plugins."""
         from elspeth.web.catalog.policy_view import PolicyCatalogView

@@ -851,6 +851,7 @@ def test_llm_source_audit_projection_uses_authored_profile_and_restores_executab
             sources={"generated_brief": source},
             transforms=(),
             aggregations={},
+            collectors={},
             sinks={},
         ),
     )

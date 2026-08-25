@@ -553,6 +553,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
             sources={},
             transforms=(SimpleNamespace(plugin=plugin_id.name),),
             aggregations=(),
+            collectors=(),
             sinks={},
         )
         if plugin_id in snapshot.available:
@@ -1199,3 +1200,52 @@ def test_auto_wired_required_controls_clear_the_execution_required_control_gate(
     # The remaining gate is the acknowledgeable disclosure the pass staged.
     pending = [error.message for error in wired_result.errors if error.error_code == "interpretation_review_pending"]
     assert any(REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in message for message in pending), pending
+
+
+def test_configured_plugin_ids_cover_every_plugin_bearing_settings_section() -> None:
+    """Reflection guard: every plugin-bearing ElspethSettings section feeds the gate.
+
+    ``require_settings_plugins_available`` is the pre-construction admission
+    gate re-checking authored plugins against one frozen approval. The
+    collector section was silently missing from ``_configured_plugin_ids``
+    (2026-08-26 systems review): a policy-hidden batch plugin executed as an
+    EXPAND-group closer. This derives the plugin-bearing sections from the
+    settings model itself so the NEXT section cannot be forgotten silently.
+    """
+    import typing
+
+    from pydantic import BaseModel
+
+    from elspeth.core.config import ElspethSettings
+    from elspeth.web.execution.preflight import _configured_plugin_ids
+
+    def element_models(annotation: object) -> list[type]:
+        models: list[type] = []
+        for arg in typing.get_args(annotation) or ():
+            if isinstance(arg, type) and issubclass(arg, BaseModel):
+                models.append(arg)
+            else:
+                models.extend(element_models(arg))
+        return models
+
+    plugin_bearing = {
+        name
+        for name, field in ElspethSettings.model_fields.items()
+        if any("plugin" in model.model_fields for model in element_models(field.annotation))
+    }
+    assert plugin_bearing == {"sources", "transforms", "aggregations", "collectors", "sinks"}, (
+        "A new plugin-bearing ElspethSettings section appeared (or one was removed). "
+        "Extend _configured_plugin_ids AND this pin together — the admission gate "
+        "silently ignores any section it does not enumerate."
+    )
+
+    settings = SimpleNamespace(
+        sources={"s": SimpleNamespace(plugin="csv")},
+        transforms=[SimpleNamespace(plugin="passthrough")],
+        aggregations=[SimpleNamespace(plugin="batch_stats")],
+        collectors=[SimpleNamespace(plugin="batch_stats_probe")],
+        sinks={"out": SimpleNamespace(plugin="json")},
+    )
+    ids = _configured_plugin_ids(settings)  # type: ignore[arg-type]
+    assert ("transform", "batch_stats_probe") in {(pid.kind, pid.name) for pid in ids}
+    assert len(ids) == 5

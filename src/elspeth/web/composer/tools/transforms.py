@@ -1489,7 +1489,7 @@ def _execute_patch_node_options(
     if credential_error is not None:
         return credential_error
 
-    if current.node_type in ("transform", "aggregation") and current.plugin is not None:
+    if current.node_type in ("transform", "aggregation", "collector") and current.plugin is not None:
         prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, new_options)
         if prevalidation_error is not None:
             return _failure_result(state, prevalidation_error)

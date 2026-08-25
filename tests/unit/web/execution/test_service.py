@@ -412,6 +412,7 @@ def _mock_pipeline_settings() -> SimpleNamespace:
         sources={},
         transforms=[],
         aggregations=[],
+        collectors=[],
         sinks={"primary": SimpleNamespace(plugin="json", options={})},
         gates=[],
         coalesce=[],

@@ -13442,6 +13442,74 @@ class TestPrevalidatePluginOptions:
         assert node.node_type == "aggregation"
         assert node.plugin == "batch_stats"
 
+    def test_patch_node_options_collector_routes_through_prevalidation(self) -> None:
+        """patch_node_options with node_type='collector' pre-validates the patch.
+
+        Regression guard (2026-08-26 systems review): the patch guard checked
+        ``node_type in ("transform", "aggregation")``, so patching a collector's
+        options skipped plugin prevalidation entirely — invalid options were
+        accepted and failed only later at lowering/preflight. Collectors are
+        plugin-bearing (batch-transform contract) and take the same path.
+        """
+        state = CompositionState.from_dict(
+            {
+                "version": 1,
+                "sources": {
+                    "source": {
+                        "plugin": "csv",
+                        "on_success": "pages",
+                        "options": {"path": "cases.csv"},
+                        "on_validation_failure": "discard",
+                    }
+                },
+                "nodes": [
+                    {
+                        "id": "page_stitcher",
+                        "node_type": "collector",
+                        "plugin": "batch_stats",
+                        "input": "pages",
+                        "on_success": "out",
+                        "on_error": None,
+                        "options": {"schema": {"mode": "observed"}, "value_field": "amount"},
+                        "scope_name": "document_pages",
+                        "scope_opener": "explode",
+                        "scope_policy": "require_all",
+                    }
+                ],
+                "edges": [],
+                "outputs": [{"name": "out", "plugin": "json", "options": {}, "on_write_failure": "discard"}],
+                "metadata": {"name": "Collector patch", "description": ""},
+            }
+        )
+        catalog = _mock_catalog()
+        catalog.list_transforms.return_value = [
+            *catalog.list_transforms.return_value,
+            PluginSummary(
+                name="batch_stats",
+                description="Batch statistics aggregation",
+                plugin_type="transform",
+                config_fields=[],
+            ),
+        ]
+
+        # value_field must be a string; prevalidation must refuse the patch.
+        result = execute_tool(
+            "patch_node_options",
+            {"node_id": "page_stitcher", "patch": {"value_field": 123}},
+            state,
+            catalog,
+        )
+        assert result.success is False
+
+        # A valid patch still lands.
+        result = execute_tool(
+            "patch_node_options",
+            {"node_id": "page_stitcher", "patch": {"value_field": "page_size_bytes"}},
+            state,
+            catalog,
+        )
+        assert result.success is True
+
     def test_upsert_node_batch_stats_group_by_keeps_expected_count_open(self) -> None:
         """Grouped rollups may emit one row per group, so cardinality stays unset."""
         state = _empty_state()
