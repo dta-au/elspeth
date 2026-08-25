@@ -28,24 +28,27 @@ pinned by a crashed-image precondition below:
    "escalation partially staged" image does not exist at depth 5 on one
    worker; it requires multi-worker loss staging — the collector
    death-matrix lane's territory (META-9.1), not Task 5a's.
-3. **An in-process abort sweeps BLOCKED journal rows terminal** (the
-   NodeStateGuard/teardown path), so a durably-open-group crash image is
-   reachable only by PROCESS DEATH. And any pre-settlement process death
-   forces the loss to be staged POST-RESUME — again META-9.1's scenario,
-   excluded from this lane by the dispatch brief.
+3. **No post-failure crash image holds durable BLOCKED rows** — measured
+   identically for the in-process abort AND the SIGKILL surface: once the
+   groups have failed, every hold is already durably terminal (whether by
+   settlement release or teardown sweep was not isolated; both legs pin
+   ``blocked == 0`` below either way). A durably-open-group crash image
+   therefore exists only BEFORE the failing claim — and a pre-settlement
+   process death forces the loss to be staged POST-RESUME, which is
+   META-9.1's scenario, excluded from this lane by the dispatch brief.
 
 The in-scope family is therefore the post-settlement crash, exercised
 through both crash surfaces:
 
 - **Config-injected in-process abort** (``escalation_fixpoint_bound=0``):
   the EOF fixpoint raises its non-convergence ``OrchestrationInvariantError``
-  with every loss durable; the run marks itself FAILED and the abort sweep
-  has run.
+  with every loss durable; the run marks itself FAILED through its own
+  teardown.
 - **SIGKILL at the EOF-intake seam** (the recovery harness's pausable
   spawn): the process dies with every loss durable but NO finalization and
-  NO abort sweep — the run is left ``running`` and an external-supervisor
-  classification (``update_run_status(FAILED)`` + leader-heartbeat expiry,
-  the death-matrix pattern) makes it resumable.
+  NO teardown of any kind — the run is left ``running`` and an
+  external-supervisor classification (``update_run_status(FAILED)`` +
+  leader-heartbeat expiry, the death-matrix pattern) makes it resumable.
 
 Scope note (brief, Task 5a): crash+resume WITHOUT loss scenarios only —
 non-opener-worker loss and post-resume loss belong to the collector
@@ -231,22 +234,34 @@ def _leg_outcome(db_path: Path) -> _LegOutcome:
     )
 
 
-def _crashed_image(db_path: Path) -> tuple[str, RunStatus, list[str]]:
-    """(run_id, status, loss reasons) at the crash instant."""
+def _crashed_image(db_path: Path) -> tuple[str, RunStatus, list[str], int]:
+    """(run_id, status, loss reasons, BLOCKED row count) at the crash instant."""
     engine = create_engine(f"sqlite:///{db_path}")
     try:
         with engine.connect() as conn:
             run_row = conn.execute(select(runs_table)).one()
             reasons = list(conn.execute(select(group_losses_table.c.reason)).scalars())
+            blocked = len(
+                conn.execute(
+                    select(token_work_items_table.c.work_item_id).where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
+                ).fetchall()
+            )
     finally:
         engine.dispose()
-    return str(run_row.run_id), RunStatus(run_row.status), reasons
+    return str(run_row.run_id), RunStatus(run_row.status), reasons, blocked
 
 
-def _assert_settled_crash_image(status: RunStatus, reasons: list[str], *, expected_status: RunStatus) -> None:
+def _assert_settled_crash_image(status: RunStatus, reasons: list[str], blocked: int, *, expected_status: RunStatus) -> None:
     """The post-settlement preconditions (measured facts 1-3, module docstring):
     the whole unwrap must already be durable at the crash instant."""
     assert status is expected_status, status
+    # Fact 3's pin (review M-1): a post-settlement image holds NO durable
+    # BLOCKED rows — measured 0 on BOTH crash surfaces (the abort leg after
+    # its teardown, the SIGKILL leg with no teardown at all). If this ever
+    # goes non-zero, settlement is no longer drain-time-complete and the
+    # family's scope reduction (open-group images = META-9.1's lane) must
+    # be revisited rather than this assert loosened.
+    assert blocked == 0, f"post-settlement crash image must hold no BLOCKED rows, found {blocked}"
     assert reasons.count("quarantined") == 1
     assert reasons.count("group_failed") == DEPTH - 1, (
         "drain-time settlement must be complete at the crash instant; a partial cascade here would mean "
@@ -325,8 +340,8 @@ def test_depth5_in_process_abort_after_settlement_resumes_to_the_baseline_outcom
         with pytest.raises(OrchestrationInvariantError, match="did not converge within 0 intake/flush rounds"):
             _run_fresh(db, settings, crash_dir, clamp_bound=0)
 
-        run_id, status, reasons = _crashed_image(crash_dir / "audit.db")
-        _assert_settled_crash_image(status, reasons, expected_status=RunStatus.FAILED)
+        run_id, status, reasons, blocked = _crashed_image(crash_dir / "audit.db")
+        _assert_settled_crash_image(status, reasons, blocked, expected_status=RunStatus.FAILED)
 
         _resume_after_crash(db, settings, crash_dir, run_id)
     finally:
@@ -360,10 +375,10 @@ def test_depth5_process_death_after_settlement_resumes_to_the_baseline_outcome(
         child.kill()
         assert child.wait_for_exit(timeout=_PROCESS_TIMEOUT_SECONDS).was_killed
 
-    run_id, status, reasons = _crashed_image(crash_dir / "audit.db")
+    run_id, status, reasons, blocked = _crashed_image(crash_dir / "audit.db")
     # SIGKILL executes no finalization ceremony: settlement is durable but the
     # run is still RUNNING — the un-swept image only process death can leave.
-    _assert_settled_crash_image(status, reasons, expected_status=RunStatus.RUNNING)
+    _assert_settled_crash_image(status, reasons, blocked, expected_status=RunStatus.RUNNING)
 
     # External-supervisor classification (the death-matrix pattern): the
     # production lifecycle writer marks the run FAILED and the dead leader's
