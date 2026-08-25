@@ -21,6 +21,7 @@ from litellm.exceptions import (
 )
 from litellm.types.utils import ModelResponse, Usage
 
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -114,7 +115,7 @@ def _response(*, content: str = "Hello", finish_reason: str = "stop") -> ModelRe
 
 def _execute(provider: BedrockLLMProvider) -> Any:
     return provider.execute_query(
-        messages=[{"role": "user", "content": "hi"}],
+        messages=[ChatMessage(role="user", content="hi")],
         model=MODEL,
         temperature=0.25,
         max_tokens=64,
@@ -127,7 +128,7 @@ def _execute(provider: BedrockLLMProvider) -> Any:
 
 def _execute_for_operation(provider: BedrockLLMProvider) -> Any:
     return provider.execute_query(
-        messages=[{"role": "user", "content": "hi"}],
+        messages=[ChatMessage(role="user", content="hi")],
         model=MODEL,
         temperature=0.25,
         max_tokens=64,

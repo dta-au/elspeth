@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
 
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.sources.llm import LLMSource
@@ -29,7 +31,7 @@ class FakeProvider:
             finish_reason=FinishReason.STOP,
         )
         self.calls = 0
-        self.messages: list[list[dict[str, str]]] = []
+        self.messages: list[Sequence[ChatMessage]] = []
         self.audit_parents: list[LLMAuditParent] = []
         self.runtime_preflight_calls = 0
         self.close_calls = 0
@@ -37,7 +39,7 @@ class FakeProvider:
 
     def execute_query(
         self,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         model: str,
         temperature: float,

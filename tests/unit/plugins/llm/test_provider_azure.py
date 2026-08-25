@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
@@ -79,7 +80,7 @@ class FakeUnderlyingAzureClient:
 @dataclass(frozen=True)
 class ChatCompletionCall:
     model: str
-    messages: list[dict[str, str]]
+    messages: Sequence[ChatMessage]
     temperature: float
     max_tokens: int | None
     response_format: dict[str, Any] | None
@@ -95,7 +96,7 @@ class FakeLLMClient:
     def chat_completion(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
@@ -197,7 +198,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -219,7 +220,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -236,7 +237,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -254,7 +255,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(RateLimitError, match="429 rate limited"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -269,7 +270,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(ContentPolicyError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -284,7 +285,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(ServerError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -299,7 +300,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(NetworkError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -314,7 +315,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(LLMClientError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -329,7 +330,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(ContextLengthError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -345,7 +346,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(NetworkError, match="timed out"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -367,7 +368,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=None,
@@ -392,7 +393,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=None,
@@ -417,7 +418,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(ContentPolicyError, match="empty content"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -438,7 +439,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(ContentPolicyError, match="empty content"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -460,7 +461,7 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(LLMClientError, match="tool_calls"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -485,7 +486,7 @@ class TestExecuteQuery:
 
         with pytest.raises(LLMClientError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,

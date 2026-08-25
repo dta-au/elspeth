@@ -278,6 +278,7 @@ def build_llm_audit_metadata(
     lookup_hash: str | None,
     lookup_source: str | None,
     system_prompt_source: str | None,
+    parts_hash: str | None = None,
 ) -> dict[str, str | None]:
     """Build audit provenance dict for inclusion in success_reason["metadata"].
 
@@ -292,12 +293,17 @@ def build_llm_audit_metadata(
         lookup_hash: SHA-256 of lookup data (None if no lookup).
         lookup_source: Config file path of lookup data (None if no lookup).
         system_prompt_source: Config file path of system prompt (None if inline).
+        parts_hash: SHA-256 over the user message's content parts (from
+            ``chat_parts.parts_hash``) when image inputs were bound into the
+            call. ``None`` for a text-only call — the key is omitted entirely
+            rather than emitted as null, so text-only audit metadata stays
+            byte-identical to the pre-image tree.
 
     Returns:
         Dict of audit field names to values, ready to merge into
         success_reason["metadata"].
     """
-    return {
+    metadata: dict[str, str | None] = {
         f"{field_prefix}_template_hash": template_hash,
         f"{field_prefix}_variables_hash": variables_hash,
         f"{field_prefix}_template_source": template_source,
@@ -305,6 +311,9 @@ def build_llm_audit_metadata(
         f"{field_prefix}_lookup_source": lookup_source,
         f"{field_prefix}_system_prompt_source": system_prompt_source,
     }
+    if parts_hash is not None:
+        metadata[f"{field_prefix}_parts_hash"] = parts_hash
+    return metadata
 
 
 def _build_augmented_output_schema(

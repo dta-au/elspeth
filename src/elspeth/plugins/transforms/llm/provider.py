@@ -18,6 +18,7 @@ via their Audited*Client (D2 from architecture remediation).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, TypedDict, runtime_checkable
@@ -25,6 +26,7 @@ from typing import Any, Protocol, TypedDict, runtime_checkable
 from elspeth.contracts import Call, CallStatus, CallType
 from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.contracts.call_data import CallPayload
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.token_usage import TokenUsage
 
 
@@ -292,7 +294,7 @@ class LLMProvider(Protocol):
 
     def execute_query(
         self,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         model: str,
         temperature: float,

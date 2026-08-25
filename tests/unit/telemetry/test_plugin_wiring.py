@@ -27,6 +27,7 @@ import pytest
 
 from elspeth.contracts import Call, CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.core.rate_limit.registry import NoOpLimiter
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
@@ -301,7 +302,7 @@ class TestBedrockProviderTelemetryWiring:
         try:
             with patch("litellm.completion", return_value=response):
                 result = provider.execute_query(
-                    messages=[{"role": "user", "content": "classify"}],
+                    messages=[ChatMessage(role="user", content="classify")],
                     model="bedrock/anthropic.test-model-v1:0",
                     temperature=0.0,
                     max_tokens=16,
@@ -373,7 +374,7 @@ class TestGatewayProviderTelemetryWiring:
                     )
                 )
                 result = provider.execute_query(
-                    messages=[{"role": "user", "content": "classify"}],
+                    messages=[ChatMessage(role="user", content="classify")],
                     model="standard",
                     temperature=0.0,
                     max_tokens=16,

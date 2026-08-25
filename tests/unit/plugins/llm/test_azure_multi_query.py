@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import Determinism, TransformResult
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
@@ -255,7 +256,7 @@ class TestSingleQueryProcessing:
         transform = LLMTransform(_make_config())
 
         # Track what messages were sent
-        captured_messages: list[list[dict[str, str]]] = []
+        captured_messages: list[list[ChatMessage]] = []
 
         def capture_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             captured_messages.append(messages)
@@ -286,7 +287,7 @@ class TestSingleQueryProcessing:
         assert result.status == "success"
         # First query should have rendered template with cs1_bg data
         assert len(captured_messages) == 4
-        first_user_msg = captured_messages[0][-1]["content"]
+        first_user_msg = captured_messages[0][-1].content
         assert "45yo male" in first_user_msg
 
     def test_process_row_parses_json_response(self) -> None:
@@ -389,6 +390,7 @@ class TestSingleQueryProcessing:
             telemetry_emit=None,
             rate_limit_registry=None,
             shutdown_event=None,
+            payload_store=None,
         )
         transform.on_start(ctx)
 

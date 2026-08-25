@@ -22,6 +22,7 @@ import pytest
 import respx
 
 from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
@@ -184,7 +185,7 @@ class TestExecuteQueryHappyPath:
             )
         )
         result = provider.execute_query(
-            messages=[{"role": "user", "content": "hi"}],
+            messages=[ChatMessage(role="user", content="hi")],
             model="standard",
             temperature=0.0,
             max_tokens=100,
@@ -215,7 +216,7 @@ class TestExecuteQueryHappyPath:
             pytest.raises(RuntimeError, match="close failed"),
         ):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -242,7 +243,7 @@ class TestExecuteQueryHappyPath:
             pytest.raises(ServerError) as exc_info,
         ):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -258,7 +259,7 @@ class TestExecuteQueryHappyPath:
     def test_sends_contract_header_and_bearer(self, provider: GatewayLLMProvider) -> None:
         route = respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body()))
         provider.execute_query(
-            messages=[{"role": "user", "content": "hi"}],
+            messages=[ChatMessage(role="user", content="hi")],
             model="standard",
             temperature=0.0,
             max_tokens=100,
@@ -275,7 +276,7 @@ class TestExecuteQueryHappyPath:
     def test_max_tokens_none_omitted_from_body(self, provider: GatewayLLMProvider) -> None:
         route = respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body()))
         provider.execute_query(
-            messages=[{"role": "user", "content": "hi"}],
+            messages=[ChatMessage(role="user", content="hi")],
             model="standard",
             temperature=0.0,
             max_tokens=None,
@@ -298,7 +299,7 @@ class TestExecuteQueryHappyPath:
     def test_response_format_forwarded_unchanged(self, provider: GatewayLLMProvider, response_format: dict[str, Any]) -> None:
         route = respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body()))
         provider.execute_query(
-            messages=[{"role": "user", "content": "hi"}],
+            messages=[ChatMessage(role="user", content="hi")],
             model="standard",
             temperature=0.0,
             max_tokens=100,
@@ -316,7 +317,7 @@ class TestExecuteQueryHappyPath:
         """ELSPETH owns all retry policy — the provider must contain no retry loop."""
         route = respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body()))
         provider.execute_query(
-            messages=[{"role": "user", "content": "hi"}],
+            messages=[ChatMessage(role="user", content="hi")],
             model="standard",
             temperature=0.0,
             max_tokens=100,
@@ -339,7 +340,7 @@ class TestContractHeader:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(), contract_header=None))
         with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -355,7 +356,7 @@ class TestContractHeader:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(), contract_header="2"))
         with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -406,7 +407,7 @@ class TestErrorCodeMapping:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_error_body(code), status_code=400))
         with pytest.raises(expected_exc) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -426,7 +427,7 @@ class TestErrorCodeMapping:
         )
         with pytest.raises(RateLimitError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -443,7 +444,7 @@ class TestErrorCodeMapping:
         )
         with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -459,7 +460,7 @@ class TestErrorCodeMapping:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response({"error": {"message": "oops"}}, status_code=400))
         with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -481,7 +482,7 @@ class TestErrorCodeMapping:
         )
         with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -499,7 +500,7 @@ class TestErrorCodeMapping:
         )
         with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -519,7 +520,7 @@ class TestErrorCodeMapping:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(body, status_code=400))
         with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -598,7 +599,7 @@ class TestSuccessPathLeakGuard:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(body))
         with pytest.raises(ContentPolicyError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -621,7 +622,7 @@ class TestTransportErrors:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(side_effect=httpx.ConnectError("refused"))
         with pytest.raises(NetworkError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -636,7 +637,7 @@ class TestTransportErrors:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(side_effect=httpx.ReadTimeout("timed out"))
         with pytest.raises(NetworkError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -667,7 +668,7 @@ class TestUsageHandling:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(usage=None)))
         with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -682,7 +683,7 @@ class TestUsageHandling:
     def test_usage_absent_and_not_required_is_unknown_never_zeros(self, provider: GatewayLLMProvider) -> None:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(usage=None)))
         result = provider.execute_query(
-            messages=[{"role": "user", "content": "hi"}],
+            messages=[ChatMessage(role="user", content="hi")],
             model="standard",
             temperature=0.0,
             max_tokens=100,
@@ -709,7 +710,7 @@ class TestBlankContent:
         )
         with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -727,7 +728,7 @@ class TestBlankContent:
         )
         with pytest.raises(ContentPolicyError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -751,7 +752,7 @@ class TestModelValidation:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(body))
         with pytest.raises(LLMClientError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -768,7 +769,7 @@ class TestModelValidation:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(body))
         with pytest.raises(LLMClientError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -789,7 +790,7 @@ class TestAuditRows:
     def test_success_records_two_rows(self, provider: GatewayLLMProvider, audit_recorder: FakeAuditRecorder) -> None:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body()))
         provider.execute_query(
-            messages=[{"role": "user", "content": "hi"}],
+            messages=[ChatMessage(role="user", content="hi")],
             model="standard",
             temperature=0.0,
             max_tokens=100,
@@ -815,7 +816,7 @@ class TestAuditRows:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body()))
 
         provider.execute_query(
-            messages=[{"role": "user", "content": "hi"}],
+            messages=[ChatMessage(role="user", content="hi")],
             model="standard",
             temperature=0.0,
             max_tokens=100,
@@ -839,7 +840,7 @@ class TestAuditRows:
 
         with pytest.raises(ServerError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -871,7 +872,7 @@ class TestAuditRows:
         with respx.mock:
             respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body()))
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
@@ -888,7 +889,7 @@ class TestAuditRows:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_error_body("internal_error"), status_code=500))
         with pytest.raises(LLMClientError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,

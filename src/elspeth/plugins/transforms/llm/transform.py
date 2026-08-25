@@ -30,6 +30,7 @@ from pydantic import Field as PydanticField
 
 from elspeth.contracts import Determinism, TransformErrorReason, TransformResult, propagate_contract
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.chat_parts import ChatMessage, ContentPart, ImagePart, TextPart, parts_hash
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.freeze import freeze_fields
@@ -58,6 +59,7 @@ from elspeth.plugins.transforms.llm import (
     populate_llm_operational_fields,
 )
 from elspeth.plugins.transforms.llm.base import LLMConfig
+from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig, resolve_image_parts
 from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer, create_langfuse_tracer
 from elspeth.plugins.transforms.llm.multi_query import QuerySpec, ResponseFormat, resolve_queries
 from elspeth.plugins.transforms.llm.provider import (
@@ -80,6 +82,7 @@ from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant,
 logger = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
+    from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_semantics import OutputSemanticDeclaration
 
 
@@ -236,6 +239,7 @@ class QueryStrategy(Protocol):
         *,
         provider: LLMProvider,
         tracer: LangfuseTracer,
+        payload_store: PayloadStore | None = None,
     ) -> TransformResult: ...
 
 
@@ -252,6 +256,9 @@ class SingleQueryStrategy:
     response_field: str
     align_output_contract: Callable[[SchemaContract], SchemaContract]
     apply_declared_output_field_contracts: Callable[[SchemaContract], SchemaContract]
+    image_specs: tuple[ImageInputConfig, ...] = ()
+    max_image_bytes: int = 0
+    max_images_per_call: int = 0
 
     def execute(
         self,
@@ -260,6 +267,7 @@ class SingleQueryStrategy:
         *,
         provider: LLMProvider,
         tracer: LangfuseTracer,
+        payload_store: PayloadStore | None = None,
     ) -> TransformResult:
         """Execute single LLM query and build output row."""
         state_id = ctx.state_id
@@ -283,11 +291,33 @@ class SingleQueryStrategy:
                 error_reason["template_file_path"] = self.template.template_source
             return TransformResult.error(error_reason)
 
+        # 1b. Resolve config-declared image inputs (THEIR DATA — wrap). A
+        # resolve failure is a row-level error result; the provider must
+        # never be called on it.
+        image_parts: tuple[ImagePart, ...] = ()
+        if self.image_specs:
+            resolved = resolve_image_parts(
+                row,
+                payload_store=payload_store,
+                specs=self.image_specs,
+                max_image_bytes=self.max_image_bytes,
+                max_images_per_call=self.max_images_per_call,
+            )
+            if isinstance(resolved, TransformResult):
+                return resolved
+            image_parts = resolved
+        tracer_extra_metadata: dict[str, Any] | None = {"image_parts": [p.audit_view() for p in image_parts]} if image_parts else None
+
         # 2. Build messages
-        messages: list[dict[str, str]] = []
+        messages: list[ChatMessage] = []
         if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": rendered.prompt})
+            messages.append(ChatMessage(role="system", content=self.system_prompt))
+        user_content: str | tuple[ContentPart, ...] = rendered.prompt
+        content_hash: str | None = None
+        if image_parts:
+            user_content = (TextPart(text=rendered.prompt), *image_parts)
+            content_hash = parts_hash(user_content)
+        messages.append(ChatMessage(role="user", content=user_content))
 
         if _shutdown_event_is_set(shutdown_event):
             return _shutdown_requested_result()
@@ -312,7 +342,7 @@ class SingleQueryStrategy:
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
-                extra_metadata=None,
+                extra_metadata=tracer_extra_metadata,
                 system_prompt=self.system_prompt,
             )
             return TransformResult.error(
@@ -328,7 +358,7 @@ class SingleQueryStrategy:
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
-                extra_metadata=None,
+                extra_metadata=tracer_extra_metadata,
                 system_prompt=self.system_prompt,
             )
             if e.retryable:
@@ -353,7 +383,7 @@ class SingleQueryStrategy:
                 error_message=finish_reason_error.error_message,
                 model=self.model,
                 latency_ms=latency_ms,
-                extra_metadata=None,
+                extra_metadata=tracer_extra_metadata,
                 system_prompt=self.system_prompt,
             )
             return finish_reason_error.result
@@ -370,7 +400,7 @@ class SingleQueryStrategy:
             model=result.model,
             usage=result.usage,
             latency_ms=latency_ms,
-            extra_metadata=None,
+            extra_metadata=tracer_extra_metadata,
             system_prompt=self.system_prompt,
         )
 
@@ -393,6 +423,7 @@ class SingleQueryStrategy:
             lookup_hash=rendered.lookup_hash,
             lookup_source=rendered.lookup_source,
             system_prompt_source=self.system_prompt_source,
+            parts_hash=content_hash,
         )
 
         # 8. Propagate contract
@@ -444,6 +475,9 @@ class MultiQueryStrategy:
     align_output_contract: Callable[[SchemaContract], SchemaContract]
     align_output_row_contract: Callable[[PipelineRow], PipelineRow]
     apply_declared_output_field_contracts: Callable[[SchemaContract], SchemaContract]
+    image_specs: tuple[ImageInputConfig, ...] = ()
+    max_image_bytes: int = 0
+    max_images_per_call: int = 0
     executor: PooledExecutor | None = None
     max_capacity_retry_seconds: int = 3600
     _query_templates: Mapping[str, PromptTemplate] = field(init=False, default_factory=dict)
@@ -470,6 +504,7 @@ class MultiQueryStrategy:
         *,
         provider: LLMProvider,
         tracer: LangfuseTracer,
+        payload_store: PayloadStore | None = None,
     ) -> TransformResult:
         """Execute all queries, returning atomic success or failure."""
         state_id = ctx.state_id
@@ -481,8 +516,8 @@ class MultiQueryStrategy:
         shutdown_event = ctx.shutdown_event
 
         if self.executor is not None:
-            return self._execute_parallel(row, state_id, token_id, provider, tracer, shutdown_event)
-        return self._execute_sequential(row, state_id, token_id, provider, tracer, shutdown_event)
+            return self._execute_parallel(row, state_id, token_id, provider, tracer, shutdown_event, payload_store)
+        return self._execute_sequential(row, state_id, token_id, provider, tracer, shutdown_event, payload_store)
 
     @dataclass(frozen=True, slots=True)
     class _QuerySuccess:
@@ -514,6 +549,7 @@ class MultiQueryStrategy:
         provider: LLMProvider,
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
+        payload_store: PayloadStore | None = None,
     ) -> _QuerySuccess | TransformResult:
         """Execute a single query within a multi-query row.
 
@@ -571,6 +607,24 @@ class MultiQueryStrategy:
                 retryable=False,
             )
 
+        # Resolve config-declared image inputs (THEIR DATA — wrap). Resolved
+        # from the full row, not the synthetic template_ctx above — image
+        # fields are never template variables. A resolve failure is a
+        # row-level error result; the provider must never be called on it.
+        image_parts: tuple[ImagePart, ...] = ()
+        if self.image_specs:
+            resolved = resolve_image_parts(
+                row,
+                payload_store=payload_store,
+                specs=self.image_specs,
+                max_image_bytes=self.max_image_bytes,
+                max_images_per_call=self.max_images_per_call,
+            )
+            if isinstance(resolved, TransformResult):
+                return resolved
+            image_parts = resolved
+        tracer_extra_metadata: dict[str, Any] | None = {"image_parts": [p.audit_view() for p in image_parts]} if image_parts else None
+
         # Build the provider response constraint and exact prompt sent for this
         # query. Structured mode sends the schema through the API-native
         # response_format contract. Standard JSON mode guarantees only a JSON
@@ -603,11 +657,18 @@ class MultiQueryStrategy:
                     f"{canonical_json(output_schema)}"
                 )
 
-        # Build messages
-        messages: list[dict[str, str]] = []
+        # Build messages. Images append AFTER the standard-mode schema suffix
+        # above, so the schema text and the images travel in the same user
+        # message.
+        messages: list[ChatMessage] = []
         if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": provider_prompt})
+            messages.append(ChatMessage(role="system", content=self.system_prompt))
+        user_content: str | tuple[ContentPart, ...] = provider_prompt
+        content_hash: str | None = None
+        if image_parts:
+            user_content = (TextPart(text=provider_prompt), *image_parts)
+            content_hash = parts_hash(user_content)
+        messages.append(ChatMessage(role="user", content=user_content))
         # Langfuse reconstructs the outbound messages from these separate
         # values. Match the provider's truthy inclusion rule so an explicitly
         # empty system prompt is omitted from both records.
@@ -639,7 +700,7 @@ class MultiQueryStrategy:
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
-                extra_metadata=None,
+                extra_metadata=tracer_extra_metadata,
                 system_prompt=tracer_system_prompt,
             )
             return TransformResult.error(
@@ -660,7 +721,7 @@ class MultiQueryStrategy:
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
-                extra_metadata=None,
+                extra_metadata=tracer_extra_metadata,
                 system_prompt=tracer_system_prompt,
             )
             if e.retryable:
@@ -691,7 +752,7 @@ class MultiQueryStrategy:
                 error_message=finish_reason_error.error_message,
                 model=self.model,
                 latency_ms=latency_ms,
-                extra_metadata=None,
+                extra_metadata=tracer_extra_metadata,
                 system_prompt=tracer_system_prompt,
             )
             return finish_reason_error.result
@@ -707,7 +768,7 @@ class MultiQueryStrategy:
             model=result.model,
             usage=result.usage,
             latency_ms=latency_ms,
-            extra_metadata=None,
+            extra_metadata=tracer_extra_metadata,
             system_prompt=tracer_system_prompt,
         )
 
@@ -794,6 +855,7 @@ class MultiQueryStrategy:
             lookup_hash=rendered.lookup_hash,
             lookup_source=rendered.lookup_source,
             system_prompt_source=self.system_prompt_source,
+            parts_hash=content_hash,
         )
         # Record finish_reason so audit trail distinguishes None (absent) from
         # STOP (confirmed completion). See Bug elspeth-393d2459aa.
@@ -856,6 +918,7 @@ class MultiQueryStrategy:
         provider: LLMProvider,
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
+        payload_store: PayloadStore | None = None,
     ) -> TransformResult:
         """Execute queries sequentially (pool_size=1 fallback).
 
@@ -885,6 +948,7 @@ class MultiQueryStrategy:
                         provider,
                         tracer,
                         shutdown_event,
+                        payload_store,
                     )
                     break  # success or non-retryable error result - exit retry loop
                 except LLMClientError as e:
@@ -973,6 +1037,7 @@ class MultiQueryStrategy:
         provider: LLMProvider,
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
+        payload_store: PayloadStore | None = None,
     ) -> TransformResult:
         """Execute queries in parallel via PooledExecutor with AIMD retry.
 
@@ -1004,6 +1069,7 @@ class MultiQueryStrategy:
                     "tracer": tracer,
                     "token_id": token_id,
                     "state_id": state_id,
+                    "payload_store": payload_store,
                 },
                 state_id=state_id,
                 row_index=i,
@@ -1022,6 +1088,7 @@ class MultiQueryStrategy:
                 work["provider"],
                 work["tracer"],
                 shutdown_event,
+                work["payload_store"],
             )
             if isinstance(result, TransformResult):
                 return result  # Error passthrough
@@ -1157,7 +1224,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:120c19ed831930a3"
+    source_file_hash: str | None = "sha256:739801f87cca88b9"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1317,7 +1384,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         class _InvariantProvider:
             def execute_query(
                 self,
-                messages: list[dict[str, str]],
+                messages: Sequence[ChatMessage],
                 *,
                 model: str,
                 temperature: float,
@@ -1457,6 +1524,12 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         pool_config = self._config.pool_config
         self._query_executor: PooledExecutor | None = PooledExecutor(pool_config) if pool_config is not None else None
 
+        # Config-declared image inputs — empty tuple (text-only) when unset,
+        # same shape both strategies expect.
+        image_specs: tuple[ImageInputConfig, ...] = tuple(self._config.image_inputs or ())
+        max_image_bytes = self._config.max_image_bytes
+        max_images_per_call = self._config.max_images_per_call
+
         # Strategy dispatch: queries is not None → multi-query
         if self._config.queries is not None:
             query_specs = resolve_queries(self._config.queries)
@@ -1472,6 +1545,9 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 align_output_contract=self._align_output_contract,
                 align_output_row_contract=self._align_output_row_contract,
                 apply_declared_output_field_contracts=self._apply_declared_output_field_contracts,
+                image_specs=image_specs,
+                max_image_bytes=max_image_bytes,
+                max_images_per_call=max_images_per_call,
                 executor=self._query_executor,
                 max_capacity_retry_seconds=self._max_capacity_retry_seconds,
             )
@@ -1519,6 +1595,9 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 response_field=self._response_field,
                 align_output_contract=self._align_output_contract,
                 apply_declared_output_field_contracts=self._apply_declared_output_field_contracts,
+                image_specs=image_specs,
+                max_image_bytes=max_image_bytes,
+                max_images_per_call=max_images_per_call,
             )
 
             # Single-query emits unprefixed fields (operational only — audit goes to success_reason)
@@ -1540,12 +1619,13 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # Provider instance — deferred to on_start() when recorder/telemetry available
         self._provider: LLMProvider | None = None
 
-        # Recorder, telemetry, rate limit (set in on_start)
+        # Recorder, telemetry, rate limit, payload store (set in on_start)
         self._recorder: PluginAuditWriter | None = None
         self._run_id: str = ""
         self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
         self._limiter: Any = None
         self._shutdown_event: threading.Event | None = None
+        self._payload_store: PayloadStore | None = None
 
         # Batch processing state
         self._batch_initialized = False
@@ -1643,6 +1723,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         self._run_id = ctx.run_id
         self._telemetry_emit = ctx.telemetry_emit
         self._shutdown_event = ctx.shutdown_event
+        self._payload_store = ctx.payload_store
         limiter_name = (
             "azure_openai"
             if isinstance(self._config, AzureOpenAIConfig)
@@ -1774,6 +1855,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             ctx,
             provider=self._provider,
             tracer=self._tracer,
+            payload_store=self._payload_store,
         )
 
     def close(self) -> None:

@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Sequence
 from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -48,6 +49,7 @@ from pydantic import Field, field_validator
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
+from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
@@ -432,7 +434,7 @@ class GatewayLLMProvider:
 
     def execute_query(
         self,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         model: str,
         temperature: float,
@@ -465,7 +467,7 @@ class GatewayLLMProvider:
         try:
             request_body: dict[str, Any] = {
                 "model": model,
-                "messages": messages,
+                "messages": wire_messages(messages),
                 "temperature": temperature,
             }
             if max_tokens is not None:
@@ -563,7 +565,7 @@ class GatewayLLMProvider:
         self,
         *,
         model: str,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         temperature: float,
         max_tokens: int | None,
         response_format: dict[str, Any] | None,
@@ -573,7 +575,7 @@ class GatewayLLMProvider:
             extra_kwargs["response_format"] = response_format
         return LLMCallRequest(
             model=model,
-            messages=messages,
+            messages=audit_messages(messages),
             temperature=temperature,
             provider="gateway",
             max_tokens=max_tokens,
@@ -729,7 +731,7 @@ class GatewayLLMProvider:
         try:
             request_body: dict[str, Any] = {
                 "model": model,
-                "messages": [{"role": "user", "content": "This is a pre-flight smoke test. Please reply with ok."}],
+                "messages": wire_messages([ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]),
                 "temperature": 0.0,
                 "max_tokens": 32,
             }

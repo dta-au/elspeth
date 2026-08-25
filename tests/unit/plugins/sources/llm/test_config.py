@@ -30,6 +30,12 @@ TRANSFORM_ONLY_FIELDS = {
     "recovery_step_ms",
     "max_capacity_retry_seconds",
     "resolved_prompt_template_hash",
+    # image_inputs binds to a ROW column (`field`); the LLM source has no
+    # input row (its prompt_template is static Jinja2 with no `row.*`
+    # context), so there is nothing for an image input to bind to.
+    "image_inputs",
+    "max_image_bytes",
+    "max_images_per_call",
 }
 
 

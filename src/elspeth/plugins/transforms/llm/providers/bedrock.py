@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from threading import Lock
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from pydantic import Field, field_validator
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
@@ -135,7 +137,7 @@ class BedrockLLMProvider:
 
     def execute_query(
         self,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         model: str,
         temperature: float,
@@ -207,7 +209,7 @@ class BedrockLLMProvider:
             try:
                 client.chat_completion(
                     model=model,
-                    messages=[{"role": "user", "content": "This is a pre-flight smoke test. Please reply with ok."}],
+                    messages=[ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
                     temperature=0.0,
                     max_tokens=32,
                 )

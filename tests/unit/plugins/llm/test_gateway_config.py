@@ -260,6 +260,7 @@ def _make_ctx() -> SimpleNamespace:
         shutdown_event=None,
         landscape=object(),
         telemetry_emit=lambda event: None,
+        payload_store=None,
     )
 
 
@@ -291,7 +292,10 @@ class TestGatewayPrivateOptionsCoverage:
     # these AND NOT added to _LLM_PRIVATE_OPTIONS fails this test loudly.
     _DELIBERATELY_PUBLIC_FIELDS = frozenset(
         {
+            "image_inputs",
             "lookup",
+            "max_image_bytes",
+            "max_images_per_call",
             "prompt_template",
             "queries",
             "required_input_fields",

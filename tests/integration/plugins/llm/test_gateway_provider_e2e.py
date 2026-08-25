@@ -103,6 +103,7 @@ from mock.oauth import create_mock_oauth_app  # noqa: E402
 from mock.upstream import create_mock_upstream_app  # noqa: E402
 
 from elspeth.contracts import CallStatus, CallType  # noqa: E402
+from elspeth.contracts.chat_parts import ChatMessage  # noqa: E402
 from elspeth.plugins.infrastructure.clients.llm import (  # noqa: E402
     ContentPolicyError,
     ContextLengthError,
@@ -412,7 +413,7 @@ def forced_401_stack() -> Iterator[tuple[GatewayLLMProvider, _RecordingTransport
 class TestCriterion4Shapes:
     def test_single_query_text(self, main_provider: GatewayLLMProvider) -> None:
         result = main_provider.execute_query(
-            messages=[{"role": "user", "content": "hello gateway"}],
+            messages=[ChatMessage(role="user", content="hello gateway")],
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
@@ -441,7 +442,7 @@ class TestCriterion4Shapes:
             },
         }
         result = main_provider.execute_query(
-            messages=[{"role": "user", "content": "structured please"}],
+            messages=[ChatMessage(role="user", content="structured please")],
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
@@ -457,7 +458,7 @@ class TestCriterion4Shapes:
     def test_multi_query_json_object(self, main_provider: GatewayLLMProvider) -> None:
         response_format = {"type": "json_object"}
         result = main_provider.execute_query(
-            messages=[{"role": "user", "content": "object please"}],
+            messages=[ChatMessage(role="user", content="object please")],
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
@@ -480,7 +481,7 @@ class TestCriterion5UsageAndFinishReason:
     def test_truncated_maps_to_length_with_preserved_usage(self, main_provider: GatewayLLMProvider) -> None:
         message = "TRIGGER_HALT truncated"
         result = main_provider.execute_query(
-            messages=[{"role": "user", "content": message}],
+            messages=[ChatMessage(role="user", content=message)],
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
@@ -499,7 +500,7 @@ class TestCriterion5UsageAndFinishReason:
     def test_complete_maps_to_stop_with_preserved_usage(self, main_provider: GatewayLLMProvider) -> None:
         message = "TRIGGER_HALT complete"
         result = main_provider.execute_query(
-            messages=[{"role": "user", "content": message}],
+            messages=[ChatMessage(role="user", content=message)],
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
@@ -519,7 +520,7 @@ class TestCriterion5UsageAndFinishReason:
         rule raises ContentPolicyError (never a successful, empty result)."""
         with pytest.raises(ContentPolicyError):
             main_provider.execute_query(
-                messages=[{"role": "user", "content": "TRIGGER_HALT screened"}],
+                messages=[ChatMessage(role="user", content="TRIGGER_HALT screened")],
                 model=_MODEL_ALIAS,
                 temperature=0.0,
                 max_tokens=100,
@@ -531,7 +532,7 @@ class TestCriterion5UsageAndFinishReason:
 
     def test_unavailable_usage_recorded_as_unknown_never_zeros(self, no_usage_provider: GatewayLLMProvider) -> None:
         result = no_usage_provider.execute_query(
-            messages=[{"role": "user", "content": "no usage please"}],
+            messages=[ChatMessage(role="user", content="no usage please")],
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
@@ -559,7 +560,7 @@ class TestCriterion6RetriesStayOutside:
         _, _, upstream_transport = main_stack
         before = upstream_transport.call_count
         main_provider.execute_query(
-            messages=[{"role": "user", "content": "count me once"}],
+            messages=[ChatMessage(role="user", content="count me once")],
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
@@ -576,7 +577,7 @@ class TestCriterion6RetriesStayOutside:
         provider, oauth_transport, upstream_transport = forced_401_stack
 
         result = provider.execute_query(
-            messages=[{"role": "user", "content": "hello after replay"}],
+            messages=[ChatMessage(role="user", content="hello after replay")],
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
@@ -612,7 +613,7 @@ class TestCriterion9ErrorMapping:
     def test_overloaded_is_retryable_server_error(self, main_provider: GatewayLLMProvider) -> None:
         with pytest.raises(ServerError) as exc_info:
             main_provider.execute_query(
-                messages=[{"role": "user", "content": "TRIGGER_FAULT overloaded"}],
+                messages=[ChatMessage(role="user", content="TRIGGER_FAULT overloaded")],
                 model=_MODEL_ALIAS,
                 temperature=0.0,
                 max_tokens=100,
@@ -627,7 +628,7 @@ class TestCriterion9ErrorMapping:
     def test_screening_is_content_policy_error(self, main_provider: GatewayLLMProvider) -> None:
         with pytest.raises(ContentPolicyError) as exc_info:
             main_provider.execute_query(
-                messages=[{"role": "user", "content": "TRIGGER_FAULT screening"}],
+                messages=[ChatMessage(role="user", content="TRIGGER_FAULT screening")],
                 model=_MODEL_ALIAS,
                 temperature=0.0,
                 max_tokens=100,
@@ -642,7 +643,7 @@ class TestCriterion9ErrorMapping:
     def test_too_long_is_context_length_error(self, main_provider: GatewayLLMProvider) -> None:
         with pytest.raises(ContextLengthError) as exc_info:
             main_provider.execute_query(
-                messages=[{"role": "user", "content": "TRIGGER_FAULT too_long"}],
+                messages=[ChatMessage(role="user", content="TRIGGER_FAULT too_long")],
                 model=_MODEL_ALIAS,
                 temperature=0.0,
                 max_tokens=100,
@@ -657,7 +658,7 @@ class TestCriterion9ErrorMapping:
     def test_unmapped_model_alias_is_non_retryable_config_failure(self, main_provider: GatewayLLMProvider) -> None:
         with pytest.raises(LLMClientError) as exc_info:
             main_provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="not-a-published-alias",
                 temperature=0.0,
                 max_tokens=100,
@@ -677,7 +678,7 @@ class TestCriterion9ErrorMapping:
         main_provider._request_headers[_CONTRACT_HEADER] = "99"
         with pytest.raises(LLMClientError) as exc_info:
             main_provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model=_MODEL_ALIAS,
                 temperature=0.0,
                 max_tokens=100,
@@ -727,7 +728,7 @@ def test_success_records_two_audit_rows_end_to_end(main_stack: tuple[str, _Recor
     )
     try:
         provider.execute_query(
-            messages=[{"role": "user", "content": "audit me"}],
+            messages=[ChatMessage(role="user", content="audit me")],
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,

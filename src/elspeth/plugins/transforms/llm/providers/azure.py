@@ -12,7 +12,7 @@ evicting the wrong cache entry during retry races.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -20,6 +20,7 @@ import structlog
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
 from elspeth.plugins.llm.config_validation import AZURE_MODEL_VALUE_SOURCES, derive_azure_model, validate_azure_endpoint
@@ -138,7 +139,7 @@ class AzureLLMProvider:
 
     def execute_query(
         self,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         model: str,
         temperature: float,
@@ -234,7 +235,7 @@ class AzureLLMProvider:
         try:
             client.chat_completion(
                 model=model,
-                messages=[{"role": "user", "content": "This is a pre-flight smoke test. Please reply with ok."}],
+                messages=[ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
                 temperature=0.0,
                 # Azure OpenAI requires max_output_tokens >= 16. Values below
                 # the floor return HTTP 400 with "integer_below_min_value"

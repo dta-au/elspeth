@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -260,7 +261,7 @@ class TestExecuteQuery:
         http_client = FakeHTTPClient(response=_make_http_response())
         with _provider_http_client(provider, http_client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -292,7 +293,7 @@ class TestExecuteQuery:
 
         with pytest.raises(RuntimeError, match="close failed"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -319,7 +320,7 @@ class TestExecuteQuery:
 
         with pytest.raises(ServerError) as exc_info:
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -343,7 +344,7 @@ class TestExecuteQuery:
             client_class.return_value = http_client
 
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -366,7 +367,7 @@ class TestExecuteQuery:
 
             with pytest.raises(ServerError):
                 provider.execute_query(
-                    messages=[{"role": "user", "content": "hi"}],
+                    messages=[ChatMessage(role="user", content="hi")],
                     model="gpt-4o",
                     temperature=0.0,
                     max_tokens=100,
@@ -389,7 +390,7 @@ class TestExecuteQuery:
         http_client = FakeHTTPClient(response=_make_http_response())
         with _provider_http_client(provider, http_client):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=None,
@@ -414,7 +415,7 @@ class TestExecuteQuery:
         http_client = FakeHTTPClient(response=resp)
         with _provider_http_client(provider, http_client), pytest.raises(LLMClientError, match="not valid JSON"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -440,7 +441,7 @@ class TestExecuteQuery:
         http_client = FakeHTTPClient(response=resp)
         with _provider_http_client(provider, http_client), pytest.raises(ContentPolicyError, match="null content"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -466,7 +467,7 @@ class TestExecuteQuery:
         http_client = FakeHTTPClient(response=resp)
         with _provider_http_client(provider, http_client), pytest.raises(LLMClientError, match="Expected string content"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -489,7 +490,7 @@ class TestExecuteQuery:
         http_client = FakeHTTPClient(response=resp)
         with _provider_http_client(provider, http_client), pytest.raises(LLMClientError, match="not valid JSON"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -520,7 +521,7 @@ class TestExecuteQuery:
                 pytest.raises(LLMClientError, match="Non-finite value in usage"),
             ):
                 provider.execute_query(
-                    messages=[{"role": "user", "content": "hi"}],
+                    messages=[ChatMessage(role="user", content="hi")],
                     model="gpt-4o",
                     temperature=0.0,
                     max_tokens=100,
@@ -549,7 +550,7 @@ class TestExecuteQuery:
         http_client = FakeHTTPClient(response=resp)
         with _provider_http_client(provider, http_client), pytest.raises(ContentPolicyError, match="empty content"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -577,7 +578,7 @@ class TestExecuteQuery:
         http_client = FakeHTTPClient(response=resp)
         with _provider_http_client(provider, http_client), pytest.raises(ContentPolicyError, match="empty content"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -591,7 +592,7 @@ class TestExecuteQuery:
         http_client = FakeHTTPClient(response=_make_http_response(finish_reason="end_turn"))
         with _provider_http_client(provider, http_client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -608,7 +609,7 @@ class TestExecuteQuery:
         http_client = FakeHTTPClient(response=_make_http_response(finish_reason="stop"))
         with _provider_http_client(provider, http_client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -639,7 +640,7 @@ class TestExecuteQuery:
             client_class.return_value = http_client
 
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -662,7 +663,7 @@ class TestHTTPErrorMapping:
         http_client = FakeHTTPClient(response=_make_error_response(429))
         with _provider_http_client(provider, http_client), pytest.raises(RateLimitError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -676,7 +677,7 @@ class TestHTTPErrorMapping:
         http_client = FakeHTTPClient(response=_make_error_response(500))
         with _provider_http_client(provider, http_client), pytest.raises(ServerError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -691,7 +692,7 @@ class TestHTTPErrorMapping:
         http_client = FakeHTTPClient(response=_make_error_response(502))
         with _provider_http_client(provider, http_client), pytest.raises(ServerError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -706,7 +707,7 @@ class TestHTTPErrorMapping:
         http_client = FakeHTTPClient(response=_make_error_response(503))
         with _provider_http_client(provider, http_client), pytest.raises(ServerError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -720,7 +721,7 @@ class TestHTTPErrorMapping:
         http_client = FakeHTTPClient(error=httpx.ConnectError("connection refused"))
         with _provider_http_client(provider, http_client), pytest.raises(NetworkError, match="Network error"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -734,7 +735,7 @@ class TestHTTPErrorMapping:
         http_client = FakeHTTPClient(error=httpx.ReadTimeout("timed out"))
         with _provider_http_client(provider, http_client), pytest.raises(NetworkError, match="Network error"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -748,7 +749,7 @@ class TestHTTPErrorMapping:
         http_client = FakeHTTPClient(response=_make_error_response(400))
         with _provider_http_client(provider, http_client), pytest.raises(LLMClientError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -766,7 +767,7 @@ class TestHTTPErrorMapping:
         with _provider_http_client(provider, http_client):
             with pytest.raises(ContextLengthError) as exc_info:
                 provider.execute_query(
-                    messages=[{"role": "user", "content": "hi"}],
+                    messages=[ChatMessage(role="user", content="hi")],
                     model="gpt-4o",
                     temperature=0.0,
                     max_tokens=100,
@@ -794,7 +795,7 @@ class TestHTTPErrorMapping:
         )
         with _provider_http_client(provider, http_client), pytest.raises(ContextLengthError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -818,7 +819,7 @@ class TestHTTPErrorMapping:
         http_client = FakeHTTPClient(response=_make_error_response(400, body=anthropic_body))
         with _provider_http_client(provider, http_client), pytest.raises(ContextLengthError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="anthropic/claude-sonnet-4",
                 temperature=0.0,
                 max_tokens=100,
@@ -839,7 +840,7 @@ class TestHTTPErrorMapping:
         http_client = FakeHTTPClient(response=resp)
         with _provider_http_client(provider, http_client), pytest.raises(LLMClientError, match="Empty or missing choices"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
@@ -1037,7 +1038,7 @@ class TestRuntimePreflight:
         with _provider_http_client(provider, http_client):
             with pytest.raises(LLMClientError) as exc_info:
                 provider.execute_query(
-                    messages=[{"role": "user", "content": "hi"}],
+                    messages=[ChatMessage(role="user", content="hi")],
                     model="gpt-5-mini",
                     temperature=0.0,
                     max_tokens=100,

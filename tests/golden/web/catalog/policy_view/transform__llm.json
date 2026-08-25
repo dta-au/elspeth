@@ -69,6 +69,53 @@
         "title": "FieldDefinition",
         "type": "object"
       },
+      "ImageInputConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "format": {
+            "anyOf": [
+              {
+                "enum": [
+                  "jpeg",
+                  "png"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Format"
+          },
+          "format_field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Format Field"
+          },
+          "required": {
+            "default": true,
+            "title": "Required",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "field"
+        ],
+        "title": "ImageInputConfig",
+        "type": "object"
+      },
       "OutputFieldConfig": {
         "additionalProperties": false,
         "description": "Configuration for a single output field in the LLM response.\n\nAttributes:\n    suffix: Column suffix in output row (e.g., \"score\" -> \"{prefix}_score\")\n    type: Data type for schema enforcement\n    values: Required for enum type - list of allowed values",
@@ -303,6 +350,23 @@
     },
     "additionalProperties": false,
     "properties": {
+      "image_inputs": {
+        "anyOf": [
+          {
+            "items": {
+              "$ref": "#/$defs/ImageInputConfig"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Row columns to resolve as image message parts (absent = text-only)",
+        "title": "Image Inputs"
+      },
       "lookup": {
         "anyOf": [
           {
@@ -316,6 +380,21 @@
         "default": null,
         "description": "Lookup data loaded from YAML file",
         "title": "Lookup"
+      },
+      "max_image_bytes": {
+        "default": 5242880,
+        "description": "Per-image byte cap (hard upper bound 20 MiB)",
+        "exclusiveMinimum": 0,
+        "maximum": 20971520,
+        "title": "Max Image Bytes",
+        "type": "integer"
+      },
+      "max_images_per_call": {
+        "default": 20,
+        "description": "Maximum resolved images per LLM call",
+        "exclusiveMinimum": 0,
+        "title": "Max Images Per Call",
+        "type": "integer"
       },
       "profile": {
         "description": "Operator-approved LLM profile alias",
@@ -461,6 +540,24 @@
         "name": "response_field",
         "required": false,
         "type": "string"
+      },
+      {
+        "description": "Row columns to resolve as image message parts (absent = text-only)",
+        "name": "image_inputs",
+        "required": false,
+        "type": "object"
+      },
+      {
+        "description": "Per-image byte cap (hard upper bound 20 MiB)",
+        "name": "max_image_bytes",
+        "required": false,
+        "type": "integer"
+      },
+      {
+        "description": "Maximum resolved images per LLM call",
+        "name": "max_images_per_call",
+        "required": false,
+        "type": "integer"
       },
       {
         "description": "Lookup data loaded from YAML file",
