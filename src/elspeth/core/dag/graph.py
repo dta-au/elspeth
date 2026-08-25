@@ -1032,12 +1032,9 @@ class ExecutionGraph:
         treats coalesce/row_union/collector uniformly as legal DIVERT
         targets — extending the RUNTIME-facing closer vocabulary (the
         orchestrator preflight validators and the token-dispatch
-        classification) to collectors is WS4 Task 8-12's parity sweep, not
-        this one's. A collector-targeted rule-9 config cannot reach either
-        consumer of this set today regardless: collector graphs are
-        hard-refused before execution starts
-        (``orchestrator/graph_registration.py``). Re-derive this set (add
-        ``get_collector_id_map()``) only when WS4 lifts that refusal.
+        classification) to collectors is the rule-9 parity sweep
+        (integration item 18, after the collector executor lift) — this set
+        gains ``get_collector_id_map()`` there, not before.
         """
         return {str(name) for name in self._coalesce_id_map} | {str(name) for name in self._row_union_id_map}
 

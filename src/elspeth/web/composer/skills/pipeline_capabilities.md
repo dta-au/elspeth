@@ -157,11 +157,10 @@ ids identify components; they are not implicit connections.
   opener; `on_success` names the flush destination (a sink or a consumed
   connection); `on_error` is optional (`discard` or a sink name — omitted, the
   route derives from the scope's group machinery). Omit gate, coalesce, and
-  aggregation fields. A collector currently validates and builds but cannot
-  execute: collector execution lands in a later engine release, so a pipeline
-  containing one is refused at runtime preflight ("collector execution lands
-  in WS4 and cannot run yet"). Author a collector only to stage work for that
-  release, and tell the user the pipeline will not run until then.
+  aggregation fields. At runtime every member of the opener's expansion holds
+  at the collector until the group's roster settles (arrived or lost), then the
+  plugin runs once over the members in expansion order and its output flows to
+  `on_success`.
 - [capability-node:row_union] A `row_union` is a plugin-free, correlated
   barrier that waits for every declared fork branch, then releases the
   original branch rows in declared order without merging fields. Declare at

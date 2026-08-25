@@ -20,7 +20,6 @@ from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, resolve_config
 from elspeth.core.dag.graph import ExecutionGraph
-from elspeth.core.dag.models import GraphValidationError
 from elspeth.plugins.infrastructure.runtime_factory import (
     PluginBundle,
     instantiate_plugins_from_config,
@@ -666,22 +665,4 @@ def build_validated_runtime_graph(
             graph = build_runtime_graph(settings, bundle)
     graph.validate()
     graph.validate_edge_compatibility()
-    # Collectors validate and BUILD but cannot execute until WS4 lands the
-    # collector executor: the orchestrator's graph-registration invariant
-    # (engine/orchestrator/graph_registration.py, pinned decision 5) refuses
-    # any collector-bearing graph at run time. Refusing HERE keeps this
-    # surface's contract honest — a green runtime preflight means RUNNABLE —
-    # instead of admitting a bundle the engine immediately rejects. The
-    # wording mirrors the engine invariant (its exact "collector execution
-    # lands in WS4 and cannot run yet" kernel, pinned by test) so the web run
-    # path and `elspeth run` tell the operator the same thing.
-    collector_id_map = graph.get_collector_id_map()
-    if collector_id_map:
-        first_collector = sorted(str(name) for name in collector_id_map)[0]
-        raise GraphValidationError(
-            "Pipeline contains collector node(s) (EXPAND-group closers, barrier-scopes spec §3); "
-            "collector execution lands in WS4 and cannot run yet.",
-            component_id=first_collector,
-            component_type="collector",
-        )
     return RuntimeGraphBundle(plugin_bundle=bundle, graph=graph)

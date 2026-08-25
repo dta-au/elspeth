@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
 from elspeth import __version__ as ENGINE_VERSION
@@ -77,8 +76,8 @@ def resolve_node_audit_metadata(
     config_gate_node_ids: set[NodeID],
     aggregation_node_ids: set[NodeID],
     coalesce_node_ids: set[NodeID],
-    collector_id_map: Mapping[CollectorName, NodeID] = MappingProxyType({}),
-    collector_transforms: Mapping[CollectorName, _AuditMetadataPlugin] = MappingProxyType({}),
+    collector_id_map: Mapping[CollectorName, NodeID],
+    collector_transforms: Mapping[CollectorName, _AuditMetadataPlugin],
 ) -> dict[NodeID, NodeAuditMetadata]:
     """Resolve audit metadata for every graph node before Landscape writes.
 

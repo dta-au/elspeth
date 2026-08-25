@@ -1487,13 +1487,10 @@ class BarrierIntakeCoordinator:
                 # _binding_for_closer_name) — cannot authenticate or even
                 # check settlement; discard rather than crash a run over a
                 # test-harness/legacy-wiring gap that never arises from a
-                # real built graph. Inert today: build_group_binding_registry
-                # guarantees a binding for every executable coalesce/
-                # row_union/collector closer, and graph_registration.py
-                # hard-refuses any graph carrying a collector node before
-                # execution — re-adjudicate this arm under filigree
-                # elspeth-c00a82bf97 once WS4 lifts that refusal and
-                # collector closers become reachable here.
+                # real built graph: build_group_binding_registry guarantees a
+                # binding for every executable coalesce/row_union/collector
+                # closer (collector closers are reachable here since the
+                # integration lift; filigree elspeth-c00a82bf97).
                 del self._failed_group_notes[(closer_name, group_id)]
                 continue
             if not self._group_roster_settled(closer_name=closer_name, group_id=group_id, binding=failed_binding):

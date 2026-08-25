@@ -147,9 +147,8 @@ class GroupBindingRegistry:
 
         Collector closers are excluded (mirrors ``ExecutionGraph.
         get_error_routable_closer_names()``'s fuller trigger comment):
-        extending this to collectors is WS4 Task 8-12's parity sweep, and a
-        collector-bound graph cannot reach a live dispatch anyway
-        (hard-refused pre-execution)."""
+        extending this to collectors is the rule-9 parity sweep (integration
+        item 18, after the collector executor lift)."""
         return any(binding.closer_name == name and binding.closer_kind is not CloserKind.COLLECTOR for binding in self.bindings)
 
     def binding_for(self, frame: LineageFrame) -> GroupBinding | None:

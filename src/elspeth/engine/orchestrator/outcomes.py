@@ -150,7 +150,8 @@ def _terminalize_swept_coalesce_failure(
     with a nested coalesce is buildable and runs end-to-end today
     (`tests/integration/core/dag/test_nested_fork_coalesce.py`) — a fix-round-1
     correction (I1) of an earlier claim here that nested bound regions were
-    build-rejected; only nested collector/scope regions are (WS4). Ruling
+    build-rejected (nested collector/scope regions run since the integration
+    lift). Ruling
     38/C1 is what makes firing this walk safe (the escalation is
     deduplicated per resolved enclosing member, not run once per consumed
     sibling); Ruling 39/C2 is what makes its staged loss durable, below.

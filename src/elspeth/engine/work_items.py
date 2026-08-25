@@ -57,14 +57,13 @@ class WorkItem:
     (processor.py's DAGNavigator, WS3-owned, outside this task's lane) does
     not yet provide it — confirmed by a whole-tree mypy run before landing
     this shape. barrier_key's compound "collector:<name>:<group_id>" address
-    is name-based, not node-id-based, so the bare name is sufficient.
-    There are ZERO production writers of this field until the WS3+WS4
-    integration item wires the first dispatch call that sets it
-    (integration worklist item 1) — META-14.2's no-writer invariant test
-    (test_collector_barrier_key_interlock.py) pins the durable barrier_key
-    half of that same fact and self-destructs the moment a real writer
-    lands, which is when this comment (and a resolver, if the integration
-    item's design needs one) should be revisited.
+    is name-based, not node-id-based, so the bare name is sufficient; the
+    processor resolves it through ``RowProcessor._collector_node_for_cursor``.
+    The producers are the opener's expansion (token_traversal) and the
+    release cursor derivations (integration item 1/C5); the durable
+    barrier_key producer is ``RowProcessor._barrier_key_for_blocked_item``,
+    and test_collector_barrier_key_interlock.py pins the exact set of
+    ``collector_barrier_key`` call sites.
     """
 
     token: TokenInfo

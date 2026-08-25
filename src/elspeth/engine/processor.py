@@ -4293,11 +4293,10 @@ class RowProcessor:
                         # only production register_expand_group call is
                         # TokenManager.expand_token's mint path, which this
                         # resume-path reconstruction bypasses entirely. If a
-                        # scope opener's residual is ever rebuilt here (not
-                        # reachable today — collector graphs are
-                        # build-rejected until WS4), the rebuilt frame stays
-                        # inert; re-registering on residual rebuild is
-                        # WS4/WS5-6 work (see group_bindings.py's docstring).
+                        # scope opener's residual is rebuilt here, the rebuilt
+                        # frame resolves on its next settle through the
+                        # META-9.1 durable re-derivation
+                        # (_rederive_expand_binding) rather than staying inert.
                         LineageFrame(kind=FrameKind.EXPAND, group_id=child.expand_group_id, member_key=child.token_id),
                     ),
                 )
