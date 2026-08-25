@@ -61,12 +61,50 @@ class _HoldingCollectorExecutor:
         raise AssertionError("not reached")
 
 
-def _build(*, mode: ProcessorMode, executor: _HoldingCollectorExecutor | None) -> tuple[RowProcessor, RecorderSetup, MockClock]:
-    """Real RowProcessor over a real scheduler DB, one collector node in the traversal."""
+UNION_NODE = "row_union::variants"
+AFTER_UNION = "after-union"
+
+
+def _build(
+    *,
+    mode: ProcessorMode,
+    executor: _HoldingCollectorExecutor | None,
+    with_union_before_collector: bool = False,
+    group_bindings: GroupBindingRegistry | None = None,
+) -> tuple[RowProcessor, RecorderSetup, MockClock]:
+    """Real RowProcessor over a real scheduler DB, one collector node in the traversal.
+
+    ``with_union_before_collector`` adds source -> union -> after-union ->
+    collector, the depth-2 shape a union INSIDE a scope releases into."""
     setup = make_recorder_with_run(run_id="run-collector-wiring", source_node_id=SOURCE_NODE, leader_worker_id=LEADER_OWNER)
     register_test_node(setup.data_flow, setup.run_id, COLLECTOR_NODE)
     clock = MockClock(start=1_750_000_000.0)
     leader = mode is ProcessorMode.LEADER
+    if with_union_before_collector:
+        register_test_node(setup.data_flow, setup.run_id, UNION_NODE)
+        register_test_node(setup.data_flow, setup.run_id, AFTER_UNION)
+        traversal = DAGTraversalContext(
+            node_step_map={NodeID(SOURCE_NODE): 0, NodeID(UNION_NODE): 1, NodeID(AFTER_UNION): 2, NodeID(COLLECTOR_NODE): 3},
+            node_to_plugin={},
+            node_to_next={
+                NodeID(SOURCE_NODE): NodeID(UNION_NODE),
+                NodeID(UNION_NODE): NodeID(AFTER_UNION),
+                NodeID(AFTER_UNION): NodeID(COLLECTOR_NODE),
+                NodeID(COLLECTOR_NODE): None,
+            },
+            coalesce_node_map={},
+            row_union_node_map={RowUnionName("variants"): NodeID(UNION_NODE)},
+            collector_node_map={STITCH: NodeID(COLLECTOR_NODE)},
+            structural_node_ids=frozenset({NodeID(AFTER_UNION)}),
+        )
+    else:
+        traversal = DAGTraversalContext(
+            node_step_map={NodeID(SOURCE_NODE): 0, NodeID(COLLECTOR_NODE): 1},
+            node_to_plugin={},
+            node_to_next={NodeID(SOURCE_NODE): NodeID(COLLECTOR_NODE), NodeID(COLLECTOR_NODE): None},
+            coalesce_node_map={},
+            collector_node_map={STITCH: NodeID(COLLECTOR_NODE)},
+        )
     processor = RowProcessor(
         execution=setup.execution,
         data_flow=setup.data_flow,
@@ -74,13 +112,8 @@ def _build(*, mode: ProcessorMode, executor: _HoldingCollectorExecutor | None) -
         run_id=setup.run_id,
         source_node_id=NodeID(SOURCE_NODE),
         source_on_success="default",
-        traversal=DAGTraversalContext(
-            node_step_map={NodeID(SOURCE_NODE): 0, NodeID(COLLECTOR_NODE): 1},
-            node_to_plugin={},
-            node_to_next={NodeID(SOURCE_NODE): NodeID(COLLECTOR_NODE), NodeID(COLLECTOR_NODE): None},
-            coalesce_node_map={},
-            collector_node_map={STITCH: NodeID(COLLECTOR_NODE)},
-        ),
+        traversal=traversal,
+        group_bindings=group_bindings,
         scheduler=setup.factory.scheduler,
         scheduler_lease_owner=LEADER_OWNER if leader else "follower-1",
         coordination_token=leader_coordination_token(setup.factory, setup.run_id) if leader else None,
@@ -427,3 +460,46 @@ class TestCollectorCursorLookup:
             processor.route_collector_release(collector_name=CollectorName("ghost"), released_tokens=(token,))
         with pytest.raises(AuditIntegrityError, match="cursor names collector 'ghost'"):
             processor._process_single_token(token, _ctx(setup), NodeID(COLLECTOR_NODE), collector_name=CollectorName("ghost"))
+
+
+class TestDepthTwoReleaseHoldsAtTheCollector:
+    def test_union_release_inside_a_scope_travels_to_the_collector_and_holds(self) -> None:
+        """C5 review M-1: the cursor is not the point — the JOURNEY is. The
+        token a union releases inside a scope must reach the collector node
+        and hold there (durable BLOCKED row under the compound key), driven
+        through the real drain from the release's own continuation item."""
+        registry = GroupBindingRegistry(
+            bindings=(
+                GroupBinding(
+                    kind=FrameKind.EXPAND,
+                    opener_node_id=NodeID("explode"),
+                    opener_name="explode",
+                    closer_node_id=NodeID(COLLECTOR_NODE),
+                    closer_name="stitch",
+                    closer_kind=CloserKind.COLLECTOR,
+                    policy="require_all",
+                    on_group_failure=None,
+                    member_roster=(),
+                ),
+            )
+        )
+        registry.register_expand_group("g-scope", opener_name="explode")
+        executor = _HoldingCollectorExecutor()
+        processor, setup, _clock = _build(
+            mode=ProcessorMode.LEADER, executor=executor, with_union_before_collector=True, group_bindings=registry
+        )
+        released = _expand_member(setup, sequence=11, group_id="g-scope")
+
+        [item] = processor.released_row_union_items(row_union_name=RowUnionName("variants"), released_tokens=(released,))
+        assert (item.current_node_id, item.collector_name) == (NodeID(AFTER_UNION), STITCH)
+
+        results = processor._drain_durable_work_queue(item, _ctx(setup))
+
+        assert results == []
+        blocked = setup.factory.scheduler.list_blocked_barrier_items(run_id=setup.run_id)
+        # node_id is the enqueue-time cursor (after-union), never the barrier
+        # owner; the compound key and the executor accept prove the journey.
+        assert [(row.token_id, row.barrier_key, row.collector_name, row.node_id) for row in blocked] == [
+            (released.token_id, collector_barrier_key("stitch", "g-scope"), "stitch", AFTER_UNION),
+        ]
+        assert [(token_id, name) for token_id, name, _ctx_seen in executor.accepted] == [(released.token_id, "stitch")]
