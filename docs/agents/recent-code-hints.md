@@ -8,6 +8,36 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-25 — LLM messages are `Sequence[ChatMessage]`; `wire_messages`/
+  `audit_messages` are the ONLY two exits, and image bytes must never reach
+  audit, tracing, logs, or exception text** (`contracts/chat_parts.py`, llm
+  image-input feature). One owned type replaces the old `list[dict[str, str]]`
+  provider seam: `ChatMessage(role, content)` where `content` is a plain `str`
+  for text-only messages (byte-identical audit behavior to the pre-image
+  tree) or a non-empty `tuple[TextPart | ImagePart, ...]` for a multimodal
+  message. `ImagePart` is constructed via `ImagePart.from_bytes(format=,
+  data=, blob_ref=)` — never the bare dataclass constructor outside tests —
+  and `__post_init__` re-asserts every invariant (byte-signature match via
+  `binary_documents.binary_document_signature_matches`, `sha256`/`byte_count`
+  agreement) so a hand-built instance cannot lie. Two projections derive from
+  a message sequence and are the only sanctioned way out of the module:
+  `wire_messages()` (OpenAI content-parts dialect, base64 image data URLs —
+  goes to the provider ONLY) and `audit_messages()` (each `ImagePart` reduced
+  to `ImagePart.audit_view()`: format/sha256/byte_count/blob_ref, never
+  `data`) for `LLMCallRequest` recording. `parts_hash()` is the one other
+  reader of raw bytes (order-sensitive SHA-256 over `audit_view()`s, used for
+  the multi-query `parts_hash` audited on each call) — do not add a third.
+  Every call site that used to build `[{"role": ..., "content": ...}]` by
+  hand now constructs `ChatMessage`s and calls one of the two projections at
+  the wire/audit boundary; `AuditedLLMClient` (`plugins/infrastructure/clients`)
+  cannot import the transform-layer serializer, which is why this type lives
+  in `contracts/chat_parts.py` rather than beside the LLM transform (a
+  deliberate one-layer-lower placement vs. the originating spec's prose).
+  Any NEW code that touches message content must go through
+  `wire_messages`/`audit_messages` — never hand-serialize a `ChatMessage`,
+  and never let `ImagePart.data` reach anything that isn't the wire
+  projection.
+
 - **2026-08-25 — the death-matrix harness hosts a LIVE-leader + follower
   composition, and "multi-worker collector test" names TWO different items**
   (integration phase 1b, `tests/e2e/recovery/test_barrier_process_death_matrix.py`
