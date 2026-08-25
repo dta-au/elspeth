@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
 from elspeth.contracts.types import NodeID
-from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
+from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
 from elspeth.core.dag.models import GraphValidationError
 
 if TYPE_CHECKING:
@@ -399,8 +399,9 @@ def validate_openers_bound_in_region(
 
     Every token-creating node inside a bound region must be a declared
     scope opener whose closer is ALSO inside that region. A fork's own
-    branches close at an in-region coalesce/row_union exactly as before
-    (rule 4 already enforces that); this rule adds the EXPAND case: an
+    branches close at an in-region COALESCE (rule 4 already enforces the
+    SESE shape; a row_union closer is rejected here — see the closer-kind
+    split below); this rule adds the EXPAND case: an
     undeclared multi-row transform inside any bound region is rejected
     flat, and a declared scope whose collector closes outside the
     enclosing region is rejected too, so every member of a bound region
@@ -423,10 +424,12 @@ def validate_openers_bound_in_region(
     limb below (a collector cannot open its own scope), which is the
     correct fail-closed outcome.
 
-    In-region FORK gates have FOUR shapes, and this rule owns the fourth
-    (META-38 commit 3, 2026-08-25): a fork inside a bound region either
-    closes at an in-region coalesce/row_union (well-nested, legal — rule 3
-    enforces the nesting, rule 4 the SESE shape), closes outside the
+    In-region FORK gates have FOUR shapes; this rule owns the fourth
+    (META-38 commit 3, 2026-08-25) and a closer-kind split of the first
+    (elspeth-9db785ace7, 2026-08-26): a fork inside a bound region either
+    closes at an in-region closer of its own (rule 3 enforces the nesting,
+    rule 4 the SESE shape — legal ONLY for a COALESCE closer, see the next
+    paragraph), closes outside the
     enclosing region (rule 3's partial-overlap rejection already fires,
     before this function ever runs), fans out to sinks (pure fan-out —
     rule 4's sink-inside check already rejects a sink reached from within
@@ -443,6 +446,30 @@ def validate_openers_bound_in_region(
     states. The runtime truncation guard (``truncate_at_closer_frame``)
     still raises on the frame it would leave above the closer's own — a
     fail-closed defense, not the enforcement point; this is.
+
+    The closer-kind split (elspeth-9db785ace7): an earlier revision of
+    this docstring declared the first shape's closer kinds interchangeable
+    ("closes at an in-region coalesce/row_union — well-nested, legal"),
+    and they are NOT, because the two kinds differ in release cardinality.
+    A coalesce is a MERGING closer: ``truncate_at_closer_frame``
+    (contracts/identity.py) mints ONE successor per group, so the
+    enclosing region still sees exactly one token per member — legal. A
+    row_union is a PASS-THROUGH closer (ruling 27, ``pop_fork_frame``):
+    it releases the ORIGINAL branch tokens, each still carrying the same
+    innermost enclosing-group (group_id, member_key), so one member of
+    the enclosing region presents branch-count tokens at the enclosing
+    closer and rule 5's one-token-per-member certification above is
+    FALSE. The enclosing closer's fail-closed guards then raise at
+    runtime — the collector's duplicate-member check (a Tier-1
+    ``AuditIntegrityError`` whose message calls the state build-time
+    impossible), or the coalesce/row_union duplicate-arrival
+    ``OrchestrationInvariantError`` — on a builder-certified shape.
+    Rulings 27 and 28 contradict each other for that shape, so the
+    contradiction is resolved here, at build: an in-region fork gate
+    whose binding's ``closer_kind`` is ROW_UNION is rejected flat, for
+    EVERY enclosing closer kind (collector, coalesce, row_union alike).
+    The runtime guards stay exactly as they are — fail-closed defenses,
+    never the enforcement point.
 
     The "closer closes outside" limb below is a DEFENSIVE invariant, not a
     reachable rejection: whenever an opener node is genuinely a member of
@@ -476,25 +503,41 @@ def validate_openers_bound_in_region(
     Raises:
         GraphValidationError: a multi-row transform inside a bound region is
             not a declared scope opener, an UNBOUND fork gate sits inside a
-            bound region, or (defensively; see above) a scope opener's
-            collector closes outside the enclosing region.
+            bound region, an in-region fork gate closes at a ROW_UNION (a
+            pass-through closer cannot preserve the enclosing region's
+            one-token-per-member guarantee), or (defensively; see above) a
+            scope opener's collector closes outside the enclosing region.
     """
     bound_openers = registry.by_opener_node()
     gate_name_by_node_id = {node_id: str(name) for name, node_id in graph.get_config_gate_id_map().items()}
     for region in regions:
         binding = region.binding
         for gate_node_id in sorted(fork_gate_node_ids):
-            if gate_node_id not in region.member_node_ids or gate_node_id in bound_openers:
+            if gate_node_id not in region.member_node_ids:
                 continue
             gate_name = gate_name_by_node_id[gate_node_id] if gate_node_id in gate_name_by_node_id else str(gate_node_id)
-            raise GraphValidationError(
-                f"Fork gate '{gate_name}' inside bound region '{binding.closer_name}' is unbound: its branches "
-                f"reach '{binding.closer_name}' with no coalesce or row_union of their own. Inside a bound region "
-                f"a shape change must itself be a group (spec §7 rule 5, ruling 28): close the fork at an "
-                f"in-region coalesce/row_union before '{binding.closer_name}', or move the fork outside the region.",
-                component_id=gate_name,
-                component_type="gate",
-            )
+            fork_binding = bound_openers[gate_node_id] if gate_node_id in bound_openers else None
+            if fork_binding is None:
+                raise GraphValidationError(
+                    f"Fork gate '{gate_name}' inside bound region '{binding.closer_name}' is unbound: its branches "
+                    f"reach '{binding.closer_name}' with no coalesce or row_union of their own. Inside a bound region "
+                    f"a shape change must itself be a group (spec §7 rule 5, ruling 28): close the fork at an "
+                    f"in-region coalesce/row_union before '{binding.closer_name}', or move the fork outside the region.",
+                    component_id=gate_name,
+                    component_type="gate",
+                )
+            if fork_binding.closer_kind is CloserKind.ROW_UNION:
+                raise GraphValidationError(
+                    f"Fork gate '{gate_name}' inside bound region '{binding.closer_name}' closes at row_union "
+                    f"'{fork_binding.closer_name}'. A row_union is a pass-through closer (ruling 27): it releases "
+                    f"the original branch tokens — one per fork branch — so each member of the region would "
+                    f"present {len(fork_binding.member_roster)} token(s) at the region's {binding.closer_kind} "
+                    f"closer '{binding.closer_name}', violating spec §7 rule 5's one-token-per-member guarantee. "
+                    f"Close the fork at an in-region coalesce instead (a merging closer releases one token per "
+                    f"member), or move the fork and '{fork_binding.closer_name}' outside the region.",
+                    component_id=gate_name,
+                    component_type="gate",
+                )
         for node_id in sorted(multi_row_node_ids):
             transform_name = multi_row_node_ids[node_id]
             if node_id not in region.member_node_ids:

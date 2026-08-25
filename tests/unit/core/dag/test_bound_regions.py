@@ -8,7 +8,7 @@ import pytest
 
 from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.types import NodeID, SinkName
+from elspeth.contracts.types import GateName, NodeID, SinkName
 from elspeth.core.config import (
     AggregationSettings,
     CoalesceSettings,
@@ -2303,3 +2303,228 @@ class TestRule5ForkArm:
         graph = _build_bound_fork_inside_scope()
         regions = graph.get_bound_regions()
         assert {r.binding.closer_name for r in regions} == {"stitcher", "merge"}
+
+
+# ---------------------------------------------------------------------------
+# §7 rule 5 FORK arm, closer-kind split (elspeth-9db785ace7): a ROW_UNION-bound
+# fork inside ANY bound region is refused at build
+# ---------------------------------------------------------------------------
+
+
+def _build_row_union_bound_fork_inside_scope() -> ExecutionGraph:
+    """The elspeth-9db785ace7 crash shape, hand-built: identical topology to
+    `_build_bound_fork_inside_scope` except the in-region fork closes at a
+    ROW_UNION instead of a coalesce. A row_union is a pass-through closer
+    (ruling 27) — it releases the original branch tokens, so every member of
+    the enclosing scope would present branch-count tokens at the collector,
+    which used to sail through the builder and die at runtime on the
+    collector's Tier-1 duplicate-member AuditIntegrityError."""
+    obs = SchemaConfig(mode="observed", fields=None)
+    source = _BoundRegionMockSource()
+    opener = _BoundRegionMultiRowTransform(name="expand", output_schema_config=obs)
+    t_pa = _BoundRegionTransform(name="t_pa", output_schema_config=obs)
+    t_pb = _BoundRegionTransform(name="t_pb", output_schema_config=obs)
+    collector = _BoundRegionCollectorPlugin(name="stitcher", output_schema_config=obs)
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[dict-item]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=opener,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="expand", plugin=opener.name, input="source_out", on_success="pages", on_error="discard", options={}
+                ),
+            ),
+            WiredTransform(
+                plugin=t_pa,  # type: ignore[arg-type]
+                settings=TransformSettings(name="t_pa", plugin=t_pa.name, input="pa", on_success="pa_out", on_error="discard", options={}),
+            ),
+            WiredTransform(
+                plugin=t_pb,  # type: ignore[arg-type]
+                settings=TransformSettings(name="t_pb", plugin=t_pb.name, input="pb", on_success="pb_out", on_error="discard", options={}),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[GateSettings(name="fanout", input="pages", condition="'all'", routes={"all": "fork"}, fork_to=["pa", "pb"])],
+        row_union_settings=[RowUnionSettings(name="union_merge", branches={"pa": "pa_out", "pb": "pb_out"}, on_success="merged")],
+        collectors={"stitcher": (collector, CollectorSettings(name="stitcher", plugin="stitch_pages", input="merged", on_success="out"))},  # type: ignore[dict-item]
+        scope_settings=[ScopeSettings(name="doc_pages", opener="expand", closer="stitcher", policy="require_all")],
+    )
+
+
+def _build_nested_fork_pair(*, outer_closer: str, inner_closer: str) -> ExecutionGraph:
+    """Outer fork [left, right] closed by ``outer_closer``; 'left' carries an
+    inner fork [la, lb] closed by ``inner_closer``, whose output chains into
+    the outer closer's 'left' branch (the `_build_nested_fork_in_fork` chain
+    pattern with both closer KINDS parametrized — elspeth-9db785ace7's two
+    fork-in-fork enclosures). The outer closer chains through a tail
+    transform to the sink so the wiring is identical for both outer kinds."""
+    obs = SchemaConfig(mode="observed", fields=None)
+    source = _BoundRegionMockSource()
+    right_transform = _BoundRegionTransform(name="right_transform", output_schema_config=obs)
+    tail = _BoundRegionTransform(name="tail", output_schema_config=obs)
+    inner_conn = "inner_merge" if inner_closer == "coalesce" else "inner_union_out"
+    coalesce_settings: list[CoalesceSettings] = []
+    row_union_settings: list[RowUnionSettings] = []
+    if inner_closer == "coalesce":
+        # on_success omitted: chains via the connection named after itself.
+        coalesce_settings.append(
+            CoalesceSettings(name="inner_merge", branches={"la": "la", "lb": "lb"}, policy="require_all", merge="union")
+        )
+    else:
+        row_union_settings.append(RowUnionSettings(name="inner_union", branches={"la": "la", "lb": "lb"}, on_success=inner_conn))
+    if outer_closer == "coalesce":
+        coalesce_settings.append(
+            CoalesceSettings(
+                name="outer_closer",
+                branches={"left": inner_conn, "right": "right_out"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+    else:
+        row_union_settings.append(
+            RowUnionSettings(name="outer_closer", branches={"left": inner_conn, "right": "right_out"}, on_success="outer_closer")
+        )
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[dict-item]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=right_transform,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="right_transform",
+                    plugin=right_transform.name,
+                    input="right",
+                    on_success="right_out",
+                    on_error="discard",
+                    options={},
+                ),
+            ),
+            WiredTransform(
+                plugin=tail,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="tail", plugin=tail.name, input="outer_closer", on_success="out", on_error="discard", options={}
+                ),
+            ),
+        ],
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(name="outer_gate", input="source_out", condition="'all'", routes={"all": "fork"}, fork_to=["left", "right"]),
+            GateSettings(name="inner_gate", input="left", condition="'all'", routes={"all": "fork"}, fork_to=["la", "lb"]),
+        ],
+        coalesce_settings=coalesce_settings or None,
+        row_union_settings=row_union_settings or None,
+    )
+
+
+class TestRule5RowUnionCloserKind:
+    """elspeth-9db785ace7: an in-region fork bound to a ROW_UNION closer is
+    rejected at build for EVERY enclosing closer kind; the coalesce-bound
+    sibling shape stays legal (the collector-region coalesce control is
+    `TestRule5ForkArm.test_bound_fork_inside_a_bound_region_still_builds`)."""
+
+    def test_row_union_bound_fork_inside_scope_is_refused(self) -> None:
+        with pytest.raises(
+            GraphValidationError,
+            match=r"Fork gate 'fanout' inside bound region 'stitcher' closes at row_union 'union_merge'",
+        ) as excinfo:
+            _build_row_union_bound_fork_inside_scope()
+        assert "collector closer 'stitcher'" in str(excinfo.value)
+        assert "one-token-per-member" in str(excinfo.value)
+        assert (excinfo.value.component_id, excinfo.value.component_type) == ("fanout", "gate")
+
+    @pytest.mark.parametrize("outer_closer", ["coalesce", "row_union"])
+    def test_row_union_bound_fork_nested_in_a_fork_region_is_refused_at_build(self, outer_closer: str) -> None:
+        # Through the REAL build path these two enclosures are rejected
+        # BEFORE the rule-5 walk ever runs, by the pre-existing row_union
+        # group-indivisibility guard (builder.py: a coalesce/row_union
+        # downstream of a row_union with no intervening sink cannot consume
+        # an N-to-N release). Both rejections are correct for the shape —
+        # the same overlap posture the rule-5 docstring documents for
+        # rule 6 — and the guard that fires first owns the message. The
+        # closer-kind limb itself is pinned for these enclosing kinds by
+        # test_row_union_bound_fork_rejected_for_every_enclosing_closer_kind
+        # below, at the validator surface.
+        with pytest.raises(
+            GraphValidationError,
+            match=r"'outer_closer' is downstream of row_union 'inner_union' with no intervening sink",
+        ):
+            _build_nested_fork_pair(outer_closer=outer_closer, inner_closer="row_union")
+
+    @pytest.mark.parametrize(
+        ("enclosing_kind", "enclosing_frame"),
+        [
+            (CloserKind.COLLECTOR, FrameKind.EXPAND),
+            (CloserKind.COALESCE, FrameKind.FORK),
+            (CloserKind.ROW_UNION, FrameKind.FORK),
+        ],
+        ids=["collector-region", "coalesce-region", "row_union-region"],
+    )
+    def test_row_union_bound_fork_rejected_for_every_enclosing_closer_kind(
+        self, enclosing_kind: CloserKind, enclosing_frame: FrameKind
+    ) -> None:
+        """Direct predicate pin over the raw ``BoundRegion``/``GroupBinding``
+        surface (the ``_build_scope_closing_outside_region`` escape hatch):
+        the closer-kind limb rejects a ROW_UNION-bound in-region fork for
+        EVERY enclosing closer kind. Through ``build_execution_graph`` only
+        the collector enclosure reaches this limb today (the row_union
+        group-indivisibility guard pre-empts the two fork enclosures), so
+        the raw invocation is what pins the enclosing-kind-agnostic
+        mechanism."""
+        graph = ExecutionGraph()
+        graph.set_config_gate_id_map({GateName("inner_gate"): NodeID("gate_node")})
+        enclosing_binding = GroupBinding(
+            kind=enclosing_frame,
+            opener_node_id=NodeID("region_open"),
+            opener_name="region_opener",
+            closer_node_id=NodeID("region_close"),
+            closer_name="region_closer",
+            closer_kind=enclosing_kind,
+            policy="require_all",
+            member_roster=("left", "right") if enclosing_frame is FrameKind.FORK else (),
+        )
+        fork_binding = GroupBinding(
+            kind=FrameKind.FORK,
+            opener_node_id=NodeID("gate_node"),
+            opener_name="inner_gate",
+            closer_node_id=NodeID("union_node"),
+            closer_name="inner_union",
+            closer_kind=CloserKind.ROW_UNION,
+            policy="require_all",
+            member_roster=("la", "lb"),
+        )
+        registry = GroupBindingRegistry(bindings=(enclosing_binding, fork_binding))
+        region = BoundRegion(
+            binding=enclosing_binding,
+            member_node_ids=frozenset({NodeID("gate_node"), NodeID("union_node")}),
+            depth=1,
+        )
+        with pytest.raises(
+            GraphValidationError,
+            match=r"Fork gate 'inner_gate' inside bound region 'region_closer' closes at row_union 'inner_union'",
+        ) as excinfo:
+            validate_openers_bound_in_region(graph, (region,), registry, {}, frozenset({NodeID("gate_node")}))
+        assert f"{enclosing_kind} closer 'region_closer'" in str(excinfo.value)
+        assert "one-token-per-member" in str(excinfo.value)
+        assert (excinfo.value.component_id, excinfo.value.component_type) == ("inner_gate", "gate")
+
+    def test_coalesce_bound_fork_inside_coalesce_region_still_builds(self) -> None:
+        graph = _build_nested_fork_pair(outer_closer="coalesce", inner_closer="coalesce")
+        assert {r.binding.closer_name for r in graph.get_bound_regions()} == {"outer_closer", "inner_merge"}
+
+    def test_no_fork_of_any_kind_nests_inside_a_row_union_branch_today(self) -> None:
+        # There is NO buildable coalesce control for the row_union
+        # ENCLOSURE: a fork gate nested inside a branch that feeds a
+        # row_union is flat-rejected by the pre-existing nested-fork guard
+        # (builder.py, "nested fork replaces the enclosing branch
+        # identity") regardless of the inner closer's kind. Pinned here so
+        # the raw-invocation row_union-region arm above is read as the
+        # defensive mechanism pin it is, not as a shape reachable today.
+        with pytest.raises(
+            GraphValidationError,
+            match=r"nested inside a branch that feeds row_union 'outer_closer'",
+        ):
+            _build_nested_fork_pair(outer_closer="row_union", inner_closer="coalesce")

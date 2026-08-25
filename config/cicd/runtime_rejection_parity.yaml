@@ -2086,6 +2086,29 @@ sites:
     The twin itself is untouched, per the plan''s "the row_union twin already exists and stays." Scope/collector
     regions: not yet composer-authorable at all (Task 12), so uncovered by construction, not a gap — this
     disposition covers coalesce and row_union only.'
+- key: a3dfef620d2b1f55
+  path: src/elspeth/core/dag/bound_regions.py
+  qualname: validate_openers_bound_in_region
+  exception: GraphValidationError
+  message: 'Fork gate ''{}'' inside bound region ''{}'' closes at row_union ''{}''. A row_union is a pass-through
+    closer (ruling 27): it releases the original branch tokens — one'
+  ordinal: 0
+  disposition: unmirrored
+  note: 'Spec §7 rule 5 (ruling 28), ROW_UNION closer-kind limb (elspeth-9db785ace7): an in-region fork
+    bound to a row_union closer is rejected because a row_union is a pass-through closer (ruling 27) —
+    it releases the original branch tokens, so an enclosing region''s member presents branch-count tokens
+    and rule 5''s one-token-per-member certification is false (the ticket''s runtime symptom was the collector''s
+    Tier-1 duplicate-member AuditIntegrityError). Unmirrored per the sibling rule-5 limbs'' precedent
+    (keys 54e4545d6795d37c / 8690ed0e601cb2fd, maintainer-ruled 2026-08-23): the shape IS authorable through
+    the composer post-WS6 (fork gates, row_unions, scopes and collectors are all NodeSpec-authorable)
+    and composer state validation has no in-region membership set, so Stage 1 has ZERO predicate for rule
+    5. UNMIRRORED_CEILING raised 12->13 (tests/unit/scripts/cicd/test_runtime_rejection_parity_gate.py)
+    under elspeth-9db785ace7; ratchet back when the Stage-1 rule-5 mirror (elspeth-239500195b) lands —
+    this limb belongs to the same membership walk. Stage 2 preview_pipeline translates the runtime message
+    meanwhile (bound_region_row_union_fork catalogue entry, tools/generation.py). Only the collector enclosure
+    reaches this raise through build_execution_graph today: the coalesce/row_union enclosures are pre-empted
+    by the row_union group-indivisibility and nested-fork guards (builder.py), and the limb stays enclosing-kind-agnostic
+    as the fail-closed backstop behind both.'
 - key: 8690ed0e601cb2fd
   path: src/elspeth/core/dag/bound_regions.py
   qualname: validate_openers_bound_in_region

@@ -536,11 +536,24 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "before the enclosing group's closer (coalesce/row_union/collector).",
     ),
     (
+        # Ordered before the unbound-fork entry: both headlines start
+        # "Fork gate '...' inside bound region", and patterns match in list
+        # order against raw text (specific-first).
+        r"bound_region_row_union_fork|Fork gate '(.+)' inside bound region '(.+)' closes at row_union",
+        "A fork inside a bound group closes at a row_union. A row_union passes the original branch "
+        "tokens through instead of merging them, so every member of the enclosing group would arrive "
+        "at the group's closer once per branch — violating the one-token-per-member guarantee "
+        "(spec §7 rule 5).",
+        "Close the in-group fork at a coalesce (which merges to one token per member), or move the "
+        "fork and its row_union outside the group.",
+    ),
+    (
         r"bound_region_unbound_fork|Fork gate '(.+)' inside bound region '(.+)' is unbound",
         "A fork sits inside a bound group (a scope, or a fork→coalesce/row_union region) without a coalesce or "
         "row_union of its own, so its branches multiply the group's members with no roster accounting for them "
         "(spec §7 rule 5).",
-        "Close the fork at a coalesce/row_union inside the group before the group's closer, or move the fork outside the group.",
+        "Close the fork at a coalesce inside the group before the group's closer (a row_union cannot close "
+        "an in-group fork — it passes branch tokens through instead of merging them), or move the fork outside the group.",
     ),
     (
         r"bound_region_aggregation_invalid",

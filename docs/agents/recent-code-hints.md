@@ -8,6 +8,31 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-26 — §7 rule 5's fork closer kinds are NOT interchangeable: a
+  ROW_UNION-bound fork inside ANY bound region is a build-time rejection**
+  (elspeth-9db785ace7, `core/dag/bound_regions.py::validate_openers_bound_in_region`).
+  A row_union is a pass-through closer (ruling 27, `pop_fork_frame`): it
+  releases the ORIGINAL branch tokens, so an enclosing region's member
+  presents branch-count tokens and rule 5's one-token-per-member
+  certification is false — the runtime symptom was the collector's Tier-1
+  duplicate-member `AuditIntegrityError` calling itself build-time
+  impossible. Only a COALESCE (merging, `truncate_at_closer_frame`, one
+  successor per group) may close an in-region fork. Traps: (a) the spec's
+  §7 rule 5 prose ("forks close at an in-region coalesce/row_union — as
+  before", 2026-08-21-barrier-scopes-full-nesting-spec.md) still declares
+  the kinds interchangeable — the code is ruled right, the spec sentence is
+  stale; do not "fix" the code back to match it. (b) Through
+  `build_execution_graph` only the COLLECTOR enclosure reaches the new
+  limb: a fork nested in a row_union branch and a barrier downstream of a
+  row_union are pre-empted by older builder guards (builder.py
+  group-indivisibility + nested-fork walks) — the limb stays
+  enclosing-kind-agnostic as the backstop, and the raw
+  `validate_openers_bound_in_region` invocation is how tests pin the
+  coalesce/row_union enclosures. (c) The runtime duplicate-arrival guards
+  (collector.py, coalesce_executor.py, row_union_executor.py) are
+  deliberate fail-closed defenses — never weaken them to "tolerate" this
+  shape.
+
 - **2026-08-25 — the guided collector guard is LIFTED (WS6 lane 2, ruling 7878):
   `guided_collector_not_authorable` is RETIRED, and the guided projection now
   carries a closed collector behavior arm.** Conventions and traps from the

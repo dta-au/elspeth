@@ -56,7 +56,7 @@ from scripts.cicd.runtime_rejection_parity import (
 # falsifier built with the real builder; authorable (fork gates, scopes and
 # collectors are NodeSpec-authorable since C4), Stage 1 still has zero rule-5
 # predicate. Same ticket elspeth-239500195b; ratchet back to 10 when it lands.
-UNMIRRORED_CEILING = 12
+UNMIRRORED_CEILING = 13  # 12->13: rule-5 ROW_UNION closer-kind limb (elspeth-9db785ace7); ratchet back with elspeth-239500195b
 
 
 # --------------------------------------------------------------------------
