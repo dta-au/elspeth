@@ -43,7 +43,9 @@ class TestContextSplit:
         content = build_catalog_context_string(view, plugin_snapshot=snapshot)
 
         assert content.startswith(CATALOG_CONTEXT_PREFIX)
-        assert "UNTRUSTED DATA" in content
+        # Two-layer posture: the deployment-owned catalog is authoritative
+        # reference data (not instructions), never labeled untrusted.
+        assert "AUTHORITATIVE REFERENCE DATA" in content
         for key in _CATALOG_KEYS:
             assert key in content
         for key in _STATE_KEYS:

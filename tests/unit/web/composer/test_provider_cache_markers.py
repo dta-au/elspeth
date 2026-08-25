@@ -329,7 +329,7 @@ class TestCacheMarkersWiredAtCallSite:
         # tail marker for the append-only tool loop.
         assert catalog_context_msg["role"] == "user"
         assert catalog_context_msg["content"].startswith("Deployment plugin catalog and authoring aids")
-        assert "UNTRUSTED DATA" in catalog_context_msg["content"]
+        assert "AUTHORITATIVE REFERENCE DATA" in catalog_context_msg["content"]
         assert catalog_context_msg["cache_control"] == {"type": "ephemeral"}
         assert state_context_msg["role"] == "user"
         assert state_context_msg["content"].startswith("Current pipeline state and session progress")
@@ -407,7 +407,7 @@ class TestCacheMarkersWiredAtCallSite:
             assert "cache_control" not in message
         assert sent_messages[1]["role"] == "user"
         assert sent_messages[1]["content"].startswith("Deployment plugin catalog and authoring aids")
-        assert "UNTRUSTED DATA" in sent_messages[1]["content"]
+        assert "AUTHORITATIVE REFERENCE DATA" in sent_messages[1]["content"]
         assert sent_messages[-2]["content"].startswith("Current pipeline state and session progress")
         assert "cache_control" not in sent_messages[1]
 

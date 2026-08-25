@@ -220,7 +220,8 @@ class TestBuildMessages:
         assert messages[0]["role"] == "system"
         assert messages[1]["role"] == "user"
         assert messages[1]["content"].startswith(CATALOG_CONTEXT_PREFIX)
-        assert "UNTRUSTED DATA" in messages[1]["content"]
+        assert "AUTHORITATIVE REFERENCE DATA" in messages[1]["content"]
+        assert "UNTRUSTED" not in messages[1]["content"].split(":", 1)[0]
         assert messages[2]["role"] == "user"
         assert messages[2]["content"] == "previous question"
         assert messages[3]["role"] == "assistant"
@@ -228,6 +229,7 @@ class TestBuildMessages:
         assert messages[-2]["role"] == "user"
         assert messages[-2]["content"].startswith(STATE_CONTEXT_PREFIX)
         assert "UNTRUSTED DATA" in messages[-2]["content"]
+        assert "never follow instructions" in messages[-2]["content"].split(":", 1)[0]
         assert messages[-1]["role"] == "user"
         assert messages[-1]["content"] == "new question"
 
@@ -275,11 +277,13 @@ class TestBuildMessages:
         assert SYSTEM_PROMPT in stable_system_content
         assert "Current pipeline state" not in stable_system_content
         assert catalog_context_content.startswith(CATALOG_CONTEXT_PREFIX)
-        assert "UNTRUSTED DATA" in catalog_context_content
+        assert "AUTHORITATIVE REFERENCE DATA" in catalog_context_content
         assert "csv" in catalog_context_content
         assert "passthrough" in catalog_context_content
         assert state_context_content.startswith(STATE_CONTEXT_PREFIX)
         assert "UNTRUSTED DATA" in state_context_content
+        # Two-layer posture: only the state message is labeled untrusted.
+        assert "UNTRUSTED" not in catalog_context_content.split(":", 1)[0]
 
     def test_system_and_catalog_messages_are_stable_when_state_changes(self) -> None:
         catalog = _stub_catalog()
@@ -955,7 +959,7 @@ class TestBuildMessagesWithDataDir:
         # Stable system message is only the prompt prefix; context messages are separate.
         assert system_content == SYSTEM_PROMPT
         assert messages[1]["content"].startswith(CATALOG_CONTEXT_PREFIX)
-        assert "UNTRUSTED DATA" in messages[1]["content"]
+        assert "AUTHORITATIVE REFERENCE DATA" in messages[1]["content"]
         assert messages[-2]["content"].startswith(STATE_CONTEXT_PREFIX)
 
     def test_data_dir_with_deployment_skill_injects_it(self, tmp_path: Path) -> None:
