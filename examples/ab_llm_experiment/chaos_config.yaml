@@ -1,0 +1,65 @@
+# ChaosLLM config for the ab_llm_experiment example.
+#
+# TWO deliberate choices make this fixture an honest A/B rather than noise:
+#
+# 1. Fault injection is ZEROED. A row_union fails a token's sibling closed when
+#    its partner is lost, so a single injected 429 would turn the whole run
+#    PARTIAL and destroy the paired comparison. Terminal-fault behaviour is the
+#    subject of chaosllm_endurance, not of this example.
+#
+# 2. response.mode is `template`, not `preset`. A preset bank cycles canned
+#    answers without reading the request, so both arms would receive the SAME
+#    responses and the measured lift would be an artefact of file order. The
+#    Jinja2 template below is handed `model` and `messages` by ChaosLLM, so the
+#    score it returns genuinely depends on WHICH MODEL was called and WHICH
+#    PROMPT was sent — which is exactly what the two settings files vary.
+#
+# The score is deterministic, not random: it is derived from the length of the
+# rendered user message, so re-running the example reproduces the same
+# statistics. `random_*` helpers are deliberately not used.
+
+server:
+  host: "127.0.0.1"
+  port: 8199
+  workers: 1
+
+metrics:
+  database: "file:chaosllm-metrics?mode=memory&cache=shared"
+
+response:
+  mode: template
+  # Per-case base score, plus an arm bonus. `analyst-v2` scores 9 points above
+  # `analyst-v1` (the MODEL arm); a prompt carrying the WEIGHTED-RUBRIC marker
+  # scores 6 points above the terse one (the PROMPT arm). Each settings file
+  # varies exactly one of the two, so the reported lift is attributable.
+  template:
+    body: |
+      {%- set text = messages[-1]['content'] | string -%}
+      {%- set base = 54 + (text | length) % 23 -%}
+      {%- set model_bonus = 9 if 'analyst-v2' in (model | string) else 0 -%}
+      {%- set rubric_bonus = 6 if 'WEIGHTED RUBRIC' in text else 0 -%}
+      {"score": {{ base + model_bonus + rubric_bonus }}, "rationale": "Assessed by {{ model }} against the supplied rubric; {{ text | length }} characters of case material considered."}
+
+latency:
+  base_ms: 15
+  jitter_ms: 10
+
+error_injection:
+  rate_limit_pct: 0.0
+  capacity_529_pct: 0.0
+  service_unavailable_pct: 0.0
+  internal_error_pct: 0.0
+  bad_gateway_pct: 0.0
+  gateway_timeout_pct: 0.0
+  retry_after_sec: [1, 2]
+  timeout_pct: 0.0
+  timeout_sec: [2, 4]
+  connection_reset_pct: 0.0
+  slow_response_pct: 0.0
+  slow_response_sec: [1, 3]
+  invalid_json_pct: 0.0
+  truncated_pct: 0.0
+  empty_body_pct: 0.0
+  missing_fields_pct: 0.0
+  burst:
+    enabled: false

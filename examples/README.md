@@ -48,11 +48,14 @@ These examples run locally with no credentials or external services.
 | [`deep_routing`](deep_routing/) | 5 chained gates, 3 transforms, 7 sinks — complex decision tree |
 | [`fork_coalesce`](fork_coalesce/) | Fork/join DAG pattern — parallel paths merged with configurable policy (includes ARCH-15 per-branch transforms variant) |
 | [`row_union_ab_experiment`](row_union_ab_experiment/) | Fork-based A/B experiment — `row_union` releases both variant branches as one correlated group in long format; variants cover pooled and paired statistics, screening with reject routing, and list-form branches |
+| [`ab_llm_experiment`](ab_llm_experiment/) | The same A/B barrier with real LLM calls in the arms — one case study forked to two assessments, `row_union` releasing the pair. `settings.yaml` varies the prompt, `settings_models.yaml` varies the model, and `settings_arm_loss.yaml` shows what a lost arm costs: the whole row, including a completed sibling assessment |
+| [`document_review_panel`](document_review_panel/) | The combined example — a two-reviewer LLM fork nested inside an EXPAND group of pages, closed by a collector, summarised by a run-level aggregation. Shows one lost token unrolling into a lost page, a refused document verdict, and a short corpus number — and how encapsulating the run as one row makes the whole thing fail closed |
 | [`batch_aggregation`](batch_aggregation/) | Count-triggered aggregation with group-by statistics |
 | [`report_assemble`](report_assemble/) | Assemble text rows into paginated markdown reports with flush metadata |
 | [`statistical_batch_plugins`](statistical_batch_plugins/) | Statistical batch QA: distributions, experiments, classifier metrics, paired preferences, drift, outliers, data quality, top-k, thresholds, and effect sizes |
 | [`deaggregation`](deaggregation/) | 1-to-N row expansion via `batch_replicate` |
 | [`json_explode`](json_explode/) | Expand nested JSON arrays into individual rows |
+| [`scope_collector`](scope_collector/) | `scopes:` + `collectors:` — the barrier that closes an EXPAND group. `require_all` vs `best_effort` on a document with one lost page: no statistic at all, or a mean over the survivors |
 | [`transform_pipeline`](transform_pipeline/) | Normalize CSV field types, then compute derived values with `type_coerce` and `value_transform` |
 | [`database_sink`](database_sink/) | Write pipeline output to SQLite via `./examples/database_sink/run.sh`, which provisions the operator-owned target and effect ledger |
 | [`checkpoint_resume`](checkpoint_resume/) | Crash recovery via checkpointing and `elspeth resume` |
@@ -136,6 +139,8 @@ shown in the individual READMEs.
 | Example | What It Demonstrates |
 |---------|---------------------|
 | [`chaosllm_sentiment`](chaosllm_sentiment/) | Sentiment analysis against ChaosLLM (mirrors `openrouter_sentiment`) |
+| [`ab_llm_experiment`](ab_llm_experiment/) | Two-arm A/B over ChaosLLM; `run.sh` starts its own server, runs all three configs and self-verifies each |
+| [`document_review_panel`](document_review_panel/) | Two-reviewer panel per page over ChaosLLM; `run.sh` runs the clean, cascade and run-as-one-row configs and self-verifies each |
 | [`chaosllm_endurance`](chaosllm_endurance/) | Multi-query endurance test with fault injection |
 | [`rate_limited_llm`](rate_limited_llm/) | LLM pipeline with rate limiting (30 req/min cap) |
 | [`chaosweb`](chaosweb/) | Web scraping resilience with ChaosWeb fault injection |
@@ -151,6 +156,11 @@ Some examples deliberately exercise failure accounting:
 | `pdf_rasterize` | `PARTIAL`, exit 1; 1 malformed PDF is quarantined by design (3 page rows still succeed) |
 | `fork_coalesce/settings_union_fail.yaml` | `FAILED`, non-zero exit; the first field collision aborts the run |
 | `row_union_ab_experiment/settings_screened_at_settlement.yaml` | `PARTIAL`, exit 1; screened pairs fail closed and remain audited |
+| `scope_collector/settings.yaml` | `PARTIAL`, exit 1; one page is malformed by construction and `require_all` withholds that document's statistics |
+| `scope_collector/settings_best_effort.yaml` | `PARTIAL`, exit 1; the same lost page, but `best_effort` still reports over the survivors |
+| `ab_llm_experiment/settings_arm_loss.yaml` | `PARTIAL`, exit 1; 3 of 24 cases lose one arm and each surviving sibling is invalidated with it |
+| `document_review_panel/settings_incomplete.yaml` | `PARTIAL`, exit 1; one page loses a reviewer, so the page and then the document verdict fail closed |
+| `document_review_panel/settings_run_as_row.yaml` | `PARTIAL`, exit 1; the same loss with the run as a single row — nothing is published, and the empty sink is the pass |
 | ChaosLLM / ChaosWeb realistic fault profiles | Stochastic `COMPLETED`, `PARTIAL`, or preflight failure depending on injected faults; verify every ingested row reached a result or error sink |
 
 ## Resetting examples
@@ -179,6 +189,11 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Complex decision trees** | [`deep_routing`](deep_routing/) — 5 gates, 7 sinks, 8-node-deep DAG |
 | **Fork/join patterns** | [`fork_coalesce`](fork_coalesce/) — parallel paths with merge policies |
 | **Fork/union patterns (A/B)** | [`row_union_ab_experiment`](row_union_ab_experiment/) — both branches kept as separate correlated rows for cross-variant statistics |
+| **A/B testing two prompts or two models** | [`ab_llm_experiment`](ab_llm_experiment/) — each arm is a real LLM call; one config varies the prompt, the other the model |
+| **What a lost fork branch costs** | [`ab_llm_experiment`](ab_llm_experiment/) `settings_arm_loss.yaml` — a lost arm invalidates its sibling, so the row contributes nothing |
+| **Fork nested inside a batch group** | [`document_review_panel`](document_review_panel/) — two LLM reviewers per page, pages closed by a collector, documents summarised at run level |
+| **Making an entire run fail closed** | [`document_review_panel`](document_review_panel/) `settings_run_as_row.yaml` — encapsulate the run as one row so a scope's `require_all` spans the whole corpus |
+| **Closing an expand group (completeness)** | [`scope_collector`](scope_collector/) — a collector barrier, and the `require_all` / `best_effort` policy that decides what an incomplete group means |
 | **Error handling / quarantine** | [`error_routing`](error_routing/) — `on_error` diversion pattern |
 | **Aggregation (N to 1)** | [`batch_aggregation`](batch_aggregation/) — count triggers, group-by stats; [`report_assemble`](report_assemble/) — paginated markdown reports |
 | **Statistical batch QA** | [`statistical_batch_plugins`](statistical_batch_plugins/) — prompt/model score comparisons, classifier metrics, drift, outlier annotation, data quality, top-k, thresholds, and effect sizes |

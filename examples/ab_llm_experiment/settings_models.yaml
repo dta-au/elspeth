@@ -1,0 +1,186 @@
+# A/B Experiment — Fork One Case Study To TWO MODELS, Union The Pair
+#
+#   source ─(routed)─> [variant_fork] ─┬─ arm_a ─> assess_a (analyst-v1) ─> tag_a ─┐
+#                                       └─ arm_b ─> assess_b (analyst-v2) ─> tag_b ┤
+#                                                                    [variant_union]
+#                                          ─(experiment_in)─> [model_experiment] ─> output
+#
+# The mirror image of settings.yaml. There, one model saw two prompts; here,
+# two models see the SAME prompt. The rubric text below is byte-identical
+# between the arms — the only difference in the whole file is `model:`. Run
+# both and the pair isolates one factor each, which is the point: an A/B whose
+# arms differ in two ways measures neither.
+#
+# The graph, the barrier and the statistics are identical to settings.yaml;
+# see that file for why row_union rather than coalesce or a queue, and why the
+# arms are fail-closed with each other.
+#
+# Prerequisite: ChaosLLM on port 8199 with this directory's chaos_config.yaml.
+# Use ./examples/ab_llm_experiment/run.sh, which runs both configs in turn.
+
+sources:
+  primary:
+    plugin: csv
+    on_success: routed
+    options:
+      path: examples/ab_llm_experiment/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'case_id: str'
+        - 'title: str'
+        - 'case_study: str'
+      on_validation_failure: discard
+
+gates:
+- name: variant_fork
+  input: routed
+  condition: "True"
+  routes:
+    'true': fork
+    'false': output
+  fork_to:
+  - arm_a
+  - arm_b
+
+transforms:
+# ARM A — the incumbent model.
+- name: assess_a
+  plugin: llm
+  input: arm_a
+  on_success: a_assessed
+  on_error: discard
+  options:
+    provider: openrouter
+    api_key: fake-key-chaosllm-does-not-check
+    base_url: http://127.0.0.1:8199/v1
+    model: chaosllm/analyst-v1
+    timeout_seconds: 15
+    temperature: 0.0
+    system_prompt: |
+      You are a governance risk assessor. Respond ONLY with a JSON object of
+      the form {"score": <integer 0-100>, "rationale": "<one sentence>"}.
+    prompt_template: 'Assess: {{ row.input_1 }}'
+    required_input_fields: []
+    schema:
+      mode: observed
+    queries:
+      assessment:
+        input_fields:
+          input_1: case_study
+        template: |
+          Score this case study 0-100 for governance risk, weighting:
+            - control failure severity          40%
+            - detectability before impact       30%
+            - remediation cost and difficulty   20%
+            - recurrence likelihood             10%
+          Score each dimension before combining, then report the weighted total.
+
+          {{ row.input_1 }}
+        output_fields:
+        - suffix: score
+          type: integer
+        - suffix: rationale
+          type: string
+
+# ARM B — the candidate model. The template above, unchanged.
+- name: assess_b
+  plugin: llm
+  input: arm_b
+  on_success: b_assessed
+  on_error: discard
+  options:
+    provider: openrouter
+    api_key: fake-key-chaosllm-does-not-check
+    base_url: http://127.0.0.1:8199/v1
+    model: chaosllm/analyst-v2
+    timeout_seconds: 15
+    temperature: 0.0
+    system_prompt: |
+      You are a governance risk assessor. Respond ONLY with a JSON object of
+      the form {"score": <integer 0-100>, "rationale": "<one sentence>"}.
+    prompt_template: 'Assess: {{ row.input_1 }}'
+    required_input_fields: []
+    schema:
+      mode: observed
+    queries:
+      assessment:
+        input_fields:
+          input_1: case_study
+        template: |
+          Score this case study 0-100 for governance risk, weighting:
+            - control failure severity          40%
+            - detectability before impact       30%
+            - remediation cost and difficulty   20%
+            - recurrence likelihood             10%
+          Score each dimension before combining, then report the weighted total.
+
+          {{ row.input_1 }}
+        output_fields:
+        - suffix: score
+          type: integer
+        - suffix: rationale
+          type: string
+
+- name: tag_a
+  plugin: value_transform
+  input: a_assessed
+  on_success: a_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: model_variant
+      expression: "'analyst-v1'"
+    - target: score
+      expression: "row['assessment_score'] * 1.0"
+
+- name: tag_b
+  plugin: value_transform
+  input: b_assessed
+  on_success: b_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: model_variant
+      expression: "'analyst-v2'"
+    - target: score
+      expression: "row['assessment_score'] * 1.0"
+
+row_unions:
+- name: variant_union
+  branches:
+    arm_a: a_scored
+    arm_b: b_scored
+  on_success: experiment_in
+
+aggregations:
+- name: model_experiment
+  plugin: batch_experiment_compare
+  input: experiment_in
+  on_success: output
+  on_error: discard
+  trigger: {}
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    variant_field: model_variant
+    score_field: score
+    baseline_variant: analyst-v1
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/ab_llm_experiment/output/model_experiment.json
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/ab_llm_experiment/runs/audit_models.db

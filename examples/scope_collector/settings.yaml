@@ -1,0 +1,134 @@
+# Scope + Collector — An EXPAND Group Closed By A Barrier (policy: require_all)
+#
+#   source ─(rows)─> [explode_pages] ─(page_in)─> read_value ─(pages)─> [page_stitcher] ─> out
+#                     ^ scope opener                                     ^ scope closer
+#
+# WHAT A COLLECTOR IS
+# -------------------
+# A collector is the closer of an EXPAND group: it buffers every member of ONE
+# group opened by a multi-row transform, and flushes on end_of_group ONLY. It
+# reuses the batch-transform plugin contract that `aggregations:` uses — the
+# same plugins, the same options — but it is a BARRIER, not a window.
+#
+# WHAT A COLLECTOR IS NOT
+# -----------------------
+# It is not an aggregation, and the difference is not stylistic:
+#
+#   * NO TRIGGER CONFIG. `count`, `timeout_seconds` and `condition` are
+#     inexpressible on a closer, deliberately. A count trigger cannot know
+#     where a group ends, so a lost member does not shorten the batch — it
+#     BACKFILLS from the next group, and you get 99 pages of one document plus
+#     one page of the next, with honest-looking counts and no audit anomaly. A
+#     timeout on a closer is worse: it converts a liveness bug into a silently
+#     short group.
+#
+#   * FLUSH ORDER IS THE OPENER'S EXPANSION ORDINAL, never arrival order. Page
+#     2 reaches the stitcher after page 1 even if it finished first.
+#
+#   * MEMBERSHIP COMES FROM THE ENGINE, not from a row count you configured.
+#     The scope binds opener to closer at BUILD time, so the group's cardinality
+#     is whatever the opener actually produced for that row.
+#
+# THE POLICY IS THE WHOLE POINT
+# -----------------------------
+# `policy` is REQUIRED and has no default: the author must decide what an
+# incomplete group means. This file uses `require_all`; settings_best_effort.yaml
+# is the same graph with `best_effort`, and the pair is the demonstration.
+#
+# The input has one deliberately malformed page: DOC-2 page 2 reads "smudged"
+# instead of a number, so `read_value` fails and that member is discarded.
+#
+#   require_all  ->  DOC-2 produces NO statistics row at all. A mean over an
+#                    incomplete document is not a cheaper mean, it is a
+#                    different measurement, and the group refuses to report one.
+#   best_effort  ->  DOC-2 reports mean 20 over its two surviving pages. The
+#                    smudged page is simply absent from the denominator.
+#
+# Either way the loss is recorded: `group_losses` carries a row naming the
+# closer, the group, the lost token and the reason. Absence is explicit, never
+# an implied clean result.
+#
+# EXPECTED OUTCOME: PARTIAL, exit 1. One member is lost by construction, so a
+# non-zero exit is the fixture working. Compare the OUTPUT ROWS, not the exit
+# code: two rows here, three in the best_effort variant.
+
+sources:
+  docs:
+    plugin: json
+    on_success: rows
+    options:
+      path: examples/scope_collector/documents.jsonl
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+
+concurrency:
+  max_workers: 1
+
+transforms:
+# THE SCOPE OPENER. json_explode declares creates_tokens=True, which is what
+# makes it eligible to open a group — the builder enforces this, because config
+# time cannot see plugin attributes. Each document expands into one page row
+# per element, and those rows are the group's members.
+- name: explode_pages
+  plugin: json_explode
+  input: rows
+  on_success: page_in
+  on_error: discard
+  options:
+    array_field: pages
+    output_field: page
+    schema:
+      mode: observed
+
+# An ordinary transform INSIDE the bound region. Members may be processed
+# between the opener and the closer; this one lifts the numeric reading out of
+# the page object. DOC-2 page 2 carries "smudged", so this transform fails for
+# that member and `on_error: discard` drops it — which is precisely the lost
+# member the policy then has to rule on.
+- name: read_value
+  plugin: value_transform
+  input: page_in
+  on_success: pages
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: reading
+      expression: "row['page']['reading'] + 0"
+
+collectors:
+# THE SCOPE CLOSER. Note what is absent: there is no `trigger:` key, because a
+# closer has nothing to trigger on but the end of its group. `on_error` is also
+# omitted — the route then derives from structure, and losses settle through
+# the scope's group machinery rather than through a configured error edge.
+- name: page_stitcher
+  plugin: batch_stats
+  input: pages
+  on_success: out
+  options:
+    value_field: reading
+    schema:
+      mode: observed
+
+scopes:
+# The build-time binding. `policy` is REQUIRED with no default — see the header.
+- name: document_pages
+  opener: explode_pages
+  closer: page_stitcher
+  policy: require_all
+
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/scope_collector/output/require_all.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/scope_collector/runs/require_all.db
