@@ -185,6 +185,17 @@ class TestPDFRasterizePipeline:
         reasons = {json.loads(row.error_details_json)["reason"] for row in error_rows}
         assert reasons == {"pdf_malformed", "pdf_encrypted"}
 
+        # Correlate each error row back to the source document by name, so a
+        # pipeline that swapped which bad document got which reason would
+        # fail here even though the two disjoint set checks above would not.
+        doc_name_reason_pairs = {
+            (json.loads(row.row_data_json)["doc_name"], json.loads(row.error_details_json)["reason"]) for row in error_rows
+        }
+        assert doc_name_reason_pairs == {
+            ("doc_bad_malformed", "pdf_malformed"),
+            ("doc_bad_encrypted", "pdf_encrypted"),
+        }
+
     def test_landscape_records_five_expanded_tokens_grouped_two_and_three(self, pipeline_result: PipelineRunArtifacts) -> None:
         result, db, _, _ = pipeline_result
         factory = make_factory(db)
@@ -196,18 +207,29 @@ class TestPDFRasterizePipeline:
         assert len(all_tokens) == 9, f"Expected 9 tokens, got {len(all_tokens)}"
 
         parent_counts = {token.token_id: len(factory.query.get_token_parents(token.token_id)) for token in all_tokens}
-        tokens_with_one_parent = sum(1 for count in parent_counts.values() if count == 1)
-        assert tokens_with_one_parent == 5, f"Expected 5 tokens each with exactly one token_parents row, got {tokens_with_one_parent}"
+        tokens_with_one_parent = {token_id for token_id, count in parent_counts.items() if count == 1}
+        assert len(tokens_with_one_parent) == 5, (
+            f"Expected 5 tokens each with exactly one token_parents row, got {len(tokens_with_one_parent)}"
+        )
         assert all(count in (0, 1) for count in parent_counts.values()), f"No token should have more than one parent: {parent_counts}"
 
         token_ids = [token.token_id for token in all_tokens]
         lineage_paths = factory.data_flow.load_lineage_paths(result.run_id, token_ids)
         assert set(lineage_paths) == set(token_ids), "load_lineage_paths must return an entry for every requested token"
-        expand_group_ids = [path_expand_group_id(lineage_paths[token_id]) for token_id in token_ids]
-        non_none_group_ids = [group_id for group_id in expand_group_ids if group_id is not None]
-        assert len(non_none_group_ids) == 5, f"Expected 5 tokens with expand_group_id set, got {len(non_none_group_ids)}"
+        expand_group_id_by_token = {token_id: path_expand_group_id(lineage_paths[token_id]) for token_id in token_ids}
+        tokens_with_expand_group = {token_id for token_id, group_id in expand_group_id_by_token.items() if group_id is not None}
+        assert len(tokens_with_expand_group) == 5, f"Expected 5 tokens with expand_group_id set, got {len(tokens_with_expand_group)}"
 
-        group_sizes = sorted(Counter(non_none_group_ids).values())
+        # The 5 tokens with exactly one parent and the 5 tokens with a set
+        # expand_group_id must be the SAME tokens, not two independent counts
+        # that happen to both land on 5.
+        assert tokens_with_one_parent == tokens_with_expand_group, (
+            f"Expected the single-parent tokens and the expand-group tokens to coincide; "
+            f"single-parent only: {tokens_with_one_parent - tokens_with_expand_group}, "
+            f"expand-group only: {tokens_with_expand_group - tokens_with_one_parent}"
+        )
+
+        group_sizes = sorted(Counter(expand_group_id_by_token[token_id] for token_id in tokens_with_expand_group).values())
         assert group_sizes == [2, 3], f"Expected expand groups of size 2 and 3, got {group_sizes}"
 
     def test_bad_documents_carry_terminal_failure_routed_to_errors(self, pipeline_result: PipelineRunArtifacts) -> None:
