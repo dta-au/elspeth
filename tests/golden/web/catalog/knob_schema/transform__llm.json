@@ -231,6 +231,45 @@
       },
       {
         "default": null,
+        "description": "Row columns to resolve as image message parts (absent = text-only)",
+        "kind": "json-array",
+        "label": "Image Inputs",
+        "name": "image_inputs",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 5242880,
+        "description": "Per-image byte cap (hard upper bound 20 MiB)",
+        "kind": "number-int",
+        "label": "Max Image Bytes",
+        "name": "max_image_bytes",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 20,
+        "description": "Maximum resolved images per LLM call",
+        "kind": "number-int",
+        "label": "Max Images Per Call",
+        "name": "max_images_per_call",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
         "description": "Lookup data loaded from YAML file",
         "kind": "json-object",
         "label": "Lookup",
@@ -637,6 +676,45 @@
       },
       {
         "default": null,
+        "description": "Row columns to resolve as image message parts (absent = text-only)",
+        "kind": "json-array",
+        "label": "Image Inputs",
+        "name": "image_inputs",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 5242880,
+        "description": "Per-image byte cap (hard upper bound 20 MiB)",
+        "kind": "number-int",
+        "label": "Max Image Bytes",
+        "name": "max_image_bytes",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 20,
+        "description": "Maximum resolved images per LLM call",
+        "kind": "number-int",
+        "label": "Max Images Per Call",
+        "name": "max_images_per_call",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
         "description": "Lookup data loaded from YAML file",
         "kind": "json-object",
         "label": "Lookup",
@@ -1032,6 +1110,45 @@
       },
       {
         "default": null,
+        "description": "Row columns to resolve as image message parts (absent = text-only)",
+        "kind": "json-array",
+        "label": "Image Inputs",
+        "name": "image_inputs",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 5242880,
+        "description": "Per-image byte cap (hard upper bound 20 MiB)",
+        "kind": "number-int",
+        "label": "Max Image Bytes",
+        "name": "max_image_bytes",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 20,
+        "description": "Maximum resolved images per LLM call",
+        "kind": "number-int",
+        "label": "Max Images Per Call",
+        "name": "max_images_per_call",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
         "description": "Lookup data loaded from YAML file",
         "kind": "json-object",
         "label": "Lookup",
@@ -1393,6 +1510,45 @@
         "kind": "text",
         "label": "Response Field",
         "name": "response_field",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Row columns to resolve as image message parts (absent = text-only)",
+        "kind": "json-array",
+        "label": "Image Inputs",
+        "name": "image_inputs",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 5242880,
+        "description": "Per-image byte cap (hard upper bound 20 MiB)",
+        "kind": "number-int",
+        "label": "Max Image Bytes",
+        "name": "max_image_bytes",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 20,
+        "description": "Maximum resolved images per LLM call",
+        "kind": "number-int",
+        "label": "Max Images Per Call",
+        "name": "max_images_per_call",
         "nullable": false,
         "required": false,
         "visible_when": {

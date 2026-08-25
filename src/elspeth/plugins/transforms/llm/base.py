@@ -17,6 +17,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
+from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
 from elspeth.plugins.transforms.llm.multi_query import QueryDefinition, resolve_queries
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
@@ -112,6 +113,17 @@ class LLMConfig(TransformDataConfig):
     temperature: float = Field(0.0, ge=0.0, le=2.0, description="Sampling temperature")
     max_tokens: int | None = Field(None, gt=0, description="Maximum tokens in response")
     response_field: str = Field("llm_response", description="Field name for LLM response in output")
+
+    # Image inputs (docs/superpowers/specs/2026-08-25-llm-image-input-design.md §4):
+    # absent (None) is exactly today's text-only behavior. Each entry names a
+    # row column holding a payload-store blob ref (str or list[str]); its image
+    # format comes from a literal or a per-row mime column, resolved at message
+    # assembly time (image_inputs.resolve_image_parts), never here.
+    image_inputs: list[ImageInputConfig] | None = Field(
+        None, description="Row columns to resolve as image message parts (absent = text-only)"
+    )
+    max_image_bytes: int = Field(5_242_880, gt=0, le=20_971_520, description="Per-image byte cap (hard upper bound 20 MiB)")
+    max_images_per_call: int = Field(20, gt=0, description="Maximum resolved images per LLM call")
 
     # File-based content with source paths for audit trail
     lookup: dict[str, Any] | None = Field(None, description="Lookup data loaded from YAML file")
@@ -249,6 +261,22 @@ class LLMConfig(TransformDataConfig):
         if self.queries is None:
             return self
         resolve_queries(self.queries)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_image_inputs_field_names_unique(self) -> LLMConfig:
+        """Reject image_inputs entries that name the same row column twice.
+
+        Each entry's ``field`` selects a distinct blob-ref column; a duplicate
+        would resolve the same column twice into the assembled message with no
+        defined ordering between the two resolutions.
+        """
+        if self.image_inputs is None:
+            return self
+        names = [spec.field for spec in self.image_inputs]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"Duplicate image_inputs field names: {duplicates}. Each entry's field must be unique")
         return self
 
     def _field_extraction_templates(self) -> tuple[tuple[str, str], ...]:
@@ -565,3 +593,17 @@ class LLMConfig(TransformDataConfig):
                     "this template, or give those queries template overrides."
                 )
         return self
+
+    @property
+    def declared_input_fields(self) -> frozenset[str]:
+        """``required_input_fields`` plus every ``image_inputs`` field/format_field.
+
+        Mirrors ``AWSTextractInlineAnalysisConfig.declared_input_fields``: an
+        image input column is consumed the same as any other authored input
+        column, so the DAG must see it in the requiredness contract even
+        though nothing in ``prompt_template`` interpolates it.
+        """
+        if self.image_inputs is None:
+            return super().declared_input_fields
+        image_field_names = {name for spec in self.image_inputs for name in (spec.field, spec.format_field) if name is not None}
+        return super().declared_input_fields | frozenset(image_field_names)
