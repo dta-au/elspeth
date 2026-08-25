@@ -59,7 +59,8 @@ allowed_external_types:
   # to build test-double worker callables, because a spawned child's sys.path is
   # copied from the parent verbatim and must resolve through the INSTALLED
   # package rather than pytest's tests/ rootdir insertion (controller ruling,
-  # pdf_rasterize Task 2).
+  # pdf_rasterize Task 2). Lift when the rasterize protocol types are promoted
+  # to elspeth/contracts/ or the fakes leave elspeth.testing — elspeth-1788fc5dc8.
   - "plugins/infrastructure/rasterize/protocol:RasterizeRequest"
   - "plugins/infrastructure/rasterize/protocol:RasterizeResponse"
 

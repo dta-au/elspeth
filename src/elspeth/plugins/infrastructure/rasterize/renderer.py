@@ -12,7 +12,7 @@ import multiprocessing as mp
 import shutil
 import tempfile
 from collections.abc import Callable
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -78,11 +78,12 @@ class PoolRenderer:
     def _drop_pool(self) -> None:
         self._pool = None
 
-    def _kill_pool(self) -> None:
-        # Copied from query.py:143-159: future.cancel() only prevents a QUEUED task from
-        # starting — it cannot kill a worker already executing native code. shutdown(wait=False)
-        # does not terminate a running worker either; the stuck process stays alive as an
-        # orphan unless we explicitly kill it.
+    def _kill_pool(self, future: Future[RasterizeOutcome]) -> None:
+        # Copied from query.py:143-159 verbatim: future.cancel() only prevents a QUEUED
+        # task from starting — it cannot kill a worker already executing native code.
+        # shutdown(wait=False) does not terminate a running worker either; the stuck
+        # process stays alive as an orphan unless we explicitly kill it.
+        future.cancel()
         assert self._pool is not None
         stuck_processes = list(self._pool._processes.values())
         self._pool.shutdown(wait=False, cancel_futures=True)
@@ -127,7 +128,7 @@ class PoolRenderer:
         try:
             outcome = future.result(timeout=self._limits.render_timeout_seconds)
         except FuturesTimeoutError:
-            self._kill_pool()
+            self._kill_pool(future)
             return RenderTimedOut(timeout_seconds=self._limits.render_timeout_seconds), output_dir
         except BrokenProcessPool as exc:
             self._drop_pool()
