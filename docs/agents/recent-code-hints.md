@@ -14,11 +14,16 @@ is a working document under the normal delivery posture.
   `ResumeCoordinator.resume()` — call
   `check_group_satisfiability_resumable(db, run_id, group_binding_view_from_graph(graph))`
   before any mutation, so EVERY graph object reaching them must answer
-  `get_group_bindings()`. A `MagicMock(spec=ExecutionGraph)` stub that gets
-  that far needs `get_group_bindings.return_value = GroupBindingRegistry(bindings=())`
-  (a bare spec mock returns a MagicMock whose `.bindings` is not iterable);
-  a `MagicMock(spec=object)` graph now fails with AttributeError — model the
-  contract on the FAKE, never weaken the guard. (b) The WS5 plan's
+  `get_group_bindings()`. Set
+  `get_group_bindings.return_value = GroupBindingRegistry(bindings=())` on a
+  `MagicMock(spec=ExecutionGraph)` stub even though it "works" bare —
+  measured: a bare spec mock's `.bindings` IS iterable (MagicMock's magic
+  `__iter__` yields empty), so such tests reach the gate and pass
+  VACUOUSLY: the right outcome for zero bound groups, by the wrong
+  mechanism, and a future gate arm that reads anything a mock answers
+  non-emptily (truthiness, a mapping lookup, a length) flips silently. A
+  bare-`object()` or `MagicMock(spec=object)` graph fails with
+  AttributeError — model the contract on the FAKE, never weaken the guard. (b) The WS5 plan's
   third-sibling construction ("best_effort defers the merge past load") is
   FALSE against the live engine: best_effort ARRIVAL merges the moment every
   branch is accounted for, so a plain fork resolves in-row while the source
