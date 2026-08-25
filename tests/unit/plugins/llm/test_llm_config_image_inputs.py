@@ -165,6 +165,32 @@ class TestImageInputsRejection:
                 image_inputs=[{"field": "page_blob_ref"}],
             )
 
+    def test_rejects_empty_image_inputs_list(self) -> None:
+        """spec §4 requires image_inputs entries "non-empty and distinct" — an authored
+        `image_inputs: []` is a config mistake to reject at build time, not a silent
+        alias for omitting the key (fail-fast, per AWSTextractInlineAnalysisConfig's
+        "at least one output target" precedent)."""
+        with pytest.raises(ValidationError):
+            LLMConfig(
+                provider="azure",
+                prompt_template="Classify: {{ row.text }}",
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["text"],
+                image_inputs=[],
+            )
+
+    def test_omitting_image_inputs_key_stays_legal(self) -> None:
+        """The rejection is scoped to an explicit empty list — omitting the key
+        entirely (image_inputs defaulting to None) must remain the ordinary,
+        unpenalized text-only configuration."""
+        config = LLMConfig(
+            provider="azure",
+            prompt_template="Classify: {{ row.text }}",
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=["text"],
+        )
+        assert config.image_inputs is None
+
 
 class TestImageInputsTypedEntries:
     """Same acceptance/rejection contract, entries passed as typed ImageInputConfig."""

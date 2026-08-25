@@ -119,8 +119,12 @@ class LLMConfig(TransformDataConfig):
     # row column holding a payload-store blob ref (str or list[str]); its image
     # format comes from a literal or a per-row mime column, resolved at message
     # assembly time (image_inputs.resolve_image_parts), never here.
+    # min_length=1: spec §4 requires entries "non-empty and distinct" — an
+    # authored `image_inputs: []` is a mistake to catch at config-build time,
+    # not a silent no-op alias for omitting the key entirely (fail-fast, per
+    # AWSTextractInlineAnalysisConfig's "at least one output target" precedent).
     image_inputs: list[ImageInputConfig] | None = Field(
-        None, description="Row columns to resolve as image message parts (absent = text-only)"
+        None, min_length=1, description="Row columns to resolve as image message parts (absent = text-only)"
     )
     max_image_bytes: int = Field(5_242_880, gt=0, le=20_971_520, description="Per-image byte cap (hard upper bound 20 MiB)")
     max_images_per_call: int = Field(20, gt=0, description="Maximum resolved images per LLM call")
