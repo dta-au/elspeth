@@ -51,6 +51,17 @@ allowed_external_types:
   # from core. Web plugin policy is one of several intended consumers, not a
   # violation of a contracts/-only boundary.
   - "core/llm_profiles:RuntimeLLMProfile"
+  # Rasterize worker protocol messages. protocol.py's own docstring is explicit
+  # that these are "picklable messages crossing the rasterize worker process
+  # boundary" and are loaded by BOTH the parent and the spawned worker — they
+  # are subsystem-internal wire types for PoolRenderer, not universal contracts.
+  # elspeth.testing.rasterize_fakes (a different top-level package) imports them
+  # to build test-double worker callables, because a spawned child's sys.path is
+  # copied from the parent verbatim and must resolve through the INSTALLED
+  # package rather than pytest's tests/ rootdir insertion (controller ruling,
+  # pdf_rasterize Task 2).
+  - "plugins/infrastructure/rasterize/protocol:RasterizeRequest"
+  - "plugins/infrastructure/rasterize/protocol:RasterizeResponse"
 
 # dict[str, Any] patterns that are intentional
 # Format: "file_path:context:param_name"
