@@ -8,8 +8,40 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
-- **2026-08-25 — the death-matrix harness hosts a LIVE-leader + follower
-  composition, and "multi-worker collector test" names TWO different items**
+- **2026-08-25 — the guided collector guard is LIFTED (WS6 lane 2, ruling 7878):
+  `guided_collector_not_authorable` is RETIRED, and the guided projection now
+  carries a closed collector behavior arm.** Conventions and traps from the
+  parity sweep:
+  - The retired code is gone from `generation.py`'s
+    `_CLOSED_VALIDATION_ERROR_CODES` AND from `_VALIDATION_ERROR_PATTERNS`
+    (the two surfaces are disjoint paths — retiring one without the other
+    leaves the planner served advice for a rejection that can no longer
+    fire). Do not reintroduce the code or a binder-level collector refusal;
+    collector defects are ordinary Stage-1 validation errors now.
+  - The proposal projection's collector behavior is
+    `{"kind": "collector", "opener_stable_id": <the OPENER's projection
+    stable id>, "policy": "require_all"|"best_effort"}` — `scope_name` is
+    DELIBERATELY private (a canonical authored identifier; the projection
+    replaces canonical names with server ordinals/stable ids). The opener is
+    resolved to a stable id at `_build_projection`'s dispatch, and
+    `_node_behavior` raises typed on an unresolvable opener.
+  - A collector's `on_error` is OPTIONAL on the wire (`validate_payload`
+    accepts one `node_success` plus AT MOST one `node_error`) because group-
+    failure handling is structural (ADR-042 §6) — do not "fix" it to the
+    transform/aggregation exact-two-flows rule, and do not extend the
+    on_error→"discard" default at the proposal-sealing adapter
+    (`_canonical_state_from_private_pipeline`) or the freeform builder to
+    collectors: an omitted collector on_error must STAY None.
+  - Frontend: `ProposalNodeBehavior` in `types/guided.ts` gained the
+    collector arm; the two behavior renderers (`behaviorSummary` in
+    `ProposePipelineTurn.tsx`, `behaviorDetails` in `WireStageTurn.tsx`) are
+    compile-forced switches — extending the union without both arms fails
+    `tsc`. The decoder (`guidedDecoder.ts`) mirrors `validate_payload`
+    including the collector flow/opener reconciliation.
+  - `scope_on_group_failure` decode/type residuals (lane-1 deferrals) are
+    deleted from `guidedDecoder.ts` and `types/index.ts` — the wire never
+    carries the field again; do not resurrect it for old persisted states
+    (they never carried it either: it serialised omitted-when-None).
   (integration phase 1b, `tests/e2e/recovery/test_barrier_process_death_matrix.py`
   collector family). (a) `spawn_database_process_with_pause` + `release()`
   (not `kill()`) keeps the opener's LEADER alive and paused while a second
@@ -181,9 +213,9 @@ is a working document under the normal delivery posture.
     (`guided_collector_not_authorable`,
     `guided/planning.py::_reject_collector_candidate_nodes`). RULED (John,
     comment 7878 on elspeth-88bb77953c): the guard lifts AFTER the WS6
-    disposition-vocabulary freeze, never before — lifting is that ticket's
-    work, together with the proposal-projection/frontend parity sweep it
-    describes. Do not remove the guard or extend the projection ahead of it.
+    disposition-vocabulary freeze, never before. LIFTED 2026-08-25 as the
+    WS6 lane-2 parity sweep — see the collector-lift entry above; the guard,
+    the predecessor guard, and the error code no longer exist.
 
 - **2026-08-25 — RULED exemption to "never regenerate the pre-flip oracle" (META-39),
   and the rule that would have caught it earlier.** `fork-coalesce-policies`

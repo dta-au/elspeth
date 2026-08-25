@@ -261,13 +261,31 @@ class _RowUnionBehavior(TypedDict):
     timeout_seconds: float | None
 
 
-_ProposalNodeBehavior = _TransformBehavior | _GateBehavior | _AggregationBehavior | _QueueBehavior | _CoalesceBehavior | _RowUnionBehavior
+class _CollectorBehavior(TypedDict):
+    """EXPAND-scope closer: the scope binding projected by opener identity.
+
+    ``opener_stable_id`` is the projection's own stable id for the multi-row
+    transform whose expansion this collector closes; ``policy`` is the closed
+    arrival vocabulary (``ScopeSettings.policy``). The authored ``scope_name``
+    stays private: it has no semantics beyond binding the YAML ``scopes:``
+    entry, and the projection replaces canonical component names with server
+    ordinals/stable ids.
+    """
+
+    kind: Literal["collector"]
+    opener_stable_id: str
+    policy: Literal["require_all", "best_effort"]
+
+
+_ProposalNodeBehavior = (
+    _TransformBehavior | _GateBehavior | _AggregationBehavior | _QueueBehavior | _CoalesceBehavior | _RowUnionBehavior | _CollectorBehavior
+)
 
 
 class _ProposalNodeSummary(TypedDict):
     stable_id: str
     label: str
-    node_type: Literal["transform", "gate", "aggregation", "queue", "coalesce", "row_union"]
+    node_type: Literal["transform", "gate", "aggregation", "queue", "coalesce", "row_union", "collector"]
     plugin: _ProposalPluginRef | None
     behavior: _ProposalNodeBehavior
     # Allowlisted key options as pre-rendered display pairs; see
@@ -759,11 +777,10 @@ _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
     "interpretation_required": "guided.proposal.blocker.interpretation_required.v1",
 }
 _COMPONENT_KINDS = frozenset({"source", "node", "edge", "output"})
-_NODE_TYPES = frozenset({"transform", "gate", "aggregation", "queue", "coalesce", "row_union"})
+_NODE_TYPES = frozenset({"transform", "gate", "aggregation", "queue", "coalesce", "row_union", "collector"})
 # Per-kind legal flow kinds for node-origin edges. Module-level BESIDE
 # _NODE_TYPES so the two vocabularies cannot drift apart silently: extending
-# _NODE_TYPES (e.g. with "collector" when the elspeth-88bb77953c ruling lifts
-# the guided guard) without a flows arm here fails the coverage pin in
+# _NODE_TYPES without a flows arm here fails the coverage pin in
 # test_collector_guard.py, and the validator returns a typed verdict rather
 # than crashing on the miss.
 _LEGAL_NODE_FLOWS: Mapping[str, frozenset[str]] = {
@@ -773,6 +790,10 @@ _LEGAL_NODE_FLOWS: Mapping[str, frozenset[str]] = {
     "queue": frozenset({"queue_continue"}),
     "coalesce": frozenset({"coalesce_success"}),
     "row_union": frozenset({"row_union_success"}),
+    # A collector flushes to on_success (node_success) with an OPTIONAL
+    # on_error divert; group-failure handling is structural (ADR-042 §6), so
+    # an omitted on_error means the scope machinery owns the failure route.
+    "collector": frozenset({"node_success", "node_error"}),
 }
 _FLOW_KINDS = frozenset(
     {
@@ -1723,6 +1744,15 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
         ):
             return error
         return None
+    if node_type == "collector":
+        expected = frozenset({"kind", "opener_stable_id", "policy"})
+        if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
+            return error
+        if (error := _canonical_uuid_error(behavior["opener_stable_id"], f"{behavior_path}.opener_stable_id")) is not None:
+            return error
+        if behavior["policy"] not in ("require_all", "best_effort"):
+            return f"{behavior_path}.policy is outside the closed vocabulary"
+        return None
     expected = frozenset({"kind", "branch_aliases", "policy", "merge", "timeout_seconds"})
     if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
         return error
@@ -1912,7 +1942,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             return f"{path}.label must be the exact server ordinal label"
         if (error := _validate_node_behavior(node["node_type"], node["behavior"], path)) is not None:
             return error
-        if node["node_type"] in ("transform", "aggregation"):
+        if node["node_type"] in ("transform", "aggregation", "collector"):
             if (error := _validate_plugin_ref(node["plugin"], f"{path}.plugin", "transform")) is not None:
                 return error
         elif node["plugin"] is not None:
@@ -2132,6 +2162,19 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         if node["node_type"] in ("transform", "aggregation"):
             if flow_kinds.count("node_success") != 1 or flow_kinds.count("node_error") != 1 or len(flow_kinds) != 2:
                 return "payload transform and aggregation nodes require exact success and error flows"
+        elif node["node_type"] == "collector":
+            # on_error is OPTIONAL on a collector (omitted, the scope's group
+            # machinery owns the failure route — ADR-042 §6), so the error
+            # flow count is at most one, never exactly one.
+            if (
+                flow_kinds.count("node_success") != 1
+                or flow_kinds.count("node_error") > 1
+                or len(flow_kinds) != flow_kinds.count("node_success") + flow_kinds.count("node_error")
+            ):
+                return "payload collector node requires one success flow and at most one error flow"
+            opener = node_by_id.get(cast(str, node["behavior"]["opener_stable_id"]))
+            if opener is None:
+                return "payload collector scope opener must reference a node in the payload"
         elif node["node_type"] == "gate":
             direct_routes = gate_routes.get(stable_id, ())
             if len(direct_routes) != len(set(direct_routes)):
@@ -2178,7 +2221,13 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             if len(target_ids) != 1:
                 return "payload row_union node requires exactly one ordinary processing or queue target"
             target_id = next(iter(target_ids))
-            if target_id not in node_by_id or node_by_id[target_id]["node_type"] not in ("transform", "gate", "aggregation", "queue"):
+            if target_id not in node_by_id or node_by_id[target_id]["node_type"] not in (
+                "transform",
+                "gate",
+                "aggregation",
+                "queue",
+                "collector",
+            ):
                 return "payload row_union success must target one ordinary processing or queue node"
             origin_gates = {gate_id for branch in behavior["branch_aliases"] for gate_id in branch_origin_gates.get(branch, ())}
             if len(origin_gates) != 1:

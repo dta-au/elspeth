@@ -1539,6 +1539,9 @@ def _guided_advisory_safe_behavior(behavior: Mapping[str, Any]) -> _GuidedAdviso
         projected["branch_aliases"] = list(cast(Sequence[str], behavior["branch_aliases"]))
         projected["policy"] = behavior["policy"]
         projected["merge"] = behavior["merge"]
+    elif kind == "collector":
+        # Closed arrival-policy vocabulary only, matching the barrier arms.
+        projected["policy"] = behavior["policy"]
     return projected
 
 

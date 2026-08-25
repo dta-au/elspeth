@@ -571,7 +571,10 @@ class TestClosedCodeCatalogueInvariants:
             "guided_delta_nonincident_route",
             "guided_delta_unknown_reference",
             "guided_delta_reviewed_failure_route_required",
-            "guided_collector_not_authorable",
+            # guided_collector_not_authorable was RETIRED with the WS6 guided
+            # collector-guard lift (ruling 7878, elspeth-88bb77953c): the
+            # guided lane now authors and projects collectors, so the binder
+            # refusal and its code no longer exist.
         ),
     )
     def test_guided_delta_codes_are_closed_and_actionable(self, code: str) -> None:
