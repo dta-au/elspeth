@@ -348,7 +348,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b2e8c320f994a75f"
+    source_file_hash: str | None = "sha256:e4dfc8fb9e622453"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -356,8 +356,8 @@ class PDFRasterize(BaseTransform):
         "with document_format png and blob_ref_field page_blob_ref so a multipage PDF becomes N synchronous single-page calls."
     )
     usage_when_not_to_use: str = (
-        "Not a text extractor and not for images or non-PDF payloads: pages are rendered as pixels only. Documents "
-        "already staged in S3 belong in aws_textract_document_analysis, which handles multipage PDFs without rasterizing."
+        "Not an OCR text extractor: only the PDF text layer is read, empty on scans — OCR needs aws_textract_inline_analysis. "
+        "Not for images/non-PDF: pages render as pixels only. S3-staged docs use aws_textract_document_analysis (no rasterizing)."
     )
     example_use: str = """transform:
   plugin: pdf_rasterize

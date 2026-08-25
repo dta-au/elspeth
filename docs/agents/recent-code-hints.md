@@ -1202,13 +1202,18 @@ sequentially per worktree.
     editing any `usage_when_not_to_use` or `summary`, even a one-clause
     addition; do not assume "it's just prose" is free.
   - **2026-08-25 follow-up — per-page text extraction landed (pdfium text
-    layer, no OCR): `extract_text: bool = True` and `page_text_field`.** The
-    frozen `usage_when_not_to_use` string still opens "Not a text extractor"
-    — left AS-IS deliberately (the byte-budget note above had single-digit
-    bytes of headroom, none to spend correcting it) — so it is now stale
-    relative to the plugin's actual behaviour. The corrective information
-    lives in `composer_hints` instead (free of the cap). Anyone freeing
-    budget in a later pass should fix that opening clause first.
+    layer, no OCR): `extract_text: bool = True` and `page_text_field`.**
+    `usage_when_not_to_use` originally opened "Not a text extractor", which
+    the new feature made false; it was reworded THE SAME DAY (not deferred —
+    a planner-facing falsehood outweighs the freeze, the freeze was about
+    budget, not immutability) to "Not an OCR text extractor: only the PDF
+    text layer is read, empty on scans — OCR needs
+    aws_textract_inline_analysis...", which is both accurate and keeps the
+    `_REQUIRED_GUIDANCE["pdf_rasterize"]` substrings ("text extractor", "s3")
+    intact. It fit the ~36-byte headroom only by shrinking the S3 sentence
+    elsewhere in the SAME string (dropping "already"/"which handles... "
+    verbosity) — net growth was +21 bytes. `composer_hints` (uncapped) still
+    carries the fuller `extract_text`/`page_text` explanation.
 
 - **2026-08-17 — worker-pool admission follows the WORKER's lifetime, and the
   preflight coordinator owns the caller's budget** (elspeth-5269b43bca /
