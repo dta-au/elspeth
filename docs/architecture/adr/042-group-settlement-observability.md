@@ -183,6 +183,58 @@ adopted or not), live (a frame-bearing token with no completed terminal), or
 arrived (a journal row addressed to the closer). ADR-038 §3a carries the
 sweep-asymmetry ruling that gate depends on.
 
+### 5. Vocabulary frozen (2026-08-25, WS6 lane 1 — the declaration ruling 7878's lift trigger fires on)
+
+The settlement vocabulary is FROZEN as of this declaration. Two things,
+together:
+
+1. **The closed `GroupSettlementReason` membership** (§1's table, exactly
+   four members): `late_arrival_after_merge`, `scope_group_failed`,
+   `empty_expansion`, `all_members_lost`. Scope is coalesce/scope-failure
+   only (META-9.3): row_union's closed reasons (`row_union_branch_lost`,
+   `late_arrival_after_release`, `row_union_group_failed`) are a sibling
+   vocabulary and stay outside the enum; `row_union_group_failed` remains
+   deliberately distinct from the escalation ledger's bare `group_failed`
+   category token — naming adjacency, documented here, never renamed.
+2. **The two survivor-hold payload shapes §3a documents**: collector
+   survivors carry the group-failure cause nested under the
+   `ExecutionError` context; coalesce survivors carry `member_disposition`
+   top-level in the `CoalesceFailureReason` payload. The shape difference
+   is part of the frozen contract — readers read per closer kind and never
+   fail open on it.
+
+**Enforcement tripwires** (all pre-existing; this declaration names them
+as the freeze's witnesses):
+
+- the AST literal canary
+  (`tests/unit/engine/test_group_settlement_reasons.py`): pins the member
+  set and scans all of `src/` for hand-written vocabulary literals
+  (`ast.Constant` only — the concatenation/f-string limitation is
+  documented and reviewed);
+- the two META-41 re-frozen oracle snapshots
+  (`fork-coalesce-policies` `require-all-lost-c` and
+  `quorum-impossible-lost-c`, survivor `error_hash 36a9c100f8cd10fb`) —
+  MD1-verified as the corpus's ONLY pin on the settle seam's terminal
+  vocabulary; protect them accordingly;
+- the WS6 acceptance test
+  (`tests/integration/mcp/test_group_failure_forensics.py`): drives the
+  operator-visible surface end to end at depth 3, §4 reading the
+  structured `member_disposition` hold payload.
+
+**The bar for any change after this freeze:** an amendment to this ADR
+**plus** a META-class corpus re-freeze ruling (the META-39/META-41
+precedent), with mutation evidence that the re-frozen snapshots fail
+under the old vocabulary, and an export test selection that includes
+`tests/integration/core/dag`. A member addition, removal, or rename, a
+wire-value change, or a hold-payload shape change without both is a
+freeze violation, not a refactor.
+
+**Terminal-pair note (META-32):** collector survivors reuse the existing
+`(SUCCESS, COALESCED)` terminal pair; a proposed collector-specific
+terminal pair was REFUSED as a vocabulary change. That refusal's
+rationale is covered by this freeze — a new terminal pair for group
+settlement is a vocabulary change and takes the bar above.
+
 ## Consequences
 
 - **Positive:** a release context's `reason` now answers the operator's
