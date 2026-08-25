@@ -42,6 +42,7 @@ These run immediately with no setup:
 | `blob_transforms` | 200 offline expansion rows | Run `./examples/blob_transforms/run.sh`; it packages local fixtures into the payload store before executing. The hosted HTML fetch is opt-in via `./examples/blob_transforms/run_hosted_fetch.sh`. |
 | `pdf_rasterize` | 2 (1 fails) | Run `./examples/pdf_rasterize/run.sh`; it stages two committed mock PDFs into the payload store before executing. Fixture ends PARTIAL/exit 1 with 1 malformed document quarantined by design (3 page rows still succeed) |
 | `schema_contracts_demo` | 5 | Schema validation contracts |
+| `scope_collector` | 3 docs (8 pages) | `scopes:` + `collectors:` — an EXPAND group closed by a barrier; run one `settings*.yaml` at a time. Both variants end PARTIAL/exit 1 **by design** (one page is malformed by construction); the exit code does NOT distinguish them — the OUTPUT ROWS do. `settings.yaml` (`require_all`) writes 2 rows, withholding any statistic for the incomplete document; `settings_best_effort.yaml` writes 3, reporting that document's mean over a denominator of 2 |
 | `threshold_gate` | 8 | Numeric threshold routing |
 
 Run pattern:
@@ -51,7 +52,7 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 
 ### Exit 0 is not the corpus gate
 
-Seven shipped configs end non-zero **by design**. A runner that treats any
+Twelve shipped configs end non-zero **by design**. A runner that treats any
 non-zero exit as failure will report phantom defects; encode the expected exit
 per config, not a blanket `-eq 0`:
 
@@ -62,10 +63,15 @@ per config, not a blanket `-eq 0`:
 | `pdf_rasterize/settings.yaml` | 1 | 1 malformed document quarantined |
 | `row_union_ab_experiment/settings_screened_at_settlement.yaml` | 1 | 3 tickets discarded mid-branch, orphaned treatment siblings fail closed |
 | `fork_coalesce/settings_union_fail.yaml` | non-zero | raising `CoalesceCollisionError` is the point of the variant |
+| `scope_collector/settings.yaml` | 1 | 1 malformed page lost; `require_all` withholds that group's statistics |
+| `scope_collector/settings_best_effort.yaml` | 1 | the same lost page; `best_effort` still reports over survivors |
+| `ab_llm_experiment/settings_arm_loss.yaml` | 1 | 3 of 24 cases lose an arm; each surviving sibling is invalidated with it |
+| `document_review_panel/settings_incomplete.yaml` | 1 | one page loses a reviewer; the page, then the document verdict, fail closed |
+| `document_review_panel/settings_run_as_row.yaml` | 1 | same loss, run encapsulated as one row — the corpus verdict is refused entirely |
 | `chaosweb/settings.yaml` | 1, stochastic | injected fetch faults route to `scrape_failures.csv` |
 | `chaosllm_endurance/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
 
-The first five are deterministic fixtures with fixed counts. The last two
+The first ten are deterministic fixtures with fixed counts. The last two
 depend on randomly injected faults, so they may also exit 0 — for those the
 acceptance criterion is **conservation**, not the exit code: every source row
 reaches either the result sink or the error sink, with the failure reason
@@ -131,6 +137,8 @@ category.
 | `chaosllm_sentiment` | 10 | Basic sentiment with fault injection |
 | `rate_limited_llm` | 8 | Rate limiter with ChaosLLM |
 | `chaosllm_endurance` | 10,000 | Long-running endurance test; may end PARTIAL/exit 1 with rows in `quarantined.json` — see "Exit 0 is not the corpus gate" |
+| `ab_llm_experiment` | 8 + 8 + 24 cases x 2 arms | Fork one case study to TWO LLM arms, `row_union` the pair, compare. Run `./examples/ab_llm_experiment/run.sh` — it starts its OWN ChaosLLM on 8199 (never alongside a shared one), runs all THREE configs and self-verifies each against its own expected exit code. `settings.yaml` varies the PROMPT and `settings_models.yaml` varies the MODEL (8 cases, COMPLETED/exit 0 — a non-zero exit there is a real defect); `settings_arm_loss.yaml` is 24 cases of which 3 lose one arm, and ends PARTIAL/exit 1 **by design** with 21 whole pairs from 45 llm calls |
+| `document_review_panel` | 4 docs / 12 pages | THE COMBINED EXAMPLE: a fork (two LLM reviewers per page) nested inside an EXPAND group (pages closed by a collector), plus a run-level aggregation. Run `./examples/document_review_panel/run.sh` — it starts its OWN ChaosLLM on 8199 and self-verifies all three configs. `settings.yaml` is clean (COMPLETED/exit 0); `settings_incomplete.yaml` omits ONE field from ONE page and ends PARTIAL/exit 1 **by design**, publishing a summary over 3 of 4 documents; `settings_run_as_row.yaml` takes the same loss with the run encapsulated as a single row and ends PARTIAL/exit 1 publishing NOTHING — an empty/absent sink is the PASS there |
 
 ### ChaosWeb (mock web server required)
 

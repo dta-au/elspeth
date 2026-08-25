@@ -1,0 +1,161 @@
+# Document Review Panel — MAKING THE WHOLE RUN FAIL CLOSED
+#
+#   corpus_as_one_row.jsonl  ← ONE source row holding all four documents
+#          │
+#          └─(rows)─> [explode_documents]  ◄── SCOPE OPENER, one token per document
+#                          │
+#                          ├─> [need_assurance]   (the loss point)
+#                          ├─> [assess_document]  chaosllm/reviewer-strict
+#                          ↓
+#                    [corpus_verdict]  ◄── SCOPE CLOSER, policy: require_all
+#                          ↓
+#                         out
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# In settings_incomplete.yaml the cascade unrolls token -> page -> document
+# and then STOPS: the run-level `aggregations:` window has no control edge, so it
+# computes over the three surviving documents and the row does not say that a
+# fourth existed. That is correct behaviour — with no closer binding you take
+# what you can get.
+#
+# THE ROW IS THE UNIT OF PASS/FAIL. So to make an entire run fail closed you
+# encapsulate the run INSIDE A SINGLE ROW and batch it internally. Here the
+# whole corpus is one source row; the documents are members of that row's EXPAND
+# group; and `require_all` on the scope therefore spans the ENTIRE CORPUS. One
+# lost document is now a lost member of the only group there is.
+#
+# THE DIFFERENCE, CONCRETELY
+# --------------------------
+#   settings_incomplete.yaml  4 docs, 1 fails -> corpus summary over 3.
+#                                  A number is published. It is short and the
+#                                  row does not say so.
+#   THIS FILE                      4 docs, 1 fails -> NO corpus verdict at all.
+#                                  Zero output rows. Nothing is published.
+#
+# Same loss, same policy keyword, entirely different blast radius — because the
+# group boundary moved. Choosing where the row boundary sits IS choosing what
+# completeness means.
+#
+# The price is real and worth stating: the corpus is now one row, so the
+# per-document work is no longer independently retryable, and one bad document
+# costs every other document's published result. Encapsulate when a partial
+# answer is worse than no answer — a regulatory return, a reconciliation, a
+# published statistic — and not otherwise.
+#
+# EXPECTED OUTCOME: PARTIAL, exit 1, and output/corpus_verdict.jsonl is EMPTY or
+# absent. The empty sink is the whole point; do not read it as a broken run.
+#
+# Prerequisite: ChaosLLM on port 8199 with this directory's chaos_config.yaml.
+# Use ./examples/document_review_panel/run.sh.
+
+sources:
+  corpus:
+    plugin: json
+    on_success: rows
+    options:
+      path: examples/document_review_panel/corpus_as_one_row.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: discard
+
+concurrency:
+  max_workers: 1
+
+transforms:
+# SCOPE OPENER. The single corpus row expands into one token per document.
+# Because there is only ONE source row, there is only ONE group — and it spans
+# the whole run.
+- name: explode_documents
+  plugin: json_explode
+  input: rows
+  on_success: doc_raw
+  on_error: discard
+  options:
+    array_field: documents
+    output_field: document
+    schema:
+      mode: observed
+
+# The loss point. A corpus-level verdict may only be assembled from documents
+# that carry an assurance trail; SUB-02 has none, so this raises and that
+# member is discarded.
+- name: need_assurance
+  plugin: value_transform
+  input: doc_raw
+  on_success: doc_ready
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: doc_title
+      expression: "row['document']['title']"
+    - target: doc_assurance
+      expression: "row['document']['assurance']"
+
+- name: assess_document
+  plugin: llm
+  input: doc_ready
+  on_success: doc_scored
+  on_error: discard
+  options:
+    provider: openrouter
+    api_key: fake-key-chaosllm-does-not-check
+    base_url: http://127.0.0.1:8199/v1
+    model: chaosllm/reviewer-strict
+    timeout_seconds: 15
+    temperature: 0.0
+    system_prompt: |
+      You are a strict submission reviewer. Respond ONLY with a JSON object of
+      the form {"score": <integer 0-100>, "finding": "<one sentence>"}.
+    prompt_template: 'Review: {{ row.input_1 }}'
+    required_input_fields: []
+    schema:
+      mode: observed
+    queries:
+      review:
+        input_fields:
+          input_1: doc_title
+          input_2: doc_assurance
+        template: |
+          Score this submission 0-100 on the strength of its assurance trail.
+          Submission: {{ row.input_1 }}
+          Assurance: {{ row.input_2 }}
+        output_fields:
+        - suffix: score
+          type: integer
+        - suffix: finding
+          type: string
+
+collectors:
+# THE ONLY GROUP IN THE RUN. `require_all` here means every document in the
+# corpus, because the corpus is one row.
+- name: corpus_verdict
+  plugin: batch_stats
+  input: doc_scored
+  on_success: out
+  options:
+    value_field: review_score
+    schema:
+      mode: observed
+
+scopes:
+- name: whole_corpus
+  opener: explode_documents
+  closer: corpus_verdict
+  policy: require_all
+
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/document_review_panel/output/corpus_verdict.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/document_review_panel/runs/run_as_row.db

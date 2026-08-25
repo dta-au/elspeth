@@ -1,0 +1,291 @@
+# Document Review Panel — THE STACK UNROLLS: token -> page -> document -> run
+#
+#   docs.jsonl ─(rows)─> [explode_pages]  ◄── SCOPE OPENER, one token per page
+#                             │
+#                             ├─> [panel_fork] ─┬─ arm_a ─> review_a  (reviewer-strict)
+#                             │                  └─ arm_b ─> need_evidence ─> review_b  (reviewer-lenient)
+#                             │                        ↓
+#                             │              [panel_merge]  coalesce, policy: require_all
+#                             │                        ↓  ONE page row: review_a_score + review_b_score
+#                             ├─> [disagreement]  abs(a - b)
+#                             ↓
+#                       [doc_verdict]  ◄── SCOPE CLOSER, policy: require_all
+#                             ↓  one verdict row per document
+#                       [corpus_summary]  aggregation, trigger {}
+#                             ↓
+#                            out
+#
+# THREE COMPLETENESS DECISIONS, AND THEY ARE NOT THE SAME DECISION
+# ----------------------------------------------------------------
+# 1. PAGE   — `coalesce.policy: require_all`. Both reviewers or no page.
+# 2. DOCUMENT — `scopes.policy: require_all`. Every page or no verdict.
+# 3. RUN    — an `aggregations:` window, which has NO CONTROL EDGE and therefore
+#             takes what it can get. See the note at the bottom of this file.
+#
+# Levels 1 and 2 have a closer binding — a control edge — so they can fail
+# closed. Level 3 does not, so it computes over whatever arrived. That is the
+# designed behaviour, not a defect: without a control edge you take what you
+# can get, and the run STATUS is the signal that you did.
+#
+# WHY THE METRIC IS DISAGREEMENT, NOT MEAN SCORE
+# ----------------------------------------------
+# The document verdict is computed over `abs(review_a_score - review_b_score)`,
+# so both arms are load-bearing by construction. A mean over whichever reviewer
+# happened to answer would still produce a plausible number with one arm
+# missing; a disagreement cannot be computed at all. The metric is chosen so
+# that a silently-lost arm is arithmetically impossible to paper over.
+#
+# WHY THE DOCUMENT VERDICT IS STATISTICAL AND NOT AN LLM SUMMARY
+# --------------------------------------------------------------
+# A collector must be a batch-transform plugin, and ADR-020 retired both
+# batch-LLM transforms for breaking per-row attribution. So no model writes the
+# document verdict: the per-PAGE judgements are LLM work, and the document and
+# corpus levels are statistics over them. That division is deliberate.
+#
+# EXPECTED OUTCOME: COMPLETED, exit 0. 4 documents, 12 pages, 24 reviewer calls,
+# 4 document verdicts, 1 corpus summary. settings_incomplete.yaml is this
+# same graph over a corpus with ONE page missing ONE field, and shows the whole
+# stack unroll from that single token.
+#
+# Prerequisite: ChaosLLM on port 8199 with this directory's chaos_config.yaml.
+# Use ./examples/document_review_panel/run.sh.
+
+sources:
+  docs:
+    plugin: json
+    on_success: rows
+    options:
+      path: examples/document_review_panel/documents.jsonl
+      format: jsonl
+      # `observed`, deliberately: a fixed schema would reject an incomplete page
+      # AT THE SOURCE, and this example is about a member lost INSIDE a group.
+      schema:
+        mode: observed
+      on_validation_failure: discard
+
+concurrency:
+  max_workers: 1
+
+transforms:
+# SCOPE OPENER. Each document expands into one token per page; those tokens are
+# the members of the EXPAND group that `doc_verdict` will close.
+- name: explode_pages
+  plugin: json_explode
+  input: rows
+  on_success: page_raw
+  on_error: discard
+  options:
+    array_field: pages
+    output_field: page
+    schema:
+      mode: observed
+
+# Lift the fields BOTH reviewers need. Deliberately not `evidence` — that one is
+# arm B's alone, and it is pulled after the fork so its absence costs one arm
+# rather than the whole page up front.
+- name: flatten_page
+  plugin: value_transform
+  input: page_raw
+  on_success: page_routed
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: page_no
+      expression: "row['page']['page_no']"
+    - target: page_text
+      expression: "row['page']['text']"
+
+# ARM A — the strict reviewer. Reads the page text only.
+- name: review_a
+  plugin: llm
+  input: arm_a
+  on_success: a_out
+  on_error: discard
+  options:
+    provider: openrouter
+    api_key: fake-key-chaosllm-does-not-check
+    base_url: http://127.0.0.1:8199/v1
+    model: chaosllm/reviewer-strict
+    timeout_seconds: 15
+    temperature: 0.0
+    system_prompt: |
+      You are a strict submission reviewer. Respond ONLY with a JSON object of
+      the form {"score": <integer 0-100>, "finding": "<one sentence>"}.
+    prompt_template: 'Review: {{ row.input_1 }}'
+    required_input_fields: []
+    schema:
+      mode: observed
+    queries:
+      review_a:
+        input_fields:
+          input_1: page_text
+        template: |
+          Score this submission page 0-100 for how well it supports its claims.
+          {{ row.input_1 }}
+        output_fields:
+        - suffix: score
+          type: integer
+        - suffix: finding
+          type: string
+
+# ARM B'S PRECONDITION — and the only loss in the whole example. The lenient
+# reviewer weighs the cited evidence, so it will not review a page that does not
+# cite any. In documents_incomplete.jsonl exactly one page has no `evidence`
+# key, so this transform raises for that one member and it is discarded.
+#
+# `on_error: discard` and not a sink: a sink route from inside a merge branch
+# builds a DIVERT edge, and the group fails closed regardless — the sink would
+# promise a recovery path the barrier will not honour.
+- name: need_evidence
+  plugin: value_transform
+  input: arm_b
+  on_success: arm_b_ready
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: page_evidence
+      expression: "row['page']['evidence']"
+
+# ARM B — the lenient reviewer. Reads the page text AND its cited evidence.
+- name: review_b
+  plugin: llm
+  input: arm_b_ready
+  on_success: b_out
+  on_error: discard
+  options:
+    provider: openrouter
+    api_key: fake-key-chaosllm-does-not-check
+    base_url: http://127.0.0.1:8199/v1
+    model: chaosllm/reviewer-lenient
+    timeout_seconds: 15
+    temperature: 0.0
+    system_prompt: |
+      You are a lenient submission reviewer who credits cited evidence. Respond
+      ONLY with a JSON object of the form
+      {"score": <integer 0-100>, "finding": "<one sentence>"}.
+    prompt_template: 'Review: {{ row.input_1 }}'
+    required_input_fields: []
+    schema:
+      mode: observed
+    queries:
+      # A DISTINCT query name from arm A's, so the merged page row carries
+      # review_a_score AND review_b_score. Sharing a name would collide on
+      # union merge and one reviewer would vanish silently, at exit 0.
+      review_b:
+        input_fields:
+          input_1: page_text
+          input_2: page_evidence
+        template: |
+          Score this submission page 0-100 for how well it supports its claims,
+          crediting the evidence it cites.
+          {{ row.input_1 }}
+          Cited evidence: {{ row.input_2 }}
+        output_fields:
+        - suffix: score
+          type: integer
+        - suffix: finding
+          type: string
+
+# LEVEL 1 SETTLED. Both reviewers merged into one page row; now the page's own
+# metric. This runs INSIDE the bound region — members may be processed between
+# the opener and the closer.
+- name: disagreement
+  plugin: value_transform
+  input: panel_merge
+  on_success: pages_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: panel_gap
+      expression: "abs(row['review_a_score'] - row['review_b_score'])"
+
+gates:
+# Fork every page to both reviewers. The condition is constant because the fork
+# is unconditional. The 'false' route is unreachable and must be `discard`: a
+# sink cannot sit inside a bound region, because no token may leave the region
+# except through its closer.
+- name: panel_fork
+  input: page_routed
+  condition: "True"
+  routes:
+    'true': fork
+    'false': discard
+  fork_to:
+  - arm_a
+  - arm_b
+
+coalesce:
+# LEVEL 1 — THE PAGE. N-to-1: the two reviewer tokens become ONE page row.
+# `require_all` is what makes a lost reviewer cost the page.
+#
+# Note this is coalesce and NOT row_union. row_union preserves cardinality — it
+# would release TWO tokens per page — and a collector requires one token per
+# member. (Placing a row_union here currently reaches a Tier-1 audit-integrity
+# error rather than a build-time rejection: elspeth-9db785ace7.)
+- name: panel_merge
+  branches:
+    arm_a: a_out
+    arm_b: b_out
+  policy: require_all
+  merge: union
+  union_collision_policy: last_wins
+
+collectors:
+# LEVEL 2 — THE DOCUMENT. A barrier, not a window: no trigger config, flushes on
+# end_of_group only, in the opener's expansion ordinal.
+- name: doc_verdict
+  plugin: batch_stats
+  input: pages_scored
+  on_success: doc_out
+  options:
+    value_field: panel_gap
+    schema:
+      mode: observed
+
+scopes:
+- name: document_pages
+  opener: explode_pages
+  closer: doc_verdict
+  policy: require_all
+
+aggregations:
+# LEVEL 3 — THE RUN, and the level with NO CONTROL EDGE. This is a window over
+# whatever document verdicts arrived, not a group with a declared membership.
+# Nothing here can say "all four documents or none": there is no closer binding
+# to say it to. If a document verdict is refused upstream, this row is computed
+# over the survivors and NOTHING IN THE ROW SAYS SO — the run status is your
+# only signal, and it is why exit code and row content must both be read.
+#
+# The row is the unit of pass/fail. To make an entire run fail closed you have
+# to make the run ONE ROW and batch it internally, so that a scope's require_all
+# spans the whole corpus — see settings_run_as_row.yaml.
+- name: corpus_summary
+  plugin: batch_stats
+  input: doc_out
+  on_success: out
+  on_error: discard
+  trigger: {}
+  output_mode: transform
+  options:
+    value_field: mean
+    schema:
+      mode: observed
+
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/document_review_panel/output/corpus_summary.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/document_review_panel/runs/clean.db

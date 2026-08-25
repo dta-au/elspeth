@@ -1,5 +1,8 @@
 {
   "hashes": {
+    "examples/ab_llm_experiment/settings.yaml": "30ed2ffc191d80414731f729898296675fe1f7434d6d98e7e113d86a8ce52b9b",
+    "examples/ab_llm_experiment/settings_arm_loss.yaml": "6691591372ae87dc8700a27ee9a32f6992e4546a46e163a9ece3247144a9f67e",
+    "examples/ab_llm_experiment/settings_models.yaml": "fddb39fc3a291555c8c0a33b055b6416057188f90ba5fe906032a2d43150f664",
     "examples/audit_export/settings.yaml": "6f35c041560ff9a58b858c70156270ea038bdb8d69afc05c5833ce0c91bd01ee",
     "examples/batch_aggregation/settings.yaml": "cf8a247802ccfa8f7877ace17bc62e2e765bd02fbea48b3930602ce429b3c2af",
     "examples/blob_transforms/settings_expand_csv_blobs.yaml": "c17f1ddc4282853c9b82466b1564c23903d2b2181e7606873a1714af5cbaf3b6",
@@ -15,6 +18,9 @@
     "examples/database_sink/settings.yaml": "cd0af32a7e1fcd1263d5745685afc2142c22c0ac593d2d9e1e8cfd876dd85efc",
     "examples/deaggregation/settings.yaml": "61ed4d766d47f511a32fdfefa337df4f9614de6a8eb8deaf15317e19f17f82c0",
     "examples/deep_routing/settings.yaml": "a77cad5c1951be1c436f82128764ad7e97e8fa4a7fa8bc10f6630bb78933aa68",
+    "examples/document_review_panel/settings.yaml": "2da9fd285196becd807b4a7b28ad2c5f4fed0daa375e346f7e2b96597061a7d2",
+    "examples/document_review_panel/settings_incomplete.yaml": "ee3082aba1266c2d1f678b4f144238f6cefceb743266b64b64a13a95805bb80e",
+    "examples/document_review_panel/settings_run_as_row.yaml": "4beaffaf9e3b43b7e4d92f0ef09393013da08e667b94cc09155da44a14dc8385",
     "examples/error_routing/settings.yaml": "af7057deb5331035dd0d429c188cb46f6d73d816c12ea66c12daf7d9c099a861",
     "examples/explicit_routing/settings.yaml": "f83c436db817784ce0855e41a9ae1273e976dac2faa9cee07a58f3ec740112ff",
     "examples/fork_coalesce/settings.yaml": "ab7ab69db8ed7ca7d728f0f5b7dbd3911777c91cda7f1796cadf2793f83fe03e",
@@ -47,6 +53,8 @@
     "examples/row_union_ab_experiment/settings_screened_at_settlement.yaml": "f74c1bfcd9a0c9cbded388d4256c27ed8eb17f80251dd9c8cac5fa2ee61edc24",
     "examples/schema_contracts_demo/settings.yaml": "1661596115fe35499ae5e39b40b350cc1f3808c821d2ab83523bb51c4f1f72b6",
     "examples/schema_contracts_llm_assessment/settings.yaml": "0fee2c5c4add6aa669effcd6437c0e31756925a1f5cec4e6b43ef24dfbcbead1",
+    "examples/scope_collector/settings.yaml": "d4c1d539ffe78c868a8a97b476b52529a5fa3d62784293d9de3fb2948b6f61d6",
+    "examples/scope_collector/settings_best_effort.yaml": "ba4c0974dd8a58463164843b0e10a6053306b215031027476c3269d710ce3a96",
     "examples/statistical_batch_plugins/settings_classifier_metrics.yaml": "351731c93a2117cf21d28dbcbe60625b3446b1d82dc9e8930694cd34b2f26949",
     "examples/statistical_batch_plugins/settings_data_quality_report.yaml": "3bd5e0efe357440f8c885f146a568037e195eabbf7453080acd2a2ebb5e38a97",
     "examples/statistical_batch_plugins/settings_distribution_profile.yaml": "bc2d5152d3510a1f0b67275bb851f175431407871c11332e4122da73da8309de",

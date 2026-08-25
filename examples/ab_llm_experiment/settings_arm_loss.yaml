@@ -1,0 +1,249 @@
+# A/B Experiment — WHAT A LOST ARM COSTS: the whole row, not the arm
+#
+#   source (24 cases) ─(routed)─> [variant_fork] ─┬─ arm_a ─> assess_a ─> tag_a ─────┐
+#                                                  └─ arm_b ─> weigh_exposure ─> assess_b ─> tag_b ┤
+#                                                                                    [variant_union]
+#                                        ─(experiment_in)─> [prompt_experiment] ─> output
+#
+# THIS IS THE FAIL-CLOSED FIXTURE. settings.yaml and settings_models.yaml are
+# clean runs that DOCUMENT the fail-closed rule without ever exercising it —
+# their fault injection is zeroed, so no arm is ever lost and the rule never
+# fires. A behaviour that never arises is not evidence that it works. This file
+# makes it arise, deterministically, and pins what it costs.
+#
+# HOW THE ARM IS LOST
+# -------------------
+# The candidate rubric weights financial exposure, so arm B computes an
+# exposure weight before it will assess anything. Three of the 24 records do
+# not carry an `exposure_aud` key AT ALL (C-203, C-210, C-214) — not empty, not
+# zero, absent — so that transform fails for exactly those three and
+# `on_error: discard` drops their arm-B tokens. Nothing is random and nothing
+# is injected: the loss is in the data.
+#
+# WHAT IT COSTS — READ THE OUTPUT ROW, NOT THE EXIT CODE
+# -------------------------------------------------------
+# The three affected cases lose ONE arm each. They do not contribute a
+# one-armed observation to the experiment; they contribute NOTHING:
+#
+#     baseline_count  21   (not 24 — the three arm-A survivors are invalidated)
+#     variant_count   21
+#     batch_size      42   (21 pairs, not 45 tokens)
+#
+# `baseline_count` is the tell. Arm A ran to completion for C-203, C-210 and
+# C-214 — the provider was called, the model answered, the score was parsed and
+# the token was tagged — and that work is discarded anyway, because its sibling
+# never arrived. A half-observed case is not a cheaper observation; it is a
+# different experiment, and admitting it would silently bias the comparison
+# toward whichever arm survives more often.
+#
+# So three arm-A LLM calls are paid for and thrown away. That is the CORRECT
+# outcome, and the audit records the asymmetry: 45 llm calls (24 on arm A, 21
+# on arm B) against 42 admitted observations. The gap is the point.
+#
+# WHY THE ERROR ROUTE IS `discard` AND NOT A SINK
+# -----------------------------------------------
+# Routing a failed member to a quarantine sink from inside a row_union branch
+# builds a DIVERT edge, and the graph builder warns about it: the group fails
+# closed regardless, so the sink promises a recovery path that the barrier will
+# not honour. `discard` states the truth — the token is gone, and the group
+# machinery settles the consequence.
+#
+# EXPECTED OUTCOME: PARTIAL, exit 1. A non-zero exit here is the fixture
+# working. Compare `baseline_count`, not the exit code.
+#
+# Prerequisite: ChaosLLM on port 8199 with this directory's chaos_config.yaml.
+# Use ./examples/ab_llm_experiment/run.sh, which runs all three configs.
+
+sources:
+  primary:
+    plugin: json
+    on_success: routed
+    options:
+      path: examples/ab_llm_experiment/input_large.jsonl
+      format: jsonl
+      # `observed`, deliberately. A fixed schema declaring `exposure_aud` would
+      # reject the three incomplete records AT THE SOURCE, before the fork —
+      # and this example is about what happens when a member is lost AFTER the
+      # fork, with its sibling already in flight.
+      schema:
+        mode: observed
+      on_validation_failure: discard
+
+gates:
+# Fork every case into the two prompt arms. The condition is constant because
+# the fork is unconditional — every case is assessed by both arms.
+- name: variant_fork
+  input: routed
+  condition: "True"
+  routes:
+    'true': fork
+    'false': output
+  fork_to:
+  - arm_a
+  - arm_b
+
+transforms:
+# ARM A — the incumbent prompt: one sentence, no criteria breakdown.
+- name: assess_a
+  plugin: llm
+  input: arm_a
+  on_success: a_assessed
+  on_error: discard
+  options:
+    provider: openrouter
+    api_key: fake-key-chaosllm-does-not-check
+    base_url: http://127.0.0.1:8199/v1
+    model: chaosllm/analyst-v1
+    timeout_seconds: 15
+    temperature: 0.0
+    system_prompt: |
+      You are a governance risk assessor. Respond ONLY with a JSON object of
+      the form {"score": <integer 0-100>, "rationale": "<one sentence>"}.
+    prompt_template: 'Assess: {{ row.input_1 }}'
+    required_input_fields: []
+    schema:
+      mode: observed
+    queries:
+      assessment:
+        input_fields:
+          input_1: case_study
+        template: |
+          Score this case study 0-100 for governance risk.
+
+          {{ row.input_1 }}
+        output_fields:
+        - suffix: score
+          type: integer
+        - suffix: rationale
+          type: string
+
+# ARM B'S PRECONDITION — and the source of the loss. The candidate rubric
+# weights financial exposure, so this arm computes the weight up front and
+# cannot proceed without it. Three records have no `exposure_aud` key, so this
+# transform raises for them and `on_error: discard` drops those arm-B tokens.
+#
+# Note the position: BEFORE the provider call. Arm B never spends an LLM call
+# on those three cases — arm A already has, and spends it for nothing.
+- name: weigh_exposure
+  plugin: value_transform
+  input: arm_b
+  on_success: arm_b_ready
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: exposure_weight
+      expression: "row['exposure_aud'] / 1000000"
+
+# ARM B — the candidate prompt: the same question behind an explicit weighted
+# rubric. "WEIGHTED RUBRIC" is the marker the mock server keys its uplift on,
+# so the measured lift is attributable to this prompt and nothing else.
+- name: assess_b
+  plugin: llm
+  input: arm_b_ready
+  on_success: b_assessed
+  on_error: discard
+  options:
+    provider: openrouter
+    api_key: fake-key-chaosllm-does-not-check
+    base_url: http://127.0.0.1:8199/v1
+    model: chaosllm/analyst-v1
+    timeout_seconds: 15
+    temperature: 0.0
+    system_prompt: |
+      You are a governance risk assessor. Respond ONLY with a JSON object of
+      the form {"score": <integer 0-100>, "rationale": "<one sentence>"}.
+    prompt_template: 'Assess: {{ row.input_1 }}'
+    required_input_fields: []
+    schema:
+      mode: observed
+    queries:
+      assessment:
+        input_fields:
+          input_1: case_study
+        template: |
+          WEIGHTED RUBRIC
+          Score this case study 0-100 for governance risk, weighting:
+            - control failure severity          40%
+            - detectability before impact       30%
+            - remediation cost and difficulty   20%
+            - recurrence likelihood             10%
+          Score each dimension before combining, then report the weighted total.
+
+          {{ row.input_1 }}
+        output_fields:
+        - suffix: score
+          type: integer
+        - suffix: rationale
+          type: string
+
+# Tag each arm with its variant label and lift the typed score the LLM returned
+# into the long-format `score` column the comparison consumes. The multi-query
+# form names its outputs `<query>_<suffix>`, hence `assessment_score`.
+- name: tag_a
+  plugin: value_transform
+  input: a_assessed
+  on_success: a_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'control'"
+    - target: score
+      expression: "row['assessment_score'] * 1.0"
+
+- name: tag_b
+  plugin: value_transform
+  input: b_assessed
+  on_success: b_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'treatment'"
+    - target: score
+      expression: "row['assessment_score'] * 1.0"
+
+row_unions:
+# Wait for BOTH arms of a case, then release both tokens as one group.
+# Declared branch order is the release order, so control precedes treatment
+# for every case.
+- name: variant_union
+  branches:
+    arm_a: a_scored
+    arm_b: b_scored
+  on_success: experiment_in
+
+aggregations:
+# Long-format cross-variant statistics over the whole unioned stream.
+- name: prompt_experiment
+  plugin: batch_experiment_compare
+  input: experiment_in
+  on_success: output
+  on_error: discard
+  trigger: {}
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    variant_field: prompt_variant
+    score_field: score
+    baseline_variant: control
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/ab_llm_experiment/output/arm_loss_experiment.json
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/ab_llm_experiment/runs/audit_arm_loss.db
