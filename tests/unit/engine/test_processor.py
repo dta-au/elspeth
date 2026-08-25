@@ -83,6 +83,7 @@ from elspeth.engine.processor import (
     SCHEDULER_MAINTENANCE_INTERVAL,
     BarrierJournalRestoreContext,
     DAGTraversalContext,
+    ProcessorMode,
     RowProcessor,
     _FlushContext,
     _LiveBarrierHold,
@@ -197,6 +198,7 @@ def _persist_blocked_scheduler_work(
     ingest_sequence: int = 0,
     adopted: bool = True,
     coalesce_name: str | None = None,
+    collector_name: str | None = None,
 ) -> None:
     """Persist BLOCKED scheduler work matching a fabricated buffered token.
 
@@ -226,6 +228,7 @@ def _persist_blocked_scheduler_work(
         now=now,
         lineage_path=token.lineage_path,
         coalesce_name=coalesce_name,
+        collector_name=collector_name,
     )
     processor._scheduler.mark_blocked(
         work_item_id=item.work_item_id,
@@ -416,6 +419,9 @@ def _make_processor(
     row_union_executor: Any = None,
     row_union_node_ids: dict[RowUnionName, NodeID] | None = None,
     branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
+    collector_executor: Any = None,
+    collector_node_ids: dict[CollectorName, NodeID] | None = None,
+    collector_on_success_map: dict[CollectorName, str] | None = None,
     group_bindings: GroupBindingRegistry | None = None,
     branch_to_sink: dict[BranchName, str] | None = None,
     node_step_map: dict[NodeID, int] | None = None,
@@ -431,10 +437,19 @@ def _make_processor(
     clock: Any = None,
     stamp_blocked_rows_adopted: bool = True,
     structural_node_ids: frozenset[NodeID] | None = None,
+    mode: ProcessorMode = ProcessorMode.LEADER,
 ) -> RowProcessor:
-    """Create a RowProcessor with sensible defaults."""
+    """Create a RowProcessor with sensible defaults.
+
+    ``mode=ProcessorMode.FOLLOWER`` builds the follower half of a real
+    multi-worker composition over the same DB: no coordination token (the
+    fenced verbs are leader-only, ADR-030 §B.1) and a REQUIRED registered
+    ``scheduler_lease_owner`` — RowProcessor validates both fail-closed.
+    """
     if scheduler_lease_owner is not None:
         _register_test_worker(factory, scheduler_lease_owner, run_id=run_id)
+    if mode is ProcessorMode.FOLLOWER and scheduler_lease_owner is None:
+        raise ValueError("_make_processor(mode=FOLLOWER) requires a registered scheduler_lease_owner")
 
     coalesce_nodes = dict(coalesce_node_ids or {})
     traversal_steps = dict(node_step_map or {})
@@ -463,6 +478,7 @@ def _make_processor(
     node_ids_to_register.update(node_id for node_id in traversal_next.values() if node_id is not None)
     node_ids_to_register.update(coalesce_nodes.values())
     node_ids_to_register.update((row_union_node_ids or {}).values())
+    node_ids_to_register.update((collector_node_ids or {}).values())
     node_ids_to_register.update((aggregation_settings or {}).keys())
 
     for node_id in sorted(node_ids_to_register, key=str):
@@ -477,6 +493,9 @@ def _make_processor(
         elif node_id in (row_union_node_ids or {}).values():
             node_type = NodeType.ROW_UNION
             plugin_name = "row_union"
+        elif node_id in (collector_node_ids or {}).values():
+            node_type = NodeType.COLLECTOR
+            plugin_name = "collector"
         elif node_id in (aggregation_settings or {}):
             node_type = NodeType.AGGREGATION
             plugin_name = "aggregation"
@@ -512,6 +531,7 @@ def _make_processor(
         node_to_next=traversal_next,
         coalesce_node_map=coalesce_nodes,
         row_union_node_map=dict(row_union_node_ids or {}),
+        collector_node_map=dict(collector_node_ids or {}),
         structural_node_ids=traversal_structural,
     )
 
@@ -531,7 +551,9 @@ def _make_processor(
         run_id=run_id,
         # Slice 3 (ADR-030 §E.2): the journal-first barrier intake's adoption
         # verbs are leader-fenced; bind the run's own epoch-1 seat token.
-        coordination_token=leader_coordination_token(factory, run_id),
+        # A follower never carries one.
+        coordination_token=leader_coordination_token(factory, run_id) if mode is ProcessorMode.LEADER else None,
+        mode=mode,
         source_node_id=NodeID(source_node_id),
         source_on_success=source_on_success,
         source_plugin=source_plugin,
@@ -544,6 +566,8 @@ def _make_processor(
         branch_to_coalesce=branch_to_coalesce,
         row_union_executor=row_union_executor,
         branch_to_row_union=branch_to_row_union,
+        collector_executor=collector_executor,
+        collector_on_success_map=collector_on_success_map,
         group_bindings=(
             group_bindings
             if group_bindings is not None

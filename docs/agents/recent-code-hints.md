@@ -8,6 +8,31 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-25 — the death-matrix harness hosts a LIVE-leader + follower
+  composition, and "multi-worker collector test" names TWO different items**
+  (integration phase 1b, `tests/e2e/recovery/test_barrier_process_death_matrix.py`
+  collector family). (a) `spawn_database_process_with_pause` + `release()`
+  (not `kill()`) keeps the opener's LEADER alive and paused while a second
+  child — a real `ProcessorMode.FOLLOWER` processor built via the new
+  `_make_processor(mode=ProcessorMode.FOLLOWER, scheduler_lease_owner=...)`
+  kwarg (no coordination token; the owner must be a registered
+  `run_workers` row) — writes to the same DB; the released leader then
+  continues its action. That is how a follower-reported collector loss
+  (`adopted_epoch NULL`, re-derived via META-9.1) is replayed by a leader
+  whose in-memory registry DID mint the group. (b) Do not conflate the
+  worklist's item 12 with item 13: item 12 is the multi-worker
+  CONCURRENT-ADOPTION RACE (two processes racing the leader-fenced CAS on
+  one BLOCKED row — needs two simultaneous leader fences, i.e. the Postgres
+  multi-worker suite's composition, `test_barrier_recovery_postgres.py`;
+  this single-seat SQLite harness's second leader is always a takeover of
+  an expired seat, so it cannot host it); item 13 is the non-opener-worker
+  / post-resume LOSS pair, which the harness hosts fully. Also: a scoped
+  run on the shared checkout measures sibling WIP in `src/` — the family
+  went red mid-session on a half-edited `processor.py` (missing import) that
+  was not in any commit; verify from a `git archive HEAD` export with your
+  test files copied in, and read the sibling's `git status` before
+  diagnosing.
+
 - **2026-08-25 — META-38: merging closers TRUNCATE at their own frame;
   `pop_closer_frame` is GONE (branch feature/unified-lineage).** A collector
   release permanently carries its own release-group EXPAND frame innermost
