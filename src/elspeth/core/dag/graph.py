@@ -1025,18 +1025,16 @@ class ExecutionGraph:
 
     def get_error_routable_closer_names(self) -> set[str]:
         """Closer names an ``on_error`` target may legally name at RUNTIME
-        (spec §7 rule 9, WS3 Task 9b): coalesce and row_union only.
-
-        Collector names are DELIBERATELY EXCLUDED even though the builder's
-        rule-9 acceptance (``core/dag/builder.py``'s ``closer_name_to_node``)
-        treats coalesce/row_union/collector uniformly as legal DIVERT
-        targets — extending the RUNTIME-facing closer vocabulary (the
-        orchestrator preflight validators and the token-dispatch
-        classification) to collectors is the rule-9 parity sweep
-        (integration item 18, after the collector executor lift) — this set
-        gains ``get_collector_id_map()`` there, not before.
+        (spec §7 rule 9, WS3 Task 9b): coalesce, row_union and collector —
+        the same three kinds the builder's rule-9 acceptance
+        (``core/dag/builder.py``'s ``closer_name_to_node``) treats uniformly
+        as legal DIVERT targets (integration item 18 parity sweep).
         """
-        return {str(name) for name in self._coalesce_id_map} | {str(name) for name in self._row_union_id_map}
+        return (
+            {str(name) for name in self._coalesce_id_map}
+            | {str(name) for name in self._row_union_id_map}
+            | {str(name) for name in self._collector_id_map}
+        )
 
     def get_branch_to_row_union_map(self) -> dict[BranchName, RowUnionName]:
         """Get fork branch_name -> row_union_name mapping.

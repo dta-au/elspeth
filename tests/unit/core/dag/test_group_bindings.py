@@ -78,6 +78,22 @@ class TestDerivedViews:
             BranchName("path_b"): RowUnionName("union"),
         }
 
+    @pytest.mark.parametrize(
+        ("binding", "closer"),
+        [
+            pytest.param(_fork_binding(), "merge", id="coalesce"),
+            pytest.param(_fork_binding(closer_kind=CloserKind.ROW_UNION, closer="union"), "union", id="row_union"),
+            pytest.param(_expand_binding(), "page_stitcher", id="collector"),
+        ],
+    )
+    def test_every_bound_closer_kind_is_a_legal_rule9_on_error_target(self, binding: GroupBinding, closer: str) -> None:
+        """Spec §7 rule 9 parity (integration item 18): the runtime predicate
+        admits coalesce, row_union AND collector closers alike; an unbound
+        name is never a closer."""
+        reg = GroupBindingRegistry(bindings=(binding,))
+        assert reg.is_error_routable_closer(closer)
+        assert not reg.is_error_routable_closer("not_a_closer")
+
     def test_expand_binding_contributes_no_branch_view(self) -> None:
         reg = GroupBindingRegistry(bindings=(_expand_binding(),))
         assert reg.branch_to_coalesce() == {}

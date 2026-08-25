@@ -143,13 +143,10 @@ class GroupBindingRegistry:
 
     def is_error_routable_closer(self, name: str) -> bool:
         """Whether ``name`` is a legal rule-9 ``on_error`` closer target at
-        RUNTIME (spec §7 rule 9, WS3 Task 9b) — coalesce/row_union only.
-
-        Collector closers are excluded (mirrors ``ExecutionGraph.
-        get_error_routable_closer_names()``'s fuller trigger comment):
-        extending this to collectors is the rule-9 parity sweep (integration
-        item 18, after the collector executor lift)."""
-        return any(binding.closer_name == name and binding.closer_kind is not CloserKind.COLLECTOR for binding in self.bindings)
+        RUNTIME (spec §7 rule 9, WS3 Task 9b): any bound closer — coalesce,
+        row_union or collector (integration item 18 parity sweep; mirrors
+        ``ExecutionGraph.get_error_routable_closer_names()``)."""
+        return any(binding.closer_name == name for binding in self.bindings)
 
     def binding_for(self, frame: LineageFrame) -> GroupBinding | None:
         """Resolve one lineage frame to its bound closer (None = inert frame).

@@ -331,3 +331,12 @@ class TestCollectorNode:
     def test_three_level_depth_cap_rejects_below_three(self) -> None:
         with pytest.raises(GraphValidationError, match="nesting depth"):
             _build_three_level_expand_fork_fork(max_bound_region_depth=2)
+
+
+def test_collector_is_a_rule9_error_routable_closer_at_runtime() -> None:
+    """Spec §7 rule 9 parity (integration item 18): the runtime-facing
+    closer set the orchestrator validators and the dispatch classifier
+    consume names the collector, exactly as the builder's own rule-9
+    acceptance already did."""
+    graph = _build()
+    assert "page_stitcher" in graph.get_error_routable_closer_names()

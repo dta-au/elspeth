@@ -340,6 +340,120 @@ def test_transform_explicit_on_error_to_closer_settles_like_the_omitted_twin(tmp
     assert omitted.error_route_token_ids_with_work_items_at("coalesce_merge", error_paths=_tx_error_paths) == set()
 
 
+# ===== Collector arm (integration item 18, rule-9 parity): the same twin, over a scope =====
+
+_COLLECTOR_EXPLICIT_YAML = """
+sources:
+  docs:
+    plugin: json
+    on_success: rows
+    options:
+      path: {input_path}
+      format: jsonl
+      on_validation_failure: discard
+      schema: {{mode: observed}}
+concurrency:
+  max_workers: 1
+transforms:
+  - name: explode
+    plugin: json_explode
+    input: rows
+    on_success: pages
+    on_error: discard
+    options:
+      array_field: items
+      output_field: item
+      schema: {{mode: observed}}
+  - name: err_page
+    plugin: dag_corpus_branch_loss
+    input: pages
+    on_success: checked_pages
+    on_error: page_stitcher
+    options:
+      schema: {{mode: observed}}
+collectors:
+  - name: page_stitcher
+    plugin: batch_stats
+    input: checked_pages
+    on_success: output
+    on_error: discard
+    options:
+      value_field: item
+      schema: {{mode: observed}}
+scopes:
+  - name: document_pages
+    opener: explode
+    closer: page_stitcher
+    policy: require_all
+    on_group_failure: quarantine
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {output_path}
+      format: jsonl
+      schema: {{mode: observed}}
+"""
+
+_COLLECTOR_OMITTED_YAML = _COLLECTOR_EXPLICIT_YAML.replace("on_error: page_stitcher", "on_error: discard")
+
+_COLLECTOR_INPUT_JSONL = json.dumps({"id": 1, "items": [3, 1, 2]}) + "\n" + json.dumps({"id": 2, "items": [5, 7]}) + "\n"
+
+
+def _build_and_run_jsonl(settings_yaml: str, tmp_path: Path) -> tuple[Path, dict[str, Any], list[dict[str, Any]]]:
+    """The collector twin needs a LIST-bearing input (json_explode refuses
+    strings), so its source is JSONL; otherwise identical to _build_and_run."""
+    input_path = tmp_path / "docs.jsonl"
+    input_path.write_text(_COLLECTOR_INPUT_JSONL)
+    return _build_and_run(settings_yaml.replace("{input_path}", str(input_path)), tmp_path)
+
+
+def test_transform_explicit_on_error_to_collector_settles_like_the_omitted_twin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Item 18 parity: a transform INSIDE a scope naming the scope's own
+    collector via on_error settles identically to the on_error: discard
+    twin — every member is error-disposed (quarantined_at_source), every
+    loss reaches the collector through the settle seam, the require_all
+    group fails at closure, the plugin never runs, and no error-disposed
+    token ever travels the DIVERT edge as a live work item. group_losses are
+    compared as (closer, reason) multisets: EXPAND member keys are the
+    members' run-scoped token ids and cannot join a cross-run comparison."""
+    install_corpus_plugin_manager(monkeypatch)
+
+    explicit_dir = tmp_path / "explicit"
+    explicit_dir.mkdir()
+    db_path, result_data, explicit_rows = _build_and_run_jsonl(_COLLECTOR_EXPLICIT_YAML, explicit_dir)
+    explicit = PipelineResult(db_path=db_path, result_data=result_data, output_rows=explicit_rows)
+
+    omitted_dir = tmp_path / "omitted"
+    omitted_dir.mkdir()
+    db_path, result_data, omitted_rows = _build_and_run_jsonl(_COLLECTOR_OMITTED_YAML, omitted_dir)
+    omitted = PipelineResult(db_path=db_path, result_data=result_data, output_rows=omitted_rows)
+
+    def closer_and_reason(result: PipelineResult) -> Counter[tuple[str, str]]:
+        return Counter((closer, reason) for closer, _member_key, reason in result.group_losses())
+
+    assert closer_and_reason(explicit) == closer_and_reason(omitted) == Counter({("page_stitcher", "quarantined"): 5})
+
+    explicit_paths = explicit.token_outcome_paths()
+    omitted_paths = omitted.token_outcome_paths()
+    assert explicit_paths == omitted_paths
+    assert explicit_paths.count(("failure", "quarantined_at_source")) == 5  # every member, directly failing
+    assert explicit_rows == omitted_rows == []  # the collector never flushed
+
+    assert explicit.result_data["status"] == omitted.result_data["status"]
+    assert explicit.result_data["rows_quarantined"] == omitted.result_data["rows_quarantined"] == 5
+
+    # No member ever reached the collector as a live work item in either
+    # twin (they were error-disposed upstream), and no error-disposed token
+    # owns a work item at the closer — the pseudo-member-via-error-route
+    # check, now for the collector kind.
+    assert explicit.closer_work_items("collector_page_stitcher") == omitted.closer_work_items("collector_page_stitcher") == Counter()
+    _collector_error_paths = frozenset({"quarantined_at_source"})
+    assert explicit.error_route_token_ids_with_work_items_at("collector_page_stitcher", error_paths=_collector_error_paths) == set()
+    assert omitted.error_route_token_ids_with_work_items_at("collector_page_stitcher", error_paths=_collector_error_paths) == set()
+
+
 # ===== Gate arm: same equivalence pin, over handle_gate_error_outcome =====
 
 _GATE_EXPLICIT_YAML = """
