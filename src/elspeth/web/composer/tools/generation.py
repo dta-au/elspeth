@@ -570,6 +570,18 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "settles with what arrived). There is no default — the author decides.",
     ),
     (
+        # The guided binder's referential-integrity twin of the Stage-1
+        # scope_opener_unknown entry below. Containment-free by design (the
+        # catalogue forbids one code being a substring of another), so neither
+        # pattern can shadow the other.
+        r"guided_collector_opener_unresolved",
+        "A collector's scope_opener names a node id that does not exist in your candidate, so no "
+        "expansion opens the group the collector would close.",
+        "Re-emit with scope_opener set to one of the connectivity facts' candidate_node_ids — the exact "
+        "id of the multi-row transform whose expanded rows this collector reassembles. The "
+        "dangling_scope_openers facts are the values that matched nothing.",
+    ),
+    (
         r"scope_opener_unknown|scope_opener '(.+)' does not name a transform",
         "The collector's scope_opener does not name a transform node in the pipeline, so no expansion "
         "opens the group this collector would close.",
@@ -1287,6 +1299,10 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "collector_missing_scope",
     "collector_scope_policy_invalid",
     "scope_opener_unknown",
+    # Guided-binder referential-integrity twin of scope_opener_unknown (WS6
+    # lift fix round): the binder rejects a dangling opener with connectivity
+    # facts before the candidate ever reaches validation or projection.
+    "guided_collector_opener_unresolved",
     "collector_has_trigger_invalid",
     "collector_missing_plugin",
     "collector_plugin_not_batch_aware",

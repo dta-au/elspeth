@@ -42,6 +42,22 @@ is a working document under the normal delivery posture.
     deleted from `guidedDecoder.ts` and `types/index.ts` — the wire never
     carries the field again; do not resurrect it for old persisted states
     (they never carried it either: it serialised omitted-when-None).
+  - **A new planner-authorable REFERENCE field must join the guided binder's
+    dangling-reference coverage** (review finding, fix round). The binder's
+    `_collect_dangling` walk (behind `guided_route_target_unknown`) covers
+    on_success/on_error/to_node — it does NOT discover new reference fields by
+    itself, so `scope_opener` shipped uncovered and a hallucinated opener id
+    sailed past the binder toward the projection's typed raise. The fix is a
+    sibling referential check (`guided_collector_opener_unresolved`) with
+    connectivity facts; the projection raise stays as the fail-closed last
+    resort. Two sub-traps: the closed catalogue is CONTAINMENT-FREE (no code
+    may be a substring of another — `guided_scope_opener_unknown` was rejected
+    by `test_codes_are_containment_free` because Stage-1's
+    `scope_opener_unknown` exists), and binder existence vs Stage-1 kind
+    semantics stay split: the binder checks the id RESOLVES, validation's
+    `scope_opener_unknown` owns opener-must-be-a-transform, and both are
+    repairable in the planner loop (`build_set_pipeline_candidate` →
+    `acceptable` gate → `_PipelineCandidateRejected`).
 
 - **2026-08-25 — LLM messages are `Sequence[ChatMessage]`; `wire_messages`/
   `audit_messages` are the ONLY two exits, and image bytes must never reach

@@ -2969,6 +2969,38 @@ def bind_guided_reviewed_components(
                 "consumable_connections": cast(JsonValue, sorted(candidate_consumable_connections)),
             },
         )
+    # scope_opener is a planner-authored NODE reference (not a connection), so
+    # the routing check above cannot see it — a hallucinated or misspelled
+    # opener id must draw the same one-turn fact-bearing rejection as every
+    # other dangling reference. Existence only: opener-must-be-a-TRANSFORM is
+    # Stage-1 validation's rule (state.py scope_opener_unknown, already a
+    # repairable candidate rejection with its own catalogue entry) — the
+    # binder's job here is referential integrity, which is also what makes the
+    # projection's typed opener-resolution raise unreachable for planner input.
+    dangling_scope_openers: set[str] = set()
+    if isinstance(topology_nodes, list):
+        for topology_node in topology_nodes:
+            if not isinstance(topology_node, dict) or topology_node.get("node_type") != "collector":
+                continue
+            opener = topology_node.get("scope_opener")
+            if type(opener) is str and opener and opener not in node_ids:
+                dangling_scope_openers.add(opener)
+    if dangling_scope_openers:
+        raise GuidedCandidateBindingRejected(
+            "guided planner candidate collector scope_opener references unknown node(s)",
+            # Not "guided_scope_opener_unknown": the closed catalogue is
+            # containment-free (no code may be a substring of another) and
+            # Stage-1's scope_opener_unknown already exists.
+            error_code="guided_collector_opener_unresolved",
+            # Opener values and node ids are strings the planner itself
+            # authored in the rejected candidate — the same custody class as
+            # the routing facts above.
+            connectivity={
+                "component_kind": "nodes",
+                "dangling_scope_openers": cast(JsonValue, sorted(dangling_scope_openers)),
+                "candidate_node_ids": cast(JsonValue, sorted(node_ids)),
+            },
+        )
     return cast(GuidedBoundPipeline, bound)
 
 

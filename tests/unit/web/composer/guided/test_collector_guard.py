@@ -22,6 +22,7 @@ import pytest
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.guided.emitters import _node_cardinality
 from elspeth.web.composer.guided.planning import (
+    GuidedCandidateBindingRejected,
     GuidedRevisionAuthority,
     _node_behavior,
     bind_guided_prose_revision_candidate,
@@ -148,6 +149,57 @@ class TestBinderAcceptance:
         assert collector["scope_name"] == "document_pages"
         assert collector["scope_opener"] == "explode"
         assert collector["scope_policy"] == "require_all"
+
+    def test_dangling_scope_opener_is_a_repairable_rejection_not_a_crash(self) -> None:
+        # A hallucinated/misspelled opener id is planner-authored input: it
+        # must draw the binder's one-turn fact-bearing rejection (same class
+        # as guided_route_target_unknown), NEVER reach the projection's typed
+        # AuditIntegrityError and become a terminal 500.
+        candidate = _collector_candidate()
+        collector = candidate["nodes"][1]  # type: ignore[index]
+        collector["scope_opener"] = "does_not_exist"
+
+        with pytest.raises(GuidedCandidateBindingRejected) as raised:
+            bind_guided_reviewed_components(candidate, _guided())
+
+        assert type(raised.value) is GuidedCandidateBindingRejected
+        assert raised.value.error_code == "guided_collector_opener_unresolved"
+        # The planner loop reclassifies binder complaints by this prefix; a
+        # drifted message becomes a terminal 500 instead of a repair turn.
+        from elspeth.web.composer.pipeline_planner import _CANDIDATE_SHAPE_INTEGRITY_PREFIX
+
+        assert str(raised.value).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX)
+        assert raised.value.connectivity == {
+            "component_kind": "nodes",
+            "dangling_scope_openers": ["does_not_exist"],
+            "candidate_node_ids": ["explode", "page_stitcher"],
+        }
+
+    def test_valid_scope_opener_still_binds(self) -> None:
+        # The other direction of the new check: the fixture's correct opener
+        # ("explode", a candidate transform) must keep binding untouched.
+        bound = bind_guided_reviewed_components(_collector_candidate(), _guided())
+        (collector,) = [node for node in bound["nodes"] if node.get("node_type") == "collector"]
+        assert collector["scope_opener"] == "explode"
+
+    def test_nontransform_opener_stays_a_repairable_validation_rejection(self) -> None:
+        # Point-4 regression pin: an opener that EXISTS but is not a transform
+        # passes the binder's referential check deliberately — Stage-1
+        # validation owns kind semantics (state.py scope_opener_unknown), and
+        # the production loop turns any high-severity validation error into a
+        # repairable candidate rejection (build_set_pipeline_candidate ->
+        # acceptable gate -> _PipelineCandidateRejected). This pins the code's
+        # closed-catalogue registration so that repair turn keeps its guidance.
+        from elspeth.web.composer.tools.generation import _CLOSED_VALIDATION_ERROR_CODES, explain_validation_code
+
+        assert "scope_opener_unknown" in _CLOSED_VALIDATION_ERROR_CODES
+        assert explain_validation_code("scope_opener_unknown") is not None
+        # And the guided twin resolves to ITS OWN catalogue entry (the shared
+        # substring must not shadow it): the guided guidance names the
+        # connectivity facts the binder rejection carries.
+        guided_guidance = explain_validation_code("guided_collector_opener_unresolved")
+        assert guided_guidance is not None
+        assert "candidate_node_ids" in guided_guidance[1]
 
     def test_prose_revision_accepts_a_collector_bearing_predecessor(self) -> None:
         # INVERSION of the old predecessor-guard pin: a collector in the
