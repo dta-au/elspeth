@@ -1,4 +1,4 @@
-"""Closed group-settlement reason vocabulary (unified-lineage spec §2/§6.4, ADR-042, WS6).
+"""Closed group-settlement reason vocabulary (unified-lineage spec §2/§6.4, ADR-042, WS5).
 
 Reasons are categorical tokens from ONE StrEnum — never free prose, never
 hand-written strings at emission sites. ``scope_group_failed`` is the reason
@@ -47,6 +47,13 @@ def test_no_production_module_hand_writes_a_settlement_reason_literal() -> None:
     ``ast.Constant`` expression values in a load-bearing position — a
     docstring IS a Constant, so module/class/function docstrings are skipped
     explicitly rather than by luck.
+
+    Known residual (review M-1): the canary collects ``ast.Constant`` nodes
+    only, so a literal assembled at runtime — concatenation, an f-string,
+    ``str.join`` — escapes it (the same accepted residual class as the
+    collector barrier-key canary's literal walk). Canary silence is
+    therefore not proof of absence; it catches the plain-literal regression,
+    which is the only shape that has ever occurred.
     """
     vocabulary = {r.value for r in GroupSettlementReason}
     hits: list[tuple[str, int, str]] = []
