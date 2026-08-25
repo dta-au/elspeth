@@ -645,6 +645,15 @@ export type ProposalNodeBehavior =
       branch_aliases: string[];
       policy: "require_all";
       timeout_seconds: number | null;
+    }
+  | {
+      kind: "collector";
+      /** Stable id of the multi-row transform whose EXPAND group this
+       *  collector closes — the projection's own id for the opener node.
+       *  The authored scope_name stays private (server ordinals/stable ids
+       *  replace canonical component names on this surface). */
+      opener_stable_id: string;
+      policy: "require_all" | "best_effort";
     };
 
 export interface ProposePipelinePayload {
@@ -689,7 +698,8 @@ export interface ProposePipelinePayload {
       | "aggregation"
       | "queue"
       | "coalesce"
-      | "row_union";
+      | "row_union"
+      | "collector";
     plugin: ProposalPluginRef | null;
     behavior: ProposalNodeBehavior;
     node_options_summary: NodeOptionSummary[];

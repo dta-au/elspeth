@@ -33,7 +33,6 @@ def _fork_binding(
         closer_name=closer,
         closer_kind=closer_kind,
         policy="require_all",
-        on_group_failure=None,
         member_roster=member_roster,
     )
 
@@ -47,7 +46,6 @@ def _expand_binding(*, opener: str = "explode", closer: str = "page_stitcher") -
         closer_name=closer,
         closer_kind=CloserKind.COLLECTOR,
         policy="require_all",
-        on_group_failure="quarantine",
         member_roster=(),
     )
 

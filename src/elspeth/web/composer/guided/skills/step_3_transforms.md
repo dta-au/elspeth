@@ -39,14 +39,18 @@ future-stage intent; do not ask the user to repeat those facts.
 5. Do not silently replace a requested capability with a simpler transform.
    Policy-proven unavailability is a named deployment gap; a different stage is
    a timing distinction, not a capability denial.
-6. Collector nodes and their scope-binding fields (`scope_name`,
-   `scope_opener`, `scope_policy`, `scope_on_group_failure`) are not
-   authorable in this guided lane: a candidate containing one is refused with
-   `guided_collector_not_authorable`. When the intent needs grouped
-   reassembly of expanded rows — a scoped multi-row expansion closed back
-   into one batch — present that boundary to the user as this lane's gap
-   rather than substituting an aggregation or another simpler step (rule 5
-   applies); the direct composer surface can author the collector shape.
+6. When the intent needs grouped reassembly of expanded rows — a multi-row
+   expansion closed back into one batch — author a `collector` node. It
+   carries its scope binding directly on the node: `scope_name` (the scope
+   identifier), `scope_opener` (the node id of the multi-row transform that
+   opens the group), and `scope_policy` (`require_all` or `best_effort` —
+   REQUIRED, no default: the author decides whether a lost member fails the
+   group). A collector applies a batch-aware plugin, flushes when the group
+   completes (never on a `trigger` — that field is rejected), and its
+   `on_error` is optional: omitted, the scope's group machinery owns the
+   failure route. Never satisfy this intent by substituting an aggregation
+   or another simpler step (rule 5 applies): a count/timeout trigger does
+   not correlate to the opener's expansion group.
 
 ## Presentation and field review
 

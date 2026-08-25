@@ -63,6 +63,7 @@ export const COALESCE_PHRASE = "merge the branches";
 export const ROW_UNION_PHRASE =
   "wait for every branch, then preserve every branch row";
 export const QUEUE_PHRASE = "interleave the incoming rows";
+export const COLLECTOR_PHRASE = "gather each expanded group back into one batch";
 
 function sourcePhrase(source: SourceSpec): string {
   const plugin = (source.plugin ?? "").toLowerCase();
@@ -89,6 +90,10 @@ function transformPhrase(node: NodeSpec): string {
   // and the queue interleaves those rows. NEVER merge/join/union language — it
   // does not correlate or combine schemas (contrast with coalesce above).
   if (node.node_type === "queue") return QUEUE_PHRASE;
+  // A collector is a scoped group closer, not a per-row step: whatever its
+  // batch-aware plugin does, the sentence must say it acts on the whole
+  // reassembled group — never fall through to the per-row plugin phrases.
+  if (node.node_type === "collector") return COLLECTOR_PHRASE;
   const plugin = (node.plugin ?? "").toLowerCase();
   if (/llm|rate|score|classif|grade/.test(plugin)) return "rate each row";
   if (/scrape|fetch|http|web/.test(plugin)) return SCRAPE_PAGE_PHRASE;

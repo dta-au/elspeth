@@ -64,6 +64,7 @@ const NODE_TYPES = new Set([
   "queue",
   "coalesce",
   "row_union",
+  "collector",
 ]);
 const FLOW_KINDS = new Set([
   "source_success", "source_validation_failure", "node_success", "node_error",
@@ -143,6 +144,7 @@ function decodeProposalNodeType(
     case "queue":
     case "coalesce":
     case "row_union":
+    case "collector":
       return decoded;
     default:
       return invalid(path, "unknown node type");
@@ -245,6 +247,9 @@ const LEGAL_NODE_FLOWS: Readonly<Record<string, ReadonlySet<string>>> = {
   queue: new Set(["queue_continue"]),
   coalesce: new Set(["coalesce_success"]),
   row_union: new Set(["row_union_success"]),
+  // on_error is optional on a collector (group failure is structural), so
+  // node_error is legal but not required — the flow-count arm below owns that.
+  collector: new Set(["node_success", "node_error"]),
 };
 const LEGAL_FLOW_TARGETS: Readonly<
   Record<string, ReadonlySet<ProposalEndpointKind>>
@@ -265,6 +270,7 @@ const ROW_UNION_TARGET_NODE_TYPES = new Set([
   "gate",
   "aggregation",
   "queue",
+  "collector",
 ]);
 interface DecodedProposalEndpoint { kind: ProposalEndpointKind; stableId: string | null }
 interface DecodedProposalFlow { kind: string; route?: string; routes?: string[]; branch?: string | null }
@@ -280,6 +286,8 @@ interface DecodedProposalBehavior {
   routeAliases: string[];
   forkBranches: Array<{ routes: string[]; branch: string }>;
   branchAliases: string[];
+  /** Collector only: the opener node's stable id (scope binding). */
+  openerStableId?: string;
 }
 interface DecodedProposalNode {
   stableId: string;
@@ -366,6 +374,13 @@ function validateProposalBehavior(value: unknown, nodeType: string, path: string
   if (nodeType === "transform" || nodeType === "queue") {
     exactRecord(behavior, behaviorPath, ["kind"]);
     return { kind: nodeType, routeAliases: [], forkBranches: [], branchAliases: [] };
+  }
+  if (nodeType === "collector") {
+    const exact = exactRecord(behavior, behaviorPath, ["kind", "opener_stable_id", "policy"]);
+    const openerStableId = canonicalUuid(exact.opener_stable_id, `${behaviorPath}.opener_stable_id`);
+    const policy = stringValue(exact.policy, `${behaviorPath}.policy`);
+    if (policy !== "require_all" && policy !== "best_effort") invalid(`${behaviorPath}.policy`, "unknown policy");
+    return { kind: nodeType, routeAliases: [], forkBranches: [], branchAliases: [], openerStableId };
   }
   if (nodeType === "gate") {
     const exact = exactRecord(behavior, behaviorPath, ["kind", "condition", "route_aliases", "routes", "fork_branches"]);
@@ -568,7 +583,7 @@ function validateProposalPayload(value: unknown, path: string): void {
     if (stringValue(node.label, `${nodePath}.label`) !== `node-${index + 1}`) invalid(`${nodePath}.label`, "not exact server ordinal");
     const nodeType = stringValue(node.node_type, `${nodePath}.node_type`);
     if (!NODE_TYPES.has(nodeType)) invalid(`${nodePath}.node_type`, "unknown node type");
-    if (nodeType === "transform" || nodeType === "aggregation") validateProposalPlugin(node.plugin, `${nodePath}.plugin`, "transform");
+    if (nodeType === "transform" || nodeType === "aggregation" || nodeType === "collector") validateProposalPlugin(node.plugin, `${nodePath}.plugin`, "transform");
     else if (node.plugin !== null) invalid(`${nodePath}.plugin`, "structural node plugin must be null");
     return { stableId, nodeType, behavior: validateProposalBehavior(node.behavior, nodeType, nodePath) };
   });
@@ -717,6 +732,18 @@ function validateProposalPayload(value: unknown, path: string): void {
     const kinds = flows.map((flow) => flow.kind);
     if (node.nodeType === "transform" || node.nodeType === "aggregation") {
       if (kinds.length !== 2 || kinds.filter((kind) => kind === "node_success").length !== 1 || kinds.filter((kind) => kind === "node_error").length !== 1) invalid(path, "node lacks exact success/error flows");
+    } else if (node.nodeType === "collector") {
+      // Mirrors protocol.py: exactly one success flow, AT MOST one error flow
+      // (on_error is optional — group failure is structural, ADR-042 §6).
+      const successCount = kinds.filter((kind) => kind === "node_success").length;
+      const errorCount = kinds.filter((kind) => kind === "node_error").length;
+      if (successCount !== 1 || errorCount > 1 || kinds.length !== successCount + errorCount) {
+        invalid(path, "collector requires one success flow and at most one error flow");
+      }
+      const opener = node.behavior.openerStableId;
+      if (opener === undefined || !nodeById.has(opener)) {
+        invalid(path, "collector scope opener must reference a node in the payload");
+      }
     } else if (node.nodeType === "gate") {
       const directRoutes = gateRoutes.get(node.stableId) ?? [];
       if (new Set(directRoutes).size !== directRoutes.length) invalid(path, "gate direct route alias resolves more than once");
@@ -1354,6 +1381,15 @@ function decodeProposalBehavior(
     case "queue":
       exactRecord(behavior, behaviorPath, ["kind"]);
       return { kind: nodeType };
+    case "collector": {
+      const exact = exactRecord(behavior, behaviorPath, ["kind", "opener_stable_id", "policy"]);
+      const openerStableId = canonicalUuid(exact.opener_stable_id, `${behaviorPath}.opener_stable_id`);
+      const policy = stringValue(exact.policy, `${behaviorPath}.policy`);
+      if (policy !== "require_all" && policy !== "best_effort") {
+        invalid(`${behaviorPath}.policy`, "unknown policy");
+      }
+      return { kind: "collector", opener_stable_id: openerStableId, policy };
+    }
     case "gate": {
       const exact = exactRecord(behavior, behaviorPath, ["kind", "condition", "route_aliases", "routes", "fork_branches"]);
       const routeAliases = aliasArray(exact.route_aliases, "route", `${behaviorPath}.route_aliases`, 1);
@@ -1986,7 +2022,6 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
         "scope_name",
         "scope_opener",
         "scope_policy",
-        "scope_on_group_failure",
       ],
     );
     const nodeType = stringValue(node.node_type, `${nodePath}.node_type`);
@@ -2052,9 +2087,6 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
     }
     if (node.scope_policy !== undefined) {
       decoded.scope_policy = nullableString(node.scope_policy, `${nodePath}.scope_policy`);
-    }
-    if (node.scope_on_group_failure !== undefined) {
-      decoded.scope_on_group_failure = nullableString(node.scope_on_group_failure, `${nodePath}.scope_on_group_failure`);
     }
     return decoded;
   });

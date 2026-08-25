@@ -186,6 +186,7 @@ TRANSFORMS:
   keyword_filter       - Filter rows containing blocked content patterns.
   line_explode         - Explode a string field into one output row per line.
   passthrough          - Pass rows through unchanged.
+  pdf_rasterize        - Render each page of a PDF into a PNG payload and emit one row per page.
   report_assemble      - Assemble a paginated report from a flushed batch of text rows.
   truncate             - Truncate string fields to specified maximum lengths.
   type_coerce          - Perform explicit, strict, per-field type normalization.

@@ -523,6 +523,14 @@ TransformErrorCategory = Literal[
     "csv_column_count_mismatch",
     "too_many_rows",
     "too_many_images",  # Row-declared image inputs exceed configured max_images_per_call
+    # PDF rasterization (Tier 2 - document bytes that did not survive rendering)
+    "pdf_encrypted",  # password/security-protected PDF; no password path exists
+    "pdf_malformed",  # pdfium could not parse the document
+    "pdf_page_render_failed",  # page(s) refused for render error, memory exhaustion, or invalid geometry; fires under
+    # on_page_failure=fail_document, and unconditionally when zero pages survive regardless of on_page_failure
+    "pdf_page_too_large",  # a page exceeded max_page_pixels or max_page_bytes; fires under on_page_failure=fail_document,
+    # and unconditionally when zero pages survive regardless of on_page_failure
+    "render_timeout",  # the document exceeded render_timeout_seconds (wall clock or CPU budget)
     # Template errors
     "template_rendering_failed",
     "template_context_failed",  # Multi-query template context build failed (missing field)
@@ -774,6 +782,12 @@ class TransformErrorReason(TypedDict):
     max_output_rows: NotRequired[int]  # Configured row-expansion limit
     skip_rows: NotRequired[int]  # Configured leading rows to skip
     rows_skipped: NotRequired[int]  # Actual rows skipped before exhaustion
+
+    # PDF rasterization context
+    detail: NotRequired[str]  # Renderer-supplied detail string (document or page refusal)
+    max_pages: NotRequired[int]  # Configured page-count ceiling (too_many_rows from pdf_rasterize)
+    page_count: NotRequired[int]  # Observed page count, when the renderer reported one
+    refused_pages: NotRequired[list[dict[str, Any]]]  # Per-page {page_number, kind, detail} refusal entries
 
     # Type validation context
     expected: NotRequired[str]

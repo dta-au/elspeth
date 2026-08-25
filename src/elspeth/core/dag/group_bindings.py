@@ -86,7 +86,6 @@ class GroupBinding:
     closer_name: str
     closer_kind: CloserKind
     policy: str
-    on_group_failure: str | None
     member_roster: tuple[str, ...]
 
 
@@ -280,7 +279,6 @@ def build_group_binding_registry(
                     closer_name=str(resolved_coalesce),
                     closer_kind=CloserKind.COALESCE,
                     policy=coalesce_settings.policy,
-                    on_group_failure=None,
                     member_roster=tuple(
                         b for b in fork_to if b in branch_to_coalesce_name and branch_to_coalesce_name[b] == resolved_coalesce
                     ),
@@ -296,7 +294,6 @@ def build_group_binding_registry(
                     closer_name=str(resolved_row_union),
                     closer_kind=CloserKind.ROW_UNION,
                     policy="require_all",
-                    on_group_failure=None,
                     member_roster=tuple(
                         b for b in fork_to if b in branch_to_row_union_name and branch_to_row_union_name[b] == resolved_row_union
                     ),
@@ -313,7 +310,6 @@ def build_group_binding_registry(
                 closer_name=scope.closer,
                 closer_kind=CloserKind.COLLECTOR,
                 policy=scope.policy,
-                on_group_failure=scope.on_group_failure,
                 member_roster=(),
             )
         )

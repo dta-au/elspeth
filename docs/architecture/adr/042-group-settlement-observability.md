@@ -183,6 +183,104 @@ adopted or not), live (a frame-bearing token with no completed terminal), or
 arrived (a journal row addressed to the closer). ADR-038 §3a carries the
 sweep-asymmetry ruling that gate depends on.
 
+### 5. Vocabulary frozen (2026-08-25, WS6 lane 1 — the declaration ruling 7878's lift trigger fires on)
+
+The settlement vocabulary is FROZEN as of this declaration. Two things,
+together:
+
+1. **The closed `GroupSettlementReason` membership** (§1's table, exactly
+   four members): `late_arrival_after_merge`, `scope_group_failed`,
+   `empty_expansion`, `all_members_lost`. Scope is coalesce/scope-failure
+   only (META-9.3): row_union's closed reasons (`row_union_branch_lost`,
+   `late_arrival_after_release`, `row_union_group_failed`) are a sibling
+   vocabulary and stay outside the enum; `row_union_group_failed` remains
+   deliberately distinct from the escalation ledger's bare `group_failed`
+   category token — naming adjacency, documented here, never renamed.
+2. **The two survivor-hold payload shapes §3a documents**: collector
+   survivors carry the group-failure cause nested under the
+   `ExecutionError` context; coalesce survivors carry `member_disposition`
+   top-level in the `CoalesceFailureReason` payload. The shape difference
+   is part of the frozen contract — readers read per closer kind and never
+   fail open on it.
+
+**Enforcement tripwires** (all pre-existing; this declaration names them
+as the freeze's witnesses):
+
+- the AST literal canary
+  (`tests/unit/engine/test_group_settlement_reasons.py`): pins the member
+  set and scans all of `src/` for hand-written vocabulary literals
+  (`ast.Constant` only — the concatenation/f-string limitation is
+  documented and reviewed);
+- the two META-41 re-frozen oracle snapshots
+  (`fork-coalesce-policies` `require-all-lost-c` and
+  `quorum-impossible-lost-c`, survivor `error_hash 36a9c100f8cd10fb`) —
+  MD1-verified as the corpus's ONLY pin on the settle seam's terminal
+  vocabulary; protect them accordingly;
+- the WS6 acceptance test
+  (`tests/integration/mcp/test_group_failure_forensics.py`): drives the
+  operator-visible surface end to end at depth 3, §4 reading the
+  structured `member_disposition` hold payload.
+
+**The bar for any change after this freeze:** an amendment to this ADR
+**plus** a META-class corpus re-freeze ruling (the META-39/META-41
+precedent), with mutation evidence that the re-frozen snapshots fail
+under the old vocabulary, and an export test selection that includes
+`tests/integration/core/dag`. A member addition, removal, or rename, a
+wire-value change, or a hold-payload shape change without both is a
+freeze violation, not a refactor.
+
+**Terminal-pair note (META-32):** collector survivors reuse the existing
+`(SUCCESS, COALESCED)` terminal pair; a proposed collector-specific
+terminal pair was REFUSED as a vocabulary change. That refusal's
+rationale is covered by this freeze — a new terminal pair for group
+settlement is a vocabulary change and takes the bar above.
+
+### 6. `on_group_failure` is deleted — group-failure handling is structural (2026-08-25, WS6 lane 1)
+
+`ScopeSettings.on_group_failure` (`quarantine` | `escalate`, default
+`quarantine`) is DELETED, with its build-time validator
+(`validate_escalation_targets`, §7 rule 8's decidable half), its composer
+mirror (`scope_escalate_at_outermost` and the
+`collector_scope_on_group_failure_invalid` vocabulary check), and every
+authoring/teaching surface that carried it.
+
+**Rationale (four-seat panel review, maintainer-ratified).** The field was
+found to have zero runtime effect at any depth: settlement is structural —
+a failed group escalates iff an enclosing bound frame exists
+(`_settle_member_losses` is called `escalated=True` unconditionally on
+`group_failed`), and the outermost group's failure is terminal
+(quarantine) because nothing encloses it. The field restated what nesting
+position already determined, and its default (`quarantine`) actively
+misdescribed behaviour at every non-outermost scope. An envelope-only
+validation was considered and rejected: together with rule 8 it would have
+left `escalate` declarable nowhere — a single-valued field carrying zero
+information. Per-scope runtime semantics were rejected as speculative
+generality (they duplicate `policy: best_effort`'s absorb axis, and the
+propagation machinery is unbuilt — see the barrier-scope proposal's three
+blockers). Structural derivation IS the contract; a config that declares
+the field now fails validation loudly (`extra="forbid"`) instead of
+carrying a value nothing reads.
+
+**Deliberate corpus-witness inversions (recorded per the §5 bar's spirit —
+this is a config-surface deletion, not a settlement-vocabulary change; the
+frozen membership, wire values, and hold-payload shapes are untouched):**
+
+- `tests/unit/core/dag/test_bound_regions.py`: `TestEscalateAtOutermost`
+  (value-legality pins over the deleted validator) became
+  `TestGroupFailureHandlingIsStructural` (depth pins over real computed
+  regions);
+- `tests/unit/core/test_config_collectors_scopes.py`: the
+  default-to-quarantine pin inverted to a field-rejection pin;
+- `tests/integration/mcp/test_group_failure_forensics.py`: the fixture
+  dropped its two scope declarations and the docstring's causal claim
+  ("`on_group_failure: escalate` stages...") was corrected — the staging
+  is structural and always was;
+- `tests/unit/web/composer/test_state_serialisation_contract.py`: the
+  collector shape's `composition_content_hash` pin moved (the serialised
+  node no longer carries the backfilled key). Persisted-state blast radius
+  verified empty before landing: 0/496 stored composition states and 0/26
+  proposals carried a collector node or the field.
+
 ## Consequences
 
 - **Positive:** a release context's `reason` now answers the operator's

@@ -135,13 +135,15 @@ Both rules are absolute in the composer's authoring path. They do not prohibit
 server-side *validation*, *rejection*, or *redaction* of what the planner
 produces, nor the required-control admission gates that protect runtime data.
 
-One such rejection is deliberately temporary: the guided lane refuses
-collector-bearing candidates (`guided_collector_not_authorable`,
-`guided/planning.py::_reject_collector_candidate_nodes`) as an INTERIM guard
-whose lift trigger is the WS6 disposition-vocabulary freeze (maintainer
-ruling, comment 7878 on elspeth-88bb77953c). Do not remove the guard or
-extend the guided proposal projection with a collector arm ahead of that
-ruling's trigger — lifting is that ticket's work, as one parity sweep.
+The interim guided collector guard is LIFTED (WS6, ruling 7878 on
+elspeth-88bb77953c): the guided lane authors and projects collectors like any
+other node kind, `guided_collector_not_authorable` is retired, and every
+`node_type` dispatch site in the guided path and frontend carries a collector
+arm or a deliberate documented exclusion. A new node kind or behavior arm is
+a parity sweep across those same surfaces (binder, proposal projection +
+`validate_payload`, wire cardinality, frontend union/decoder/renderers,
+teaching skills) — never a lane-scoped schema narrowing, which stays
+unauthorized unless refusal telemetry shows a real tax.
 
 ## Standing authorization: skills and subagents
 

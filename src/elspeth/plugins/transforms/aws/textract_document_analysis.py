@@ -308,7 +308,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a1c50e4b927137f7"
+    source_file_hash: str | None = "sha256:7bf91e951e98ca2a"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -323,8 +323,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     )
     usage_when_not_to_use = (
         "Not for inline bytes, document URLs, or synchronous low-latency analysis. For managed-blob documents "
-        "up to 5 MiB (single-page for PDF), use aws_textract_inline_analysis; stage each document in S3 "
-        "before using this plugin."
+        "up to 5 MiB (single-page for PDF), use aws_textract_inline_analysis; this plugin requires S3 "
+        "staging, or pdf_rasterize a multipage PDF to stay synchronous."
     )
     example_use = (
         "transform:\n"
@@ -1084,6 +1084,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 "or with per-row bucket_field and key_field; the two location modes are mutually exclusive.",
                 "In static bucket mode rows carry relative object keys only — never bucket names or locations.",
                 "QUERIES requires query definitions; inline document bytes belong in aws_textract_inline_analysis.",
+                "Multipage PDFs can alternatively be split with pdf_rasterize and analyzed inline page by page.",
                 "For explicit AWS credentials, use ELSPETH markers such as {secret_ref: AWS_ACCESS_KEY_ID}.",
             ),
         )

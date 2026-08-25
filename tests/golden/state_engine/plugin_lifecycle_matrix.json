@@ -1330,6 +1330,34 @@
       "release_lane": "local"
     },
     {
+      "plugin_key": "transform:pdf_rasterize",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.pdf_rasterize",
+      "qualname": "PDFRasterize",
+      "source_path": "src/elspeth/plugins/transforms/pdf_rasterize.py",
+      "determinism": "io_read",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.pdf_rasterize:PDFRasterize",
+        "process": "elspeth.plugins.transforms.pdf_rasterize:PDFRasterize",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.pdf_rasterize:PDFRasterize"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
       "plugin_key": "transform:rag_retrieval",
       "kind": "transform",
       "module": "elspeth.plugins.transforms.rag.transform",

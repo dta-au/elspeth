@@ -188,7 +188,6 @@ export interface NodeSpec {
   scope_name?: string | null;
   scope_opener?: string | null;
   scope_policy?: string | null;
-  scope_on_group_failure?: string | null;
 }
 
 /** An edge connecting two nodes in the DAG. */

@@ -61,7 +61,6 @@ def _collector(
     scope_name: str | None = "document_pages",
     scope_opener: str | None = "explode",
     scope_policy: str | None = "require_all",
-    scope_on_group_failure: str | None = None,
     **overrides: object,
 ) -> NodeSpec:
     kwargs: dict[str, object] = {
@@ -81,7 +80,6 @@ def _collector(
         "scope_name": scope_name,
         "scope_opener": scope_opener,
         "scope_policy": scope_policy,
-        "scope_on_group_failure": scope_on_group_failure,
     }
     kwargs.update(overrides)
     return NodeSpec(**kwargs)  # type: ignore[arg-type]
@@ -111,12 +109,10 @@ _COLLECTOR_FAMILY_CODES = (
     "collector_plugin_not_batch_aware",
     "collector_config_invalid",
     "collector_on_success_dangling",
-    "collector_scope_on_group_failure_invalid",
     "scope_name_duplicate",
     "scope_opener_duplicate",
     "scope_name_invalid",
     "node_scope_fields_unsupported",
-    "scope_escalate_at_outermost",
 )
 
 
@@ -127,9 +123,11 @@ class TestCollectorIntrinsics:
         fired = sorted({entry.error_code for entry in errors if entry.error_code in _COLLECTOR_FAMILY_CODES})
         assert fired == [], [entry.message for entry in errors if entry.error_code in fired]
 
-    def test_scope_on_group_failure_records_the_runtime_default(self) -> None:
-        node = _collector()
-        assert node.scope_on_group_failure == "quarantine"
+    def test_scope_on_group_failure_is_no_longer_a_node_field(self) -> None:
+        # Deleted (ADR-042): group-failure handling is structural. NodeSpec
+        # refuses the former field so a stale caller fails loudly.
+        with pytest.raises(TypeError):
+            _collector(scope_on_group_failure="quarantine")
 
     def test_scope_policy_is_never_defaulted(self) -> None:
         # ScopeSettings.policy is REQUIRED with no default (spec §3): Stage 1
@@ -213,11 +211,6 @@ class TestCollectorIntrinsics:
             _transform("finisher", "assembled", "out"),
         )
         assert not _errors_for(state, "collector_on_success_dangling")
-
-    def test_scope_on_group_failure_outside_vocabulary_is_rejected(self) -> None:
-        state = _state(_transform("explode", "rows", "pages"), _collector(scope_on_group_failure="explode_everything"))
-        [entry] = _errors_for(state, "collector_scope_on_group_failure_invalid")
-        assert "quarantine" in entry.message and "escalate" in entry.message
 
     def test_reserved_scope_name_is_rejected(self) -> None:
         state = _state(_transform("explode", "rows", "pages"), _collector(scope_name="continue"))
@@ -312,47 +305,6 @@ class TestCollectorScopeTopology:
         assert "duplicate_connection_producer" not in codes, summary.errors
         assert "transform_on_error_unknown_sink" not in codes, summary.errors
 
-    def test_escalate_with_no_other_barrier_is_rejected(self) -> None:
-        state = _state(
-            _transform("explode", "rows", "pages"),
-            _collector(scope_on_group_failure="escalate"),
-        )
-        [entry] = _errors_for(state, "scope_escalate_at_outermost")
-        # Task 10 N1 message shape: name the collector AND its opener, never
-        # "Scope '{collector}'".
-        assert "Scope closed by collector 'page_stitcher' (opener 'explode')" in entry.message
-
-    def test_escalate_with_another_barrier_present_is_accepted_for_stage_2(self) -> None:
-        # Stage 1 does not compute bound regions: with another barrier in the
-        # draft, membership needs the real builder — accepting is the safe
-        # drift direction (Stage 2 rejects a genuinely outermost escalate with
-        # the runtime message).
-        coalesce = NodeSpec(
-            id="join_rows",
-            node_type="coalesce",
-            plugin=None,
-            input="left",
-            on_success="out",
-            on_error=None,
-            options={},
-            condition=None,
-            routes=None,
-            fork_to=None,
-            branches=("left", "right"),
-            policy=None,
-            merge=None,
-        )
-        state = _state(
-            _transform("explode", "rows", "pages"),
-            _collector(scope_on_group_failure="escalate"),
-            coalesce,
-        )
-        assert not _errors_for(state, "scope_escalate_at_outermost")
-
-    def test_quarantine_never_fires_the_escalate_rule(self) -> None:
-        state = _state(_transform("explode", "rows", "pages"), _collector())
-        assert not _errors_for(state, "scope_escalate_at_outermost")
-
     def test_transform_on_error_may_name_a_collector_closer(self) -> None:
         # Spec §7 rule 9 relax now covers collector closers: the builder's
         # closer_name_to_node holds all three closer kinds.
@@ -425,7 +377,6 @@ scopes:
     opener: explode
     closer: page_stitcher
     policy: require_all
-    on_group_failure: quarantine
 sinks:
   out:
     plugin: json
@@ -447,13 +398,6 @@ class TestImporterAndGenerator:
         assert collector.scope_name == "document_pages"
         assert collector.scope_opener == "explode"
         assert collector.scope_policy == "require_all"
-        assert collector.scope_on_group_failure == "quarantine"
-
-    def test_import_defaults_omitted_on_group_failure_to_quarantine(self) -> None:
-        yaml_text = _ROUND_TRIP_YAML.replace("    on_group_failure: quarantine\n", "")
-        state = composition_state_from_runtime_yaml(yaml_text)
-        [collector] = [node for node in state.nodes if node.node_type == "collector"]
-        assert collector.scope_on_group_failure == "quarantine"
 
     def test_import_rejects_scope_with_unknown_closer(self) -> None:
         yaml_text = _ROUND_TRIP_YAML.replace("closer: page_stitcher", "closer: nobody")

@@ -139,9 +139,10 @@ jobs:
           docker run --rm --interactive --entrypoint python "$LEAN_IMAGE" - <<'PY'
           import psycopg
           import psycopg2
+          import pypdfium2
           from sqlalchemy import create_engine
 
-          del psycopg, psycopg2
+          del psycopg, psycopg2, pypdfium2
           for url, expected_driver in (
               ("postgresql://user:password@localhost/database", "psycopg2"),  # secret-scan: allow-this-line
               ("postgresql+psycopg://user:password@localhost/database", "psycopg"),

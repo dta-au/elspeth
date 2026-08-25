@@ -149,11 +149,12 @@ ids identify components; they are not implicit connections.
   aggregations) and carries its scope binding directly on the node:
   `scope_name` (the scope identifier), `scope_opener` (the node id of the
   multi-row transform that opens the group — it must name a transform in the
-  pipeline), `scope_policy` (`require_all` or `best_effort` — REQUIRED, no
-  default: the author decides whether a lost member fails the group), and
-  optional `scope_on_group_failure` (`quarantine`, the default terminal
-  handling, or `escalate`, which hands the loss to an enclosing bound group
-  and is rejected when provably none exists). One scope per collector and per
+  pipeline), and `scope_policy` (`require_all` or `best_effort` — REQUIRED,
+  no default: the author decides whether a lost member fails the group).
+  Group-failure handling is structural, not configured: a failed group
+  escalates its loss when an enclosing bound group exists and terminates
+  (quarantining the source row) when the scope is outermost — there is no
+  `on_group_failure` field. One scope per collector and per
   opener; `on_success` names the flush destination (a sink or a consumed
   connection); `on_error` is optional (`discard` or a sink name — omitted, the
   route derives from the scope's group machinery). Omit gate, coalesce, and
@@ -192,7 +193,7 @@ The terminal schema is authoritative. Its covered structural families are:
 | source | `plugin`, `blob_id`, `options`, `on_success`, `on_validation_failure`, `description`, `inline_blob` |
 | named_source | `plugin`, `options`, `on_success`, `on_validation_failure`, `description` |
 | inline_blob | `filename`, `mime_type`, `content`, `description` |
-| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds`, `description`, `scope_name`, `scope_opener`, `scope_policy`, `scope_on_group_failure` |
+| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds`, `description`, `scope_name`, `scope_opener`, `scope_policy` |
 | trigger | `count`, `timeout_seconds`, `condition` |
 | edge | `id`, `from_node`, `to_node`, `edge_type`, `label` |
 | output | `sink_name`, `plugin`, `options`, `on_write_failure`, `description` |

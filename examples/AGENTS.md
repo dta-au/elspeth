@@ -40,6 +40,7 @@ These run immediately with no setup:
 | `large_scale_test` | 10,000 | Performance test — committed `input.csv` is 10k rows (observed ~4 min locally); regenerate larger via `generate_data.py` (default 50k) |
 | `retention_purge` | 5 | Payload retention policy demo |
 | `blob_transforms` | 200 offline expansion rows | Run `./examples/blob_transforms/run.sh`; it packages local fixtures into the payload store before executing. The hosted HTML fetch is opt-in via `./examples/blob_transforms/run_hosted_fetch.sh`. |
+| `pdf_rasterize` | 2 (1 fails) | Run `./examples/pdf_rasterize/run.sh`; it stages two committed mock PDFs into the payload store before executing. Fixture ends PARTIAL/exit 1 with 1 malformed document quarantined by design (3 page rows still succeed) |
 | `schema_contracts_demo` | 5 | Schema validation contracts |
 | `threshold_gate` | 8 | Numeric threshold routing |
 
@@ -50,7 +51,7 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 
 ### Exit 0 is not the corpus gate
 
-Six shipped configs end non-zero **by design**. A runner that treats any
+Seven shipped configs end non-zero **by design**. A runner that treats any
 non-zero exit as failure will report phantom defects; encode the expected exit
 per config, not a blanket `-eq 0`:
 
@@ -58,12 +59,13 @@ per config, not a blanket `-eq 0`:
 |--------|------|-----|
 | `deep_routing/settings.yaml` | 1 | 2 blocked rows quarantined |
 | `error_routing/settings.yaml` | 1 | 4 blocked rows quarantined |
+| `pdf_rasterize/settings.yaml` | 1 | 1 malformed document quarantined |
 | `row_union_ab_experiment/settings_screened_at_settlement.yaml` | 1 | 3 tickets discarded mid-branch, orphaned treatment siblings fail closed |
 | `fork_coalesce/settings_union_fail.yaml` | non-zero | raising `CoalesceCollisionError` is the point of the variant |
 | `chaosweb/settings.yaml` | 1, stochastic | injected fetch faults route to `scrape_failures.csv` |
 | `chaosllm_endurance/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
 
-The first four are deterministic fixtures with fixed counts. The last two
+The first five are deterministic fixtures with fixed counts. The last two
 depend on randomly injected faults, so they may also exit 0 — for those the
 acceptance criterion is **conservation**, not the exit code: every source row
 reaches either the result sink or the error sink, with the failure reason
@@ -186,7 +188,7 @@ If a pipeline is interrupted, resume with the command shown in the output.
 
 | Example | Notes |
 |---------|-------|
-| `textract_inline` | Copy JPEG/PNG/single-page PDF files into `input/`, run `python examples/textract_inline/scripts/prepare_document_blobs.py` (stages blobs, writes `settings.generated.yaml`), then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute`. Each row is one billable `AnalyzeDocument` call. |
+| `textract_inline` | Copy JPEG/PNG/single-page PDF files into `input/`, run `python examples/textract_inline/scripts/prepare_document_blobs.py` (stages blobs, writes `settings.generated.yaml`), then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute`. Each row is one billable `AnalyzeDocument` call. A multipage PDF is not accepted by the prepare script — rasterize it into per-page PNGs with `pdf_rasterize` first. |
 
 ### Not a runnable pipeline
 

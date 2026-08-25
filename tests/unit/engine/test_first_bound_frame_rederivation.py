@@ -43,7 +43,6 @@ def _registry(*, closer_node: NodeID = COLLECTOR) -> GroupBindingRegistry:
                 closer_name="stitch",
                 closer_kind=CloserKind.COLLECTOR,
                 policy="require_all",
-                on_group_failure=None,
                 member_roster=(),
             ),
             GroupBinding(
@@ -54,7 +53,6 @@ def _registry(*, closer_node: NodeID = COLLECTOR) -> GroupBindingRegistry:
                 closer_name="other_stitch",
                 closer_kind=CloserKind.COLLECTOR,
                 policy="require_all",
-                on_group_failure=None,
                 member_roster=(),
             ),
         )

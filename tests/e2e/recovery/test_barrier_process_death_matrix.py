@@ -456,7 +456,7 @@ def _exercise_row_union(tmp_path: Path) -> LandscapeDB:
 # ===== Collector family (integration phase 1b, META-6.1: authored by integration) =====
 #
 # Seven scenarios over ONE declared scope (opener ``explode`` -> collector
-# ``stitch``, require_all, on_group_failure quarantine) with a two-member
+# ``stitch``, require_all, outermost so group failure is terminal) with a two-member
 # expansion. Each scenario's crashed/handed-off image is asserted by durable
 # PRECONDITIONS (exact rows at that instant) before the second process runs.
 #
@@ -527,7 +527,6 @@ _EXPAND_BINDING = GroupBinding(
     closer_name=str(_COLLECTOR),
     closer_kind=CloserKind.COLLECTOR,
     policy="require_all",
-    on_group_failure="quarantine",
     member_roster=(),
 )
 _FORK_BINDING = GroupBinding(
@@ -538,7 +537,6 @@ _FORK_BINDING = GroupBinding(
     closer_name=str(_MERGE),
     closer_kind=CloserKind.COALESCE,
     policy="require_all",
-    on_group_failure=None,
     member_roster=("a", "b"),
 )
 

@@ -933,6 +933,7 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `aws_bedrock_prompt_shield` | Detect prompt attacks through Bedrock Guardrails |
 | `aws_textract_document_analysis` | Extract text, tables, forms, and layout from S3-hosted documents through Amazon Textract |
 | `aws_textract_inline_analysis` | Synchronously analyze payload-store documents (managed blobs) through Amazon Textract `AnalyzeDocument` |
+| `pdf_rasterize` | Render each page of a payload-store PDF into a PNG payload, one output row per page — the on-ramp for multipage PDFs into `aws_textract_inline_analysis` |
 | `rag_retrieval` | Enriches rows with retrieval-augmented context from search providers |
 
 ### AWS Bedrock LLM

@@ -95,7 +95,6 @@ class _UpsertNodeArgumentsModel(BaseModel):
     scope_name: str | None = None
     scope_opener: str | None = None
     scope_policy: str | None = None
-    scope_on_group_failure: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -321,13 +320,6 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
                 "decides whether a lost member fails the group."
             ),
         },
-        "scope_on_group_failure": {
-            "type": ["string", "null"],
-            "enum": ["quarantine", "escalate", None],
-            "description": (
-                "require_all failure handling (collector only). Defaults to 'quarantine'; 'escalate' requires an enclosing bound group."
-            ),
-        },
     },
     "required": ["id", "node_type", "input"],
     "additionalProperties": False,
@@ -388,8 +380,7 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "because the queue is declared. "
         "collector closes a declared EXPAND scope with a batch-aware plugin: "
         "set scope_name, scope_opener (the multi-row transform that opens the "
-        "group), scope_policy ('require_all' or 'best_effort', no default), and "
-        "optionally scope_on_group_failure ('quarantine' default, or 'escalate'). "
+        "group), and scope_policy ('require_all' or 'best_effort', no default). "
         "Omit fields that don't apply to your node_type."
     ),
     json_schema=_UPSERT_NODE_DECLARATION_JSON_SCHEMA,
@@ -715,7 +706,6 @@ def _execute_upsert_node(
         scope_name=validated.scope_name,
         scope_opener=validated.scope_opener,
         scope_policy=validated.scope_policy,
-        scope_on_group_failure=validated.scope_on_group_failure,
     )
 
     row_union_contract_error = _row_union_node_contract_error(

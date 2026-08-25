@@ -171,8 +171,8 @@ def _collector_node(**overrides: Any) -> dict[str, Any]:
         ),
         pytest.param(
             [_collector_node()],
-            "03e7cc638ec451ad6f2f0053c8c22acd714700621f22bd029e6e84e3497daa94",
-            id="collector_without_on_group_failure",
+            "6cf8e9ffd32c44bb7ca2702865a1c89d5ae680469a06f47ed3f21d01821e2949",
+            id="collector_with_scope_binding",
         ),
     ],
 )
@@ -204,16 +204,16 @@ def test_collector_scope_fields_round_trip_and_omit_when_none() -> None:
     assert collector_dict["scope_name"] == "document_pages"
     assert collector_dict["scope_opener"] == "explode"
     assert collector_dict["scope_policy"] == "require_all"
-    # __post_init__ RECORDS the runtime default (ScopeSettings.on_group_failure
-    # = "quarantine"), exactly like the coalesce merge/policy normalisation.
-    assert collector_dict["scope_on_group_failure"] == "quarantine"
+    # The former scope_on_group_failure field is deleted (ADR-042): a
+    # serialised collector must not resurrect it.
+    assert "scope_on_group_failure" not in collector_dict
     # scope_policy is REQUIRED with no default: absent stays absent (None), so
     # a collector authored without it must serialise WITHOUT the key.
     sparse = CompositionState.from_dict(_state_payload([_collector_node(scope_policy=None)]))
     sparse_dict = next(n for n in sparse.to_dict()["nodes"] if n["id"] == "page_stitcher")
     assert "scope_policy" not in sparse_dict
 
-    for key in ("scope_name", "scope_opener", "scope_policy", "scope_on_group_failure"):
+    for key in ("scope_name", "scope_opener", "scope_policy"):
         assert key not in coalesce_dict
 
     assert CompositionState.from_dict(serialized) == state

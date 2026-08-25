@@ -232,7 +232,6 @@ class TestCollectorNode:
             "name": "document_pages",
             "opener": "explode",
             "policy": "require_all",
-            "on_group_failure": "quarantine",
         }
 
     def test_collector_requires_batch_aware_plugin(self) -> None:
