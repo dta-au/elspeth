@@ -25,6 +25,7 @@ from elspeth.web.composer.guided.chat_solver import (
     Step1SourceChatResolution,
     resolved_sink_config_error,
 )
+from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction
 from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, Turn, TurnType, validate_current_turn
@@ -128,7 +129,7 @@ from .guided_chat_intent_management import (
     apply_deferred_clarification,
     apply_deferred_request,
     deferred_request_management,
-    deferred_request_retained_intent_id,
+    deferred_request_retained_intent_ids,
     maybe_prepare_schema8_management_rewind,
 )
 
@@ -1154,7 +1155,7 @@ async def post_guided_chat_schema8(
                         source_resolution = None
                         source_plugin_reselection = None
                         sink_resolution = None
-                        deferred_action = None
+                        deferred_actions: tuple[DeferredIntentAction, ...] = ()
                         deferred_management_action = None
                         deferred_clarification = False
                         deferred_paired_resolution = False
@@ -1181,7 +1182,7 @@ async def post_guided_chat_schema8(
                         source_resolution = None
                         source_plugin_reselection = None
                         sink_resolution = None
-                        deferred_action = None
+                        deferred_actions = ()
                         deferred_management_action = None
                         deferred_clarification = False
                         deferred_paired_resolution = False
@@ -1229,23 +1230,24 @@ async def post_guided_chat_schema8(
                         )
                         sink_resolution = provider_outcome.sink if type(provider_outcome) is Step2SinkResolvedResult else None
                         if type(provider_outcome) is GuidedStepDeferredIntentResult:
-                            deferred_action = provider_outcome.action
+                            deferred_actions = provider_outcome.actions
                         elif type(provider_outcome) is GuidedStepDeferredIntentWithheldResolutionResult:
-                            # Retain-alone: the pair's resolution half was
+                            # Retains-alone: the group's resolution half was
                             # withheld; its chat carries the scoped not-applied
                             # failure and composes with the disposition below,
                             # exactly like the F1 contract.
-                            deferred_action = provider_outcome.action
+                            deferred_actions = provider_outcome.actions
                         elif type(provider_outcome) is Step1SourceResolvedResult:
-                            # A resolve+retain PAIR: the resolution applies at
-                            # this stage AND the future-stage instruction is
-                            # retained in the same settlement (R2-F15).
-                            deferred_action = provider_outcome.deferred_action
+                            # A resolve+retain GROUP: the resolution applies at
+                            # this stage AND every future-stage instruction is
+                            # retained in the same settlement (R2-F15,
+                            # generalized by elspeth-3a21f09f09).
+                            deferred_actions = provider_outcome.deferred_actions
                         elif type(provider_outcome) is Step2SinkResolvedResult:
-                            deferred_action = provider_outcome.deferred_action
+                            deferred_actions = provider_outcome.deferred_actions
                         else:
-                            deferred_action = None
-                        deferred_paired_resolution = deferred_action is not None and (
+                            deferred_actions = ()
+                        deferred_paired_resolution = bool(deferred_actions) and (
                             type(provider_outcome) is Step1SourceResolvedResult
                             or type(provider_outcome) is Step2SinkResolvedResult
                             or type(provider_outcome) is GuidedStepDeferredIntentWithheldResolutionResult
@@ -1335,7 +1337,9 @@ async def post_guided_chat_schema8(
                         guided=prospective,
                         catalog=catalog,
                         originating_message=originating_message,
-                        new_intent_id=uuid4(),
+                        # One id per action; at least one so the clarification
+                        # degrade path always has an id to append under.
+                        new_intent_ids=tuple(uuid4() for _ in range(max(1, len(deferred_actions)))),
                     )
                     deferred: DeferredRequestApplication
                     if deferred_clarification:
@@ -1350,7 +1354,7 @@ async def post_guided_chat_schema8(
                         )
                     else:
                         deferred = apply_deferred_request(
-                            deferred_action,
+                            deferred_actions,
                             deferred_management_action,
                             authority=deferred_authority,
                             chat=chat_result,
@@ -1375,7 +1379,7 @@ async def post_guided_chat_schema8(
                                 latency_ms=deferred.chat.latency_ms,
                                 error_class=paired_resolution_chat.error_class,
                             )
-                    retained_intent_id = deferred_request_retained_intent_id(deferred)
+                    retained_intent_ids = deferred_request_retained_intent_ids(deferred)
                     management = deferred_request_management(deferred)
                     settled_management_action = management.action if management is not None else None
                     cancelled_intent = management.effective_intent if type(management) is DeferredRequestCancelled else None
@@ -1918,7 +1922,7 @@ async def post_guided_chat_schema8(
                             payloads=tuple(prepared_payloads),
                             audit_evidence=evidence,
                             originating_message=originating_message,
-                            retained_deferred_intent_id=retained_intent_id,
+                            retained_deferred_intent_ids=retained_intent_ids,
                             deferred_intent_action=settled_management_action,
                             invalidated_pending_proposal=invalidated_pending_proposal,
                         ),

@@ -145,13 +145,15 @@ class GuidedStepDeferredClarificationResult:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuidedStepDeferredIntentResult:
     chat: StepChatResult
-    action: DeferredIntentAction
+    # One action per retain_deferred_intent call in the reply, in call order
+    # (elspeth-3a21f09f09).
+    actions: tuple[DeferredIntentAction, ...]
 
     def __post_init__(self) -> None:
         if type(self.chat) is not StepChatResult:
             raise TypeError("GuidedStepDeferredIntentResult.chat must be exact")
-        if type(self.action) is not DeferredIntentAction:
-            raise TypeError("GuidedStepDeferredIntentResult.action must be exact")
+        if type(self.actions) is not tuple or not self.actions or any(type(action) is not DeferredIntentAction for action in self.actions):
+            raise TypeError("GuidedStepDeferredIntentResult.actions must be a non-empty tuple of exact actions")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -165,15 +167,15 @@ class GuidedStepDeferredIntentWithheldResolutionResult:
     """
 
     chat: StepChatResult
-    action: DeferredIntentAction
+    actions: tuple[DeferredIntentAction, ...]
 
     def __post_init__(self) -> None:
         if type(self.chat) is not StepChatResult:
             raise TypeError("GuidedStepDeferredIntentWithheldResolutionResult.chat must be exact")
         if self.chat.status is not ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE or self.chat.error_class is None:
             raise TypeError("GuidedStepDeferredIntentWithheldResolutionResult.chat must carry the scoped not-applied failure")
-        if type(self.action) is not DeferredIntentAction:
-            raise TypeError("GuidedStepDeferredIntentWithheldResolutionResult.action must be exact")
+        if type(self.actions) is not tuple or not self.actions or any(type(action) is not DeferredIntentAction for action in self.actions):
+            raise TypeError("GuidedStepDeferredIntentWithheldResolutionResult.actions must be a non-empty tuple of exact actions")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -192,17 +194,18 @@ class GuidedStepDeferredManagementResult:
 class Step1SourceResolvedResult:
     chat: StepChatResult
     resolution: Step1SourceChatResolution
-    # Set when the reply PAIRED resolve_source with retain_deferred_intent
-    # (elspeth-a96b2f1b0a / R2-F15): both halves apply in the same settlement.
-    deferred_action: DeferredIntentAction | None
+    # Set when the reply GROUPED resolve_source with retain_deferred_intent
+    # calls (elspeth-a96b2f1b0a / R2-F15, generalized by elspeth-3a21f09f09):
+    # every half applies in the same settlement.
+    deferred_actions: tuple[DeferredIntentAction, ...]
 
     def __post_init__(self) -> None:
         if type(self.chat) is not StepChatResult:
             raise TypeError("Step1SourceResolvedResult.chat must be exact")
         if type(self.resolution) is not Step1SourceChatResolution:
             raise TypeError("Step1SourceResolvedResult.resolution must be exact")
-        if self.deferred_action is not None and type(self.deferred_action) is not DeferredIntentAction:
-            raise TypeError("Step1SourceResolvedResult.deferred_action must be exact or None")
+        if type(self.deferred_actions) is not tuple or any(type(action) is not DeferredIntentAction for action in self.deferred_actions):
+            raise TypeError("Step1SourceResolvedResult.deferred_actions must be a tuple of exact actions")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -221,17 +224,18 @@ class Step1SourcePluginReselectedResult:
 class Step2SinkResolvedResult:
     chat: StepChatResult
     sink: SinkResolved
-    # Set when the reply PAIRED resolve_sink with retain_deferred_intent
-    # (elspeth-a96b2f1b0a / R2-F15): both halves apply in the same settlement.
-    deferred_action: DeferredIntentAction | None
+    # Set when the reply GROUPED resolve_sink with retain_deferred_intent
+    # calls (elspeth-a96b2f1b0a / R2-F15, generalized by elspeth-3a21f09f09):
+    # every half applies in the same settlement.
+    deferred_actions: tuple[DeferredIntentAction, ...]
 
     def __post_init__(self) -> None:
         if type(self.chat) is not StepChatResult:
             raise TypeError("Step2SinkResolvedResult.chat must be exact")
         if type(self.sink) is not SinkResolved:
             raise TypeError("Step2SinkResolvedResult.sink must be exact")
-        if self.deferred_action is not None and type(self.deferred_action) is not DeferredIntentAction:
-            raise TypeError("Step2SinkResolvedResult.deferred_action must be exact or None")
+        if type(self.deferred_actions) is not tuple or any(type(action) is not DeferredIntentAction for action in self.deferred_actions):
+            raise TypeError("Step2SinkResolvedResult.deferred_actions must be a tuple of exact actions")
 
 
 type Step1SourceChatResult = (
@@ -509,7 +513,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
                     error_class=None,
                 ),
                 resolution=outcome.resolution,
-                deferred_action=outcome.deferred_action,
+                deferred_actions=outcome.deferred_actions,
             )
         if type(outcome) is Step1SourcePluginReselectedOutcome:
             return Step1SourcePluginReselectedResult(
@@ -524,12 +528,16 @@ async def resolve_step_1_source_chat_with_auto_drop(
         if type(outcome) is GuidedChatDeferredIntentOutcome:
             return GuidedStepDeferredIntentResult(
                 chat=StepChatResult(
-                    assistant_message="I found a future-stage instruction and will validate it before retaining it.",
+                    assistant_message=(
+                        "I found a future-stage instruction and will validate it before retaining it."
+                        if len(outcome.actions) == 1
+                        else f"I found {len(outcome.actions)} future-stage instructions and will validate each before retaining it."
+                    ),
                     status=ComposerChatTurnStatus.SUCCESS,
                     latency_ms=latency_ms,
                     error_class=None,
                 ),
-                action=outcome.action,
+                actions=outcome.actions,
             )
         if type(outcome) is GuidedChatDeferredIntentWithheldResolutionOutcome:
             return GuidedStepDeferredIntentWithheldResolutionResult(
@@ -539,7 +547,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
                     latency_ms=latency_ms,
                     error_class=outcome.resolution_error_class,
                 ),
-                action=outcome.action,
+                actions=outcome.actions,
             )
         if type(outcome) is GuidedChatDeferredManagementOutcome:
             return GuidedStepDeferredManagementResult(
@@ -765,17 +773,21 @@ async def resolve_step_2_sink_chat_with_auto_drop(
                     error_class=None,
                 ),
                 sink=outcome.sink,
-                deferred_action=outcome.deferred_action,
+                deferred_actions=outcome.deferred_actions,
             )
         if type(outcome) is GuidedChatDeferredIntentOutcome:
             return GuidedStepDeferredIntentResult(
                 chat=StepChatResult(
-                    assistant_message="I found a future-stage instruction and will validate it before retaining it.",
+                    assistant_message=(
+                        "I found a future-stage instruction and will validate it before retaining it."
+                        if len(outcome.actions) == 1
+                        else f"I found {len(outcome.actions)} future-stage instructions and will validate each before retaining it."
+                    ),
                     status=ComposerChatTurnStatus.SUCCESS,
                     latency_ms=latency_ms,
                     error_class=None,
                 ),
-                action=outcome.action,
+                actions=outcome.actions,
             )
         if type(outcome) is GuidedChatDeferredIntentWithheldResolutionOutcome:
             return GuidedStepDeferredIntentWithheldResolutionResult(
@@ -785,7 +797,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
                     latency_ms=latency_ms,
                     error_class=outcome.resolution_error_class,
                 ),
-                action=outcome.action,
+                actions=outcome.actions,
             )
         if type(outcome) is GuidedChatDeferredManagementOutcome:
             return GuidedStepDeferredManagementResult(

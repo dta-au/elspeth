@@ -105,13 +105,22 @@ class DeferredRequestUnchanged:
 class DeferredRequestRetained:
     guided: GuidedSession
     chat: StepChatResult
-    retained_intent_id: UUID
+    # One id per intent appended by this request, in append order
+    # (elspeth-3a21f09f09: a message naming N future stages appends up to N).
+    retained_intent_ids: tuple[UUID, ...]
 
     def __post_init__(self) -> None:
-        if type(self.retained_intent_id) is not UUID:
-            raise TypeError("DeferredRequestRetained.retained_intent_id must be an exact UUID")
-        if not any(intent.intent_id == str(self.retained_intent_id) for intent in self.guided.deferred_intents):
-            raise AuditIntegrityError("retained deferred request lost its exact stable intent")
+        if (
+            type(self.retained_intent_ids) is not tuple
+            or not self.retained_intent_ids
+            or any(type(intent_id) is not UUID for intent_id in self.retained_intent_ids)
+        ):
+            raise TypeError("DeferredRequestRetained.retained_intent_ids must be a non-empty tuple of exact UUIDs")
+        if len(set(self.retained_intent_ids)) != len(self.retained_intent_ids):
+            raise AuditIntegrityError("retained deferred request repeats a stable intent id")
+        present = {intent.intent_id for intent in self.guided.deferred_intents}
+        if any(str(intent_id) not in present for intent_id in self.retained_intent_ids):
+            raise AuditIntegrityError("retained deferred request lost an exact stable intent")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -170,12 +179,26 @@ def _validate_managed_request_checkpoint(request: DeferredRequestManaged) -> Non
 
 @dataclass(frozen=True, slots=True)
 class DeferredRequestAuthority:
-    """Stable authority needed to retain or manage one deferred request."""
+    """Stable authority needed to retain or manage one deferred request.
+
+    ``new_intent_ids`` is minted one-per-action by the route (at least one, so
+    the clarification degrade path always has an id); actions whose
+    disposition appends nothing simply leave their id unused.
+    """
 
     guided: GuidedSession
     catalog: PolicyCatalogView
     originating_message: GuidedOriginatingUserMessageDraft
-    new_intent_id: UUID
+    new_intent_ids: tuple[UUID, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.new_intent_ids) is not tuple
+            or not self.new_intent_ids
+            or any(type(intent_id) is not UUID for intent_id in self.new_intent_ids)
+            or len(set(self.new_intent_ids)) != len(self.new_intent_ids)
+        ):
+            raise TypeError("DeferredRequestAuthority.new_intent_ids must be a non-empty tuple of distinct exact UUIDs")
 
 
 def _guided_stage_name(step: GuidedStep) -> StageName:
@@ -462,100 +485,175 @@ def _apply_deferred_management(
     return DeferredRequestUnchanged(guided=guided, chat=rejected_chat)
 
 
+def _append_clarification_intent(
+    guided: GuidedSession,
+    *,
+    intent_id: UUID,
+    originating_message: GuidedOriginatingUserMessageDraft,
+) -> GuidedSession:
+    retained = create_deferred_clarification_intent(
+        receiving_stage=_guided_stage_name(guided.step),
+        intent_id=str(intent_id),
+        originating_message_id=str(originating_message.message_id),
+        originating_message_content=originating_message.content,
+    )
+    return replace(guided, deferred_intents=(*guided.deferred_intents, retained))
+
+
+def _apply_one_deferred_action(
+    action: DeferredIntentAction,
+    *,
+    guided: GuidedSession,
+    catalog: PolicyCatalogView,
+    originating_message: GuidedOriginatingUserMessageDraft,
+    intent_id: UUID,
+    latency_ms: int,
+) -> tuple[GuidedSession, StepChatResult, UUID | None]:
+    """Apply ONE action's disposition against the evolving guided state.
+
+    Returns the (possibly appended-to) guided state, the disposition chat, and
+    the appended intent id (``None`` when the disposition appends nothing).
+    Each action keeps the exact per-action disposition machinery the singular
+    path had; the fold in :func:`apply_deferred_request` composes them
+    (elspeth-3a21f09f09).
+    """
+    structural_rejection = validate_deferred_intent_structure(
+        action,
+        receiving_stage=_guided_stage_name(guided.step),
+    )
+    if structural_rejection is not None:
+        if structural_rejection.reason == "wrong_responsible_stage":
+            # The action claims a later target, so it IS a future-stage
+            # instruction whose encoding the server cannot verify — the
+            # R2-F15 retention net keeps it as clarification debt. The
+            # structural diagnostic still wins over the catalog-identity
+            # copy (precedence).
+            return (
+                _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
+                _retained_unverified_chat(structural_rejection, latency_ms=latency_ms),
+                intent_id,
+            )
+        # target_not_later: by its own claim this is not a future-stage
+        # instruction — the current-stage flow owns the content, so
+        # retaining it would mint spurious wire-blocking debt.
+        return (
+            guided,
+            _deferred_disposition_chat(structural_rejection, catalog=catalog, latency_ms=latency_ms),
+            None,
+        )
+    if _has_unmentioned_unavailable_action_identity(
+        action,
+        catalog=catalog,
+        originating_message_content=originating_message.content,
+    ):
+        return (
+            _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
+            _model_catalog_identity_chat(user_message=originating_message.content, latency_ms=latency_ms),
+            intent_id,
+        )
+    disposition = validate_deferred_intent_action(
+        action,
+        receiving_stage=_guided_stage_name(guided.step),
+        catalog=catalog,
+        guided=guided,
+        originating_message_content=originating_message.content,
+    )
+    if type(disposition) is DeferredIntentRejected and disposition.reason == "constraint_contradiction":
+        # ADR-033 rejection path: a contradiction rejection routes through
+        # the R2-F15 retention net — the instruction is kept as
+        # clarification debt, never silently dropped — and the chat names
+        # the exact conflicting retained intent with edit/cancel recourse.
+        return (
+            _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
+            _contradiction_chat(disposition, latency_ms=latency_ms, retained=True),
+            intent_id,
+        )
+    if type(disposition) in {DeferredIntentClarification, DeferredIntentRejected}:
+        # Every remaining unverified disposition retains the instruction as
+        # clarification debt (R2-F15): the constraint-free intent carries a
+        # content hash and closed summary only, so no unproven fact, option
+        # literal, or mis-kinded identity persists.
+        return (
+            _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
+            _retained_unverified_chat(
+                cast(DeferredIntentClarification | DeferredIntentRejected, disposition),
+                latency_ms=latency_ms,
+            ),
+            intent_id,
+        )
+    resolved_chat = _deferred_disposition_chat(disposition, catalog=catalog, latency_ms=latency_ms)
+    if type(disposition) is not DeferredIntentAccepted:
+        # DeferredIntentUnsupported: an unavailable plugin remains a
+        # distinct catalog/availability error, never clarification debt
+        # (the user manual's explicit carve-out).
+        return guided, resolved_chat, None
+    retained = create_deferred_stage_intent(
+        disposition.action,
+        receiving_stage=_guided_stage_name(guided.step),
+        intent_id=str(intent_id),
+        originating_message_id=str(originating_message.message_id),
+        originating_message_content=originating_message.content,
+        guided=guided,
+    )
+    return (
+        replace(guided, deferred_intents=(*guided.deferred_intents, retained)),
+        resolved_chat,
+        intent_id,
+    )
+
+
+def _compose_disposition_chats(chats: tuple[StepChatResult, ...]) -> StepChatResult:
+    """Compose N per-action disposition chats into the turn's one chat.
+
+    Messages join in action order; the FIRST non-success disposition supplies
+    the composed status and error_class so the transcript and audit keep the
+    not-applied signal (the F1 honesty contract) even when a sibling action
+    succeeded in the same Send.
+    """
+    if len(chats) == 1:
+        return chats[0]
+    failed = next((candidate for candidate in chats if candidate.status is not ComposerChatTurnStatus.SUCCESS), None)
+    return StepChatResult(
+        assistant_message=" ".join(candidate.assistant_message for candidate in chats),
+        status=chats[0].status if failed is None else failed.status,
+        latency_ms=chats[0].latency_ms,
+        error_class=None if failed is None else failed.error_class,
+    )
+
+
 def apply_deferred_request(
-    deferred_action: DeferredIntentAction | None,
+    deferred_actions: tuple[DeferredIntentAction, ...],
     management_action: DeferredIntentManagementAction | None,
     *,
     authority: DeferredRequestAuthority,
     chat: StepChatResult,
 ) -> DeferredRequestApplication:
-    if deferred_action is not None:
-        structural_rejection = validate_deferred_intent_structure(
-            deferred_action,
-            receiving_stage=_guided_stage_name(authority.guided.step),
-        )
-        if structural_rejection is not None:
-            if structural_rejection.reason == "wrong_responsible_stage":
-                # The action claims a later target, so it IS a future-stage
-                # instruction whose encoding the server cannot verify — the
-                # R2-F15 retention net keeps it as clarification debt. The
-                # structural diagnostic still wins over the catalog-identity
-                # copy (precedence).
-                return apply_deferred_clarification(
-                    authority=authority,
-                    chat=_retained_unverified_chat(structural_rejection, latency_ms=chat.latency_ms),
-                )
-            # target_not_later: by its own claim this is not a future-stage
-            # instruction — the current-stage flow owns the content, so
-            # retaining it would mint spurious wire-blocking debt.
-            return DeferredRequestUnchanged(
-                guided=authority.guided,
-                chat=_deferred_disposition_chat(
-                    structural_rejection,
-                    catalog=authority.catalog,
-                    latency_ms=chat.latency_ms,
-                ),
+    if deferred_actions:
+        if len(authority.new_intent_ids) < len(deferred_actions):
+            raise AuditIntegrityError("deferred request authority minted fewer intent ids than actions")
+        guided = authority.guided
+        disposition_chats: list[StepChatResult] = []
+        retained_intent_ids: list[UUID] = []
+        for action, intent_id in zip(deferred_actions, authority.new_intent_ids, strict=False):
+            guided, action_chat, appended_id = _apply_one_deferred_action(
+                action,
+                guided=guided,
+                catalog=authority.catalog,
+                originating_message=authority.originating_message,
+                intent_id=intent_id,
+                latency_ms=chat.latency_ms,
             )
-        if _has_unmentioned_unavailable_action_identity(
-            deferred_action,
-            catalog=authority.catalog,
-            originating_message_content=authority.originating_message.content,
-        ):
-            return apply_deferred_clarification(
-                authority=authority,
-                chat=_model_catalog_identity_chat(
-                    user_message=authority.originating_message.content,
-                    latency_ms=chat.latency_ms,
-                ),
+            disposition_chats.append(action_chat)
+            if appended_id is not None:
+                retained_intent_ids.append(appended_id)
+        composed_chat = _compose_disposition_chats(tuple(disposition_chats))
+        if retained_intent_ids:
+            return DeferredRequestRetained(
+                guided=guided,
+                chat=composed_chat,
+                retained_intent_ids=tuple(retained_intent_ids),
             )
-        disposition = validate_deferred_intent_action(
-            deferred_action,
-            receiving_stage=_guided_stage_name(authority.guided.step),
-            catalog=authority.catalog,
-            guided=authority.guided,
-            originating_message_content=authority.originating_message.content,
-        )
-        if type(disposition) is DeferredIntentRejected and disposition.reason == "constraint_contradiction":
-            # ADR-033 rejection path: a contradiction rejection routes through
-            # the R2-F15 retention net — the instruction is kept as
-            # clarification debt, never silently dropped — and the chat names
-            # the exact conflicting retained intent with edit/cancel recourse.
-            return apply_deferred_clarification(
-                authority=authority,
-                chat=_contradiction_chat(disposition, latency_ms=chat.latency_ms, retained=True),
-            )
-        if type(disposition) in {DeferredIntentClarification, DeferredIntentRejected}:
-            # Every remaining unverified disposition retains the instruction as
-            # clarification debt (R2-F15): the constraint-free intent carries a
-            # content hash and closed summary only, so no unproven fact, option
-            # literal, or mis-kinded identity persists.
-            return apply_deferred_clarification(
-                authority=authority,
-                chat=_retained_unverified_chat(
-                    cast(DeferredIntentClarification | DeferredIntentRejected, disposition),
-                    latency_ms=chat.latency_ms,
-                ),
-            )
-        resolved_chat = _deferred_disposition_chat(disposition, catalog=authority.catalog, latency_ms=chat.latency_ms)
-        if type(disposition) is not DeferredIntentAccepted:
-            # DeferredIntentUnsupported: an unavailable plugin remains a
-            # distinct catalog/availability error, never clarification debt
-            # (the user manual's explicit carve-out).
-            return DeferredRequestUnchanged(guided=authority.guided, chat=resolved_chat)
-        retained = create_deferred_stage_intent(
-            disposition.action,
-            receiving_stage=_guided_stage_name(authority.guided.step),
-            intent_id=str(authority.new_intent_id),
-            originating_message_id=str(authority.originating_message.message_id),
-            originating_message_content=authority.originating_message.content,
-            guided=authority.guided,
-        )
-        prospective = replace(authority.guided, deferred_intents=(*authority.guided.deferred_intents, retained))
-        return DeferredRequestRetained(
-            guided=prospective,
-            chat=resolved_chat,
-            retained_intent_id=authority.new_intent_id,
-        )
+        return DeferredRequestUnchanged(guided=guided, chat=composed_chat)
     if management_action is not None:
         return _apply_deferred_management(
             management_action,
@@ -572,36 +670,35 @@ def apply_deferred_clarification(
     authority: DeferredRequestAuthority,
     chat: StepChatResult,
 ) -> DeferredRequestRetained:
-    """Append the constraint-free clarification intent for one failed retain.
+    """Append the constraint-free clarification intent for one failed Send.
 
-    Last-resort retention (R2-F15): the Send carried a future-stage
-    instruction whose encoding could not be verified — the model failed to
-    express it as a well-formed action even after its bounded repair turn, or
-    the action it produced was rejected by settlement validation. The
-    instruction is kept as a clarification intent bound to the private
+    Last-resort retention (R2-F15): the Send carried future-stage
+    instructions whose encoding could not be verified — the model failed to
+    express them as well-formed actions even after its bounded repair turn, or
+    the action it produced was rejected by settlement validation. The whole
+    message is kept as ONE clarification intent bound to the private
     originating message; the settlement command carries
-    ``retained_deferred_intent_id`` exactly like an ordinary retain, so
+    ``retained_deferred_intent_ids`` exactly like an ordinary retain, so
     ``_verify_guided_deferred_intent_append`` verifies the append and message
     binding unchanged.
     """
-    retained = create_deferred_clarification_intent(
-        receiving_stage=_guided_stage_name(authority.guided.step),
-        intent_id=str(authority.new_intent_id),
-        originating_message_id=str(authority.originating_message.message_id),
-        originating_message_content=authority.originating_message.content,
+    intent_id = authority.new_intent_ids[0]
+    prospective = _append_clarification_intent(
+        authority.guided,
+        intent_id=intent_id,
+        originating_message=authority.originating_message,
     )
-    prospective = replace(authority.guided, deferred_intents=(*authority.guided.deferred_intents, retained))
     return DeferredRequestRetained(
         guided=prospective,
         chat=chat,
-        retained_intent_id=authority.new_intent_id,
+        retained_intent_ids=(intent_id,),
     )
 
 
-def deferred_request_retained_intent_id(application: DeferredRequestApplication) -> UUID | None:
+def deferred_request_retained_intent_ids(application: DeferredRequestApplication) -> tuple[UUID, ...]:
     if type(application) is DeferredRequestRetained:
-        return application.retained_intent_id
-    return None
+        return application.retained_intent_ids
+    return ()
 
 
 def deferred_request_management(application: DeferredRequestApplication) -> DeferredRequestManaged | None:
@@ -714,6 +811,6 @@ __all__ = [
     "apply_deferred_clarification",
     "apply_deferred_request",
     "deferred_request_management",
-    "deferred_request_retained_intent_id",
+    "deferred_request_retained_intent_ids",
     "maybe_prepare_schema8_management_rewind",
 ]

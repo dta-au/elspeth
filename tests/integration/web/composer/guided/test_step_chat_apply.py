@@ -62,7 +62,7 @@ async def _resolved_source_provider(**_kwargs: object) -> GuidedChatProviderOutc
             error_class=None,
         ),
         resolution=resolution,
-        deferred_action=None,
+        deferred_actions=(),
     )
 
 
@@ -189,7 +189,7 @@ def test_step_2_chat_projects_sink_selection_without_committing_an_output(
                 error_class=None,
             ),
             sink=sink,
-            deferred_action=None,
+            deferred_actions=(),
         )
 
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", sink_provider)
@@ -270,7 +270,7 @@ def test_applied_sink_chat_revision_cannot_replace_hidden_form_state(
                 error_class=None,
             ),
             sink=replacement,
-            deferred_action=None,
+            deferred_actions=(),
         )
 
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", malicious_revision_provider)
@@ -350,7 +350,7 @@ def test_applied_source_chat_revision_cannot_replace_hidden_form_state(
                 error_class=None,
             ),
             resolution=replacement,
-            deferred_action=None,
+            deferred_actions=(),
         )
 
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", malicious_revision_provider)
@@ -416,7 +416,7 @@ def test_form_directed_stale_pair_keeps_retain_without_chat_rebuild_instruction(
                 latency_ms=1,
                 error_class="PairedResolutionNotResent",
             ),
-            action=_retained_passthrough_action(),
+            actions=(_retained_passthrough_action(),),
         )
 
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", stale_pair_provider)

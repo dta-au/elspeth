@@ -266,10 +266,10 @@ def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_un
     ("variant", "required_fields"),
     [
         pytest.param(chat_solver.GuidedChatProseOutcome, {"assistant_message"}, id="GuidedChatProseOutcome"),
-        pytest.param(chat_solver.GuidedChatDeferredIntentOutcome, {"action"}, id="GuidedChatDeferredIntentOutcome"),
+        pytest.param(chat_solver.GuidedChatDeferredIntentOutcome, {"actions"}, id="GuidedChatDeferredIntentOutcome"),
         pytest.param(
             chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome,
-            {"action", "resolution_error_class"},
+            {"actions", "resolution_error_class"},
             id="GuidedChatDeferredIntentWithheldResolutionOutcome",
         ),
         pytest.param(chat_solver.GuidedChatDeferredManagementOutcome, {"action"}, id="GuidedChatDeferredManagementOutcome"),
@@ -280,12 +280,12 @@ def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_un
         ),
         pytest.param(
             chat_solver.Step1SourceResolvedOutcome,
-            {"resolution", "deferred_action"},
+            {"resolution", "deferred_actions"},
             id="Step1SourceResolvedOutcome",
         ),
         pytest.param(
             chat_solver.Step2SinkResolvedOutcome,
-            {"sink", "assistant_message", "deferred_action"},
+            {"sink", "assistant_message", "deferred_actions"},
             id="Step2SinkResolvedOutcome",
         ),
         pytest.param(guided_step_chat_module.GuidedStepChatOnlyResult, {"chat"}, id="GuidedStepChatOnlyResult"),
@@ -296,12 +296,12 @@ def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_un
         ),
         pytest.param(
             guided_step_chat_module.GuidedStepDeferredIntentResult,
-            {"chat", "action"},
+            {"chat", "actions"},
             id="GuidedStepDeferredIntentResult",
         ),
         pytest.param(
             guided_step_chat_module.GuidedStepDeferredIntentWithheldResolutionResult,
-            {"chat", "action"},
+            {"chat", "actions"},
             id="GuidedStepDeferredIntentWithheldResolutionResult",
         ),
         pytest.param(
@@ -316,12 +316,12 @@ def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_un
         ),
         pytest.param(
             guided_step_chat_module.Step1SourceResolvedResult,
-            {"chat", "resolution", "deferred_action"},
+            {"chat", "resolution", "deferred_actions"},
             id="Step1SourceResolvedResult",
         ),
         pytest.param(
             guided_step_chat_module.Step2SinkResolvedResult,
-            {"chat", "sink", "deferred_action"},
+            {"chat", "sink", "deferred_actions"},
             id="Step2SinkResolvedResult",
         ),
     ],
@@ -348,7 +348,7 @@ def test_closed_chat_variant_rejects_cross_channel_construction() -> None:
     ("outcome_type", "expected_fields"),
     [
         (DeferredRequestUnchanged, {"guided", "chat"}),
-        (DeferredRequestRetained, {"guided", "chat", "retained_intent_id"}),
+        (DeferredRequestRetained, {"guided", "chat", "retained_intent_ids"}),
         (
             DeferredRequestCancelled,
             {"guided", "chat", "action", "effective_intent", "deferred_intents", "invalidated_active_proposal"},
@@ -577,7 +577,7 @@ async def test_step_1_solver_returns_only_the_closed_deferred_intent_action(monk
     )
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
-    assert outcome.action == DeferredIntentAction(
+    assert outcome.actions[0] == DeferredIntentAction(
         target_stage="topology",
         catalog_kind="transform",
         catalog_name="llm",
@@ -977,7 +977,7 @@ def test_repair_thread_admission_parses_real_litellm_dynamic_tool_call() -> None
     admitted = chat_solver._admit_deferred_intent_repair_thread(
         message,
         (tool_call,),
-        retain_call=tool_call,
+        rejected_calls=(tool_call,),
     )
 
     assert admitted is not None
@@ -985,7 +985,7 @@ def test_repair_thread_admission_parses_real_litellm_dynamic_tool_call() -> None
     assert admitted.calls[0].id == "call_retain"
     assert admitted.calls[0].function.name == "retain_deferred_intent"
     assert admitted.calls[0].function.arguments == json.dumps({"target_stage": "topology"})
-    assert admitted.calls[0].is_retain is True
+    assert admitted.calls[0].is_rejected is True
 
 
 def test_record_llm_call_preserves_active_primary_when_secondary_audit_build_fails(
@@ -1078,7 +1078,7 @@ async def test_step_1_pair_with_omitted_hinted_plugin_applies_both(monkeypatch: 
 
     assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
     assert outcome.resolution.plugin == "json"
-    assert outcome.deferred_action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION,)
 
 
 @pytest.mark.asyncio
@@ -1177,7 +1177,7 @@ async def test_malformed_deferred_action_is_repaired_within_one_tool_turn(
     outcome = await _run_stage_solver(stage)
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
-    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION,)
     assert len(calls) == 2
     repair_messages = calls[1]["messages"]
     assert repair_messages[-1]["role"] == "tool"
@@ -1266,7 +1266,7 @@ async def test_step_2_pair_of_resolve_sink_and_retain_applies_both(monkeypatch: 
     assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
     assert outcome.sink.outputs[0].plugin == "json"
     assert outcome.assistant_message == "Saved the results as a JSON Lines file."
-    assert outcome.deferred_action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION,)
 
 
 @pytest.mark.asyncio
@@ -1295,7 +1295,215 @@ async def test_step_1_pair_of_resolve_source_and_retain_applies_both(monkeypatch
 
     assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
     assert outcome.resolution.plugin == "json"
-    assert outcome.deferred_action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION,)
+
+
+_SECOND_DEFERRED_ARGUMENTS: dict[str, Any] = {
+    "target_stage": "topology",
+    "catalog_kind": "transform",
+    "catalog_name": "field_mapper",
+    "redacted_summary": "Include the named mapping transform during topology authoring.",
+    "constraints": [
+        {
+            "kind": "component_count",
+            "component_kind": "node",
+            "plugin_kind": "transform",
+            "plugin_name": "field_mapper",
+            "operator": "at_least",
+            "count": 1,
+        }
+    ],
+}
+
+_SECOND_EXPECTED_DEFERRED_ACTION = DeferredIntentAction(
+    target_stage="topology",
+    catalog_kind="transform",
+    catalog_name="field_mapper",
+    redacted_summary="Include the named mapping transform during topology authoring.",
+    constraints=(
+        ComponentCountConstraint(
+            kind="component_count",
+            component_kind="node",
+            plugin_kind="transform",
+            plugin_name="field_mapper",
+            operator="at_least",
+            count=1,
+        ),
+    ),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_two_retains_alone_return_every_action_in_call_order(monkeypatch: pytest.MonkeyPatch, stage: str) -> None:
+    """A first message describing two future stages keeps BOTH structured intents.
+
+    elspeth-3a21f09f09: the planner correctly emits one retain_deferred_intent
+    per future-stage instruction; the solver must accept the whole group
+    instead of rejecting the reply and degrading to a single constraint-free
+    clarification intent."""
+
+    async def two_retain_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
+        calls = [
+            SimpleNamespace(
+                id="c_retain_1",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+            SimpleNamespace(
+                id="c_retain_2",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", two_retain_acompletion)
+    outcome = await _run_stage_solver(stage)
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+
+
+@pytest.mark.asyncio
+async def test_step_1_resolve_source_with_two_retains_applies_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def group_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
+        calls = [
+            SimpleNamespace(id="c_source", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS))),
+            SimpleNamespace(
+                id="c_retain_1",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+            SimpleNamespace(
+                id="c_retain_2",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", group_acompletion)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Use these JSON rows, later add the passthrough transform, and later map the fields.",
+        plugin_hint="json",
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    assert outcome.resolution.plugin == "json"
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+
+
+@pytest.mark.asyncio
+async def test_step_2_resolve_sink_with_two_retains_applies_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def group_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
+        calls = [
+            SimpleNamespace(id="c_sink", function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_SINK_ARGUMENTS))),
+            SimpleNamespace(
+                id="c_retain_1",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+            SimpleNamespace(
+                id="c_retain_2",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", group_acompletion)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save results as jsonl, later add the passthrough transform, and later map the fields.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.sink.outputs[0].plugin == "json"
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+
+
+@pytest.mark.asyncio
+async def test_step_1_retain_count_above_cap_degrades_to_clarification_retention(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reply-shape cap bounds one reply; breach degrades to the R2-F15 net."""
+
+    async def flooding_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
+        calls = [
+            SimpleNamespace(
+                id=f"c_retain_{index}",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            )
+            for index in range(chat_solver.GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY + 1)
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", flooding_acompletion)
+    result = await resolve_step_1_source_chat_with_auto_drop(
+        site="test",
+        session_id="session",
+        user_id="user",
+        model="test/model",
+        user_message="Later do many things.",
+        plugin_hint=None,
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(result) is guided_step_chat_module.GuidedStepDeferredClarificationResult
+
+
+@pytest.mark.asyncio
+async def test_step_1_group_with_one_malformed_retain_is_repaired_answering_every_call_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One malformed retain among two gets the bounded repair; every call id is answered."""
+    calls_seen: list[dict[str, Any]] = []
+
+    async def repairing_group(**kwargs: Any) -> _FakeLLMResponse:
+        calls_seen.append(kwargs)
+        second_retain_arguments = (
+            json.dumps({"target_stage": "topology"}) if len(calls_seen) == 1 else json.dumps(_SECOND_DEFERRED_ARGUMENTS)
+        )
+        calls = [
+            SimpleNamespace(id="c_source", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS))),
+            SimpleNamespace(
+                id="c_retain_1",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+            SimpleNamespace(
+                id="c_retain_2",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=second_retain_arguments),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_group)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Use these JSON rows, later add the passthrough transform, and later map the fields.",
+        plugin_hint="json",
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert len(calls_seen) == 2
+    repair_messages = calls_seen[1]["messages"]
+    tool_results = [message for message in repair_messages if message.get("role") == "tool"]
+    assert {message["tool_call_id"] for message in tool_results} == {"c_source", "c_retain_1", "c_retain_2"}
+    rejected = [message for message in tool_results if message["tool_call_id"] == "c_retain_2"]
+    assert "rejected" in rejected[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -1358,7 +1566,7 @@ async def test_form_directed_revision_keeps_retain_from_pair_with_withheld_resol
         )
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
-    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION,)
     assert outcome.resolution_error_class == "PairedResolutionNotResent"
 
 
@@ -1391,7 +1599,7 @@ async def test_step_2_pair_with_malformed_retain_is_repaired_then_applies_both(m
     )
 
     assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
-    assert outcome.deferred_action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION,)
     assert len(calls) == 2
     repair_messages = calls[1]["messages"]
     tool_results = [entry for entry in repair_messages if entry.get("role") == "tool"]
@@ -1453,7 +1661,7 @@ async def test_step_2_pair_with_config_invalid_sink_at_cap_returns_retain_alone(
     )
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
-    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION,)
     assert outcome.resolution_error_class == "PairedResolutionConfigRejected"
     assert len(calls) == 2
 
@@ -1483,7 +1691,7 @@ async def test_step_2_pair_with_shape_invalid_sink_returns_retain_alone(monkeypa
     )
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
-    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION,)
     assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
 
 
@@ -1514,7 +1722,7 @@ async def test_step_1_pair_with_shape_invalid_source_returns_retain_alone(monkey
     )
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
-    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION,)
     assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
 
 
@@ -1557,7 +1765,7 @@ async def test_step_1_pair_with_mistyped_on_validation_failure_returns_retain_al
     )
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
-    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION,)
     assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
 
 
@@ -1597,7 +1805,7 @@ async def test_step_1_pair_with_non_string_assistant_message_returns_retain_alon
     )
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
-    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION,)
     assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
 
 
@@ -1634,7 +1842,7 @@ async def test_step_2_pair_with_non_string_assistant_message_returns_retain_alon
     )
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
-    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION,)
     assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
 
 
@@ -1676,7 +1884,7 @@ async def test_step_1_pair_with_scaffold_assistant_message_returns_retain_alone(
     )
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
-    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION,)
     assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
 
 
@@ -1716,7 +1924,7 @@ async def test_step_2_pair_with_scaffold_assistant_message_returns_retain_alone(
     )
 
     assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
-    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION,)
     assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
 
 
@@ -1747,7 +1955,7 @@ async def test_step_2_pair_wrapper_threads_deferred_action(monkeypatch: pytest.M
 
     assert type(result) is guided_step_chat_module.Step2SinkResolvedResult
     assert result.sink.outputs[0].plugin == "json"
-    assert result.deferred_action == _EXPECTED_DEFERRED_ACTION
+    assert result.deferred_actions == (_EXPECTED_DEFERRED_ACTION,)
 
 
 @pytest.mark.asyncio
@@ -1792,7 +2000,7 @@ async def test_step_2_solver_returns_the_same_closed_deferred_action(monkeypatch
     )
 
     assert type(result) is chat_solver.GuidedChatDeferredIntentOutcome
-    assert result.action.target_stage == "topology"
+    assert result.actions[0].target_stage == "topology"
     assert [tool["function"]["name"] for tool in captured["tools"]] == [
         "resolve_sink",
         "retain_deferred_intent",

@@ -66,7 +66,7 @@ def _action(catalog_name: str, *, target_stage: StageName = "topology") -> Defer
 
 def _apply(action: DeferredIntentAction, *, catalog: PolicyCatalogView) -> DeferredRequestApplication:
     return apply_deferred_request(
-        action,
+        (action,),
         None,
         authority=DeferredRequestAuthority(
             guided=GuidedSession.initial(),
@@ -75,7 +75,7 @@ def _apply(action: DeferredIntentAction, *, catalog: PolicyCatalogView) -> Defer
                 message_id=_MESSAGE_ID,
                 content=_ROUTING_MESSAGE,
             ),
-            new_intent_id=_INTENT_ID,
+            new_intent_ids=(_INTENT_ID,),
         ),
         chat=StepChatResult(
             assistant_message="model-authored response",
@@ -127,7 +127,7 @@ def test_responsible_stage_rejection_keeps_its_diagnostic_and_retains_clarificat
     )
 
     assert type(result) is DeferredRequestRetained
-    assert result.retained_intent_id == _INTENT_ID
+    assert result.retained_intent_ids == (_INTENT_ID,)
     assert result.chat.error_class == "DeferredIntentRejected"
     assert "pending clarification" in result.chat.assistant_message
     assert "target stage" in result.chat.assistant_message
@@ -148,7 +148,7 @@ def test_unproven_stated_routing_retains_instruction_as_clarification_debt() -> 
     )
 
     assert type(result) is DeferredRequestRetained
-    assert result.retained_intent_id == _INTENT_ID
+    assert result.retained_intent_ids == (_INTENT_ID,)
     assert result.chat.error_class == "DeferredIntentRejected"
     assert "pending clarification" in result.chat.assistant_message
     (intent,) = result.guided.deferred_intents
@@ -178,7 +178,7 @@ def test_catalog_kind_mismatch_retains_instruction_as_clarification_debt() -> No
         ),
     )
     result = apply_deferred_request(
-        action,
+        (action,),
         None,
         authority=DeferredRequestAuthority(
             guided=GuidedSession.initial(),
@@ -187,7 +187,7 @@ def test_catalog_kind_mismatch_retains_instruction_as_clarification_debt() -> No
                 message_id=_MESSAGE_ID,
                 content="Later add the csv step to the processing.",
             ),
-            new_intent_id=_INTENT_ID,
+            new_intent_ids=(_INTENT_ID,),
         ),
         chat=StepChatResult(
             assistant_message="model-authored response",
@@ -269,7 +269,7 @@ def test_contradiction_rejection_retains_instruction_as_clarification_debt() -> 
     )
     guided = replace(GuidedSession.initial(), deferred_intents=(retained,))
     result = apply_deferred_request(
-        _bounded_action("passthrough", operator="at_most", count=1),
+        (_bounded_action("passthrough", operator="at_most", count=1),),
         None,
         authority=DeferredRequestAuthority(
             guided=guided,
@@ -278,7 +278,7 @@ def test_contradiction_rejection_retains_instruction_as_clarification_debt() -> 
                 message_id=_MESSAGE_ID,
                 content="Later keep at most 1 passthrough node.",
             ),
-            new_intent_id=_INTENT_ID,
+            new_intent_ids=(_INTENT_ID,),
         ),
         chat=StepChatResult(
             assistant_message="model-authored response",
@@ -289,7 +289,7 @@ def test_contradiction_rejection_retains_instruction_as_clarification_debt() -> 
     )
 
     assert type(result) is DeferredRequestRetained
-    assert result.retained_intent_id == _INTENT_ID
+    assert result.retained_intent_ids == (_INTENT_ID,)
     assert result.chat.error_class == "DeferredIntentContradiction"
     assert _RETAINED_INTENT_ID in result.chat.assistant_message
     assert "pending clarification" in result.chat.assistant_message
@@ -318,7 +318,7 @@ def test_management_edit_contradiction_names_conflict_and_leaves_saved_instructi
     guided = replace(GuidedSession.initial(), deferred_intents=(conflicting, edited))
     edit_command = f"Edit exact intent {_EDITED_INTENT_ID}: keep at most one passthrough node."
     result = apply_deferred_request(
-        None,
+        (),
         DeferredIntentEditAction(
             intent_id=_EDITED_INTENT_ID,
             selection_token=deferred_intent_management_option(edited).selection_token,
@@ -328,7 +328,7 @@ def test_management_edit_contradiction_names_conflict_and_leaves_saved_instructi
             guided=guided,
             catalog=_catalog(available=frozenset({PluginId("transform", "passthrough"), PluginId("transform", "numeric_route")})),
             originating_message=GuidedOriginatingUserMessageDraft(message_id=_MESSAGE_ID, content=edit_command),
-            new_intent_id=_INTENT_ID,
+            new_intent_ids=(_INTENT_ID,),
         ),
         chat=StepChatResult(
             assistant_message="model-authored response",
@@ -343,3 +343,76 @@ def test_management_edit_contradiction_names_conflict_and_leaves_saved_instructi
     assert _RETAINED_INTENT_ID in result.chat.assistant_message
     assert "did not change" in result.chat.assistant_message
     assert result.guided.deferred_intents == (conflicting, edited)
+
+
+def test_two_actions_in_one_send_fold_and_compose_against_the_evolving_state() -> None:
+    """elspeth-3a21f09f09: N actions in one Send each keep their own disposition.
+
+    An accepted action appends with its verified constraints; a sibling whose
+    catalog identity cannot be verified appends as clarification debt — BOTH
+    intents land in one application, in call order, and the composed chat
+    keeps the not-applied signal from the unverified half."""
+
+    from uuid import uuid4
+
+    second_intent_id = uuid4()
+    result = apply_deferred_request(
+        (_action("passthrough"), _action("numeric_route")),
+        None,
+        authority=DeferredRequestAuthority(
+            guided=GuidedSession.initial(),
+            catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+            originating_message=GuidedOriginatingUserMessageDraft(
+                message_id=_MESSAGE_ID,
+                content="Later add the passthrough transform, and later route rows through the special step.",
+            ),
+            new_intent_ids=(_INTENT_ID, second_intent_id),
+        ),
+        chat=StepChatResult(
+            assistant_message="model-authored response",
+            status=ComposerChatTurnStatus.SUCCESS,
+            latency_ms=7,
+            error_class=None,
+        ),
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.retained_intent_ids == (_INTENT_ID, second_intent_id)
+    first, second = result.guided.deferred_intents
+    assert first.intent_id == str(_INTENT_ID)
+    assert first.catalog_name == "passthrough"
+    assert second.intent_id == str(second_intent_id)
+    # The unverified half is constraint-free clarification debt, never the
+    # model's unproven catalog identity.
+    assert second.catalog_name is None
+    # Composed chat: both dispositions visible, the not-applied signal wins.
+    assert "I saved that instruction for the topology stage." in result.chat.assistant_message
+    assert result.chat.status is ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+    assert result.chat.error_class == "DeferredIntentModelCatalogIdentity"
+
+
+def test_all_actions_unretainable_in_one_send_leave_state_unchanged() -> None:
+    """Two same-stage actions in one Send append nothing and change nothing."""
+
+    result = apply_deferred_request(
+        (_action("passthrough", target_stage="source"), _action("csv", target_stage="source")),
+        None,
+        authority=DeferredRequestAuthority(
+            guided=GuidedSession.initial(),
+            catalog=_catalog(available=frozenset({PluginId("transform", "passthrough"), PluginId("transform", "csv")})),
+            originating_message=GuidedOriginatingUserMessageDraft(
+                message_id=_MESSAGE_ID,
+                content="Use the passthrough and csv steps here.",
+            ),
+            new_intent_ids=(_INTENT_ID, UUID("55555555-5555-4555-8555-555555555555")),
+        ),
+        chat=StepChatResult(
+            assistant_message="model-authored response",
+            status=ComposerChatTurnStatus.SUCCESS,
+            latency_ms=7,
+            error_class=None,
+        ),
+    )
+
+    assert type(result) is DeferredRequestUnchanged
+    assert result.guided.deferred_intents == ()

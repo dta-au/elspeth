@@ -1575,15 +1575,21 @@ class GuidedStateOperationCommand:
     payloads: tuple[PreparedGuidedJsonPayload, ...] = ()
     audit_evidence: GuidedAuditEvidence = GuidedAuditEvidence()
     originating_message: GuidedOriginatingUserMessageDraft | None = None
-    retained_deferred_intent_id: UUID | None = None
+    # One id per deferred intent this settlement appends, in append order
+    # (elspeth-3a21f09f09: a Send naming N future stages appends up to N).
+    retained_deferred_intent_ids: tuple[UUID, ...] = ()
     deferred_intent_action: DeferredIntentManagementAction | None = None
     invalidated_pending_proposal: GuidedPendingProposalInvalidation | None = None
     interpretations: tuple[PreparedGuidedInterpretationDraft, ...] = ()
 
     def _validate_deferred_intent_sidebands(self) -> None:
-        if self.retained_deferred_intent_id is not None and type(self.retained_deferred_intent_id) is not UUID:
-            raise AuditIntegrityError("GuidedStateOperationCommand.retained_deferred_intent_id must be a UUID or None")
-        if self.retained_deferred_intent_id is not None and self.originating_message is None:
+        if type(self.retained_deferred_intent_ids) is not tuple or any(
+            type(intent_id) is not UUID for intent_id in self.retained_deferred_intent_ids
+        ):
+            raise AuditIntegrityError("GuidedStateOperationCommand.retained_deferred_intent_ids must be a tuple of exact UUIDs")
+        if len(set(self.retained_deferred_intent_ids)) != len(self.retained_deferred_intent_ids):
+            raise AuditIntegrityError("GuidedStateOperationCommand.retained_deferred_intent_ids must not repeat an id")
+        if self.retained_deferred_intent_ids and self.originating_message is None:
             raise AuditIntegrityError("A retained deferred intent requires an originating user-message draft")
         if self.deferred_intent_action is not None and type(self.deferred_intent_action) not in {
             DeferredIntentCancelAction,
@@ -1592,7 +1598,7 @@ class GuidedStateOperationCommand:
             raise AuditIntegrityError("GuidedStateOperationCommand.deferred_intent_action must be exact or None")
         if self.deferred_intent_action is not None and self.originating_message is None:
             raise AuditIntegrityError("A deferred intent action requires an originating user-message draft")
-        if self.deferred_intent_action is not None and self.retained_deferred_intent_id is not None:
+        if self.deferred_intent_action is not None and self.retained_deferred_intent_ids:
             raise AuditIntegrityError("A guided settlement cannot retain and manage deferred intent together")
         if (
             self.invalidated_pending_proposal is not None

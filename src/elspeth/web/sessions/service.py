@@ -969,22 +969,33 @@ def _verify_guided_deferred_intent_append(
     *,
     prior_guided: GuidedSession,
     candidate_guided: GuidedSession,
-) -> DeferredStageIntent:
+) -> tuple[DeferredStageIntent, ...]:
+    """Verify the K exact terminal appends the command claims, in order.
+
+    Generalized from the single terminal append (elspeth-3a21f09f09): the
+    candidate must extend the prior intents by EXACTLY the claimed ids, in
+    claimed order, and every appended intent must bind the one originating
+    user message by id and content hash.
+    """
+    claimed = command.retained_deferred_intent_ids
+    appended_count = len(claimed)
     if (
-        len(candidate_guided.deferred_intents) != len(prior_guided.deferred_intents) + 1
-        or candidate_guided.deferred_intents[:-1] != prior_guided.deferred_intents
-        or candidate_guided.deferred_intents[-1].intent_id != str(command.retained_deferred_intent_id)
+        len(candidate_guided.deferred_intents) != len(prior_guided.deferred_intents) + appended_count
+        or candidate_guided.deferred_intents[: len(prior_guided.deferred_intents)] != prior_guided.deferred_intents
+        or tuple(intent.intent_id for intent in candidate_guided.deferred_intents[len(prior_guided.deferred_intents) :])
+        != tuple(str(intent_id) for intent_id in claimed)
     ):
-        raise AuditIntegrityError("retained deferred intent must be one exact terminal append")
-    retained = candidate_guided.deferred_intents[-1]
+        raise AuditIntegrityError("retained deferred intents must be the exact claimed terminal appends in order")
+    retained = candidate_guided.deferred_intents[len(prior_guided.deferred_intents) :]
     originating = command.originating_message
     if originating is None:  # pragma: no cover - command type owns this guard
         raise AuditIntegrityError("retained deferred intent lost its originating message")
-    if retained.originating_message_id != str(originating.message_id):
-        raise AuditIntegrityError("retained deferred intent names the wrong originating message")
-    if retained.message_content_hash != stable_hash(originating.content):
-        raise AuditIntegrityError("retained deferred intent message content hash mismatch")
-    return retained
+    for intent in retained:
+        if intent.originating_message_id != str(originating.message_id):
+            raise AuditIntegrityError("retained deferred intent names the wrong originating message")
+        if intent.message_content_hash != stable_hash(originating.content):
+            raise AuditIntegrityError("retained deferred intent message content hash mismatch")
+    return tuple(retained)
 
 
 def _expected_guided_deferred_intents_after_management(
@@ -1051,7 +1062,7 @@ def _verify_guided_deferred_intent_mutation(
     command: GuidedStateOperationCommand,
     prior_guided: GuidedSession,
     candidate_guided: GuidedSession,
-) -> DeferredStageIntent | None:
+) -> tuple[DeferredStageIntent, ...] | None:
     """Verify the exact append/cancel/edit sideband against both checkpoints."""
 
     from elspeth.web.composer.guided.deferred_intents import DeferredIntentCancelAction
@@ -1063,11 +1074,11 @@ def _verify_guided_deferred_intent_mutation(
     if is_cancel != bool(cancellation_invocations):
         raise AuditIntegrityError("guided intent cancellation audit must exist if and only if the typed action is cancel")
 
-    if command.retained_deferred_intent_id is None and command.deferred_intent_action is None:
+    if not command.retained_deferred_intent_ids and command.deferred_intent_action is None:
         if candidate_guided.deferred_intents != prior_guided.deferred_intents:
             raise AuditIntegrityError("deferred intent mutation requires an explicit typed sideband")
         return None
-    if command.retained_deferred_intent_id is not None:
+    if command.retained_deferred_intent_ids:
         return _verify_guided_deferred_intent_append(command, prior_guided=prior_guided, candidate_guided=candidate_guided)
     expected = _expected_guided_deferred_intents_after_management(
         conn,
@@ -10347,7 +10358,7 @@ class SessionServiceImpl:
                     if current_row is None
                     else _guided_checkpoint(self._row_to_state_record(current_row).composer_meta, role="prior")
                 )
-                retained_deferred_intent = _verify_guided_deferred_intent_mutation(
+                retained_deferred_intents = _verify_guided_deferred_intent_mutation(
                     conn,
                     session_id=sid,
                     command=command,
@@ -10426,7 +10437,7 @@ class SessionServiceImpl:
                         created_at=now,
                         message_id=str(originating.message_id),
                     )
-                    if retained_deferred_intent is not None:
+                    if retained_deferred_intents:
                         persisted_origin = conn.execute(
                             select(
                                 chat_messages_table.c.session_id,
@@ -10434,12 +10445,10 @@ class SessionServiceImpl:
                                 chat_messages_table.c.content,
                             ).where(chat_messages_table.c.id == str(originating.message_id))
                         ).one_or_none()
-                        if (
-                            persisted_origin is None
-                            or persisted_origin.session_id != sid
-                            or persisted_origin.role != "user"
-                            or stable_hash(persisted_origin.content) != retained_deferred_intent.message_content_hash
-                        ):
+                        if persisted_origin is None or persisted_origin.session_id != sid or persisted_origin.role != "user":
+                            raise AuditIntegrityError("retained deferred intent originating message failed session/role/content custody")
+                        persisted_hash = stable_hash(persisted_origin.content)
+                        if any(intent.message_content_hash != persisted_hash for intent in retained_deferred_intents):
                             raise AuditIntegrityError("retained deferred intent originating message failed session/role/content custody")
                     originating_record = ChatMessageRecord(
                         id=originating.message_id,

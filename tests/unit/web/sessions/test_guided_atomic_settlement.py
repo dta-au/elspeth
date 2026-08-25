@@ -1984,7 +1984,7 @@ async def test_deferred_intent_delta_rejects_every_untyped_or_non_append_mutatio
     )
     if mutation == "omitted_addition":
         candidate = (appended,)
-        sideband = None
+        sideband: tuple[UUID, ...] = ()
     elif mutation == "replacement_same_id":
         candidate = (
             _deferred_intent(
@@ -1994,26 +1994,26 @@ async def test_deferred_intent_delta_rejects_every_untyped_or_non_append_mutatio
                 summary="Changed existing intent under the same id.",
             ),
         )
-        sideband = UUID(first.intent_id)
+        sideband = (UUID(first.intent_id),)
     elif mutation == "reorder":
         candidate = (second, first)
-        sideband = None
+        sideband = ()
     elif mutation == "removal":
         candidate = (first,)
-        sideband = None
+        sideband = ()
     elif mutation == "extra_append":
         candidate = (first, appended, _deferred_intent())
-        sideband = UUID(appended.intent_id)
+        sideband = (UUID(appended.intent_id),)
     else:
         candidate = (first, appended)
-        sideband = uuid4()
+        sideband = (uuid4(),)
     command = replace(
         command,
         state=replace(
             command.state,
             composer_meta={"guided_session": replace(GuidedSession.initial(), deferred_intents=candidate).to_dict()},
         ),
-        retained_deferred_intent_id=sideband,
+        retained_deferred_intent_ids=sideband,
     )
     with engine.connect() as connection:
         events_before = connection.execute(
@@ -2101,7 +2101,7 @@ async def test_deferred_intent_delta_allows_one_typed_terminal_append(service_an
             command.state,
             composer_meta={"guided_session": replace(GuidedSession.initial(), deferred_intents=candidate).to_dict()},
         ),
-        retained_deferred_intent_id=UUID(appended.intent_id),
+        retained_deferred_intent_ids=(UUID(appended.intent_id),),
     )
 
     settlement = await service.settle_guided_state_operation(command)
@@ -2109,6 +2109,64 @@ async def test_deferred_intent_delta_allows_one_typed_terminal_append(service_an
     result_guided = state_from_record(settlement.result_state).guided_session
     assert result_guided is not None
     assert result_guided.deferred_intents == candidate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["exact", "wrong_order", "undersized_claim"])
+async def test_deferred_intent_delta_verifies_multi_append_custody(service_and_engine, mutation: str) -> None:
+    """elspeth-3a21f09f09: K appends settle only as the exact claimed ids in order.
+
+    One Send may append several intents (one per retain call). The custody
+    check must accept the exact ordered claim and reject a candidate whose
+    appends are reordered against the claim or exceed it."""
+    service, _engine = service_and_engine
+    session_id = (await service.create_session("alice", f"guided deferred multi append {mutation}", "local")).id
+    prior = (_deferred_intent(),)
+    predecessor = await _seed_guided_predecessor_with_intents(service, session_id, prior)
+    claimed = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id=f"respond-deferred-multi-append-{mutation}",
+        kind="guided_respond",
+        request_hash="a" * 64,
+        actor="worker",
+        lease_seconds=60,
+    )
+    assert isinstance(claimed, GuidedOperationClaimed)
+    command = _present_respond_command(claimed.fence, predecessor)
+    originating = command.originating_message
+    assert originating is not None
+    appended_first = _deferred_intent(
+        originating_message_id=originating.message_id,
+        message_content=originating.content,
+    )
+    appended_second = _deferred_intent(
+        originating_message_id=originating.message_id,
+        message_content=originating.content,
+    )
+    candidate = (*prior, appended_first, appended_second)
+    if mutation == "wrong_order":
+        sideband = (UUID(appended_second.intent_id), UUID(appended_first.intent_id))
+    elif mutation == "undersized_claim":
+        sideband = (UUID(appended_first.intent_id),)
+    else:
+        sideband = (UUID(appended_first.intent_id), UUID(appended_second.intent_id))
+    command = replace(
+        command,
+        state=replace(
+            command.state,
+            composer_meta={"guided_session": replace(GuidedSession.initial(), deferred_intents=candidate).to_dict()},
+        ),
+        retained_deferred_intent_ids=sideband,
+    )
+
+    if mutation == "exact":
+        settlement = await service.settle_guided_state_operation(command)
+        result_guided = state_from_record(settlement.result_state).guided_session
+        assert result_guided is not None
+        assert result_guided.deferred_intents == candidate
+    else:
+        with pytest.raises(AuditIntegrityError, match="deferred intent"):
+            await service.settle_guided_state_operation(command)
 
 
 @pytest.mark.asyncio
@@ -2369,7 +2427,7 @@ def test_cancellation_audit_is_forbidden_without_exact_cancel_sideband(non_cance
         originating_message=GuidedOriginatingUserMessageDraft(message_id=uuid4(), content="private non-cancel request"),
     )
     if non_cancel_sideband == "append":
-        command = replace(command, retained_deferred_intent_id=uuid4())
+        command = replace(command, retained_deferred_intent_ids=(uuid4(),))
     elif non_cancel_sideband == "edit":
         command = replace(
             command,

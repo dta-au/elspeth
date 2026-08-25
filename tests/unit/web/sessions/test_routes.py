@@ -5494,7 +5494,7 @@ class TestMessageRoutes:
                             sample_rows=({"name": raw_row_secret, "value": "1"},),
                             on_validation_failure="discard",
                         ),
-                        deferred_action=None,
+                        deferred_actions=(),
                     )
                 ),
             ),

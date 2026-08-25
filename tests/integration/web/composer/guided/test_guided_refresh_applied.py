@@ -35,7 +35,7 @@ async def _source_selection_provider(**_kwargs: object) -> GuidedChatProviderOut
             error_class=None,
         ),
         resolution=resolution,
-        deferred_action=None,
+        deferred_actions=(),
     )
 
 

@@ -163,7 +163,7 @@ def _provider(action: DeferredIntentAction) -> Callable[..., Awaitable[GuidedCha
                 latency_ms=1,
                 error_class=None,
             ),
-            action=action,
+            actions=(action,),
         )
 
     return run
@@ -311,7 +311,7 @@ def _pair_sink_provider(sink: SinkResolved, action: DeferredIntentAction) -> Cal
                 error_class=None,
             ),
             sink=sink,
-            deferred_action=action,
+            deferred_actions=(action,),
         )
 
     return run
@@ -330,7 +330,7 @@ def _pair_source_provider(
                 error_class=None,
             ),
             resolution=resolution,
-            deferred_action=action,
+            deferred_actions=(action,),
         )
 
     return run
@@ -1562,6 +1562,116 @@ def test_pair_of_sink_resolution_and_future_intent_applies_both_atomically(
     assert [content for _message_id, content in _non_root_user_rows(client, session_id)] == [private_message]
     assert all(private_message not in message.content for message in messages if message.role != "user")
     assert all(private_message not in repr(message.tool_calls) for message in messages if message.role != "user")
+
+
+def test_group_of_sink_resolution_and_two_future_intents_applies_all_atomically(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message naming a sink AND two future stages loses none of its halves.
+
+    elspeth-3a21f09f09 (the WS6 collector calibration walk): the planner
+    correctly emits one retain per future-stage instruction, and the whole
+    group must settle atomically — the sink prefill applies and BOTH deferred
+    intents append, in call order, bound to the one originating message.
+    """
+    client = composer_test_client
+    session_id = _create_session(client)
+    TestStepChatCrossStep._seed_csv_blob(client, session_id)
+    TestStepChatCrossStep._configure_csv_source(client, session_id)
+    before = client.get(f"/api/sessions/{session_id}/guided").json()
+    assert before["guided_session"]["step"] == "step_2_sink"
+    out_path = _respond_outputs_path(client, session_id, "group_out.jsonl")
+    private_message = "Save results as jsonl, later add the passthrough transform, and later map fields with secret-group-needle."
+
+    def _retain_call(call_id: str, plugin_name: str, summary: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(
+                name="retain_deferred_intent",
+                arguments=json.dumps(
+                    {
+                        "target_stage": "topology",
+                        "catalog_kind": "transform",
+                        "catalog_name": plugin_name,
+                        "redacted_summary": summary,
+                        "constraints": [
+                            {
+                                "kind": "component_count",
+                                "component_kind": "node",
+                                "plugin_kind": "transform",
+                                "plugin_name": plugin_name,
+                                "operator": "at_least",
+                                "count": 1,
+                            }
+                        ],
+                    }
+                ),
+            ),
+        )
+
+    async def group_completion(**_kwargs: object) -> SimpleNamespace:
+        tool_calls = [
+            SimpleNamespace(
+                id="c_sink",
+                function=SimpleNamespace(
+                    name="resolve_sink",
+                    arguments=json.dumps(
+                        {
+                            "resolution": "sink",
+                            "output": {
+                                "name": "main",
+                                "plugin": "json",
+                                "options": {
+                                    "path": out_path,
+                                    "schema": {"mode": "observed"},
+                                    "mode": "write",
+                                    "collision_policy": "auto_increment",
+                                },
+                                "required_fields": [],
+                                "schema_mode": "observed",
+                                "on_write_failure": "discard",
+                            },
+                            "assistant_message": "Output set to JSON.",
+                        }
+                    ),
+                ),
+            ),
+            _retain_call("c_retain_1", "passthrough", "Include the named transform during topology authoring."),
+            _retain_call("c_retain_2", "field_mapper", "Include the named mapping transform during topology authoring."),
+        ]
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", group_completion)
+    response = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=before["next_turn"]["turn_token"],
+        message=private_message,
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message"] == (
+        "Output set to JSON. I saved that instruction for the topology stage. I saved that instruction for the topology stage."
+    )
+    guided = _guided(client, session_id)
+    first, second = guided.deferred_intents
+    assert (first.catalog_name, second.catalog_name) == ("passthrough", "field_mapper")
+    for intent in (first, second):
+        assert intent.receiving_stage == "output"
+        assert intent.target_stage == "topology"
+        assert intent.message_content_hash == stable_hash(private_message)
+    assert first.originating_message_id == second.originating_message_id
+    # The sink half applied too.
+    next_turn = body["next_turn"]
+    assert next_turn is not None
+    assert next_turn["type"] == "schema_form"
+    assert next_turn["payload"]["prefilled"]["path"] == out_path
+    # The raw mixed message stays out of every non-user surface.
+    assert private_message not in _text_outside_chat_history(body)
+    assert [content for _message_id, content in _non_root_user_rows(client, session_id)] == [private_message]
 
 
 def _last_chat_turn_audit(client: TestClient, session_id: str) -> dict:

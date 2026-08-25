@@ -8,6 +8,34 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-26 — the guided deferral surface is PLURAL end to end: one
+  resolution + 1..K retains per reply (elspeth-3a21f09f09), and every carrier
+  field renamed with it.** The R2-F15 pair (one resolve + one retain) is
+  generalized to a GROUP at both solver sites (`chat_solver.py` step-1/step-2):
+  `GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY` (8) caps ONE reply's retain calls
+  (breach = shape error → the existing clarification-retention net; the
+  durable bound stays `GUIDED_MAX_DEFERRED_INTENTS` = 256 at settlement).
+  Conventions: (a) the renames are TOTAL, no compat shims —
+  `GuidedChat*Outcome.action`→`actions`, `Step{1,2}*Resolved*.deferred_action`
+  →`deferred_actions`, `DeferredRequestRetained.retained_intent_id`→
+  `retained_intent_ids`, `DeferredRequestAuthority.new_intent_id`→
+  `new_intent_ids`, `GuidedStateOperationCommand.retained_deferred_intent_id`
+  →`retained_deferred_intent_ids: tuple[UUID, ...] = ()` (absent = EMPTY
+  TUPLE, never None); constructing any of them with the singular name is a
+  TypeError. (b) `manage_deferred_intent` stays SINGULAR by design — a
+  multi-call reply containing it is still a shape rejection; do not fold it
+  into the group. (c) `apply_deferred_request` FOLDS N actions against the
+  EVOLVING guided state (`_apply_one_deferred_action`), so action 2 can
+  legitimately contradict action 1 retained in the same Send; the composed
+  chat takes the FIRST non-success disposition's status/error_class (the F1
+  not-applied signal must survive a successful sibling). (d) settlement
+  custody (`service.py::_verify_guided_deferred_intent_append`) verifies K
+  ordered appends whose ids match the claimed tuple EXACTLY — a set/count
+  comparison is a mutation the wrong-order test kills. (e) the repair thread
+  answers EVERY call id with per-call errors (`rejected_calls=`/`errors=`
+  aligned tuples); step-3/wire chats never offer `retain_deferred_intent`,
+  so there is deliberately no third solver site to sweep.
+
 - **2026-08-26 — §7 rule 5's fork closer kinds are NOT interchangeable: a
   ROW_UNION-bound fork inside ANY bound region is a build-time rejection**
   (elspeth-9db785ace7, `core/dag/bound_regions.py::validate_openers_bound_in_region`).
