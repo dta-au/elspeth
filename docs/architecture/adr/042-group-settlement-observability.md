@@ -235,6 +235,52 @@ terminal pair was REFUSED as a vocabulary change. That refusal's
 rationale is covered by this freeze — a new terminal pair for group
 settlement is a vocabulary change and takes the bar above.
 
+### 6. `on_group_failure` is deleted — group-failure handling is structural (2026-08-25, WS6 lane 1)
+
+`ScopeSettings.on_group_failure` (`quarantine` | `escalate`, default
+`quarantine`) is DELETED, with its build-time validator
+(`validate_escalation_targets`, §7 rule 8's decidable half), its composer
+mirror (`scope_escalate_at_outermost` and the
+`collector_scope_on_group_failure_invalid` vocabulary check), and every
+authoring/teaching surface that carried it.
+
+**Rationale (four-seat panel review, maintainer-ratified).** The field was
+found to have zero runtime effect at any depth: settlement is structural —
+a failed group escalates iff an enclosing bound frame exists
+(`_settle_member_losses` is called `escalated=True` unconditionally on
+`group_failed`), and the outermost group's failure is terminal
+(quarantine) because nothing encloses it. The field restated what nesting
+position already determined, and its default (`quarantine`) actively
+misdescribed behaviour at every non-outermost scope. An envelope-only
+validation was considered and rejected: together with rule 8 it would have
+left `escalate` declarable nowhere — a single-valued field carrying zero
+information. Per-scope runtime semantics were rejected as speculative
+generality (they duplicate `policy: best_effort`'s absorb axis, and the
+propagation machinery is unbuilt — see the barrier-scope proposal's three
+blockers). Structural derivation IS the contract; a config that declares
+the field now fails validation loudly (`extra="forbid"`) instead of
+carrying a value nothing reads.
+
+**Deliberate corpus-witness inversions (recorded per the §5 bar's spirit —
+this is a config-surface deletion, not a settlement-vocabulary change; the
+frozen membership, wire values, and hold-payload shapes are untouched):**
+
+- `tests/unit/core/dag/test_bound_regions.py`: `TestEscalateAtOutermost`
+  (value-legality pins over the deleted validator) became
+  `TestGroupFailureHandlingIsStructural` (depth pins over real computed
+  regions);
+- `tests/unit/core/test_config_collectors_scopes.py`: the
+  default-to-quarantine pin inverted to a field-rejection pin;
+- `tests/integration/mcp/test_group_failure_forensics.py`: the fixture
+  dropped its two scope declarations and the docstring's causal claim
+  ("`on_group_failure: escalate` stages...") was corrected — the staging
+  is structural and always was;
+- `tests/unit/web/composer/test_state_serialisation_contract.py`: the
+  collector shape's `composition_content_hash` pin moved (the serialised
+  node no longer carries the backfilled key). Persisted-state blast radius
+  verified empty before landing: 0/496 stored composition states and 0/26
+  proposals carried a collector node or the field.
+
 ## Consequences
 
 - **Positive:** a release context's `reason` now answers the operator's

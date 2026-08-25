@@ -168,7 +168,6 @@ def nested_intake_harness():
                 closer_name="outer_closer",
                 closer_kind=CloserKind.COALESCE,
                 policy=outer_policy,
-                on_group_failure=None,
                 member_roster=("outer_a",),
             )
             inner_binding = GroupBinding(
@@ -179,7 +178,6 @@ def nested_intake_harness():
                 closer_name="inner_closer",
                 closer_kind=CloserKind.COALESCE,
                 policy=inner_policy,
-                on_group_failure=None,
                 member_roster=("inner_1", "inner_2"),
             )
             registry = GroupBindingRegistry(bindings=(outer_binding, inner_binding))
@@ -206,7 +204,6 @@ def nested_intake_harness():
                 closer_name="solo_closer",
                 closer_kind=CloserKind.COALESCE,
                 policy=inner_policy,
-                on_group_failure=None,
                 member_roster=("solo_1", "solo_2"),
             )
             registry = GroupBindingRegistry(bindings=(solo_binding,))
@@ -333,7 +330,6 @@ def test_staged_escalation_replays_and_settles_the_enclosing_closer_on_next_pass
         closer_name="outer_closer",
         closer_kind=CloserKind.COALESCE,
         policy="require_all",
-        on_group_failure=None,
         member_roster=("outer_a",),
     )
     inner_binding = GroupBinding(
@@ -344,7 +340,6 @@ def test_staged_escalation_replays_and_settles_the_enclosing_closer_on_next_pass
         closer_name="inner_closer",
         closer_kind=CloserKind.COALESCE,
         policy="require_all",
-        on_group_failure=None,
         member_roster=("inner_1", "inner_2"),
     )
     registry = GroupBindingRegistry(bindings=(outer_binding, inner_binding))

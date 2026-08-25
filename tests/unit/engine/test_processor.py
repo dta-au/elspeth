@@ -370,7 +370,6 @@ def _synthesize_group_bindings_from_legacy_maps(
                 closer_name=str(coalesce_name),
                 closer_kind=CloserKind.COALESCE,
                 policy="require_all",
-                on_group_failure=None,
                 member_roster=tuple(members),
             )
         )
@@ -393,7 +392,6 @@ def _synthesize_group_bindings_from_legacy_maps(
                 closer_name=str(row_union_name),
                 closer_kind=CloserKind.ROW_UNION,
                 policy="require_all",
-                on_group_failure=None,
                 member_roster=tuple(members),
             )
         )

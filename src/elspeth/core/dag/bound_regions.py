@@ -570,34 +570,3 @@ def validate_no_aggregations_in_regions(
                 component_id=agg_name,
                 component_type="aggregation",
             )
-
-
-def validate_escalation_targets(regions: tuple[BoundRegion, ...]) -> None:
-    """§7 rule 8 (standing ruling): escalate requires an enclosing bound group.
-
-    ``on_group_failure: escalate`` hands a lost member's failure up to the
-    ENCLOSING bound group — there is no enclosing group at depth 1 (an
-    outermost bound region), so escalating there has nowhere to go.
-    Outermost closers declare TERMINAL handling: ``quarantine``.
-
-    Only ``ScopeSettings`` carries a configurable ``on_group_failure`` field
-    (coalesce/row_union bindings are built with ``on_group_failure=None`` —
-    see ``group_bindings.py``'s three ``GroupBinding`` construction sites —
-    so this predicate can only ever fire for a EXPAND/scope closer; the
-    message says "Scope" deliberately, not "bound group" generically.
-
-    Raises:
-        GraphValidationError: a region's binding declares
-            ``on_group_failure == "escalate"`` at depth 1 (outermost).
-    """
-    for region in regions:
-        if region.binding.on_group_failure == "escalate" and region.depth == 1:
-            raise GraphValidationError(
-                f"Scope closed by collector '{region.binding.closer_name}' (opener "
-                f"'{region.binding.opener_name}') declares on_group_failure: escalate at an outermost "
-                f"bound group — there is no enclosing bound group to escalate to (spec §7 rule 8). "
-                f"Use quarantine (terminal handling) at the outermost level, or nest this scope inside "
-                f"another bound group.",
-                component_id=region.binding.closer_name,
-                component_type=region.binding.closer_kind,
-            )

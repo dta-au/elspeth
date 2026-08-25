@@ -344,8 +344,7 @@ def _generate_pipeline_dict(
     # produce a dangling closer reference. scope_policy is REQUIRED with no
     # default and scope_name/scope_opener are mandatory for the node type, so
     # absences refuse to lower rather than fabricate (never .get with a
-    # default); scope_on_group_failure is recorded by NodeSpec.__post_init__,
-    # so its absence likewise proves a state that never crossed that boundary.
+    # default).
     collectors = [n for n in state_dict["nodes"] if n["node_type"] == "collector"]
     if collectors:
         doc["collectors"] = []
@@ -375,7 +374,6 @@ def _generate_pipeline_dict(
                     "opener": _require_node_key(c, "scope_opener", "Collector"),
                     "closer": c["id"],
                     "policy": _require_node_key(c, "scope_policy", "Collector"),
-                    "on_group_failure": _require_node_key(c, "scope_on_group_failure", "Collector"),
                 }
             )
 

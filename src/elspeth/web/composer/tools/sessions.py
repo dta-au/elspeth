@@ -1376,7 +1376,6 @@ def build_set_pipeline_candidate(
             scope_name=n.scope_name,
             scope_opener=n.scope_opener,
             scope_policy=n.scope_policy,
-            scope_on_group_failure=n.scope_on_group_failure,
         )
         # Validate every queue's intrinsic shape via the single shared guard
         # BEFORE the new state is assembled/assigned below, so a malformed
@@ -1882,13 +1881,6 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                                 "collectors — there is no default; the author decides whether a lost member fails the group."
                             ),
                         },
-                        "scope_on_group_failure": {
-                            "type": ["string", "null"],
-                            "description": (
-                                "require_all failure handling (collector only): 'quarantine' (default) or 'escalate' "
-                                "('escalate' requires an enclosing bound group)."
-                            ),
-                        },
                     },
                     "required": ["id", "node_type", "input"],
                 },
@@ -1901,8 +1893,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "(not a sink), no options/routing/policy/merge fields, optional timeout_seconds. "
                     "A collector closes a declared EXPAND scope: node_type='collector', a batch-aware plugin, "
                     "and the scope binding authored on the node — scope_name, scope_opener (the multi-row "
-                    "transform that opens the group), scope_policy ('require_all' or 'best_effort', no default), "
-                    "and optional scope_on_group_failure ('quarantine' default, or 'escalate')."
+                    "transform that opens the group), and scope_policy ('require_all' or 'best_effort', no default)."
                 ),
             },
             "edges": {

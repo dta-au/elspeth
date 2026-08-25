@@ -1938,7 +1938,6 @@ class _PipelineNodeModel(BaseModel):
     scope_name: str | None = None
     scope_opener: str | None = None
     scope_policy: str | None = None
-    scope_on_group_failure: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3703,7 +3702,6 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "scope_name",
                     "scope_opener",
                     "scope_policy",
-                    "scope_on_group_failure",
                 ),
                 sensitive_argument_keys=("options", "routes", "trigger"),
                 argument_summarizers={

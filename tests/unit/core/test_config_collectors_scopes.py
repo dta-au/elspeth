@@ -95,9 +95,13 @@ class TestScopeSettings:
         with pytest.raises(ValidationError):
             ScopeSettings(name="s", opener="explode", closer="stitch", policy="quorum")
 
-    def test_on_group_failure_defaults_to_quarantine(self) -> None:
-        s = ScopeSettings(name="s", opener="explode", closer="stitch", policy="require_all")
-        assert s.on_group_failure == "quarantine"
+    def test_on_group_failure_is_rejected(self) -> None:
+        # Deleted (ADR-042): group-failure handling is structural — a failed
+        # group escalates iff an enclosing bound group exists. The field is
+        # refused (extra="forbid") so a config declaring it fails loudly
+        # instead of carrying a value nothing reads.
+        with pytest.raises(ValidationError):
+            ScopeSettings(name="s", opener="explode", closer="stitch", policy="require_all", on_group_failure="quarantine")
 
 
 class TestElspethSettingsCrossRefs:

@@ -890,10 +890,12 @@ class CollectorExecutor:
     # integration) is the sole source of truth: it records whatever
     # terminal disposition it finds missing among `consumed_tokens`, full
     # stop, on every path — no flag to consult, none to keep in sync. The
-    # group verdict itself (escalation vs quarantine per
-    # `scope.on_group_failure`, survivor termination as `scope_group_failed`)
-    # is staged by that same seam consuming this `CollectorOutcome` — the
-    # executor renders, WS3 settles. Do not add escalation logic here, do
+    # group verdict itself is staged by that same seam consuming this
+    # `CollectorOutcome`, and it is STRUCTURAL: a failed group escalates
+    # iff an enclosing bound frame exists (outermost is terminal —
+    # quarantine); survivors terminate `scope_group_failed`. No config
+    # field selects the arm (the former `on_group_failure` was deleted) —
+    # the executor renders, WS3 settles. Do not add escalation logic here, do
     # not reintroduce a direct `record_token_outcome` call for arrived
     # members in this method, and do not resurrect `outcomes_recorded`.
 

@@ -86,15 +86,12 @@ _QUEUE_OPTION_KEYS: frozenset[str] = frozenset({"description"})
 # changes its default — the exact drift the normalisation is here to prevent.
 _COALESCE_RUNTIME_POLICY_DEFAULT: Final[str] = CoalesceSettings.model_fields["policy"].default
 _COALESCE_RUNTIME_MERGE_DEFAULT: Final[str] = CoalesceSettings.model_fields["merge"].default
-# Same one-owner rule for the scope binding: ``ScopeSettings.on_group_failure``
-# defaults to "quarantine" (core/config.py); ``ScopeSettings.policy`` is
+# Same one-owner rule for the scope binding: ``ScopeSettings.policy`` is
 # REQUIRED with no default (spec §3), so it deliberately has NO constant here —
 # a Stage-1 default may only RECORD a runtime default, never invent one.
-_SCOPE_RUNTIME_ON_GROUP_FAILURE_DEFAULT: Final[str] = ScopeSettings.model_fields["on_group_failure"].default
-# Closed vocabularies of the scope binding, read from the runtime Literals so
+# Closed vocabulary of the scope binding, read from the runtime Literal so
 # the two surfaces cannot disagree (typing.get_args over the annotation).
 _SCOPE_POLICY_VOCABULARY: Final[tuple[str, ...]] = get_args(ScopeSettings.model_fields["policy"].annotation)
-_SCOPE_ON_GROUP_FAILURE_VOCABULARY: Final[tuple[str, ...]] = get_args(ScopeSettings.model_fields["on_group_failure"].annotation)
 
 
 def _row_union_normalized_branches(node_type: str, branches: CoalesceBranches | None) -> CoalesceBranches | None:
@@ -600,11 +597,6 @@ class NodeSpec:
             REQUIRED for a collector with no default — ``ScopeSettings.policy``
             has none (spec §3), so Stage 1 must not invent one. None for
             non-collector nodes.
-        scope_on_group_failure: require_all failure handling ("quarantine" or
-            "escalate"), defaulted to "quarantine" for collectors so composer
-            state carries the handling the runtime will actually run
-            (``ScopeSettings.on_group_failure`` default). None for
-            non-collector nodes.
     """
 
     id: str
@@ -628,7 +620,6 @@ class NodeSpec:
     scope_name: str | None = None
     scope_opener: str | None = None
     scope_policy: str | None = None
-    scope_on_group_failure: str | None = None
 
     def __post_init__(self) -> None:
         # ``CoalesceSettings`` DEFAULTS both optional coalesce fields —
@@ -651,15 +642,10 @@ class NodeSpec:
             object.__setattr__(self, "merge", _COALESCE_RUNTIME_MERGE_DEFAULT)
         if self.node_type == "coalesce" and self.policy is None:
             object.__setattr__(self, "policy", _COALESCE_RUNTIME_POLICY_DEFAULT)
-        # Collector scope binding: ``ScopeSettings.on_group_failure`` has a
-        # runtime default ("quarantine"), so defaulting it here RECORDS a
-        # decision the runtime has already made — the same rule as the coalesce
-        # normalisation above. ``scope_policy`` is deliberately NOT defaulted:
-        # ``ScopeSettings.policy`` is REQUIRED with no default (spec §3), and a
-        # Stage-1 default may only record a runtime default, never invent one —
-        # ``validate()`` rejects the absence (collector_missing_scope) instead.
-        if self.node_type == "collector" and self.scope_on_group_failure is None:
-            object.__setattr__(self, "scope_on_group_failure", _SCOPE_RUNTIME_ON_GROUP_FAILURE_DEFAULT)
+        # ``scope_policy`` is deliberately NOT defaulted: ``ScopeSettings.policy``
+        # is REQUIRED with no default (spec §3), and a Stage-1 default may only
+        # record a runtime default, never invent one — ``validate()`` rejects
+        # the absence (collector_missing_scope) instead.
         # Do NOT extend this normalisation to ``on_error`` by analogy. The shapes
         # look identical and the remedies are inverted. ``merge`` has a runtime
         # DEFAULT to mirror (``CoalesceSettings.merge = "union"``), so defaulting
@@ -734,7 +720,6 @@ class NodeSpec:
             scope_name=d["scope_name"] if "scope_name" in d else None,
             scope_opener=d["scope_opener"] if "scope_opener" in d else None,
             scope_policy=d["scope_policy"] if "scope_policy" in d else None,
-            scope_on_group_failure=d["scope_on_group_failure"] if "scope_on_group_failure" in d else None,
         )
 
 
@@ -881,7 +866,6 @@ def queue_node_contract_error(node: NodeSpec) -> str | None:
         "scope_name": node.scope_name,
         "scope_opener": node.scope_opener,
         "scope_policy": node.scope_policy,
-        "scope_on_group_failure": node.scope_on_group_failure,
     }
     present = sorted(name for name, value in forbidden.items() if value is not None)
     if present:
@@ -989,7 +973,7 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
                 component,
                 f"Collector '{node.id}' does not accept field(s): {present}. A collector carries "
                 "plugin/input/on_success/on_error/options plus its scope binding "
-                "(scope_name/scope_opener/scope_policy/scope_on_group_failure).",
+                "(scope_name/scope_opener/scope_policy).",
                 "high",
                 "collector_config_invalid",
             )
@@ -1018,20 +1002,6 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
                 f"Valid values: {', '.join(_SCOPE_POLICY_VOCABULARY)}.",
                 "high",
                 "collector_scope_policy_invalid",
-            )
-        )
-
-    # None never reaches here: __post_init__ normalizes it (explicit null
-    # included) to the recorded runtime default before validate() runs, so
-    # this arm guards only non-None strings outside the vocabulary.
-    if node.scope_on_group_failure not in _SCOPE_ON_GROUP_FAILURE_VOCABULARY:
-        errors.append(
-            _err(
-                component,
-                f"Collector '{node.id}' scope_on_group_failure {node.scope_on_group_failure!r} is not a "
-                f"valid value. Valid values: {', '.join(_SCOPE_ON_GROUP_FAILURE_VOCABULARY)}.",
-                "high",
-                "collector_scope_on_group_failure_invalid",
             )
         )
 
@@ -1118,26 +1088,6 @@ def _collector_scope_topology_errors(nodes: tuple[NodeSpec, ...]) -> list[Valida
                 )
             )
 
-    barrier_ids = {node.id for node in nodes if node.node_type in ("coalesce", "row_union", "collector")}
-    for node in collectors:
-        if node.scope_on_group_failure != "escalate":
-            continue
-        other_barriers = barrier_ids - {node.id}
-        if other_barriers:
-            continue
-        opener = _scope_binding_value(node, "scope_opener") or "unset"
-        errors.append(
-            _err(
-                f"node:{node.id}",
-                f"Scope closed by collector '{node.id}' (opener '{opener}') declares "
-                "scope_on_group_failure: escalate, but the pipeline holds no other bound group — there "
-                "is no enclosing bound group to escalate to (spec §7 rule 8). Use "
-                "scope_on_group_failure: quarantine (terminal handling) at the outermost level, or nest "
-                "this scope inside another bound group.",
-                "high",
-                "scope_escalate_at_outermost",
-            )
-        )
     return errors
 
 
@@ -6345,8 +6295,6 @@ class CompositionState:
                 node_dict["scope_opener"] = node.scope_opener
             if node.scope_policy is not None:
                 node_dict["scope_policy"] = node.scope_policy
-            if node.scope_on_group_failure is not None:
-                node_dict["scope_on_group_failure"] = node.scope_on_group_failure
             result["nodes"].append(node_dict)
 
         for edge in self.edges:
@@ -6610,7 +6558,6 @@ class CompositionState:
                         ("scope_name", node.scope_name),
                         ("scope_opener", node.scope_opener),
                         ("scope_policy", node.scope_policy),
-                        ("scope_on_group_failure", node.scope_on_group_failure),
                     )
                     if value is not None
                 )
@@ -6620,7 +6567,7 @@ class CompositionState:
                             f"node:{node.id}",
                             f"Node '{node.id}' of type '{node.node_type}' does not accept collector scope "
                             f"field(s): {scope_fields_present}; only collector nodes carry "
-                            "scope_name/scope_opener/scope_policy/scope_on_group_failure.",
+                            "scope_name/scope_opener/scope_policy.",
                             "high",
                             "node_scope_fields_unsupported",
                         )

@@ -871,7 +871,6 @@ class TestTokenManagerRegisterExpandGroup:
             closer_name="page_stitcher",
             closer_kind=CloserKind.COLLECTOR,
             policy="require_all",
-            on_group_failure="quarantine",
             member_roster=(),
         )
         return GroupBindingRegistry(bindings=(binding,))

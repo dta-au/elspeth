@@ -71,7 +71,6 @@ def coalesce_binding(name: str, *, member_key: str = "path_a") -> GroupBinding:
         closer_name=name,
         closer_kind=CloserKind.COALESCE,
         policy="require_all",
-        on_group_failure=None,
         member_roster=(member_key,),
     )
 
@@ -388,7 +387,6 @@ def test_collector_closer_stages_only_and_defers_the_notify_to_intake(processor_
         closer_name="scope_collector",
         closer_kind=CloserKind.COLLECTOR,
         policy="require_all",
-        on_group_failure=None,
         member_roster=(),
     )
     proc = processor_with_bindings({("eg_scope", "tok-child"): collector_binding})

@@ -550,12 +550,6 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "region belongs to a scoped multi-row transform closed by a collector.",
     ),
     (
-        r"scope_escalate_at_outermost|escalate at an outermost bound group",
-        "The scope's failure policy escalates to an enclosing group, but the scope is outermost — nothing encloses it.",
-        "Set on_group_failure: quarantine on the outermost scope, or nest it inside a fork→coalesce "
-        "or another scope that will receive the escalation.",
-    ),
-    (
         r"on_error_closer_out_of_region|names closer .* but .* is not inside that closer's bound region",
         "on_error names a barrier closer, but the failing node is not inside that closer's bound region, "
         "so the closer has no membership to settle for it.",
@@ -604,18 +598,12 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         r"collector_config_invalid|Collector '(.+)' does not accept field",
         "The collector node carries fields outside its shape (gate, coalesce, or aggregation fields).",
         "Re-emit the collector with only plugin/input/on_success/on_error/options plus its scope "
-        "binding fields (scope_name/scope_opener/scope_policy/scope_on_group_failure).",
+        "binding fields (scope_name/scope_opener/scope_policy).",
     ),
     (
         r"collector_on_success_dangling|Collector '(.+)' on_success '(.+)' is neither a sink",
         "The collector's flush destination resolves to neither a declared sink nor a connection any downstream node consumes.",
         "Set the collector's on_success to a declared sink name, or add a downstream node whose input equals it.",
-    ),
-    (
-        r"collector_scope_on_group_failure_invalid|scope_on_group_failure .* is not a valid value",
-        "The collector's scope_on_group_failure is outside the closed failure-handling vocabulary.",
-        "Set scope_on_group_failure to 'quarantine' (terminal handling, the default) or 'escalate' "
-        "(hand the loss to the enclosing bound group — requires one).",
     ),
     (
         r"scope_name_duplicate|Scope name '(.+)' is declared twice",
@@ -635,8 +623,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"node_scope_fields_unsupported|does not accept collector scope field",
-        "A non-collector node carries scope_name/scope_opener/scope_policy/scope_on_group_failure, "
-        "which bind an EXPAND group only on collector nodes.",
+        "A non-collector node carries scope_name/scope_opener/scope_policy, which bind an EXPAND group only on collector nodes.",
         "Remove the scope_* fields from this node, or re-emit it as node_type='collector' if it is the group's closer.",
     ),
     (
@@ -913,7 +900,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         r"guided_collector_not_authorable|collector/scope authoring is not yet available in the guided lane",
         "The guided candidate contains a collector node, but collector/scope authoring is not yet available in the guided lane.",
         "Re-emit the candidate without any node_type='collector' node and without "
-        "scope_name/scope_opener/scope_policy/scope_on_group_failure fields; author the requested shape with "
+        "scope_name/scope_opener/scope_policy fields; author the requested shape with "
         "the guided lane's node kinds (transform, gate, aggregation, coalesce, row_union, queue).",
     ),
     (
@@ -1312,12 +1299,10 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "collector_plugin_not_batch_aware",
     "collector_config_invalid",
     "collector_on_success_dangling",
-    "collector_scope_on_group_failure_invalid",
     "scope_name_duplicate",
     "scope_opener_duplicate",
     "scope_name_invalid",
     "node_scope_fields_unsupported",
-    "scope_escalate_at_outermost",
     "structural_node_plugin_forbidden",
     "queue_no_consumer",
     "queue_name_collision",

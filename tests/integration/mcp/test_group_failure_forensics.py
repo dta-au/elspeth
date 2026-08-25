@@ -25,11 +25,12 @@ come off the graph, settings off ``ElspethSettings.collectors``/``.scopes``):
       -> closer collector ``page_stitcher`` -> sink
 
 Expected settlement (spec §6.3): the discarded sentence stages a
-``quarantined`` loss at ``sentence_stitcher``; the inner group FAILs and
-``on_group_failure: escalate`` stages a ``group_failed`` loss against fork
+``quarantined`` loss at ``sentence_stitcher``; the inner group FAILs and —
+structurally, because an enclosing bound frame exists (ADR-042; no config
+field selects the arm) — stages a ``group_failed`` loss against fork
 branch ``analysis`` at ``section_merge``; the coalesce FAILs and escalates a
 ``group_failed`` loss against page 0's member at ``page_stitcher``; the outer
-group FAILs and ``on_group_failure: quarantine`` handles it — the run
+group FAILs and, being outermost, handles it terminally (quarantine) — the run
 terminates by SETTLEMENT as ``COMPLETED_WITH_FAILURES``. Survivors (sentence
 0, branch ``summary``'s token, page 1's whole subtree) terminate
 ``scope_group_failed``.
@@ -154,12 +155,10 @@ scopes:
     opener: explode_pages
     closer: page_stitcher
     policy: require_all
-    on_group_failure: quarantine
   - name: sentence_scope
     opener: explode_sentences
     closer: sentence_stitcher
     policy: require_all
-    on_group_failure: escalate
 sinks:
   out:
     plugin: json
@@ -241,7 +240,8 @@ def _run_depth3_failure(tmp_path: Path) -> tuple[str, str]:
     with engine.connect() as conn:
         run_row = conn.execute(select(runs_table)).one()
     engine.dispose()
-    # COMPLETED-family, ratified: an outermost on_group_failure: quarantine is
+    # COMPLETED-family, ratified: an outermost group's failure is terminal
+    # (structural quarantine, ADR-042) and thereby a
     # HANDLED failure, so the run terminates by SETTLEMENT — and with this
     # run's only source row quarantined the exact family member is
     # COMPLETED_WITH_FAILURES. FAILED here means the construction crashed

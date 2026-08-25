@@ -1395,7 +1395,6 @@ class ScopeSettings(BaseModel):
             opener: pdf_explode
             closer: page_stitcher
             policy: require_all
-            on_group_failure: quarantine
     """
 
     model_config = {"frozen": True, "extra": "forbid"}
@@ -1405,10 +1404,6 @@ class ScopeSettings(BaseModel):
     closer: str = Field(description="Collector that closes the group; MUST name a collectors: entry")
     policy: Literal["require_all", "best_effort"] = Field(
         description="Group arrival policy. REQUIRED — no default (spec §3). quorum/first are deferred (spec decision 15).",
-    )
-    on_group_failure: Literal["quarantine", "escalate"] = Field(
-        default="quarantine",
-        description="require_all failure handling: quarantine the group's source row, or escalate one loss to the enclosing bound group (escalate requires one — §7 rule 8).",
     )
 
     @field_validator("name")

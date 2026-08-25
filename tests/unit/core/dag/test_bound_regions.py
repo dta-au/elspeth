@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Literal, get_args
+from typing import Any, ClassVar, get_args
 
 import pytest
 
@@ -371,7 +371,6 @@ def _build_partially_overlapping_regions() -> None:
         closer_name="coalesce1",
         closer_kind=CloserKind.COALESCE,
         policy="require_all",
-        on_group_failure=None,
         member_roster=("a", "b"),
     )
     binding2 = GroupBinding(
@@ -382,7 +381,6 @@ def _build_partially_overlapping_regions() -> None:
         closer_name="coalesce2",
         closer_kind=CloserKind.COALESCE,
         policy="require_all",
-        on_group_failure=None,
         member_roster=("c", "d"),
     )
     registry = GroupBindingRegistry(bindings=(binding1, binding2))
@@ -547,7 +545,6 @@ def _build_coalesce_with_external_branch_feed() -> None:
         closer_name="coalesce",
         closer_kind=CloserKind.COALESCE,
         policy="require_all",
-        on_group_failure=None,
         member_roster=("path_a", "path_b"),
     )
     registry = GroupBindingRegistry(bindings=(binding,))
@@ -1137,7 +1134,6 @@ def _build_crosslimb_no_path_violation() -> None:
         closer_name="coalesce",
         closer_kind=CloserKind.COALESCE,
         policy="require_all",
-        on_group_failure=None,
         member_roster=("a", "b"),
     )
     registry = GroupBindingRegistry(bindings=(binding,))
@@ -1384,9 +1380,7 @@ def _build_fork_coalesce_with_undeclared_expand_in_branch() -> ExecutionGraph:
     )
 
 
-def _build_fork_coalesce_with_scoped_expand_in_branch(
-    *, on_group_failure: Literal["quarantine", "escalate"] = "quarantine"
-) -> ExecutionGraph:
+def _build_fork_coalesce_with_scoped_expand_in_branch() -> ExecutionGraph:
     """Same shape as the undeclared case, but branch_a's expand is a
     declared scope whose collector closes BEFORE the coalesce
     (batch-in-fork-line — legal under ruling 28): source -> gate
@@ -1395,10 +1389,8 @@ def _build_fork_coalesce_with_scoped_expand_in_branch(
     feeds the coalesce's 'path_a' branch connection.
 
     The scope's binding nests inside the outer FORK->coalesce region
-    (depth 2), so ``on_group_failure`` defaults to "quarantine" (matching
-    ``ScopeSettings``'s own default) but a caller can pass "escalate" — rule
-    8 (spec §7, this task) legalizes escalate here precisely because an
-    enclosing bound group (the coalesce) exists at depth 1.
+    (depth 2), so an enclosing bound group (the coalesce) exists at depth 1
+    and a failed inner group escalates to it structurally (ADR-042).
     """
     source = _BoundRegionMockSource()
     branch_a = _BoundRegionMultiRowTransform(name="branch_a_expand", output_schema_config=SchemaConfig(mode="observed", fields=None))
@@ -1464,18 +1456,17 @@ def _build_fork_coalesce_with_scoped_expand_in_branch(
                 opener="branch_a_expand",
                 closer="page_stitcher",
                 policy="require_all",
-                on_group_failure=on_group_failure,
             )
         ],
     )
 
 
-def _build_top_level_scope(*, on_group_failure: Literal["quarantine", "escalate"]) -> ExecutionGraph:
+def _build_top_level_scope() -> ExecutionGraph:
     """A standalone scope (opener -> collector), no fork/coalesce anywhere.
 
     No enclosing bound region exists, so this scope's own binding is the
-    ONLY bound group in the graph — depth 1, outermost. Rule 8 (spec §7)
-    rejects ``escalate`` here: there is nowhere to escalate to.
+    ONLY bound group in the graph — depth 1, outermost: a group failure
+    here is terminal (nowhere to escalate to, ADR-042 structural handling).
     """
     source = _BoundRegionMockSource()
     opener = _BoundRegionMultiRowTransform(name="expand", output_schema_config=SchemaConfig(mode="observed", fields=None))
@@ -1511,7 +1502,6 @@ def _build_top_level_scope(*, on_group_failure: Literal["quarantine", "escalate"
                 opener="expand",
                 closer="stitcher",
                 policy="require_all",
-                on_group_failure=on_group_failure,
             )
         ],
     )
@@ -1563,7 +1553,6 @@ def _build_scope_closing_outside_region() -> None:
         closer_name="coalesce",
         closer_kind=CloserKind.COALESCE,
         policy="require_all",
-        on_group_failure=None,
         member_roster=("path_a", "path_b"),
     )
     scope_binding = GroupBinding(
@@ -1574,7 +1563,6 @@ def _build_scope_closing_outside_region() -> None:
         closer_name="page_stitcher",
         closer_kind=CloserKind.COLLECTOR,
         policy="require_all",
-        on_group_failure="quarantine",
         member_roster=(),
     )
     registry = GroupBindingRegistry(bindings=(fork_binding, scope_binding))
@@ -2162,33 +2150,27 @@ class TestRule6AggregatorBan:
             _build_aggregation_alongside_nested_scope_in_a_branch()
 
 
-class TestEscalateAtOutermost:
-    """Spec §7 rule 8 (standing ruling): escalate requires an enclosing
-    bound group; outermost closers declare terminal handling.
+class TestGroupFailureHandlingIsStructural:
+    """Group-failure handling is structural (ADR-042): a failed group
+    escalates iff an enclosing bound group exists; the outermost group is
+    terminal. The former ``on_group_failure`` field is deleted — depth is
+    the only input, pinned here at both depths over REAL computed regions.
     """
 
-    def test_escalate_on_outermost_scope_rejected(self) -> None:
-        with pytest.raises(GraphValidationError, match="escalate at an outermost bound group"):
-            _build_top_level_scope(on_group_failure="escalate")
-
-    def test_escalate_on_nested_scope_is_legal(self) -> None:
+    def test_nested_scope_computes_depth_2(self) -> None:
         # A REAL nested region (not a fixture with hand-set depth): the
         # scope's own binding computes to depth 2 via compute_bound_regions
         # because it is genuinely nested inside the outer fork->coalesce
-        # region's span — an enclosing bound group exists.
-        graph = _build_fork_coalesce_with_scoped_expand_in_branch(on_group_failure="escalate")
-        assert graph is not None
+        # region's span — an enclosing bound group exists to escalate to.
+        graph = _build_fork_coalesce_with_scoped_expand_in_branch()
         regions = graph.get_bound_regions()
         scope_region = next(r for r in regions if r.binding.closer_kind == CloserKind.COLLECTOR)
         assert scope_region.depth == 2
-        assert scope_region.binding.on_group_failure == "escalate"
 
-    def test_quarantine_on_outermost_scope_is_legal(self) -> None:
-        graph = _build_top_level_scope(on_group_failure="quarantine")
-        assert graph is not None
+    def test_top_level_scope_computes_depth_1(self) -> None:
+        graph = _build_top_level_scope()
         (region,) = graph.get_bound_regions()
         assert region.depth == 1
-        assert region.binding.on_group_failure == "quarantine"
 
 
 class TestRule7RosterAuthorityIsStructural:

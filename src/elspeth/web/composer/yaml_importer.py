@@ -40,7 +40,7 @@ _UNSUPPORTED_COALESCE_FIELDS = frozenset(
 )
 _ROW_UNION_FIELDS = frozenset({"name", "branches", "on_success", "timeout_seconds", "input"})
 _COLLECTOR_FIELDS = frozenset({"name", "plugin", "input", "on_success", "on_error", "options"})
-_SCOPE_FIELDS = frozenset({"name", "opener", "closer", "policy", "on_group_failure"})
+_SCOPE_FIELDS = frozenset({"name", "opener", "closer", "policy"})
 # Recognised top-level pipeline sections. A parsed document that is a
 # mapping but shares none of these keys is not a pipeline export at all
 # (see the guard in composition_state_from_runtime_yaml).
@@ -391,7 +391,7 @@ def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section:
     """Fold ``collectors:`` and ``scopes:`` into collector NodeSpecs.
 
     A collector NodeSpec carries its scope binding directly
-    (``scope_name``/``scope_opener``/``scope_policy``/``scope_on_group_failure``,
+    (``scope_name``/``scope_opener``/``scope_policy``,
     barrier-scopes spec §3), so each ``scopes:`` entry locates its closer's
     NodeSpec and populates those fields. A scope whose closer matches no
     collector is a reference error here — the composer state has nowhere to
@@ -446,10 +446,6 @@ def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section:
                 scope_name=_require_nonblank_str(entry, "name", path),
                 scope_opener=_require_nonblank_str(entry, "opener", path),
                 scope_policy=_require_nonblank_str(entry, "policy", path),
-                # Omitted on_group_failure stays None here; NodeSpec.__post_init__
-                # records the runtime default ("quarantine") exactly as the
-                # coalesce merge/policy normalisation does.
-                scope_on_group_failure=_optional_str(entry, "on_group_failure"),
             )
     return collector_nodes
 

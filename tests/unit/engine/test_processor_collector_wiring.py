@@ -256,7 +256,6 @@ def _expand_binding(opener_node: NodeID) -> GroupBindingRegistry:
                 closer_name="stitch",
                 closer_kind=CloserKind.COLLECTOR,
                 policy="require_all",
-                on_group_failure=None,
                 member_roster=(),
             ),
         )
@@ -322,7 +321,6 @@ class TestReleaseCursorDerivation:
                     closer_name="outer_stitch",
                     closer_kind=CloserKind.COLLECTOR,
                     policy="require_all",
-                    on_group_failure=None,
                     member_roster=(),
                 ),
             )
@@ -388,7 +386,6 @@ class TestReleaseCursorWalk:
                     closer_name=str(STITCH),
                     closer_kind=CloserKind.COLLECTOR,
                     policy="require_all",
-                    on_group_failure=None,
                     member_roster=(),
                 ),
                 GroupBinding(
@@ -399,7 +396,6 @@ class TestReleaseCursorWalk:
                     closer_name="outer_stitch",
                     closer_kind=CloserKind.COLLECTOR,
                     policy="require_all",
-                    on_group_failure=None,
                     member_roster=(),
                 ),
             )
@@ -532,7 +528,6 @@ class TestNestedReleaseCursor:
                     closer_name="outer_stitch",
                     closer_kind=CloserKind.COLLECTOR,
                     policy="require_all",
-                    on_group_failure=None,
                     member_roster=(),
                 ),
             )
@@ -665,7 +660,6 @@ class TestDepthTwoReleaseHoldsAtTheCollector:
                     closer_name="stitch",
                     closer_kind=CloserKind.COLLECTOR,
                     policy="require_all",
-                    on_group_failure=None,
                     member_roster=(),
                 ),
             )

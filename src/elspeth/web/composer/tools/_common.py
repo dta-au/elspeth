@@ -1394,7 +1394,6 @@ def _serialize_node(node: NodeSpec) -> dict[str, Any]:
         "scope_name": node.scope_name,
         "scope_opener": node.scope_opener,
         "scope_policy": node.scope_policy,
-        "scope_on_group_failure": node.scope_on_group_failure,
     }
 
 
@@ -3059,7 +3058,6 @@ class _SetPipelineNodePayload(TypedDict):
     scope_name: str | None
     scope_opener: str | None
     scope_policy: str | None
-    scope_on_group_failure: str | None
 
 
 def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonValue]:

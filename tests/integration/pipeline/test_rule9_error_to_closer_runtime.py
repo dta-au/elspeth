@@ -392,7 +392,6 @@ scopes:
     opener: explode
     closer: page_stitcher
     policy: require_all
-    on_group_failure: quarantine
 sinks:
   output:
     plugin: json

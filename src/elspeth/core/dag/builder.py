@@ -33,7 +33,6 @@ from elspeth.core.canonical import canonical_json
 from elspeth.core.dag.bound_regions import (
     compute_bound_regions,
     derive_escalation_fixpoint_bound,
-    validate_escalation_targets,
     validate_no_aggregations_in_regions,
     validate_openers_bound_in_region,
     validate_sese_regions,
@@ -712,7 +711,6 @@ def build_execution_graph(
                     "name": scope.name,
                     "opener": scope.opener,
                     "policy": scope.policy,
-                    "on_group_failure": scope.on_group_failure,
                 },
             }
             col_id = node_id("collector", collector_name, collector_node_config)
@@ -1934,7 +1932,6 @@ def build_execution_graph(
     # branches), RowUnionSettings carries no policy field at all (v1 arrival
     # policy is require_all unconditionally), and AggregationSettings stays
     # policy-free. Do not add a runtime check here — it can never fire.
-    validate_escalation_targets(regions)
 
     # ===== RULE 9: on_error may target the enclosing region's closer (spec §7 rule 9) =====
     # Resolve the deferrals collected above, now that region membership is
