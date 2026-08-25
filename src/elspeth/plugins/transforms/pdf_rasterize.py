@@ -322,7 +322,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:811a0a79091de524"
+    source_file_hash: str | None = "sha256:b0eeeb93b2971cb8"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -567,12 +567,12 @@ class PDFRasterize(BaseTransform):
             {"page_number": refused.page_number, "kind": refused.kind.value, "detail": refused.detail} for refused in response.refused
         ]
 
-        if response.refused and (self._on_page_failure == "fail_document" or not response.rendered):
-            size_only = all(refused.kind in _SIZE_REFUSALS for refused in response.refused)
-            if size_only:
+        if not response.rendered:
+            if response.refused:
+                size_only = all(refused.kind in _SIZE_REFUSALS for refused in response.refused)
                 return TransformResult.error(
                     {
-                        "reason": "pdf_page_too_large",
+                        "reason": "pdf_page_too_large" if size_only else "pdf_page_render_failed",
                         "field": field_name,
                         "blob_ref": blob_ref,
                         "refused_pages": refused_entries,
@@ -580,9 +580,25 @@ class PDFRasterize(BaseTransform):
                     },
                     retryable=False,
                 )
+            # Zero pages rendered AND zero pages refused: the renderer reported an
+            # empty document (page_count == 0) with nothing to explain why. Not one
+            # of the typed page-refusal kinds — treat the document itself as
+            # malformed rather than crash building an output row from nothing.
             return TransformResult.error(
                 {
-                    "reason": "pdf_page_render_failed",
+                    "reason": "pdf_malformed",
+                    "field": field_name,
+                    "blob_ref": blob_ref,
+                    "detail": "document has no pages",
+                },
+                retryable=False,
+            )
+
+        if response.refused and self._on_page_failure == "fail_document":
+            size_only = all(refused.kind in _SIZE_REFUSALS for refused in response.refused)
+            return TransformResult.error(
+                {
+                    "reason": "pdf_page_too_large" if size_only else "pdf_page_render_failed",
                     "field": field_name,
                     "blob_ref": blob_ref,
                     "refused_pages": refused_entries,
@@ -604,6 +620,15 @@ class PDFRasterize(BaseTransform):
             output[self._page_width_field] = page.width_px
             output[self._page_height_field] = page.height_px
             output_rows.append(output)
+
+        first_keys = set(output_rows[0])
+        for index, output_row in enumerate(output_rows[1:], start=1):
+            row_keys = set(output_row)
+            if row_keys != first_keys:
+                raise ValueError(
+                    f"Multi-row output has heterogeneous schema: row 0 has fields {sorted(first_keys)}, "
+                    f"row {index} has fields {sorted(row_keys)}"
+                )
 
         output_contract = narrow_contract_to_output(input_contract=row.contract, output_row=output_rows[0])
         output_contract = self._apply_declared_output_field_contracts(output_contract)

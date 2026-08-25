@@ -156,6 +156,35 @@ def test_fail_document_uses_too_large_reason_for_size_refusals(store: Filesystem
     assert result.reason["reason"] == "pdf_page_too_large"
 
 
+def test_fully_empty_response_is_pdf_malformed_not_a_crash(store: FilesystemPayloadStore) -> None:
+    """A renderer reporting zero pages AND zero refusals (page_count=0, nothing to explain
+
+    why) must not crash building an output row from an empty rendered tuple — it is a
+    typed pdf_malformed row error instead. Regression test for fix round 1 finding #1.
+    """
+    ref = store.store(minimal_pdf(1))
+    response = RasterizeResponse(page_count=0, rendered=(), refused=())
+    result = _transform(store, _StubRenderer(response)).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "error"
+    assert result.reason["reason"] == "pdf_malformed"
+    assert result.reason["blob_ref"] == ref
+    assert result.reason["detail"] == "document has no pages"
+
+
+def test_zero_survivors_with_refusals_maps_per_kind_regardless_of_policy(store: FilesystemPayloadStore) -> None:
+    """The zero-rendered-with-refusals path is unconditional on on_page_failure — confirms
+
+    the fix-round-1 restructure (moving this check ahead of the fail_document/emit_rendered
+    branch) preserves the existing per-kind mapping under emit_rendered too.
+    """
+    ref = store.store(minimal_pdf(1))
+    response = RasterizeResponse(page_count=1, rendered=(), refused=(RefusedPage(1, PageRefusalKind.OVERSIZE_PIXELS, "huge"),))
+    result = _transform(store, _StubRenderer(response), on_page_failure="emit_rendered").process(
+        make_pipeline_row({"blob_ref": ref}), make_context()
+    )
+    assert result.status == "error" and result.reason["reason"] == "pdf_page_too_large"
+
+
 def test_emit_rendered_emits_surviving_pages_and_records_the_gaps(store: FilesystemPayloadStore) -> None:
     ref = store.store(minimal_pdf(3))
     response = RasterizeResponse(
