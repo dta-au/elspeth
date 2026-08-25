@@ -35,7 +35,7 @@ from elspeth.contracts import TokenInfo, TransformProtocol
 from elspeth.contracts.barrier_scalars import BarrierScalars, CoalescePendingScalars
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath, TriggerType
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import RowResult
 from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
@@ -419,6 +419,20 @@ class TestCoalesceIntakeTaxonomy:
         assert len(outcome.results) == 1
         assert outcome.results[0].outcome is TerminalOutcome.FAILURE
         assert scheduler.release_contexts and scheduler.release_contexts[0]["late_arrival"] is True
+
+    def test_late_arrival_without_a_reason_is_an_executor_contract_violation(self) -> None:
+        """ADR-042: the two late-arrival flavors are not interchangeable, so the
+        coordinator never defaults a missing reason — it fails closed before
+        any release write."""
+        row = _blocked_row(barrier_key=str(_COALESCE))
+        scheduler = RecordingScheduler(pending=[row])
+        coalesce = RecordingCoalesceExecutor(CoalesceOutcome(held=False, failure_reason=None, late_arrival=True))
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE))}
+        coordinator = _make_coordinator(scheduler=scheduler, coalesce_executor=coalesce, live_holds=holds)
+
+        with pytest.raises(OrchestrationInvariantError, match="no failure_reason"):
+            coordinator.run_intake_pass(_ctx())
+        assert scheduler.release_contexts == []
 
     def test_nonterminal_merge_returns_ready_continuation(self) -> None:
         row = _blocked_row(barrier_key=str(_COALESCE))

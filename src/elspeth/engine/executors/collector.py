@@ -18,7 +18,7 @@ import structlog
 
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TokenInfo
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     ExecutionError,
@@ -59,8 +59,10 @@ class CollectorOutcome:
     consumed_tokens: tuple[TokenInfo, ...] = ()
     collector_name: str | None = None
     group_id: str | None = None
-    failure_reason: str | None = None  # "collector_missing_members" | "collector_transform_error" | "empty_expansion" | None
-    closed_without_plugin: str | None = None  # "all_members_lost" | "empty_expansion" | None
+    # "collector_missing_members" | "collector_transform_error" | GroupSettlementReason.EMPTY_EXPANSION | None
+    failure_reason: str | None = None
+    # GroupSettlementReason.ALL_MEMBERS_LOST | GroupSettlementReason.EMPTY_EXPANSION | None (ADR-042 closed vocabulary)
+    closed_without_plugin: str | None = None
 
     def __post_init__(self) -> None:
         if self.held and (self.released_tokens or self.failure_reason is not None):
@@ -528,14 +530,14 @@ class CollectorExecutor:
                 held=False,
                 collector_name=collector_name,
                 group_id=group_id,
-                failure_reason="empty_expansion",
-                closed_without_plugin="empty_expansion",
+                failure_reason=GroupSettlementReason.EMPTY_EXPANSION.value,
+                closed_without_plugin=GroupSettlementReason.EMPTY_EXPANSION.value,
             )
         return CollectorOutcome(
             held=False,
             collector_name=collector_name,
             group_id=group_id,
-            closed_without_plugin="empty_expansion",
+            closed_without_plugin=GroupSettlementReason.EMPTY_EXPANSION.value,
         )
 
     def restore_from_journal(
@@ -802,7 +804,7 @@ class CollectorExecutor:
                 held=False,
                 collector_name=collector_name,
                 group_id=group_id,
-                closed_without_plugin="all_members_lost",
+                closed_without_plugin=GroupSettlementReason.ALL_MEMBERS_LOST.value,
             )
         return self._execute_flush(collector_name, key, pending, ctx)
 

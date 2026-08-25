@@ -20,7 +20,7 @@ from elspeth.contracts.barrier_scalars import CoalescePendingScalars
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
 from elspeth.contracts.coalesce_metadata import ArrivalOrderEntry, CoalesceMetadata
 from elspeth.contracts.engine import CoalesceParentCompletion
-from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import GroupSettlementReason, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     CoalesceCollisionError,
@@ -522,9 +522,14 @@ class CoalesceExecutor:
         self._pending: dict[tuple[str, str], _PendingCoalesce] = {}
         # Completed coalesces: tracks keys that have already merged/failed
         # Used to detect late arrivals after merge and reject them gracefully
-        # Uses OrderedDict as bounded FIFO set to prevent unbounded memory growth
-        # (values are None, we only care about key presence and insertion order)
-        self._completed_keys: OrderedDict[tuple[str, str], None] = OrderedDict()
+        # Uses OrderedDict as bounded FIFO map to prevent unbounded memory growth.
+        # The value is the closure FLAVOR (ADR-042 / spec §6.4): True = the
+        # group RELEASED by a successful merge, False = it FAILED closed,
+        # None = flavor not known in memory (restore-seeded or backfilled from
+        # the plain-completion Landscape lookup) — the late-arrival arm then
+        # asks the Landscape's released-status point lookup, exactly as
+        # row_union keeps its own per-key closed reason.
+        self._completed_keys: OrderedDict[tuple[str, str], bool | None] = OrderedDict()
         # Maximum completed keys to retain (prevents OOM in long-running pipelines).
         # Configurable to match source cardinality and memory budget.
         self._max_completed_keys: int = max_completed_keys
@@ -682,7 +687,10 @@ class CoalesceExecutor:
         self._pending.clear()
         self._completed_keys.clear()
         for completed_key in restored.completed_keys:
-            self._mark_completed(completed_key)
+            # The restorer enumerates COMPLETED keys (merged OR failed); the
+            # flavor is resolved lazily by the late-arrival arm's released-
+            # status point lookup, so seed it as unknown, never as merged.
+            self._mark_completed(completed_key, merged=None)
         for group in restored.pending:
             self._pending[group.key] = _PendingCoalesce(
                 branches={
@@ -729,11 +737,13 @@ class CoalesceExecutor:
         node_id = self._node_ids[coalesce_name]
 
         if self._barrier_restore_reads.has_completed_group_for_node(run_id=self._run_id, node_id=str(node_id), group_id=fork_group_id):
-            self._mark_completed((coalesce_name, fork_group_id))
+            # Plain completion says nothing about the flavor; leave it for
+            # the late-arrival arm's released-status lookup.
+            self._mark_completed((coalesce_name, fork_group_id), merged=None)
             return True
         return False
 
-    def _mark_completed(self, key: tuple[str, str]) -> None:
+    def _mark_completed(self, key: tuple[str, str], *, merged: bool | None) -> None:
         """Mark a coalesce key as completed with bounded memory.
 
         Uses FIFO eviction to prevent unbounded memory growth in long-running
@@ -743,8 +753,11 @@ class CoalesceExecutor:
 
         Args:
             key: (coalesce_name, fork_group_id) tuple to mark as completed
+            merged: closure flavor — True after a successful merge, False
+                after a failed closure, None when the caller does not know
+                (restore seeding / plain-completion backfill).
         """
-        self._completed_keys[key] = None
+        self._completed_keys[key] = merged
         # Evict oldest entries if over capacity.
         # Eviction is harmless: Landscape fallback in accept() catches
         # late arrivals for evicted keys.
@@ -828,9 +841,23 @@ class CoalesceExecutor:
         # source of truth. Evicted FIFO entries are rediscovered from
         # the Landscape, eliminating the eviction window.
         if key in self._completed_keys or self._check_landscape_for_completion(coalesce_name, fork_group_id):
-            # Late arrival after merge/failure already happened
-            # Record failure audit trail for this late token
-            failure_reason = "late_arrival_after_merge"
+            # Late arrival after merge/failure already happened.
+            # Record failure audit trail for this late token, with the
+            # CLOSED-vocabulary reason discriminated by how the group closed
+            # (ADR-042 / spec §2): a member arriving after a FAILED group is
+            # `scope_group_failed`, never `late_arrival_after_merge`. The
+            # in-memory flavor is authoritative when known; otherwise the
+            # durable discriminator is a status-COMPLETED node_state at the
+            # closer (a failed closure sets completed_at too).
+            merged = self._completed_keys[key]
+            if merged is None:
+                merged = self._barrier_restore_reads.has_released_group_for_node(
+                    run_id=self._run_id, node_id=str(node_id), group_id=fork_group_id
+                )
+                self._mark_completed(key, merged=merged)
+            failure_reason = (
+                GroupSettlementReason.LATE_ARRIVAL_AFTER_MERGE.value if merged else GroupSettlementReason.SCOPE_GROUP_FAILED.value
+            )
             state = self._execution.begin_node_state(
                 token_id=token.token_id,
                 node_id=node_id,
@@ -865,7 +892,11 @@ class CoalesceExecutor:
                 consumed_tokens=(token,),
                 coalesce_metadata=CoalesceMetadata.for_late_arrival(
                     policy=CoalescePolicy(settings.policy),
-                    reason="Siblings already merged/failed, this token arrived too late",
+                    reason=(
+                        "Siblings already merged, this token arrived too late"
+                        if merged
+                        else "Group already failed closed, this token arrived after its failure"
+                    ),
                 ),
                 coalesce_name=coalesce_name,
                 late_arrival=True,
@@ -1068,7 +1099,7 @@ class CoalesceExecutor:
             # enclosing bound frame.
 
         del self._pending[key]
-        self._mark_completed(key)
+        self._mark_completed(key, merged=False)
 
         if metadata is None:
             metadata = CoalesceMetadata.for_failure(
@@ -1209,7 +1240,7 @@ class CoalesceExecutor:
 
             # Clean up pending state and mark as completed
             del self._pending[key]
-            self._mark_completed(key)  # Track completion to reject late arrivals (bounded)
+            self._mark_completed(key, merged=True)  # Track completion to reject late arrivals (bounded)
 
             return CoalesceOutcome(
                 held=False,
@@ -1278,8 +1309,9 @@ class CoalesceExecutor:
                 )
 
             # Clean up pending state only after every cleanup audit write succeeds.
+            # The merge raised: the group never released, so it closed FAILED.
             del self._pending[key]
-            self._mark_completed(key)
+            self._mark_completed(key, merged=False)
 
             raise
 

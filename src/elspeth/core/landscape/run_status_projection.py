@@ -7,6 +7,7 @@ import json
 from sqlalchemy import func, select
 
 from elspeth.contracts import NodeStateStatus, NodeType
+from elspeth.contracts.enums import GroupSettlementReason
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape._database_ops import ReadOnlyDatabaseOps
 from elspeth.core.landscape.schema import (
@@ -207,7 +208,7 @@ class AuditRunStatusProjection:
             # ExecutionError shapes with no failure_reason — is a real failed
             # barrier. .get() reads the optional discriminator across the valid
             # payload shapes without crashing on the keyless one.
-            if error_payload.get("failure_reason") in {"late_arrival_after_merge", "late_arrival_after_release"}:
+            if error_payload.get("failure_reason") in {GroupSettlementReason.LATE_ARRIVAL_AFTER_MERGE.value, "late_arrival_after_release"}:
                 continue
             failed_barriers.add((db_row.node_id, db_row.row_id))
         return len(failed_barriers)

@@ -102,6 +102,12 @@ def _restore_reads_from_execution_double(execution: MagicMock) -> SimpleNamespac
         # WS4 Task 10: restore_from_journal's completed-key reconstruction
         # now queries the group-keyed sibling too.
         get_completed_group_ids_for_nodes=execution.get_completed_group_ids_for_nodes,
+        # WS6 Task 6 (ADR-042): the late-arrival arm resolves the closure
+        # FLAVOR for a key whose in-memory flavor is unknown (restore-seeded
+        # or Landscape-backfilled) through the released-status point lookup.
+        # Default False = "completed but not released" = scope_group_failed;
+        # a test modelling a MERGED group sets return_value = True.
+        has_released_group_for_node=execution.has_released_group_for_node,
     )
 
 
@@ -243,6 +249,8 @@ def _make_executor(
     _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
     execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
     execution.has_completed_group_for_node.return_value = False
+    execution.has_released_group_for_node = _read_model_autospec.has_released_group_for_node
+    execution.has_released_group_for_node.return_value = False
     # WS4 Task 10: restore's completed-key reconstruction now queries the
     # group-keyed sibling too.
     execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
@@ -290,6 +298,8 @@ def _make_raw_executor(
     _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
     execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
     execution.has_completed_group_for_node.return_value = False
+    execution.has_released_group_for_node = _read_model_autospec.has_released_group_for_node
+    execution.has_released_group_for_node.return_value = False
     # WS4 Task 10: restore's completed-key reconstruction now queries the
     # group-keyed sibling too.
     execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
@@ -2015,14 +2025,14 @@ class TestMarkCompleted:
         executor, *_ = _make_executor()
         executor._max_completed_keys = 5
         for i in range(10):
-            executor._mark_completed(("c", f"row_{i}"))
+            executor._mark_completed(("c", f"row_{i}"), merged=True)
         assert len(executor._completed_keys) == 5
 
     def test_fifo_eviction_oldest_removed(self):
         executor, *_ = _make_executor()
         executor._max_completed_keys = 3
         for i in range(5):
-            executor._mark_completed(("c", f"row_{i}"))
+            executor._mark_completed(("c", f"row_{i}"), merged=True)
         # Oldest (row_0, row_1) should be evicted; row_2, row_3, row_4 remain
         assert ("c", "row_0") not in executor._completed_keys
         assert ("c", "row_1") not in executor._completed_keys
@@ -2033,8 +2043,8 @@ class TestMarkCompleted:
     def test_idempotent_mark(self):
         """Marking the same key twice does not create duplicates."""
         executor, *_ = _make_executor()
-        executor._mark_completed(("c", "row_1"))
-        executor._mark_completed(("c", "row_1"))
+        executor._mark_completed(("c", "row_1"), merged=True)
+        executor._mark_completed(("c", "row_1"), merged=True)
         assert len(executor._completed_keys) == 1
 
     def test_default_max_is_10000(self):
@@ -2394,6 +2404,8 @@ class TestDefaultClock:
         _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
         execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
         execution.has_completed_group_for_node.return_value = False
+        execution.has_released_group_for_node = _read_model_autospec.has_released_group_for_node
+        execution.has_released_group_for_node.return_value = False
         execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
         execution.get_completed_group_ids_for_nodes.return_value = set()
         executor = CoalesceExecutor(
@@ -2415,6 +2427,8 @@ class TestDefaultClock:
         _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
         execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
         execution.has_completed_group_for_node.return_value = False
+        execution.has_released_group_for_node = _read_model_autospec.has_released_group_for_node
+        execution.has_released_group_for_node.return_value = False
         execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
         execution.get_completed_group_ids_for_nodes.return_value = set()
         executor = CoalesceExecutor(
@@ -2965,11 +2979,16 @@ class TestLandscapeCompletedKeys:
         # way a spec-generated attribute is), so it needs its own reset.
         execution.has_completed_group_for_node.reset_mock()
         execution.has_completed_group_for_node.return_value = True
+        # The backfilled key's flavor is unknown in memory; the Landscape says
+        # the group RELEASED (ADR-042 discriminator), so the reason is merge.
+        execution.has_released_group_for_node.return_value = True
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_0")
         outcome = executor.accept(late, "merge")
 
         assert outcome.held is False
         assert outcome.failure_reason == "late_arrival_after_merge"
+        execution.has_released_group_for_node.assert_called_once_with(run_id="run_1", node_id="node_1", group_id="row_0")
+        assert executor._completed_keys[("merge", "row_0")] is True
         execution.has_completed_group_for_node.assert_called_once_with(run_id="run_1", node_id="node_1", group_id="row_0")
         # Key should now be in the FIFO cache (backfilled from Landscape)
         assert ("merge", "row_0") in executor._completed_keys
@@ -3411,11 +3430,24 @@ class TestRestoreFromJournal:
 
         assert ("merge", "row_0") in executor._completed_keys
         assert ("merge", "row_9") in executor._completed_keys
+        # Restore seeds COMPLETED keys with the flavor UNKNOWN (None), never
+        # as merged — the enumeration cannot tell a merge from a failure.
+        assert executor._completed_keys[("merge", "row_0")] is None
 
+        # Flavor resolved lazily: this group RELEASED, so the reason is merge.
+        execution.has_released_group_for_node.return_value = True
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_0")
         outcome = executor.accept(late, "merge")
         assert outcome.held is False
         assert outcome.failure_reason == "late_arrival_after_merge"
+
+        # The failed twin: a restore-seeded key whose group never released
+        # answers scope_group_failed (ADR-042 / spec §2).
+        execution.has_released_group_for_node.return_value = False
+        late_failed = _make_token(branch_name="a", token_id="t_late_failed", row_id="row_9")
+        failed_outcome = executor.accept(late_failed, "merge")
+        assert failed_outcome.held is False
+        assert failed_outcome.failure_reason == "scope_group_failed"
 
     def test_restore_from_journal_keeps_completed_keys_bounded(self) -> None:
         """Restore seeds the FIFO cache through the bounded completion path."""

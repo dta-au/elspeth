@@ -61,6 +61,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [039](039-unconstrained-text-framing.md) | Unconstrained Text Framing — A Positive Claim That Makes Generative Producers Gateable | 2026-08-07 | **Accepted** |
 | [040](040-composer-runtime-validation-posture.md) | The Composer/Runtime Validation Posture — Soundness, Placement, and Per-Rule Authority | 2026-08-07 | **Accepted** |
 | [041](041-state-engine-supported-profiles.md) | State-Engine Supported Profiles | 2026-08-11 | **Accepted** |
+| [042](042-group-settlement-observability.md) | Group Settlement Vocabulary and Observability — One Closed Reason Set for Coalesce/Scope Settlement, One Lineage Read Authority | 2026-08-25 | **Accepted** |
 
 ## Status Definitions
 

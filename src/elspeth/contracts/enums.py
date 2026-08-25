@@ -298,6 +298,31 @@ if _paths_overlap:
         f"disjoint (a path is either terminal-paired or non-terminal, never both)."
     )
 
+
+class GroupSettlementReason(StrEnum):
+    """Closed vocabulary for coalesce / scope-failure group-settlement
+    dispositions (unified-lineage spec §2/§6.4, ADR-042).
+
+    The StrEnum IS the vocabulary: emission sites reference these members,
+    never string literals. ``SCOPE_GROUP_FAILED`` is the reason for a member
+    terminated because its group had already FAILED when the member arrived
+    — never ``LATE_ARRIVAL_AFTER_MERGE``, which is reserved for arrival after
+    a SUCCESSFUL merge. The durable discriminator is release status at the
+    closer (``has_released_group_for_node``: a status-COMPLETED node_state),
+    not completion — a failed closure sets ``completed_at`` too.
+
+    SCOPE (META-9.3): coalesce and scope/collector closers only. row_union's
+    own closed reasons (``row_union_branch_lost``, ``late_arrival_after_release``,
+    ``row_union_group_failed`` in ``engine/row_union_executor.py``) are a
+    sibling vocabulary and stay outside this enum by ruling.
+    """
+
+    LATE_ARRIVAL_AFTER_MERGE = "late_arrival_after_merge"
+    SCOPE_GROUP_FAILED = "scope_group_failed"
+    EMPTY_EXPANSION = "empty_expansion"
+    ALL_MEMBERS_LOST = "all_members_lost"
+
+
 # Outcome exhaustiveness: every TerminalOutcome value MUST be the lifecycle
 # answer for at least one legal terminal pair.  An unused outcome would mean
 # the enum has dead values that no producer can emit — drift from the ADR.

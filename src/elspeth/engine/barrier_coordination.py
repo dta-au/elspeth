@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 from elspeth.contracts import RowResult, TokenInfo, TransformProtocol
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierScalars, CoalescePendingScalars
-from elspeth.contracts.enums import BatchStatus, FrameKind, TerminalOutcome, TerminalPath, TriggerType
+from elspeth.contracts.enums import BatchStatus, FrameKind, GroupSettlementReason, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.identity import LineageFrame, path_fork_group_id
@@ -540,10 +540,21 @@ class BarrierIntakeCoordinator:
             # ordering); with no escalation here the drained group_losses
             # are always empty, but the ordering and the single
             # mark_blocked_barrier_terminal transaction stay the one channel.
+            # ADR-042: the executor's late arm always sets a closed-vocabulary
+            # reason (`late_arrival_after_merge` after a merge,
+            # `scope_group_failed` after a failed closure). A missing reason
+            # is an executor contract violation — never default it, because
+            # the two flavors are not interchangeable.
+            if outcome.failure_reason is None:
+                raise OrchestrationInvariantError(
+                    f"Late-arrival CoalesceOutcome for token {token.token_id!r} at coalesce {coalesce_name!r} "
+                    f"(run {self._run_id!r}) carries no failure_reason; the executor must emit a GroupSettlementReason."
+                )
+            late_reason: str = outcome.failure_reason
             late_child_items: list[WorkItem] = []
             late_cascaded_results = self._record_group_member_terminals(
                 tuple(outcome.consumed_tokens),
-                failure_reason=outcome.failure_reason or "late_arrival_after_merge",
+                failure_reason=late_reason,
                 child_items=late_child_items,
                 group_failed=False,
             )
@@ -556,7 +567,7 @@ class BarrierIntakeCoordinator:
                 coordination_token=coordination_token,
                 release_context={
                     "late_arrival": True,
-                    "reason": outcome.failure_reason,
+                    "reason": late_reason,
                     "released_by": self._scheduler_lease_owner,
                     "scope_row_id": row.row_id,
                 },
@@ -576,7 +587,7 @@ class BarrierIntakeCoordinator:
                         final_data=token.row_data,
                         outcome=TerminalOutcome.FAILURE,
                         path=TerminalPath.UNROUTED,
-                        error=FailureInfo(exception_type="CoalesceFailure", message=outcome.failure_reason or "late_arrival_after_merge"),
+                        error=FailureInfo(exception_type="CoalesceFailure", message=late_reason),
                     ),
                     *late_cascaded_results,
                 ),
@@ -2247,12 +2258,32 @@ class BarrierRecoveryCoordinator:
                     for node_id_str, group_id in completed_pairs
                     if node_id_str in node_id_to_coalesce_name
                 )
+                # ADR-042 flavor discriminator: the RELEASED subset of the
+                # completed set (status-COMPLETED closure at the coalesce
+                # node). A key completed but not released FAILED closed, so
+                # its straggler carries `scope_group_failed`, never
+                # `late_arrival_after_merge` — same released-only read the
+                # row_union holdless reconcile above uses.
+                released_pairs_for_coalesce = self._barrier_restore_reads.get_released_group_ids_for_nodes(
+                    self._run_id,
+                    frozenset(node_id_to_coalesce_name.keys()),
+                )
+                released_keys_set: frozenset[tuple[str, str]] = frozenset(
+                    (node_id_to_coalesce_name[node_id_str], group_id)
+                    for node_id_str, group_id in released_pairs_for_coalesce
+                    if node_id_str in node_id_to_coalesce_name
+                )
                 for item in holdless:
                     coalesce_name_str = item.coalesce_name or item.barrier_key
                     key = (str(coalesce_name_str), coalesce_fork_group_id_by_token_id[item.token_id])
                     if key in completed_keys_set:
                         # §E.3a at restore: adopted-but-unreleased late row
                         # against a completed key — journal-release it now.
+                        reconcile_reason = (
+                            GroupSettlementReason.LATE_ARRIVAL_AFTER_MERGE.value
+                            if key in released_keys_set
+                            else GroupSettlementReason.SCOPE_GROUP_FAILED.value
+                        )
                         released = self._scheduler.mark_blocked_barrier_terminal(
                             run_id=self._run_id,
                             barrier_key=str(coalesce_name_str),
@@ -2261,7 +2292,7 @@ class BarrierRecoveryCoordinator:
                             coordination_token=self._coordination_token,
                             release_context={
                                 "late_arrival": True,
-                                "reason": "late_arrival_after_merge",
+                                "reason": reconcile_reason,
                                 "released_by": self._scheduler_lease_owner,
                                 "scope_row_id": item.row_id,
                                 "restore_reconcile": True,

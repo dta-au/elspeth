@@ -8,6 +8,33 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-25 — group-settlement reasons are a CLOSED StrEnum (coalesce /
+  scope closers only), and the merged-vs-failed discriminator is RELEASE
+  status, not completion** (ADR-042, unified-lineage WS6 Task 6). Every
+  coalesce/collector settlement reason (`late_arrival_after_merge`,
+  `scope_group_failed`, `empty_expansion`, `all_members_lost`) comes from
+  `contracts.enums.GroupSettlementReason` — never write the string at an
+  emission site; `tests/unit/engine/test_group_settlement_reasons.py`
+  AST-scans all of `src/` for the literals and is red on the first one.
+  row_union's `row_union_branch_lost` / `late_arrival_after_release` /
+  `row_union_group_failed` are a SIBLING vocabulary by ruling (META-9.3) and
+  stay outside the enum — do not fold them, and `row_union_group_failed` is
+  NOT the settlement channel's `group_failed=` flag. A group that closed by
+  FAILURE has `completed_at` set on its closer node_states just like a
+  merge does; only `status == COMPLETED` discriminates, which is why
+  `has_released_group_for_node` / `get_released_group_ids_for_nodes` exist
+  beside the plain-completion reads — do not "simplify" them onto
+  `completed_at`. `CoalesceExecutor._completed_keys` now carries the flavor
+  (`True` merged / `False` failed / `None` unknown → Landscape point lookup);
+  restore seeding is ALWAYS `None`, never merged. A late-arrival
+  `CoalesceOutcome` without a `failure_reason` now raises in the intake
+  coordinator instead of defaulting — a test double that returns
+  `late_arrival=True` must set the reason. Test-double trap: the coalesce
+  executor tests' `_restore_reads_from_execution_double` is a deliberately
+  narrow `SimpleNamespace`, so any NEW read the executor makes on
+  `_barrier_restore_reads` must be bound there (autospec'd) or every late-
+  arrival test fails with `AttributeError`.
+
 - **2026-08-24 — WS2 config-validation campaign conventions (barrier scopes:
   collectors, bound regions, parity; branch feature/unified-lineage).** Eight
   traps, the first four from the campaign plan, the rest measured while
