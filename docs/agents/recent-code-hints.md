@@ -1183,6 +1183,22 @@ sequentially per worktree.
     author can now reach it two ways instead of one). Tracked as spec §4
     Medium in `docs/superpowers/specs/2026-08-21-pdf-explode-stitch-risk-assessment.md`;
     the guard is universal batch-lane work, not owned by this plugin.
+  - **Every plugin's `usage_when_not_to_use` and `summary` (not
+    `usage_when_to_use`, not `composer_hints`) is embedded verbatim in the
+    composer's initial scaffolding request, against a global, whole-catalog
+    96 KiB cap.** Editing ANY plugin's `not_for`/summary prose — not just
+    pdf_rasterize's — spends from that one shared budget; there is no
+    per-plugin allowance. Landing this plugin's own prose plus a few
+    sentences of cross-references in sibling plugins' `usage_when_not_to_use`
+    strings (textract inline/document, for the multipage on-ramp) took the
+    live headroom from comfortable to single-digit bytes. The only local
+    signal is a failing
+    `tests/unit/web/composer/test_pipeline_planner.py::test_initial_request_declares_supplied_information_and_omits_redundant_discovery`
+    — nothing in the plugin's own test file or the catalogue-metadata gates
+    catches it, because they check substrings and lengths per-plugin, never
+    the summed whole-catalog payload. Verify that test explicitly after
+    editing any `usage_when_not_to_use` or `summary`, even a one-clause
+    addition; do not assume "it's just prose" is free.
 
 - **2026-08-17 — worker-pool admission follows the WORKER's lifetime, and the
   preflight coordinator owns the caller's budget** (elspeth-5269b43bca /

@@ -308,7 +308,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ff13549ddbb76610"
+    source_file_hash: str | None = "sha256:7bf91e951e98ca2a"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -323,8 +323,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     )
     usage_when_not_to_use = (
         "Not for inline bytes, document URLs, or synchronous low-latency analysis. For managed-blob documents "
-        "up to 5 MiB (single-page for PDF), use aws_textract_inline_analysis; stage in S3, or pdf_rasterize a "
-        "multipage PDF to stay synchronous."
+        "up to 5 MiB (single-page for PDF), use aws_textract_inline_analysis; this plugin requires S3 "
+        "staging, or pdf_rasterize a multipage PDF to stay synchronous."
     )
     example_use = (
         "transform:\n"

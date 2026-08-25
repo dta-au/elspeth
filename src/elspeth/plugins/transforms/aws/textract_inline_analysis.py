@@ -255,7 +255,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ab7447e0bcddddf7"
+    source_file_hash: str | None = "sha256:1f32bee0e6bea914"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -270,9 +270,9 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         "content remains untrusted before LLM consumption."
     )
     usage_when_not_to_use = (
-        "Not for multipage or larger documents, or documents already stored in S3 — rasterize it with "
-        "pdf_rasterize first, or use aws_textract_document_analysis. AnalyzeDocument has no idempotency "
-        "guarantee, so SDK and engine retries can each repeat a billable provider call."
+        "Not for multipage or larger documents, or documents already in S3 — rasterize a multipage PDF "
+        "with pdf_rasterize, or use aws_textract_document_analysis. AnalyzeDocument isn't idempotent, "
+        "so retries can repeat a billable call."
     )
     example_use = (
         "transform:\n"
