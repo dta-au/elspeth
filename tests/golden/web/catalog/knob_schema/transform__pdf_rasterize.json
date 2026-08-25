@@ -111,6 +111,15 @@
         "required": false
       },
       {
+        "default": 1048576,
+        "description": "Refuse a page whose extracted text (UTF-8 encoded) exceeds this many bytes; only evaluated when extract_text is true. Guards against an unbounded page_text row feeding a downstream LLM.",
+        "kind": "number-int",
+        "label": "Maximum page text bytes",
+        "name": "max_page_text_bytes",
+        "nullable": false,
+        "required": false
+      },
+      {
         "default": 150,
         "description": "Raster resolution; 150 keeps a Letter/A4 page comfortably under the 5 MiB per-page bound.",
         "kind": "number-int",

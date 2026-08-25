@@ -24,6 +24,7 @@ def _request(pdf: bytes, tmp_path: Path, **overrides: int | bool) -> RasterizeRe
         "max_page_pixels": 1_000_000,
         "max_page_bytes": 5 * 1024 * 1024,
         "extract_text": True,
+        "max_page_text_bytes": 1024 * 1024,
     }
     values.update(overrides)
     return RasterizeRequest(pdf_bytes=pdf, output_dir=tmp_path, **values)
@@ -53,6 +54,33 @@ def test_extract_text_false_leaves_text_none(tmp_path: Path) -> None:
     result = rasterize_document(_request(minimal_pdf(2), tmp_path, extract_text=False))
     assert type(result) is RasterizeResponse
     assert [page.text for page in result.rendered] == [None, None]
+
+
+def test_page_with_no_text_layer_renders_fine_with_empty_text(tmp_path: Path) -> None:
+    result = rasterize_document(_request(minimal_pdf(3, textless_pages=frozenset({2})), tmp_path))
+    assert type(result) is RasterizeResponse
+    assert result.refused == ()
+    assert [page.text for page in result.rendered] == ["Page 1", "", "Page 3"]
+
+
+def test_extracted_text_over_max_page_text_bytes_is_refused_as_oversize_text(tmp_path: Path) -> None:
+    # "Page 1" is 6 UTF-8 bytes; a 3-byte cap forces the refusal.
+    result = rasterize_document(_request(minimal_pdf(1), tmp_path, max_page_text_bytes=3))
+    assert type(result) is RasterizeResponse
+    assert result.rendered == ()
+    assert [(page.page_number, page.kind) for page in result.refused] == [(1, PageRefusalKind.OVERSIZE_TEXT)]
+    assert "6" in result.refused[0].detail and "3" in result.refused[0].detail
+    # a refused page must not leave an orphaned PNG file behind
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_extract_text_false_never_evaluates_the_text_cap(tmp_path: Path) -> None:
+    # A cap of 0 bytes would refuse any real extracted text; with extraction disabled
+    # the worker must never reach the cap check at all.
+    result = rasterize_document(_request(minimal_pdf(1), tmp_path, extract_text=False, max_page_text_bytes=0))
+    assert type(result) is RasterizeResponse
+    assert result.refused == ()
+    assert result.rendered[0].text is None
 
 
 def test_dpi_scales_geometry_by_ceil(tmp_path: Path) -> None:

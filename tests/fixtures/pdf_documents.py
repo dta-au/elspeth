@@ -9,10 +9,26 @@ MALFORMED_PDF = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /
 NOT_A_PDF = b"\x89PNG\r\n\x1a\nnot-a-pdf"
 
 
-def minimal_pdf(page_count: int = 1, *, width_pt: float = 200.0, height_pt: float = 100.0) -> bytes:
-    """Return a valid single-font PDF with ``page_count`` pages of the given MediaBox."""
+def minimal_pdf(
+    page_count: int = 1,
+    *,
+    width_pt: float = 200.0,
+    height_pt: float = 100.0,
+    textless_pages: frozenset[int] = frozenset(),
+) -> bytes:
+    """Return a valid single-font PDF with ``page_count`` pages of the given MediaBox.
+
+    ``textless_pages`` names 1-based page numbers whose content stream draws
+    nothing (no ``BT``/``Tj``/``ET`` text-showing operators) — pdfium's text
+    layer for such a page is genuinely empty, not merely untested. Defaults to
+    the empty set, so every existing call site (including the committed
+    ``examples/pdf_rasterize`` fixtures) stays byte-identical.
+    """
     if page_count < 1:
         raise ValueError("page_count must be >= 1")
+    for page_number in textless_pages:
+        if not 1 <= page_number <= page_count:
+            raise ValueError(f"textless_pages entry {page_number} is out of range for page_count={page_count}")
     objs: list[bytes] = []
     # 1 catalog, 2 pages root, 3 font, then per page: page + content stream
     first_page_obj = 4
@@ -28,7 +44,8 @@ def minimal_pdf(page_count: int = 1, *, width_pt: float = 200.0, height_pt: floa
                 f"/Contents {content_obj} 0 R /Resources << /Font << /F1 3 0 R >> >> >>"
             ).encode()
         )
-        stream = f"BT /F1 24 Tf 20 40 Td (Page {i + 1}) Tj ET".encode()
+        page_number = i + 1
+        stream = b"" if page_number in textless_pages else f"BT /F1 24 Tf 20 40 Td (Page {page_number}) Tj ET".encode()
         objs.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream")
     out = bytearray(b"%PDF-1.7\n")
     offsets: list[int] = []

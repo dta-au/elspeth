@@ -25,6 +25,7 @@ class PageRefusalKind(StrEnum):
     INVALID_GEOMETRY = "invalid_geometry"  # declared page size is non-positive at the configured dpi
     OVERSIZE_PIXELS = "oversize_pixels"  # declared size x dpi exceeds max_page_pixels (checked BEFORE render)
     OVERSIZE_BYTES = "oversize_bytes"  # encoded PNG exceeds max_page_bytes
+    OVERSIZE_TEXT = "oversize_text"  # extracted text (UTF-8 encoded) exceeds max_page_text_bytes
     MEMORY_EXHAUSTED = "memory_exhausted"  # MemoryError under RLIMIT_AS
     RENDER_ERROR = "render_error"  # PdfiumError during page load/render
 
@@ -38,6 +39,7 @@ class RasterizeRequest:
     max_page_bytes: int
     output_dir: Path  # parent-owned temp dir; worker writes page-<n>.png files here
     extract_text: bool
+    max_page_text_bytes: int  # only evaluated when extract_text is True
 
 
 @dataclass(frozen=True, slots=True)

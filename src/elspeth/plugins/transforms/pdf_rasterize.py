@@ -47,12 +47,14 @@ DEFAULT_RENDER_TIMEOUT_SECONDS = 120
 HARD_MAX_RENDER_TIMEOUT_SECONDS = 900
 DEFAULT_WORKER_MEMORY_LIMIT_BYTES = 2 * 1024**3
 HARD_MAX_WORKER_MEMORY_LIMIT_BYTES = 8 * 1024**3
+DEFAULT_MAX_PAGE_TEXT_BYTES = 1024 * 1024
+HARD_MAX_PAGE_TEXT_BYTES = 5 * 1024 * 1024
 PAGE_MIME_TYPE = "image/png"
 _PAYLOAD_REF_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _INVARIANT_PROBE_BLOB_REF = "0" * 64
 _INVARIANT_PROBE_PNG = b"\x89PNG\r\n\x1a\n" + b"pdf-rasterize-invariant-probe"
 
-_SIZE_REFUSALS = frozenset({PageRefusalKind.OVERSIZE_PIXELS, PageRefusalKind.OVERSIZE_BYTES})
+_SIZE_REFUSALS = frozenset({PageRefusalKind.OVERSIZE_PIXELS, PageRefusalKind.OVERSIZE_BYTES, PageRefusalKind.OVERSIZE_TEXT})
 
 
 def _build_invariant_probe_pdf() -> bytes:
@@ -164,6 +166,16 @@ class PDFRasterizeConfig(TransformDataConfig):
         max_length=256,
         title="Page text field",
         description="Output field receiving the page's extracted text when extract_text is true; not emitted when false.",
+    )
+    max_page_text_bytes: int = Field(
+        default=DEFAULT_MAX_PAGE_TEXT_BYTES,
+        gt=0,
+        le=HARD_MAX_PAGE_TEXT_BYTES,
+        title="Maximum page text bytes",
+        description=(
+            "Refuse a page whose extracted text (UTF-8 encoded) exceeds this many bytes; only evaluated when "
+            "extract_text is true. Guards against an unbounded page_text row feeding a downstream LLM."
+        ),
     )
     dpi: int = Field(
         default=DEFAULT_DPI,
@@ -348,7 +360,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e4dfc8fb9e622453"
+    source_file_hash: str | None = "sha256:ebdb076e676ab400"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -404,6 +416,7 @@ class PDFRasterize(BaseTransform):
             render_timeout_seconds=cfg.render_timeout_seconds,
             worker_memory_limit_bytes=cfg.worker_memory_limit_bytes,
             extract_text=cfg.extract_text,
+            max_page_text_bytes=cfg.max_page_text_bytes,
         )
         self._renderer: Any = PoolRenderer(self._limits)  # pool is created lazily on first render
 
@@ -432,6 +445,8 @@ class PDFRasterize(BaseTransform):
                     "grouping and ordering downstream.",
                     "extract_text (default true) also emits page_text: each page's text via pdfium's text layer, "
                     "no OCR — empty string for a page with no text layer, not a refusal. Set extract_text: false to skip it.",
+                    "max_page_text_bytes (default 1 MiB, ceiling 5 MiB) refuses a page whose extracted text exceeds it "
+                    "— a size refusal like max_page_bytes, folded into the same pdf_page_too_large reason.",
                 ),
             )
         return None

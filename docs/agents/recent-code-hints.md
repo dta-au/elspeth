@@ -1214,6 +1214,23 @@ sequentially per worktree.
     elsewhere in the SAME string (dropping "already"/"which handles... "
     verbosity) — net growth was +21 bytes. `composer_hints` (uncapped) still
     carries the fuller `extract_text`/`page_text` explanation.
+    - **Fix round (same day).** Three review findings: (1) `minimal_pdf()`
+      gained a `textless_pages: frozenset[int]` kwarg (default empty, so
+      every existing call — including the committed
+      `examples/pdf_rasterize` fixtures — stays byte-identical) to construct
+      a real page with an empty content stream, proving a genuinely
+      text-layer-less page yields `""`, not an untested code path. (2) The
+      `type(page.text) is not str` `FrameworkBugError` guard
+      (`pdf_rasterize.py`, row-mapping loop) is now pinned by a stub-renderer
+      test. (3) A new `max_page_text_bytes` config knob (default 1 MiB,
+      ceiling 5 MiB, same shape as `max_page_pixels`/`max_page_bytes`) caps
+      the UTF-8-encoded extracted text; the worker enforces it AFTER
+      extraction (only when `extract_text` is true — never evaluated when
+      false) and folds the new `PageRefusalKind.OVERSIZE_TEXT` into the
+      existing size-refusal set, so the `pdf_page_too_large` vs
+      `pdf_page_render_failed` rule reads "ALL refusals are a size kind" —
+      one worked example of extending that rule without touching its
+      call sites.
 
 - **2026-08-17 — worker-pool admission follows the WORKER's lifetime, and the
   preflight coordinator owns the caller's budget** (elspeth-5269b43bca /

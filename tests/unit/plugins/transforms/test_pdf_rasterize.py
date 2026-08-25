@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.payload_store import IntegrityError
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
@@ -164,6 +165,22 @@ def test_emits_one_row_per_page_with_page_metadata_and_parent_fields(store: File
     assert renderer.discarded and renderer.discarded[0] is not None and not renderer.discarded[0].exists()
 
 
+def test_worker_contract_violation_text_none_with_extract_text_enabled_is_a_framework_bug(
+    store: FilesystemPayloadStore,
+) -> None:
+    """extract_text defaults True; a worker/renderer returning text=None anyway violates
+
+    its own contract (worker.py always populates text when RasterizeRequest.extract_text
+    is True) — this must crash loudly as a framework bug, never silently emit a null/absent
+    page_text.
+    """
+    ref = store.store(minimal_pdf(1))
+    renderer = _StubRenderer(RasterizeResponse(page_count=1, rendered=(_page(1, text=None),), refused=()), (PNG,))
+    transform = _transform(store, renderer)
+    with pytest.raises(FrameworkBugError, match="extract_text enabled"):
+        transform.process(make_pipeline_row({"blob_ref": ref}), make_context())
+
+
 def test_page_png_path_outside_output_dir_raises_containment_error(store: FilesystemPayloadStore, tmp_path: Path) -> None:
     """A worker-returned png_path outside its own render output_dir is a containment
 
@@ -228,11 +245,31 @@ def test_fail_document_refuses_the_whole_row_when_any_page_is_refused(store: Fil
     assert not store.exists(hashlib.sha256(PNG).hexdigest())
 
 
-def test_fail_document_uses_too_large_reason_for_size_refusals(store: FilesystemPayloadStore) -> None:
+@pytest.mark.parametrize("kind", [PageRefusalKind.OVERSIZE_BYTES, PageRefusalKind.OVERSIZE_PIXELS, PageRefusalKind.OVERSIZE_TEXT])
+def test_fail_document_uses_too_large_reason_for_size_refusals(store: FilesystemPayloadStore, kind: PageRefusalKind) -> None:
     ref = store.store(minimal_pdf(1))
-    response = RasterizeResponse(page_count=1, rendered=(), refused=(RefusedPage(1, PageRefusalKind.OVERSIZE_BYTES, "big"),))
+    response = RasterizeResponse(page_count=1, rendered=(), refused=(RefusedPage(1, kind, "big"),))
     result = _transform(store, _StubRenderer(response)).process(make_pipeline_row({"blob_ref": ref}), make_context())
     assert result.reason["reason"] == "pdf_page_too_large"
+
+
+def test_mixed_size_and_render_error_refusals_use_render_failed_reason(store: FilesystemPayloadStore) -> None:
+    """The size-only rule requires ALL refusals to be size-kind (OVERSIZE_PIXELS/
+
+    OVERSIZE_BYTES/OVERSIZE_TEXT); one non-size refusal in the mix still maps to
+    pdf_page_render_failed, not pdf_page_too_large.
+    """
+    ref = store.store(minimal_pdf(2))
+    response = RasterizeResponse(
+        page_count=2,
+        rendered=(),
+        refused=(
+            RefusedPage(1, PageRefusalKind.OVERSIZE_TEXT, "big"),
+            RefusedPage(2, PageRefusalKind.RENDER_ERROR, "boom"),
+        ),
+    )
+    result = _transform(store, _StubRenderer(response)).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.reason["reason"] == "pdf_page_render_failed"
 
 
 def test_fully_empty_response_is_pdf_malformed_not_a_crash(store: FilesystemPayloadStore) -> None:

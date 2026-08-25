@@ -20,6 +20,7 @@ def _limits(**overrides: int | bool) -> RenderLimits:
         "render_timeout_seconds": 20,
         "worker_memory_limit_bytes": 2 * 1024**3,
         "extract_text": True,
+        "max_page_text_bytes": 1024 * 1024,
     }
     values.update(overrides)
     return RenderLimits(**values)

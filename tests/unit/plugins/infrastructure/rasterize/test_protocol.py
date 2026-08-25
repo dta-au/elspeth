@@ -16,7 +16,14 @@ from elspeth.plugins.infrastructure.rasterize.protocol import (
 
 def test_messages_round_trip_through_pickle() -> None:
     request = RasterizeRequest(
-        pdf_bytes=b"%PDF-", dpi=72, max_pages=1, max_page_pixels=10, max_page_bytes=10, output_dir=Path("/tmp/x"), extract_text=True
+        pdf_bytes=b"%PDF-",
+        dpi=72,
+        max_pages=1,
+        max_page_pixels=10,
+        max_page_bytes=10,
+        output_dir=Path("/tmp/x"),
+        extract_text=True,
+        max_page_text_bytes=1024 * 1024,
     )
     response = RasterizeResponse(
         page_count=2,

@@ -145,6 +145,13 @@ def _render_page(document: object, index: int, page_number: int, scale: float, r
                 return RefusedPage(page_number=page_number, kind=PageRefusalKind.RENDER_ERROR, detail=str(exc))
             finally:
                 textpage.close()
+            text_bytes = len(text.encode("utf-8"))
+            if text_bytes > request.max_page_text_bytes:
+                return RefusedPage(
+                    page_number=page_number,
+                    kind=PageRefusalKind.OVERSIZE_TEXT,
+                    detail=f"extracted text is {text_bytes} bytes; max_page_text_bytes is {request.max_page_text_bytes}",
+                )
         png_path = request.output_dir / f"page-{page_number}.png"
         png_path.write_bytes(png)
         return RenderedPage(
