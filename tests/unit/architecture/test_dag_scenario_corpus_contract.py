@@ -613,7 +613,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # comparison, confirming no other field moved. No case showed a status
 # change, a row-count change, or a lost record type other than the
 # retirement — a pure rotation, not behaviour drift.
-EXPECTED_CASE_REGISTRY_SHA256 = "8963b930c8711ee59b441594dbabcb1be0b3c6ab91891d4f8555bf0da1d45b93"
+EXPECTED_CASE_REGISTRY_SHA256 = "75f88906e9a928543864a226da2ae2f87a4e91285e0e7494ce2de704ac1b40ea"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

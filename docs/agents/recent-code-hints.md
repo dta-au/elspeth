@@ -214,7 +214,14 @@ is a working document under the normal delivery posture.
   and was disproved from a clean export. Those snapshots are the corpus's
   ONLY pin on the seam's terminal vocabulary (the semantic projection
   excludes terminal `error_hash`), so reverting the META-40 seam write
-  fails exactly them and nothing else in the family.
+  fails exactly them and nothing else in the family. RULE (learned at the
+  WS5 close gate): a registry-hash re-pin rides EVERY ruled manifest
+  re-freeze commit — `tests/unit/architecture/
+  test_dag_scenario_corpus_contract.py::EXPECTED_CASE_REGISTRY_SHA256`
+  hashes every harness case's FULL `model_dump` (the manifest `expected`
+  oracle values included, not just ids), so META-39's re-pin went stale
+  there and META-41's compounded it; neither lane's scoped selection
+  included `tests/unit/architecture`.
 
 - **2026-08-23 — a NEW corpus case fails the WS1 frozen-oracle gate closed, and
   the fix is a scoped write, never a full regenerate.** `tests/integration/core/
