@@ -110,8 +110,9 @@ def validate_pipeline_route_targets(
     """Run the full route-target preflight bundle for a pipeline config.
 
     ``closer_names`` (spec §7 rule 9, WS3 Task 9b): legal ``on_error``
-    targets beyond a sink name — coalesce/row_union closer names the
-    graph's own builder already accepted (``ExecutionGraph.
+    targets beyond a sink name — the error-routable closer names (coalesce,
+    row_union and, since the integration item-18 parity sweep, collector)
+    the graph's own builder already accepted (``ExecutionGraph.
     get_error_routable_closer_names()``). The BUILDER is the
     in-region/out-of-region validity authority (``core/dag/builder.py``'s
     rule-9 resolution runs at graph construction, before this ever sees the
@@ -172,8 +173,9 @@ def validate_transform_error_sinks(
     Args:
         transforms: List of transform plugins
         available_sinks: Set of sink names from PipelineConfig
-        closer_names: Coalesce/row_union closer names the builder already
-            accepted as this transform's own enclosing-region target (spec
+        closer_names: Error-routable closer names (coalesce, row_union,
+            collector) the builder already accepted as this transform's own
+            enclosing-region target (spec
             §7 rule 9, WS3 Task 9b) — see
             ``validate_pipeline_route_targets``'s docstring for why this
             widens membership only, never re-derives region validity.

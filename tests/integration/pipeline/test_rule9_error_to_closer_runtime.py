@@ -192,6 +192,13 @@ class PipelineResult:
             rows = conn.execute(select(group_losses_table)).mappings().all()
         return sorted((row["closer_name"], row["member_key"], row["reason"]) for row in rows)
 
+    def token_ids_with_path(self, path: str) -> set[str]:
+        """Token ids whose recorded terminal path is ``path`` — the per-run
+        identity half of a member-loss pin (member keys are run-scoped)."""
+        with self._connect() as conn:
+            rows = conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.path == path)).all()
+        return {row.token_id for row in rows}
+
     def token_outcome_paths(self) -> list[tuple[str, str]]:
         """Sorted (outcome, path) pairs over every recorded token_outcomes row."""
         with self._connect() as conn:
@@ -434,6 +441,14 @@ def test_transform_explicit_on_error_to_collector_settles_like_the_omitted_twin(
         return Counter((closer, reason) for closer, _member_key, reason in result.group_losses())
 
     assert closer_and_reason(explicit) == closer_and_reason(omitted) == Counter({("page_stitcher", "quarantined"): 5})
+    # Per-run member identity (C7 review M-1): the five losses name five
+    # DISTINCT members, and they are exactly the tokens that were
+    # error-disposed — a loss staged against the wrong member (or one member
+    # five times) is a settlement bug the cross-run multiset cannot see.
+    for result in (explicit, omitted):
+        member_keys = [member_key for _closer, member_key, _reason in result.group_losses()]
+        assert len(set(member_keys)) == 5
+        assert set(member_keys) == result.token_ids_with_path("quarantined_at_source")
 
     explicit_paths = explicit.token_outcome_paths()
     omitted_paths = omitted.token_outcome_paths()
