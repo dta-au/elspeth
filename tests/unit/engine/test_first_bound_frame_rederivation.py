@@ -28,6 +28,7 @@ from tests.unit.engine.test_processor import _make_factory, _make_processor, _pe
 OPENER = NodeID("explode-node")
 OTHER_OPENER = NodeID("other-explode-node")
 COLLECTOR = NodeID("collector-stitch")
+OTHER_COLLECTOR = NodeID("collector-other")
 PLAIN = NodeID("plain-explode")
 
 
@@ -49,7 +50,7 @@ def _registry(*, closer_node: NodeID = COLLECTOR) -> GroupBindingRegistry:
                 kind=FrameKind.EXPAND,
                 opener_node_id=OTHER_OPENER,
                 opener_name="other_explode",
-                closer_node_id=NodeID("collector-other"),
+                closer_node_id=OTHER_COLLECTOR,
                 closer_name="other_stitch",
                 closer_kind=CloserKind.COLLECTOR,
                 policy="require_all",
@@ -60,7 +61,7 @@ def _registry(*, closer_node: NodeID = COLLECTOR) -> GroupBindingRegistry:
     )
 
 
-_STEPS = {NodeID("source-0"): 0, OPENER: 1, OTHER_OPENER: 2, COLLECTOR: 3, PLAIN: 4}
+_STEPS = {NodeID("source-0"): 0, OPENER: 1, OTHER_OPENER: 2, COLLECTOR: 3, PLAIN: 4, OTHER_COLLECTOR: 5}
 
 
 def _mint(factory: Any, *, opener_node: NodeID, registry: GroupBindingRegistry | None) -> tuple[list[TokenInfo], str]:
@@ -125,25 +126,64 @@ def test_no_declared_openers_means_no_durable_read_at_all() -> None:
         assert settling._first_bound_frame(children[0]) is None
 
 
-def test_cross_check_is_membership_and_fires_on_a_mismatched_durable_closer_set() -> None:
+def _complete_member_at(factory: Any, token_id: str, node_id: NodeID) -> None:
+    """A REAL completed node_state for a group member at ``node_id`` — the
+    durable write `resolve_group_collector_node`'s join actually reads
+    (META-35: the earlier version of these cases patched the resolver,
+    which is exactly what hid the any-node false positive)."""
+    factory.execution.record_completed_node_state(
+        token_id=token_id,
+        node_id=str(node_id),
+        run_id="test-run",
+        step_index=_STEPS[node_id],
+        input_data={"value": 1},
+        output_data={"value": 1},
+        duration_ms=1.0,
+    )
+
+
+def test_intermediate_transform_completion_is_not_collector_evidence() -> None:
+    """META-35 (elspeth-421d9004bb): a member completing an ORDINARY node
+    between opener and collector — the realistic shape — is any-node
+    evidence, not collector evidence. The re-derivation must bind, not
+    raise a node-id mismatch."""
     _db, factory = _make_factory()
-    children, _group_id = _mint(factory, opener_node=OPENER, registry=_registry())
+    children, group_id = _mint(factory, opener_node=OPENER, registry=_registry())
+    _complete_member_at(factory, children[0].token_id, PLAIN)
     settling = _make_processor(factory, node_step_map=_STEPS, group_bindings=_registry())
 
-    # Nested-healthy: config's closer is ONE OF several durable nodes.
-    with patch.object(
-        settling._barrier_restore_reads, "resolve_group_collector_node", return_value=frozenset({"collector-inner", str(COLLECTOR)})
-    ):
-        resolved = settling._first_bound_frame(children[0])
+    resolved = settling._first_bound_frame(children[0])
+
+    assert resolved is not None
+    assert (resolved[0].group_id, resolved[1].closer_name) == (group_id, "stitch")
+
+
+def test_cross_check_is_membership_when_config_closer_is_one_of_the_scoped_nodes() -> None:
+    # Membership, not equality: completions at BOTH configured collector
+    # nodes (the nested shape's durable footprint) — config's closer is one
+    # of them, so the re-derivation binds.
+    _db, factory = _make_factory()
+    children, _group_id = _mint(factory, opener_node=OPENER, registry=_registry())
+    _complete_member_at(factory, children[0].token_id, COLLECTOR)
+    _complete_member_at(factory, children[1].token_id, OTHER_COLLECTOR)
+    settling = _make_processor(factory, node_step_map=_STEPS, group_bindings=_registry())
+
+    resolved = settling._first_bound_frame(children[0])
+
     assert resolved is not None and resolved[1].closer_name == "stitch"
 
-    # Mismatch: durable evidence names nodes config's closer is not among.
-    mismatched = _make_processor(factory, node_step_map=_STEPS, group_bindings=_registry())
-    with (
-        patch.object(mismatched._barrier_restore_reads, "resolve_group_collector_node", return_value=frozenset({"collector-elsewhere"})),
-        pytest.raises(AuditIntegrityError, match="durable is authoritative"),
-    ):
-        mismatched._first_bound_frame(children[0])
+
+def test_completion_at_a_different_configured_collector_fails_closed() -> None:
+    # The check the scoping must NOT lose: durable completion at another
+    # CONFIGURED COLLECTOR node, config's closer not among the scoped
+    # evidence — durable is authoritative.
+    _db, factory = _make_factory()
+    children, _group_id = _mint(factory, opener_node=OPENER, registry=_registry())
+    _complete_member_at(factory, children[0].token_id, OTHER_COLLECTOR)
+    settling = _make_processor(factory, node_step_map=_STEPS, group_bindings=_registry())
+
+    with pytest.raises(AuditIntegrityError, match="durable is authoritative"):
+        settling._first_bound_frame(children[0])
 
 
 def test_frame_for_a_group_never_minted_fails_closed() -> None:

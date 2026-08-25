@@ -22,7 +22,7 @@ than re-deriving the join independently.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
@@ -78,6 +78,46 @@ class GroupRecordRow:
     kind: str
     opener_token_id: str
     member_count: int
+
+
+def collector_scoped_completion_conflict(
+    *,
+    durable_node_ids: frozenset[str],
+    configured_collector_node_ids: Iterable[str],
+    config_node_id: str,
+) -> frozenset[str] | None:
+    """THE membership predicate over :meth:`BarrierRestoreReadModel.resolve_group_collector_node` (META-35).
+
+    That resolver returns ANY-node completion evidence: every node with a
+    completed node_state for ANY token carrying the group's frame, at any
+    depth — a member completing an ordinary transform between the opener
+    and the collector puts that transform's node in the set. Treating the
+    raw set as collector-completion evidence therefore false-positives on
+    the realistic opener → transform → collector shape (META-35: the
+    restore-time cross-check refused to resume such runs; the META-9.1
+    re-derivation raised on them).
+
+    This helper is the ONE shared scoping step both cross-check sites call
+    (:class:`~elspeth.engine.journal_restore.CollectorJournalRestorer`'s
+    restore cross-check and ``RowProcessor._rederive_expand_binding``'s
+    META-22.1 check — never a second copy of the predicate): intersect the
+    durable evidence with the caller's configured collector node ids, then
+    test config's node for MEMBERSHIP of that subset (never equality —
+    nesting legitimately puts an inner collector's node in an outer
+    group's set).
+
+    Returns the collector-scoped evidence set when it CONTRADICTS
+    ``config_node_id`` — the group durably completed at a different
+    configured collector — for the caller to raise with; ``None`` when
+    consistent, or when the scoped evidence is empty (no collector-node
+    completion evidence exists yet — including the intermediate-transform
+    case above — so there is nothing to check: vacuous, config remains the
+    only authority).
+    """
+    scoped = durable_node_ids & {str(node_id) for node_id in configured_collector_node_ids}
+    if scoped and config_node_id not in scoped:
+        return scoped
+    return None
 
 
 class BarrierRestoreReadModel:

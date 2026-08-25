@@ -39,6 +39,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import CoalesceSettings, CollectorSettings
+from elspeth.core.landscape.scheduler.restore_read_model import collector_scoped_completion_conflict
 from elspeth.core.landscape.scheduler_repository import token_from_journal_item
 
 if TYPE_CHECKING:
@@ -557,34 +558,42 @@ class CollectorJournalRestorer:
         # collector_name) or route a live arrival into the wrong
         # collector's roster rebuild entirely.
         #
-        # MEMBERSHIP, not equality: resolve_group_collector_node returns a
-        # SET, not a single value — a NESTED outer group's frame is carried
-        # by every descendant token at any depth (I-6's documented
-        # semantic), so an outer group's durable set legitimately contains
-        # more than one node once inner scopes have completed too. The
-        # config node only needs to be ONE OF the durable nodes; requiring
-        # equality against the whole set would raise on healthy nested
-        # pipelines. Vacuous (no assertion possible) for a group that has
-        # not completed anywhere yet — the ordinary, expected case for
-        # every live restore.
+        # MEMBERSHIP over the COLLECTOR-SCOPED evidence, not equality and
+        # never the raw set (META-35): resolve_group_collector_node is
+        # ANY-node evidence — a member completing an ordinary transform
+        # between opener and collector puts that node in the set, so
+        # checking against the raw set refused to resume every crashed run
+        # with a transform inside the scope (the realistic shape).
+        # collector_scoped_completion_conflict — the ONE shared predicate,
+        # also called by RowProcessor._rederive_expand_binding — intersects
+        # with this restorer's configured collector node ids first;
+        # membership rather than equality because a NESTED outer group's
+        # frame is carried by every descendant token at any depth (I-6), so
+        # an outer group's scoped set legitimately contains an inner
+        # collector's node too. Vacuous when the scoped evidence is empty —
+        # no collector-node completion yet, the ordinary case for every
+        # live restore.
+        configured_collector_node_ids = [str(node_id) for node_id in self._node_ids.values()]
         durable_nodes_by_group: dict[str, frozenset[str]] = {}
         for collector_name, group_id, _member_key in group_of.values():
             if group_id not in durable_nodes_by_group:
                 durable_nodes_by_group[group_id] = self._barrier_restore_reads.resolve_group_collector_node(
                     run_id=self._run_id, group_id=group_id
                 )
-            durable_node_ids = durable_nodes_by_group[group_id]
-            if not durable_node_ids:
-                continue
             config_node_id = str(self._node_ids[collector_name])
-            if config_node_id not in durable_node_ids:
+            conflicting = collector_scoped_completion_conflict(
+                durable_node_ids=durable_nodes_by_group[group_id],
+                configured_collector_node_ids=configured_collector_node_ids,
+                config_node_id=config_node_id,
+            )
+            if conflicting is not None:
                 raise AuditIntegrityError(
-                    f"Group {group_id!r} durably completed at node(s) {sorted(durable_node_ids)!r}, "
-                    f"but a journal row declares collector {collector_name!r} (config node "
-                    f"{config_node_id!r}, not among them) for it (run {self._run_id!r}, resume "
-                    f"checkpoint {resume_checkpoint_id!r}) — durable and config derivations of "
-                    '"the collector node for this group" disagree; refusing rather than silently '
-                    "trusting either side."
+                    f"Group {group_id!r} durably completed at configured collector node(s) "
+                    f"{sorted(conflicting)!r}, but a journal row declares collector "
+                    f"{collector_name!r} (config node {config_node_id!r}, not among them) for it "
+                    f"(run {self._run_id!r}, resume checkpoint {resume_checkpoint_id!r}) — durable "
+                    'and config derivations of "the collector node for this group" disagree; '
+                    "refusing rather than silently trusting either side."
                 )
 
         # Step 2: reconstruct completed groups from the Landscape FIRST

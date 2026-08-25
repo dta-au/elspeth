@@ -261,8 +261,12 @@ class _CollectorEnv:
                 .where(token_parents_table.c.token_id == token_id)
             )
 
-    def fresh_executor(self) -> _EnvExecutor:
+    def fresh_executor(self, *, second_collector_node_id: NodeID | None = None) -> _EnvExecutor:
         """A SECOND CollectorExecutor against the SAME Landscape (Task 7).
+
+        ``second_collector_node_id`` additionally registers collector
+        'other_stitch' at that node — a SECOND configured collector, for
+        the META-35 scoped cross-check cases.
 
         Distinct in-memory state (own _pending/_completed_keys, own
         transform instance) sharing the same DB/run_id/node_id/registration
@@ -285,6 +289,13 @@ class _CollectorEnv:
         settings = CollectorSettings(name="stitch", plugin="recording_stitch", input="pages_in", on_success="assembled_out")
         scope = ScopeSettings(name="scope1", opener="expand_node", closer="stitch", policy=self.policy)
         raw.register_collector(settings, scope, self.node_id, transform)
+        if second_collector_node_id is not None:
+            raw.register_collector(
+                CollectorSettings(name="other_stitch", plugin="recording_stitch", input="pages_in", on_success="assembled_out"),
+                ScopeSettings(name="scope2", opener="other_expand_node", closer="other_stitch", policy=self.policy),
+                second_collector_node_id,
+                _FakeCollectorTransform(),  # type: ignore[arg-type]  # same fake the primary registration uses
+            )
         wrapped = _EnvExecutor(raw, self.ctx)
         wrapped.transform = transform  # type: ignore[attr-defined]  # test-only convenience handle
         return wrapped
@@ -1393,32 +1404,62 @@ class TestRestore:
         assert fresh._executor._pending == {}
         assert fresh._executor._completed_keys
 
-    def test_restore_cross_checks_durable_vs_config_collector_node_and_raises_on_divergence(self, collector_env: _CollectorEnv) -> None:
-        # META-22: an item declares collector_name="stitch" (config node =
-        # env.node_id) for a group that durably completed at a completely
-        # DIFFERENT, foreign node — durable and config derivations of "the
-        # collector node for this group" disagree. Must fail loudly rather
-        # than silently trusting either side (misclassifying a residual, or
-        # routing a live arrival into the wrong collector's roster rebuild).
-        env = collector_env
-        members, group_id = env.seed_group(count=2)
-        foreign_node_id = register_test_node(env.factory.data_flow, env.run_id, "some-other-node")
-        member_a_frame = members[0].lineage_path[-1]
-        assert member_a_frame.group_id == group_id
+    @staticmethod
+    def _complete_member_at(env: _CollectorEnv, member: TokenInfo, node_id: str, *, step_index: int = 1) -> None:
+        """A REAL completed node_state for a group member at ``node_id`` —
+        the durable write resolve_group_collector_node's join reads.
+        ``step_index=0`` when the member ALSO holds at the collector (the
+        env's step_resolver pins the collector hold at step 1, and
+        node_states are unique on (token, step, attempt))."""
         state = env.factory.execution.begin_node_state(
-            token_id=members[0].token_id,
-            node_id=foreign_node_id,
+            token_id=member.token_id,
+            node_id=node_id,
             run_id=env.run_id,
-            step_index=1,
-            input_data=members[0].row_data.to_dict(),
+            step_index=step_index,
+            input_data=member.row_data.to_dict(),
             attempt=0,
             resume_checkpoint_id=None,
         )
         env.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={}, duration_ms=1.0)
 
-        item = env.blocked_item_for(members[1], collector_name="stitch")
+    def test_restore_treats_intermediate_node_completion_as_no_collector_evidence(self, collector_env: _CollectorEnv) -> None:
+        # META-35 (elspeth-421d9004bb): a member that completed an ORDINARY
+        # node between opener and collector — the realistic
+        # opener → transform → collector shape — is any-node evidence, not
+        # collector evidence. The crashed run must RESUME; the pre-fix
+        # cross-check refused it with a "disagree" AuditIntegrityError.
+        env = collector_env
+        members, _group_id = env.seed_group(count=2)
+        transform_node_id = register_test_node(env.factory.data_flow, env.run_id, "mid-transform")
+        self._complete_member_at(env, members[0], transform_node_id, step_index=0)
+        env.executor.accept(members[0], "stitch")
+
+        item = env.blocked_item_for(members[0], collector_name="stitch")
         state_ids = env.state_ids_for([item])
         fresh = env.fresh_executor()
+        fresh.restore_from_journal(
+            items=[item], state_ids=state_ids, attempt_offsets={members[0].token_id: 0}, resume_checkpoint_id="ckpt-1"
+        )
+        assert fresh.buffered_member_count() == 1
+
+    def test_restore_cross_checks_durable_vs_config_collector_node_and_raises_on_divergence(self, collector_env: _CollectorEnv) -> None:
+        # META-22, scoped by META-35: an item declares collector_name=
+        # "stitch" (config node = env.node_id) for a group that durably
+        # completed at a DIFFERENT CONFIGURED COLLECTOR node — durable and
+        # config derivations of "the collector node for this group"
+        # disagree. Must fail loudly rather than silently trusting either
+        # side (misclassifying a residual, or routing a live arrival into
+        # the wrong collector's roster rebuild).
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        other_collector_node_id = register_test_node(env.factory.data_flow, env.run_id, "other-stitch")
+        member_a_frame = members[0].lineage_path[-1]
+        assert member_a_frame.group_id == group_id
+        self._complete_member_at(env, members[0], other_collector_node_id)
+
+        item = env.blocked_item_for(members[1], collector_name="stitch")
+        state_ids = env.state_ids_for([item])
+        fresh = env.fresh_executor(second_collector_node_id=NodeID(other_collector_node_id))
         with pytest.raises(AuditIntegrityError, match="disagree"):
             fresh.restore_from_journal(
                 items=[item], state_ids=state_ids, attempt_offsets={members[1].token_id: 0}, resume_checkpoint_id="ckpt-1"

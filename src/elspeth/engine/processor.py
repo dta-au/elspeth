@@ -162,6 +162,7 @@ from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.scheduler.restore_read_model import collector_scoped_completion_conflict
 from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.scheduler_repository import (
     TokenSchedulerRepository,
@@ -3360,14 +3361,21 @@ class RowProcessor:
         is registered on the registry so later frames of the same group are
         an in-memory hit.
 
-        META-22.1 cross-check, MEMBERSHIP not equality: when the group has
-        durable completion evidence anywhere
-        (``resolve_group_collector_node`` non-empty), config's closer node
-        must be ONE OF those nodes — nesting legitimately adds an inner
-        collector's node to an outer group's set, so equality would raise on
-        healthy nested data. Durable is authoritative: a config closer absent
-        from a non-empty durable set is a silent node-id mismatch and fails
-        closed. Empty before completion — nothing to check yet.
+        META-22.1 cross-check, MEMBERSHIP over COLLECTOR-SCOPED evidence
+        (META-35): ``resolve_group_collector_node`` is ANY-node completion
+        evidence — a member completing an ordinary transform between the
+        opener and the collector puts that node in the set, so checking
+        against the raw set raised on the realistic
+        opener → transform → collector shape. The shared
+        ``collector_scoped_completion_conflict`` predicate (also the
+        restore cross-check's, ``CollectorJournalRestorer.restore``)
+        intersects the durable set with this config's collector closer
+        nodes first, then tests membership — never equality, since nesting
+        legitimately adds an inner collector's node to an outer group's
+        set. Durable is authoritative: a config closer absent from
+        non-empty SCOPED evidence is a node-id mismatch and fails closed.
+        Empty scoped evidence — no completion yet, or completion only at
+        non-collector nodes — leaves nothing to check.
         """
         if not self._expand_opener_binding_by_node_id or frame.group_id in self._inert_expand_groups:
             return None
@@ -3405,11 +3413,17 @@ class RowProcessor:
             )
         binding = candidates[0]
         durable_closer_nodes = reads.resolve_group_collector_node(run_id=self._run_id, group_id=frame.group_id)
-        if durable_closer_nodes and str(binding.closer_node_id) not in durable_closer_nodes:
+        conflicting = collector_scoped_completion_conflict(
+            durable_node_ids=durable_closer_nodes,
+            configured_collector_node_ids=[str(b.closer_node_id) for b in self._expand_opener_binding_by_node_id.values()],
+            config_node_id=str(binding.closer_node_id),
+        )
+        if conflicting is not None:
             raise AuditIntegrityError(
-                f"EXPAND group {frame.group_id!r} (run {self._run_id!r}) has durable completion evidence at nodes "
-                f"{sorted(durable_closer_nodes)} but config binds opener {binding.opener_name!r} to closer node "
-                f"{binding.closer_node_id!r}, which is not among them; durable is authoritative — node-id mismatch."
+                f"EXPAND group {frame.group_id!r} (run {self._run_id!r}) has durable completion evidence at "
+                f"configured collector nodes {sorted(conflicting)} but config binds opener {binding.opener_name!r} "
+                f"to closer node {binding.closer_node_id!r}, which is not among them; durable is authoritative — "
+                "node-id mismatch."
             )
         self._group_bindings.register_expand_group(frame.group_id, opener_name=binding.opener_name)
         return binding
