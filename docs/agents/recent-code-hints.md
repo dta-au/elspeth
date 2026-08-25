@@ -8,6 +8,30 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-25 — resume now has a THIRD entry guard (group satisfiability), and
+  two traps around it** (WS5 Tasks 1/2, spec §8). (a) Both resume surfaces —
+  advisory `RecoveryManager.can_resume` and enforcing
+  `ResumeCoordinator.resume()` — call
+  `check_group_satisfiability_resumable(db, run_id, group_binding_view_from_graph(graph))`
+  before any mutation, so EVERY graph object reaching them must answer
+  `get_group_bindings()`. A `MagicMock(spec=ExecutionGraph)` stub that gets
+  that far needs `get_group_bindings.return_value = GroupBindingRegistry(bindings=())`
+  (a bare spec mock returns a MagicMock whose `.bindings` is not iterable);
+  a `MagicMock(spec=object)` graph now fails with AttributeError — model the
+  contract on the FAKE, never weaken the guard. (b) The WS5 plan's
+  third-sibling construction ("best_effort defers the merge past load") is
+  FALSE against the live engine: best_effort ARRIVAL merges the moment every
+  branch is accounted for, so a plain fork resolves in-row while the source
+  is still `loading` and the lifecycle gate masks the group gate. The
+  measured construction that yields exhausted-source + checkpoint + open
+  bound group is an EOF-triggered aggregation UPSTREAM of the fork (see
+  `_run_fork_coalesce_to_eof_flush_crash` in
+  tests/integration/audit/test_contract_violation_token_outcomes.py); note
+  the crash path already terminalizes the consumed branches, so an
+  adversarial image writes NO second terminal (unique index) — it removes
+  settlement evidence instead. Shared group/lineage raw-seed helpers live in
+  `tests/fixtures/group_lineage.py`; extend there, not per-file.
+
 - **2026-08-25 — group-settlement reasons are a CLOSED StrEnum (coalesce /
   scope closers only), and the merged-vs-failed discriminator is RELEASE
   status, not completion** (ADR-042, unified-lineage WS6 Task 6). Every

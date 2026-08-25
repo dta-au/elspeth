@@ -37,6 +37,7 @@ from elspeth.core.checkpoint.manager import CheckpointManager
 from elspeth.core.checkpoint.recovery import NonResumableRunError, RecoveryManager, ResumeWorkSet
 from elspeth.core.config import AggregationSettings, ElspethSettings
 from elspeth.core.dag import ExecutionGraph
+from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -1891,10 +1892,15 @@ class TestResumeFinalizesAsFailed:
             patch.object(orch._ceremony, "emit_telemetry"),
             patch.object(orch._checkpoints, "delete_checkpoints"),
         ):
+            # The entry guard's group-satisfiability arm reads the graph's
+            # binding registry (WS5 Task 2), so the graph stub must model the
+            # real contract: an empty registry (no bound groups).
+            graph_stub = MagicMock(spec=ExecutionGraph)
+            graph_stub.get_group_bindings.return_value = GroupBindingRegistry(bindings=())
             result = orch.resume(
                 resume_point,
                 MagicMock(spec=object),
-                MagicMock(spec=object),
+                graph_stub,
                 payload_store=MockPayloadStore(),
             )
 

@@ -26,25 +26,46 @@ for every undecided token — see
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 
 from elspeth.contracts import Determinism, PluginSchema, ResumePoint, RunStatus
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.enums import OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import IncompleteSourceResumeError, PluginContractViolation
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.types import AggregationName
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
-from elspeth.core.config import AggregationSettings, CheckpointSettings, SourceSettings, TriggerConfig
+from elspeth.core.checkpoint.recovery import GroupUnsatisfiableResumeError
+from elspeth.core.config import (
+    AggregationSettings,
+    CheckpointSettings,
+    CoalesceSettings,
+    ElspethSettings,
+    GateSettings,
+    SourceSettings,
+    TriggerConfig,
+)
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
-from elspeth.core.landscape.schema import run_sources_table, runs_table, token_outcomes_table, tokens_table
+from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.schema import (
+    group_losses_table,
+    run_sources_table,
+    runs_table,
+    token_lineage_frames_table,
+    token_outcomes_table,
+    token_work_items_table,
+    tokens_table,
+)
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
+from elspeth.engine.processor import RowProcessor
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.web.execution.accounting import load_run_accounting_from_db
@@ -424,3 +445,245 @@ def test_sink_input_validation_violation_records_terminal_outcome() -> None:
 
     assert sink.results == []
     _assert_failed_token_outcome(db)
+
+
+class _PassthroughBatchTransform(BaseTransform):
+    """Benign batch transform: re-emits its buffered rows unchanged.
+
+    Exists to DEFER the fork past source exhaustion: rows buffer here until
+    the END_OF_SOURCE flush, so the fork/coalesce lifecycle downstream runs
+    entirely after the source lifecycle reached ``exhausted``.
+    """
+
+    name = "batch-passthrough"
+    determinism = Determinism.DETERMINISTIC
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = None
+    input_schema = _TestSchema
+    output_schema = _TestSchema
+    is_batch_aware = True
+    on_success = "to_gate"
+    on_error = "discard"
+
+    def __init__(self) -> None:
+        super().__init__({"schema": {"mode": "observed"}})
+
+    def process(self, rows: list[PipelineRow], ctx: Any) -> TransformResult:  # type: ignore[override]
+        shared_contract = rows[0].contract
+        return TransformResult.success_multi(
+            tuple(PipelineRow(row.to_dict(), shared_contract) for row in rows),
+            success_reason={"action": "passthrough"},
+        )
+
+
+def _run_fork_coalesce_to_eof_flush_crash(
+    db: LandscapeDB, tmp_path: Path
+) -> tuple[str, RecoveryManager, ExecutionGraph, CheckpointManager, PipelineConfig, ElspethSettings]:
+    """Crash a fork→coalesce run at the EOF-deferred merge, mid-group.
+
+    The one deterministic construction where the crashed image has complete
+    sources, a checkpoint, and an OPEN bound fork group: an EOF-triggered
+    aggregation UPSTREAM of the fork buffers the row until the source
+    lifecycle reaches ``exhausted``; the END_OF_SOURCE flush then re-emits
+    it, the gate forks it, both branches arrive at the coalesce, and the
+    injected ``_complete_coalesce_fire`` raise kills the run BEFORE the
+    fired group's atomic journal completion — branches stay BLOCKED, the
+    group stays open, and only the group gate has anything to say.
+
+    (The WS5 plan's original construction — best_effort deferring the merge
+    past load with no aggregation — is FALSE against the live engine:
+    best_effort ARRIVAL merges the moment every branch is accounted for, so
+    a plain fork resolves in-row while the source is still ``loading`` and
+    the lifecycle gate masks the group gate. Re-measured 2026-08-25.)
+    """
+    checkpoint_mgr = CheckpointManager(db)
+    checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+    source = ListSource([{"value": 1}], name="list_source", on_success="agg_in")
+    transform = _PassthroughBatchTransform()
+    sink = CollectSink("default")
+    agg_settings = AggregationSettings(
+        name="eof_buffer",
+        plugin=transform.name,
+        input="agg_in",
+        on_success="to_gate",
+        on_error="discard",
+        # count above the row count: only the END_OF_SOURCE flush fires,
+        # strictly after the source lifecycle reached ``exhausted``.
+        trigger=TriggerConfig(count=5, timeout_seconds=3600),
+        output_mode=OutputMode.TRANSFORM,
+    )
+    gate = GateSettings(
+        name="fork_gate",
+        input="to_gate",
+        condition="True",
+        routes={"true": "fork", "false": "default"},
+        fork_to=["path_a", "path_b"],
+    )
+    coalesce = CoalesceSettings(
+        name="merger",
+        branches=["path_a", "path_b"],
+        policy="require_all",
+        merge="union",
+        on_success="default",
+    )
+    graph = ExecutionGraph.from_plugin_instances(
+        sources={"primary": as_source(source)},
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="agg_in", options={})},
+        transforms=[],
+        sinks={"default": as_sink(sink)},
+        gates=[gate],
+        aggregations={"eof_buffer": (as_transform(transform), agg_settings)},
+        coalesce_settings=[coalesce],
+    )
+    agg_node_id = graph.get_aggregation_id_map()[AggregationName("eof_buffer")]
+    transform.node_id = agg_node_id
+    config = PipelineConfig(
+        sources={"primary": as_source(source)},
+        transforms=[as_transform(transform)],
+        sinks={"default": as_sink(sink)},
+        gates=[gate],
+        coalesce_settings=[coalesce],
+        aggregation_settings={agg_node_id: agg_settings},
+        sink_effect_modes={"default": "write"},
+    )
+    settings_obj = ElspethSettings(
+        sources={"primary": {"plugin": "test", "on_success": "default", "options": {}}},
+        sinks={"default": {"plugin": "test", "on_write_failure": "discard"}},
+        gates=[gate],
+        coalesce=[coalesce],
+    )
+
+    real_fire = RowProcessor._complete_coalesce_fire
+
+    def crash_before_completion(self: RowProcessor, **kwargs: Any) -> None:
+        raise RuntimeError("test: injected crash at EOF coalesce flush (mid-group)")
+
+    RowProcessor._complete_coalesce_fire = crash_before_completion  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="injected crash at EOF coalesce flush"):
+            Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config).run(
+                config,
+                graph=graph,
+                settings=settings_obj,
+                payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
+            )
+    finally:
+        RowProcessor._complete_coalesce_fire = real_fire  # type: ignore[method-assign]
+
+    with db.connection() as conn:
+        run_rows = conn.execute(select(runs_table)).fetchall()
+    assert len(run_rows) == 1
+    run_id = str(run_rows[0].run_id)
+    # Preconditions the construction exists to guarantee: without them the
+    # earlier gates mask the group gate and this test proves nothing.
+    assert run_rows[0].status == RunStatus.FAILED
+    assert _source_lifecycle_states(db, run_id) == {"primary": "exhausted"}
+    return run_id, RecoveryManager(db, checkpoint_mgr), graph, checkpoint_mgr, config, settings_obj
+
+
+def test_group_satisfiability_gate_passes_on_an_honest_mid_group_crash(tmp_path: Path) -> None:
+    """HAPPY control (spec §9 row 5: false-refuse is WS5's dominant risk).
+
+    Every member of the open fork group is live or arrived, so both surfaces
+    must treat the crashed run as resumable — the gate exists for the
+    terminal-without-settlement anomaly, not for ordinary mid-group crashes.
+    """
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    run_id, recovery, graph, _ckpt, _config, _settings = _run_fork_coalesce_to_eof_flush_crash(db, tmp_path)
+    check = recovery.can_resume(run_id, graph)
+    assert check.can_resume, f"false refuse: {check.reason}"
+
+
+def test_group_satisfiability_refusal_names_scope_group_and_member(tmp_path: Path) -> None:
+    """Third sibling to the aggregation-violation pair (spec §8).
+
+    Adversarial construction for a fail-closed gate: terminalize one branch
+    token through the raw outcome writer (the exact bypass class WS3
+    retired) and wipe the run's group_losses rows — the member is now
+    terminal, never arrived, and unnamed in the ledger. Both the advisory
+    and enforcing surfaces must refuse, naming closer, group, and member.
+    """
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    run_id, recovery, graph, checkpoint_mgr, config, _settings = _run_fork_coalesce_to_eof_flush_crash(db, tmp_path)
+
+    with db.connection() as conn:
+        frame = conn.execute(
+            select(token_lineage_frames_table)
+            .where(token_lineage_frames_table.c.run_id == run_id)
+            .where(token_lineage_frames_table.c.member_key == "path_b")
+        ).fetchone()
+    assert frame is not None
+    lost_token_id = str(frame.token_id)
+    fork_group_id = str(frame.group_id)
+
+    # The retired-bypass shape: a terminal outcome with no settlement.
+    # The live crash path already terminalized the consumed branches
+    # (FAILURE/UNROUTED via the executor's merge-exception cleanup), so the
+    # terminal half of the anomaly is already durable — measured 2026-08-25;
+    # assert it rather than double-writing into the unique terminal index.
+    # The bypass image is completed by REMOVING the settlement evidence:
+    # wipe the ledger and un-point the journal row from the closer.
+    with db.connection() as conn:
+        terminal_row = conn.execute(
+            select(token_outcomes_table)
+            .where(token_outcomes_table.c.run_id == run_id)
+            .where(token_outcomes_table.c.token_id == lost_token_id)
+            .where(token_outcomes_table.c.completed == 1)
+        ).fetchone()
+    if terminal_row is None:
+        RecorderFactory(db).data_flow.record_token_outcome(
+            ref=TokenRef(token_id=lost_token_id, run_id=run_id),
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.UNROUTED,
+            error_hash="0" * 16,
+        )
+    with db.engine.begin() as conn:
+        conn.execute(delete(group_losses_table).where(group_losses_table.c.run_id == run_id))
+        # Defeat the arrived limb for path_b: the bypass class terminalized
+        # tokens that never reached the closer, so its journal row must not
+        # point at the closer either.
+        conn.execute(
+            update(token_work_items_table)
+            .where(token_work_items_table.c.token_id == lost_token_id)
+            .values(coalesce_name=None, row_union_name=None, barrier_key=None)
+        )
+
+    # Advisory surface.
+    check = recovery.can_resume(run_id, graph)
+    assert not check.can_resume
+    assert check.reason is not None
+    for needle in ("merger", fork_group_id, "path_b", "group_losses"):
+        assert needle in check.reason, f"refusal must name the evidence; missing {needle!r} in: {check.reason}"
+
+    # Enforcing surface — SAME shared implementation, before any mutation.
+    latest = checkpoint_mgr.get_latest_checkpoint(run_id)
+    assert latest is not None
+    resume_point = ResumePoint(checkpoint=latest, sequence_number=latest.sequence_number)
+    with pytest.raises(GroupUnsatisfiableResumeError) as excinfo:
+        Orchestrator(db, checkpoint_manager=checkpoint_mgr).resume(
+            resume_point,
+            config,
+            graph,
+            payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
+        )
+    assert excinfo.value.run_id == run_id
+    assert [(m.group_id, m.member_key) for m in excinfo.value.members] == [(fork_group_id, "path_b")]
+
+    # Settling the member (a group_losses row, unadopted) clears the refusal:
+    # the gate reads the FULL ledger, not the adoption cursor.
+    with db.engine.begin() as conn:
+        conn.execute(
+            group_losses_table.insert().values(
+                loss_id="loss-restored",
+                run_id=run_id,
+                closer_name="merger",
+                group_id=fork_group_id,
+                member_key="path_b",
+                token_id=lost_token_id,
+                reason="quarantined",
+                recorded_by="worker:test",
+                recorded_at=datetime.now(UTC),
+                adopted_epoch=None,
+            )
+        )
+    assert recovery.can_resume(run_id, graph).can_resume

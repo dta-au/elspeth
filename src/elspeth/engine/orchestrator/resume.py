@@ -54,9 +54,12 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.canonical import canonical_json
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.checkpoint.recovery import (
+    GroupUnsatisfiableResumeError,
     NonResumableRunError,
+    check_group_satisfiability_resumable,
     check_run_status_resumable,
     check_source_lifecycle_resumable,
+    group_binding_view_from_graph,
 )
 from elspeth.core.landscape.factory import RecorderFactory
 
@@ -960,6 +963,17 @@ class ResumeCoordinator:
                 guarded_run_id,
                 topology_check.reason or "checkpoint topology is incompatible with the current execution graph",
             )
+
+        # ---- resume() entry guard, part 3: group satisfiability (spec §8) ----
+        # SAME shared implementation as the advisory can_resume() — the
+        # check_source_lifecycle_resumable two-surface precedent
+        # (elspeth-1f5b83cd28). READ-ONLY refusal before the first mutation
+        # (prepare_for_run / rebase_sequence / the seat CAS): a bound-group
+        # member that is terminal without settlement can never settle, so the
+        # resumed run would wedge at its closer forever (ADR-042 D4).
+        group_gate = check_group_satisfiability_resumable(self._db, guarded_run_id, group_binding_view_from_graph(graph))
+        if not group_gate.check.can_resume:
+            raise GroupUnsatisfiableResumeError(guarded_run_id, group_gate.unsatisfiable_members)
 
         # ADR-010 §Decision 3: freeze both registries at bootstrap, mirroring
         # run(). Recovery happens in a new process — the module import chain

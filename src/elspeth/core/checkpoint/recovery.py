@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.engine import Row
 
 from elspeth.contracts import (
@@ -44,14 +44,18 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler import BarrierJournalRepository, SchedulerEventStore
+from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.schema import (
     SOURCE_COMPLETE_LIFECYCLE_STATES,
+    group_losses_table,
+    group_records_table,
     node_states_table,
     rows_table,
     run_sources_table,
     runs_table,
     token_lineage_frames_table,
     token_outcomes_table,
+    token_work_items_table,
     tokens_table,
 )
 
@@ -74,6 +78,9 @@ def _reject_source_row_json_constant(constant: str) -> Any:
 
 
 __all__ = [
+    "GroupBindingView",
+    "GroupSatisfiabilityResumeGate",
+    "GroupUnsatisfiableResumeError",
     "IncompleteTokenSpec",
     "NonResumableRunError",
     "RecoveryManager",
@@ -81,8 +88,11 @@ __all__ = [
     "ResumePoint",  # Re-exported from contracts for convenience
     "ResumeWorkSet",
     "SourceLifecycleResumeGate",
+    "UnsatisfiableGroupMember",
+    "check_group_satisfiability_resumable",
     "check_run_status_resumable",
     "check_source_lifecycle_resumable",
+    "group_binding_view_from_graph",
 ]
 
 
@@ -243,6 +253,294 @@ def check_source_lifecycle_resumable(db: LandscapeDB, run_id: str) -> SourceLife
         lifecycle_by_source=lifecycle_by_source,
         incomplete_sources=incomplete_sources,
         check=ResumeCheck(can_resume=True),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GroupBindingView:
+    """Config-derived binding facts for the group-satisfiability gate.
+
+    Built from the builder's group-binding registry by
+    :func:`group_binding_view_from_graph` (the ONE seam coupling this gate to
+    the DAG layer); unit tests construct it directly. Boundness is a config
+    fact, never a durable one — ``group_records`` deliberately carries no
+    binding column (spec §4.3).
+    """
+
+    fork_branch_closers: Mapping[str, str]
+    fork_branch_rosters: Mapping[str, tuple[str, ...]]
+    scope_opener_closers: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "fork_branch_closers", "fork_branch_rosters", "scope_opener_closers")
+
+
+@dataclass(frozen=True, slots=True)
+class UnsatisfiableGroupMember:
+    """One minted member of a bound group that no resume can ever settle."""
+
+    closer_name: str
+    group_id: str
+    member_key: str
+    kind: FrameKind
+
+
+@dataclass(frozen=True, slots=True)
+class GroupSatisfiabilityResumeGate:
+    """Facts + verdict from the shared group-satisfiability resume gate.
+
+    SINGLE shared implementation for the advisory ``can_resume`` surface and
+    the enforcing entry guard in ``ResumeCoordinator.resume()`` — the two
+    must never drift (the check_source_lifecycle_resumable precedent,
+    elspeth-1f5b83cd28; spec §8).
+    """
+
+    unsatisfiable_members: tuple[UnsatisfiableGroupMember, ...]
+    check: ResumeCheck
+
+
+# TIER-2: same operator-refusal register as NonResumableRunError above — the
+# audit DB is intact; the durable group state proves the roster can never
+# close, so resuming would wedge at the barrier forever (the B3 dishonesty
+# spec §5 names). Carries the members so CLI/API callers surface the exact
+# scope/group/member without parsing text.
+class GroupUnsatisfiableResumeError(Exception):
+    """Raised by ``ResumeCoordinator.resume()`` when a bound group can never settle."""
+
+    def __init__(self, run_id: str, members: Sequence[UnsatisfiableGroupMember]) -> None:
+        if not members:
+            raise ValueError("GroupUnsatisfiableResumeError requires at least one member")
+        self.run_id = run_id
+        self.members = tuple(members)
+        summary = "; ".join(f"closer {m.closer_name!r} group {m.group_id!r} member {m.member_key!r}" for m in self.members)
+        super().__init__(
+            f"Cannot resume run {run_id!r}: {len(self.members)} bound-group member(s) are terminal "
+            f"without settlement — neither arrived at their closer nor named in group_losses ({summary}). "
+            "The group roster can never close; investigate the audit evidence instead of resuming over it."
+        )
+
+
+def _group_member_is_settled_or_live(
+    conn: Any,
+    *,
+    run_id: str,
+    closer_name: str,
+    group_id: str,
+    member_key: str,
+) -> bool:
+    """The three-limb satisfiability check for one minted member (spec §8)."""
+    lost = conn.execute(
+        select(group_losses_table.c.loss_id)
+        .where(
+            group_losses_table.c.run_id == run_id,
+            group_losses_table.c.closer_name == closer_name,
+            group_losses_table.c.group_id == group_id,
+            group_losses_table.c.member_key == member_key,
+            # NO adopted_epoch filter: §6.2 full-table-read discipline —
+            # adoption is a leader-memory cursor, not a truth filter.
+        )
+        .limit(1)
+    ).fetchone()
+    if lost is not None:
+        return True
+
+    frames = token_lineage_frames_table
+    live = conn.execute(
+        select(frames.c.token_id)
+        .where(
+            frames.c.run_id == run_id,
+            frames.c.group_id == group_id,
+            frames.c.member_key == member_key,
+            ~select(token_outcomes_table.c.outcome_id)
+            .where(
+                token_outcomes_table.c.run_id == run_id,
+                token_outcomes_table.c.token_id == frames.c.token_id,
+                token_outcomes_table.c.completed == 1,
+            )
+            .exists(),
+        )
+        .limit(1)
+    ).fetchone()
+    if live is not None:
+        return True
+
+    arrived = conn.execute(
+        select(token_work_items_table.c.work_item_id)
+        .select_from(
+            token_work_items_table.join(
+                frames,
+                (token_work_items_table.c.token_id == frames.c.token_id) & (token_work_items_table.c.run_id == frames.c.run_id),
+            )
+        )
+        .where(
+            token_work_items_table.c.run_id == run_id,
+            frames.c.group_id == group_id,
+            frames.c.member_key == member_key,
+            or_(
+                token_work_items_table.c.coalesce_name == closer_name,
+                token_work_items_table.c.row_union_name == closer_name,
+                # Collector rows: collector_name is the address column; their
+                # barrier_key is the compound "collector:<name>:<group-id>"
+                # (WS4 Task 6), so the bare-equality barrier_key disjunct
+                # below cannot match them — do not drop this disjunct.
+                token_work_items_table.c.collector_name == closer_name,
+                token_work_items_table.c.barrier_key == closer_name,
+                # The compound collector address itself, built by THE single
+                # construction site (never re-derived inline; the interlock
+                # canary pins this call).
+                token_work_items_table.c.barrier_key == collector_barrier_key(closer_name, group_id),
+            ),
+        )
+        .limit(1)
+    ).fetchone()
+    return arrived is not None
+
+
+def check_group_satisfiability_resumable(
+    db: LandscapeDB,
+    run_id: str,
+    bindings: GroupBindingView,
+) -> GroupSatisfiabilityResumeGate:
+    """Group-satisfiability portion of :meth:`RecoveryManager.can_resume` (spec §8).
+
+    SINGLE shared implementation for the advisory ``can_resume`` surface and
+    the enforcing ``GroupUnsatisfiableResumeError`` guard in
+    ``ResumeCoordinator.resume()`` — the two must never drift (the
+    check_source_lifecycle_resumable two-surface precedent). Every minted
+    member of every bound group must be non-terminal, arrived at its closer,
+    or named in ``group_losses``; otherwise refuse with closer, group, and
+    member named. Unbound groups are inert provenance and never refuse.
+    """
+    unsatisfiable: list[UnsatisfiableGroupMember] = []
+    with db.engine.connect() as conn:
+        # --- FORK groups: roster authority is the declared branch list. ---
+        fork_rows = conn.execute(
+            select(token_lineage_frames_table.c.group_id, token_lineage_frames_table.c.member_key)
+            .where(
+                token_lineage_frames_table.c.run_id == run_id,
+                token_lineage_frames_table.c.kind == FrameKind.FORK.value,
+            )
+            .distinct()
+        ).fetchall()
+        fork_members_seen: dict[str, set[str]] = {}
+        for row in fork_rows:
+            fork_members_seen.setdefault(str(row.group_id), set()).add(str(row.member_key))
+
+        for group_id in sorted(fork_members_seen):
+            seen = fork_members_seen[group_id]
+            bound = {member for member in seen if member in bindings.fork_branch_closers}
+            if not bound:
+                continue  # fully unbound fork: pure fan-out, no roster watching
+            if bound != seen:
+                raise AuditIntegrityError(
+                    f"Fork group {group_id!r} in run {run_id!r} violates whole-roster closure "
+                    f"(ruling 23): members {sorted(seen - bound)} are unbound while "
+                    f"{sorted(bound)} bind a closer. Config/audit disagreement."
+                )
+            sample = next(iter(bound))
+            closer_name = bindings.fork_branch_closers[sample]
+            roster = bindings.fork_branch_rosters[sample]
+            for member_key in roster:
+                if not _group_member_is_settled_or_live(
+                    conn, run_id=run_id, closer_name=closer_name, group_id=group_id, member_key=member_key
+                ):
+                    unsatisfiable.append(
+                        UnsatisfiableGroupMember(closer_name=closer_name, group_id=group_id, member_key=member_key, kind=FrameKind.FORK)
+                    )
+
+        # --- EXPAND groups: roster authority is group_records + frames. ---
+        if bindings.scope_opener_closers:
+            expand_rows = conn.execute(
+                select(
+                    group_records_table.c.group_id,
+                    group_records_table.c.member_count,
+                    node_states_table.c.node_id,
+                )
+                .select_from(
+                    group_records_table.join(
+                        node_states_table,
+                        (group_records_table.c.opener_token_id == node_states_table.c.token_id)
+                        & (group_records_table.c.run_id == node_states_table.c.run_id),
+                    )
+                )
+                .where(
+                    group_records_table.c.run_id == run_id,
+                    group_records_table.c.kind == FrameKind.EXPAND.value,
+                    node_states_table.c.node_id.in_(sorted(bindings.scope_opener_closers)),
+                )
+                .distinct()
+            ).fetchall()
+            for row in expand_rows:
+                group_id = str(row.group_id)
+                closer_name = bindings.scope_opener_closers[str(row.node_id)]
+                minted = {
+                    str(r.member_key)
+                    for r in conn.execute(
+                        select(token_lineage_frames_table.c.member_key)
+                        .where(
+                            token_lineage_frames_table.c.run_id == run_id,
+                            token_lineage_frames_table.c.group_id == group_id,
+                            token_lineage_frames_table.c.kind == FrameKind.EXPAND.value,
+                        )
+                        .distinct()
+                    )
+                }
+                if len(minted) != int(row.member_count):
+                    raise AuditIntegrityError(
+                        f"Expand group {group_id!r} in run {run_id!r}: group_records.member_count="
+                        f"{int(row.member_count)} but {len(minted)} distinct member frames exist. "
+                        "Roster cross-check failed (spec §5)."
+                    )
+                for member_key in sorted(minted):
+                    if not _group_member_is_settled_or_live(
+                        conn, run_id=run_id, closer_name=closer_name, group_id=group_id, member_key=member_key
+                    ):
+                        unsatisfiable.append(
+                            UnsatisfiableGroupMember(
+                                closer_name=closer_name, group_id=group_id, member_key=member_key, kind=FrameKind.EXPAND
+                            )
+                        )
+
+    if unsatisfiable:
+        shown = unsatisfiable[:5]
+        detail = "; ".join(f"{m.kind.value} group {m.group_id!r} member {m.member_key!r} at closer {m.closer_name!r}" for m in shown)
+        suffix = "" if len(unsatisfiable) <= 5 else f" (+{len(unsatisfiable) - 5} more)"
+        reason = (
+            f"{len(unsatisfiable)} bound-group member(s) can never settle — each is terminal without "
+            f"arriving at its closer and without a group_losses record: {detail}{suffix}"
+        )
+        return GroupSatisfiabilityResumeGate(
+            unsatisfiable_members=tuple(unsatisfiable),
+            check=ResumeCheck(can_resume=False, reason=reason),
+        )
+    return GroupSatisfiabilityResumeGate(unsatisfiable_members=(), check=ResumeCheck(can_resume=True))
+
+
+def group_binding_view_from_graph(graph: ExecutionGraph) -> GroupBindingView:
+    """Project the builder's group-binding registry into the gate's input.
+
+    THE single seam coupling the satisfiability gate to the DAG layer: a
+    FORK binding contributes every declared branch (whole-roster, ruling
+    23); an EXPAND binding contributes its opener node. The discriminator
+    is ``GroupBinding.kind`` — an EXPAND binding's ``member_roster`` is
+    ``()`` by contract (runtime roster authority is ``group_records``),
+    so roster emptiness must never be used to tell the kinds apart.
+    """
+    fork_branch_closers: dict[str, str] = {}
+    fork_branch_rosters: dict[str, tuple[str, ...]] = {}
+    scope_opener_closers: dict[str, str] = {}
+    for binding in graph.get_group_bindings().bindings:
+        if binding.kind is FrameKind.FORK:
+            roster = tuple(binding.member_roster)
+            for branch in roster:
+                fork_branch_closers[branch] = binding.closer_name
+                fork_branch_rosters[branch] = roster
+        else:  # FrameKind.EXPAND
+            scope_opener_closers[str(binding.opener_node_id)] = binding.closer_name
+    return GroupBindingView(
+        fork_branch_closers=fork_branch_closers,
+        fork_branch_rosters=fork_branch_rosters,
+        scope_opener_closers=scope_opener_closers,
     )
 
 
@@ -409,6 +707,9 @@ class RecoveryManager:
         - Every declared source reached a complete lifecycle state
           (``SOURCE_COMPLETE_LIFECYCLE_STATES``) — the same precondition
           ``resume()`` enforces via ``IncompleteSourceResumeError``
+        - Every minted member of every bound group is satisfiable (spec §8) —
+          the same precondition ``resume()`` enforces via
+          ``GroupUnsatisfiableResumeError``
         - The stored schema contract passes integrity verification (if present)
 
         Args:
@@ -457,6 +758,15 @@ class RecoveryManager:
         lifecycle_gate = check_source_lifecycle_resumable(self._db, run_id)
         if not lifecycle_gate.check.can_resume:
             return lifecycle_gate.check
+
+        # Group satisfiability (spec §8; ADR-038 amendment, ADR-042 D4):
+        # every minted member of every bound group must be non-terminal,
+        # arrived at its closer, or named in group_losses — otherwise no
+        # resume can ever close the roster and the run would wedge at the
+        # barrier. Same shared implementation as resume()'s enforcing guard.
+        group_gate = check_group_satisfiability_resumable(self._db, run_id, group_binding_view_from_graph(graph))
+        if not group_gate.check.can_resume:
+            return group_gate.check
 
         # Verify schema contract integrity (Tier 1 - raises on corruption)
         # This must happen AFTER topology validation passes, as contract

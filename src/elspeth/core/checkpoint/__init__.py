@@ -14,20 +14,37 @@ Provides:
 from elspeth.contracts import ResumeCheck, ResumePoint
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator, IncompatibleCheckpointError
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError, CheckpointManager
-from elspeth.core.checkpoint.recovery import IncompleteTokenSpec, NonResumableRunError, RecoveryManager, check_run_status_resumable
+from elspeth.core.checkpoint.recovery import (
+    GroupBindingView,
+    GroupSatisfiabilityResumeGate,
+    GroupUnsatisfiableResumeError,
+    IncompleteTokenSpec,
+    NonResumableRunError,
+    RecoveryManager,
+    UnsatisfiableGroupMember,
+    check_group_satisfiability_resumable,
+    check_run_status_resumable,
+    group_binding_view_from_graph,
+)
 from elspeth.core.checkpoint.serialization import checkpoint_dumps, checkpoint_loads
 
 __all__ = [
     "CheckpointCompatibilityValidator",
     "CheckpointCorruptionError",
     "CheckpointManager",
+    "GroupBindingView",
+    "GroupSatisfiabilityResumeGate",
+    "GroupUnsatisfiableResumeError",
     "IncompatibleCheckpointError",
     "IncompleteTokenSpec",
     "NonResumableRunError",
     "RecoveryManager",
     "ResumeCheck",
     "ResumePoint",
+    "UnsatisfiableGroupMember",
+    "check_group_satisfiability_resumable",
     "check_run_status_resumable",
     "checkpoint_dumps",
     "checkpoint_loads",
+    "group_binding_view_from_graph",
 ]

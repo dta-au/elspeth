@@ -70,6 +70,10 @@ EXPECTED_HELPER_CALL_SITES = frozenset(
         ("src/elspeth/engine/barrier_coordination.py", "_adopt_collector_row"),
         ("src/elspeth/engine/barrier_coordination.py", "_dispose_collector_outcome"),
         ("src/elspeth/engine/barrier_coordination.py", "restore_from_journal"),
+        # WS5 Task 1 (spec §8): the group-satisfiability resume gate's
+        # arrived limb matches collector journal rows by the compound
+        # address — through the helper, never a re-derived format.
+        ("src/elspeth/core/checkpoint/recovery.py", "_group_member_is_settled_or_live"),
     }
 )
 
