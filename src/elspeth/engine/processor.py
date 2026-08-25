@@ -4861,25 +4861,43 @@ class RowProcessor:
     def _released_collector_cursor(self, token: TokenInfo) -> tuple[CoalesceName | None, RowUnionName | None, CollectorName | None]:
         """Barrier cursor for a token a collector just released (spec §7 rules 2/5).
 
-        ``collect_tokens`` popped the closed group's EXPAND frame; whatever
-        frame is now innermost names the ENCLOSING region the release is a
-        member of, if any: a FORK frame resolves through the branch maps
-        (``resolve_merged_branch_barrier``'s nested arm), an EXPAND frame
-        through the binding registry (a collector-in-collector nest; inert
-        when unbound). A release with no remaining frame, or an unbound one,
-        carries no cursor — an ordinary consumer or a sink awaits it.
+        ``collect_tokens`` popped the closed group's EXPAND frame and minted
+        the release with its OWN release-group EXPAND frame INNERMOST
+        (META-37: ``(EXPAND, release_group_id, own token_id)``,
+        data_flow ``collect_tokens``) — so the innermost frame is never the
+        enclosing region, and reading ``lineage_path[-1]`` alone left a
+        release inside a fork with no cursor at all (it then terminal-
+        defaulted past the coalesce to a nonexistent sink). Walk OUTWARD
+        past inert/unbound frames — the ``_first_bound_frame`` discipline —
+        to the first frame that names an enclosing barrier: a FORK frame
+        resolves through the branch maps
+        (``resolve_merged_branch_barrier``'s nested arm; a branch feeding
+        neither map has no barrier and the walk continues), an EXPAND frame
+        through the binding registry with the META-9.1 re-derivation (a
+        collector-in-collector nest). The release-group frame itself
+        resolves INERT structurally, not heuristically: its
+        ``group_records.opener_token_id`` is the representative MEMBER,
+        which holds no node_state at any declared opener node
+        (``collect_tokens`` never calls ``register_expand_group``), so the
+        re-derivation classifies it undeclared and the walk moves outward.
+        A release with no remaining bound frame carries no cursor — an
+        ordinary consumer or a sink awaits it.
         """
-        if not token.lineage_path:
-            return None, None, None
-        frame = token.lineage_path[-1]
-        if frame.kind is FrameKind.FORK:
-            branch_key = BranchName(frame.member_key)
-            if branch_key in self._branch_to_coalesce:
-                return self._branch_to_coalesce[branch_key], None, None
-            if branch_key in self._branch_to_row_union:
-                return None, self._branch_to_row_union[branch_key], None
-            return None, None, None
-        return None, None, self._enclosing_collector_cursor(token)
+        for frame in reversed(token.lineage_path):
+            if frame.kind is FrameKind.FORK:
+                branch_key = BranchName(frame.member_key)
+                if branch_key in self._branch_to_coalesce:
+                    return self._branch_to_coalesce[branch_key], None, None
+                if branch_key in self._branch_to_row_union:
+                    return None, self._branch_to_row_union[branch_key], None
+                continue
+            if frame.kind is FrameKind.EXPAND:
+                binding = self._group_bindings.binding_for(frame)
+                if binding is None:
+                    binding = self._rederive_expand_binding(frame)
+                if binding is not None and binding.closer_kind is CloserKind.COLLECTOR:
+                    return None, None, CollectorName(binding.closer_name)
+        return None, None, None
 
     def _enclosing_collector_cursor(self, token: TokenInfo) -> CollectorName | None:
         """The collector cursor a token owes its ENCLOSING scope, if its

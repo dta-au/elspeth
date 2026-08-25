@@ -326,6 +326,158 @@ class TestReleaseCursorDerivation:
             assert processor._released_collector_cursor(inert) == (None, None, None)
 
 
+class TestReleaseCursorWalk:
+    """META-37 (elspeth-e00cb66b7d): a collector release carries its OWN
+    release-group EXPAND frame INNERMOST (``collect_tokens`` mints
+    ``(EXPAND, release_group_id, own token_id)``), so the cursor derivation
+    must walk OUTWARD past it — reading ``lineage_path[-1]`` alone gave a
+    release inside a fork no cursor at all, and the release then
+    terminal-defaulted past the coalesce to a nonexistent sink. Release
+    tokens here are minted through the REAL durable writers (fork_token /
+    expand_token / collect_tokens), never synthesized, so the walk's inert
+    classification runs against the release group's real group_records row
+    (opener = the representative MEMBER, which visited no declared opener —
+    the structural fact that makes the frame inert)."""
+
+    INNER_OPENER = NodeID("inner-explode")
+    OUTER_OPENER = NodeID("outer-explode")
+
+    def _registry(self) -> GroupBindingRegistry:
+        return GroupBindingRegistry(
+            bindings=(
+                GroupBinding(
+                    kind=FrameKind.EXPAND,
+                    opener_node_id=self.INNER_OPENER,
+                    opener_name="inner_explode",
+                    closer_node_id=NodeID(COLLECTOR_NODE),
+                    closer_name=str(STITCH),
+                    closer_kind=CloserKind.COLLECTOR,
+                    policy="require_all",
+                    on_group_failure=None,
+                    member_roster=(),
+                ),
+                GroupBinding(
+                    kind=FrameKind.EXPAND,
+                    opener_node_id=self.OUTER_OPENER,
+                    opener_name="outer_explode",
+                    closer_node_id=NodeID("collector-outer"),
+                    closer_name="outer_stitch",
+                    closer_kind=CloserKind.COLLECTOR,
+                    policy="require_all",
+                    on_group_failure=None,
+                    member_roster=(),
+                ),
+            )
+        )
+
+    @staticmethod
+    def _seed_root(factory: Any, *, run_id: str = "test-run") -> tuple[str, str]:
+        row = factory.data_flow.create_row(run_id, "source-0", 1, {"seed": 1}, source_row_index=1, ingest_sequence=1)
+        root = factory.data_flow.create_token(row_id=row.row_id)
+        return row.row_id, root.token_id
+
+    @staticmethod
+    def _collect_release(factory: Any, *, scope_parent_id: str, row_id: str, run_id: str = "test-run") -> TokenInfo:
+        """Durably expand ``scope_parent_id`` into a one-member scope group and
+        close it through collect_tokens; return the release child with its
+        REAL durable lineage (outer frames + its own release-group frame)."""
+        from elspeth.contracts.audit import TokenRef
+
+        contract = make_contract()
+        children, scope_gid = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=scope_parent_id, run_id=run_id),
+            row_id=row_id,
+            child_payloads=[{"v": 1}],
+            output_contract=contract,
+        )
+        committed = factory.data_flow.collect_tokens(
+            member_refs=[TokenRef(token_id=children[0].token_id, run_id=run_id)],
+            group_id=scope_gid,
+            collector_node_id=COLLECTOR_NODE,
+            output_payloads=[{"assembled": True}],
+            output_contracts=[contract],
+        )
+        [release] = committed.children
+        lineage = factory.data_flow.load_lineage_paths(run_id, [release.token_id])[release.token_id]
+        return make_token_info(row_id=row_id, token_id=release.token_id, lineage_path=lineage)
+
+    def test_release_inside_a_fork_walks_past_its_release_group_frame_to_the_branch_coalesce(self) -> None:
+        from elspeth.contracts.audit import TokenRef
+
+        _db, factory = _make_factory()
+        processor = _make_processor(
+            factory,
+            branch_to_coalesce={BranchName("path_a"): CoalesceName("merge")},
+            coalesce_node_ids={CoalesceName("merge"): NodeID("coalesce::merge")},
+            group_bindings=self._registry(),
+        )
+        row_id, root_id = self._seed_root(factory)
+        forked, _fork_gid = factory.data_flow.fork_token(TokenRef(token_id=root_id, run_id="test-run"), row_id, ["path_a", "path_b"])
+        release = self._collect_release(factory, scope_parent_id=forked[0].token_id, row_id=row_id)
+
+        # The release's innermost frame is its OWN release-group frame — the
+        # META-37 shape — with the FORK frame one level out.
+        assert [f.kind for f in release.lineage_path] == [FrameKind.FORK, FrameKind.EXPAND]
+        assert release.lineage_path[-1].member_key == release.token_id
+        assert processor._released_collector_cursor(release) == (CoalesceName("merge"), None, None)
+
+    def test_release_inside_an_outer_scope_walks_to_the_enclosing_collector(self) -> None:
+        _db, factory = _make_factory()
+        registry = self._registry()
+        processor = _make_processor(factory, group_bindings=registry)
+        row_id, root_id = self._seed_root(factory)
+        from elspeth.contracts.audit import TokenRef
+
+        outer_members, outer_gid = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=root_id, run_id="test-run"),
+            row_id=row_id,
+            child_payloads=[{"page": 1}],
+            output_contract=make_contract(),
+        )
+        registry.register_expand_group(outer_gid, opener_name="outer_explode")
+        release = self._collect_release(factory, scope_parent_id=outer_members[0].token_id, row_id=row_id)
+
+        assert [f.kind for f in release.lineage_path] == [FrameKind.EXPAND, FrameKind.EXPAND]
+        assert processor._released_collector_cursor(release) == (None, None, CollectorName("outer_stitch"))
+
+    def test_release_in_an_unbarried_fork_branch_still_walks_to_the_enclosing_collector(self) -> None:
+        """A FORK frame whose branch feeds no coalesce/row_union has no
+        barrier of its own — the walk continues OUTWARD to the enclosing
+        scope's collector rather than stopping cursorless at the branch."""
+        from elspeth.contracts.audit import TokenRef
+
+        _db, factory = _make_factory()
+        registry = self._registry()
+        processor = _make_processor(factory, group_bindings=registry)
+        row_id, root_id = self._seed_root(factory)
+        outer_members, outer_gid = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=root_id, run_id="test-run"),
+            row_id=row_id,
+            child_payloads=[{"page": 1}],
+            output_contract=make_contract(),
+        )
+        registry.register_expand_group(outer_gid, opener_name="outer_explode")
+        forked, _fork_gid = factory.data_flow.fork_token(
+            TokenRef(token_id=outer_members[0].token_id, run_id="test-run"), row_id, ["path_x", "path_y"]
+        )
+        release = self._collect_release(factory, scope_parent_id=forked[0].token_id, row_id=row_id)
+
+        assert [f.kind for f in release.lineage_path] == [FrameKind.EXPAND, FrameKind.FORK, FrameKind.EXPAND]
+        assert processor._released_collector_cursor(release) == (None, None, CollectorName("outer_stitch"))
+
+    def test_flat_release_cursor_stays_none(self) -> None:
+        """Zero-delta pin: a flat (terminal-collector) release carries ONLY
+        its own release-group frame and derives no cursor — exactly the
+        pre-walk behaviour, byte-identical."""
+        _db, factory = _make_factory()
+        processor = _make_processor(factory, group_bindings=self._registry())
+        row_id, root_id = self._seed_root(factory)
+        release = self._collect_release(factory, scope_parent_id=root_id, row_id=row_id)
+
+        assert [f.kind for f in release.lineage_path] == [FrameKind.EXPAND]
+        assert processor._released_collector_cursor(release) == (None, None, None)
+
+
 class TestNestedReleaseCursor:
     """A coalesce or row_union INSIDE a scope releases the scope's member:
     the continuation's remaining innermost frame is the bound EXPAND frame,
