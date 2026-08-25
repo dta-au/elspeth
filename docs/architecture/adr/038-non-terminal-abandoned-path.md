@@ -203,6 +203,32 @@ COMMITTED (lock all run tokens, then classify from a fresh snapshot); combining
 was proven unsafe. Local PostgreSQL is implementation support, not evidence of
 the AWS deployment boundary.
 
+### 3a. Amendment (2026-08-25, unified-lineage WS5): the group-satisfiability arm is deliberately NOT mirrored
+
+The unified-lineage campaign added a fourth structural resume refusal:
+`check_group_satisfiability_resumable` (`core/checkpoint/recovery.py`),
+enforced by `resume()` as `GroupUnsatisfiableResumeError` — a minted member
+of a bound group that is terminal without arriving at its closer and
+without a `group_losses` record can never settle, so the roster can never
+close (spec 2026-08-21-barrier-scopes-full-nesting-spec §8).
+
+This arm intentionally breaks the "sweep fires iff a hypothetical resume
+would be refused" symmetry. The three original arms describe *ordinary
+operational states* (no checkpoint, no sources, incomplete lifecycle) —
+honest run-death shapes the sweep may tidy into `ABANDONED`. A
+group-unsatisfiable state is different in kind: after WS3, loss staging
+rides the settling disposition's own transaction (the claim's
+`take_claim_group_losses`, the empty flush's `complete_barrier`, or the
+escalation adoption write), so terminal-without-settlement is reachable
+only through an audit-integrity anomaly or the retired bypass class.
+Sweeping such a run's tokens to `(NULL, ABANDONED)` would launder
+an integrity anomaly into a routine closure and destroy the investigation
+signal the fail-closed refusal exists to preserve. Such runs therefore
+keep `closure='open'` and the refusal names closer, group, and member.
+
+If a legitimate operational path to terminal-without-settlement is ever
+found, revisit this asymmetry rather than working around the refusal.
+
 ### 4. Accounting: `abandoned` tokens and `closure='abandoned'`
 
 `web/execution/accounting.py` splits the undecided set:
@@ -350,6 +376,8 @@ encode.
 
 - **Amends:** ADR-019 (Two-Axis Terminal Model) — adds one non-terminal
   row to the mapping table; all other rows unchanged.
+- **Amended by:** unified-lineage WS5 (2026-08-25) — group-satisfiability
+  resume arm, deliberately unmirrored in the sweep (§3a).
 - ADR-030 (Multi-Worker Deployment Shape) — §D finalization transaction is
   the sweep's home; §E.3a reconcile semantics are deliberately untouched.
 - ADR-029 (Journal is Barrier-Buffer Truth) — journal rows of abandoned

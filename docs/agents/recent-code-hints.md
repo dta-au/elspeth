@@ -90,7 +90,9 @@ is a working document under the normal delivery posture.
   the crash path already terminalizes the consumed branches, so an
   adversarial image writes NO second terminal (unique index) — it removes
   settlement evidence instead. Shared group/lineage raw-seed helpers live in
-  `tests/fixtures/group_lineage.py`; extend there, not per-file.
+  `tests/fixtures/group_lineage.py`; extend there, not per-file. The
+  ADR-038 abandonment sweep deliberately does NOT mirror this arm
+  (ADR-038 §3a): do not "complete" the symmetry.
 
 - **2026-08-25 — group-settlement reasons are a CLOSED StrEnum (coalesce /
   scope closers only), and the merged-vs-failed discriminator is RELEASE
