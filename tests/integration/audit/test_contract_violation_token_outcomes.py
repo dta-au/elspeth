@@ -594,18 +594,17 @@ def test_group_satisfiability_gate_passes_on_an_honest_mid_group_crash(tmp_path:
     assert check.can_resume, f"false refuse: {check.reason}"
 
 
-def test_group_satisfiability_refusal_names_scope_group_and_member(tmp_path: Path) -> None:
-    """Third sibling to the aggregation-violation pair (spec §8).
+def _seed_unsatisfiable_bypass_image(db: LandscapeDB, run_id: str) -> tuple[str, str]:
+    """Complete the retired-bypass image on a crashed run: path_b terminal
+    with NO settlement evidence. Returns (lost_token_id, fork_group_id).
 
-    Adversarial construction for a fail-closed gate: terminalize one branch
-    token through the raw outcome writer (the exact bypass class WS3
-    retired) and wipe the run's group_losses rows — the member is now
-    terminal, never arrived, and unnamed in the ledger. Both the advisory
-    and enforcing surfaces must refuse, naming closer, group, and member.
+    The live crash path already terminalized the consumed branches
+    (FAILURE/UNROUTED via the executor's merge-exception cleanup), so the
+    terminal half of the anomaly is already durable — measured 2026-08-25;
+    assert it rather than double-writing into the unique terminal index.
+    The bypass image is completed by REMOVING the settlement evidence:
+    wipe the ledger and un-point the journal row from the closer.
     """
-    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
-    run_id, recovery, graph, checkpoint_mgr, config, _settings = _run_fork_coalesce_to_eof_flush_crash(db, tmp_path)
-
     with db.connection() as conn:
         frame = conn.execute(
             select(token_lineage_frames_table)
@@ -616,13 +615,6 @@ def test_group_satisfiability_refusal_names_scope_group_and_member(tmp_path: Pat
     lost_token_id = str(frame.token_id)
     fork_group_id = str(frame.group_id)
 
-    # The retired-bypass shape: a terminal outcome with no settlement.
-    # The live crash path already terminalized the consumed branches
-    # (FAILURE/UNROUTED via the executor's merge-exception cleanup), so the
-    # terminal half of the anomaly is already durable — measured 2026-08-25;
-    # assert it rather than double-writing into the unique terminal index.
-    # The bypass image is completed by REMOVING the settlement evidence:
-    # wipe the ledger and un-point the journal row from the closer.
     with db.connection() as conn:
         terminal_row = conn.execute(
             select(token_outcomes_table)
@@ -647,27 +639,33 @@ def test_group_satisfiability_refusal_names_scope_group_and_member(tmp_path: Pat
             .where(token_work_items_table.c.token_id == lost_token_id)
             .values(coalesce_name=None, row_union_name=None, barrier_key=None)
         )
+    return lost_token_id, fork_group_id
 
-    # Advisory surface.
+
+def test_group_satisfiability_refusal_names_scope_group_and_member(tmp_path: Path) -> None:
+    """Third sibling to the aggregation-violation pair (spec §8) — the
+    ADVISORY surface ONLY.
+
+    Adversarial construction for a fail-closed gate: terminalize one branch
+    token through the raw outcome writer (the exact bypass class WS3
+    retired) and wipe the run's group_losses rows — the member is now
+    terminal, never arrived, and unnamed in the ledger. can_resume must
+    refuse, naming closer, group, and member.
+
+    Deliberately does NOT touch resume(): this test is the exclusive kill
+    for the advisory wiring mutant (MB7), and its enforcing twin below is
+    the exclusive kill for MB8 — a shared pin cannot tell which surface was
+    unwired (review M-1 on 2dd76efe4).
+    """
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    run_id, recovery, graph, _checkpoint_mgr, _config, _settings = _run_fork_coalesce_to_eof_flush_crash(db, tmp_path)
+    lost_token_id, fork_group_id = _seed_unsatisfiable_bypass_image(db, run_id)
+
     check = recovery.can_resume(run_id, graph)
     assert not check.can_resume
     assert check.reason is not None
     for needle in ("merger", fork_group_id, "path_b", "group_losses"):
         assert needle in check.reason, f"refusal must name the evidence; missing {needle!r} in: {check.reason}"
-
-    # Enforcing surface — SAME shared implementation, before any mutation.
-    latest = checkpoint_mgr.get_latest_checkpoint(run_id)
-    assert latest is not None
-    resume_point = ResumePoint(checkpoint=latest, sequence_number=latest.sequence_number)
-    with pytest.raises(GroupUnsatisfiableResumeError) as excinfo:
-        Orchestrator(db, checkpoint_manager=checkpoint_mgr).resume(
-            resume_point,
-            config,
-            graph,
-            payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
-        )
-    assert excinfo.value.run_id == run_id
-    assert [(m.group_id, m.member_key) for m in excinfo.value.members] == [(fork_group_id, "path_b")]
 
     # Settling the member (a group_losses row, unadopted) clears the refusal:
     # the gate reads the FULL ledger, not the adoption cursor.
@@ -687,3 +685,28 @@ def test_group_satisfiability_refusal_names_scope_group_and_member(tmp_path: Pat
             )
         )
     assert recovery.can_resume(run_id, graph).can_resume
+
+
+def test_group_satisfiability_enforcing_guard_refuses_before_mutation(tmp_path: Path) -> None:
+    """The ENFORCING twin: resume() itself, never can_resume.
+
+    Same shared implementation, exercised through the entry guard alone so
+    unwiring it (mutant MB8) fails exactly this test while the advisory
+    sibling above stays green — and vice versa for MB7.
+    """
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    run_id, _recovery, graph, checkpoint_mgr, config, _settings = _run_fork_coalesce_to_eof_flush_crash(db, tmp_path)
+    _lost_token_id, fork_group_id = _seed_unsatisfiable_bypass_image(db, run_id)
+
+    latest = checkpoint_mgr.get_latest_checkpoint(run_id)
+    assert latest is not None
+    resume_point = ResumePoint(checkpoint=latest, sequence_number=latest.sequence_number)
+    with pytest.raises(GroupUnsatisfiableResumeError) as excinfo:
+        Orchestrator(db, checkpoint_manager=checkpoint_mgr).resume(
+            resume_point,
+            config,
+            graph,
+            payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
+        )
+    assert excinfo.value.run_id == run_id
+    assert [(m.group_id, m.member_key) for m in excinfo.value.members] == [(fork_group_id, "path_b")]
