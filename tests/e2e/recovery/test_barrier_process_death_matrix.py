@@ -1244,7 +1244,13 @@ def _assert_follower_handoff_image(database_url: str) -> None:
     with LandscapeDB.from_url(database_url, create_tables=False) as db, db.connection() as conn:
         member_0, member_1 = _member_token_id(db, 0), _member_token_id(db, 1)
         assert _loss_rows(conn) == [(str(_COLLECTOR), _expand_group_id(db), member_1, member_1, "quarantined", None)]
-        assert _work_rows(conn)[member_0] == (TokenWorkStatus.BLOCKED.value, _collector_key(db), 1)
+        # The WHOLE journal: member 0's adopted hold, and member 1's own claim
+        # row FAILED under the same compound key (the follower's cursor), never
+        # adopted (a follower carries no fence) — nothing else.
+        assert _work_rows(conn) == {
+            member_0: (TokenWorkStatus.BLOCKED.value, _collector_key(db), 1),
+            member_1: (TokenWorkStatus.FAILED.value, _collector_key(db), None),
+        }
         assert _outcome_rows(conn) == {
             _OPENER_TOKEN: (TerminalOutcome.TRANSIENT.value, TerminalPath.EXPAND_PARENT.value),
             member_1: (TerminalOutcome.FAILURE.value, TerminalPath.QUARANTINED_AT_SOURCE.value),
