@@ -82,8 +82,10 @@ _EXAMPLES_WITHOUT_SETTINGS: frozenset[str] = frozenset(
 # validation merely because it is not called settings.yaml.
 _AUXILIARY_EXAMPLE_YAMLS: frozenset[tuple[str, str]] = frozenset(
     {
+        ("ab_llm_experiment", "chaos_config.yaml"),
         ("chaosllm_endurance", "chaos_config.yaml"),
         ("chaosllm_sentiment", "chaos_config.yaml"),
+        ("document_review_panel", "chaos_config.yaml"),
         ("multi_query_assessment", "criteria_lookup.yaml"),
         ("multi_worker", "chaos_config.yaml"),
         ("multi_worker", "chaos_config_faults.yaml"),

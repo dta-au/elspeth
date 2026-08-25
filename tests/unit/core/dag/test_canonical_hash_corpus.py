@@ -51,6 +51,9 @@ def _topology_hash(settings_path: Path) -> str:
         coalesce_settings=list(config.coalesce) or None,
         queues=config.queues,
         row_union_settings=list(config.row_unions) or None,
+        collectors=plugins.collectors or None,
+        scope_settings=list(config.scopes) or None,
+        max_bound_region_depth=config.max_bound_region_depth,
     )
     return compute_full_topology_hash(graph)
 
