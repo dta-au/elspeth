@@ -62,6 +62,20 @@ def test_page_cap_refuses_the_whole_document_before_rendering(tmp_path: Path) ->
     assert list(tmp_path.iterdir()) == []
 
 
+def test_zero_width_mediabox_is_absorbed_by_pdfiums_own_fallback(tmp_path: Path) -> None:
+    # A zero-width MediaBox does NOT reach the INVALID_GEOMETRY guard: pypdfium2 treats
+    # the degenerate box as undefined and substitutes its own Letter-size fallback
+    # (612x792 pt) before get_size() ever returns to us, so the page renders normally.
+    # Verified empirically for zero, negative, reversed-corner, and NaN MediaBoxes alike
+    # -- none reaches worker.py's `width_px <= 0 or height_px <= 0` branch through a real
+    # PDF. INVALID_GEOMETRY therefore stays defensive/unexercised by this fixture, same
+    # as the `except (ValueError, TypeError)` branch in rasterize_document.
+    result = rasterize_document(_request(minimal_pdf(1, width_pt=0.0, height_pt=100.0), tmp_path))
+    assert type(result) is RasterizeResponse
+    assert result.refused == ()
+    assert (result.rendered[0].width_px, result.rendered[0].height_px) == (612, 792)
+
+
 def test_oversize_page_is_refused_from_declared_size_without_rendering(tmp_path: Path) -> None:
     result = rasterize_document(_request(minimal_pdf(2), tmp_path, max_page_pixels=100))
     assert type(result) is RasterizeResponse

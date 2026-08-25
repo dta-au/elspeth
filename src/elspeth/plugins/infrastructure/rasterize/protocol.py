@@ -22,6 +22,7 @@ class DocumentRefusalKind(StrEnum):
 class PageRefusalKind(StrEnum):
     """Why one page could not be rendered within the configured limits."""
 
+    INVALID_GEOMETRY = "invalid_geometry"  # declared page size is non-positive at the configured dpi
     OVERSIZE_PIXELS = "oversize_pixels"  # declared size x dpi exceeds max_page_pixels (checked BEFORE render)
     OVERSIZE_BYTES = "oversize_bytes"  # encoded PNG exceeds max_page_bytes
     MEMORY_EXHAUSTED = "memory_exhausted"  # MemoryError under RLIMIT_AS

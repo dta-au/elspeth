@@ -11,7 +11,6 @@ from __future__ import annotations
 import math
 import signal
 import sys
-from pathlib import Path
 
 from elspeth.plugins.infrastructure.rasterize.png import encode_rgb_png
 from elspeth.plugins.infrastructure.rasterize.protocol import (
@@ -67,7 +66,10 @@ def rasterize_document(request: RasterizeRequest) -> RasterizeOutcome:
         if code in (_PDFIUM_ERR_PASSWORD, _PDFIUM_ERR_SECURITY):
             return DocumentRefusal(kind=DocumentRefusalKind.ENCRYPTED, detail=str(exc))
         return DocumentRefusal(kind=DocumentRefusalKind.MALFORMED, detail=str(exc))
-    except (ValueError, TypeError) as exc:  # pypdfium2 rejects empty/odd inputs before pdfium sees them
+    # Defensive and currently unexercised: every fixture we have raises PdfiumError
+    # (err_code 3) instead, but pypdfium2's own input handling can in principle reject
+    # empty/odd inputs before pdfium sees them.
+    except (ValueError, TypeError) as exc:
         return DocumentRefusal(kind=DocumentRefusalKind.MALFORMED, detail=str(exc))
 
     try:
@@ -104,7 +106,13 @@ def _render_page(document: object, index: int, page_number: int, scale: float, r
         width_pt, height_pt = page.get_size()
         width_px = math.ceil(width_pt * scale)
         height_px = math.ceil(height_pt * scale)
-        if width_px <= 0 or height_px <= 0 or width_px * height_px > request.max_page_pixels:
+        if width_px <= 0 or height_px <= 0:
+            return RefusedPage(
+                page_number=page_number,
+                kind=PageRefusalKind.INVALID_GEOMETRY,
+                detail=f"page declares a non-positive size at this dpi: {width_px}x{height_px} px",
+            )
+        if width_px * height_px > request.max_page_pixels:
             return RefusedPage(
                 page_number=page_number,
                 kind=PageRefusalKind.OVERSIZE_PIXELS,
@@ -125,7 +133,7 @@ def _render_page(document: object, index: int, page_number: int, scale: float, r
                 kind=PageRefusalKind.OVERSIZE_BYTES,
                 detail=f"encoded page is {len(png)} bytes; max_page_bytes is {request.max_page_bytes}",
             )
-        png_path = Path(request.output_dir) / f"page-{page_number}.png"
+        png_path = request.output_dir / f"page-{page_number}.png"
         png_path.write_bytes(png)
         return RenderedPage(page_number=page_number, png_path=png_path, width_px=bitmap.width, height_px=bitmap.height, size_bytes=len(png))
     finally:
