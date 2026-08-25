@@ -105,6 +105,7 @@ def _make_ctx() -> SimpleNamespace:
         run_id="run-123",
         token=SimpleNamespace(token_id="token-1"),
         shutdown_event=None,
+        payload_store=None,
     )
 
 

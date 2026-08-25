@@ -390,6 +390,7 @@ class TestSingleQueryProcessing:
             telemetry_emit=None,
             rate_limit_registry=None,
             shutdown_event=None,
+            payload_store=None,
         )
         transform.on_start(ctx)
 
