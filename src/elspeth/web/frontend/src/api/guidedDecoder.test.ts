@@ -1421,3 +1421,173 @@ describe("guided schema-10 wire decoder", () => {
     });
   });
 });
+
+describe("guided collector proposals (WS6 lift, ruling 7878)", () => {
+  function collectorProposalWireResponse(
+    mutate: (payload: Record<string, unknown>) => void = () => {},
+  ): Record<string, unknown> {
+    const sourceId = "00000000-0000-4000-8000-000000000601";
+    const explodeId = "00000000-0000-4000-8000-000000000602";
+    const collectorId = "00000000-0000-4000-8000-000000000603";
+    const outputId = "00000000-0000-4000-8000-000000000604";
+    const edgeIds = Array.from(
+      { length: 6 },
+      (_, index) => `00000000-0000-4000-8000-${String(610 + index).padStart(12, "0")}`,
+    );
+    const payload: Record<string, unknown> = {
+      proposal_id: "00000000-0000-4000-8000-000000000600",
+      draft_hash: "d".repeat(64),
+      supersedes_draft_hash: null,
+      summary: "guided.proposal.summary.full_graph.v1",
+      rationale: "guided.proposal.rationale.review_required.v1",
+      component_counts: { sources: 1, nodes: 2, edges: 6, outputs: 1 },
+      blockers: [],
+      graph: {
+        sources: [
+          { stable_id: sourceId, label: "source-1", plugin: { kind: "source", id: "csv" } },
+        ],
+        edges: [
+          {
+            stable_id: edgeIds[0],
+            from_endpoint: { kind: "source", stable_id: sourceId },
+            to_endpoint: { kind: "node", stable_id: explodeId },
+            flow: { kind: "source_success", branch: null },
+          },
+          {
+            stable_id: edgeIds[1],
+            from_endpoint: { kind: "source", stable_id: sourceId },
+            to_endpoint: { kind: "discard" },
+            flow: { kind: "source_validation_failure" },
+          },
+          {
+            stable_id: edgeIds[2],
+            from_endpoint: { kind: "node", stable_id: explodeId },
+            to_endpoint: { kind: "node", stable_id: collectorId },
+            flow: { kind: "node_success", branch: null },
+          },
+          {
+            stable_id: edgeIds[3],
+            from_endpoint: { kind: "node", stable_id: explodeId },
+            to_endpoint: { kind: "discard" },
+            flow: { kind: "node_error" },
+          },
+          {
+            stable_id: edgeIds[4],
+            from_endpoint: { kind: "node", stable_id: collectorId },
+            to_endpoint: { kind: "output", stable_id: outputId },
+            flow: { kind: "node_success", branch: null },
+          },
+          {
+            stable_id: edgeIds[5],
+            from_endpoint: { kind: "output", stable_id: outputId },
+            to_endpoint: { kind: "discard" },
+            flow: { kind: "output_write_failure" },
+          },
+        ],
+      },
+      nodes: [
+        {
+          stable_id: explodeId,
+          label: "node-1",
+          node_type: "transform",
+          plugin: { kind: "transform", id: "json_explode" },
+          behavior: { kind: "transform" },
+          node_options_summary: [],
+        },
+        {
+          stable_id: collectorId,
+          label: "node-2",
+          node_type: "collector",
+          plugin: { kind: "transform", id: "batch_stats" },
+          behavior: {
+            kind: "collector",
+            opener_stable_id: explodeId,
+            policy: "require_all",
+          },
+          node_options_summary: [],
+        },
+      ],
+      outputs: [
+        { stable_id: outputId, label: "output-1", plugin: { kind: "sink", id: "json" } },
+      ],
+      edit_targets: [
+        { kind: "node", stable_id: explodeId },
+        { kind: "node", stable_id: collectorId },
+      ],
+    };
+    mutate(payload);
+    return {
+      guided_session: {
+        step: "step_3_transforms",
+        history: [],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      },
+      next_turn: {
+        type: "propose_pipeline",
+        step_index: 2,
+        turn_token: "b".repeat(64),
+        payload,
+      },
+      terminal: null,
+      composition_state: null,
+    };
+  }
+
+  it("decodes the collector behavior with its opener identity and closed policy", () => {
+    // No collector node_error edge in the fixture: on_error is OPTIONAL on a
+    // collector (group failure is structural), so this decode succeeding is
+    // itself the optional-error pin.
+    const decoded = decodeGetGuidedResponse(collectorProposalWireResponse());
+
+    expect(decoded.next_turn?.type).toBe("propose_pipeline");
+    if (decoded.next_turn?.type !== "propose_pipeline") {
+      throw new Error("collector fixture did not decode as a proposal");
+    }
+    expect(decoded.next_turn.payload.nodes[1]).toMatchObject({
+      node_type: "collector",
+      plugin: { kind: "transform", id: "batch_stats" },
+      behavior: {
+        kind: "collector",
+        opener_stable_id: "00000000-0000-4000-8000-000000000602",
+        policy: "require_all",
+      },
+    });
+  });
+
+  it("rejects a collector whose opener does not name a payload node", () => {
+    expect(() => decodeGetGuidedResponse(collectorProposalWireResponse((payload) => {
+      const nodes = payload.nodes as Array<Record<string, unknown>>;
+      (nodes[1].behavior as Record<string, unknown>).opener_stable_id = "00000000-0000-4000-8000-0000000006ff";
+    }))).toThrow(/opener/i);
+  });
+
+  it("rejects a collector policy outside the closed vocabulary", () => {
+    expect(() => decodeGetGuidedResponse(collectorProposalWireResponse((payload) => {
+      const nodes = payload.nodes as Array<Record<string, unknown>>;
+      (nodes[1].behavior as Record<string, unknown>).policy = "quorum";
+    }))).toThrow(/policy/i);
+  });
+
+  it("rejects a collector without a transform plugin ref", () => {
+    expect(() => decodeGetGuidedResponse(collectorProposalWireResponse((payload) => {
+      const nodes = payload.nodes as Array<Record<string, unknown>>;
+      nodes[1].plugin = null;
+    }))).toThrow(/plugin/i);
+  });
+
+  it("rejects a second collector success flow", () => {
+    expect(() => decodeGetGuidedResponse(collectorProposalWireResponse((payload) => {
+      const graph = payload.graph as { edges: Array<Record<string, unknown>> };
+      graph.edges.push({
+        stable_id: "00000000-0000-4000-8000-000000000620",
+        from_endpoint: { kind: "node", stable_id: "00000000-0000-4000-8000-000000000603" },
+        to_endpoint: { kind: "output", stable_id: "00000000-0000-4000-8000-000000000604" },
+        flow: { kind: "node_success", branch: null },
+      });
+      (payload.component_counts as Record<string, number>).edges = 7;
+    }))).toThrow(/success flow/i);
+  });
+});

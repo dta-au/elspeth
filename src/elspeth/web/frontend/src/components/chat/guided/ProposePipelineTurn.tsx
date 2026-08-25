@@ -156,10 +156,20 @@ function gateSummary(
   return `When ${behavior.condition} — ${arms.join(", ")}.${forkNote}`;
 }
 
-function behaviorSummary(behavior: Exclude<ProposalNodeBehavior, { kind: "gate" }>): string {
+function behaviorSummary(
+  behavior: Exclude<ProposalNodeBehavior, { kind: "gate" }>,
+  nodeLabel: (stableId: string) => string | null = () => null,
+): string {
   switch (behavior.kind) {
     case "transform":
       return "Transforms each incoming item.";
+    case "collector": {
+      const opener = nodeLabel(behavior.opener_stable_id);
+      const policyText = behavior.policy === "require_all"
+        ? "requiring every member to arrive"
+        : "releasing whichever members arrived (best effort)";
+      return `Collects every row expanded by ${opener ?? "its scope opener"} and releases the group as one batch, ${policyText}.`;
+    }
     case "aggregation": {
       const triggers: string[] = [];
       if (behavior.count !== null) triggers.push(`count ${behavior.count}`);
@@ -407,7 +417,7 @@ export function ProposePipelineTurn({
                 {" "}
                 {node.behavior.kind === "gate"
                   ? gateSummary(node.behavior, node.stable_id, payload.graph.edges, labelById)
-                  : behaviorSummary(node.behavior)}
+                  : behaviorSummary(node.behavior, (stableId) => labelById.get(stableId) ?? null)}
               </span>
               {/* R2-F3: the behavior discriminant alone made every transform
                   read as "transforms each incoming item"; the allowlisted key

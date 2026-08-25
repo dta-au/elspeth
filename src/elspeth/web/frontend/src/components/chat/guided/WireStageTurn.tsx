@@ -184,12 +184,22 @@ function flowText(flow: ProposalFlow, routeKeys: ReadonlyMap<string, string>): s
 function behaviorDetails(
   behavior: ProposalNodeBehavior,
   routeDestination: (alias: string) => string | null = () => null,
+  nodeLabel: (stableId: string) => string | null = () => null,
 ): string[] {
   switch (behavior.kind) {
     case "transform":
       return ["Policy: transform each input row"];
     case "queue":
       return ["Policy: continue queued items individually"];
+    case "collector": {
+      const opener = nodeLabel(behavior.opener_stable_id);
+      return [
+        opener === null
+          ? "Closes the row group opened by its scope opener"
+          : `Closes the row group opened by ${opener}`,
+        `Policy: ${humanToken(behavior.policy)}`,
+      ];
+    }
     case "gate":
       return [
         // The authored predicate, verbatim (F11) — followed by each
@@ -439,7 +449,11 @@ export function WireStageTurn({
                   <p>{cardinalityText(node.row_cardinality)}</p>
                   <p>{fieldsText("Required", node.required_fields)}</p>
                   <p>{fieldsText("Guaranteed", node.guaranteed_fields)}</p>
-                  {behaviorDetails(node.behavior, routeDestinationFor(node.stable_id)).map((detail) => <p key={detail}>{detail}</p>)}
+                  {behaviorDetails(
+                    node.behavior,
+                    routeDestinationFor(node.stable_id),
+                    (stableId) => data.nodes.find((candidate) => candidate.stable_id === stableId)?.label ?? null,
+                  ).map((detail) => <p key={detail}>{detail}</p>)}
                   {node.node_options_summary.map((entry) => (
                     <p key={entry.key}>{nodeOptionText(entry)}</p>
                   ))}

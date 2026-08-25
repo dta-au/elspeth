@@ -12,6 +12,7 @@ export interface ReadOnlyPipelineGraphNode {
     | "queue"
     | "coalesce"
     | "row_union"
+    | "collector"
     | "output"
     | "discard";
   subtitle: string | null;
