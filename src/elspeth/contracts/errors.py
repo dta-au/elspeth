@@ -522,6 +522,7 @@ TransformErrorCategory = Literal[
     "csv_config_error",
     "csv_column_count_mismatch",
     "too_many_rows",
+    "too_many_images",  # Row-declared image inputs exceed configured max_images_per_call
     # Template errors
     "template_rendering_failed",
     "template_context_failed",  # Multi-query template context build failed (missing field)
@@ -764,6 +765,8 @@ class TransformErrorReason(TypedDict):
     body_size: NotRequired[int]  # Actual response body size in bytes (body_too_large errors)
     max_body_bytes: NotRequired[int]  # Configured limit in bytes (body_too_large errors)
     max_blob_bytes: NotRequired[int]  # Configured blob parser limit in bytes
+    list_index: NotRequired[int]  # Position within a list-valued row column (image_inputs)
+    max_images: NotRequired[int]  # Configured max_images_per_call limit (too_many_images)
     phase: NotRequired[str]  # Parser phase: skip_rows, header, data, etc.
     line_number: NotRequired[int]  # Source text line number for parser errors
     row_number: NotRequired[int]  # Data row number for parser errors
