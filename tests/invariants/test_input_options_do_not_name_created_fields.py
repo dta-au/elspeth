@@ -50,7 +50,15 @@ KNOWN LIMITS, so nobody reads more assurance into this than it carries:
   ``str`` or ``None`` valued column-naming options are mutated. LIST-valued
   ones are skipped — ``azure_document_intelligence.query_fields`` matches the
   ``*_fields`` naming rule but holds Azure-side query names, not row columns,
-  so mutating it would assert a contract that does not exist.
+  so mutating it would assert a contract that does not exist. ``llm``'s
+  ``image_inputs`` folds ``field``/``format_field`` into
+  ``declared_input_fields`` (a real column-naming surface — see
+  ``LLMConfig.declared_input_fields``) but those names live inside
+  ``list[ImageInputConfig]`` entries, not a top-level scalar option, so the
+  roster excludes ``llm`` via ``_has_a_scalar_naming_option`` rather than
+  failing the anti-vacuity assertion on a plugin this mechanism cannot probe.
+  ``image_inputs[].field`` naming a created field (e.g. ``response_field``) is
+  therefore NOT swept by this gate.
 * Mutating a ``None``-valued option can collide with an interlock rather than
   with the created-field rule — ``aws_textract_document_analysis`` makes
   ``bucket`` and ``bucket_field`` mutually exclusive, and a future option in
@@ -111,6 +119,28 @@ def _declares_an_arriving_column(cls: type[BaseTransform]) -> bool:
     return config_model.declared_input_fields is not TransformDataConfig.declared_input_fields
 
 
+def _has_a_scalar_naming_option(cls: type[BaseTransform]) -> bool:
+    """Whether this plugin exposes at least one ``str | None`` naming option to mutate.
+
+    ``_declares_an_arriving_column`` is a proxy for "this config has a
+    column-naming surface to test", and for every anchor plugin the two
+    coincide. They came apart for ``llm``: ``LLMConfig.declared_input_fields``
+    folds in ``image_inputs[].field``/``format_field`` (base.py, "``required_
+    input_fields`` plus every ``image_inputs`` field/format_field"), but those
+    names live inside a ``list[ImageInputConfig]``, not a top-level ``str |
+    None`` field, so ``_input_naming_options`` — which only mutates a top-
+    level dict key (see the control-mutation step below) — finds nothing to
+    test. Per KNOWN LIMITS above, list-valued naming surfaces are out of this
+    gate's scope; this predicate makes the roster match that stated scope
+    instead of failing the anti-vacuity assertion on a plugin the mechanism
+    cannot exercise. ``image_inputs[].field`` is therefore NOT swept by this
+    gate — a real coverage gap, left for a future gate widening rather than
+    invented here.
+    """
+    probe = cls(cls.probe_config())
+    return bool(_input_naming_options(cls, probe))
+
+
 def _input_naming_options(cls: type[BaseTransform], probe: BaseTransform) -> dict[str, str | None]:
     """Column-naming config options this plugin READS, with their probe values.
 
@@ -140,7 +170,7 @@ def _input_naming_options(cls: type[BaseTransform], probe: BaseTransform) -> dic
 
 class TestInputOptionsDoNotNameCreatedFields:
     def test_every_plugin_declaring_an_input_column_rejects_naming_a_created_field(self) -> None:
-        roster = [cls for cls in _registered_transform_classes() if _declares_an_arriving_column(cls)]
+        roster = [cls for cls in _registered_transform_classes() if _declares_an_arriving_column(cls) and _has_a_scalar_naming_option(cls)]
 
         assert roster, "No transform declares an arriving column; the sweep would pass vacuously"
         discovered = {cls.name for cls in roster}

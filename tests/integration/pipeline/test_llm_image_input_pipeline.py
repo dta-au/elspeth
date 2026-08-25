@@ -110,7 +110,9 @@ def _stub_azure_provider(content: str) -> Generator[MagicMock, None, None]:
             model_dump=lambda *_a, **_k: raw_response,
         )
 
-    client = MagicMock()
+    from openai import AzureOpenAI
+
+    client = MagicMock(spec=AzureOpenAI)
     client.chat.completions.create.side_effect = make_response
     with patch("openai.AzureOpenAI", return_value=client) as mock_cls:
         yield mock_cls
