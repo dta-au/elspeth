@@ -23,7 +23,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
-from elspeth.contracts.binary_documents import binary_document_signature_matches
+from elspeth.contracts.binary_documents import (
+    BINARY_DOCUMENT_MIME_BY_FORMAT,
+    binary_document_signature_matches,
+)
 from elspeth.contracts.hashing import canonical_json
 
 ImageFormat = Literal["jpeg", "png"]
@@ -32,7 +35,7 @@ widening to pdf is a deliberate later change, not a config knob."""
 
 IMAGE_FORMATS: frozenset[str] = frozenset(get_args(ImageFormat))
 
-_IMAGE_MIME_BY_FORMAT = {"jpeg": "image/jpeg", "png": "image/png"}
+_IMAGE_MIME_BY_FORMAT = {fmt: BINARY_DOCUMENT_MIME_BY_FORMAT[fmt] for fmt in IMAGE_FORMATS}
 
 
 @dataclass(frozen=True, slots=True)
