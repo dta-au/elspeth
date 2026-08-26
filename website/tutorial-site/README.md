@@ -15,6 +15,9 @@ site (`.github/workflows/pages.yaml` serves this tree at the site root, so
   `evals/composer-battery/calibration/run_collector_calibration.py`). Three
   documents with `document_id` / `title` / `sections`, each with a different
   section count so a `require_all` collector losing a section is observable.
+  The array is nested under a top-level `documents` key (alongside the
+  `_notice` marker), so a `json` source reading it needs `data_key: documents`
+  — with the default it fails on "expected array, got object".
 
 The base is `https://dta-au.github.io/elspeth` by default; a fork republishing
 its own copy overrides it with `ELSPETH_WEB__TUTORIAL_SAMPLE_BASE_URL` (see the
