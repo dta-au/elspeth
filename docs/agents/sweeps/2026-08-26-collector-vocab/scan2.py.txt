@@ -1,0 +1,132 @@
+"""v2: node-kind / plugin-kind subset detector, block-aggregated, multi-shape."""
+
+from __future__ import annotations
+
+import ast
+import re
+import sys
+from pathlib import Path
+
+SING = ["source", "transform", "sink", "aggregation", "collector", "gate", "coalesce", "row_union", "queue"]
+PLUR = ["sources", "transforms", "sinks", "aggregations", "collectors", "gates", "coalesces", "queues", "row_unions"]
+CAMEL = {"rowUnion": "row_union"}
+
+PATTERNS: list[tuple[re.Pattern[str], str]] = []
+for k in SING:
+    PATTERNS.append((re.compile(r"""(['"])""" + k + r"""\1"""), k))
+for k in PLUR:
+    PATTERNS.append((re.compile(r"""(['"])""" + k + r"""\1"""), k.rstrip("s") if not k.startswith("row") else "row_union"))
+for k in SING:
+    PATTERNS.append((re.compile(r"\bNodeType\." + k.upper() + r"\b"), k))
+for k in PLUR:
+    PATTERNS.append((re.compile(r"\.(" + k + r")\b"), k.rstrip("s") if not k.startswith("row") else "row_union"))
+for c, k in CAMEL.items():
+    PATTERNS.append((re.compile(r"\b" + c + r"\b"), k))
+
+CANON = {
+    "aggregation": "aggregation", "aggregations": "aggregation",
+    "coalesce": "coalesce", "coalesces": "coalesce",
+    "collector": "collector", "collectors": "collector",
+    "gate": "gate", "gates": "gate",
+    "queue": "queue", "queues": "queue",
+    "row_union": "row_union",
+    "sink": "sink", "sinks": "sink",
+    "source": "source", "sources": "source",
+    "transform": "transform", "transforms": "transform",
+}
+
+REPO = Path("/home/john/elspeth")
+ROOT = REPO / "src/elspeth"
+
+
+def hits_in(text: str) -> list[tuple[int, str]]:
+    out = []
+    for pat, kind in PATTERNS:
+        for m in pat.finditer(text):
+            out.append((m.start(), CANON[kind]))
+    out.sort()
+    return out
+
+
+def py_blocks(text: str, path: Path):
+    """Yield (label, start_line, block_text) for module consts + each function/class body."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return
+    lines = text.splitlines(keepends=True)
+
+    def seg(node):
+        s = node.lineno - 1
+        e = getattr(node, "end_lineno", node.lineno)
+        return "".join(lines[s:e]), node.lineno
+
+    def walk(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                t, ln = seg(child)
+                yield (f"{prefix}{child.name}()", ln, t)
+                # do not descend: nested funcs included in parent text
+            elif isinstance(child, ast.ClassDef):
+                # class-level assignments then methods
+                for gc in child.body:
+                    if isinstance(gc, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        t, ln = seg(gc)
+                        yield (f"{prefix}{child.name}.{gc.name}()", ln, t)
+                    else:
+                        t, ln = seg(gc)
+                        yield (f"{prefix}{child.name}:attr", ln, t)
+            elif isinstance(child, (ast.Assign, ast.AnnAssign, ast.Expr, ast.If, ast.Try, ast.With)):
+                t, ln = seg(child)
+                yield (f"{prefix}<module>", ln, t)
+
+    yield from walk(tree, "")
+
+
+TS_BLOCK = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|const|let|var|type|interface|enum|class|abstract\s+class)\b", re.M)
+
+
+def ts_blocks(text: str):
+    starts = [m.start() for m in TS_BLOCK.finditer(text)]
+    if not starts:
+        starts = [0]
+    if starts[0] != 0:
+        starts.insert(0, 0)
+    starts.append(len(text))
+    line_of = [0] * (len(text) + 1)
+    ln = 1
+    for i, ch in enumerate(text):
+        line_of[i] = ln
+        if ch == "\n":
+            ln += 1
+    line_of[len(text)] = ln
+    for a, b in zip(starts, starts[1:]):
+        chunk = text[a:b]
+        if chunk.strip():
+            yield ("<block>", line_of[a], chunk)
+
+
+def main() -> None:
+    rows = []
+    for path in sorted(ROOT.rglob("*")):
+        if path.suffix not in {".py", ".ts", ".tsx"}:
+            continue
+        if "__pycache__" in path.parts or "node_modules" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        blocks = py_blocks(text, path) if path.suffix == ".py" else ts_blocks(text)
+        for label, ln, btext in blocks:
+            hs = hits_in(btext)
+            kinds = {k for _, k in hs}
+            if len(kinds) < 2:
+                continue
+            rel = str(path.relative_to(REPO))
+            missing = sorted(set(CANON.values()) - kinds)
+            snippet = " ".join(btext.split())[:220]
+            rows.append((rel, ln, label, sorted(kinds), missing, snippet))
+    for r in rows:
+        print(f"{r[0]}:{r[1]}\t{r[2]}\tHAS={','.join(r[3])}\tMISS={','.join(r[4])}\t{r[5]}")
+    print(f"\nTOTAL BLOCKS: {len(rows)}", file=sys.stderr)
+
+
+main()

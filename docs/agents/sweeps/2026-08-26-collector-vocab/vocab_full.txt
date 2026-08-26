@@ -1,0 +1,1 @@
+src/elspeth/web/frontend/src/components/ui/TypeBadge.tsx:6	| "source"

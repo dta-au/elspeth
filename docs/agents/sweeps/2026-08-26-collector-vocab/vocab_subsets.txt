@@ -1,0 +1,149 @@
+src/elspeth/cli_plugins.py:15	['sink', 'source', 'transform']	VALID_PLUGIN_TYPES: tuple[PluginKind, ...] = ("source", "transform", "sink")
+src/elspeth/contracts/barrier_scalars.py:285	['aggregation', 'coalesce']	freeze_fields(self, "aggregation", "coalesce")
+src/elspeth/core/dag/group_bindings.py:65	['coalesce', 'collector', 'row_union']	("coalesce"/"row_union"/"collector"), so every serialized surface —
+src/elspeth/core/dag/models.py:32	['coalesce', 'gate', 'transform']	component_type: The node type (e.g. ``'gate'``, ``'transform'``,
+src/elspeth/core/landscape/run_status_projection.py:110	['coalesce', 'row_union']	``nodes.node_type IN ('coalesce', 'row_union')`` — indexed, structural columns —
+src/elspeth/engine/orchestrator/preflight.py:749	['source', 'transform']	component_type: Literal["source", "transform"],
+src/elspeth/engine/orchestrator/preflight.py:776	['source', 'transform']	component_type: Literal["source", "transform"] = "transform",
+src/elspeth/engine/orchestrator/preflight.py:824	['source', 'transform']	component_type: Literal["source", "transform"],
+src/elspeth/engine/orchestrator/preflight.py:848	['source', 'transform']	component_type: Literal["source", "transform"],
+src/elspeth/engine/orchestrator/preflight.py:900	['source', 'transform']	component_type: Literal["source", "transform"],
+src/elspeth/engine/orchestrator/value_source_validation.py:31	['source', 'transform']	component_type: Literal["source", "transform"] = "transform"
+src/elspeth/engine/orchestrator/value_source_validation.py:40	['source', 'transform']	if self.component_type not in ("source", "transform"):
+src/elspeth/engine/orchestrator/value_source_validation.py:41	['source', 'transform']	raise ValueError("ValueSourceFinding.component_type must be 'source' or 'transform'")
+src/elspeth/mcp/types.py:38	['aggregation', 'coalesce', 'gate', 'queue', 'sink', 'source', 'transform']	NodeTypeValue = Literal["source", "transform", "gate", "aggregation", "coalesce", "queue", "sink"]
+src/elspeth/plugins/infrastructure/config_base.py:100	['sink', 'source', 'transform']	component_type: The pipeline component type (``'source'``, ``'sink'``,
+src/elspeth/plugins/infrastructure/config_base.py:313	['sink', 'source', 'transform']	_VALID_PLUGIN_COMPONENT_TYPES: tuple[str, ...] = ("source", "sink", "transform")
+src/elspeth/tui/types.py:153	['sink', 'source', 'transform']	- node_type: Type of node ("source", "transform", "sink", etc.)
+src/elspeth/tui/widgets/lineage_tree.py:89	['aggregation', 'coalesce', 'gate', 'row_union', 'transform']	_TYPE_LABELS = {
+src/elspeth/web/audit_readiness/boundary_expectations.py:13	['sink', 'source']	kind in ("source", "sink") or
+src/elspeth/web/audit_readiness/service.py:806	['sink', 'source']	if kind in ("source", "sink") or plugin_cls.determinism in _AUDIT_FLAGGED_DETERMINISMS:
+src/elspeth/web/catalog/protocol.py:10	['sink', 'source', 'transform']	PluginKind = Literal["source", "transform", "sink"]
+src/elspeth/web/catalog/schemas.py:19	['sink', 'source', 'transform']	PluginKind = Literal["source", "transform", "sink"]
+src/elspeth/web/catalog/service.py:51	['sink', 'source', 'transform']	_VALID_TYPES = frozenset({"source", "transform", "sink"})
+src/elspeth/web/catalog/service.py:118	['sink', 'source', 'transform']	_KIND_DEFAULT_DETERMINISM: dict[PluginKind, Determinism] = {
+src/elspeth/web/composer/_producer_resolver.py:128	['coalesce', 'collector', 'row_union']	closer_names = {node.id for node in nodes if node.node_type in ("coalesce", "row_union", "collector")}
+src/elspeth/web/composer/guided/chat_solver.py:565	['sink', 'source', 'transform']	"plugin_kind": {"type": "string", "enum": ["source", "transform", "sink"]},
+src/elspeth/web/composer/guided/chat_solver.py:603	['sink', 'source', 'transform']	"plugin_kind": {"type": ["string", "null"], "enum": ["source", "transform", "sink", None]},
+src/elspeth/web/composer/guided/chat_solver.py:706	['sink', 'source', 'transform']	"catalog_kind": {"type": ["string", "null"], "enum": ["source", "transform", "sink", None]},
+src/elspeth/web/composer/guided/chat_solver.py:1590	['coalesce', 'row_union']	elif kind in {"coalesce", "row_union"}:
+src/elspeth/web/composer/guided/connection_consumers.py:32	['coalesce', 'row_union']	if node.node_type in ("coalesce", "row_union"):
+src/elspeth/web/composer/guided/deferred_intents.py:193	['sink', 'source', 'transform']	canonical = tuple(kind for kind in ("source", "transform", "sink") if kind in self.plugin_kinds)
+src/elspeth/web/composer/guided/planning.py:3296	['aggregation', 'transform']	node["on_error"] = node.get("on_error") or ("discard" if node.get("node_type") in ("transform", "aggregation")
+src/elspeth/web/composer/guided/planning.py:3397	['coalesce', 'row_union']	if node.node_type in ("coalesce", "row_union"):
+src/elspeth/web/composer/guided/planning.py:3539	['coalesce', 'row_union']	if node.node_type not in ("coalesce", "row_union"):
+src/elspeth/web/composer/guided/planning.py:3687	['coalesce', 'row_union']	barrier_stable_ids = {node_ids[node.id] for node in state.nodes if node.node_type in ("coalesce", "row_union")
+src/elspeth/web/composer/guided/planning.py:3705	['coalesce', 'row_union']	barrier_incoming_branch_aliases.get(node_ids[node.id]) if node.node_type in ("coalesce", "row_union") else Non
+src/elspeth/web/composer/guided/planning.py:3813	['coalesce', 'row_union']	if isinstance(node.get("behavior"), Mapping) and node["behavior"].get("kind") in ("coalesce", "row_union")
+src/elspeth/web/composer/guided/protocol.py:123	['sink', 'source', 'transform']	kind: Literal["source", "transform", "sink"]
+src/elspeth/web/composer/guided/protocol.py:288	['aggregation', 'coalesce', 'collector', 'gate', 'queue', 'row_union', 'transform']	node_type: Literal["transform", "gate", "aggregation", "queue", "coalesce", "row_union", "collector"]
+src/elspeth/web/composer/guided/protocol.py:780	['aggregation', 'coalesce', 'collector', 'gate', 'queue', 'row_union', 'transform']	_NODE_TYPES = frozenset({"transform", "gate", "aggregation", "queue", "coalesce", "row_union", "collector"})
+src/elspeth/web/composer/guided/protocol.py:1554	['sink', 'source', 'transform']	def _validate_plugin_ref(value: object, path: str, expected_kind: Literal["source", "transform", "sink"]) -> s
+src/elspeth/web/composer/guided/protocol.py:1626	['queue', 'transform']	if node_type in ("transform", "queue"):
+src/elspeth/web/composer/guided/protocol.py:1945	['aggregation', 'collector', 'transform']	if node["node_type"] in ("transform", "aggregation", "collector"):
+src/elspeth/web/composer/guided/protocol.py:2082	['coalesce', 'row_union']	if to_kind == "node" and node_by_id[to_stable_id]["node_type"] in ("coalesce", "row_union") and branch is None
+src/elspeth/web/composer/guided/protocol.py:2153	['coalesce', 'queue', 'row_union']	if node["node_type"] in ("queue", "coalesce", "row_union"):
+src/elspeth/web/composer/guided/protocol.py:2162	['aggregation', 'transform']	if node["node_type"] in ("transform", "aggregation"):
+src/elspeth/web/composer/guided/protocol.py:2224	['aggregation', 'collector', 'gate', 'queue', 'transform']	if target_id not in node_by_id or node_by_id[target_id]["node_type"] not in (
+src/elspeth/web/composer/guided/protocol.py:2268	['coalesce', 'row_union']	if node["node_type"] not in ("coalesce", "row_union"):
+src/elspeth/web/composer/guided/protocol.py:2288	['coalesce', 'row_union']	if node["node_type"] not in ("coalesce", "row_union"):
+src/elspeth/web/composer/guided/protocol.py:2397	['sink', 'source', 'transform']	if set(catalog_plugin_ids) != {"source", "transform", "sink"}:
+src/elspeth/web/composer/guided/stage_subjects.py:24	['sink', 'source', 'transform']	_PLUGIN_KINDS: tuple[PluginKind, ...] = ("source", "transform", "sink")
+src/elspeth/web/composer/guided/state_machine.py:774	['sink', 'source', 'transform']	catalog_kind: Literal["source", "transform", "sink"] | None
+src/elspeth/web/composer/guided/state_machine.py:790	['sink', 'source', 'transform']	if self.catalog_kind is not None and self.catalog_kind not in {"source", "transform", "sink"}:
+src/elspeth/web/composer/guided/state_machine.py:826	['sink', 'source', 'transform']	catalog_kind: Literal["source", "transform", "sink"] | None,
+src/elspeth/web/composer/pipeline_planner.py:1752	['aggregation', 'transform']	return sum(1 for node in nodes if node["node_type"] in ("transform", "aggregation"))
+src/elspeth/web/composer/planner_authoring_aids.py:1402	['sink', 'source', 'transform']	loaded_pairs = frozenset(pair for pair in schemas_loaded if pair[0] in {"source", "transform", "sink"})
+src/elspeth/web/composer/required_controls.py:192	['source']	return (_CandidateSource(container="source", name="source", block=singular),)
+src/elspeth/web/composer/service.py:943	['source', 'transform']	def _component_type_for_kind(kind: InterpretationKind) -> Literal["source", "transform"]:
+src/elspeth/web/composer/state.py:69	['aggregation', 'coalesce', 'collector', 'gate', 'queue', 'row_union', 'transform']	NodeType = Literal["transform", "gate", "aggregation", "coalesce", "row_union", "queue", "collector"]
+src/elspeth/web/composer/state.py:73	['aggregation', 'coalesce', 'collector', 'gate', 'queue', 'row_union', 'transform']	COMPOSER_NODE_TYPES: frozenset[str] = frozenset(("aggregation", "coalesce", "collector", "gate", "queue", "row
+src/elspeth/web/composer/state.py:170	['aggregation', 'coalesce', 'collector', 'gate', 'queue', 'row_union', 'transform']	_NODE_TYPE_NAME_LABELS: Final[dict[str, str]] = {
+src/elspeth/web/composer/state.py:279	['aggregation', 'gate', 'transform']	if node.node_type in ("transform", "aggregation", "gate"):
+src/elspeth/web/composer/state.py:280	['aggregation', 'gate', 'transform']	kind = {"transform": "Transform", "aggregation": "Aggregation", "gate": "Gate"}[node.node_type]
+src/elspeth/web/composer/state.py:340	['coalesce', 'row_union']	elif node.node_type in ("coalesce", "row_union"):
+src/elspeth/web/composer/state.py:802	['coalesce', 'gate']	_PLUGINLESS_STRUCTURAL_NODE_TYPES: Final[frozenset[str]] = frozenset({"gate", "coalesce"})
+src/elspeth/web/composer/state.py:1601	['aggregation', 'transform']	if producer_node.node_type not in {"transform", "aggregation"}:
+src/elspeth/web/composer/state.py:1905	['coalesce', 'row_union']	consumers = {node.input for node in nodes if node.node_type not in ("coalesce", "row_union")}
+src/elspeth/web/composer/state.py:1965	['coalesce', 'row_union']	if producer_node.node_type in ("coalesce", "row_union"):
+src/elspeth/web/composer/state.py:2039	['coalesce', 'row_union']	inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node
+src/elspeth/web/composer/state.py:2096	['coalesce', 'row_union']	inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node
+src/elspeth/web/composer/state.py:2148	['coalesce', 'row_union']	inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node
+src/elspeth/web/composer/state.py:2216	['coalesce', 'row_union']	inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node
+src/elspeth/web/composer/state.py:2381	['coalesce', 'collector', 'row_union']	closer_names = {node.id for node in state.nodes if node.node_type in ("coalesce", "row_union", "collector")}
+src/elspeth/web/composer/state.py:2405	['aggregation', 'gate', 'row_union', 'transform']	if node.node_type in ("transform", "aggregation", "row_union", "gate"):
+src/elspeth/web/composer/state.py:2417	['gate', 'transform']	node.node_type in ("transform", "gate")
+src/elspeth/web/composer/state.py:2470	['coalesce', 'collector', 'row_union']	closer_names = {node.id for node in nodes if node.node_type in ("coalesce", "row_union", "collector")}
+src/elspeth/web/composer/state.py:2498	['coalesce', 'row_union']	if candidate.node_type in ("coalesce", "row_union") and candidate.branches is not None
+src/elspeth/web/composer/state.py:2507	['gate', 'transform']	unbound_consumer_fed_inputs = {node.input for node in nodes if node.node_type in ("transform", "gate")}
+src/elspeth/web/composer/state.py:2805	['aggregation', 'collector', 'transform']	if from_kind in ("transform", "aggregation", "collector"):
+src/elspeth/web/composer/state.py:3519	['coalesce', 'row_union']	if node.node_type in ("coalesce", "row_union") and node.branches is not None
+src/elspeth/web/composer/state.py:3527	['coalesce', 'collector', 'row_union']	closer_names = {node.id for node in nodes if node.node_type in ("coalesce", "row_union", "collector")}
+src/elspeth/web/composer/state.py:3652	['coalesce', 'queue', 'row_union']	(node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue", "r
+src/elspeth/web/composer/state.py:4246	['aggregation', 'transform']	if producer_node.node_type not in {"transform", "aggregation"} or producer_node.plugin is None:
+src/elspeth/web/composer/state.py:4379	['aggregation', 'transform']	if producer_node.node_type not in {"transform", "aggregation"} or producer_node.plugin is None:
+src/elspeth/web/composer/state.py:4432	['queue', 'row_union']	if producer_node.node_type in ("queue", "row_union"):
+src/elspeth/web/composer/state.py:4891	['aggregation', 'transform']	if producer_node.node_type not in {"transform", "aggregation"}:
+src/elspeth/web/composer/state.py:5017	['coalesce', 'queue']	if producer_node.node_type in ("queue", "coalesce"):
+src/elspeth/web/composer/state.py:5875	['aggregation', 'transform']	if node.node_type not in {"transform", "aggregation"} or node.plugin is None:
+src/elspeth/web/composer/state.py:6536	['coalesce', 'queue', 'row_union']	if node.timeout_seconds is not None and node.node_type not in ("coalesce", "row_union", "queue"):
+src/elspeth/web/composer/state.py:6551	['collector', 'queue']	if node.node_type not in ("collector", "queue"):
+src/elspeth/web/composer/state.py:7058	['coalesce', 'row_union']	if node.node_type not in ("coalesce", "row_union"):
+src/elspeth/web/composer/state.py:7086	['coalesce', 'row_union']	barrier_node_by_id = {node.id: node for node in self.nodes if node.node_type in ("coalesce", "row_union")}
+src/elspeth/web/composer/state.py:7093	['gate', 'transform']	fork_closure_consumer_fed_inputs = {node.input for node in self.nodes if node.node_type in ("transform", "gate
+src/elspeth/web/composer/state.py:7428	['coalesce', 'row_union']	if downstream.node_type in ("coalesce", "row_union"):
+src/elspeth/web/composer/state.py:7503	['coalesce', 'queue', 'row_union']	n.id for n in self.nodes if n.node_type not in ("coalesce", "queue", "row_union") and n.input == node.id
+src/elspeth/web/composer/tools/_common.py:656	['coalesce', 'queue', 'row_union']	if node.node_type in ("coalesce", "queue", "row_union"):
+src/elspeth/web/composer/tools/_common.py:1665	['queue']	"queue": (
+src/elspeth/web/composer/tools/_common.py:1905	['sink', 'source', 'transform']	# PluginKind is Literal["source", "transform", "sink"] — unreachable.
+src/elspeth/web/composer/tools/generation.py:298	['sink', 'source', 'transform']	"enum": ["source", "transform", "sink"],
+src/elspeth/web/composer/tools/generation.py:1637	['sink', 'source', 'transform']	if plugin_type_raw not in ("source", "transform", "sink"):
+src/elspeth/web/composer/tools/generation.py:1711	['sink', 'source', 'transform']	"enum": ["source", "transform", "sink"],
+src/elspeth/web/composer/tools/generation.py:2426	['coalesce', 'row_union']	if node.node_type in ("coalesce", "row_union"):
+src/elspeth/web/composer/tools/secrets.py:244	['aggregation', 'transform']	if node.node_type not in ("transform", "aggregation") or node.plugin is None:
+src/elspeth/web/composer/tools/sessions.py:857	['source']	credential_error = _credential_wiring_contract_failure(
+src/elspeth/web/composer/tools/sessions.py:1120	['aggregation', 'collector', 'transform']	if node_type in ("transform", "aggregation", "collector") and node_plugin is not None:
+src/elspeth/web/composer/tools/sessions.py:1358	['aggregation', 'transform']	on_error=n.on_error or ("discard" if nt in ("transform", "aggregation") else None),
+src/elspeth/web/composer/tools/transforms.py:203	['aggregation', 'coalesce', 'gate', 'queue', 'row_union', 'transform']	"enum": ["transform", "gate", "aggregation", "coalesce", "row_union", "queue"],
+src/elspeth/web/composer/tools/transforms.py:643	['aggregation', 'collector', 'transform']	if node_type in ("transform", "aggregation", "collector") and plugin is not None:
+src/elspeth/web/composer/tools/transforms.py:700	['aggregation', 'transform']	on_error=validated.on_error or ("discard" if node_type in ("transform", "aggregation") else None),
+src/elspeth/web/composer/tools/transforms.py:965	['coalesce', 'gate', 'queue']	or node.node_type in {"gate", "coalesce", "queue"}
+src/elspeth/web/composer/tools/transforms.py:1499	['aggregation', 'collector', 'transform']	if current.node_type in ("transform", "aggregation", "collector") and current.plugin is not None:
+src/elspeth/web/composer/yaml_generator.py:62	['aggregation', 'coalesce', 'collector', 'gate', 'queue', 'row_union', 'transform']	_YAML_LOWERED_NODE_TYPES = frozenset({"aggregation", "coalesce", "collector", "gate", "queue", "row_union", "t
+src/elspeth/web/execution/_validation_diagnostics.py:436	['gate', 'queue', 'row_union']	if upstream_id in nodes_by_id and nodes_by_id[upstream_id].node_type in ("gate", "queue", "row_union"):
+src/elspeth/web/execution/_validation_diagnostics.py:476	['coalesce', 'row_union']	if node.node_type in ("coalesce", "row_union"):
+src/elspeth/web/execution/_validation_materialization.py:65	['source', 'transform']	component_type: Literal["source", "transform"]
+src/elspeth/web/execution/fanout_guard.py:384	['coalesce', 'row_union']	if node.node_type in ("coalesce", "row_union"):
+src/elspeth/web/frontend/src/api/client.ts:1253	['sink', 'source', 'transform']	* The plugin type uses singular form ("source", "transform", "sink")
+src/elspeth/web/frontend/src/api/client.ts:1256	['sink', 'source', 'transform']	export async function getPluginSchema(
+src/elspeth/web/frontend/src/api/guidedDecoder.ts:60	['aggregation', 'coalesce', 'collector', 'gate', 'queue', 'row_union', 'transform']	const NODE_TYPES = new Set([
+src/elspeth/web/frontend/src/api/guidedDecoder.ts:77	['aggregation', 'coalesce', 'collector', 'gate', 'queue', 'row_union', 'transform']	const COMPOSITION_NODE_TYPES = new Set([
+src/elspeth/web/frontend/src/api/guidedDecoder.ts:268	['aggregation', 'collector', 'gate', 'queue', 'transform']	const ROW_UNION_TARGET_NODE_TYPES = new Set([
+src/elspeth/web/frontend/src/api/guidedDecoder.ts:298	['sink', 'source', 'transform']	function validateProposalPlugin(value: unknown, path: string, expectedKind: "source" | "transform" | "sink"):
+src/elspeth/web/frontend/src/api/guidedDecoder.ts:374	['queue', 'transform']	if (nodeType === "transform" || nodeType === "queue") {
+src/elspeth/web/frontend/src/api/guidedDecoder.ts:586	['aggregation', 'collector', 'transform']	if (nodeType === "transform" || nodeType === "aggregation" || nodeType === "collector") validateProposalPlugin
+src/elspeth/web/frontend/src/api/guidedDecoder.ts:647	['coalesce', 'row_union']	&& ["coalesce", "row_union"].includes(nodeById.get(toId)!.nodeType)
+src/elspeth/web/frontend/src/api/guidedDecoder.ts:724	['coalesce', 'queue', 'row_union']	if (["queue", "coalesce", "row_union"].includes(node.nodeType)) {
+src/elspeth/web/frontend/src/api/guidedDecoder.ts:733	['aggregation', 'transform']	if (node.nodeType === "transform" || node.nodeType === "aggregation") {
+src/elspeth/web/frontend/src/api/guidedDecoder.ts:1008	['coalesce', 'row_union']	&& ["coalesce", "row_union"].includes(
+src/elspeth/web/frontend/src/types/guided.ts:587	['sink', 'source', 'transform']	export interface ProposalPluginRef {
+src/elspeth/web/frontend/src/types/index.ts:436	['sink', 'source', 'transform']	export interface PluginSchemaInfo {
+src/elspeth/web/interpretation_state.py:257	['source', 'transform']	component_type: Literal["source", "transform"]
+src/elspeth/web/plugin_policy/compiler.py:58	['sink', 'source', 'transform']	category: Literal["source", "transform", "sink"],
+src/elspeth/web/plugin_policy/coverage.py:83	['source', 'transform']	component_type: Literal["source", "transform"]
+src/elspeth/web/plugin_policy/coverage.py:568	['coalesce', 'row_union']	if node.node_type in ("coalesce", "row_union"):
+src/elspeth/web/plugin_policy/models.py:17	['sink', 'source', 'transform']	PluginKind = Literal["source", "transform", "sink"]
+src/elspeth/web/plugin_policy/validation.py:75	['sink', 'source', 'transform']	component_type: Literal["source", "transform", "sink"]
+src/elspeth/web/plugin_policy/validation.py:377	['sink', 'source', 'transform']	def _plugin_id(kind: Literal["source", "transform", "sink"], name: object) -> PluginId | None:
+src/elspeth/web/sessions/protocol.py:1716	['sink', 'source', 'transform']	if type(self.catalog_plugin_ids) not in {dict, MappingProxyType} or set(self.catalog_plugin_ids) != {
+src/elspeth/web/sessions/routes/_helpers.py:782	['aggregation', 'collector', 'transform']	if node_type in ("transform", "aggregation", "collector"):
+src/elspeth/web/sessions/routes/_helpers.py:789	['coalesce', 'gate', 'queue', 'row_union']	elif node_type in ("gate", "coalesce", "queue", "row_union"):
+src/elspeth/web/sessions/routes/composer/guided_chat_intent_management.py:299	['coalesce', 'gate', 'queue', 'row_union']	_STRUCTURAL_NODE_TYPES = ("gate", "coalesce", "row_union", "queue")
+src/elspeth/web/shareable_reviews/models.py:126	['aggregation', 'coalesce', 'gate', 'queue', 'row_union', 'transform']	node_type: Literal["transform", "gate", "aggregation", "coalesce", "queue", "row_union"]
+src/elspeth/web/frontend/src/api/client.ts:1257	['sink', 'source', 'transform']	pluginType: "source" | "transform" | "sink",
+src/elspeth/web/frontend/src/stores/pluginCatalogStore.ts:14	['sink', 'source', 'transform']	type PluginKind = "source" | "transform" | "sink";
+src/elspeth/web/frontend/src/types/guided.ts:588	['sink', 'source', 'transform']	kind: "source" | "transform" | "sink";
+src/elspeth/web/frontend/src/types/guided.ts:696	['aggregation', 'coalesce', 'collector', 'gate', 'queue', 'row_union', 'transform']	| "transform"
+src/elspeth/web/frontend/src/types/index.ts:155	['aggregation', 'coalesce', 'collector', 'gate', 'queue', 'row_union', 'transform']	| "transform"
+src/elspeth/web/frontend/src/types/index.ts:423	['sink', 'source', 'transform']	plugin_type: "source" | "transform" | "sink";
+src/elspeth/web/frontend/src/types/index.ts:438	['sink', 'source', 'transform']	plugin_type: "source" | "transform" | "sink";
