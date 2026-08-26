@@ -18,6 +18,7 @@ from typing import Any, Literal, TypedDict
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.web.composer._producer_resolver import published_success_connection
 from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
 from elspeth.web.paths import resolve_data_path
 
@@ -290,7 +291,15 @@ def _build_producer_index(state: CompositionState) -> _ProducerIndex:
             register(source.on_success, _Producer(kind="source", source_name=source_name, source=source))
 
     for node in state.nodes:
-        for label in (node.on_success, node.on_error):
+        # DERIVED from ``published_success_connection``, never restated. A
+        # non-terminal coalesce, an aggregation that omits ``on_success``, and
+        # every queue all have ``on_success is None`` yet are fully connected —
+        # each publishes under its own node id. Reading ``node.on_success``
+        # directly left all three unregistered, and ``walk_label`` below does a
+        # ``.get()`` that returns silently on a miss, so the upstream trace
+        # simply stopped and the LLM fanout guard was never raised
+        # (elspeth-8190d4e4cf).
+        for label in (published_success_connection(node), node.on_error):
             if label is not None and label != "discard":
                 register(label, _Producer(kind="node", node=node))
         if node.routes is not None:
@@ -302,10 +311,12 @@ def _build_producer_index(state: CompositionState) -> _ProducerIndex:
                 if label != "discard":
                     register(label, _Producer(kind="node", node=node))
 
-    # Install each declared queue as the canonical producer of its own id.
-    for node in state.nodes:
-        if node.node_type == "queue":
-            by_connection[node.id] = _Producer(kind="node", node=node)
+    # No separate queue install: a queue publishes under its own id, so
+    # ``published_success_connection`` already registered it in the loop above,
+    # and ``register``'s divert only routes AWAY producers whose key is not
+    # ``node:<queue id>`` — the queue itself always lands in ``by_connection``
+    # regardless of the order its predecessors are seen in. Re-installing it
+    # here would be the same hand restatement this function just stopped making.
 
     frozen_predecessors = {
         queue_id: tuple(predecessors[key] for key in sorted(predecessors)) for queue_id, predecessors in queue_predecessors.items()

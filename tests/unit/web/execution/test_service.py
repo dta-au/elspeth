@@ -20,6 +20,7 @@ import json
 import threading
 from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import Future
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -2500,6 +2501,173 @@ def _queue_fan_in_state(*, sources: dict[str, Any], extra_nodes: tuple[Any, ...]
         metadata=PipelineMetadata(),
         version=1,
     )
+
+
+class TestFanoutGuardProducerIndexDerivesPublication:
+    """The producer index must ask the helper, not test ``on_success`` by hand.
+
+    ``_build_producer_index`` read ``node.on_success`` directly and installed
+    only queues under their own id. A non-terminal coalesce and an aggregation
+    that omits ``on_success`` publish under their own ids too, so neither was
+    ever registered — and ``walk_label`` does a ``.get()`` that returns
+    silently on a miss, so the upstream trace simply stopped.
+
+    Consequence (elspeth-8190d4e4cf): a ``batch_replicate`` aggregation over
+    500 rows feeding an ``llm`` node returned no guard at all. No 428, no ack
+    token, and ``annotate_pipeline_yaml_with_fanout_guard`` never ran, so the
+    launch YAML lost its audit comment as well. Unacknowledged LLM spend with
+    no record a guard was ever owed. FALSE ACCEPT.
+    """
+
+    @staticmethod
+    def _state_with(node: Any, *, llm_input: str, data_path: Path) -> Any:
+        from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
+
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="src_out",
+                options={"path": str(data_path.name), "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(node, _fanout_llm_node(llm_input)),
+            edges=(),
+            outputs=(
+                OutputSpec(name="out", plugin="json", options={"schema": {"mode": "observed"}}, on_write_failure="discard"),
+                OutputSpec(name="errors", plugin="json", options={"schema": {"mode": "observed"}}, on_write_failure="discard"),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    @staticmethod
+    def _replicating_aggregation(*, on_success: str | None) -> Any:
+        from elspeth.web.composer.state import NodeSpec
+
+        return NodeSpec(
+            id="agg",
+            node_type="aggregation",
+            plugin="batch_replicate",
+            input="src_out",
+            on_success=on_success,
+            on_error="errors",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            trigger={"count": 10},
+            output_mode="transform",
+        )
+
+    def _csv(self, tmp_path: Path) -> Path:
+        path = tmp_path / "in.csv"
+        path.write_text("a,b\n" + "".join(f"{i},{i}\n" for i in range(500)), encoding="utf-8")
+        return path
+
+    def test_implicit_aggregation_upstream_of_llm_still_raises_the_guard(self, tmp_path: Path) -> None:
+        """The reproduction: two runtime-identical graphs, only the guard differed."""
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        data_path = self._csv(tmp_path)
+        implicit = self._state_with(self._replicating_aggregation(on_success=None), llm_input="agg", data_path=data_path)
+        explicit = self._state_with(self._replicating_aggregation(on_success="agg_out"), llm_input="agg_out", data_path=data_path)
+
+        implicit_guard = evaluate_execution_fanout_guard(implicit, data_dir=tmp_path)
+        explicit_guard = evaluate_execution_fanout_guard(explicit, data_dir=tmp_path)
+
+        assert implicit_guard is not None, (
+            "A transform-mode batch_replicate aggregation feeding an LLM raised NO guard when it omitted "
+            "on_success — unacknowledged LLM spend, and no audit comment on the launch YAML either."
+        )
+        assert explicit_guard is not None
+        assert implicit_guard.risk_level == explicit_guard.risk_level, (
+            "The two graphs are runtime-identical; omitting on_success must not change the risk level."
+        )
+        assert [risk.node_id for risk in implicit_guard.risks] == [risk.node_id for risk in explicit_guard.risks]
+
+    def test_every_implicit_self_publisher_registers_as_a_producer_of_its_own_id(self, tmp_path: Path) -> None:
+        """The pin, ENUMERATED FROM the helper's own set — not restated here.
+
+        A fourth node kind added to ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES``
+        cannot skip this site: it joins the loop automatically and fails here
+        if the producer index does not register it.
+        """
+        from elspeth.web.composer._producer_resolver import _IMPLICIT_SELF_PUBLISHING_NODE_TYPES, published_success_connection
+        from elspeth.web.composer.state import NodeSpec
+        from elspeth.web.execution.fanout_guard import _build_producer_index
+
+        data_path = self._csv(tmp_path)
+        for kind in sorted(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES):
+            node = NodeSpec(
+                id="publisher",
+                node_type=kind,
+                plugin=None,
+                # A queue's input IS its own id; the others consume upstream.
+                input="publisher" if kind == "queue" else "src_out",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"only": "src_out"} if kind == "coalesce" else None,
+                policy="all" if kind == "coalesce" else None,
+                merge="row_union" if kind == "coalesce" else None,
+                **({"trigger": {"count": 10}} if kind == "aggregation" else {}),
+            )
+            assert published_success_connection(node) == "publisher", kind
+            index = _build_producer_index(self._state_with(node, llm_input="publisher", data_path=data_path))
+            assert "publisher" in index.by_connection, (
+                f"A '{kind}' publishing under its own id is not registered in the fanout guard's producer "
+                "index, so walk_label() returns silently on it and the upstream trace stops — the LLM "
+                "fanout guard is disabled for every pipeline routing through one. Register "
+                "published_success_connection(node); do not restate the set here."
+            )
+
+    def test_a_queue_owns_its_own_id_regardless_of_node_order(self, tmp_path: Path) -> None:
+        """Deleting the separate queue install must not depend on declaration order.
+
+        The removed block re-installed each queue as the canonical producer of
+        its id AFTER the main loop. Deriving the channel makes the queue
+        self-register inside the loop instead, and ``register``'s divert only
+        routes away producers whose key is not ``node:<queue id>`` — so the
+        queue wins either way. Measured here rather than reasoned.
+        """
+        from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
+        from elspeth.web.execution.fanout_guard import _build_producer_index
+
+        data_path = self._csv(tmp_path)
+        queue = _queue_node("q")
+        feeders = (_fanout_llm_node("src_out", node_id="a"), _fanout_llm_node("src_out", node_id="b"))
+        feeders = tuple(replace(node, on_success="q") for node in feeders)
+
+        for label, nodes in (
+            ("feeders first", (*feeders, queue)),
+            ("queue first", (queue, *feeders)),
+        ):
+            state = CompositionState(
+                source=SourceSpec(
+                    plugin="csv",
+                    on_success="src_out",
+                    options={"path": str(data_path.name), "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                ),
+                nodes=nodes,
+                edges=(),
+                outputs=(
+                    OutputSpec(name="out", plugin="json", options={"schema": {"mode": "observed"}}, on_write_failure="discard"),
+                    OutputSpec(name="errors", plugin="json", options={"schema": {"mode": "observed"}}, on_write_failure="discard"),
+                ),
+                metadata=PipelineMetadata(),
+                version=1,
+            )
+            index = _build_producer_index(state)
+            owner = index.by_connection.get("q")
+            assert owner is not None and owner.node is not None and owner.node.id == "q", label
+            assert sorted(p.node.id for p in index.queue_predecessors.get("q", ()) if p.node) == ["a", "b"], label
 
 
 class TestExecutionFanoutGuard:
