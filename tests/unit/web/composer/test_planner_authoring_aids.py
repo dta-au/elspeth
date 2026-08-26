@@ -1124,7 +1124,7 @@ class TestDiscoveryDigest:
                 ),
             }
         ]
-        assert len(planner_authoring_aids.canonical_json(digest).encode("utf-8")) <= 24 * 1024
+        assert len(planner_authoring_aids.canonical_json(digest).encode("utf-8")) <= 28 * 1024
 
     def test_digest_covers_every_policy_visible_plugin(self) -> None:
         """DISCOVERY_CYCLE churn re-derives the catalog; the digest IS the catalog."""
@@ -1181,7 +1181,7 @@ class TestDiscoveryDigest:
 
         rendered = canonical_json(discovery_digest(view)).encode("utf-8")
 
-        assert len(rendered) <= 24 * 1024
+        assert len(rendered) <= 28 * 1024
 
     def test_digest_bounds_synthetic_public_prose_without_losing_plugin_identities(self) -> None:
         from elspeth.core.canonical import canonical_json
@@ -1203,8 +1203,8 @@ class TestDiscoveryDigest:
 
         digest = discovery_digest(view, summaries=summaries)
 
-        assert len(canonical_json(digest).encode("utf-8")) <= 24 * 1024
-        assert digest["budget"]["max_canonical_bytes"] == 24 * 1024
+        assert len(canonical_json(digest).encode("utf-8")) <= 28 * 1024
+        assert digest["budget"]["max_canonical_bytes"] == 28 * 1024
         assert digest["budget"]["canonical_bytes_used"] <= digest["budget"]["max_canonical_bytes"]
         assert digest["budget"]["omitted_public_text_count"] > 0
         for kind, entries in (("source", digest["sources"]), ("transform", digest["transforms"]), ("sink", digest["sinks"])):
@@ -1262,7 +1262,7 @@ class TestDiscoveryDigest:
 
         digest = discovery_digest(view, summaries=summaries)
 
-        assert len(original(digest).encode("utf-8")) <= 24 * 1024
+        assert len(original(digest).encode("utf-8")) <= 28 * 1024
         assert calls <= 8
 
     def test_digest_fails_closed_when_identity_facts_alone_exceed_budget(self) -> None:

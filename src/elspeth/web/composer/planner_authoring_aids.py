@@ -1043,7 +1043,7 @@ SchemaContractProjectionUnsupported = _SchemaContractProjectionUnsupported
 _PLANNER_CONTRACT_MAX_DEPTH: Final[int] = 32
 _PLANNER_CONTRACT_MAX_NODES: Final[int] = 4096
 _PLANNER_CONTRACT_MAX_CANONICAL_BYTES: Final[int] = 48 * 1024
-_DISCOVERY_DIGEST_MAX_CANONICAL_BYTES: Final[int] = 24 * 1024
+_DISCOVERY_DIGEST_MAX_CANONICAL_BYTES: Final[int] = 28 * 1024
 _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES: Final[int] = 1024
 # The planner request is append-only and carries no cache markers, so every
 # aid byte is re-sent on every turn of one plan. That is why the model-catalog

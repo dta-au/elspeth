@@ -130,6 +130,16 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 
+# Cost RATCHET on the planner's fixed scaffolding — the system message, fixed
+# payload, and tool palette re-sent uncached on EVERY planner turn. This is a
+# test-side cost-discipline ceiling, not a correctness limit (the production
+# fail-closed cap is composer_planner_max_request_bytes, 2 MiB). It only ever
+# moves by an operator ruling: growth must be priced as deliberately-landed
+# palette additions, never absorbed by deforming a plugin contract or trimming
+# load-bearing teaching text to fit. Last re-set 2026-08-27 (John): 96 -> 100
+# KiB, paid for by reference_join + the two blob expanders (+911 B net).
+_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = 100 * 1024
+
 
 @dataclass
 class _Function:
@@ -1802,7 +1812,7 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
         "messages": [request["messages"][0], {"role": "user", "content": canonical_json(fixed_payload)}],
         "tools": request["tools"],
     }
-    assert len(canonical_json(fixed_scaffolding).encode("utf-8")) <= 96 * 1024
+    assert len(canonical_json(fixed_scaffolding).encode("utf-8")) <= _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
 
 
 @pytest.mark.asyncio
