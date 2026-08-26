@@ -1,10 +1,13 @@
 # tests/core/test_config.py
 """Tests for configuration schema and loading."""
 
+from collections.abc import Sequence
 from pathlib import Path
+from types import UnionType
+from typing import Union, get_args, get_origin
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 
 def _complete_audit_export_config(**overrides: object) -> dict[str, object]:
@@ -3561,6 +3564,278 @@ sinks:
         assert "secret" not in sanitized
         assert had_password is True
         assert fingerprint is not None
+
+
+class TestAuditRedactionSectionCoverage:
+    """Reflection pin: EVERY options-bearing settings section must be redacted.
+
+    A hand-listed test reproduces the exact defect it is meant to catch the
+    next time a section is added. That is not hypothetical: ``collectors``
+    was added to ``ElspethSettings`` and nothing told
+    ``_fingerprint_config_for_audit`` about it, so collector plugin options
+    reached the durable audit record in cleartext (elspeth-bc1b2c2959).
+
+    So the section list is DISCOVERED from ``ElspethSettings.model_fields``
+    rather than written down, and the assertion is BEHAVIOURAL: a sentinel
+    secret is planted under each discovered ``options`` mapping and must not
+    survive the redactor. An inventory assertion — "the discovered set equals
+    this literal set" — would have passed with the defect present, because it
+    checks the section list rather than the redaction.
+
+    The walk is recursive because ``telemetry.exporters[*].options`` is not a
+    top-level section; a top-level-only walk would miss exactly the shape that
+    is missed next time.
+    """
+
+    # Not a credential: a marker string asserted absent from redactor output.
+    SENTINEL = "sentinel-value-must-not-survive-redaction"  # secret-scan: allow-this-line
+
+    # Depth cap: ElspethSettings nests three levels at most. The cap is a
+    # runaway guard for a future self-referential model, not a scoping choice.
+    MAX_DEPTH = 6
+
+    @staticmethod
+    def _classify(annotation: object) -> tuple[str, tuple[type[BaseModel], ...]]:
+        """Return the container shape and element models of one field annotation.
+
+        Shapes: ``"dict"`` (name -> entry), ``"list"`` (sequence of entries),
+        ``"single"`` (a nested model), ``""`` (carries no model).
+        Optionals are unwrapped; ``None`` is not a container.
+        """
+        candidates = [annotation]
+        if get_origin(annotation) in (Union, UnionType):
+            candidates = [arg for arg in get_args(annotation) if arg is not type(None)]
+
+        for candidate in candidates:
+            origin = get_origin(candidate)
+            args = get_args(candidate)
+            if origin is dict and len(args) == 2:
+                models = tuple(a for a in args[1:] if isinstance(a, type) and issubclass(a, BaseModel))
+                if models:
+                    return "dict", models
+            elif origin in (list, tuple, Sequence) and args:
+                models = tuple(a for a in args[:1] if isinstance(a, type) and issubclass(a, BaseModel))
+                if models:
+                    return "list", models
+            elif isinstance(candidate, type) and issubclass(candidate, BaseModel):
+                return "single", (candidate,)
+        return "", ()
+
+    @classmethod
+    def _options_bearing_paths(cls) -> list[tuple[tuple[str, str], ...]]:
+        """Discover every path in ElspethSettings reaching a model with ``options``.
+
+        Each path is a tuple of ``(field_name, container_shape)`` segments, e.g.
+        ``(("transforms", "list"),)`` or ``(("telemetry", "single"), ("exporters", "list"))``.
+
+        Deduplication is on the PATH, not on the model class: if two sections
+        ever share an element model, dropping the second by class would
+        silently remove it from this pin's coverage.
+        """
+        from elspeth.core.config import ElspethSettings
+
+        found: list[tuple[tuple[str, str], ...]] = []
+        seen_paths: set[tuple[tuple[str, str], ...]] = set()
+
+        def walk(model: type[BaseModel], prefix: tuple[tuple[str, str], ...]) -> None:
+            if len(prefix) >= cls.MAX_DEPTH:
+                return
+            for name in model.model_fields:
+                shape, element_models = cls._classify(model.model_fields[name].annotation)
+                if not element_models:
+                    continue
+                path = (*prefix, (name, shape))
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                for element_model in element_models:
+                    if "options" in element_model.model_fields:
+                        found.append(path)
+                    walk(element_model, path)
+
+        walk(ElspethSettings, ())
+        return found
+
+    @classmethod
+    def _plant(cls, path: tuple[tuple[str, str], ...]) -> dict[str, object]:
+        """Build the minimal config dict that puts SENTINEL under ``path``'s options.
+
+        ``_fingerprint_config_for_audit`` takes a plain dict and reads it
+        structurally, so this deliberately does NOT construct real settings
+        models: doing so would drag in every required field and the
+        scopes/collectors cross-validator without making the pin stronger.
+        """
+        payload: object = {"options": {"api_key": cls.SENTINEL}}
+        for name, shape in reversed(path):
+            if shape == "dict":
+                payload = {name: {"entry": payload}}
+            elif shape == "list":
+                payload = {name: [payload]}
+            else:
+                payload = {name: payload}
+        assert isinstance(payload, dict)
+        return payload
+
+    def test_walk_finds_the_known_options_bearing_sections(self) -> None:
+        """Guard the probe itself: a broken walk must not report vacuous success.
+
+        This is the positive control. If the discovery walk silently returned
+        nothing — a changed annotation style, a pydantic upgrade — the
+        behavioural test below would pass by testing nothing at all.
+        """
+        paths = self._options_bearing_paths()
+        rendered = {".".join(name for name, _shape in path) for path in paths}
+
+        assert {"sources", "sinks", "transforms", "collectors", "aggregations", "telemetry.exporters"} <= rendered, (
+            f"Discovery walk lost a known options-bearing section; found {sorted(rendered)}"
+        )
+
+    def test_every_options_bearing_section_is_redacted_for_audit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No discovered section may carry a plaintext secret into the audit copy.
+
+        Fingerprint mode: the secret must be replaced by a fingerprint.
+        """
+        from elspeth.core.config import _fingerprint_config_for_audit
+
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
+
+        leaked = []
+        for path in self._options_bearing_paths():
+            result = _fingerprint_config_for_audit(self._plant(path))
+            if self.SENTINEL in repr(result):
+                leaked.append(".".join(name for name, _shape in path))
+
+        assert not leaked, (
+            f"Sections written to the audit record with UNREDACTED options: {sorted(leaked)}. "
+            f"Add each to _fingerprint_config_for_audit and to its docstring enumeration."
+        )
+
+    def test_every_options_bearing_section_fails_closed_without_a_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Absent a fingerprint key, a secret must abort rather than persist.
+
+        This is the asymmetry that made elspeth-bc1b2c2959 silent: a covered
+        section refuses to produce an audit copy at all, while the uncovered
+        one returned successfully with the secret intact. Nothing in the run
+        distinguished "no secrets present" from "secrets present, not redacted".
+        """
+        from elspeth.contracts.security import SecretFingerprintError
+        from elspeth.core.config import _fingerprint_config_for_audit
+
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
+
+        failed_open = []
+        for path in self._options_bearing_paths():
+            try:
+                _fingerprint_config_for_audit(self._plant(path))
+            except SecretFingerprintError:
+                continue
+            failed_open.append(".".join(name for name, _shape in path))
+
+        assert not failed_open, (
+            f"Sections that FAIL OPEN on a secret with no fingerprint key: {sorted(failed_open)}. "
+            f"Every options-bearing section must reach _fingerprint_secrets."
+        )
+
+
+class TestEnvPlaceholderGuardSectionCoverage:
+    """Reflection pin: the pre-expansion guard must cover every plugin-bearing section.
+
+    ``_reject_sensitive_plugin_env_placeholders_before_expansion`` is the ONLY
+    containment for presentation options like ``report_assemble.title``. The
+    audit redactor cannot substitute for it: that redactor is heuristic on the
+    option NAME, so a field called ``title`` never trips it. So a section
+    missing from this guard leaks the expanded host value into the durable
+    audit record with nothing downstream to catch it.
+
+    That is not hypothetical either. The guard iterated ``transforms`` and
+    ``aggregations`` only, while ``collectors`` reuse the same batch-transform
+    plugin contract — so a collector's ``title: ${VAR}`` was expanded and
+    persisted verbatim into ``runs.settings_json``, while the identical option
+    on a transform was rejected at load (elspeth-bc1b2c2959).
+
+    As with the redactor pin, the sections are DISCOVERED rather than listed,
+    and the assertion is behavioural: plant a placeholder in a forbidden field
+    and require a rejection.
+    """
+
+    @classmethod
+    def _plugin_bearing_sections(cls) -> dict[str, str]:
+        """Return ``{section_name: container_shape}`` for sections hosting plugins.
+
+        A plugin-bearing section is one whose entries carry BOTH ``plugin`` and
+        ``options`` — the shape the forbidden-field map is keyed against.
+        """
+        from elspeth.core.config import ElspethSettings
+
+        sections: dict[str, str] = {}
+        for name in ElspethSettings.model_fields:
+            shape, element_models = TestAuditRedactionSectionCoverage._classify(ElspethSettings.model_fields[name].annotation)
+            for element_model in element_models:
+                if "plugin" in element_model.model_fields and "options" in element_model.model_fields:
+                    sections[name] = shape
+        return sections
+
+    def test_transform_registry_sections_are_exactly_the_list_shaped_ones(self) -> None:
+        """Pin the deliberate sources/sinks exclusion so a new section forces a decision.
+
+        ``sources`` and ``sinks`` are plugin-bearing but host the source and
+        sink registries, which are disjoint from the transform registry the
+        forbidden map is keyed on. That exclusion is deliberate — but it must
+        be re-decided, not inherited, if a new plugin-bearing section appears.
+        """
+        sections = self._plugin_bearing_sections()
+
+        assert {name for name, shape in sections.items() if shape == "dict"} == {"sources", "sinks"}, (
+            f"Plugin-bearing dict-shaped sections changed: {sections}. Decide whether the new section can host a transform-registry plugin."
+        )
+        assert {name for name, shape in sections.items() if shape == "list"} == {
+            "transforms",
+            "collectors",
+            "aggregations",
+        }, (
+            f"Plugin-bearing list-shaped sections changed: {sections}. "
+            f"A new one must be added to "
+            f"_reject_sensitive_plugin_env_placeholders_before_expansion."
+        )
+
+    def test_every_transform_registry_section_rejects_env_placeholders(self) -> None:
+        """No section hosting a transform-registry plugin may expand a forbidden field."""
+        from elspeth.core.config import (
+            _ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS,
+            _reject_sensitive_plugin_env_placeholders_before_expansion,
+        )
+
+        assert _ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS, (
+            "Positive control: the forbidden-field map is empty, so this test proves nothing."
+        )
+
+        sections = [name for name, shape in self._plugin_bearing_sections().items() if shape == "list"]
+        failed_open = []
+        for section in sections:
+            for plugin_name, forbidden_fields in _ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS.items():
+                for option_name in sorted(forbidden_fields):
+                    raw_config = {
+                        section: [
+                            {
+                                "name": "probe",
+                                "plugin": plugin_name,
+                                "options": {option_name: "${ELSPETH_TEST_HOST_VALUE}"},
+                            }
+                        ]
+                    }
+                    try:
+                        _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+                    except ValueError:
+                        continue
+                    failed_open.append(f"{section}[*] {plugin_name}.{option_name}")
+
+        assert not failed_open, (
+            f"Sections that EXPAND a forbidden env placeholder instead of rejecting it: {sorted(failed_open)}. "
+            f"The expanded host value reaches the durable audit record, and the audit redactor "
+            f"cannot catch it because it matches on the option name."
+        )
 
 
 class TestRunModeSettings:

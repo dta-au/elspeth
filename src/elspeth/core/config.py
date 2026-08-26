@@ -2646,8 +2646,23 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
     references. Reject their raw ``${VAR}`` syntax before the loader expands it,
     so later plugin validation cannot be bypassed by replacing the marker with
     a host secret value.
+
+    Covers every section that can host a transform-registry plugin:
+    ``transforms``, ``aggregations`` and ``collectors``. Collectors reuse the
+    batch-transform plugin contract, so ``report_assemble`` — the one plugin in
+    the forbidden map — is authorable as a collector and was reachable through
+    exactly this path (elspeth-bc1b2c2959): a collector's ``title: ${VAR}`` was
+    expanded and persisted verbatim into the audit record, while the identical
+    option on a transform was rejected here.
+
+    This guard is NOT redundant with ``_fingerprint_config_for_audit``. That
+    redactor is heuristic on the option NAME, so a presentation field like
+    ``title`` never trips it; containment for these fields exists only here,
+    upstream of expansion. ``sources``/``sinks`` are deliberately excluded:
+    they host the source and sink registries, which are disjoint from the
+    transform registry the forbidden map is keyed on.
     """
-    for collection_name in ("transforms", "aggregations"):
+    for collection_name in ("transforms", "aggregations", "collectors"):
         collection = raw_config[collection_name] if collection_name in raw_config else None
         if type(collection) is not list:
             continue
@@ -2988,12 +3003,24 @@ def _fingerprint_config_for_audit(
     Called by resolve_config() to create a copy safe for audit storage.
     The original config (with secrets) is untouched.
 
+    Covers EVERY settings section whose entries carry a plugin ``options``
+    mapping. That set is pinned behaviourally by
+    ``TestAuditRedactionSectionCoverage`` (tests/unit/core/test_config.py),
+    which discovers the sections by walking ``ElspethSettings.model_fields``
+    rather than trusting this list — a section added to the settings tree and
+    not added here writes plugin options into the durable audit record in
+    cleartext, and fails open with no error (elspeth-bc1b2c2959). Keep this
+    enumeration in step with the code below; the pin, not the docstring, is
+    the guarantee.
+
     Processes:
-    - source.options
+    - sources.*.options (and the legacy singular source.options)
     - sinks.*.options
     - database sink options.url (DSN password)
     - transforms[*].options
+    - collectors[*].options
     - aggregations[*].options
+    - telemetry.exporters[*].options
     - landscape.url (DSN password)
 
     Args:
@@ -3059,6 +3086,14 @@ def _fingerprint_config_for_audit(
         for plugin in config["transforms"]:
             if isinstance(plugin, dict) and "options" in plugin and isinstance(plugin["options"], dict):
                 plugin["options"] = _fingerprint_secrets(plugin["options"], fail_if_no_key=fail_if_no_key)
+
+    # === Collector plugin options ===
+    # Collectors reuse the batch-transform plugin contract, so their options
+    # are the same arbitrary secret-bearing shape as a transform's.
+    if "collectors" in config and isinstance(config["collectors"], list):
+        for collector in config["collectors"]:
+            if isinstance(collector, dict) and "options" in collector and isinstance(collector["options"], dict):
+                collector["options"] = _fingerprint_secrets(collector["options"], fail_if_no_key=fail_if_no_key)
 
     # === Aggregation options ===
     if "aggregations" in config and isinstance(config["aggregations"], list):
