@@ -1,0 +1,97 @@
+# reference_join — flat CSV reference table
+#
+# The main line is a list of orders carrying a product key and nothing else
+# about the product. The descriptive values live in products.csv, which is
+# CONFIGURATION, not a second source: the settings loader reads it into the
+# transform's options at load time, so the table's bytes end up inside the
+# node identity and the run's topology hash. Edit products.csv between a run
+# and its resume and the resume is refused, because the answers would differ.
+#
+# reference_file is resolved relative to THIS FILE'S directory and is confined
+# to it, which is why products.csv sits beside settings.yaml rather than being
+# addressed from the repository root the way source paths are.
+
+sources:
+  primary:
+    plugin: csv
+    on_success: enrich_products
+    options:
+      path: examples/reference_join/orders.csv
+      on_validation_failure: quarantine
+      schema:
+        mode: observed
+
+transforms:
+  - name: enrich_products
+    plugin: reference_join
+    input: enrich_products
+    on_success: coerce_numbers
+    on_error: quarantine
+    options:
+      schema:
+        mode: observed
+      reference_file: products.csv
+      reference_format: csv
+      # key_field names the column on the ARRIVING ROW.
+      key_field: product
+      # reference_key_name names the key column INSIDE the reference table.
+      reference_key_name: sku
+      # Each output field is an expression over the matched entry, bound as
+      # `ref`. This is the engine's existing expression grammar, not a second
+      # one invented for joins.
+      output:
+        product_description: "ref['description']"
+        product_category: "ref['category']"
+        unit_price: "ref['unit_price']"
+      # Every order in orders.csv has a matching product, so nothing misses
+      # here. on_miss defaults to `fail` regardless — see
+      # settings_missing_product.yaml for what that costs when a key is absent.
+      on_miss: fail
+
+  # The join lifts reference values VERBATIM and never coerces them, so a
+  # CSV table yields text. Coerce explicitly, exactly as you would for any
+  # other string-typed source column.
+  - name: coerce_numbers
+    plugin: type_coerce
+    input: coerce_numbers
+    on_success: line_totals
+    on_error: quarantine
+    options:
+      schema:
+        mode: observed
+      conversions:
+        - field: unit_price
+          to: float
+        - field: quantity
+          to: int
+
+  - name: line_totals
+    plugin: value_transform
+    input: line_totals
+    on_success: output
+    on_error: quarantine
+    options:
+      schema:
+        mode: observed
+      operations:
+        - target: line_total
+          expression: "row['unit_price'] * row['quantity']"
+
+sinks:
+  output:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/reference_join/output/enriched_orders.csv
+      schema:
+        mode: observed
+  quarantine:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: examples/reference_join/output/quarantine.csv
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/reference_join/runs/audit.db
