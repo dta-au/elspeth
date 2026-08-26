@@ -2658,9 +2658,19 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
     This guard is NOT redundant with ``_fingerprint_config_for_audit``. That
     redactor is heuristic on the option NAME, so a presentation field like
     ``title`` never trips it; containment for these fields exists only here,
-    upstream of expansion. ``sources``/``sinks`` are deliberately excluded:
-    they host the source and sink registries, which are disjoint from the
-    transform registry the forbidden map is keyed on.
+    upstream of expansion.
+
+    ``sources``/``sinks`` are NOT walked, and that exclusion is KNOWN-FALSE
+    rather than deliberate. It was originally justified on the grounds that
+    those sections host the source and sink registries, disjoint from the
+    transform registry the forbidden map is keyed on. That reasoning is the
+    wrong question: what matters is whether the option VALUE reaches row data
+    or an artifact, not which registry the plugin came from. ``csv.headers``
+    falsifies it by execution — its ``{field: display_name}`` mapping is
+    written as the artifact's header row, so a ``${VAR}`` there becomes a host
+    environment value in customer-facing output bytes. Do not read this
+    exclusion as clearance for sinks; it stands only until elspeth-8f0a6b3391
+    replaces the hand-maintained map with a derived one.
     """
     for collection_name in ("transforms", "aggregations", "collectors"):
         collection = raw_config[collection_name] if collection_name in raw_config else None

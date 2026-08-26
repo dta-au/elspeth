@@ -3778,12 +3778,27 @@ class TestEnvPlaceholderGuardSectionCoverage:
         return sections
 
     def test_transform_registry_sections_are_exactly_the_list_shaped_ones(self) -> None:
-        """Pin the deliberate sources/sinks exclusion so a new section forces a decision.
+        """Pin the CURRENT guard scope so a new plugin-bearing section forces a decision.
 
-        ``sources`` and ``sinks`` are plugin-bearing but host the source and
-        sink registries, which are disjoint from the transform registry the
-        forbidden map is keyed on. That exclusion is deliberate — but it must
-        be re-decided, not inherited, if a new plugin-bearing section appears.
+        WARNING — this assertion records what the guard does today, NOT a
+        finding that the sources/sinks exclusion is safe. Read no clearance
+        into it.
+
+        The exclusion was originally justified here on the grounds that
+        ``sources`` and ``sinks`` host the source and sink registries, disjoint
+        from the transform registry the forbidden map is keyed on. **That
+        justification is FALSE** — falsified by execution, not by review.
+        ``csv.headers`` takes a ``{field: display_name}`` mapping whose values
+        are written as the artifact's header row, so a ``${VAR}`` in a sink
+        option reaches customer-facing output bytes as a host environment
+        value. Which registry the plugin came from was never the question; the
+        question is whether the option value reaches row data or an artifact.
+
+        The exclusion stands only because widening the assertion while the
+        policy itself stays a one-entry hand-map would relocate the wrong
+        rationale rather than remove it. elspeth-8f0a6b3391 inverts that
+        dependency — plugins declare, the guard derives — and this assertion
+        is rewritten there, in the same change as the behaviour.
         """
         sections = self._plugin_bearing_sections()
 
