@@ -166,7 +166,12 @@ def test_unmentioned_unavailable_model_catalog_identity_teaches_collector_scopes
     assert result.chat.error_class == "DeferredIntentModelCatalogIdentity"
     assert result.chat.assistant_message == _FRAME_OPEN + _COLLECTOR_CLAUSE + _FRAME_CLOSE
     # Nothing may bind the proposed plugin to the collector, and the collector
-    # must never be called "not a transform plugin".
+    # must never be called "not a transform plugin". Honest about their power:
+    # the first two pass on every ancestor too, so they witness no change —
+    # they are standing bans on a shape the reviewed draft had, kept because
+    # the shape is tempting, not because this commit removed it. The third is
+    # NOT vacuous: adding `collector` to `_STRUCTURAL_NODE_TYPES` — the fix
+    # this ticket originally specified and later overruled — makes it fire.
     assert "proposed for the collector" not in result.chat.assistant_message
     assert "batch-transform plugin I proposed" not in result.chat.assistant_message
     assert "A collector is a built-in topology node, not a transform plugin" not in result.chat.assistant_message
@@ -202,15 +207,25 @@ def test_collector_and_structural_clauses_both_emit_inside_one_frame() -> None:
 
 
 def test_declining_a_collector_still_gets_the_true_structural_clause() -> None:
-    """Negation must not turn a TRUE clause into a FALSE one.
+    """TRIPWIRE: negation is deliberately NOT detected, and must stay that way.
 
+    Be precise about what this pins, because the obvious reading is wrong. It
+    is NOT an independent witness that a precedence arm would have replaced the
+    gate clause — this test and
+    `test_collector_and_structural_clauses_both_emit_inside_one_frame` assert
+    the IDENTICAL expected string, and their two messages are indistinguishable
+    to the code under test (both contain word-bounded `gate` and word-bounded
+    `collector`). A replaces-instead-of-appends mutant kills the pair together,
+    so the sibling already covers that.
+
+    What this test alone kills is a mutant that ADDS negation detection and
+    suppresses the clause on "no collector needed". That is the direction
+    someone will eventually be tempted to "fix", and it is banned:
     `_message_names_identifier` is a word-boundary regex with no notion of
-    negation, and detecting negation here is banned — it would fail the other
-    way on "no gate, add a collector". Composition makes that safe: "no
-    collector needed" keeps its correct gate clause, and the appended collector
-    clause is a general truth, so it is at worst unhelpful. A precedence arm
-    would have REPLACED the gate clause with collector copy, turning a true
-    message false — the regression this shape exists to prevent.
+    negation, and a negation parse fails the opposite way on "no gate, add a
+    collector". Composition is what makes leaving it undetected safe — the
+    appended clause is a general truth, so an unwanted match is unhelpful
+    rather than false.
     """
 
     result = _apply(
@@ -228,11 +243,18 @@ def test_collector_clause_stays_true_beside_a_successfully_saved_sibling_action(
 
     `_compose_disposition_chats` joins per-action chats in action order, so a
     retained sibling prepends "I saved that instruction for the topology stage."
-    to this frame. Under the superseded copy that turn was self-contradictory —
-    it said the COLLECTOR request was unverified because of a plugin that in
-    fact belonged to the scoring transform. The frame now attributes the
-    unavailable plugin to no node, so both halves are true at once
-    (review comment 7977 §2B).
+    to this frame. The turn this defends against was self-contradictory: it said
+    the COLLECTOR request was unverified because of a plugin that in fact
+    belonged to the scoring transform. That copy was a REVIEWED WORKING-TREE
+    DRAFT that never landed (review comment 7977 §2B) — do not go looking for it
+    in history. On every ancestor the substituted form could only ever say
+    "I kept your {gate|coalesce|row_union|queue} request", so this exact message
+    took the generic arm and "I kept your collector request" was unreachable.
+
+    The frame now attributes the unavailable plugin to no node, so both halves
+    are true at once. Note the referent limit this does NOT fix: two future-stage
+    instructions are in play, and "that future-stage instruction" does not say
+    which. See the module docstring on what the frame deliberately cannot claim.
     """
 
     result = _apply_many(

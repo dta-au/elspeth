@@ -404,12 +404,18 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
       decides whether the collector clause fires at all.
     * Every clause is a GENERAL TRUTH, true regardless of what happened in the
       turn, so no clause CAN be false and none needs a provenance hedge to make
-      it safe. Negation therefore costs at most an unhelpful sentence: "no
-      collector needed" still gets its correct gate clause, plus a true but
-      unsolicited collector definition. Detecting negation is banned —
-      `_message_names_identifier` is a word-boundary regex with no notion of it,
-      and a negation parse would fail in the opposite direction on "no gate, add
-      a collector".
+      it safe. An unwanted match therefore costs at most an unhelpful sentence,
+      never a wrong one. Two classes reach that state, and the second is the
+      larger: NEGATION ("no collector needed" still gets its correct gate
+      clause, plus a true but unsolicited collector definition) and HOMONYMS
+      ("the garbage collector is slow" and "add a data collector for the survey"
+      both emit the full EXPAND-scope paragraph, verified). Detecting negation
+      is banned — `_message_names_identifier` is a word-boundary regex with no
+      notion of it, and a negation parse would fail in the opposite direction on
+      "no gate, add a collector". Homonym disambiguation is worse still: it
+      needs to know what the user meant. Tolerating both is the price of never
+      printing a falsehood, and it is the right trade only because every clause
+      is unconditionally true.
 
     Note what the frame deliberately does NOT say. The only caller sits inside
     the `_has_unmentioned_unavailable_action_identity` guard, so an unavailable

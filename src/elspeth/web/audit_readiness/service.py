@@ -810,14 +810,28 @@ _BOUNDARY_RULE_VERSION = "phase-7a-v3"
 #     row_union's forbidden-fields block respectively).
 #   - ``web/sessions/routes/composer/guided_chat_intent_management.py::
 #     _STRUCTURAL_NODE_TYPES`` — {gate, coalesce, row_union, queue}.
-#     IDENTICAL membership, DIFFERENT predicate — do not treat the
-#     agreement as corroboration. It is not a validation set at all: it
-#     keyword-matches the USER'S CHAT TEXT to pick a teaching line, and
-#     the tuple itself carries no comment (the rationale lives at its one
-#     call site, ``_model_catalog_identity_chat``, and is about dispatch
-#     ordering, not about hosting a plugin). Two sets answering different
-#     questions may hold the same members today and diverge tomorrow for
-#     entirely valid reasons on either side.
+#     IDENTICAL membership, and — CORRECTED 2026-08-26, see below — the
+#     SAME underlying rule, reached from the other direction. It is not a
+#     validation set: it keyword-matches the USER'S CHAT TEXT to pick a
+#     teaching line. But the line it picks reads "a {x} is a built-in
+#     topology node, NOT a transform plugin", so a kind belongs in the
+#     tuple exactly when that sentence is true of it — which is the
+#     plugin-free partition, the same one this set states. Same question,
+#     different consumer.
+#
+#     What this entry said before f4565143e was wrong on both halves, and
+#     the correction is recorded rather than silently swapped because the
+#     mistake is instructive. It said the tuple "carries no comment" —
+#     true when written, false now: ``_model_catalog_identity_chat``
+#     acquired a docstring stating this membership rule explicitly. And
+#     it said the rationale was "about dispatch ordering, not about
+#     hosting a plugin", which conflated the tuple's MECHANISM (a
+#     ``next()`` scan, which is indeed ordering-sensitive) with its
+#     MEMBERSHIP RULE (the truth condition of the clause, which is
+#     entirely about hosting a plugin). Writing "different predicate"
+#     over two sets that share a rule is the same restatement error this
+#     block warns about, one level up: it manufactured a licence for the
+#     two to diverge that neither side actually has.
 #
 # All three currently agree BY HAND, not by structure. Nothing in the
 # tree fails if one drifts from the others. Unifying them is
