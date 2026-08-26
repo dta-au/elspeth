@@ -336,9 +336,13 @@ def walk_effective_guarantee_vote(
             #   closed every predecessor was.
             #
             # Reading ``any(predecessor closed)`` here — or inheriting the
-            # disjunction from ``participated`` — is exactly the manufactured
-            # completeness claim ADR-040 forbids: a node that cannot see its
-            # predecessor's field set asserting that set is complete.
+            # disjunction from ``participated`` — manufactures a completeness
+            # claim out of ignorance: a node that cannot see its predecessor's
+            # field set asserting that set is complete. (ADR-040 §Consequences
+            # supports this by extension of its principle, not by its letter:
+            # it names only the green direction, an abstention rendering as
+            # ``is_valid: true``. This is the opposite polarity — an abstention
+            # rendering as a false rejection.)
             result = EffectiveGuaranteeVote(
                 fields=result_fields,
                 participated=own_participates or any(vote.participated for vote in predecessor_votes),
