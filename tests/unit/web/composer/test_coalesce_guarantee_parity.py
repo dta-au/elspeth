@@ -286,3 +286,153 @@ class TestNestedCoalesceGuaranteesAreBranchNames:
         summary = _composer_summary(merge="nested")
         skipped = [w.message for w in summary.warnings if "Contract check skipped" in w.message]
         assert skipped == []
+
+
+def _nested_coalesce_summary(*, inner_merge: str) -> ValidationSummary:
+    """Outer UNION coalesce whose branch `a` is fed by an INNER coalesce.
+
+    The topology is load-bearing and three structural rules constrain it — a
+    probe that trips any of them draws unrelated errors and discriminates
+    nothing:
+
+    * every coalesce branch connection must be produced by some gate's
+      ``fork_to`` (else ``coalesce_branch_alias_unreachable``);
+    * both coalesces stay TERMINAL, published under their own id and consumed by
+      name, because a coalesce routed into a transform is
+      ``coalesce_on_success_must_be_sink``;
+    * each fork gets exactly ONE closer — ``g2`` closes at ``c2`` and ``g1``
+      closes at ``c1`` — else ``fork_multiple_closers_invalid``.
+
+        src -> g1 forks [a, b]
+                 a -> g2 forks [aa, ab]
+                        aa -> t_aa (guarantees `extra`) -> aa_done
+                        ab -> t_ab (guarantees `extra`) -> ab_done
+                      c2 {aa: aa_done, ab: ab_done}        <- inner_merge
+                 c1 {a: c2, b: b}                          <- union, require_all
+               consumer requires `extra`
+
+    The DISCRIMINATOR: only the inner coalesce's branches guarantee ``extra``;
+    the outer coalesce's other branch ``b`` carries just ``colour``. So under the
+    outer union, ``extra`` reaching the consumer proves the inner coalesce
+    PARTICIPATED, and ``extra`` missing proves it ABSTAINED. Without that
+    asymmetry both outcomes look identical and the probe passes either way.
+    """
+
+    def _gate(node_id: str, source: str, forks: tuple[str, ...]) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="gate",
+            plugin=None,
+            input=source,
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="'all'",
+            routes={"all": "fork"},
+            fork_to=forks,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _coalesce(node_id: str, branches: dict[str, str], merge: str, options: dict[str, Any]) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="coalesce",
+            plugin=None,
+            input="branches",
+            on_success=None,
+            on_error=None,
+            options=options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=branches,
+            policy="require_all",
+            merge=merge,
+        )
+
+    def _transform(node_id: str, source: str, target: str, options: dict[str, Any]) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="value_transform",
+            input=source,
+            on_success=target,
+            on_error="discard",
+            options={"operations": [{"target": "extra", "expression": "'x'"}], **options},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    guarantees_extra: dict[str, Any] = {"schema": {"mode": "flexible", "fields": ["extra: str"], "guaranteed_fields": ["extra"]}}
+    state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    state = state.with_source(
+        SourceSpec(
+            plugin="csv", on_success="rows", options={"path": "/data/input.csv", "schema": _SOURCE_SCHEMA}, on_validation_failure="discard"
+        )
+    )
+    state = state.with_node(_gate("g1", "rows", ("a", "b")))
+    state = state.with_node(_gate("g2", "a", ("aa", "ab")))
+    state = state.with_node(_transform("t_aa", "aa", "aa_done", guarantees_extra))
+    state = state.with_node(_transform("t_ab", "ab", "ab_done", guarantees_extra))
+    state = state.with_node(
+        _coalesce(
+            "c2",
+            {"aa": "aa_done", "ab": "ab_done"},
+            inner_merge,
+            {"select_branch": "aa"} if inner_merge == "select" else {},
+        )
+    )
+    state = state.with_node(_coalesce("c1", {"a": "c2", "b": "b"}, "union", {}))
+    state = state.with_node(_transform("consumer", "c1", "main", {"schema": {"mode": "observed"}, "required_input_fields": ["extra"]}))
+    state = state.with_output(
+        OutputSpec(
+            name="main", plugin="csv", options={"path": "outputs/main.csv", "schema": {"mode": "observed"}}, on_write_failure="discard"
+        )
+    )
+    return state.validate()
+
+
+class TestUnmirrorableMergeAbstainsOnEveryPath:
+    """A merge Composer cannot mirror must abstain even reached as a BRANCH.
+
+    ``coalesce_merge_select_unsupported`` fires per node, so a select coalesce
+    never gates an acceptance by itself. But the guarantee walk still REACHES it
+    when it feeds another coalesce's branch, and there it used to fall through to
+    the union arm and contribute the union of ALL its branches — where the
+    runtime's select forwards exactly ONE. That over-claims whenever the branches
+    differ: the same polarity as the nested defect, one layer down, and a live
+    false accept the day ``select`` is legalised.
+    """
+
+    def test_inner_union_coalesce_participates(self) -> None:
+        """Control. Without this the abstain assertions prove nothing — a probe
+        that abstains everywhere would satisfy them while measuring nothing."""
+        summary = _nested_coalesce_summary(inner_merge="union")
+        assert _contract_violations(summary) == [], [entry.to_dict() for entry in summary.errors]
+
+    def test_inner_select_coalesce_abstains(self) -> None:
+        summary = _nested_coalesce_summary(inner_merge="select")
+        violations = _contract_violations(summary)
+        assert violations, (
+            "the select coalesce contributed a guarantee Composer cannot mirror",
+            [entry.to_dict() for entry in summary.errors],
+        )
+        assert "Missing fields: [extra]" in "\n".join(violations)
+
+    def test_inner_nested_coalesce_contributes_branch_names_not_inner_fields(self) -> None:
+        """The third arm, which discriminates abstain-everywhere from correct.
+
+        A nested inner merge PARTICIPATES with its branch NAMES, so the outer
+        union reports ``[aa, ab, colour]`` — and ``extra`` is still correctly
+        missing because a nested merge buries inner fields under branch keys.
+        """
+        summary = _nested_coalesce_summary(inner_merge="nested")
+        violations = _contract_violations(summary)
+        assert violations, [entry.to_dict() for entry in summary.errors]
+        assert "guarantees: [aa, ab, colour]" in "\n".join(violations)
