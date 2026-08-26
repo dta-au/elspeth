@@ -75,6 +75,25 @@ def is_source_producer_id(producer_id: str) -> bool:
 # its own name.
 _IMPLICIT_SELF_PUBLISHING_NODE_TYPES = frozenset({"queue", "coalesce", "aggregation"})
 
+# The subset of the above that a REACHABILITY check may treat as a reachable
+# connection target. ``queue`` is the sole, deliberate exclusion, and the
+# reason is queue's own shape rather than any one caller's: a queue's
+# ``input`` IS its own id (``queue_node_contract_error`` enforces it), so
+# putting a queue id into the reachable-target set lets an orphan queue
+# satisfy its own input — silently deleting the ``node_input_not_reachable``
+# check that reachability analysis exists to make possible.
+#
+# The other members stay in because their ``input`` names a DIFFERENT
+# connection, so reaching them still requires a real upstream producer.
+#
+# DERIVED, never restated: a fourth kind added to the authority above lands
+# here without an edit. Its consumer — ``state.py``'s
+# ``_runtime_connection_targets`` — hand-wrote this subset as a literal at
+# first and drifted exactly that way: it listed only ``coalesce``, and the
+# composer rejected a pipeline the runtime builds and runs with
+# ``node_input_not_reachable`` on the aggregation's consumer.
+_SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS = _IMPLICIT_SELF_PUBLISHING_NODE_TYPES - {"queue"}
+
 
 def published_success_connection(node: NodeSpec) -> str | None:
     """Return the connection name ``node`` publishes its success output under.

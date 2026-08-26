@@ -6,6 +6,8 @@ import ast
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
+
 import elspeth
 from elspeth.core.config import (
     AggregationSettings,
@@ -18,12 +20,17 @@ from elspeth.core.config import (
 )
 from elspeth.web.composer._producer_resolver import (
     _IMPLICIT_SELF_PUBLISHING_NODE_TYPES,
+    _SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS,
     ProducerResolver,
     published_success_connection,
 )
-from elspeth.web.composer.state import COMPOSER_NODE_TYPES, NodeSpec, SourceSpec
+from elspeth.web.composer.state import COMPOSER_NODE_TYPES, NodeSpec, SourceSpec, _runtime_connection_targets
 
 _STATE_SOURCE_PATH = Path(elspeth.__file__).parent / "web" / "composer" / "state.py"
+_PRODUCER_RESOLVER_SOURCE_PATH = Path(elspeth.__file__).parent / "web" / "composer" / "_producer_resolver.py"
+_AUTHORITY_NAME = "_IMPLICIT_SELF_PUBLISHING_NODE_TYPES"
+_DERIVED_NAME = "_SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS"
+_AUTHORITY_MODULE = "elspeth.web.composer._producer_resolver"
 
 
 def _node(
@@ -460,8 +467,8 @@ class TestPublishedSuccessConnection:
         assert producer.producer_id == "merge"
 
 
-class TestRuntimeConnectionTargetsRestatement:
-    """Pin ``state.py``'s DELIBERATE hand-written twin to the helper it excludes from.
+class TestRuntimeConnectionTargetsDerivesFromItsAuthority:
+    """Pin ``state.py``'s reachable-target site to the authority it must not restate.
 
     ``_runtime_connection_targets`` is the one site that must NOT call
     ``published_success_connection``: a queue's ``input`` IS its own id
@@ -470,28 +477,35 @@ class TestRuntimeConnectionTargetsRestatement:
     silently delete the ``node_input_not_reachable`` check the function exists
     to make possible.
 
-    That carve-out is correct, but until this guard it was UNPINNED IN BOTH
-    DIRECTIONS: nothing in ``tests/`` referenced either name, so the next kind
-    added to ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES`` would not fail a single
-    test for being absent at that site. That is exactly how ``aggregation``
-    was missed the first time — the hand-written twin listed only
-    ``("coalesce",)`` and the composer rejected a pipeline the runtime runs.
+    That carve-out is correct. The way it was EXPRESSED was not: the site
+    hand-wrote the surviving subset as an inline literal, and the literal
+    drifted — it listed only ``("coalesce",)``, so the composer rejected a
+    pipeline the runtime builds and runs. An earlier version of this guard read
+    that literal out of the AST and compared it to ``helper - {"queue"}``,
+    which caught the drift but left the restatement in place.
 
-    So the expectation is DERIVED, not restated: the literal enumerated at the
-    site must equal ``helper - {"queue"}``. Neither side may drift alone, and
-    the site may not quietly disappear (the anchor assertions below).
+    The site now DERIVES the subset from
+    ``_SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS``, so that class of drift is
+    structurally impossible rather than merely watched. This guard was
+    re-anchored onto the derivation rather than deleted, and it watches strictly
+    more than it did:
+
+    * the site still has exactly ONE ``node.node_type in ...`` membership test
+      (a second hand-written arm is the way a derivation gets quietly
+      supplemented);
+    * that test's operand is a NAME, not a literal, and the name is imported
+      from the authority module rather than rebound locally;
+    * the authority's own definition is a subtraction from the helper of
+      exactly ``{"queue"}``, not a second hand-written set; and
+    * every kind the derivation admits is really treated as a reachable target,
+      and a queue really is not.
     """
 
     @staticmethod
-    def _self_publishing_membership_test() -> ast.Tuple | ast.Set | ast.List:
-        """Return the literal enumerated by the single ``node.node_type in (...)`` test.
+    def _target_function() -> ast.FunctionDef:
+        """Return the single ``_runtime_connection_targets`` definition in state.py.
 
-        Located by STRUCTURE, never by line number: the enclosing
-        ``FunctionDef`` by name, then the ``ast.Compare`` whose operator is
-        ``in`` and whose left operand is the ``node.node_type`` attribute
-        access. The function's other comparisons are ``!=`` against discard
-        keywords, so this shape is unambiguous — and the count assertion
-        below proves it stayed that way.
+        Located by STRUCTURE, never by line number.
         """
         module = ast.parse(_STATE_SOURCE_PATH.read_text(encoding="utf-8"))
         functions = [node for node in ast.walk(module) if isinstance(node, ast.FunctionDef) and node.name == "_runtime_connection_targets"]
@@ -499,9 +513,22 @@ class TestRuntimeConnectionTargetsRestatement:
             f"Expected exactly one `_runtime_connection_targets` definition in {_STATE_SOURCE_PATH.name}, "
             f"found {len(functions)}. This guard's anchor is ambiguous — fix the anchor, do not delete the guard."
         )
+        return functions[0]
+
+    @classmethod
+    def _self_publishing_membership_test(cls) -> ast.expr:
+        """Return the operand of the single ``node.node_type in ...`` test.
+
+        The function's other comparisons are ``!=`` against discard keywords,
+        so this shape is unambiguous — and the count assertion below proves it
+        stayed that way. A SECOND membership arm would mean the derivation had
+        been supplemented by hand, which is the drift this site is fixed
+        against, so the count is part of what the guard asserts rather than
+        merely how it navigates.
+        """
         candidates = [
             node
-            for node in ast.walk(functions[0])
+            for node in ast.walk(cls._target_function())
             if isinstance(node, ast.Compare)
             and len(node.ops) == 1
             and isinstance(node.ops[0], ast.In)
@@ -511,40 +538,88 @@ class TestRuntimeConnectionTargetsRestatement:
             and node.left.value.id == "node"
         ]
         assert len(candidates) == 1, (
-            f"Expected exactly one `node.node_type in (...)` test inside `_runtime_connection_targets`, "
-            f"found {len(candidates)}. If the deliberate hand-written restatement of the implicit "
-            f"self-publisher set was removed or duplicated, this guard is no longer watching it — "
-            f"re-anchor it, do not delete it."
+            f"Expected exactly one `node.node_type in ...` test inside `_runtime_connection_targets`, "
+            f"found {len(candidates)}. Either the derived membership test was removed — and this guard is "
+            f"no longer watching anything — or a second arm was hand-written alongside it, which reopens "
+            f"the drift the derivation closes. Re-anchor this guard, do not delete it."
         )
-        comparator = candidates[0].comparators[0]
-        # Hoisted here so BOTH tests below get this written message rather than
-        # one of them getting a bare AttributeError off `.elts`.
-        assert isinstance(comparator, ast.Tuple | ast.Set | ast.List), (
-            "Expected an inline literal of node-type names at the restatement site, got "
-            f"{type(comparator).__name__}. A guard can only pin a literal it can read."
-        )
-        return comparator
+        return candidates[0].comparators[0]
 
-    def test_the_hand_written_twin_equals_the_helper_minus_queue(self):
-        comparator = self._self_publishing_membership_test()
-        enumerated = set()
-        for element in comparator.elts:
+    def test_the_site_derives_the_subset_instead_of_enumerating_it(self):
+        operand = self._self_publishing_membership_test()
+        assert isinstance(operand, ast.Name), (
+            f"`_runtime_connection_targets` tests `node.node_type` against an inline "
+            f"{type(operand).__name__}, not a name. Enumerating the implicit-publisher subset here IS the "
+            f"original defect: the literal listed only `coalesce`, drifted from `{_AUTHORITY_NAME}`, and the "
+            f"composer rejected a pipeline the runtime builds and runs with `node_input_not_reachable` on "
+            f"the aggregation's consumer. Use `{_DERIVED_NAME}` rather than restating the subset."
+        )
+        assert operand.id == _DERIVED_NAME, (
+            f"`_runtime_connection_targets` tests `node.node_type` against `{operand.id}`, but the derived "
+            f"subset of implicit self-publishers is `{_DERIVED_NAME}`. If a different name is now the "
+            f"authority for what a reachability check may treat as a target, re-point this guard at it — "
+            f"do not leave the site pinned to nothing."
+        )
+
+    def test_the_derived_name_is_imported_from_the_authority_module(self):
+        """A local rebinding of the same name passes the check above.
+
+        Without this, ``_SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS = {"coalesce"}``
+        written inside ``state.py`` would satisfy every structural assertion
+        while being exactly the hand-written twin the derivation removes.
+        """
+        imported = {
+            alias.asname or alias.name
+            for node in ast.walk(self._target_function())
+            if isinstance(node, ast.ImportFrom) and node.module == _AUTHORITY_MODULE
+            for alias in node.names
+        }
+        assert _DERIVED_NAME in imported, (
+            f"`_runtime_connection_targets` uses `{_DERIVED_NAME}` but does not import it from "
+            f"`{_AUTHORITY_MODULE}` (names it imports from there: {sorted(imported) or 'none'}). A name bound "
+            f"anywhere else is a hand-written twin wearing the authority's name, which is the drift this "
+            f"site is fixed against."
+        )
+
+    def test_the_authority_derives_the_subset_by_subtracting_exactly_queue(self):
+        """The derivation itself must be a subtraction, not a second literal.
+
+        ``_SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS = {"coalesce", "aggregation"}``
+        would satisfy every runtime assertion in this class today and drift the
+        moment a fourth kind is added — the same defect, moved one file over.
+        """
+        module = ast.parse(_PRODUCER_RESOLVER_SOURCE_PATH.read_text(encoding="utf-8"))
+        assignments = [
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == _DERIVED_NAME for target in node.targets)
+        ]
+        assert len(assignments) == 1, (
+            f"Expected exactly one assignment to `{_DERIVED_NAME}` in {_PRODUCER_RESOLVER_SOURCE_PATH.name}, found {len(assignments)}."
+        )
+        value = assignments[0].value
+        assert isinstance(value, ast.BinOp) and isinstance(value.op, ast.Sub), (
+            f"`{_DERIVED_NAME}` is assigned a {type(value).__name__}, not a subtraction from "
+            f"`{_AUTHORITY_NAME}`. It must be DERIVED so a fourth implicit-publisher kind lands here "
+            f"without an edit; anything else is the hand-written twin one file further away."
+        )
+        assert isinstance(value.left, ast.Name) and value.left.id == _AUTHORITY_NAME, (
+            f"`{_DERIVED_NAME}` subtracts from {ast.dump(value.left)}, not from `{_AUTHORITY_NAME}`."
+        )
+        assert isinstance(value.right, ast.Set), (
+            f"`{_DERIVED_NAME}` subtracts a {type(value.right).__name__}; this guard can only verify a set literal of node-type names."
+        )
+        excluded = set()
+        for element in value.right.elts:
             assert isinstance(element, ast.Constant) and isinstance(element.value, str), (
-                f"Non-literal element {ast.dump(element)} at the restatement site — this guard cannot "
-                "evaluate it. Keep the site a plain literal, or derive it from the helper directly."
+                f"Non-literal element {ast.dump(element)} in the exclusion set — this guard cannot evaluate it."
             )
-            enumerated.add(element.value)
-
-        expected = set(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES) - {"queue"}
-        assert enumerated == expected, (
-            "`_runtime_connection_targets` has drifted from its authority.\n"
-            f"  helper `_IMPLICIT_SELF_PUBLISHING_NODE_TYPES`: {sorted(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES)}\n"
-            f"  expected at the site (helper - {{'queue'}}):     {sorted(expected)}\n"
-            f"  actually enumerated at the site:                {sorted(enumerated)}\n"
-            "A kind that publishes implicitly must be listed at BOTH places. `queue` is the sole, "
-            "deliberate exclusion: its `input` is its own id, so listing it there would let an orphan "
-            "queue satisfy its own input and delete `node_input_not_reachable`. If a NEW kind also needs "
-            "excluding, widen the exclusion here with the reason — do not silently drop it from the site."
+            excluded.add(element.value)
+        assert excluded == {"queue"}, (
+            f"The exclusion set is {sorted(excluded)}, expected ['queue']. `queue` is the sole, deliberate "
+            f"exclusion: its `input` is its own id, so listing it as a reachable target lets an orphan queue "
+            f"satisfy its own input and deletes `node_input_not_reachable`. If a NEW kind also needs "
+            f"excluding, widen this guard with the reason — and if `queue` left the set, say why here."
         )
 
     def test_queue_is_excluded_at_the_site_but_present_in_the_helper(self):
@@ -553,12 +628,35 @@ class TestRuntimeConnectionTargetsRestatement:
             "A queue publishes under its own id — if it left the helper, `published_success_connection` "
             "no longer describes the DAG builder's producer registration."
         )
-        comparator = self._self_publishing_membership_test()
-        enumerated = {element.value for element in comparator.elts if isinstance(element, ast.Constant)}
-        assert "queue" not in enumerated, (
-            "`queue` was added to `_runtime_connection_targets`'s literal. A queue's `input` IS its own id, "
+        assert "queue" not in _SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS, (
+            "`queue` reached the subset `_runtime_connection_targets` walks. A queue's `input` IS its own id, "
             "so a queue's id in the reachable TARGET set lets an orphan queue satisfy its own input — "
-            "silently deleting the `node_input_not_reachable` check this function exists to make possible."
+            "silently deleting the `node_input_not_reachable` check that function exists to make possible."
+        )
+
+    @pytest.mark.parametrize("node_type", sorted(_SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS))
+    def test_every_admitted_kind_is_really_reached_as_a_target(self, node_type: str) -> None:
+        """The behavioural half: the derivation is not merely shaped right.
+
+        Enumerated FROM the derived constant, so a fourth implicit-publisher
+        kind arrives here with a passing test rather than with an absence of
+        red.
+        """
+        node = _node("implicit_publisher", plugin=None, node_type=node_type, input="upstream")
+
+        assert "implicit_publisher" in _runtime_connection_targets({}, (node,)), (
+            f"A '{node_type}' node with no `on_success` publishes under its own id — `core/dag/builder.py` "
+            f"registers it by name — but `_runtime_connection_targets` did not treat that id as reachable. "
+            f"Its consumer would be rejected with `node_input_not_reachable` on a pipeline the runtime runs."
+        )
+
+    def test_a_queue_id_is_never_reached_as_a_target(self) -> None:
+        """The negative the carve-out exists for, stated behaviourally."""
+        orphan_queue = _node("q", plugin=None, node_type="queue", input="q")
+
+        assert "q" not in _runtime_connection_targets({}, (orphan_queue,)), (
+            "An orphan queue's own id reached the target set, so the queue satisfies its own `input` and "
+            "`node_input_not_reachable` can never fire for it."
         )
 
 

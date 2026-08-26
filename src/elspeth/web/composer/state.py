@@ -1959,28 +1959,30 @@ def _runtime_connection_targets(
     and DAG build: source/node connection fields define runtime topology, while
     non-sink UI edges are advisory/editor state.
     """
+    from elspeth.web.composer._producer_resolver import _SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS
+
     targets: set[str] = set()
     for source in sources.values():
         targets.add(source.on_success)
     for node in nodes:
         # Deliberately NOT ``published_success_connection`` — this is the one
-        # site that must exclude ``queue``. A queue's ``input`` IS its own id
-        # (``queue_node_contract_error`` enforces it), so adding a queue's id
-        # to the reachable TARGET set would let the queue satisfy its own
-        # input and silently delete the orphan-queue ``node_input_not_reachable``
-        # check that this function exists to make possible.
+        # site that must exclude ``queue``, because a queue's ``input`` IS its
+        # own id and putting that id into the reachable TARGET set would let an
+        # orphan queue satisfy its own input, deleting the
+        # ``node_input_not_reachable`` check this function exists to make
+        # possible. The exclusion and its full reasoning live with the
+        # authority, at ``_producer_resolver``'s
+        # ``_SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS``.
         #
-        # The implicit-publisher kinds that ARE safe here are the ones whose
-        # ``input`` names a DIFFERENT connection, so reaching them still
-        # requires a real upstream producer: coalesce, and aggregation
-        # (``AggregationSettings.on_success`` is ``str | None = None``, and
-        # ``core/dag/builder.py`` registers ``agg_settings.name`` when it is
-        # omitted). Aggregation was missing here, so a pipeline the runtime
-        # builds and runs was rejected with ``node_input_not_reachable`` on
-        # the aggregation's consumer.
+        # DERIVED rather than enumerated here on purpose: this site previously
+        # hand-wrote the subset as a literal and drifted from the authority —
+        # it listed only ``coalesce``, so a pipeline the runtime builds and
+        # runs was rejected with ``node_input_not_reachable`` on the
+        # aggregation's consumer. A fourth implicit-publisher kind must not be
+        # able to go the same way, so do not re-inline a literal here.
         if node.on_success is not None:
             targets.add(node.on_success)
-        elif node.node_type in ("coalesce", "aggregation"):
+        elif node.node_type in _SELF_PUBLISHING_KINDS_REACHABLE_AS_TARGETS:
             targets.add(node.id)
         if node.on_error is not None and node.on_error != "discard":
             targets.add(node.on_error)
