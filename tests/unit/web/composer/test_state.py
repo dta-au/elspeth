@@ -22,6 +22,9 @@ from elspeth.web.composer.state import (
     SourceSpec,
     ValidationEntry,
     ValidationSummary,
+    _closer_backward_reach_connections,
+    _fork_branch_reaches_sink_before_closer,
+    _runtime_nodes_downstream_of_connection,
     queue_node_contract_error,
     route_destination_facts,
 )
@@ -3499,6 +3502,161 @@ class TestStage1Validation:
             routes={"high": "main", "low": "main"},
         ).validate()
         assert result.is_valid is True, [e.message for e in result.errors]
+
+
+class TestImplicitPublisherWalksReachThroughAggregations:
+    """The three remaining graph walks derive the success channel, not restate it.
+
+    All three stopped dead at an aggregation that omits ``on_success``. That
+    aggregation publishes under its own id (``core/dag/builder.py`` registers
+    ``agg_settings.name``), so "publishes nothing" was wrong and everything
+    beyond it was invisible to the walk.
+
+    These are not cosmetic conversions — the walks feed real checks:
+    ``_runtime_nodes_downstream_of_connection`` backs
+    ``row_union_downstream_group_invalid``, and the other two back bound-region
+    fork-branch anchoring.
+
+    Tested at the function level deliberately. Each blind spot is a property of
+    one walk, and building a fully-valid pipeline that isolates one walk's
+    contribution to a caller's verdict takes a fixture so elaborate that it
+    pins the fixture rather than the walk — a first attempt here produced a
+    graph whose error came from a different arm entirely.
+
+    Each case carries a QUEUE control, because deriving the channel means these
+    walks now see a queue's own id where they did not before. That is inert:
+    every one of them is entered only when the node's input already intersects
+    the reachable set, and a queue's sole input IS its own id
+    (``queue_node_contract_error`` enforces it), so re-adding it is a no-op.
+    The controls hold that reasoning to account.
+    """
+
+    @staticmethod
+    def _node(**overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "x",
+            "node_type": "transform",
+            "plugin": None,
+            "input": "in",
+            "on_success": None,
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def _transform(self, node_id: str, input_connection: str, on_success: str) -> NodeSpec:
+        return self._node(id=node_id, plugin="passthrough", input=input_connection, on_success=on_success)
+
+    def _implicit_aggregation(self, node_id: str, input_connection: str) -> NodeSpec:
+        """An aggregation that omits on_success — it publishes under its own id."""
+        return self._node(
+            id=node_id,
+            node_type="aggregation",
+            plugin="batch_stats",
+            input=input_connection,
+            on_success=None,
+            on_error="discard",
+            trigger={"count": 2},
+        )
+
+    def test_downstream_walk_continues_past_an_implicit_aggregation(self) -> None:
+        """Site A. Backs ``row_union_downstream_group_invalid``."""
+        nodes = (
+            self._implicit_aggregation("agg", "start"),
+            self._transform("after", "agg", "done"),
+        )
+        reached = [node.id for node in _runtime_nodes_downstream_of_connection("start", nodes)]
+        assert reached == ["agg", "after"], (
+            f"The walk stopped at the aggregation and never saw 'after'. Got {reached}. "
+            "An aggregation omitting on_success publishes under its own id."
+        )
+
+    def test_downstream_walk_is_unchanged_for_queues(self) -> None:
+        nodes = (
+            self._node(id="q", node_type="queue", input="q"),
+            self._transform("feed", "rows", "q"),
+            self._transform("drain", "q", "done"),
+        )
+        reached = [node.id for node in _runtime_nodes_downstream_of_connection("rows", nodes)]
+        assert reached == ["feed", "drain"], reached
+
+    def test_backward_reach_continues_past_an_implicit_aggregation(self) -> None:
+        """Site B. Widens the fork-branch seed roster for bound regions."""
+        closer = self._node(
+            id="co",
+            node_type="coalesce",
+            input="l_done",
+            on_success="out",
+            branches={"l": "l_done", "r": "r_done"},
+            policy="require_all",
+            merge="union",
+        )
+        nodes = (
+            self._implicit_aggregation("agg", "seed"),
+            self._transform("mid", "agg", "l_done"),
+            self._transform("right", "r_in", "r_done"),
+            closer,
+        )
+        reach = _closer_backward_reach_connections(nodes, closer)
+        assert "seed" in reach, (
+            f"Backward reach stopped at the aggregation, so its own input 'seed' was never reached. Got {sorted(reach)}."
+        )
+
+    def test_backward_reach_is_unchanged_for_queues(self) -> None:
+        closer = self._node(
+            id="co",
+            node_type="coalesce",
+            input="l_done",
+            on_success="out",
+            branches={"l": "l_done"},
+            policy="require_all",
+            merge="union",
+        )
+        nodes = (self._node(id="q", node_type="queue", input="q"), self._transform("drain", "q", "l_done"), closer)
+        reach = _closer_backward_reach_connections(nodes, closer)
+        assert "q" in reach and "l_done" in reach, sorted(reach)
+
+    def test_fork_branch_sink_walk_continues_past_an_implicit_aggregation(self) -> None:
+        """Site C. A sink reached THROUGH an in-region aggregation was invisible."""
+        nodes = (
+            self._implicit_aggregation("agg", "branch_l"),
+            self._transform("leak", "agg", "main"),
+            self._node(
+                id="closer",
+                node_type="coalesce",
+                input="branch_l",
+                on_success="out",
+                branches={"l": "branch_l"},
+                policy="require_all",
+                merge="union",
+            ),
+        )
+        hit = _fork_branch_reaches_sink_before_closer({"branch_l"}, "closer", nodes, frozenset({"main"}))
+        assert hit == "main", f"The in-region sink leak was invisible because the walk stopped at the aggregation. Got {hit!r}."
+
+    def test_fork_branch_sink_walk_reports_no_leak_when_there_is_none(self) -> None:
+        """Control: the walk must still abstain when nothing reaches a sink."""
+        nodes = (
+            self._implicit_aggregation("agg", "branch_l"),
+            self._transform("inner", "agg", "closer_in"),
+            self._node(
+                id="closer",
+                node_type="coalesce",
+                input="closer_in",
+                on_success="out",
+                branches={"l": "closer_in"},
+                policy="require_all",
+                merge="union",
+            ),
+        )
+        assert _fork_branch_reaches_sink_before_closer({"branch_l"}, "closer", nodes, frozenset({"main"})) is None
 
 
 class TestWebScrapeAbuseContactValidation:

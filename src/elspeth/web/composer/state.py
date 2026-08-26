@@ -2052,6 +2052,8 @@ def _runtime_nodes_downstream_of_connection(
     are traversed, identity and mapped barrier inputs are both topology edges,
     and structural queue placeholders are skipped.
     """
+    from elspeth.web.composer._producer_resolver import published_success_connection
+
     reachable_connections = {connection_name}
     reachable_node_ids: set[str] = set()
     ordered_nodes: list[NodeSpec] = []
@@ -2067,10 +2069,13 @@ def _runtime_nodes_downstream_of_connection(
             reachable_node_ids.add(node.id)
             ordered_nodes.append(node)
             changed = True
-            if node.node_type == "coalesce" and node.on_success is None:
-                reachable_connections.add(node.id)
-            elif node.on_success is not None:
-                reachable_connections.add(node.on_success)
+            # DERIVED, not restated. Queues are skipped above, so this only
+            # ever sees a coalesce or an aggregation publishing under its own
+            # id; both name a connection DIFFERENT from their own input, so
+            # the walk still needs a real upstream producer to reach them.
+            published_success = published_success_connection(node)
+            if published_success is not None:
+                reachable_connections.add(published_success)
             if node.on_error is not None and node.on_error != _DISCARD_ROUTE_TARGET:
                 reachable_connections.add(node.on_error)
             if node.routes is not None:
@@ -2097,6 +2102,8 @@ def _closer_backward_reach_connections(nodes: tuple[NodeSpec, ...], closer_node:
     module's own forward walk — deliberately NOT ``_node_published_connections``,
     which includes ``on_error``).
     """
+    from elspeth.web.composer._producer_resolver import published_success_connection
+
     target_connections = set(_coalesce_branch_connections(closer_node.branches))
     seen_node_ids: set[str] = set()
     changed = True
@@ -2106,10 +2113,13 @@ def _closer_backward_reach_connections(nodes: tuple[NodeSpec, ...], closer_node:
             if node.id in seen_node_ids or node.id == closer_node.id:
                 continue
             published: set[str] = set()
-            if node.node_type == "coalesce" and node.on_success is None:
-                published.add(node.id)
-            elif node.on_success is not None:
-                published.add(node.on_success)
+            # DERIVED, not restated. Queue-inert: this walk only visits a node
+            # whose published set already intersects the target set, and a
+            # queue's sole input IS its own id — so a queue is reached only
+            # when its id is already present, and re-adding it is a no-op.
+            published_success = published_success_connection(node)
+            if published_success is not None:
+                published.add(published_success)
             if node.routes is not None:
                 published.update(target for target in node.routes.values() if target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET))
             if node.fork_to is not None:
@@ -2162,6 +2172,8 @@ def _fork_branch_reaches_sink_before_closer(
     single_observed_code`). Firing here too would silently duplicate that
     single-code guarantee with a less specific message.
     """
+    from elspeth.web.composer._producer_resolver import published_success_connection
+
     reachable_connections = set(fork_branches)
     visited_node_ids: set[str] = set()
     changed = True
@@ -2177,10 +2189,13 @@ def _fork_branch_reaches_sink_before_closer(
             changed = True
             if node.id == closer_id:
                 continue
-            if node.node_type == "coalesce" and node.on_success is None:
-                reachable_connections.add(node.id)
-            elif node.on_success is not None:
-                reachable_connections.add(node.on_success)
+            # DERIVED, not restated. Queue-inert for the same reason as the
+            # backward walk above: entry is gated on the node's inputs already
+            # intersecting the reachable set, and a queue's only input is its
+            # own id.
+            published_success = published_success_connection(node)
+            if published_success is not None:
+                reachable_connections.add(published_success)
             if node.routes is not None:
                 reachable_connections.update(
                     target for target in node.routes.values() if target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET)
