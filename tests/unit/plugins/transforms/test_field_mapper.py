@@ -1764,11 +1764,19 @@ class TestFieldMapperInputGuaranteesUseTheDocumentedPredicate:
         assert transform.declared_output_fields == frozenset()
 
     def test_a_guaranteed_target_is_now_derived_from_a_fixed_input_schema(self) -> None:
-        """The concrete consequence: a declared, required source guarantees its target."""
+        """The concrete consequence: a declared, required source guarantees its target.
+
+        Scoped to the EMIT description. The sibling assertion this once carried
+        — ``declared_output_fields == {"z"}`` — was removed as part of
+        elspeth-892161b2d5: that set is the field-collision check's trigger, not
+        a statement about what the node emits, and asserting the widened value
+        there pinned the very regression it caused. See
+        ``TestSelectOnlyDoesNotArmTheCollisionCheck``, which pins the opposite
+        and is the claim that matters for the runtime path.
+        """
         transform = self._built({"a": "z"}, ["a: str"])
 
         assert transform._output_schema_config.guaranteed_fields == ("z",)
-        assert transform.declared_output_fields == frozenset({"z"})
 
     def test_an_unresolved_original_source_still_abstains(self) -> None:
         """TRUE POSITIVE, preserved. 'Name' is not a normalization fixed point.
@@ -1790,3 +1798,76 @@ class TestFieldMapperInputGuaranteesUseTheDocumentedPredicate:
 
         raw, effective = self._halves(transform)
         assert raw == effective == frozenset()
+
+
+class TestSelectOnlyDoesNotArmTheCollisionCheck:
+    """``select_only`` cannot overwrite an input field, so it must not declare one.
+
+    ``declared_output_fields`` is the trigger for
+    ``TransformExecutor._run_preflight``'s field-collision check, which raises a
+    per-row ``PluginContractViolation`` when a declared output name is already
+    on the INPUT row. Under ``select_only`` that check is a false positive by
+    its own premise: ``process`` starts from a fresh ``{}``, so it cannot
+    overwrite anything, and a mapping that renames onto a name the input also
+    carries DROPS that input — which is what ``select_only`` MEANS.
+
+    Regression: elspeth-892161b2d5. Widening this set to the effective
+    guarantee predicate armed that sleeping check on configs whose every valid
+    row then failed — 100% row loss at RUNTIME on pipelines that ran before.
+    The shipped examples all rename to FRESH names under ``mode: observed``, so
+    the suite stayed green while the defect was live; the coverage gap was that
+    no test paired ``select_only`` with a fixed/flexible schema declaring the
+    target.
+    """
+
+    @staticmethod
+    def _built(mapping: dict[str, str], fields: list[str], mode: str, required: list[str]) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        return FieldMapper(
+            {
+                "select_only": True,
+                "mapping": mapping,
+                "schema": {"mode": mode, "fields": fields, "required_fields": required},
+            }
+        )
+
+    @pytest.mark.parametrize("mode", ["fixed", "flexible"])
+    @pytest.mark.parametrize("required", [["a", "b"], ["a"]])
+    @pytest.mark.parametrize("target", ["b", "fresh"])
+    def test_select_only_declares_no_output_field(self, mode: str, required: list[str], target: str) -> None:
+        """Every shape the regression armed must leave the check ASLEEP."""
+        fields = ["a: str", "b: str"] if target == "b" else ["a: str", "b: str", "fresh: str"]
+        transform = self._built({"a": target}, fields, mode, required)
+
+        assert transform.declared_output_fields == frozenset()
+
+    def test_a_valid_row_does_not_collide(self) -> None:
+        """The end-to-end consequence: the row the regression failed must pass.
+
+        Pinned through the real collision helper rather than by asserting the
+        empty set twice — an empty declaration is only interesting because it is
+        what keeps this row alive.
+        """
+        from elspeth.contracts.field_collision import detect_field_collisions
+
+        transform = self._built({"a": "b"}, ["a: str", "b: str"], "fixed", ["a", "b"])
+
+        assert detect_field_collisions({"a", "b"}, transform.declared_output_fields) is None
+
+    def test_select_only_still_emits_the_renamed_target(self) -> None:
+        """Declaring nothing must not mean emitting nothing.
+
+        The fix narrows a DECLARATION, not behaviour: the rename still happens
+        and the input field it lands on is dropped, not overwritten.
+        """
+        from elspeth.testing import make_pipeline_row
+        from tests.fixtures.factories import make_context
+
+        transform = self._built({"a": "b"}, ["a: str", "b: str"], "fixed", ["a", "b"])
+        transform.on_start(make_context())
+
+        result = transform.process(make_pipeline_row({"a": "1", "b": "2"}), make_context())
+
+        assert result.status == "success"
+        assert result.row.to_dict() == {"b": "1"}

@@ -227,7 +227,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ab40c07d20b3f9f8"
+    source_file_hash: str | None = "sha256:38f16119ef68bd98"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -429,8 +429,36 @@ class FieldMapper(BaseTransform):
 
     @classmethod
     def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:
-        """Derive targets safe for executor-level declared-output checks."""
-        base_guaranteed = cls._admitted_input_fields(cfg)
+        """Derive targets safe for executor-level declared-output checks.
+
+        Deliberately reads the RAW ``guaranteed_fields``, not
+        ``_admitted_input_fields``. The two call sites ask different questions
+        and one widened answer is wrong for this one (elspeth-892161b2d5).
+
+        ``_build_field_mapper_output_schema_config`` describes what this node
+        EMITS, and widening it there is the fix for the composer's Rule C false
+        reject. ``declared_output_fields`` is different: it is the trigger for
+        ``TransformExecutor._run_preflight``'s field-collision check, which
+        raises a per-row ``PluginContractViolation`` when a declared output
+        name is already present on the INPUT row.
+
+        Under ``select_only`` that check is a false positive by its own premise.
+        ``process`` starts from ``output: dict[str, Any] = {}`` — a fresh dict —
+        so it cannot overwrite an input field; a mapping that renames onto a
+        name the input also carries DROPS that input, which is precisely what
+        ``select_only`` means. ``field_collision`` scopes itself to transforms
+        that "enrich rows with new fields" and its message says "would overwrite
+        existing input fields"; neither is true here. Widening this set armed
+        that sleeping check on configs whose every valid row then failed —
+        100% row loss at RUNTIME on pipelines that ran fine before.
+
+        The raw read is not a workaround: ``guaranteed_fields`` is the author's
+        EXPLICIT promise, and a name promised on input while also being written
+        on output is the only shape where a collision claim is defensible. The
+        implicit type-system guarantees the wider predicate adds are exactly the
+        ones ``select_only`` consumes rather than collides with.
+        """
+        base_guaranteed = set(cfg.schema_config.guaranteed_fields or ())
         return frozenset(
             target
             for source, target in cfg.mapping.items()
