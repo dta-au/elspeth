@@ -596,6 +596,10 @@ async def test_step_1_solver_returns_only_the_closed_deferred_intent_action(monk
     tool_names = [tool["function"]["name"] for tool in captured["tools"]]
     assert tool_names == ["resolve_source", "retain_deferred_intent", "manage_deferred_intent"]
     deferred_schema = captured["tools"][1]["function"]["parameters"]
+    # Flat object on purpose: a top-level oneOf degrades provider steering
+    # (elspeth-3a21f09f09 washup). The both-or-neither catalog pairing is
+    # taught in the tool description instead.
+    assert deferred_schema["type"] == "object"
     assert deferred_schema["additionalProperties"] is False
     assert set(deferred_schema["required"]) == {
         "target_stage",
@@ -604,6 +608,8 @@ async def test_step_1_solver_returns_only_the_closed_deferred_intent_action(monk
         "redacted_summary",
         "constraints",
     }
+    description = captured["tools"][1]["function"]["description"]
+    assert "BOTH to the exact known catalog plugin, or BOTH to null" in description
 
 
 @pytest.mark.asyncio

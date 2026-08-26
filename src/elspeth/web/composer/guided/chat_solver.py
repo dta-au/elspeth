@@ -687,9 +687,17 @@ _DEFERRED_INTENT_TOOL: dict[str, Any] = {
             "Use only when the user gives a concrete instruction whose responsible guided stage is later than the current stage. "
             "Emit structural facts only; never copy raw user prose into redacted_summary. "
             "Gate, coalesce, row_union, and queue are structural node types, never transform plugins. "
+            "catalog_kind and catalog_name are a pair: set BOTH to the exact known catalog plugin, or BOTH to null "
+            "when the instruction does not name one specific plugin. "
             "If this schema cannot faithfully encode the instruction, ask for clarification instead of fabricating a catalog identity."
         ),
         "parameters": {
+            # Flat object schema on purpose: a top-level oneOf here measurably
+            # DEGRADES provider steering (models start inventing keys — 0/3 on
+            # the elspeth-3a21f09f09 repro). The both-or-neither catalog
+            # pairing is carried by the tool description and enforced by the
+            # DeferredIntentAction invariant, whose error text names the fix
+            # for the bounded repair turn.
             "type": "object",
             "additionalProperties": False,
             "required": ["target_stage", "catalog_kind", "catalog_name", "redacted_summary", "constraints"],
