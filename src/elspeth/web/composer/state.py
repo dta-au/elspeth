@@ -7778,15 +7778,37 @@ class CompositionState:
                 # with no required on_error to keep the warning quiet on its
                 # behalf — which is exactly why it was the kind that flipped.
                 #
-                # So a dangling AGGREGATION is still unreported here. That gap
-                # predates both this arm and the false positive it replaced
-                # (``on_error is not None`` counts the literal "discard", which
-                # is neither a downstream node nor a sink). Closing it is a
-                # separate change; do not read this arm as covering it.
+                # A dangling AGGREGATION reaches this arm only because the
+                # ``on_error`` limb below no longer counts ``discard`` — see
+                # the note on ``has_connection_out``.
                 published_is_consumed = published in node_inputs or published in output_names
             else:
                 published_is_consumed = published is not None
-            has_connection_out = published_is_consumed or node.on_error is not None or (node.routes is not None and len(node.routes) > 0)
+            # ``on_error: "discard"`` is NOT a connection out. It is a hole:
+            # the rows go nowhere, and counting it here made this warning
+            # contradict its own message, which promises the output is "not
+            # connected to any downstream node or sink" — discard is neither.
+            # ``_runtime_connection_targets`` in this same module already
+            # excludes it (``node.on_error is not None and node.on_error !=
+            # "discard"``); W3 was the inconsistent sibling.
+            #
+            # This is what makes a dangling aggregation reportable. ``on_error``
+            # is REQUIRED for an aggregation (``aggregation_missing_on_error``),
+            # so before this, an aggregation could satisfy the limb with
+            # ``discard`` and dead-end in silence.
+            #
+            # Deliberately measured, not assumed: across all 715 saved
+            # composition states this changes nothing (5 warned before, 5
+            # after). That is not evidence of safety — it is evidence the
+            # corpus cannot exercise it. ``on_error`` takes only ``discard``
+            # (830) or None (203) across 1033 saved nodes, and every one of
+            # those 830 already satisfies the ``published_is_consumed`` limb
+            # first. The regression tests are the whole evidence base here.
+            has_connection_out = (
+                published_is_consumed
+                or (node.on_error is not None and node.on_error != "discard")
+                or (node.routes is not None and len(node.routes) > 0)
+            )
             if not has_edge_out and not has_connection_out:
                 warnings.append(
                     _warn(

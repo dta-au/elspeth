@@ -2509,6 +2509,80 @@ class TestStage1Validation:
             w.to_dict() for w in result.warnings
         ]
 
+    def _dangling_aggregation_state(self, *, on_error: str) -> CompositionState:
+        """source -> t1 -> aggregation, with NOTHING consuming the aggregation."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="rows"))
+        state = state.with_node(self._make_transform("t1", "rows", "agg_in", on_error="main"))
+        state = state.with_node(
+            NodeSpec(
+                id="agg",
+                node_type="aggregation",
+                plugin="batch_stats",
+                input="agg_in",
+                on_success=None,
+                on_error=on_error,
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                trigger={"count": 2},
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_validate_w3_warns_when_the_only_outbound_is_on_error_discard(self) -> None:
+        """``on_error: "discard"`` is not a connection out — it is a hole.
+
+        The rows go nowhere and the author is never told. Counting discard as
+        an outbound made W3 contradict its own message, which promises the
+        node's output is "not connected to any downstream node or sink";
+        discard is neither. ``_runtime_connection_targets`` in the same module
+        already excluded it, so W3 was the inconsistent sibling.
+
+        An aggregation is the archetypal case because ``on_error`` is REQUIRED
+        for one (``aggregation_missing_on_error``) — so before this it could
+        always satisfy the limb with ``discard`` and dead-end in silence.
+
+        This test is the ENTIRE evidence base for the change: all 715 saved
+        composition states are unaffected (5 warned before, 5 after), because
+        ``on_error`` is only ever ``discard`` or None across the corpus's 1033
+        nodes and every discard node already satisfies the consumed limb
+        first. The corpus cannot exercise this in either direction.
+        """
+        result = self._dangling_aggregation_state(on_error="discard").validate()
+        assert any("agg" in (w.component or "") and "no outgoing edges" in w.message for w in result.warnings), [
+            w.to_dict() for w in result.warnings
+        ]
+
+    def test_validate_w3_silent_when_on_error_names_a_real_sink(self) -> None:
+        """The other direction: a real ``on_error`` target IS a connection out.
+
+        Guards the tightening from becoming a blanket "ignore on_error". Same
+        dangling aggregation, but its errors reach a sink — the rows leave in
+        good order, so there is nothing to warn about.
+        """
+        result = self._dangling_aggregation_state(on_error="main").validate()
+        assert not any("agg" in (w.component or "") and "no outgoing edges" in w.message for w in result.warnings), [
+            w.to_dict() for w in result.warnings
+        ]
+
+    def test_validate_w3_silent_when_the_aggregation_is_consumed(self) -> None:
+        """A consumed aggregation is quiet even with ``on_error: discard``.
+
+        The consumed limb is checked first and independently, so tightening
+        the ``on_error`` limb must not accuse a correctly-wired node.
+        """
+        state = self._dangling_aggregation_state(on_error="discard")
+        state = state.with_node(self._make_transform("t2", "agg", "main", on_error="main"))
+        result = state.validate()
+        assert not any("agg" in (w.component or "") and "no outgoing edges" in w.message for w in result.warnings), [
+            w.to_dict() for w in result.warnings
+        ]
+
     def test_validate_source_on_success_mismatch_warns(self) -> None:
         """W2: Source on_success doesn't match any node input."""
         state = self._empty_state()
