@@ -74,7 +74,18 @@ is a working document under the normal delivery posture.
   fake in `tests/` needs them — omitting one is an `AttributeError` at
   build, not a skip, and it took ~14 test files to model the contract; add
   them to the fake rather than weakening the builder's read (ADR-032: nominal
-  typing for what we own). (2) A new declarer of either fact is a soundness
+  typing for what we own). There is a SECOND, quieter failure mode for the
+  same omission: `TransformProtocol` is `@runtime_checkable`, so a fake that
+  reaches an `isinstance` site fails STRUCTURAL CONFORMANCE instead of
+  raising `AttributeError`, and the message names neither the protocol nor
+  the missing attribute — `test_protocols.py` reports only "Must conform to
+  TransformProtocol", and `token_traversal.py:1091` reports "Unknown
+  transform type: <FakeName>. Expected TransformProtocol or GateSettings."
+  Both of those cost a debugging cycle after the AttributeError sweep looked
+  complete. When you add a protocol attribute, grep for fakes that assign the
+  sibling flags in `__init__` (`self.passes_through_input = ...`) as well as
+  in the class body — an AST sweep over class bodies alone misses them, which
+  is exactly how these two survived. (2) A new declarer of either fact is a soundness
   argument, not a config change: the structural source arm answers only for
   fields in the source's OWN `guaranteed_fields`, which is what keeps
   over-recursion self-limiting for fields introduced mid-path.

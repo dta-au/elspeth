@@ -132,6 +132,10 @@ class _UncalledBatchTransform:
         self.creates_tokens = False
         self.passes_through_input = False
         self.forwards_input_fields = False
+        # elspeth-e6e552ce34: the VALUE promise sibling of passes_through_input.
+        # Required for TransformProtocol conformance — token_traversal's
+        # isinstance check rejects the fake outright without it.
+        self.preserves_input_values = False
         self.removed_input_fields: frozenset[str] = frozenset()
         self.can_drop_rows = False
         self.declared_output_fields = frozenset()

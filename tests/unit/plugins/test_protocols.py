@@ -180,6 +180,10 @@ class TestTransformProtocol:
             creates_tokens = False  # Deaggregation (multi-row output)
             passes_through_input = False  # ADR-007: pass-through contract flag
             forwards_input_fields = False
+            # elspeth-e6e552ce34: the VALUE promise. passes_through_input above
+            # says only that the FIELD survives; this says its value is never
+            # rewritten. Fail-closed default, mirroring BaseTransform.
+            preserves_input_values = False
             removed_input_fields = frozenset()
             can_drop_rows = False  # ADR-012: empty-emission governance flag
             declared_input_fields: frozenset[str] = frozenset()
