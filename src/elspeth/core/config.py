@@ -3013,15 +3013,22 @@ def _fingerprint_config_for_audit(
     Called by resolve_config() to create a copy safe for audit storage.
     The original config (with secrets) is untouched.
 
-    Covers EVERY settings section whose entries carry a plugin ``options``
-    mapping. That set is pinned behaviourally by
-    ``TestAuditRedactionSectionCoverage`` (tests/unit/core/test_config.py),
-    which discovers the sections by walking ``ElspethSettings.model_fields``
-    rather than trusting this list — a section added to the settings tree and
-    not added here writes plugin options into the durable audit record in
-    cleartext, and fails open with no error (elspeth-bc1b2c2959). Keep this
-    enumeration in step with the code below; the pin, not the docstring, is
-    the guarantee.
+    Covers EVERY free-form mapping in the settings tree — any field annotated
+    ``dict[str, Any]`` / ``Mapping[str, Any]``, whatever it is named. That set
+    is pinned behaviourally by ``TestAuditRedactionSectionCoverage``
+    (tests/unit/core/test_config.py), which discovers the fields by walking
+    ``ElspethSettings.model_fields`` and testing the ANNOTATION rather than
+    trusting this list.
+
+    The discovery predicate is deliberately typed rather than named. Keying it
+    on the literal field name ``options`` encoded "free-form plugin config is
+    always called ``options``", which was true when written and false by the
+    time it was: ``collection_probes[*].provider_config`` is the same
+    arbitrary secret-bearing shape under a different name and was persisted in
+    cleartext (elspeth-fb8492c07b). A section or field added to the settings
+    tree and not added here fails OPEN with no error, exactly as ``collectors``
+    did (elspeth-bc1b2c2959). Keep this enumeration in step with the code
+    below; the pin, not the docstring, is the guarantee.
 
     Processes:
     - sources.*.options (and the legacy singular source.options)
@@ -3031,6 +3038,7 @@ def _fingerprint_config_for_audit(
     - collectors[*].options
     - aggregations[*].options
     - telemetry.exporters[*].options
+    - collection_probes[*].provider_config
     - landscape.url (DSN password)
 
     Args:
@@ -3119,6 +3127,17 @@ def _fingerprint_config_for_audit(
             for exporter in exporters:
                 if isinstance(exporter, dict) and "options" in exporter and isinstance(exporter["options"], dict):
                     exporter["options"] = _fingerprint_secrets(exporter["options"], fail_if_no_key=fail_if_no_key)
+
+    # === Collection probe provider config ===
+    # Not named `options`, but the same free-form arbitrary-key mapping: the
+    # settings layer types it Mapping[str, Any], so any key an operator writes
+    # is carried into the audit copy. The provider model's own extra="forbid"
+    # is NOT containment here — it applies at probe construction, downstream of
+    # the settings validation that admits the value.
+    if "collection_probes" in config and isinstance(config["collection_probes"], list):
+        for probe in config["collection_probes"]:
+            if isinstance(probe, dict) and "provider_config" in probe and isinstance(probe["provider_config"], dict):
+                probe["provider_config"] = _fingerprint_secrets(probe["provider_config"], fail_if_no_key=fail_if_no_key)
 
     return config
 

@@ -1,10 +1,10 @@
 # tests/core/test_config.py
 """Tests for configuration schema and loading."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import UnionType
-from typing import Union, get_args, get_origin
+from typing import Any, Union, get_args, get_origin
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -3567,7 +3567,7 @@ sinks:
 
 
 class TestAuditRedactionSectionCoverage:
-    """Reflection pin: EVERY options-bearing settings section must be redacted.
+    """Reflection pin: EVERY free-form mapping in the settings tree is redacted.
 
     A hand-listed test reproduces the exact defect it is meant to catch the
     next time a section is added. That is not hypothetical: ``collectors``
@@ -3575,12 +3575,26 @@ class TestAuditRedactionSectionCoverage:
     ``_fingerprint_config_for_audit`` about it, so collector plugin options
     reached the durable audit record in cleartext (elspeth-bc1b2c2959).
 
-    So the section list is DISCOVERED from ``ElspethSettings.model_fields``
-    rather than written down, and the assertion is BEHAVIOURAL: a sentinel
-    secret is planted under each discovered ``options`` mapping and must not
-    survive the redactor. An inventory assertion — "the discovered set equals
-    this literal set" — would have passed with the defect present, because it
-    checks the section list rather than the redaction.
+    So the set is DISCOVERED from ``ElspethSettings.model_fields`` rather than
+    written down, and the assertion is BEHAVIOURAL: a sentinel secret is
+    planted under each discovered mapping and must not survive the redactor.
+    An inventory assertion — "the discovered set equals this literal set" —
+    would have passed with the defect present, because it checks the section
+    list rather than the redaction.
+
+    DISCOVERY IS BY TYPE, NOT BY NAME. This pin originally keyed on
+    ``"options" in element_model.model_fields``, which quietly encoded a second
+    hand-maintained fact: that free-form plugin config is always *called*
+    ``options``. That was true when written and already false —
+    ``collection_probes[*].provider_config`` is the same arbitrary
+    secret-bearing mapping under a different name, so the pin could not see the
+    field it most needed to (elspeth-fb8492c07b). The predicate now tests the
+    ANNOTATION (``dict[str, Any]`` / ``Mapping[str, Any]``), which no naming
+    convention can drift away from.
+
+    If a newly discovered mapping is genuinely not secret-bearing, record that
+    disposition here — do NOT narrow the predicate back toward a hand-shaped
+    scope, which is the defect this pin exists to prevent.
 
     The walk is recursive because ``telemetry.exporters[*].options`` is not a
     top-level section; a top-level-only walk would miss exactly the shape that
@@ -3621,12 +3635,40 @@ class TestAuditRedactionSectionCoverage:
                 return "single", (candidate,)
         return "", ()
 
-    @classmethod
-    def _options_bearing_paths(cls) -> list[tuple[tuple[str, str], ...]]:
-        """Discover every path in ElspethSettings reaching a model with ``options``.
+    @staticmethod
+    def _is_free_form_mapping(annotation: object) -> bool:
+        """Is this annotation an arbitrary-key config mapping?
 
-        Each path is a tuple of ``(field_name, container_shape)`` segments, e.g.
-        ``(("transforms", "list"),)`` or ``(("telemetry", "single"), ("exporters", "list"))``.
+        ``dict[str, Any]`` and ``Mapping[str, Any]``, Optional-unwrapped. Both
+        forms are in use — plugin ``options`` is the former, ``provider_config``
+        the latter — and ``get_origin(Mapping[str, Any])`` is
+        ``collections.abc.Mapping``, not ``dict``. A predicate checking only
+        ``dict`` discovers the six fields that were already covered and misses
+        the one this pin was widened for, while every assertion still passes.
+
+        The value type must be ``Any``: a mapping with a concrete value type is
+        a declared structure, not free-form operator-supplied config.
+        """
+        candidates = [annotation]
+        if get_origin(annotation) in (Union, UnionType):
+            candidates = [arg for arg in get_args(annotation) if arg is not type(None)]
+
+        for candidate in candidates:
+            args = get_args(candidate)
+            if get_origin(candidate) in (dict, Mapping) and len(args) == 2 and args[0] is str and args[1] is Any:
+                return True
+        return False
+
+    @classmethod
+    def _free_form_mapping_paths(cls) -> list[tuple[tuple[str, str], ...]]:
+        """Discover every path in ElspethSettings reaching a free-form mapping.
+
+        Each path is a tuple of ``(field_name, container_shape)`` segments whose
+        LAST segment is the mapping field itself, shape ``"mapping"``, e.g.
+        ``(("transforms", "list"), ("options", "mapping"))`` or
+        ``(("collection_probes", "list"), ("provider_config", "mapping"))``.
+        Carrying the field name in the path is what lets this pin cover a
+        mapping that is not called ``options``.
 
         Deduplication is on the PATH, not on the model class: if two sections
         ever share an element model, dropping the second by class would
@@ -3641,7 +3683,10 @@ class TestAuditRedactionSectionCoverage:
             if len(prefix) >= cls.MAX_DEPTH:
                 return
             for name in model.model_fields:
-                shape, element_models = cls._classify(model.model_fields[name].annotation)
+                annotation = model.model_fields[name].annotation
+                if cls._is_free_form_mapping(annotation):
+                    found.append((*prefix, (name, "mapping")))
+                shape, element_models = cls._classify(annotation)
                 if not element_models:
                     continue
                 path = (*prefix, (name, shape))
@@ -3649,8 +3694,6 @@ class TestAuditRedactionSectionCoverage:
                     continue
                 seen_paths.add(path)
                 for element_model in element_models:
-                    if "options" in element_model.model_fields:
-                        found.append(path)
                     walk(element_model, path)
 
         walk(ElspethSettings, ())
@@ -3658,15 +3701,18 @@ class TestAuditRedactionSectionCoverage:
 
     @classmethod
     def _plant(cls, path: tuple[tuple[str, str], ...]) -> dict[str, object]:
-        """Build the minimal config dict that puts SENTINEL under ``path``'s options.
+        """Build the minimal config dict that puts SENTINEL under ``path``.
 
         ``_fingerprint_config_for_audit`` takes a plain dict and reads it
         structurally, so this deliberately does NOT construct real settings
         models: doing so would drag in every required field and the
         scopes/collectors cross-validator without making the pin stronger.
         """
-        payload: object = {"options": {"api_key": cls.SENTINEL}}
-        for name, shape in reversed(path):
+        mapping_name, mapping_shape = path[-1]
+        assert mapping_shape == "mapping", f"path must end at the mapping field, got {path!r}"
+
+        payload: object = {mapping_name: {"api_key": cls.SENTINEL}}
+        for name, shape in reversed(path[:-1]):
             if shape == "dict":
                 payload = {name: {"entry": payload}}
             elif shape == "list":
@@ -3676,22 +3722,50 @@ class TestAuditRedactionSectionCoverage:
         assert isinstance(payload, dict)
         return payload
 
-    def test_walk_finds_the_known_options_bearing_sections(self) -> None:
+    def test_walk_finds_the_known_free_form_mappings(self) -> None:
         """Guard the probe itself: a broken walk must not report vacuous success.
 
         This is the positive control. If the discovery walk silently returned
         nothing — a changed annotation style, a pydantic upgrade — the
-        behavioural test below would pass by testing nothing at all.
+        behavioural tests below would pass by testing nothing at all.
+
+        Asserted as EQUALITY, not containment. Containment cannot tell a
+        widened predicate from a broken one, and the whole point of moving off
+        the field name was to catch the mapping nobody thought to list. A new
+        entry here is a real event: adjudicate whether it is secret-bearing and
+        record the disposition in the class docstring.
         """
-        paths = self._options_bearing_paths()
+        paths = self._free_form_mapping_paths()
         rendered = {".".join(name for name, _shape in path) for path in paths}
 
-        assert {"sources", "sinks", "transforms", "collectors", "aggregations", "telemetry.exporters"} <= rendered, (
-            f"Discovery walk lost a known options-bearing section; found {sorted(rendered)}"
+        assert rendered == {
+            "sources.options",
+            "sinks.options",
+            "transforms.options",
+            "collectors.options",
+            "aggregations.options",
+            "telemetry.exporters.options",
+            "collection_probes.provider_config",
+        }, f"Free-form mappings in ElspethSettings changed; found {sorted(rendered)}"
+
+    def test_discovery_is_not_keyed_on_the_field_name_options(self) -> None:
+        """Mutation guard: the pin must still see a mapping that is not called ``options``.
+
+        Without this, someone restoring the name-keyed predicate gets a green
+        suite: the other tests iterate whatever the walk returns, so a walk that
+        silently stops returning ``provider_config`` simply stops testing it.
+        """
+        rendered = {".".join(name for name, _shape in path) for path in self._free_form_mapping_paths()}
+        not_named_options = {path for path in rendered if not path.endswith(".options")}
+
+        assert not_named_options, (
+            "Discovery found only fields named 'options'. The predicate has regressed to keying "
+            "on the field NAME, so a free-form mapping under any other name is invisible to this pin "
+            "(elspeth-fb8492c07b)."
         )
 
-    def test_every_options_bearing_section_is_redacted_for_audit(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """No discovered section may carry a plaintext secret into the audit copy.
+    def test_every_free_form_mapping_is_redacted_for_audit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No discovered mapping may carry a plaintext secret into the audit copy.
 
         Fingerprint mode: the secret must be replaced by a fingerprint.
         """
@@ -3701,23 +3775,25 @@ class TestAuditRedactionSectionCoverage:
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
         leaked = []
-        for path in self._options_bearing_paths():
+        for path in self._free_form_mapping_paths():
             result = _fingerprint_config_for_audit(self._plant(path))
             if self.SENTINEL in repr(result):
                 leaked.append(".".join(name for name, _shape in path))
 
         assert not leaked, (
-            f"Sections written to the audit record with UNREDACTED options: {sorted(leaked)}. "
+            f"Free-form mappings written to the audit record UNREDACTED: {sorted(leaked)}. "
             f"Add each to _fingerprint_config_for_audit and to its docstring enumeration."
         )
 
-    def test_every_options_bearing_section_fails_closed_without_a_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_every_free_form_mapping_fails_closed_without_a_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Absent a fingerprint key, a secret must abort rather than persist.
 
-        This is the asymmetry that made elspeth-bc1b2c2959 silent: a covered
-        section refuses to produce an audit copy at all, while the uncovered
-        one returned successfully with the secret intact. Nothing in the run
-        distinguished "no secrets present" from "secrets present, not redacted".
+        This is the asymmetry that made elspeth-bc1b2c2959 silent, and made
+        elspeth-fb8492c07b silent again a section later: a covered field
+        refuses to produce an audit copy at all, while the uncovered one
+        returns successfully with the secret intact. Nothing in the run
+        distinguishes "no secrets present" from "secrets present, not
+        redacted" — which is why coverage is asserted here rather than trusted.
         """
         from elspeth.contracts.security import SecretFingerprintError
         from elspeth.core.config import _fingerprint_config_for_audit
@@ -3726,7 +3802,7 @@ class TestAuditRedactionSectionCoverage:
         monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
 
         failed_open = []
-        for path in self._options_bearing_paths():
+        for path in self._free_form_mapping_paths():
             try:
                 _fingerprint_config_for_audit(self._plant(path))
             except SecretFingerprintError:
@@ -3734,8 +3810,8 @@ class TestAuditRedactionSectionCoverage:
             failed_open.append(".".join(name for name, _shape in path))
 
         assert not failed_open, (
-            f"Sections that FAIL OPEN on a secret with no fingerprint key: {sorted(failed_open)}. "
-            f"Every options-bearing section must reach _fingerprint_secrets."
+            f"Mappings that FAIL OPEN on a secret with no fingerprint key: {sorted(failed_open)}. "
+            f"Every free-form mapping must reach _fingerprint_secrets."
         )
 
 
