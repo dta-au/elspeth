@@ -14,7 +14,7 @@ from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
-from elspeth.web.composer._producer_resolver import source_producer_id
+from elspeth.web.composer._producer_resolver import published_success_connection, source_producer_id
 from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
 
 _NON_PRODUCED_ROUTE_TARGETS = frozenset({"discard", "fork", "stop"})
@@ -547,12 +547,20 @@ def _upstream_control_scan_scopes(
 
 
 def _node_output_streams(node: NodeSpec) -> tuple[str, ...]:
+    # ``published_success_connection`` is THE statement of this rule and is
+    # called rather than restated. The previous form tested ``node.on_success``
+    # with a coalesce-only fallback — one of the authority's three arms — so an
+    # AGGREGATION or QUEUE omitting ``on_success`` published under its own id at
+    # runtime while reading here as publishing nothing. That is a security
+    # defect, not a cosmetic one: such a node's only remaining stream is its
+    # ``on_error`` target, and ``_stream_proves_output_control`` short-circuits
+    # True on a non-produced route target like ``discard``, so a REQUIRED
+    # CONTENT_SAFETY control was reported satisfied on a pipeline carrying none
+    # (elspeth-b231af0c16). A false accept on an admission gate.
+    published = published_success_connection(node)
     streams: list[str] = []
-    if node.on_success:
-        streams.append(node.on_success)
-    elif node.node_type == "coalesce":
-        # Runtime publishes a non-terminal coalesce under its own name.
-        streams.append(node.id)
+    if published:
+        streams.append(published)
     if node.on_error:
         streams.append(node.on_error)
     if node.routes:

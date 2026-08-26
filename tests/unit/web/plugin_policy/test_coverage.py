@@ -10,6 +10,7 @@ from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.sources.llm.source import LLMSource
+from elspeth.web.composer._producer_resolver import _IMPLICIT_SELF_PUBLISHING_NODE_TYPES
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -1702,3 +1703,81 @@ def test_external_call_below_the_shield_preserves_unprovable_field_diagnosis() -
     # No field sets are asserted for a topology failure — naming a control
     # that does not dominate would be a second false statement.
     assert findings[0].scanned_fields == ()
+
+
+def _self_publishing_state(node_type: str, *, guarded: bool) -> CompositionState:
+    """An llm feeding one implicit self-publisher that omits ``on_success``.
+
+    Each kind is wired the way the composer actually wires it — a queue is fed
+    by producers publishing to its own id, a coalesce declares ``branches`` —
+    so a finding is attributable to the missing control rather than to a
+    malformed graph. ``on_error="discard"`` is the shape that made the defect
+    reachable: it left a non-produced route target as the node's only surviving
+    stream.
+    """
+    node_id = f"{node_type}_x"
+    if node_type == "queue":
+        producer_target = node_id
+        node = replace(_node(node_id, None, node_id, None, node_type=node_type), on_error="discard")
+    elif node_type == "coalesce":
+        producer_target = "post_llm"
+        node = replace(
+            _node(node_id, None, "post_llm", None, node_type=node_type),
+            on_error="discard",
+            branches={"branch": "post_llm"},
+        )
+    else:
+        producer_target = "post_llm"
+        node = replace(_node(node_id, None, "post_llm", None, node_type=node_type), on_error="discard")
+
+    nodes = [_llm(on_success=producer_target), node]
+    if guarded:
+        nodes.append(_node("safety", "azure_content_safety", node_id, "main", options={"detect_only": False, "fields": "all"}))
+    return _state(*nodes)
+
+
+@pytest.mark.parametrize("node_type", sorted(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES))
+def test_a_self_publishing_node_does_not_hide_a_missing_required_control(node_type: str) -> None:
+    """An implicit self-publisher must not launder a MISSING control into a satisfied one.
+
+    ``queue``, ``coalesce`` and ``aggregation`` all publish their success output
+    under their OWN id when ``on_success`` is omitted — that is
+    ``published_success_connection``'s whole reason to exist. ``coverage.py``
+    restated the rule with a coalesce-only arm, so an aggregation or queue in
+    that shape read as publishing nothing. Its only surviving stream was then
+    ``on_error`` (``discard``), and ``_stream_proves_output_control``
+    short-circuits True on a non-produced route target — so a REQUIRED
+    CONTENT_SAFETY control was reported SATISFIED on a pipeline carrying no
+    content-safety control at all (elspeth-b231af0c16). A false accept on an
+    admission gate, which also suppressed the repair: ``required_controls.py``
+    auto-wires the control in only when coverage reports it uncovered.
+
+    BEHAVIOURAL, and enumerated from the runtime authority. Two properties a
+    stream-list or set-comparison assertion would not have:
+
+    * It asserts the CONTROL OUTCOME an operator relies on, not an intermediate
+      stream tuple. The defect was never that the tuple looked wrong; it was
+      that a security verdict came out of it.
+    * Membership derives from ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES``, so a
+      fourth self-publishing kind is covered the day it is added. A pin
+      comparing two hand-written sets goes green under a mutation that edits
+      both sides — the shape ``yaml_generator.py``'s node-type guard still has.
+    """
+    findings = control_coverage_findings(_self_publishing_state(node_type, guarded=False), PluginCapability.CONTENT_SAFETY)
+
+    assert findings, f"a {node_type} publishing under its own id hid a missing CONTENT_SAFETY control"
+
+
+@pytest.mark.parametrize("node_type", sorted(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES))
+def test_a_self_publishing_node_still_accepts_a_real_downstream_control(node_type: str) -> None:
+    """The discriminating half: the guard must not reject a genuinely covered pipeline.
+
+    Without this, the test above would pass equally against a coverage function
+    that reported a finding for every pipeline containing one of these kinds —
+    a guard that rejects legal configurations is worse than the defect it
+    closes. Together the two make the finding attributable to the ABSENT
+    control rather than to the node kind.
+    """
+    findings = control_coverage_findings(_self_publishing_state(node_type, guarded=True), PluginCapability.CONTENT_SAFETY)
+
+    assert findings == (), f"a content-safety control downstream of a {node_type} was not credited: {findings}"
