@@ -6991,3 +6991,178 @@ class TestComposerEnvPlaceholderAgreement:
             f"rejection above is not attributable to the placeholder. Errors: "
             f"{[e.message for e in result.errors]}"
         )
+
+
+# ── Shape 10 — bind-time CSV guarantee x llm required_input_fields ────────────
+# elspeth-da68332faf x elspeth-d39ec0c4d9: a source guarantees what it knows.
+# Binding a CSV blob stamps schema.guaranteed_fields from the header at BIND
+# time, so by the time an llm node's required_input_fields is forced (the
+# LLMConfig template-binding remedy), the edge contract is already satisfied —
+# the session-2e0c8ea3 contradiction (validator demands the declaration, edge
+# check rejects it) is structurally unreachable for the bound-blob case.
+
+
+class TestCsvBindGuaranteeRuntimeAgreement:
+    def _bind_csv_blob_state(self, tmp_path: Path) -> CompositionState:
+        """Drive the REAL bind tool so the stamp comes from production code."""
+        from datetime import datetime as _datetime
+        from unittest.mock import MagicMock
+
+        from sqlalchemy import insert as _insert
+        from sqlalchemy.pool import StaticPool
+
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.catalog.protocol import CatalogService as _CatalogService
+        from elspeth.web.catalog.schemas import PluginSummary
+        from elspeth.web.composer.tools import _execute_create_blob, _execute_set_source_from_blob
+        from elspeth.web.composer.tools._common import ToolContext
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+        from elspeth.web.sessions.engine import create_session_engine
+        from elspeth.web.sessions.models import chat_messages_table, sessions_table
+        from elspeth.web.sessions.schema import initialize_session_schema
+
+        engine = create_session_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+        initialize_session_schema(engine)
+        now = _datetime.now(UTC)
+        with engine.begin() as conn:
+            conn.execute(
+                _insert(sessions_table).values(
+                    id=_AGREEMENT_SESSION_ID,
+                    user_id="agreement-suite-user",
+                    auth_provider_type="local",
+                    title="csv guarantee agreement",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        content = "colour\nred\nblue\n"
+        user_message_content = f"Use this exact CSV:\n{content}"
+        user_message_id = str(uuid4())
+        with engine.begin() as conn:
+            conn.execute(
+                _insert(chat_messages_table).values(
+                    id=user_message_id,
+                    session_id=_AGREEMENT_SESSION_ID,
+                    role="user",
+                    content=user_message_content,
+                    raw_content=None,
+                    tool_calls=None,
+                    tool_call_id=None,
+                    sequence_no=1,
+                    writer_principal="route_user_message",
+                    created_at=now,
+                    composition_state_id=None,
+                    parent_assistant_id=None,
+                )
+            )
+        catalog = MagicMock(spec=_CatalogService)
+        catalog.list_sources.return_value = [
+            PluginSummary(name=name, description=name, plugin_type="source", config_fields=[]) for name in ("csv", "json", "text")
+        ]
+        catalog.get_schema.return_value = {"properties": {}}
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        ctx = ToolContext(
+            catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
+            plugin_snapshot=snapshot,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=_AGREEMENT_SESSION_ID,
+            user_message_id=user_message_id,
+            user_message_content=user_message_content,
+        )
+        empty = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+        create_result = _execute_create_blob(
+            {"filename": "colours.csv", "mime_type": "text/csv", "content": content},
+            empty,
+            ctx,
+        )
+        assert create_result.success is True, create_result.data
+        bind_result = _execute_set_source_from_blob(
+            {
+                "blob_id": create_result.data["blob_id"],
+                "on_success": "classify",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            empty,
+            ctx,
+        )
+        assert bind_result.success is True, bind_result.data
+        return bind_result.updated_state
+
+    def _runtime_graph_for_source_schema(self, tmp_path: Path, schema: dict[str, Any]) -> ExecutionGraph:
+        csv_path = tmp_path / "in.csv"
+        csv_path.write_text("colour\nred\nblue\n", encoding="utf-8")
+        config = ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin="csv",
+                    on_success="t1",
+                    options={"path": str(csv_path), "schema": schema, "on_validation_failure": "discard"},
+                )
+            },
+            transforms=[
+                TransformSettings(
+                    name="t1",
+                    plugin="llm",
+                    input="t1",
+                    on_success="main",
+                    on_error="discard",
+                    options={
+                        "provider": "openrouter",
+                        "model": "openai/gpt-4.1-nano",
+                        "api_key": "sk-test-key",
+                        "prompt_template": "Classify {{ row.colour }}.",
+                        "required_input_fields": ["colour"],
+                        "schema": {"mode": "observed"},
+                    },
+                )
+            ],
+            sinks={
+                "main": SinkSettings(
+                    plugin="csv",
+                    on_write_failure="discard",
+                    options={"path": str(tmp_path / "out.csv"), "schema": {"mode": "observed"}},
+                )
+            },
+        )
+        plugins = instantiate_plugins_from_config(config)
+        return ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=list(config.gates),
+            coalesce_settings=None,
+        )
+
+    def test_bound_csv_blob_stamps_header_guarantee(self, tmp_path: Path) -> None:
+        state = self._bind_csv_blob_state(tmp_path)
+        source = state.sources["source"]
+        schema = source.options["schema"]
+        assert schema["mode"] == "observed"
+        assert list(schema["guaranteed_fields"]) == ["colour"]
+
+    def test_bound_guarantee_satisfies_llm_required_input_fields_at_runtime(self, tmp_path: Path) -> None:
+        """The stamped schema block, fed through the runtime path, builds the
+        exact edge session 2e0c8ea3 could never validate."""
+        state = self._bind_csv_blob_state(tmp_path)
+        from elspeth.contracts.freeze import deep_thaw
+
+        stamped_schema = cast(dict[str, Any], deep_thaw(state.sources["source"].options["schema"]))
+
+        graph = self._runtime_graph_for_source_schema(tmp_path, stamped_schema)
+        graph.validate_edge_compatibility()  # green: no EdgeContractError
+
+    def test_unstamped_observed_source_still_rejects_the_same_edge(self, tmp_path: Path) -> None:
+        """Control: without the stamp the contradiction is still real, which is
+        what makes the bind-time stamp load-bearing rather than decorative."""
+        with pytest.raises(EdgeContractError) as exc_info:
+            graph = self._runtime_graph_for_source_schema(tmp_path, {"mode": "observed"})
+            graph.validate_edge_compatibility()
+        assert "colour" in str(exc_info.value)
+        assert exc_info.value.from_component_type == "source"

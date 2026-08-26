@@ -128,7 +128,13 @@ class TestSetSourceFromBlobs:
             "mime_type": "image/jpeg",
             "size_bytes": len(_JPEG),
         }
-        assert source.options["schema"] == {"mode": "observed"}
+        # A source guarantees what it knows (elspeth-da68332faf): blob_rows
+        # rows carry exactly the plugin's five fixed custody fields, so the
+        # bind stamps the complete structural guarantee.
+        schema = source.options["schema"]
+        assert set(schema) == {"mode", "guaranteed_fields"}
+        assert schema["mode"] == "observed"
+        assert list(schema["guaranteed_fields"]) == ["blob_id", "blob_ref", "blob_filename", "blob_mime_type", "blob_size_bytes"]
         # Bounded audit payload only — never storage paths or content.
         payloads = result.data["source_blobs"]
         assert [p["blob_id"] for p in payloads] == [jpg_id, png_id]

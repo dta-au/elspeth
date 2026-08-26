@@ -564,3 +564,219 @@ class TestSetSourceFromBlobTsvDelimiter:
         source = bind_result.updated_state.sources["source"]
         assert source.plugin == "csv"
         assert source.options.get("delimiter") is None
+
+
+# ---------------------------------------------------------------------------
+# Content-derived guaranteed_fields (elspeth-da68332faf)
+# ---------------------------------------------------------------------------
+
+
+class TestSetSourceFromBlobDerivedGuarantees:
+    """A bound blob IS the run's data, so a CSV bind auto-declares
+    ``schema.guaranteed_fields`` from the header it can read — all-or-nothing,
+    never partial, and never over an author-written declaration."""
+
+    def _bind_blob(
+        self,
+        *,
+        filename: str,
+        content: str,
+        mime_type: str,
+        tmp_path: Path,
+        options: dict[str, Any] | None = None,
+    ) -> Any:
+        user_message_content = f"Bind this blob as the source:\n{content}"
+        engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
+        catalog = _mock_catalog()
+        ctx = ToolContext(
+            catalog=catalog,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=user_message_id,
+            user_message_content=user_message_content,
+        )
+        create_result = _execute_create_blob(
+            {"filename": filename, "mime_type": mime_type, "content": content},
+            _empty_state(),
+            ctx,
+        )
+        assert create_result.success is True, create_result.data
+        bind_result = _execute_set_source_from_blob(
+            {
+                "blob_id": create_result.data["blob_id"],
+                "on_success": "out",
+                "options": options if options is not None else {"schema": {"mode": "observed"}},
+            },
+            _empty_state(),
+            ctx,
+        )
+        return bind_result
+
+    def _schema(self, bind_result: Any) -> dict[str, Any]:
+        assert bind_result.success is True, bind_result.data
+        return dict(bind_result.updated_state.sources["source"].options["schema"])
+
+    def test_csv_bind_stamps_complete_header_guarantee(self, tmp_path: Path) -> None:
+        schema = self._schema(
+            self._bind_blob(
+                filename="data.csv",
+                content="id,Score Value,colour\n1,2,red\n",
+                mime_type="text/csv",
+                tmp_path=tmp_path,
+            )
+        )
+        # Headers map through declarable_field_name to canonical row keys.
+        assert schema["mode"] == "observed"
+        assert list(schema["guaranteed_fields"]) == ["id", "score_value", "colour"]
+
+    def test_csv_bind_without_schema_block_creates_observed_guarantee(self, tmp_path: Path) -> None:
+        schema = self._schema(
+            self._bind_blob(
+                filename="data.csv",
+                content="a,b\n1,2\n",
+                mime_type="text/csv",
+                tmp_path=tmp_path,
+                options={},
+            )
+        )
+        assert schema == {"mode": "observed", "guaranteed_fields": ["a", "b"]} or (
+            schema["mode"] == "observed" and list(schema["guaranteed_fields"]) == ["a", "b"]
+        )
+
+    def test_tsv_bind_reads_header_with_derived_tab_delimiter(self, tmp_path: Path) -> None:
+        schema = self._schema(
+            self._bind_blob(
+                filename="data.tsv",
+                content="alpha\tbeta\n1\t2\n",
+                mime_type="text/csv",
+                tmp_path=tmp_path,
+            )
+        )
+        assert list(schema["guaranteed_fields"]) == ["alpha", "beta"]
+
+    def test_undeclarable_header_stamps_nothing_all_or_nothing(self, tmp_path: Path) -> None:
+        """One header with no declarable form abstains ENTIRELY — a partial
+        guaranteed_fields is a complete-claim violation (SchemaConfig)."""
+        schema = self._schema(
+            self._bind_blob(
+                filename="data.csv",
+                content="id,!!!\n1,2\n",
+                mime_type="text/csv",
+                tmp_path=tmp_path,
+            )
+        )
+        assert "guaranteed_fields" not in schema
+
+    def test_colliding_canonical_headers_stamp_nothing(self, tmp_path: Path) -> None:
+        """Two headers collapsing onto one canonical row key are ambiguous
+        evidence, so the bind abstains rather than guessing."""
+        schema = self._schema(
+            self._bind_blob(
+                filename="data.csv",
+                content="A B,a_b\n1,2\n",
+                mime_type="text/csv",
+                tmp_path=tmp_path,
+            )
+        )
+        assert "guaranteed_fields" not in schema
+
+    def test_jsonl_bind_does_not_auto_declare(self, tmp_path: Path) -> None:
+        """A sampled key-union is not per-row evidence — JSON/JSONL abstain."""
+        bind_result = self._bind_blob(
+            filename="data.jsonl",
+            content='{"a": 1}\n{"a": 2, "b": 3}\n',
+            mime_type="application/x-jsonlines",
+            tmp_path=tmp_path,
+            options={"schema": {"mode": "observed"}},
+        )
+        schema = self._schema(bind_result)
+        assert "guaranteed_fields" not in schema
+
+    def test_columns_configured_csv_still_binds_green_and_unstamped(self, tmp_path: Path) -> None:
+        """Bind-regression pin: ``columns`` replaces the observed header as the
+        row-key authority, so a header-derived guarantee could be unreachable
+        (check_declared_fields_reachable) — the bind must stay green and stamp
+        nothing."""
+        bind_result = self._bind_blob(
+            filename="data.csv",
+            content="one,two\n1,2\n",
+            mime_type="text/csv",
+            tmp_path=tmp_path,
+            options={"columns": ["first", "second"], "schema": {"mode": "observed"}},
+        )
+        schema = self._schema(bind_result)
+        assert "guaranteed_fields" not in schema
+
+    def test_field_mapping_configured_csv_still_binds_green_and_unstamped(self, tmp_path: Path) -> None:
+        bind_result = self._bind_blob(
+            filename="data.csv",
+            content="one,two\n1,2\n",
+            mime_type="text/csv",
+            tmp_path=tmp_path,
+            options={"field_mapping": {"one": "renamed_one"}, "schema": {"mode": "observed"}},
+        )
+        schema = self._schema(bind_result)
+        assert "guaranteed_fields" not in schema
+
+    def test_author_written_guarantee_is_never_widened(self, tmp_path: Path) -> None:
+        bind_result = self._bind_blob(
+            filename="data.csv",
+            content="a,b\n1,2\n",
+            mime_type="text/csv",
+            tmp_path=tmp_path,
+            options={"schema": {"mode": "observed", "guaranteed_fields": ["a"]}},
+        )
+        schema = self._schema(bind_result)
+        assert list(schema["guaranteed_fields"]) == ["a"]
+
+    def test_non_utf8_csv_blob_still_binds_and_abstains(self, tmp_path: Path) -> None:
+        """Widening the bind-time content read must not make a latin-1 CSV
+        unbindable: the guarantee derivation abstains, the bind stays green."""
+        import asyncio
+        from uuid import UUID
+
+        from elspeth.web.blobs.service import BlobServiceImpl
+
+        engine, session_id = _session_engine_with_session()
+        blob_service = BlobServiceImpl(engine, tmp_path)
+        record = asyncio.run(
+            blob_service.create_blob(
+                session_id=UUID(session_id),
+                filename="latin.csv",
+                content="colonne,prix\ncaf\xe9,3\n".encode("latin-1"),
+                mime_type="text/csv",  # type: ignore[arg-type]
+                created_by="user",
+                source_description="uploaded",
+            )
+        )
+        ctx = ToolContext(
+            catalog=_mock_catalog(),
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+        )
+        bind_result = _execute_set_source_from_blob(
+            {
+                "blob_id": str(record.id),
+                "on_success": "out",
+                "options": {"schema": {"mode": "observed"}, "encoding": "latin-1"},
+            },
+            _empty_state(),
+            ctx,
+        )
+        schema = self._schema(bind_result)
+        assert "guaranteed_fields" not in schema
+
+    def test_non_utf8_encoding_option_abstains_even_for_utf8_bytes(self, tmp_path: Path) -> None:
+        """The runtime will read the file with the configured encoding; when
+        that is not UTF-8 the bind-time evidence may not match, so abstain."""
+        bind_result = self._bind_blob(
+            filename="data.csv",
+            content="a,b\n1,2\n",
+            mime_type="text/csv",
+            tmp_path=tmp_path,
+            options={"schema": {"mode": "observed"}, "encoding": "latin-1"},
+        )
+        schema = self._schema(bind_result)
+        assert "guaranteed_fields" not in schema

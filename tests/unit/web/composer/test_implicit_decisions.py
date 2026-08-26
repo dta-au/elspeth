@@ -236,3 +236,67 @@ def test_llm_source_non_model_options_and_routing_keep_source_contract() -> None
         "provenance": "picked",
         "candidate_alternatives": ["discard", "named_sink"],
     }
+
+
+def test_blob_bound_guaranteed_fields_attribute_to_content_not_planner() -> None:
+    """The bind-time guarantee stamp is evidenced by the file's own header
+    (elspeth-da68332faf), so the report must say ``derived_from_content``."""
+    by_path = _entries_by_path(
+        _state_with_source_options(
+            {
+                "blob_ref": _BLOB_REF,
+                "path": _STORAGE_PATH,
+                "schema": {"mode": "observed", "guaranteed_fields": ["colour"]},
+            }
+        )
+    )
+
+    entry = by_path["source.schema.guaranteed_fields"]
+    assert entry["provenance"] == "derived_from_content"
+    assert "content" in str(entry["note"])
+    # The sibling schema key keeps ordinary provenance.
+    assert by_path["source.schema.mode"]["provenance"] == "composer_selected"
+
+
+def test_non_blob_source_guaranteed_fields_keep_ordinary_provenance() -> None:
+    """Without the blob binding there is no content evidence to attribute."""
+    by_path = _entries_by_path(
+        _state_with_source_options(
+            {
+                "path": "/data/input.csv",
+                "schema": {"mode": "observed", "guaranteed_fields": ["colour"]},
+            }
+        )
+    )
+
+    entry = by_path["source.schema.guaranteed_fields"]
+    assert entry["provenance"] == "composer_selected"
+    assert "note" not in entry
+
+
+def test_blob_rows_guarantee_attributes_to_plugin_contract() -> None:
+    """The blob_rows fixed-row-field stamp is server-derived, not the planner's."""
+    by_path = _entries_by_path(
+        _state_with_source_options(
+            {
+                "blobs": [
+                    {
+                        "blob_id": _BLOB_REF,
+                        "payload_ref": "a" * 64,
+                        "filename": "doc.png",
+                        "mime_type": "image/png",
+                        "size_bytes": 10,
+                    }
+                ],
+                "schema": {
+                    "mode": "observed",
+                    "guaranteed_fields": ["blob_id", "blob_ref", "blob_filename", "blob_mime_type", "blob_size_bytes"],
+                },
+            },
+            plugin="blob_rows",
+        )
+    )
+
+    entry = by_path["source.schema.guaranteed_fields"]
+    assert entry["provenance"] == "derived_from_content"
+    assert "plugin" in str(entry["note"])

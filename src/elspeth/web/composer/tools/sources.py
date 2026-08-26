@@ -21,6 +21,9 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.plugins.sources.blob_rows import _ROW_FIELDS as _BLOB_ROWS_ROW_FIELDS
+from elspeth.plugins.sources.field_normalization import declarable_field_name
+from elspeth.web.blobs.protocol import BlobIntegrityError
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchSourceOptionsArgumentsModel,
@@ -106,7 +109,7 @@ class _CsvParseIncompleteError(_CsvContentBoundaryError):
     """
 
 
-def _bounded_csv_rows(content: str) -> Iterator[list[str]]:
+def _bounded_csv_rows(content: str, *, delimiter: str = ",") -> Iterator[list[str]]:
     """Yield CSV rows while containing parser and structural limit failures."""
 
     input_exhausted = False
@@ -117,7 +120,7 @@ def _bounded_csv_rows(content: str) -> Iterator[list[str]]:
         input_exhausted = True
 
     try:
-        for row in csv.reader(_content_lines(), strict=True):
+        for row in csv.reader(_content_lines(), delimiter=delimiter, strict=True):
             if len(row) > _CSV_MAX_COLUMNS or any(len(cell) > _CSV_FIELD_MAX_CHARS or "\x00" in cell for cell in row):
                 raise _CsvContentBoundaryError("CSV content exceeds bounded inspection limits")
             yield row
@@ -353,6 +356,137 @@ def _options_with_source_blob_review(
     )
 
 
+def _schema_options_with_guarantees(
+    options: Mapping[str, Any],
+    guaranteed_fields: Sequence[str],
+) -> Mapping[str, Any] | None:
+    """Merge derived ``guaranteed_fields`` into the options' schema block.
+
+    Returns ``None`` to ABSTAIN (stamp nothing). Abstention rules, in order
+    (elspeth-da68332faf):
+
+    - ``columns``/``field_mapping`` present: those options move row keys off
+      the observed header, so a header-derived guarantee can be unreachable —
+      ``check_declared_fields_reachable`` would then fail a bind that is green
+      today (the bind-regression trap).
+    - author already declared ``schema.guaranteed_fields`` or ``schema.fields``:
+      the author's claim stands; never silently widen it.
+    - schema block is not a mapping, or its mode is not ``observed``: malformed
+      or explicit-schema configs belong to validation, not to this stamp.
+
+    The merge mirrors ``guided/planning.py``'s sink materializer shape: the
+    existing schema block is extended in place-shape (mode and sibling keys
+    preserved), never replaced wholesale.
+    """
+    if "columns" in options or "field_mapping" in options:
+        return None
+    schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else "schema")
+    raw_schema = options.get(schema_key)
+    if raw_schema is None:
+        schema: dict[str, Any] = {"mode": "observed"}
+    elif isinstance(raw_schema, Mapping):
+        schema = dict(raw_schema)
+    else:
+        return None
+    if "guaranteed_fields" in schema or "fields" in schema:
+        return None
+    if schema.get("mode", "observed") != "observed":
+        return None
+    schema.setdefault("mode", "observed")
+    schema["guaranteed_fields"] = list(guaranteed_fields)
+    return {**options, schema_key: schema}
+
+
+def _read_blob_content_for_guarantees(
+    session_engine: Engine,
+    session_id: str,
+    blob: BlobToolRecord,
+    *,
+    pending_content: bytes | None,
+) -> str | None:
+    """Best-effort one-version content read for guarantee derivation ONLY.
+
+    Returns ``None`` to abstain on ANY read, integrity, or decode problem so
+    the non-authored bind path stays byte-for-byte as bindable as before the
+    derivation existed (elspeth-da68332faf). The LLM-authored path must NOT
+    use this — its review stamp requires the strict fail-recoverably read in
+    :func:`_resolve_source_blob`.
+    """
+    try:
+        if pending_content is not None:
+            fresh_blob: BlobToolRecord | None = blob
+            data: bytes | None = pending_content
+        else:
+            fresh_blob, data = _locked_read_ready_blob(session_engine, session_id, blob["id"])
+        if fresh_blob is None or fresh_blob["status"] != "ready" or data is None:
+            return None
+        if fresh_blob["content_hash"] != blob["content_hash"]:
+            return None
+        return data.decode("utf-8")
+    except (AuditIntegrityError, BlobIntegrityError, OSError, UnicodeDecodeError):
+        return None
+
+
+def _derived_csv_guarantee_fields(content: str, *, delimiter: str) -> tuple[str, ...] | None:
+    """Derive the complete guaranteed-field set from a CSV header, or abstain.
+
+    All-or-nothing: a partial ``guaranteed_fields`` is a complete-claim
+    violation (SchemaConfig docstring, contracts/schema.py) — the documented
+    worst option. So one undeclarable header, or two headers collapsing onto
+    one canonical row key (ambiguous evidence), abstains entirely.
+    """
+    try:
+        header = _first_nonempty_csv_row(content, delimiter=delimiter)
+    except _CsvContentBoundaryError:
+        return None
+    if header is None:
+        return None
+    fields: list[str] = []
+    seen: set[str] = set()
+    for cell in header:
+        name = declarable_field_name(cell)
+        if name is None or name in seen:
+            return None
+        seen.add(name)
+        fields.append(name)
+    return tuple(fields)
+
+
+def _options_with_derived_guarantees(
+    options: Mapping[str, Any],
+    *,
+    plugin: str,
+    mime_type: str,
+    content: str,
+) -> Mapping[str, Any]:
+    """Auto-declare ``schema.guaranteed_fields`` from bound CSV content.
+
+    A source guarantees what it knows (elspeth-da68332faf): a blob bound at
+    authoring time IS the run's data, so every header column genuinely present
+    is guaranteeable from content alone. Scope is deliberately CSV-only —
+    JSON/JSONL/text ABSTAIN, because a sampled key-union is not per-row
+    evidence and ADR-016 asserts guaranteed fields per row at runtime.
+
+    Evidence must be read the way the runtime will read it: a non-comma
+    ``delimiter`` is honoured, and a non-UTF-8 ``encoding`` option abstains
+    (bind-time content was decoded as UTF-8, so the runtime's view could
+    differ).
+    """
+    if plugin != "csv" or mime_type != "text/csv":
+        return options
+    encoding = options.get("encoding")
+    if encoding is not None and (not isinstance(encoding, str) or encoding.lower().replace("-", "").replace("_", "") != "utf8"):
+        return options
+    delimiter = options.get("delimiter", ",")
+    if not isinstance(delimiter, str) or len(delimiter) != 1:
+        return options
+    fields = _derived_csv_guarantee_fields(content, delimiter=delimiter)
+    if fields is None:
+        return options
+    stamped = _schema_options_with_guarantees(options, fields)
+    return options if stamped is None else stamped
+
+
 def _manual_source_authoring_error(*, tool_name: str) -> str:
     """Return the source-options error for caller-supplied source_authoring."""
     return (
@@ -546,6 +680,33 @@ def _resolve_source_blob(
             content=content,
             existing_options=existing_options,
         )
+        merged_options = _options_with_derived_guarantees(
+            merged_options,
+            plugin=plugin,
+            mime_type=blob["mime_type"],
+            content=content,
+        )
+    elif plugin == "csv" and blob["mime_type"] == "text/csv":
+        # A user-uploaded/verbatim CSV blob is ALSO the run's data, so its
+        # header is per-row evidence for guaranteed_fields
+        # (elspeth-da68332faf). Unlike the LLM-authored review path above,
+        # this read is strictly ADDITIVE: any read, integrity, or decode
+        # problem abstains from the stamp and leaves the bind exactly as it
+        # was before this derivation existed — run admission remains the
+        # custody gate for those failures.
+        guarantee_content = _read_blob_content_for_guarantees(
+            session_engine,
+            session_id,
+            blob,
+            pending_content=pending_content,
+        )
+        if guarantee_content is not None:
+            merged_options = _options_with_derived_guarantees(
+                merged_options,
+                plugin=plugin,
+                mime_type=blob["mime_type"],
+                content=guarantee_content,
+            )
     canonical_error = _canonical_interpretation_requirement_error(
         merged_options,
         tool_name=tool_name,
@@ -934,7 +1095,16 @@ def _resolve_source_blobs(
         payloads.append(_source_blob_payload(blob))
 
     merged_options: dict[str, Any] = {**caller_options, "blobs": entries}
-    if "schema" not in merged_options and "schema_config" not in merged_options:
+    # A source guarantees what it knows (elspeth-da68332faf): blob_rows rows
+    # carry EXACTLY the plugin's five fixed custody fields — the guarantee is
+    # structural, from the plugin contract, not from content evidence (the
+    # blobs are opaque documents; their bytes are never read here). The claim
+    # is complete by construction, which is what SchemaConfig's participation
+    # vote requires.
+    stamped = _schema_options_with_guarantees(merged_options, _BLOB_ROWS_ROW_FIELDS)
+    if stamped is not None:
+        merged_options = dict(stamped)
+    elif "schema" not in merged_options and "schema_config" not in merged_options:
         merged_options["schema"] = {"mode": "observed"}
     canonical_error = _canonical_interpretation_requirement_error(merged_options, tool_name="set_source_from_blobs")
     if canonical_error is not None:
@@ -1131,9 +1301,9 @@ _SET_SOURCE_FROM_BLOB_DECLARATION = ToolDeclaration(
 )
 
 
-def _first_nonempty_csv_row(content: str) -> tuple[str, ...] | None:
+def _first_nonempty_csv_row(content: str, *, delimiter: str = ",") -> tuple[str, ...] | None:
     """Return the first non-empty CSV row, if any."""
-    for row in _bounded_csv_rows(content):
+    for row in _bounded_csv_rows(content, delimiter=delimiter):
         if any(cell.strip() for cell in row):
             return tuple(row)
     return None

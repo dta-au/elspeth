@@ -102,6 +102,7 @@ from elspeth.web.composer.tools.sources import (
     _MIME_TO_SOURCE,
     _delimiter_extra_for_csv_blob,
     _header_only_inline_csv_conflict,
+    _options_with_derived_guarantees,
     _options_with_source_blob_review,
     _reject_manual_source_authoring,
     _reject_manual_source_blob_ref,
@@ -828,6 +829,15 @@ def build_set_pipeline_candidate(
                 legacy_src_options,
                 prepared_inline_blob,
                 existing_options=state.sources["source"].options if "source" in state.sources else None,
+            )
+            # An inline blob IS the run's data: its CSV header is per-row
+            # evidence, so the bound source guarantees the fields it knows
+            # (elspeth-da68332faf; same stamp as _resolve_source_blob).
+            legacy_src_options = _options_with_derived_guarantees(
+                legacy_src_options,
+                plugin=src_plugin,
+                mime_type=prepared_inline_blob.mime_type,
+                content=inline_blob.content,
             )
 
         canonical_error = _canonical_interpretation_requirement_error(

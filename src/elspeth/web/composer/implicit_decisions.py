@@ -35,6 +35,7 @@ DecisionCategory = Literal[
 DecisionProvenance = Literal[
     "composer_selected",
     "default",
+    "derived_from_content",
     "explicit_source_required",
     "picked",
     "policy_required",
@@ -112,7 +113,8 @@ def _source_entries(source: SourceSpec) -> list[ImplicitDecisionEntry]:
             f"source.{field_path}",
             value,
             category=_category_for_source_option(source, field_path),
-            provenance=_provenance_for_path(f"source.{field_path}", value),
+            provenance=_source_provenance(source, field_path, value),
+            note=_note_for_source_option(source, field_path),
         )
         for field_path, value in _flatten_options(
             source.options,
@@ -322,6 +324,50 @@ def _category_for_source_option(source: SourceSpec, field_path: str) -> Decision
     if source.plugin == "llm" and field_path in {"provider", "model", "temperature", "pool_size"}:
         return "model"
     return "source"
+
+
+def _is_content_derived_guarantee(source: SourceSpec, field_path: str) -> bool:
+    """Detect the bind-time content-derived ``schema.guaranteed_fields`` stamp.
+
+    The stamp exists only on blob-bound sources (``blob_ref`` is the structural
+    marker the bind tools write alongside it), where the bound content IS the
+    run's data (elspeth-da68332faf). The final state alone cannot distinguish
+    a planner-authored guarantee on a blob-bound source from the derived one,
+    so this attribution is conservative in the report's documented sense: for
+    blob-bound sources the guarantee is evidenced by the file's content either
+    way — the bind path refuses to stamp anything the header does not carry.
+    """
+    return field_path in ("schema.guaranteed_fields", "schema_config.guaranteed_fields") and "blob_ref" in source.options
+
+
+def _is_structural_blob_rows_guarantee(source: SourceSpec, field_path: str) -> bool:
+    """Detect the blob_rows fixed-row-field guarantee stamped at bind time."""
+    return (
+        field_path in ("schema.guaranteed_fields", "schema_config.guaranteed_fields")
+        and source.plugin == "blob_rows"
+        and "blobs" in source.options
+    )
+
+
+def _source_provenance(source: SourceSpec, field_path: str, value: object) -> DecisionProvenance:
+    if _is_content_derived_guarantee(source, field_path) or _is_structural_blob_rows_guarantee(source, field_path):
+        return "derived_from_content"
+    return _provenance_for_path(f"source.{field_path}", value)
+
+
+def _note_for_source_option(source: SourceSpec, field_path: str) -> str | None:
+    if _is_content_derived_guarantee(source, field_path):
+        return (
+            "Guaranteed fields derived from the bound file's own header at bind "
+            "time — the content, not the planner, is the evidence for this claim."
+        )
+    if _is_structural_blob_rows_guarantee(source, field_path):
+        return (
+            "Guaranteed fields derived from the blob_rows plugin's fixed row "
+            "shape at bind time — the plugin contract, not the planner, is the "
+            "evidence for this claim."
+        )
+    return None
 
 
 def _provenance_for_path(path: str, value: object) -> DecisionProvenance:
