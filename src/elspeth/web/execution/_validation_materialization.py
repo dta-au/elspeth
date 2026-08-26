@@ -102,16 +102,39 @@ def _llm_policy_components(state: CompositionState) -> tuple[_LLMPolicyComponent
         )
         for source_name, source in source_items
     ]
+    # Every PLUGIN-BEARING node, not ``node_type == "transform"`` alone
+    # (elspeth-df8082552d). Keying on ``node.plugin is None`` derives the
+    # subject set from the authority that actually matters here — does this
+    # node host a plugin whose options these gates can act on — instead of
+    # restating the node-kind vocabulary, which is stated by hand in at least
+    # four other places in the tree already (see elspeth-b3117ec3ac).
+    # Plugin-less structural nodes carry inert options and are skipped
+    # exactly as they were before.
+    #
+    # This is LIVE, not a latent tidy-up: ``llm`` on an AGGREGATION node
+    # validates with zero composer errors (the batch-aware constraint is
+    # collector-only, in ``state.py``'s ``_collector_intrinsic_errors``), so
+    # before this widening a web-authored aggregation could carry an
+    # attacker-supplied ``base_url`` past the egress gate and be stopped only
+    # at runtime, by an unrelated check, with a runtime-shaped error instead
+    # of ``llm_base_url_not_allowed``.
+    #
+    # ``component_type`` deliberately stays ``"transform"``: it is a closed
+    # wire Literal, and the readers below branch on it to choose between
+    # "LLM nodes" and "LLM sources" phrasing. Widening THAT would change a
+    # wire vocabulary and a message contract, which a coverage fix has no
+    # business doing. The node kind rides on ``label``, which exists only to
+    # be interpolated into the human-readable ``detail`` string.
     components.extend(
         _LLMPolicyComponent(
             component_id=node.id,
             component_type="transform",
-            label="Transform",
+            label=node.node_type.capitalize(),
             plugin=node.plugin,
             options=node.options,
         )
         for node in state.nodes
-        if node.node_type == "transform"
+        if node.plugin is not None
     )
     return tuple(components)
 
@@ -258,9 +281,25 @@ def materialize_validation_yaml(
 
 
 def validate_managed_identity_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
-    """Reject web-authored managed identity configuration."""
+    """Reject web-authored managed identity configuration.
+
+    Subject set is every PLUGIN-BEARING node (elspeth-df8082552d). This gate
+    is OPTION-shaped — it reads ``options["provider"]`` and
+    ``options["provider_config"]`` and never consults the plugin name — so
+    ``node_type`` was the sole limiter, and a collector or aggregation
+    carrying a managed-identity ``provider_config`` passed it silently.
+    Measured before the fix, with a transform control: transform FIRES,
+    aggregation and collector SILENT.
+
+    Containment was incidental and LATE, never structural: a batch-aware
+    plugin's config model is ``extra="forbid"`` and has no ``provider_config``
+    field, so the composition dies at ``validate_runtime_plugins`` — two
+    phases AFTER this gate, with an unrelated error. The reactivation trigger
+    is one batch-aware plugin adding a ``provider_config`` field to its own
+    config model.
+    """
     for node in materialized.authored.policy.state.nodes:
-        if node.node_type != "transform":
+        if node.plugin is None:
             continue
         policy_error = web_rag_provider_config_policy_error(node.options)
         if policy_error is None:
@@ -270,7 +309,7 @@ def validate_managed_identity_policy(materialized: MaterializedYaml) -> PhaseRep
             failed_check=ValidationCheck(
                 name=CHECK_MANAGED_IDENTITY_POLICY,
                 passed=False,
-                detail=f"Transform '{node.id}' uses disallowed managed identity provider_config",
+                detail=f"{node.node_type.capitalize()} '{node.id}' uses disallowed managed identity provider_config",
                 affected_nodes=(node.id,),
                 outcome_code=None,
             ),
@@ -285,7 +324,7 @@ def validate_managed_identity_policy(materialized: MaterializedYaml) -> PhaseRep
             ),
             readiness=_blocked_readiness(
                 code=CHECK_MANAGED_IDENTITY_POLICY,
-                detail=f"transform {node.id} enables managed identity from web-authored provider_config",
+                detail=f"{node.node_type} {node.id} enables managed identity from web-authored provider_config",
                 component_id=node.id,
                 component_type="transform",
             ),
@@ -306,9 +345,15 @@ def validate_managed_identity_policy(materialized: MaterializedYaml) -> PhaseRep
 
 
 def validate_llm_retry_budget_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
-    """Reject unsafe sequential multi-query LLM retry budgets."""
+    """Reject unsafe sequential multi-query LLM retry budgets.
+
+    Subject set is every PLUGIN-BEARING node (elspeth-df8082552d). Note this
+    gate carries its OWN node walk — it is not fed by
+    ``_llm_policy_components`` despite gating the same plugin, so widening
+    that helper alone would have left this site behind.
+    """
     for node in materialized.authored.policy.state.nodes:
-        if node.node_type != "transform":
+        if node.plugin is None:
             continue
         policy_error = web_llm_retry_budget_policy_error(node.plugin, node.options)
         if policy_error is None:
@@ -318,7 +363,7 @@ def validate_llm_retry_budget_policy(materialized: MaterializedYaml) -> PhaseRep
             failed_check=ValidationCheck(
                 name=CHECK_LLM_RETRY_BUDGET_POLICY,
                 passed=False,
-                detail=f"Transform '{node.id}' uses disallowed sequential multi-query LLM retry budget",
+                detail=f"{node.node_type.capitalize()} '{node.id}' uses disallowed sequential multi-query LLM retry budget",
                 affected_nodes=(node.id,),
                 outcome_code=None,
             ),
@@ -333,7 +378,7 @@ def validate_llm_retry_budget_policy(materialized: MaterializedYaml) -> PhaseRep
             ),
             readiness=_blocked_readiness(
                 code=CHECK_LLM_RETRY_BUDGET_POLICY,
-                detail=f"transform {node.id} uses an unsafe sequential multi-query LLM retry budget",
+                detail=f"{node.node_type} {node.id} uses an unsafe sequential multi-query LLM retry budget",
                 component_id=node.id,
                 component_type="transform",
             ),
