@@ -431,10 +431,31 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     `catalog_kind` may be "sink" rather than "transform". No clause may
     attribute the plugin to a node, and none does.
 
-    Clause order is structural-then-collector, which is NOT the order comment
-    7977 §7.1 lists. Deliberate: it puts "not a transform plugin" directly
-    beside "IS backed by a batch-transform plugin", and that contrast is the
-    whole reason the collector clause exists (comment 7911).
+    Clause order is structural, then collector, then aggregation. Not the order
+    comment 7977 §7.1 lists, deliberately: it puts "not a transform plugin"
+    directly beside "IS backed by a batch-transform plugin", and that contrast
+    is the whole reason the collector clause exists (comment 7911). The two
+    plugin-bearing kinds then sit together.
+
+    AGGREGATION IS THE THIRD PLUGIN-HOSTING KIND, and it has a clause because
+    AGENTS.md WS6 requires every `node_type` dispatch site to carry a collector
+    arm or a deliberate documented exclusion — and under composition a second
+    true clause costs nothing, so an exclusion would have been the more
+    expensive of the two. Its field list is NOT the collector's and was
+    verified separately against `state.py`'s aggregation arm, because the
+    obvious guess is wrong in both directions: an aggregation's mandatory
+    fields are `plugin` and `on_error` (`aggregation_missing_plugin`,
+    `aggregation_missing_on_error`); `trigger` is OPTIONAL — runtime treats a
+    missing or empty trigger as end-of-source-only — and `output_mode` is
+    optional too, merely constrained to `OutputMode` when present. There is no
+    `trigger_kinds` field at all. So an aggregation clause modelled on the
+    collector's "it needs A, B and C" shape would print a falsehood; the
+    asymmetry is real and the clause states it.
+
+    `transform` is the fourth plugin-hosting kind and is deliberately EXCLUDED:
+    it is the DEFAULT reading of an unavailable catalog identity, so a clause
+    saying "a transform is backed by a transform plugin" teaches nothing the
+    frame has not already implied.
 
     Collector is also deliberately absent from `_STRUCTURAL_NODE_TYPES` itself.
     That tuple is a copy-trigger keyword list whose sole membership rule is that
@@ -455,6 +476,12 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
             "A collector is a built-in topology node that IS backed by a batch-transform plugin, and it closes "
             "an EXPAND scope — it needs scope_name, scope_opener and scope_policy. Name the batch behaviour you "
             "want and the scope it should close. "
+        )
+    if _message_names_identifier(user_message, "aggregation"):
+        clauses.append(
+            "An aggregation is a built-in topology node that IS backed by a batch-transform plugin, and it "
+            "needs on_error; its trigger is optional and defaults to firing once at end of source. Name the "
+            "batch behaviour you want. "
         )
     message = (
         "I kept that future-stage instruction, but its structure was not verified. "

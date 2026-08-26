@@ -47,7 +47,16 @@ _COLLECTOR_CLAUSE = (
     "an EXPAND scope — it needs scope_name, scope_opener and scope_policy. Name the batch behaviour you "
     "want and the scope it should close. "
 )
+_AGGREGATION_CLAUSE = (
+    "An aggregation is a built-in topology node that IS backed by a batch-transform plugin, and it "
+    "needs on_error; its trigger is optional and defaults to firing once at end of source. Name the "
+    "batch behaviour you want. "
+)
 _FRAME_CLOSE = "Clarify the concrete topology structure and I'll firm it up."
+_AGGREGATION_MESSAGE = "Later add an aggregation that rolls the scored rows up per customer."
+_AGGREGATION_AND_COLLECTOR_MESSAGE = (
+    "Later add a collector to stitch the exploded pages back together and an aggregation to roll them up per customer."
+)
 
 
 def _catalog(*, available: frozenset[PluginId]) -> PolicyCatalogView:
@@ -269,6 +278,57 @@ def test_collector_clause_stays_true_beside_a_successfully_saved_sibling_action(
         "I saved that instruction for the topology stage. " + _FRAME_OPEN + _COLLECTOR_CLAUSE + _FRAME_CLOSE
     )
     assert "collector request" not in result.chat.assistant_message
+
+
+def test_aggregation_gets_its_own_clause_with_its_own_field_list() -> None:
+    """Aggregation is the third plugin-hosting kind and carries a clause too.
+
+    AGENTS.md WS6 requires every `node_type` dispatch site to carry a collector
+    arm or a deliberate documented exclusion; under composition a second true
+    clause is cheaper than the exclusion paragraph.
+
+    The point of this test is the FIELD LIST, not the presence of the clause.
+    An aggregation's mandatory fields are `plugin` and `on_error`. `trigger` is
+    OPTIONAL — a missing or empty trigger means end-of-source-only — and there
+    is no `trigger_kinds` field anywhere. Copying the collector clause's
+    "it needs A, B and C" shape onto aggregation would therefore ship a
+    falsehood, so the assertions below pin the asymmetry directly.
+    """
+
+    result = _apply(
+        _action("rollup_stats"),
+        catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+        message=_AGGREGATION_MESSAGE,
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.chat.assistant_message == _FRAME_OPEN + _AGGREGATION_CLAUSE + _FRAME_CLOSE
+    # The collector's scope binding must never be attributed to an aggregation.
+    assert "scope_name" not in result.chat.assistant_message
+    assert "EXPAND scope" not in result.chat.assistant_message
+    # No such field exists; naming it would be fabrication.
+    assert "trigger_kinds" not in result.chat.assistant_message
+    # An aggregation is NOT plugin-free, so the structural clause must not fire.
+    assert "An aggregation is a built-in topology node, not a transform plugin" not in result.chat.assistant_message
+
+
+def test_all_three_plugin_bearing_and_structural_clauses_compose_in_one_frame() -> None:
+    """Two plugin-bearing kinds in one message get two clauses, one frame.
+
+    Same additive property as the collector/gate pair, extended to the kind
+    added last. Ordering is structural, then collector, then aggregation.
+    """
+
+    result = _apply(
+        _action("rollup_stats"),
+        catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+        message=_AGGREGATION_AND_COLLECTOR_MESSAGE,
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.chat.assistant_message == _FRAME_OPEN + _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE + _FRAME_CLOSE
+    assert result.chat.assistant_message.count(_FRAME_OPEN) == 1
+    assert result.chat.assistant_message.count(_FRAME_CLOSE) == 1
 
 
 def test_unmentioned_unavailable_identity_cannot_bypass_same_stage_rejection() -> None:
