@@ -114,8 +114,13 @@ const PARALLEL_HANDLE_INSET = 16;
 // backend authority and the ONLY place the rule is decided:
 //
 //     if node.on_success is not None: return node.on_success
-//     if node.node_type in {"queue", "coalesce"}: return node.id
+//     if node.node_type in {"queue", "coalesce", "aggregation"}: return node.id
 //     return None
+//
+// `aggregation` is in that set for the same reason coalesce is:
+// `AggregationSettings.on_success` is `str | None = None`, and
+// `core/dag/builder.py` registers `agg_settings.name` when it is omitted.
+// It was missed on the first pass here and in the Python.
 //
 // Do not re-derive it from `on_success` here. `CoalesceSettings.on_success` is
 // OPTIONAL ("Required when coalesce is terminal"), and a queue never declares
@@ -127,6 +132,7 @@ const PARALLEL_HANDLE_INSET = 16;
 const IMPLICIT_SELF_PUBLISHING_NODE_TYPES: ReadonlySet<string> = new Set([
   "queue",
   "coalesce",
+  "aggregation",
 ]);
 
 function publishedSuccessConnection(node: {

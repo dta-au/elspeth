@@ -202,6 +202,77 @@ class TestStructuralRejectionCodes:
         assert _entries_with_code(result, "no_source_configured")
         assert _entries_with_code(result, "no_sinks_configured")
 
+    def test_an_implicit_aggregation_is_a_reachable_producer(self) -> None:
+        """An aggregation that omits on_success publishes under its own NAME.
+
+        ``AggregationSettings.on_success`` is ``str | None = None`` and
+        ``core/dag/builder.py`` does ``if agg_settings.on_success is None:
+        register_producer(agg_settings.name, ...)``. The composer's reachable-
+        target set restated that rule by hand and covered only ``coalesce``, so
+        a pipeline the runtime builds and runs was rejected here with
+        ``node_input_not_reachable`` on the aggregation's CONSUMER — an
+        authoring dead end with nothing for the repair loop to fix.
+        """
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="agg",
+                node_type="aggregation",
+                plugin="row_batcher",
+                input="rows",
+                on_success=None,
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(_make_transform("reader", "agg", "main"))
+        state = state.with_output(_make_output())
+        result = state.validate()
+        assert not _entries_with_code(result, "node_input_not_reachable"), [e.to_dict() for e in result.errors]
+
+    def test_an_orphan_queue_is_still_unreachable(self) -> None:
+        """The guard the aggregation arm must NOT dissolve.
+
+        A queue's ``input`` IS its own id (``queue_node_contract_error``
+        enforces it), so if the reachable-target set added every implicit
+        self-publisher's id — the shape ``published_success_connection``
+        returns — a queue would satisfy its OWN input and this rejection would
+        silently disappear. Queue is therefore deliberately excluded at that
+        one site; coalesce and aggregation are safe because their ``input``
+        names a different connection.
+        """
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="q",
+                node_type="queue",
+                plugin=None,
+                input="q",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(_make_transform("reader", "q", "main"))
+        state = state.with_output(_make_output())
+        result = state.validate()
+        assert not result.is_valid
+        assert _entries_with_code(result, "node_input_not_reachable"), [e.to_dict() for e in result.errors]
+
     def test_unreachable_input_carries_code(self) -> None:
         state = _empty_state()
         state = state.with_source(_make_source(on_success="rows"))

@@ -387,6 +387,22 @@ class TestPublishedSuccessConnection:
         node = _node("merge", plugin=None, node_type="coalesce", input="a_out", on_success="main")
         assert published_success_connection(node) == "main", "a declared on_success always wins"
 
+    def test_aggregation_without_on_success_publishes_under_its_own_id(self):
+        """Missed on the first pass of this helper — the authority is builder.py.
+
+        ``AggregationSettings.on_success`` is ``str | None = None``; when it is
+        omitted ``core/dag/builder.py`` registers ``agg_settings.name`` as the
+        producer. Excluding aggregation made the composer reject a pipeline the
+        runtime builds and runs.
+        """
+        node = _node("agg", plugin="row_batcher", node_type="aggregation", input="rows")
+        assert node.on_success is None, "the shape under test: on_success omitted"
+        assert published_success_connection(node) == "agg"
+
+    def test_aggregation_with_on_success_publishes_under_it(self):
+        node = _node("agg", plugin="row_batcher", node_type="aggregation", input="rows", on_success="next")
+        assert published_success_connection(node) == "next"
+
     def test_queue_publishes_under_its_own_id(self):
         node = _node("inbound", plugin=None, node_type="queue", input="inbound")
         assert published_success_connection(node) == "inbound"

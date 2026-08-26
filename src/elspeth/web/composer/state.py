@@ -1888,10 +1888,25 @@ def _runtime_connection_targets(
     for source in sources.values():
         targets.add(source.on_success)
     for node in nodes:
-        if node.node_type == "coalesce" and node.on_success is None:
-            targets.add(node.id)
-        elif node.on_success is not None:
+        # Deliberately NOT ``published_success_connection`` — this is the one
+        # site that must exclude ``queue``. A queue's ``input`` IS its own id
+        # (``queue_node_contract_error`` enforces it), so adding a queue's id
+        # to the reachable TARGET set would let the queue satisfy its own
+        # input and silently delete the orphan-queue ``node_input_not_reachable``
+        # check that this function exists to make possible.
+        #
+        # The implicit-publisher kinds that ARE safe here are the ones whose
+        # ``input`` names a DIFFERENT connection, so reaching them still
+        # requires a real upstream producer: coalesce, and aggregation
+        # (``AggregationSettings.on_success`` is ``str | None = None``, and
+        # ``core/dag/builder.py`` registers ``agg_settings.name`` when it is
+        # omitted). Aggregation was missing here, so a pipeline the runtime
+        # builds and runs was rejected with ``node_input_not_reachable`` on
+        # the aggregation's consumer.
+        if node.on_success is not None:
             targets.add(node.on_success)
+        elif node.node_type in ("coalesce", "aggregation"):
+            targets.add(node.id)
         if node.on_error is not None and node.on_error != "discard":
             targets.add(node.on_error)
         if node.routes is not None:
