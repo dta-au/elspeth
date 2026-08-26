@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from typing import ClassVar
 
 import elspeth
+from elspeth.core.config import (
+    AggregationSettings,
+    CoalesceSettings,
+    CollectorSettings,
+    GateSettings,
+    QueueSettings,
+    RowUnionSettings,
+    TransformSettings,
+)
 from elspeth.web.composer._producer_resolver import (
     _IMPLICIT_SELF_PUBLISHING_NODE_TYPES,
     ProducerResolver,
     published_success_connection,
 )
-from elspeth.web.composer.state import NodeSpec, SourceSpec
+from elspeth.web.composer.state import COMPOSER_NODE_TYPES, NodeSpec, SourceSpec
 
 _STATE_SOURCE_PATH = Path(elspeth.__file__).parent / "web" / "composer" / "state.py"
 
@@ -549,4 +559,98 @@ class TestRuntimeConnectionTargetsRestatement:
             "`queue` was added to `_runtime_connection_targets`'s literal. A queue's `input` IS its own id, "
             "so a queue's id in the reachable TARGET set lets an orphan queue satisfy its own input — "
             "silently deleting the `node_input_not_reachable` check this function exists to make possible."
+        )
+
+
+class TestEveryNodeKindIsAdjudicatedForImplicitPublishing:
+    """No node kind may sit in or out of the self-publisher set unadjudicated.
+
+    ``aggregation`` was missing from ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES``
+    not because anyone decided it did not belong, but because nobody decided
+    anything about it — the set was written from the two kinds in view, and the
+    comment enumerating the exclusions read as considered while never having
+    considered aggregation at all. Silence is the failure mode this test
+    removes; the AST guard above pins ONE site against the set, this pins the
+    set against the runtime.
+
+    Membership is DERIVED from the runtime settings models, which is where the
+    fact actually lives (``core/dag/builder.py`` registers a producer under the
+    node's own name exactly when ``on_success`` is absent from the config).
+    Each composer node kind must land in exactly one population:
+
+    * ``on_success`` REQUIRED   -> never publishes implicitly, must be OUT;
+    * ``on_success`` OPTIONAL   -> publishes under its own id when omitted,
+      must be IN;
+    * ``on_success`` ABSENT from the model -> the kind does not have a success
+      channel at all, and only an explicit ruling below can place it.
+
+    A new node kind, or an existing kind whose ``on_success`` optionality
+    changes, lands in no population and fails here with the ways to discharge
+    it. That is the point: this test would have failed on the day
+    ``aggregation`` was left out.
+    """
+
+    # The two kinds whose runtime model has NO ``on_success`` field, each with
+    # the ruling that places it. Field-absence alone cannot decide membership,
+    # so these are adjudicated by hand and by hand ONLY here.
+    _ABSENT_FIELD_RULINGS: ClassVar[dict[str, bool]] = {
+        # A queue never declares on_success; its id IS the connection its
+        # predecessors publish to and its consumers read from.
+        "queue": True,
+        # A gate's output is described by routes / fork_to, not by a success
+        # channel — giving it an implicit id would invent a connection the DAG
+        # builder does not resolve.
+        "gate": False,
+    }
+
+    @staticmethod
+    def _runtime_settings_by_node_type() -> dict[str, type]:
+        return {
+            "transform": TransformSettings,
+            "aggregation": AggregationSettings,
+            "coalesce": CoalesceSettings,
+            "row_union": RowUnionSettings,
+            "collector": CollectorSettings,
+            "queue": QueueSettings,
+            "gate": GateSettings,
+        }
+
+    def test_every_composer_node_kind_has_a_runtime_model_to_derive_from(self) -> None:
+        """The coverage gate: a new composer kind cannot skip adjudication."""
+        mapped = set(self._runtime_settings_by_node_type())
+        assert mapped == set(COMPOSER_NODE_TYPES), (
+            "Composer node kinds without a runtime settings model mapped here: "
+            f"{sorted(set(COMPOSER_NODE_TYPES) - mapped)}; mapped kinds the composer does not define: "
+            f"{sorted(mapped - set(COMPOSER_NODE_TYPES))}. Map the kind to its runtime settings class so "
+            "the test below can derive whether it publishes implicitly."
+        )
+
+    def test_every_node_kind_is_adjudicated_for_implicit_publishing(self) -> None:
+        should_publish: dict[str, bool] = {}
+        for node_type, settings_cls in self._runtime_settings_by_node_type().items():
+            field = settings_cls.model_fields.get("on_success")
+            if field is None:
+                assert node_type in self._ABSENT_FIELD_RULINGS, (
+                    f"'{node_type}' has no `on_success` field in {settings_cls.__name__}, so optionality "
+                    "cannot decide whether it publishes under its own id. Add an explicit ruling to "
+                    "_ABSENT_FIELD_RULINGS with the reason, the way queue and gate carry one."
+                )
+                should_publish[node_type] = self._ABSENT_FIELD_RULINGS[node_type]
+                continue
+            # Required => the author must always name a target, so the kind can
+            # never fall back to its own id. Optional => omitting it is exactly
+            # the case builder.py registers under the node's own name.
+            should_publish[node_type] = not field.is_required()
+
+        expected = {node_type for node_type, publishes in should_publish.items() if publishes}
+        actual = set(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES)
+
+        assert actual == expected, (
+            "`_IMPLICIT_SELF_PUBLISHING_NODE_TYPES` has drifted from the runtime models it describes.\n"
+            f"  missing (runtime says these publish implicitly): {sorted(expected - actual)}\n"
+            f"  extra   (runtime says these do NOT):             {sorted(actual - expected)}\n"
+            "A kind whose runtime `on_success` is OPTIONAL publishes under its own id when the author "
+            "omits it — `core/dag/builder.py` registers it by name — so the composer must say so too, or "
+            "it will reject a pipeline the runtime builds and runs. This is the exact defect that shipped "
+            "when `aggregation` was left out."
         )
