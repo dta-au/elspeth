@@ -62,6 +62,23 @@ def _names_a_row_key(name: str) -> bool:
         return False
 
 
+def _is_static_normalized_source(source: str) -> bool:
+    """Return True when config-time contract math can use ``source``.
+
+    Only a normalization fixed point names a row key config time can state; see
+    ``_names_a_row_key``. Dotted sources are nested reads, not row keys, so they
+    are excluded here and in every complement of this predicate.
+
+    Module-level because BOTH the config model and the transform ask it —
+    ``FieldMapperConfig.declared_input_fields`` derives the node's input
+    requirement from the mapping, and ``FieldMapper`` does its constructor
+    contract math — and the two must never drift into disagreeing about which
+    sources are nameable. ``FieldMapper._is_static_normalized_source`` delegates
+    here rather than restating the test.
+    """
+    return "." not in source and _names_a_row_key(source)
+
+
 def _canonical_row_key(name: str) -> str:
     """The row key a mapping literal collapses to when ``process`` uses it.
 
@@ -133,6 +150,44 @@ class FieldMapperConfig(TransformDataConfig):
     )
     select_only: bool = Field(default=False, description="When true, emit only fields named in the mapping.")
     strict: bool = Field(default=False, description="When true, fail if any mapped source field is missing from an input row.")
+
+    @property
+    def declared_input_fields(self) -> frozenset[str]:
+        """Mapping SOURCES are input fields this transform requires.
+
+        Configuring ``mapping: {source: target}`` IS the author's assertion that
+        ``source`` arrives on the row — the mapping names the field exactly, so
+        the requirement is DERIVED here rather than restated by hand in
+        ``required_input_fields`` (elspeth-d4ae04b374). Without it a mapping
+        naming a field that never arrives produced no error and no quarantine:
+        ``process`` skips a ``MISSING`` source in non-strict mode, so the column
+        simply vanished from the output.
+
+        Joining ``declared_input_fields`` — rather than the explicit
+        ``required_input_fields`` option — is what makes that enforceable.
+        ``validate_transform_declared_input_fields`` (and the composer's mirror
+        of it) gate on the producer's ``EffectiveGuaranteeVote.participated``,
+        so an OBSERVED or otherwise abstaining upstream, which promises nothing
+        because nothing was declared rather than because the field is absent,
+        stays runnable and enforced per-row by the executor's pre-emission
+        check. The explicit option routes instead through ``validate_edge_schemas``
+        Phase 1, a bare set subtraction that fails closed against exactly those
+        upstreams — right for a promise the author wrote by hand, wrong for one
+        inferred from a rename.
+
+        Sources config time cannot resolve to a row key ABSTAIN, via the same
+        predicate the rest of this plugin's contract math uses: a DOTTED source
+        is a nested read rather than a row key, and a non-fixed-point of
+        ``normalize_field_name`` reaches ``process`` through
+        ``contract.resolve_name``, so which key it names is unknowable until a
+        row arrives (elspeth-f262a8c678).
+
+        Note the DIRECTION. This requires mapping SOURCES only. Requiring rename
+        TARGETS on input is the elspeth-d6eeb3a71d trap — they are fields this
+        node CREATES, which is why ``self_created_input_fields`` demotes every
+        one of them.
+        """
+        return super().declared_input_fields | frozenset(source for source in self.mapping if _is_static_normalized_source(source))
 
     @model_validator(mode="after")
     def _reject_duplicate_targets(self) -> FieldMapperConfig:
@@ -227,7 +282,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:38f16119ef68bd98"
+    source_file_hash: str | None = "sha256:e44845bae4843de6"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -301,7 +356,7 @@ class FieldMapper(BaseTransform):
         # so the removal is equally unnameable here.
         #
         # Deliberately WITHOUT `_build_field_mapper_output_schema_config`'s
-        # `source in base_guaranteed` filter: that set is the node's own
+        # `source in admitted_on_input` filter: that set is the node's own
         # AUTHORED guarantees, whereas this rule is applied to fields proven
         # present by the upstream walk, which the authored config never names.
         self.forwards_input_fields = not cfg.select_only and not any(self._is_unresolved_original_source(source) for source in cfg.mapping)
@@ -330,7 +385,7 @@ class FieldMapper(BaseTransform):
         state; see ``_names_a_row_key``. Dotted sources are nested reads, not
         row keys, so they are excluded here and in the complement below.
         """
-        return "." not in source and _names_a_row_key(source)
+        return _is_static_normalized_source(source)
 
     @staticmethod
     def _is_unresolved_original_source(source: str) -> bool:
@@ -348,14 +403,14 @@ class FieldMapper(BaseTransform):
         cls,
         cfg: FieldMapperConfig,
         source: str,
-        base_guaranteed: set[str],
+        input_fields_present: set[str],
     ) -> bool:
         """Whether target exists on every successful row for this mapping."""
         if cls._is_unresolved_original_source(source):
             return False
         if cfg.strict:
             return True
-        return cls._is_static_normalized_source(source) and source in base_guaranteed
+        return cls._is_static_normalized_source(source) and source in input_fields_present
 
     @property
     def self_created_input_fields(self) -> frozenset[str]:
@@ -458,11 +513,17 @@ class FieldMapper(BaseTransform):
         implicit type-system guarantees the wider predicate adds are exactly the
         ones ``select_only`` consumes rather than collides with.
         """
-        base_guaranteed = set(cfg.schema_config.guaranteed_fields or ())
+        # NOT ``_admitted_input_fields`` — see this method's docstring. The two
+        # sites deliberately hold DIFFERENT sets, so they carry different names
+        # (elspeth-c84fa33f75's naming finding: one local name over two
+        # semantics is what invited the raw-tuple read in the first place).
+        # This one is the AUTHOR'S EXPLICIT promise; the emit-description site
+        # binds ``admitted_on_input``, which is wider.
+        explicitly_promised_on_input = set(cfg.schema_config.guaranteed_fields or ())
         return frozenset(
             target
             for source, target in cfg.mapping.items()
-            if source != target and cls._mapping_target_is_guaranteed(cfg, source, base_guaranteed)
+            if source != target and cls._mapping_target_is_guaranteed(cfg, source, explicitly_promised_on_input)
         )
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
@@ -558,9 +619,13 @@ class FieldMapper(BaseTransform):
         When select_only=False: output guarantees are input fields MINUS removed
             sources PLUS new targets.
         """
-        base_guaranteed = self._admitted_input_fields(cfg)
+        # Wider than ``_derive_declared_output_fields``'s
+        # ``explicitly_promised_on_input``, and deliberately so: this describes
+        # what the node EMITS, where the type system's implicit guarantees
+        # count. That site feeds the collision TRIGGER, where they must not.
+        admitted_on_input = self._admitted_input_fields(cfg)
         guaranteed_targets = {
-            target for source, target in cfg.mapping.items() if self._mapping_target_is_guaranteed(cfg, source, base_guaranteed)
+            target for source, target in cfg.mapping.items() if self._mapping_target_is_guaranteed(cfg, source, admitted_on_input)
         }
 
         if cfg.select_only:
@@ -579,9 +644,9 @@ class FieldMapper(BaseTransform):
                 removed_sources = {
                     source
                     for source, target in cfg.mapping.items()
-                    if source != target and self._is_static_normalized_source(source) and source in base_guaranteed
+                    if source != target and self._is_static_normalized_source(source) and source in admitted_on_input
                 }
-                passthrough_fields = base_guaranteed - removed_sources
+                passthrough_fields = admitted_on_input - removed_sources
             output_fields = passthrough_fields | guaranteed_targets
 
         # Always include declared_output_fields (targets that aren't also sources)

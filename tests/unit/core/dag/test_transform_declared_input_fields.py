@@ -588,3 +588,125 @@ class TestVoteCarriesClosedness:
 
         assert vote.participated is False
         assert vote.closed is False
+
+
+def _field_mapper_settings(*, mapping: dict[str, str], source_mode: str) -> Any:
+    """The live defect's shape: a typed CSV source {colour,hex_code} -> field_mapper -> json sink."""
+    from elspeth.core.config import (
+        ElspethSettings,
+        SinkSettings,
+        SourceSettings,
+        TransformSettings,
+    )
+
+    source_schema: dict[str, Any] = (
+        {"mode": "fixed", "fields": ["colour: str", "hex_code: str"]} if source_mode == "fixed" else {"mode": "observed"}
+    )
+    return ElspethSettings(
+        sources={
+            "primary": SourceSettings(
+                plugin="csv",
+                on_success="raw",
+                options={"path": "input.csv", "on_validation_failure": "discard", "schema": source_schema},
+            )
+        },
+        transforms=[
+            TransformSettings(
+                name="tidy",
+                plugin="field_mapper",
+                input="raw",
+                on_success="output",
+                on_error="discard",
+                options={"mapping": mapping, "select_only": True, "schema": {"mode": "observed"}},
+            )
+        ],
+        sinks={
+            "output": SinkSettings(
+                plugin="json",
+                on_write_failure="discard",
+                options={"path": "out.jsonl", "format": "jsonl", "schema": {"mode": "observed"}},
+            )
+        },
+    )
+
+
+class TestFieldMapperMappingSourceBuildPath:
+    """A mapping SOURCE is an asserted input field (elspeth-d4ae04b374).
+
+    The reported defect: a planner authored ``mapping`` backwards, naming the
+    DESIRED OUTPUT name as the key. field_mapper's ``process`` skips a MISSING
+    source in non-strict mode, so the run completed with 10/10 rows succeeding
+    and the column simply absent from the CSV. Configuring the mapping IS the
+    assertion that the source arrives, so it must fail the BUILD.
+    """
+
+    def test_backwards_mapping_against_a_typed_source_is_rejected(self) -> None:
+        """At HEAD this built green and dropped the column at runtime."""
+        settings = _field_mapper_settings(
+            mapping={"colour": "colour", "recommended_pairing": "complementary_colour", "hex_code": "hex_code"},
+            source_mode="fixed",
+        )
+
+        with pytest.raises(GraphValidationError) as excinfo:
+            _build(settings)
+
+        message = str(excinfo.value)
+        assert "recommended_pairing" in message
+        # The verdict must be RIGHT FOR THE RIGHT REASON. Erroring because the
+        # producer guarantees nothing at all would name every mapping source and
+        # pass a bare substring check while telling the author nothing.
+        assert "colour" not in message.replace("complementary_colour", "").replace("recommended_pairing", "")
+        assert "hex_code" not in message
+
+    def test_corrected_mapping_builds(self) -> None:
+        """Baseline: the repaired mapping the ticket recommends must build."""
+        settings = _field_mapper_settings(
+            mapping={"colour": "colour", "hex_code": "hex_code"},
+            source_mode="fixed",
+        )
+
+        _build(settings)
+
+    def test_backwards_mapping_against_an_observed_source_abstains(self) -> None:
+        """An observed source promises nothing because nothing was DECLARED.
+
+        Its guarantee set is empty for want of a promise, not because the column
+        is absent, so rejecting here would refuse the composer's default
+        authoring shape for every field_mapper. Enforcement stays per-row.
+        """
+        settings = _field_mapper_settings(
+            mapping={"colour": "colour", "recommended_pairing": "complementary_colour"},
+            source_mode="observed",
+        )
+
+        _build(settings)
+
+    def test_rename_targets_are_not_required_on_input(self) -> None:
+        """Requiring a rename TARGET is the elspeth-d6eeb3a71d trap.
+
+        ``hex`` is CREATED by this node; the upstream never carries it, and
+        ``self_created_input_fields`` demotes it for exactly this reason. Only
+        SOURCES are required.
+        """
+        settings = _field_mapper_settings(
+            mapping={"colour": "colour", "hex_code": "hex"},
+            source_mode="fixed",
+        )
+
+        graph = _build(settings)
+
+        info = next(data["info"] for _nid, data in graph._graph.nodes(data=True) if data["info"].node_type == NodeType.TRANSFORM)
+        assert info.declared_input_fields == frozenset({"colour", "hex_code"})
+        assert "hex" not in info.declared_input_fields
+
+    def test_projection_reaches_node_info(self) -> None:
+        """The builder must carry the derived declaration verbatim onto the node."""
+        settings = _field_mapper_settings(
+            mapping={"colour": "colour", "hex_code": "hex_code"},
+            source_mode="fixed",
+        )
+
+        graph = _build(settings)
+
+        info = next(data["info"] for _nid, data in graph._graph.nodes(data=True) if data["info"].node_type == NodeType.TRANSFORM)
+        assert info.declared_input_fields == frozenset({"colour", "hex_code"})

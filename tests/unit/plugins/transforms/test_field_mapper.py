@@ -1166,7 +1166,13 @@ class TestFieldMapperDeclaredOutputFieldContracts:
 
         transform = FieldMapper(
             {
-                "schema": DECLARED_SCHEMA,
+                # `raw_cuisine` is DECLARED, unlike DECLARED_SCHEMA: a mapping
+                # source is a configured READ, and a mode: fixed schema is
+                # extra='forbid', so a row carrying an undeclared source dies at
+                # input validation and the rename could never fire. Construction
+                # rejects that as incoherent (elspeth-d3958d90f5). The restamp
+                # under test is unaffected — only the config is made coherent.
+                "schema": {"mode": "fixed", "fields": ["dish: str", "cuisine: str", "raw_cuisine: str"]},
                 "mapping": {"raw_cuisine": "cuisine"},
             }
         )
@@ -1871,3 +1877,84 @@ class TestSelectOnlyDoesNotArmTheCollisionCheck:
 
         assert result.status == "success"
         assert result.row.to_dict() == {"b": "1"}
+
+
+class TestFieldMapperDerivedInputRequirement:
+    """``mapping`` sources become ``declared_input_fields`` (elspeth-d4ae04b374).
+
+    John's ruling: "the field mapper should assert a required field when it's
+    configured." Configuring ``mapping: {source: target}`` IS that assertion,
+    so the requirement is DERIVED from the mapping rather than restated by hand
+    in ``required_input_fields`` — a guard must derive from the authority it
+    enforces.
+
+    ``declared_input_fields`` is the right channel rather than the explicit
+    option because its build-time enforcement gates on the producer's
+    ``EffectiveGuaranteeVote.participated``; the explicit option routes through
+    ``validate_edge_schemas`` Phase 1, a bare set subtraction that also rejects
+    an OBSERVED upstream — which promises nothing because nothing was declared,
+    not because the field is absent.
+    """
+
+    @staticmethod
+    def _config(**overrides: object) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
+
+        options: dict[str, object] = {"schema": DYNAMIC_SCHEMA, "mapping": {"colour": "colour"}}
+        options.update(overrides)
+        return FieldMapperConfig.from_dict(options, plugin_name="field_mapper")
+
+    def test_identity_and_rename_sources_are_both_required(self) -> None:
+        """An identity mapping asserts its source just as a rename does."""
+        config = self._config(mapping={"colour": "colour", "complementary_colour": "recommended_pairing"})
+
+        assert config.declared_input_fields == frozenset({"colour", "complementary_colour"})
+
+    def test_rename_targets_are_not_required(self) -> None:
+        """Targets are CREATED here; requiring them on input is elspeth-d6eeb3a71d."""
+        config = self._config(mapping={"colour": "colour", "complementary_colour": "recommended_pairing"})
+
+        assert "recommended_pairing" not in config.declared_input_fields
+
+    def test_dotted_sources_abstain(self) -> None:
+        """A dotted source is a nested READ, never a row key."""
+        config = self._config(mapping={"meta.origin": "origin", "colour": "colour"})
+
+        assert config.declared_input_fields == frozenset({"colour"})
+
+    @pytest.mark.parametrize("source", ["First Name", "B", "Name", "userID", "class"])
+    def test_non_fixed_point_sources_abstain(self, source: str) -> None:
+        """Config time cannot say which row key these name (elspeth-f262a8c678).
+
+        ``normalize_field_name`` lowercases and keyword-suffixes, so each of
+        these reaches ``process`` through ``contract.resolve_name``. Claiming
+        them as required would reject pipelines that run.
+        """
+        config = self._config(mapping={source: "target"})
+
+        assert config.declared_input_fields == frozenset()
+
+    def test_explicit_required_input_fields_are_unioned_not_replaced(self) -> None:
+        """An author may still declare extra requirements the mapping never names."""
+        config = self._config(mapping={"colour": "colour"}, required_input_fields=["audit_id"])
+
+        assert config.declared_input_fields == frozenset({"colour", "audit_id"})
+
+    def test_empty_mapping_declares_nothing(self) -> None:
+        """A field_mapper with no mapping asserts no input contract."""
+        config = self._config(mapping={})
+
+        assert config.declared_input_fields == frozenset()
+
+    def test_transform_instance_carries_the_derivation(self) -> None:
+        """The declaration must survive construction, not just live on the config."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "mapping": {"colour": "colour", "complementary_colour": "recommended_pairing"},
+            }
+        )
+
+        assert transform.declared_input_fields == frozenset({"colour", "complementary_colour"})

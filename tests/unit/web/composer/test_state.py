@@ -5039,7 +5039,12 @@ class TestSchemaContractValidation:
                 options={
                     "schema": {
                         "mode": "fixed",
-                        "fields": ["body: str"],
+                        # 'text' is DECLARED because it is a mapping SOURCE and
+                        # therefore a configured READ (elspeth-d4ae04b374); a
+                        # fixed schema omitting it is rejected at construction
+                        # (elspeth-d3958d90f5), which would build no probe at
+                        # all and make this lifecycle assertion vacuous.
+                        "fields": ["body: str", "text: str"],
                         "required_fields": ["body"],
                     },
                     "mapping": {"text": "body"},
@@ -5072,7 +5077,9 @@ class TestSchemaContractValidation:
             "main",
             plugin="field_mapper",
             options={
-                "schema": {"mode": "fixed", "fields": ["body: str"]},
+                # 'text' declared for the same reason as the sibling probe
+                # test above: a mapping source is a configured read.
+                "schema": {"mode": "fixed", "fields": ["body: str", "text: str"]},
                 "mapping": {"text": "body"},
                 "select_only": True,
                 "strict": True,
@@ -6203,7 +6210,13 @@ class TestSchemaContractValidation:
                     # metadata so Rule C runs at all (elspeth-a2bf676e6f).
                     "mapping": {"url": "url", "maybe_missing": "bogus"},
                     "schema": {
-                        "mode": "fixed",
+                        # flexible, not fixed: 'maybe_missing' is a mapping
+                        # SOURCE and therefore a configured READ
+                        # (elspeth-d4ae04b374), absent from fields on purpose so
+                        # 'bogus' stays unguaranteed. Under extra='forbid' that
+                        # read could never fire and construction rejects it
+                        # (elspeth-d3958d90f5).
+                        "mode": "flexible",
                         "fields": ["url: str", "bogus: str"],
                         "guaranteed_fields": ["url"],
                     },
@@ -6247,8 +6260,28 @@ class TestSchemaContractValidation:
         *,
         sink_requires: str | None = None,
         select_only: Any = True,
+        schema_mode: str = "fixed",
     ) -> CompositionState:
-        """A minimal source -> field_mapper -> sink composition for Rule C."""
+        """A minimal source -> field_mapper -> sink composition for Rule C.
+
+        ``schema_mode`` exists because these fixtures state a mapping SOURCE
+        deliberately absent from ``fields`` — that asymmetry is what leaves the
+        target unguaranteed and is the point of Rule C. Since
+        elspeth-d4ae04b374 a mapping source is a configured READ
+        (``FieldMapperConfig.declared_input_fields``), and ``mode: fixed`` is
+        ``extra='forbid'``, so for a source config time CAN name, a row carrying
+        it dies at input validation and the mapping could never fire —
+        construction rejects that as incoherent (elspeth-d3958d90f5). Those
+        cases pass ``schema_mode="flexible"``, which keeps the fixture
+        buildable AND the target unguaranteed.
+
+        The default stays ``fixed`` deliberately. A source config time CANNOT
+        name — a non-fixed-point like ``'Name'``, or a dotted nested read —
+        ABSTAINS from ``declared_input_fields``, so it never reaches that
+        construction check and builds fine under ``fixed``. Those tests assert
+        that Rule C's remedy ADVISES ``schema.mode: flexible``, so their fixture
+        must not already be flexible or they would stop proving it.
+        """
         state = self._empty_state()
         state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
         state = state.with_node(
@@ -6257,7 +6290,7 @@ class TestSchemaContractValidation:
                 "t1",
                 "main",
                 plugin="field_mapper",
-                options={"select_only": select_only, "mapping": mapping, "schema": {"mode": "fixed", "fields": fields}},
+                options={"select_only": select_only, "mapping": mapping, "schema": {"mode": schema_mode, "fields": fields}},
             )
         )
         # The sink is what makes a withdrawn guarantee visible. Against a
@@ -6370,7 +6403,7 @@ class TestSchemaContractValidation:
         named field alone tells the author to edit a string their config does
         not contain. That edit is accepted and changes nothing.
         """
-        result = self._rule_c_state({"first_name": "fname"}, ["fname: str"]).validate()
+        result = self._rule_c_state({"first_name": "fname"}, ["fname: str"], schema_mode="flexible").validate()
         error = self._rule_c_error(result)
         assert error is not None, [e.error_code for e in result.errors]
         assert "'first_name'" in error.message, error.message
@@ -6384,7 +6417,7 @@ class TestSchemaContractValidation:
         EMITTED name as an input field it never receives, which trades Rule C
         for a schema_contract_violation on the input edge.
         """
-        before = self._rule_c_state({"first_name": "fname"}, ["fname: str"], sink_requires="fname").validate()
+        before = self._rule_c_state({"first_name": "fname"}, ["fname: str"], sink_requires="fname", schema_mode="flexible").validate()
         assert self._rule_c_error(before) is not None
 
         # Exactly what the message instructs: declare the source, guarantee the
@@ -6613,6 +6646,10 @@ class TestSchemaContractValidation:
         result = self._rule_c_state(
             {"first_name": "fname", "user.name": "uname", "Name": "nm"},
             ["fname: str", "uname: str", "nm: str"],
+            # 'first_name' is the declarable class, so it is a configured READ
+            # this fixed schema would forbid; the other two abstain. See
+            # _rule_c_state's schema_mode note.
+            schema_mode="flexible",
         ).validate()
         error = self._rule_c_error(result)
         assert error is not None, [e.error_code for e in result.errors]
@@ -6632,7 +6669,7 @@ class TestSchemaContractValidation:
         here turns a validation finding into a 500 on the composer surface.
         """
         for source in ("class", "!!!", "", "  ", "user..name", "1", "caf\u00e9"):
-            state = self._rule_c_state({source: "tgt"}, ["tgt: str"])
+            state = self._rule_c_state({source: "tgt"}, ["tgt: str"], schema_mode="flexible")
             result = state.validate()
             assert self._rule_c_error(result) is not None, f"no finding for source {source!r}"
 
@@ -6658,7 +6695,7 @@ class TestSchemaContractValidation:
                     return fix
             return None
 
-        rule_c = self._rule_c_error(self._rule_c_state({"first_name": "fname"}, ["fname: str"]).validate())
+        rule_c = self._rule_c_error(self._rule_c_state({"first_name": "fname"}, ["fname: str"], schema_mode="flexible").validate())
         assert rule_c is not None
         assert first_match_fix(rule_c.message) is _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX
 

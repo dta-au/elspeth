@@ -1544,7 +1544,7 @@ def _correction_predecessor() -> CompositionState:
                 on_success="output",
                 on_error="discard",
                 options={
-                    "mapping": {"amount": "amount", "tier": "'high'"},
+                    "mapping": {"amount": "amount"},
                     "select_only": False,
                     "schema": {"mode": "observed", "required_fields": ["amount"]},
                 },
@@ -1618,7 +1618,7 @@ def _planner_correction_candidate() -> dict[str, object]:
     }
     selected = pipeline["nodes"][2]
     selected["options"] = {
-        "mapping": {"amount": "amount", "tier": "'priority'"},
+        "mapping": {"amount": "amount"},
         "select_only": True,
         "schema": {"mode": "fixed", "fields": [{"name": "attacker", "type": "str", "required": True}]},
         "required_input_fields": ["attacker"],
@@ -1638,7 +1638,12 @@ def test_bind_replans_selected_node_while_restoring_unselected_node_authority() 
 
     assert bound["nodes"][0] == predecessor.to_dict()["nodes"][0]
     assert bound["nodes"][1] == predecessor.to_dict()["nodes"][1]
-    assert bound["nodes"][2]["options"]["mapping"]["tier"] == "'priority'"
+    # The planner's replanned mapping reaches the bound node. Keyed on 'amount'
+    # since the fixture's old `{"tier": "'priority'"}` pair was removed: its
+    # SOURCE was 'tier', which nothing upstream produces, so field_mapper
+    # silently skipped it and no tier column was ever emitted. What this asserts
+    # — that the selected node's planner edit is carried through — is unchanged.
+    assert bound["nodes"][2]["options"]["mapping"] == {"amount": "amount"}
 
 
 def test_bind_selected_field_mapper_admits_only_public_option_edits() -> None:
@@ -1652,7 +1657,7 @@ def test_bind_selected_field_mapper_admits_only_public_option_edits() -> None:
     )
 
     assert bound["nodes"][2]["options"] == {
-        "mapping": {"amount": "amount", "tier": "'priority'"},
+        "mapping": {"amount": "amount"},
         "select_only": True,
         "schema": {"mode": "observed", "required_fields": ["amount"]},
     }
@@ -2553,7 +2558,7 @@ def test_node_correction_materializer_preserves_every_unselected_node_byte() -> 
     assert bound["nodes"][0] == before_nodes[0]
     assert bound["nodes"][1] == before_nodes[1]
     assert bound["nodes"][2]["options"] == {
-        "mapping": {"amount": "amount", "tier": "'priority'"},
+        "mapping": {"amount": "amount"},
         "select_only": True,
         "schema": {"mode": "observed", "required_fields": ["amount"]},
     }
@@ -2926,7 +2931,7 @@ def _boundary_valid_correction_predecessor() -> CompositionState:
                 on_success="output",
                 on_error="discard",
                 options={
-                    "mapping": {"amount": "amount", "tier": "'high'"},
+                    "mapping": {"amount": "amount"},
                     "select_only": False,
                     "schema": {"mode": "observed", "required_fields": ["amount"]},
                 },
@@ -3079,7 +3084,7 @@ def test_selected_node_correction_delta_matches_equivalent_full_candidate_state(
     }
     full = _set_pipeline_document(predecessor)
     full["nodes"][2]["options"] = {
-        "mapping": {"amount": "amount", "tier": "'priority'"},
+        "mapping": {"amount": "amount"},
         "select_only": True,
         "schema": {"mode": "observed", "required_fields": ["amount"]},
     }
