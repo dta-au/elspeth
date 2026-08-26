@@ -13,6 +13,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
+from elspeth.web.composer.guided.chat_solver import PLUGIN_FREE_NODE_TYPES
 from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentAccepted,
     DeferredIntentAction,
@@ -296,7 +297,19 @@ def _deferred_disposition_chat(
 
 
 _MAX_POLICY_VISIBLE_ALTERNATIVES = 5
-_STRUCTURAL_NODE_TYPES = ("gate", "coalesce", "row_union", "queue")
+# DERIVED, not restated. This was a hand-written tuple byte-identical to
+# ``chat_solver.PLUGIN_FREE_NODE_TYPES`` — same four members, same order, same
+# feature — and the two agreed only by hand. They answer the identical
+# question: a kind belongs here exactly when "a {x} is a built-in topology
+# node, not a transform plugin" is TRUE of it, which is the plugin-free
+# partition. Importing it means the module-load assert over ``NodeType`` that
+# guards that partition now guards this clause too, so a new or renamed node
+# kind cannot leave this teaching surface quietly incomplete.
+#
+# ORDER is load-bearing and is inherited deliberately: the ``next()`` scan
+# below returns the first member in TUPLE order that the message names, so
+# reordering the authority changes which clause "a queue and a gate" teaches.
+_STRUCTURAL_NODE_TYPES = PLUGIN_FREE_NODE_TYPES
 
 
 def _message_names_identifier(message: str, identifier: str) -> bool:
@@ -478,12 +491,15 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     aggregation whose plugin is not batch-aware. The sentence states the
     contract correctly; the composer simply does not check that half of it.
 
-    Collector is also deliberately absent from `_STRUCTURAL_NODE_TYPES` itself.
-    That tuple is a copy-trigger keyword list whose sole membership rule is that
-    "a {x} is a built-in topology node, not a transform plugin" is TRUE of x —
-    exactly the plugin-free kinds. A collector is plugin-BEARING (barrier-scopes
-    spec §3 types it as a transform plugin, and a collector with no `plugin` is
-    rejected outright), so adding it there would print a falsehood.
+    Collector is also deliberately absent from `_STRUCTURAL_NODE_TYPES`, and
+    that is now enforced rather than merely intended: the tuple IS
+    `chat_solver.PLUGIN_FREE_NODE_TYPES`, whose membership rule is exactly "a
+    {x} is a built-in topology node, not a transform plugin" is TRUE of x. A
+    collector is plugin-BEARING (barrier-scopes spec §3 types it as a
+    transform plugin, and a collector with no `plugin` is rejected outright),
+    so it cannot appear there without failing that module's own partition
+    assert against `NodeType`. Adding it would have printed a falsehood; it is
+    no longer possible to add it here at all.
     """
     clauses: list[str] = []
     structural_node = next(

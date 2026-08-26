@@ -690,24 +690,42 @@ _DEFERRED_CONSTRAINT_SCHEMA: dict[str, Any] = {
 #   plugin REQUIRED  — transform (``transform_missing_plugin``), aggregation
 #     (``aggregation_missing_plugin``), collector (``collector_missing_plugin``)
 #
-# Hand-written on purpose. That question has no single owner in the tree today:
-# ``state.py::_PLUGINLESS_STRUCTURAL_NODE_TYPES`` ({gate, coalesce}) and
-# ``audit_readiness/service.py::_PLUGINLESS_NODE_TYPES`` are two more
-# hand-written statements of it with deliberately different predicates and
-# membership, and that module's own comment forbids unifying from a fourth
-# site (elspeth-b3117ec3ac owns the unification). What IS derived is the
-# vocabulary: the assert below reads ``NodeType`` — the ``state.py`` Literal
-# ``NodeSpec.node_type`` is annotated against — and fails at import if a new
-# or renamed member leaves the sentence the planner is handed on every guided
-# turn quietly incomplete. Deriving BOTH sides here would be a tautology.
-_PLUGIN_FREE_NODE_TYPES: Final[tuple[str, ...]] = ("gate", "coalesce", "row_union", "queue")
-_PLUGIN_BEARING_NODE_TYPES: Final[tuple[str, ...]] = ("transform", "aggregation", "collector")
-assert frozenset(_PLUGIN_FREE_NODE_TYPES).isdisjoint(_PLUGIN_BEARING_NODE_TYPES) and frozenset(
-    _PLUGIN_FREE_NODE_TYPES + _PLUGIN_BEARING_NODE_TYPES
+# Hand-written membership, DERIVED vocabulary. That question has no single
+# owner in the tree, and an earlier version of this comment UNDERCOUNTED the
+# siblings — it listed two and there were three:
+#
+#   - ``state.py::_PLUGINLESS_STRUCTURAL_NODE_TYPES`` — {gate, coalesce}. A
+#     strict subset, backing ``structural_node_plugin_forbidden`` only for the
+#     two kinds no other validator already covers.
+#   - ``audit_readiness/service.py::_PLUGINLESS_NODE_TYPES`` — same four
+#     members, subtracted from ``get_args(NodeType)`` for a different consumer.
+#   - ``guided_chat_intent_management.py::_STRUCTURAL_NODE_TYPES`` — the same
+#     four members IN THE SAME ORDER, in this same feature. That one is no
+#     longer hand-written: it now imports ``PLUGIN_FREE_NODE_TYPES`` from here,
+#     because both answer the identical question (a kind belongs there exactly
+#     when "a {x} is a built-in topology node, not a transform plugin" is true
+#     of it, which is the plugin-free partition). Missing it was the same
+#     restatement error this comment exists to guard against, committed inside
+#     the guard — the sibling was edited minutes before this landed and the
+#     duplication went unnoticed because the two tuples agree BY HAND.
+#
+# The remaining two are NOT unified from here: they answer different questions
+# with deliberately different membership, and ``service.py``'s own comment
+# forbids adding a further authority (elspeth-b3117ec3ac owns that work).
+#
+# What IS derived is the vocabulary: the assert below reads ``NodeType`` — the
+# ``state.py`` Literal ``NodeSpec.node_type`` is annotated against — and fails
+# at import if a new or renamed member leaves the sentence the planner is
+# handed on every guided turn quietly incomplete. Deriving BOTH sides here
+# would be a tautology no mutation could fail.
+PLUGIN_FREE_NODE_TYPES: Final[tuple[str, ...]] = ("gate", "coalesce", "row_union", "queue")
+PLUGIN_BEARING_NODE_TYPES: Final[tuple[str, ...]] = ("transform", "aggregation", "collector")
+assert frozenset(PLUGIN_FREE_NODE_TYPES).isdisjoint(PLUGIN_BEARING_NODE_TYPES) and frozenset(
+    PLUGIN_FREE_NODE_TYPES + PLUGIN_BEARING_NODE_TYPES
 ) == frozenset(get_args(NodeType)), (
     "the retain_deferred_intent node-kind partition no longer partitions NodeType; unpartitioned members: "
-    f"{sorted(frozenset(get_args(NodeType)) ^ frozenset(_PLUGIN_FREE_NODE_TYPES + _PLUGIN_BEARING_NODE_TYPES))}, "
-    f"claimed by both arms: {sorted(frozenset(_PLUGIN_FREE_NODE_TYPES) & frozenset(_PLUGIN_BEARING_NODE_TYPES))}"
+    f"{sorted(frozenset(get_args(NodeType)) ^ frozenset(PLUGIN_FREE_NODE_TYPES + PLUGIN_BEARING_NODE_TYPES))}, "
+    f"claimed by both arms: {sorted(frozenset(PLUGIN_FREE_NODE_TYPES) & frozenset(PLUGIN_BEARING_NODE_TYPES))}"
 )
 
 
@@ -726,8 +744,8 @@ _DEFERRED_INTENT_TOOL: dict[str, Any] = {
         "description": (
             "Use only when the user gives a concrete instruction whose responsible guided stage is later than the current stage. "
             "Emit structural facts only; never copy raw user prose into redacted_summary. "
-            f"{_sentence_case(_node_kind_phrase(_PLUGIN_FREE_NODE_TYPES))} are structural node types, never transform plugins; "
-            f"{_node_kind_phrase(_PLUGIN_BEARING_NODE_TYPES)} are node types that each REQUIRE a transform plugin, "
+            f"{_sentence_case(_node_kind_phrase(PLUGIN_FREE_NODE_TYPES))} are structural node types, never transform plugins; "
+            f"{_node_kind_phrase(PLUGIN_BEARING_NODE_TYPES)} are node types that each REQUIRE a transform plugin, "
             "so naming that plugin does not make the node an ordinary transform. "
             "catalog_kind and catalog_name are a pair: set BOTH to the exact known catalog plugin, or BOTH to null "
             "when the instruction does not name one specific plugin. "
