@@ -146,6 +146,7 @@ def _rows_for(plugin_key: str) -> list[dict[str, object]]:
         "transform:report_assemble": [{"line": "alpha"}, {"line": "beta"}],
         "transform:truncate": [{"notes": "brief"}],
         "transform:type_coerce": [{"price": "2.5", "quantity": "3", "in_stock": "true"}],
+        "transform:reference_join": [{"reference_join_probe_key": "probe"}],
         "transform:value_transform": [{"price": 2.0, "quantity": 3}],
         "transform:web_scrape": [{"page_url": "filled-by-harness"}],
         "sink:document": [{"announcement_text": "hello"}],
@@ -392,7 +393,7 @@ def _stop_server(server: multiprocessing.Process | None) -> None:
 
 def test_local_lifecycle_cases_cover_the_exact_reviewed_subject_set() -> None:
     assert tuple(case.plugin_key for case in LOCAL_LIFECYCLE_CASES) == _reviewed_local_subjects()
-    assert len(LOCAL_LIFECYCLE_CASES) == 35
+    assert len(LOCAL_LIFECYCLE_CASES) == 36
     assert {case.profile_case for case in LOCAL_LIFECYCLE_CASES} == {SQLITE_SINGLE_LEADER}
 
 

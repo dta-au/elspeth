@@ -367,6 +367,20 @@ _TRANSFORM_REJECTION_CASES = [
         "collides with a reserved report metadata field",
         id="report_assemble-output_field-metadata-collision",
     ),
+    # ── reference_join ────────────────────────────────────────────────────
+    pytest.param(
+        "reference_join",
+        {
+            "schema": _make_observed_schema(),
+            "reference_content": "sku,description\nhats,A fine hat\n",
+            "reference_format": "csv",
+            "key_field": "product",
+            "reference_key_name": "sku",
+            "output": {"product": "ref['description']"},  # overwrites the column it joins on
+        },
+        "key_field",
+        id="reference_join-key_field-in-output",
+    ),
 ]
 
 _SOURCE_REJECTION_CASES = [
