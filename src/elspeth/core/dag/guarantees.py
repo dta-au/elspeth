@@ -513,6 +513,16 @@ def resolve_guaranteed_field_type(
     same topology the guarantee walk traverses (transparent gates,
     pass-through transforms, queue/row_union fan-in, coalesce branches).
 
+    Two structural arms extend "declaration" beyond ``fields:`` entries
+    (elspeth-e6e552ce34): an OBSERVED source with a structural cell type
+    (``NodeInfo.observed_value_type`` — csv emits every cell as str) answers
+    that type for fields in its own guaranteed set and abstains for all
+    others; and an undeclaring pass-through transform that promised
+    ``preserves_input_values`` is recursed through rather than abstained at,
+    because its forwarded values are exactly its inputs. Both default off:
+    sources without the structural fact and pass-throughs without the promise
+    keep the historical abstention.
+
     Soundness for the REJECTING caller is unanimity: every path a runtime
     value can take must resolve to the same base ``field_type``.
     The contributor sets below may over-include paths that cannot actually
@@ -572,6 +582,26 @@ def _resolve_guaranteed_field_type_uncached(
                     declared_by=frozenset({node_id}),
                 )
 
+    # Structural source arm (elspeth-e6e552ce34): an OBSERVED source that
+    # declares a structural cell type (csv: every parsed cell is str — no
+    # declared fields means no coercion targets) answers that type, but ONLY
+    # for fields in its own guaranteed set. The narrowness is load-bearing:
+    # recursion may over-include contributors (the walk's documented
+    # over-inclusion tolerance), and a field INTRODUCED mid-path — an llm
+    # response field, a blob_csv_expand data-derived column — must never be
+    # attributed to a source that does not vouch for it. Outside the
+    # guaranteed set the source abstains and the whole resolution collapses
+    # to None, which is the conservative posture. Declared-fields modes never
+    # reach this arm for a declared field (the own-declaration check above
+    # settles it with the type the source coerces into).
+    if node_info.node_type is NodeType.SOURCE and node_info.observed_value_type is not None and config is not None and config.is_observed:
+        if field_name in (config.guaranteed_fields or ()):
+            return ResolvedGuaranteeType(
+                field_type=node_info.observed_value_type,
+                declared_by=frozenset({node_id}),
+            )
+        return None
+
     recurses = (
         node_info.node_type in (NodeType.GATE, NodeType.QUEUE, NodeType.ROW_UNION, NodeType.COALESCE) or node_info.passes_through_input
     )
@@ -596,7 +626,21 @@ def _resolve_guaranteed_field_type_uncached(
     # empty tuple must abstain too. Gates, queues, row_unions, and coalesces
     # stay recursable: they are pure routing/merge and run no row-rewriting
     # code.
-    if node_info.node_type is NodeType.TRANSFORM and node_info.passes_through_input and (config is None or not config.fields):
+    # elspeth-e6e552ce34 carve-out: a pass-through that PROMISED value
+    # preservation (preserves_input_values — llm, passthrough) cannot have
+    # rewritten the field in place, so its silence about the type is not
+    # opting out of the declaration discipline: the value that leaves is the
+    # value that arrived, and the nearest upstream declaration still
+    # describes it. Recursion is sound under exactly that promise; a field
+    # this transform ITSELF introduced (an llm response field) resolves only
+    # if some ancestor vouches for it, which the structural source arm's
+    # guaranteed-set narrowness prevents — introduced fields abstain.
+    if (
+        node_info.node_type is NodeType.TRANSFORM
+        and node_info.passes_through_input
+        and (config is None or not config.fields)
+        and not node_info.preserves_input_values
+    ):
         return None
 
     in_edges = list(graph._graph.in_edges(node_id, data=True))

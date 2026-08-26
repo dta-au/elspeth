@@ -27,9 +27,46 @@ from __future__ import annotations
 
 import pytest
 
-from elspeth.contracts.enums import NodeType
+from elspeth.contracts.enums import NodeType, RoutingMode
+from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.dag.graph import ExecutionGraph
+from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
 from elspeth.core.dag.models import GraphValidationError
+
+_OBSERVED_GUARANTEES_ID = SchemaConfig(mode="observed", guaranteed_fields=("id",))
+_OBSERVED_BARE = SchemaConfig(mode="observed")
+
+
+def _observed_source_graph(*, observed_value_type: str | None = "str") -> ExecutionGraph:
+    """csv-shaped observed source guaranteeing ``id``, nothing else."""
+    graph = ExecutionGraph()
+    graph.add_node(
+        "src",
+        node_type=NodeType.SOURCE,
+        plugin_name="csv",
+        output_schema_config=_OBSERVED_GUARANTEES_ID,
+        observed_value_type=observed_value_type,
+    )
+    return graph
+
+
+def _append_passthrough(
+    graph: ExecutionGraph,
+    node_id: str,
+    upstream: str,
+    *,
+    preserves_input_values: bool,
+    config: SchemaConfig | None = _OBSERVED_BARE,
+) -> None:
+    graph.add_node(
+        node_id,
+        node_type=NodeType.TRANSFORM,
+        plugin_name="passthrough",
+        output_schema_config=config,
+        passes_through_input=True,
+        preserves_input_values=preserves_input_values,
+    )
+    graph.add_edge(upstream, node_id, label="continue")
 
 
 class TestNodeInfoContractFacts:
@@ -82,3 +119,150 @@ class TestNodeInfoContractFacts:
                 plugin_name="csv",
                 preserves_input_values=True,
             )
+
+
+class TestStructuralSourceResolution:
+    """The observed source answers its structural cell type — narrowly."""
+
+    def test_guaranteed_field_resolves_to_structural_type(self) -> None:
+        graph = _observed_source_graph()
+        resolved = resolve_guaranteed_field_type(graph, "src", "id")
+        assert resolved is not None
+        assert resolved.field_type == "str"
+        assert resolved.declared_by == frozenset({"src"})
+
+    def test_unguaranteed_field_abstains(self) -> None:
+        """A field outside the source's own guaranteed set gets NO structural
+        answer — this is the self-limiting edge that keeps over-recursion
+        sound: a mid-path-introduced field (an llm response) can never be
+        attributed to the source."""
+        graph = _observed_source_graph()
+        assert resolve_guaranteed_field_type(graph, "src", "answer_a") is None
+
+    def test_source_without_structural_type_abstains(self) -> None:
+        graph = _observed_source_graph(observed_value_type=None)
+        assert resolve_guaranteed_field_type(graph, "src", "id") is None
+
+    def test_declared_fields_mode_still_wins(self) -> None:
+        """A fixed/flexible source resolves through its declaration, not the
+        structural arm — the declaration is what the source coerces into."""
+        from elspeth.contracts.schema import FieldDefinition
+
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src",
+            node_type=NodeType.SOURCE,
+            plugin_name="csv",
+            output_schema_config=SchemaConfig(
+                mode="flexible",
+                fields=(FieldDefinition("id", "int"),),
+            ),
+            observed_value_type="str",
+        )
+        resolved = resolve_guaranteed_field_type(graph, "src", "id")
+        assert resolved is not None
+        assert resolved.field_type == "int"
+
+
+class TestValuePreservingPassThroughResolution:
+    """Recursion through undeclaring pass-throughs is gated on the promise."""
+
+    def test_preserving_passthrough_recurses_to_source(self) -> None:
+        graph = _observed_source_graph()
+        _append_passthrough(graph, "keep", "src", preserves_input_values=True)
+        resolved = resolve_guaranteed_field_type(graph, "keep", "id")
+        assert resolved is not None
+        assert resolved.field_type == "str"
+        assert resolved.declared_by == frozenset({"src"})
+
+    def test_non_preserving_passthrough_abstains(self) -> None:
+        """Existing posture pinned: an undeclaring pass-through that has NOT
+        promised value preservation (type_coerce/value_transform shape)
+        still abstains."""
+        graph = _observed_source_graph()
+        _append_passthrough(graph, "rewrite", "src", preserves_input_values=False)
+        assert resolve_guaranteed_field_type(graph, "rewrite", "id") is None
+
+    def test_preserving_passthrough_with_declaration_settles_first(self) -> None:
+        """A preserving pass-through that DID declare the field keeps the
+        nearest-declaration-wins rule — the promise only unlocks recursion
+        where there is nothing declared to consult."""
+        from elspeth.contracts.schema import FieldDefinition
+
+        graph = _observed_source_graph()
+        _append_passthrough(
+            graph,
+            "declares",
+            "src",
+            preserves_input_values=True,
+            config=SchemaConfig(mode="flexible", fields=(FieldDefinition("id", "float"),)),
+        )
+        resolved = resolve_guaranteed_field_type(graph, "declares", "id")
+        assert resolved is not None
+        assert resolved.field_type == "float"
+        assert resolved.declared_by == frozenset({"declares"})
+
+    def test_coalesce_unanimity_still_required(self) -> None:
+        """Two branches resolving to different structural types abstain —
+        unanimity mutation-kill for the new arms."""
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src_str",
+            node_type=NodeType.SOURCE,
+            plugin_name="csv",
+            output_schema_config=_OBSERVED_GUARANTEES_ID,
+            observed_value_type="str",
+        )
+        graph.add_node(
+            "src_int",
+            node_type=NodeType.SOURCE,
+            plugin_name="intsource",
+            output_schema_config=_OBSERVED_GUARANTEES_ID,
+            observed_value_type="int",
+        )
+        graph.add_node(
+            "merge",
+            node_type=NodeType.COALESCE,
+            plugin_name="coalesce",
+            output_schema_config=_OBSERVED_BARE,
+        )
+        graph.add_edge("src_str", "merge", label="a")
+        graph.add_edge("src_int", "merge", label="b")
+        assert resolve_guaranteed_field_type(graph, "merge", "id") is None
+
+    def test_coalesce_agreement_resolves(self) -> None:
+        graph = ExecutionGraph()
+        for src in ("src_a", "src_b"):
+            graph.add_node(
+                src,
+                node_type=NodeType.SOURCE,
+                plugin_name="csv",
+                output_schema_config=_OBSERVED_GUARANTEES_ID,
+                observed_value_type="str",
+            )
+        graph.add_node(
+            "merge",
+            node_type=NodeType.COALESCE,
+            plugin_name="coalesce",
+            output_schema_config=_OBSERVED_BARE,
+        )
+        graph.add_edge("src_a", "merge", label="a")
+        graph.add_edge("src_b", "merge", label="b")
+        resolved = resolve_guaranteed_field_type(graph, "merge", "id")
+        assert resolved is not None
+        assert resolved.field_type == "str"
+        assert resolved.declared_by == frozenset({"src_a", "src_b"})
+
+    def test_divert_in_edge_still_abstains(self) -> None:
+        """The DIVERT abstention survives the new arms (mutation-kill)."""
+        graph = _observed_source_graph()
+        graph.add_node(
+            "errsrc",
+            node_type=NodeType.SOURCE,
+            plugin_name="csv",
+            output_schema_config=_OBSERVED_GUARANTEES_ID,
+            observed_value_type="str",
+        )
+        _append_passthrough(graph, "keep", "src", preserves_input_values=True)
+        graph.add_edge("errsrc", "keep", label="divert", mode=RoutingMode.DIVERT)
+        assert resolve_guaranteed_field_type(graph, "keep", "id") is None
