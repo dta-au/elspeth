@@ -45,11 +45,11 @@ Error message headline must be DISTINCT from existing "Schema contract violation
 **Interfaces:**
 - Produces: `BaseTransform.preserves_input_values: bool = False`; `BaseSource.observed_value_type: str | None = None`; `NodeInfo.preserves_input_values: bool = False`; `NodeInfo.observed_value_type: str | None = None`; builder copies both from plugin instances.
 
-- [ ] **Step 1: Write failing tests** — construct NodeInfo directly asserting defaults; build a tiny graph through the real builder with a csv source and assert `graph.get_node_info(<source>).observed_value_type is None` (csv not yet declaring). Follow the node-type-scoped-field guard pattern: if NodeInfo `__post_init__` guards sink-only fields, mirror a guard (`observed_value_type` non-None only on SOURCE nodes; `preserves_input_values` True only on TRANSFORM nodes) and test both rejections.
-- [ ] **Step 2: Run to verify failure** (`pytest tests/unit/core/dag/test_observed_producer_type_validation.py -x -q`).
-- [ ] **Step 3: Implement** flags with full doc-comments in house style (state the VALUE-preservation semantics, the presence-contract contrast with `passes_through_input`, and the fail-closed default), NodeInfo fields + guards, builder threading.
-- [ ] **Step 4: Run tests to green.**
-- [ ] **Step 5: Commit** (pathspec-only): `git commit -m "feat(contracts): preserves_input_values + observed_value_type plugin facts threaded onto NodeInfo (elspeth-e6e552ce34)"`.
+- [x] **Step 1: Write failing tests** — construct NodeInfo directly asserting defaults; build a tiny graph through the real builder with a csv source and assert `graph.get_node_info(<source>).observed_value_type is None` (csv not yet declaring). Follow the node-type-scoped-field guard pattern: if NodeInfo `__post_init__` guards sink-only fields, mirror a guard (`observed_value_type` non-None only on SOURCE nodes; `preserves_input_values` True only on TRANSFORM nodes) and test both rejections.
+- [x] **Step 2: Run to verify failure** (`pytest tests/unit/core/dag/test_observed_producer_type_validation.py -x -q`).
+- [x] **Step 3: Implement** flags with full doc-comments in house style (state the VALUE-preservation semantics, the presence-contract contrast with `passes_through_input`, and the fail-closed default), NodeInfo fields + guards, builder threading.
+- [x] **Step 4: Run tests to green.**
+- [x] **Step 5: Commit** (pathspec-only): `git commit -m "feat(contracts): preserves_input_values + observed_value_type plugin facts threaded onto NodeInfo (elspeth-e6e552ce34)"`.
 
 ### Task 2: Resolution arms in guarantees.py
 
@@ -61,15 +61,15 @@ Error message headline must be DISTINCT from existing "Schema contract violation
 - Consumes: Task 1's NodeInfo fields.
 - Produces: `resolve_guaranteed_field_type` returns `ResolvedGuaranteeType("str", {source_id})` for an observed source's guaranteed field when the source NodeInfo carries `observed_value_type="str"`; recurses through an undeclaring pass-through transform iff `preserves_input_values`.
 
-- [ ] **Step 1: Write failing tests** (hand-built graphs per existing `test_graph_validation.py` style):
+- [x] **Step 1: Write failing tests** (hand-built graphs per existing `test_graph_validation.py` style):
   - observed source (guaranteed_fields={id}, observed_value_type="str") → resolution of `id` at source = str.
   - resolution of a field NOT in the source's guaranteed set = None (abstention pin).
   - undeclaring pass-through with `preserves_input_values=True` between source and query point → resolves str; with False → None (existing behavior pin).
   - two coalesce branches resolving to different types → None (unanimity pin, mutation kill).
-- [ ] **Step 2: Verify failures.**
-- [ ] **Step 3: Implement** both arms: source arm placed after the own-declaration check, before `recurses` (SOURCE nodes don't recurse); condition `node_info.node_type is NodeType.SOURCE and config is not None and config.is_observed and node_info.observed_value_type is not None and field_name in (config.guaranteed_fields or ())`. Pass-through arm: at the :599 abstention, `if not node_info.preserves_input_values: return None` (recursion continues otherwise). Update BOTH docstrings (resolve + module) to document the arms and abstention edges.
-- [ ] **Step 4: Green.**
-- [ ] **Step 5: Commit**: `feat(dag): resolve guaranteed field types through value-preserving pass-throughs to structural source types (elspeth-e6e552ce34)`.
+- [x] **Step 2: Verify failures.**
+- [x] **Step 3: Implement** both arms: source arm placed after the own-declaration check, before `recurses` (SOURCE nodes don't recurse); condition `node_info.node_type is NodeType.SOURCE and config is not None and config.is_observed and node_info.observed_value_type is not None and field_name in (config.guaranteed_fields or ())`. Pass-through arm: at the :599 abstention, `if not node_info.preserves_input_values: return None` (recursion continues otherwise). Update BOTH docstrings (resolve + module) to document the arms and abstention edges.
+- [x] **Step 4: Green.**
+- [x] **Step 5: Commit**: `feat(dag): resolve guaranteed field types through value-preserving pass-throughs to structural source types (elspeth-e6e552ce34)`.
 
 ### Task 3: csv + llm + passthrough plugin declarations (hash discipline)
 
@@ -79,11 +79,11 @@ Error message headline must be DISTINCT from existing "Schema contract violation
 - Modify: `src/elspeth/plugins/transforms/passthrough.py` (`preserves_input_values = True` + hash recompute)
 - Test: `tests/unit/core/dag/test_observed_producer_type_validation.py` + extend `tests/invariants/test_pass_through_invariants.py` if the ADR-009 probe harness accommodates a value-equality assertion cheaply.
 
-- [ ] **Step 1: Failing test**: builder-built graph with real csv source config (observed + guaranteed_fields) asserts `observed_value_type == "str"` on the source NodeInfo; llm-bearing graph asserts `preserves_input_values` True on the llm node.
-- [ ] **Step 2: Verify failure.**
-- [ ] **Step 3: Declare flags**; run `ruff format` on the three plugin files; recompute each `source_file_hash` with `python -c` against `scripts/cicd/plugin_hash.py::compute_source_file_hash`; assert strict equality in a throwaway check (the gate is CI-only).
-- [ ] **Step 4: Green.** If the invariants harness extension is feasible, add: for every registered transform declaring `preserves_input_values`, probe process() with a synthetic row and assert forwarded key values are `==` input values (mirror the ADR-009 probe pattern). If the harness cannot host llm (provider dependency), probe the hostable declarers and leave llm pinned by the collision-validator argument documented in the flag's comment.
-- [ ] **Step 5: Commit**: `feat(plugins): csv observed cells are structurally str; llm/passthrough forward values unchanged (elspeth-e6e552ce34)`.
+- [x] **Step 1: Failing test**: builder-built graph with real csv source config (observed + guaranteed_fields) asserts `observed_value_type == "str"` on the source NodeInfo; llm-bearing graph asserts `preserves_input_values` True on the llm node.
+- [x] **Step 2: Verify failure.**
+- [x] **Step 3: Declare flags**; run `ruff format` on the three plugin files; recompute each `source_file_hash` with `python -c` against `scripts/cicd/plugin_hash.py::compute_source_file_hash`; assert strict equality in a throwaway check (the gate is CI-only).
+- [x] **Step 4: Green.** If the invariants harness extension is feasible, add: for every registered transform declaring `preserves_input_values`, probe process() with a synthetic row and assert forwarded key values are `==` input values (mirror the ADR-009 probe pattern). If the harness cannot host llm (provider dependency), probe the hostable declarers and leave llm pinned by the collision-validator argument documented in the flag's comment.
+- [x] **Step 5: Commit**: `feat(plugins): csv observed cells are structurally str; llm/passthrough forward values unchanged (elspeth-e6e552ce34)`.
 
 ### Task 4: The validation pass
 
@@ -95,7 +95,7 @@ Error message headline must be DISTINCT from existing "Schema contract violation
 - Consumes: `resolve_guaranteed_field_type` (Task 2), `resolved_guarantee_type_mismatch` (`contracts/data.py:437`).
 - Produces: `EdgeContractError` with headline `Observed-schema type violation: edge '<from>' → '<to>'`, structured `compatibility_result=CompatibilityResult(compatible=False, type_mismatches=((field, expected, actual),))`.
 
-- [ ] **Step 1: Failing tests**:
+- [x] **Step 1: Failing tests**:
   - REPRO SHAPE (the load-bearing case): builder-built csv(observed, guaranteed [id, question]) → gate fork → two observed `preserves_input_values` transforms → coalesce(union, require_all, observed) → consumer declaring `id: int` (flexible) → build raises EdgeContractError naming `id`, expected int, arriving str, declared_by the source.
   - same graph, consumer `id: str` → builds green (monotonicity).
   - same graph, consumer `answer_a: int` where answer_a is llm-introduced → builds green (abstention — not provable).
@@ -103,10 +103,10 @@ Error message headline must be DISTINCT from existing "Schema contract violation
   - source `mode: fixed` declaring `id: int` → green (declared arm + source coercion).
   - non-strict consumer (schema mode with lax model, if constructible) → pin whatever `_types_compatible(consumer_strict=False)` yields for str→int; assert explicitly.
   - dual-violation graph (this AND an earlier check) reports the EARLIER error (ordering pin).
-- [ ] **Step 2: Verify failures.**
-- [ ] **Step 3: Implement** the pass mirroring `validate_forgiven_field_ancestor_types`'s loop/caching structure (shared `type_cache`, `schema_cache`); scope condition: effective producer schema None OR observed; consumer has model_fields; skip COALESCE/ROW_UNION consumers and DIVERT edges. Iterate `consumer_schema.model_fields` required entries. Remedy text: (1) align consumer declared type; (2) insert `type_coerce` BEFORE consumer converting the field and declaring it in the transform's `schema.fields`; (3) if the source column genuinely holds the declared type, declare it on the source schema (`mode: fixed`/`flexible` with `fields: [<field>: <type>]`) so the source coerces at ingest. Wire into `validate_edge_compatibility` after `validate_forgiven_field_ancestor_types` with the house ordering comment.
-- [ ] **Step 4: Green**, including the whole existing dag test package: `pytest tests/unit/core/dag -q` and `pytest tests/integration/core/dag -q` (vocabulary-adjacent rule from recent-code-hints META-39: any pass that can change build verdicts must sweep the corpus suites; a corpus case that now fails to build is an adjudication STOP — do not reshape fixtures, surface to John).
-- [ ] **Step 5: Parity adjudication**: `python scripts/cicd/runtime_rejection_parity.py --write`; adjudicate the seeded entry (mirrored Stage-1 counterpart or documented unmirrored rationale). Commit both together: `feat(dag): reject provably-wrong consumer declared types across observed producers at build (elspeth-e6e552ce34)`.
+- [x] **Step 2: Verify failures.**
+- [x] **Step 3: Implement** the pass mirroring `validate_forgiven_field_ancestor_types`'s loop/caching structure (shared `type_cache`, `schema_cache`); scope condition: effective producer schema None OR observed; consumer has model_fields; skip COALESCE/ROW_UNION consumers and DIVERT edges. Iterate `consumer_schema.model_fields` required entries. Remedy text: (1) align consumer declared type; (2) insert `type_coerce` BEFORE consumer converting the field and declaring it in the transform's `schema.fields`; (3) if the source column genuinely holds the declared type, declare it on the source schema (`mode: fixed`/`flexible` with `fields: [<field>: <type>]`) so the source coerces at ingest. Wire into `validate_edge_compatibility` after `validate_forgiven_field_ancestor_types` with the house ordering comment.
+- [x] **Step 4: Green**, including the whole existing dag test package: `pytest tests/unit/core/dag -q` and `pytest tests/integration/core/dag -q` (vocabulary-adjacent rule from recent-code-hints META-39: any pass that can change build verdicts must sweep the corpus suites; a corpus case that now fails to build is an adjudication STOP — do not reshape fixtures, surface to John).
+- [x] **Step 5: Parity adjudication**: `python scripts/cicd/runtime_rejection_parity.py --write`; adjudicate the seeded entry (mirrored Stage-1 counterpart or documented unmirrored rationale). Commit both together: `feat(dag): reject provably-wrong consumer declared types across observed producers at build (elspeth-e6e552ce34)`.
 
 ### Task 5: Composer feedback surfaces
 
@@ -115,10 +115,46 @@ Error message headline must be DISTINCT from existing "Schema contract violation
 - Modify: `src/elspeth/web/frontend/src/lib/validationHumaniser.ts` (headline arm)
 - Test: `tests/unit/web/composer/` existing pattern-coverage test (locate: grep `_VALIDATION_ERROR_PATTERNS` in tests); frontend `tsc`/vitest if the humaniser has a spec file.
 
-- [ ] **Step 1: Failing test**: pattern list resolves the new headline to an entry whose `explanation`/`suggested_fix` name the three remedies; assert list-order specificity (no earlier pattern shadows it).
-- [ ] **Step 2: Implement** both surfaces. Advice text imports/mirrors the raise-site constants per the two-surfaces trap (2026-08-21 entry): single ownership — put the remedy prose in a `schema_validation.py`-adjacent constant only if the import direction is legal; otherwise duplicate with a cross-reference comment and a test asserting the two stay in sync.` constants in generation.py with sync tests asserting presence in both the catalog entry and the raise-site message.*
-- [ ] **Step 3: Integration test**: runtime preflight (Stage 2) on a repro-shaped composition state reports the error with actionable suggestion — extend the existing preflight formatter tests in `tests/unit/web/execution/` (grep `EdgeContractError` there for the harness).
-- [ ] **Step 4: Green + commit**: `feat(composer): planner-facing advice for observed-schema type violations (elspeth-e6e552ce34)`.
+**WITHDRAWN 2026-08-26 — the task rested on a false premise; implementing it
+would have shipped code that can never execute.** Both surfaces were to be
+keyed on the raise site's `Observed-schema type violation: edge …` headline.
+That headline never reaches either surface. On the composer path,
+`web/execution/_validation_diagnostics.py::_format_edge_contract_message`
+REBUILDS the message from `exc.compatibility_result` (a generic "Edge contract
+violation between producer node … Type mismatches: …"), and both handlers in
+`web/execution/_validation_runtime.py` (:371 build-time, :492
+edge-compatibility) construct their `ValidationError` with a hardcoded
+`error_code=None`. So the planner sees neither the headline nor a code, and a
+`_VALIDATION_ERROR_PATTERNS` entry keyed on either is dead. The raise-site
+prose survives only as `failed_check.detail = str(exc)`. Keying the pattern on
+the REBUILT text was rejected too: that string is generic across every edge
+failure, so observed-schema-specific advice attached to it would be wrong for
+ordinary type mismatches.
+
+The planner is not left without advice, because elspeth-24's Stage-1 arm
+`declared_input_type_mismatch_against_source_schema` (edeb498b3) blocks this
+class at preview, BEFORE Stage-2 build, and carries the same three remedies.
+The gap between the two arms was enumerated rather than assumed, and is empty:
+`observed_value_type` is declared by `csv_source` alone (`BaseSource` defaults
+it to `None`), so the engine pass can only fire where the chain bottoms out at
+an observed CSV — exactly Stage-1's scope. The one structural asymmetry worth
+checking was that Stage-1 reads the AUTHORED `schema:` block
+(`get_raw_schema_config(options)`) while the engine pass reads the consumer's
+`input_schema.model_fields`; enumerating every builtin transform and sink
+found ZERO plugins declaring a code-level `input_schema`, so both arms read
+the same authored declaration and Stage-1 simply reaches it first.
+
+Division of labor therefore holds as agreed with elspeth-24: the composer path
+is served by their Stage-1 arm; the engine's rich prose serves the YAML/CLI
+operator path, where `str(exc)` reaches the operator intact and is pinned by
+`tests/unit/core/dag/test_observed_producer_type_validation.py`.
+
+Threading a real `error_code` through the `EdgeContractError` seam would close
+the theoretical gap, but `error_code=None` is shared by EVERY `EdgeContractError`
+path — that is a parity sweep across both handlers plus every consumer of the
+code, and it is not justified by a gap measured as empty. Not filed as a
+ticket for that reason; revisit if a second `observed_value_type` declarer ever
+lands, which would widen the engine pass beyond Stage-1's CSV scope.
 
 ### Task 6: Gate + docs + close
 

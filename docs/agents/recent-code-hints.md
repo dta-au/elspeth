@@ -8,6 +8,61 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-26 — EDITING ANY PLUGIN SOURCE FILE MOVES FROZEN CORPUS BYTES.
+  This is a whole-tree trap with no local symptom.** Every plugin declares a
+  `source_file_hash` line, and the node audit record carries that byte, and
+  `docs/architecture/dag/scenario-corpus/v1/manifest.yaml` pins the audit
+  records LITERALLY. So a one-line edit to a plugin under
+  `src/elspeth/plugins/` — even a pure declaration like adding a class
+  attribute — bumps its hash and turns the DAG scenario corpus red, with
+  nothing in the plugin's own suite to warn you. elspeth-e6e552ce34 cost 32
+  reds in `tests/integration/core/dag` this way (csv_source + passthrough).
+  So: (a) a plugin edit's verification selection MUST include
+  `tests/integration/core/dag` AND `tests/unit/architecture` — a green
+  `tests/unit/plugins` run certifies nothing here; (b) recompute the hash
+  with `scripts/cicd/plugin_hash.py::compute_source_file_hash` (the hash line
+  self-normalizes, so it is not self-referential) and confirm the declared
+  value matches before blaming the corpus; (c) re-pin IN DEPENDENCY ORDER,
+  because each step feeds the next — first the manifest's literal
+  `source_file_hash` bytes (they appear in BOTH plain `"..."` and
+  JSON-escaped `\"...\"` forms, so grep the bare 16-hex token, not the key),
+  then any `resumed_full_projection_sha256` (it digests a durable history
+  containing those node records), then
+  `tests/unit/architecture/test_dag_scenario_corpus_contract.py::
+  EXPECTED_CASE_REGISTRY_SHA256` (it hashes every case's full `model_dump`,
+  manifest oracle values included). Re-pinning out of order just moves the
+  later digests twice. This is a manifest BYTE CORRECTION, not an oracle
+  re-freeze: the oracle-freeze surface excludes `audit_records`, so no
+  snapshot under `tests/fixtures/dag_scenario_corpus/oracle_freeze/` should
+  move — if one does, you changed semantics and owe the META-39/META-41
+  ruling path, not a re-pin. PROVE confinement positively rather than by
+  absence: export HEAD, revert ONLY the hash byte(s), and show the suite goes
+  green except for reds that are equally red at the pre-series base — that
+  distinguishes provenance churn from a behaviour delta the digests would
+  otherwise bank silently.
+
+- **2026-08-26 — two new plugin contract facts, and the rule that a PRESENCE
+  flag never implies a VALUE promise.** `preserves_input_values` (TRANSFORM,
+  `BaseTransform`/`TransformProtocol`) says forwarded values are never
+  rewritten; `observed_value_type` (SOURCE, `BaseSource`/`SourceProtocol`)
+  gives the structural cell type an observed source emits (`csv` = `"str"`,
+  the only declarer today). These are DISTINCT from
+  `passes_through_input`/`forwards_input_fields`, which promise only that the
+  FIELD survives and say nothing about its value — a transform can pass a
+  field through and still rewrite it, which is exactly why
+  `resolve_guaranteed_field_type` used to abstain at every observed
+  pass-through. Threading is deliberate and narrow: `builder.py` reads them at
+  the transform and source `add_node` sites ONLY; aggregation and collector
+  sites are deliberately NOT threaded. Two consequences bite whole-tree.
+  (1) `builder.py` reads both attributes DIRECTLY, so every protocol-modeling
+  fake in `tests/` needs them — omitting one is an `AttributeError` at
+  build, not a skip, and it took ~14 test files to model the contract; add
+  them to the fake rather than weakening the builder's read (ADR-032: nominal
+  typing for what we own). (2) A new declarer of either fact is a soundness
+  argument, not a config change: the structural source arm answers only for
+  fields in the source's OWN `guaranteed_fields`, which is what keeps
+  over-recursion self-limiting for fields introduced mid-path.
+
 - **2026-08-26 — structured output is now a THREE-surface parity set: per-query
   (multi-query), config top-level (single-prompt transform), and the LLM
   source — one shared lowering/extraction, and four traps.** The
