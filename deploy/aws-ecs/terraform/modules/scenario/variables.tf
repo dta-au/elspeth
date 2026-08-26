@@ -462,6 +462,7 @@ variable "plugin_preferences" {
               "transform:field_mapper",
               "transform:line_explode",
               "transform:llm",
+              "transform:reference_join",
               "transform:report_assemble",
               "transform:web_scrape",
             ]),

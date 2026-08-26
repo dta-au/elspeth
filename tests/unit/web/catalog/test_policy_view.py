@@ -88,6 +88,7 @@ def test_lists_only_snapshot_available_plugins(view: PolicyCatalogView) -> None:
         "field_mapper",
         "line_explode",
         "llm",
+        "reference_join",
         "report_assemble",
         "web_scrape",
     }

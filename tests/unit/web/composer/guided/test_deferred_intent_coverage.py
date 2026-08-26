@@ -387,6 +387,59 @@ def test_source_success_route_resolves_connection_through_node_input(present: bo
         _assert_unproven(candidate, constraint)
 
 
+@pytest.mark.parametrize(("present", "proven"), ((True, True), (False, False)))
+def test_success_route_through_an_implicit_self_publisher_is_visible(present: bool, proven: bool) -> None:
+    """An aggregation that omits ``on_success`` still HAS a success edge.
+
+    ``route_targets`` restated the publication rule as ``node.on_success is
+    not None``, so an implicit self-publisher reported an EMPTY successor set
+    for an edge that genuinely exists. ``self.consumers`` was never the
+    problem — it is keyed by ``node.input`` and already held the id.
+
+    Both polarities are wrong, and the ``present=False`` one is the dangerous
+    half: an ``EdgeRouteConstraint`` asserting the edge is ABSENT read the
+    empty set as confirmation and PROVED a claim the pipeline contradicts —
+    a false accept. The ``present=True`` half merely refused a valid pipeline.
+    """
+    candidate = replace(
+        _candidate(),
+        nodes=(
+            # Omits on_success, so it publishes under its own id — which is
+            # exactly the connection ``copy`` consumes.
+            _node(
+                node_id=NODE_ID,
+                plugin="batch_stats",
+                node_type="aggregation",
+                input_name="data",
+                on_success=None,
+                on_error="rows",
+            ),
+            _node(node_id="copy", input_name=NODE_ID),
+        ),
+    )
+    constraint = EdgeRouteConstraint(
+        kind="edge_route",
+        from_subject=StableSubject(kind="stable", component_kind="node", stable_id=NODE_ID),
+        edge_type="on_success",
+        to_subject=PluginSubject(
+            kind="plugin",
+            subject_id=SUBJECT_ID,
+            plugin_kind="transform",
+            plugin_name="passthrough",
+        ),
+        present=present,
+    )
+
+    if proven:
+        assert evaluate_deferred_intent_coverage(
+            candidate=candidate,
+            reviewed_guided=_guided_with_constraint(constraint),
+            claimed_intent_ids=(INTENT_A,),
+        ) == (INTENT_A,)
+    else:
+        _assert_unproven(candidate, constraint)
+
+
 @pytest.mark.parametrize(
     ("edge_type", "routes", "fork_to", "connection"),
     (

@@ -214,3 +214,65 @@ class TestConnectionValidation:
                     "schema": {"mode": "fixed", "fields": ["i: str", "t: str"]},
                 }
             )
+
+
+class TestDeclaredRequiredFields:
+    """The two fields chroma READS FROM are requirements the graph can check.
+
+    ``_extract_effect_member`` raises on a row missing ``id_field`` or
+    ``document_field``, so a pipeline whose upstream cannot guarantee them dies
+    per row at write time — mid-run, after rows have already been committed to
+    other sinks. Declaring them moves the rejection to graph build, where
+    ``validate_sink_required_fields`` compares the set against upstream
+    guarantees, and the composer inherits it for free because it reads this
+    same attribute off the constructed sink.
+
+    Under ``observed`` the schema declares nothing, so before this the set was
+    empty and NOTHING checked the two fields at any point before the write.
+    """
+
+    @staticmethod
+    def _sink_options(mode: str = "observed") -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "collection": "test_collection",
+            "mode": "persistent",
+            "persist_directory": "./data",
+            "field_mapping": {"document_field": "body", "id_field": "doc_id", "metadata_fields": []},
+            "schema": {"mode": "observed"},
+        }
+        if mode != "observed":
+            options["schema"] = {"mode": mode, "fields": ["doc_id: str", "body: str"]}
+        return options
+
+    @staticmethod
+    def _declared(options: dict[str, Any]) -> frozenset[str]:
+        from elspeth.contracts.plugin_roles import sink_declared_required_fields
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
+
+        with plugin_preflight_mode(True):
+            sink = get_shared_plugin_manager().create_sink("chroma_sink", dict(options))
+        try:
+            declared = sink_declared_required_fields(sink)
+        finally:
+            sink.close()
+        assert declared is not None
+        return declared
+
+    def test_observed_schema_still_requires_the_consumed_fields(self) -> None:
+        assert self._declared(self._sink_options()) == frozenset({"doc_id", "body"})
+
+    @pytest.mark.parametrize("mode", ["fixed", "flexible"])
+    def test_consumed_fields_are_required_in_every_mode(self, mode: str) -> None:
+        assert {"doc_id", "body"} <= self._declared(self._sink_options(mode))
+
+    def test_optional_metadata_fields_are_not_required(self) -> None:
+        """The extractor SKIPS an absent metadata field, so requiring one would
+        reject a pipeline the runtime accepts."""
+        options = self._sink_options()
+        options["field_mapping"] = {
+            "document_field": "body",
+            "id_field": "doc_id",
+            "metadata_fields": ["never_guaranteed"],
+        }
+        assert self._declared(options) == frozenset({"doc_id", "body"})

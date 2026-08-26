@@ -18,6 +18,7 @@ from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationWarning
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
+from elspeth.web.composer._producer_resolver import published_success_connection
 from elspeth.web.composer.state import (
     CompositionState,
     _coalesce_branch_connections,
@@ -408,6 +409,17 @@ def _find_identity_node_advisories(state: CompositionState) -> list[_IdentityFin
             producer_id = "source" if source_name == "source" else f"source:{source_name}"
             producer_by_target[source.on_success] = producer_id
     for upstream in state.nodes:
+        # THE publication rule, not a restatement of it. A non-terminal
+        # coalesce, an aggregation that omits on_success, and every queue all
+        # have ``on_success is None`` yet publish under their own id, so
+        # ``if upstream.on_success`` reads them as "not connected" and they
+        # never enter this map. The old code hand-rolled the queue half of
+        # ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES`` in a second loop below and
+        # simply omitted coalesce and aggregation — so an identity passthrough
+        # downstream of either was skipped at the ``node.input not in
+        # producer_by_target`` guard, silently, and looked identical to the
+        # DELIBERATE structural exemption a few lines further down
+        # (elspeth-6632e7a0d2).
         if upstream.on_success:
             _record(upstream.on_success, upstream.id)
         if upstream.on_error:
@@ -419,8 +431,25 @@ def _find_identity_node_advisories(state: CompositionState) -> list[_IdentityFin
             for fork_target in upstream.fork_to:
                 _record(fork_target, upstream.id)
     for node in state.nodes:
-        if node.node_type == "queue":
-            producer_by_target[node.id] = node.id
+        # Implicit self-publication, asked of the AUTHORITY rather than
+        # restated. A node with ``on_success is None`` that is nonetheless
+        # fully connected publishes under its own id, and this loop previously
+        # hand-rolled that rule for ``queue`` alone — so a coalesce or an
+        # aggregation never entered the map, and the identity advisory
+        # downstream of either died at the ``node.input not in
+        # producer_by_target`` guard below. That silence was indistinguishable
+        # from the DELIBERATE structural exemption a few lines further down
+        # (elspeth-6632e7a0d2).
+        #
+        # DIRECT ASSIGNMENT, not ``_record``: this pass deliberately OVERRIDES
+        # an earlier producer for the same key. A source whose ``on_success``
+        # equals a queue's id names the same connection, and the structural
+        # node is the producer the consumer actually reads from. ``_record`` is
+        # first-wins, so routing this through it would let the source shadow
+        # the queue and flag a legitimate structural fan-in.
+        published = published_success_connection(node)
+        if published is not None and node.on_success is None:
+            producer_by_target[published] = node.id
 
     for node in state.nodes:
         if node.node_type != "transform" or node.plugin != "passthrough":

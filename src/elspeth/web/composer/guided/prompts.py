@@ -39,15 +39,30 @@ _STEP_FILE_NAMES: dict[GuidedStep, str] = {
     GuidedStep.STEP_4_WIRE: "step_4_wire.md",
 }
 
-# Discoverability invariant: the per-step file map and the playbook order
-# must cover every GuidedStep member.  If GuidedStep gains a new member and
-# either map is not updated, fail loudly at import time rather than silently
-# omit the step from the composed skill.
-assert set(_STEP_FILE_NAMES.keys()) == set(GuidedStep), (
-    f"_STEP_FILE_NAMES out of sync with GuidedStep: "
-    f"missing {set(GuidedStep) - set(_STEP_FILE_NAMES)}, "
-    f"extra {set(_STEP_FILE_NAMES) - set(GuidedStep)}"
-)
+# Discoverability invariant: the per-step file map must cover every
+# GuidedStep member. If GuidedStep gains a new member and this map is not
+# updated, fail loudly at import time rather than silently omit the step
+# from the composed skill.
+#
+# RAISES rather than asserting (elspeth-37941f1731). As an ``assert`` this
+# guard made a promise it could not keep: ``python -O`` strips assertions, so
+# under optimisation it did precisely the thing the paragraph above says it
+# prevents — the new step was silently omitted from the skill handed to the
+# planner on every guided turn. Nothing else caught it either; no test
+# consumes ``_STEP_FILE_NAMES``.
+#
+# ``GuidedStep`` is the live authority and only the map is hand-written.
+# Deriving the map from the enum would make this comparison a tautology no
+# drift could fail — the point is that a human must supply a skill FILE for
+# each step, which no derivation can do for them.
+_missing_steps = set(GuidedStep) - set(_STEP_FILE_NAMES)
+_extra_steps = set(_STEP_FILE_NAMES) - set(GuidedStep)
+if _missing_steps or _extra_steps:
+    raise RuntimeError(
+        "_STEP_FILE_NAMES out of sync with GuidedStep: "
+        f"missing {sorted(step.name for step in _missing_steps)}, "
+        f"extra {sorted(step.name for step in _extra_steps)}"
+    )
 
 
 @lru_cache(maxsize=1)

@@ -1799,6 +1799,72 @@ def _is_source_config_probe_exception(exc: Exception) -> bool:
     return _is_plugin_config_probe_exception(exc, config_error_prefix=_SOURCE_CONFIG_ERROR_PREFIX)
 
 
+def _probe_sink_declared_required_fields(plugin: str, options: Mapping[str, Any]) -> frozenset[str]:
+    """Read ``plugin``'s ``declared_required_fields`` off a constructed sink.
+
+    Sink-side twin of ``_probe_transform_declared_inputs``, and for the same
+    reason: a sink's requirement is not a pure function of its ``schema:``
+    block. ``text`` and ``document`` union the field they WRITE FROM into their
+    requirement (``get_effective_required_fields() | {self._field}``), which is
+    an ordinary option — ``field:`` — that ``required_input_fields`` never names
+    and the schema block never declares. Reading the raw config surfaces alone
+    therefore under-computes the requirement to the empty set, and Rule B's
+    ``if not sink_required and sink_locked_input is None: continue`` then skips
+    the whole sink. Composer validated GREEN a pipeline the DAG build rejects
+    with "Sink 'text' requires fields ['body']", leaving the authoring loop no
+    error to repair against. Both plugins are in ``REQUIRED_WEB_PLUGIN_IDS``, so
+    this was live on the web surface.
+
+    ``declared_required_fields`` is read through ``sink_declared_required_fields``
+    — the SAME accessor the engine's own check uses
+    (``engine/executors/sink_required_fields.py``) on the SAME attribute
+    ``core/dag/builder.py`` feeds to ``NodeInfo`` and
+    ``validate_sink_required_fields`` then enforces. One implementation, not a
+    mirror free to drift: a sink that computes its requirement from any option
+    is picked up here for free, with no arm to add. That is the point — an
+    enumeration of "the sinks that consume a field" would be a hand-restated
+    set, i.e. this defect again for whichever sink is written next.
+
+    Construction runs under ``plugin_preflight_mode`` because asking a sink what
+    it declares must not do what a run does: ``CSVSink``/``JSONSink`` resolve an
+    output collision path in ``__init__`` unless the guard is set, which
+    inspects the filesystem and, under ``auto_increment``, picks a name no run
+    claimed. ``_semantic_validator._side_effect_free_probe`` documents the same
+    seam ("semantic validation is a QUESTION, not a run").
+
+    A construction failure abstains with the empty set, matching both transform
+    probes: a draft sink whose options do not yet build is owned by the existing
+    config-validation paths, and this rule must not turn an incomplete draft
+    into a hard error. ``validate()`` runs on every composer tool call, so a
+    raise here would be a live 500 — strictly worse than the false accept. The
+    tolerated set is verified rather than assumed (see
+    ``_is_sink_config_probe_exception``); a non-config exception is a genuine
+    engine defect and crashes through.
+    """
+    from elspeth.contracts.plugin_roles import sink_declared_required_fields
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
+
+    try:
+        with plugin_preflight_mode(True):
+            sink = get_shared_plugin_manager().create_sink(
+                plugin,
+                prepare_validation_probe_options(options),
+            )
+    except Exception as exc:
+        if not _is_sink_config_probe_exception(exc):
+            raise
+        return frozenset()
+    try:
+        declared = sink_declared_required_fields(sink)
+    finally:
+        sink.close()
+    # None means "not a sink-role plugin" to the accessor's structural test.
+    # Abstain rather than invent: the raw-config union at the call site keeps
+    # whatever the schema block declared.
+    return declared if declared is not None else frozenset()
+
+
 def _batch_distribution_profile_value_field_entries(
     sources: Mapping[str, SourceSpec],
     nodes: tuple[NodeSpec, ...],
@@ -5398,12 +5464,19 @@ def _check_schema_contracts(
         output: OutputSpec,
     ) -> tuple[frozenset[str] | None, ValidationEntry | None]:
         try:
-            return (
-                get_raw_sink_required_fields(output.options, owner=f"output:{output.name}"),
-                None,
-            )
+            raw_required = get_raw_sink_required_fields(output.options, owner=f"output:{output.name}")
         except ValueError as exc:
             return None, _err(f"output:{output.name}", f"Invalid contract config: {exc}", "high", "contract_config_invalid")
+        # UNION, not replace. On a successful probe the plugin's value is the
+        # superset — every sink builds it from ``get_effective_required_fields()``
+        # and text/document add their written-from field — so the union equals
+        # the probe and the raw term is inert. It earns its place on the ABSTAIN
+        # path: a draft sink that does not yet construct still has whatever its
+        # ``schema:`` block declared, and dropping that would trade this false
+        # accept for a new false negative. Verified across the live registry
+        # that no sink's declared set is a strict subset of the raw set, which
+        # is what makes union safe rather than merely conservative.
+        return raw_required | _probe_sink_declared_required_fields(output.plugin, output.options), None
 
     def _parse_sink_locked_input(
         output: OutputSpec,
@@ -5663,9 +5736,14 @@ def _check_schema_contracts(
         # constructed plugin because neither surface above carries them: the
         # six property-computing configs derive the field name from an ordinary
         # option, so ``required_input_fields`` is empty and the ``schema:``
-        # block never names it. Probed only for transforms — sinks declare
-        # their input requirements through ``get_raw_sink_required_fields``,
-        # checked in the outputs loop below.
+        # block never names it. Probed only for transforms here — a sink's
+        # requirement is read by the same means on its own path, through
+        # ``_probe_sink_declared_required_fields`` in
+        # ``_parse_sink_required_fields``, and checked in the outputs loop
+        # below. (This comment previously said sinks declare their input
+        # requirements through ``get_raw_sink_required_fields``. That was the
+        # defect stated as fact: the raw config surfaces miss a written-from
+        # field exactly as they miss a transform's projected input.)
         declared_inputs = (
             _probe_transform_declared_inputs(node.plugin, node.options)
             if node.node_type == "transform" and node.plugin is not None

@@ -22,6 +22,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 from elspeth.plugins.transforms._scalar_buckets import ScalarBucketKey, scalar_bucket_key
 
 type BatchStatsAggregateRow = dict[str, object]
@@ -374,10 +375,19 @@ class BatchStats(BaseTransform):
             # Tier 2 pipeline data - wrong types indicate upstream bug
             # Use type() instead of isinstance() to reject bool (bool is subclass of int)
             if type(raw_value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._value_field}' must be numeric (int or float), "
-                    f"got {type(raw_value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                # BATCH-level failure, not a skip. The two branches around this
+                # one skip-and-report deliberately (a missing value and a
+                # non-finite float are documented as recoverable); a wrong TYPE
+                # is not, and John's ruling (elspeth-d5034647f0) fails the whole
+                # batch rather than publishing a statistic over a set the
+                # operator never specified. Raised here and converted in
+                # `process` because this helper returns values, not results —
+                # the shape `reference_join._coerce_key` already uses.
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
                 )
 
             # NaN/Inf are type-valid floats but operation-unsafe — they produce
@@ -535,7 +545,6 @@ class BatchStats(BaseTransform):
 
         Raises:
             KeyError: If value_field is missing from any row (upstream bug)
-            TypeError: If value_field is not numeric (upstream bug)
         """
         if not rows:
             # Empty batch is an anomaly — return error, not fabricated statistics.
@@ -549,6 +558,18 @@ class BatchStats(BaseTransform):
         if non_finite_error is not None:
             return non_finite_error
 
+        try:
+            return self._aggregate_all_groups(rows)
+        except BatchRowTypeError as exc:
+            # Requirement 2 of the ruling: the batch records that it failed and
+            # WHY — which row, which field, what was found where a number was
+            # required. NOT quarantined: no batch-shaped node can name a
+            # reachable error sink today (elspeth-d2e3f29d10), so this failure
+            # is recorded and counted but the batch data still reaches nothing.
+            return TransformResult.error(exc.as_reason(), retryable=False)
+
+    def _aggregate_all_groups(self, rows: list[PipelineRow]) -> TransformResult:
+        """Group, aggregate and assemble — the body `process` guards."""
         results: list[BatchStatsAggregateRow] = []
         for group_value, grouped_rows in self._group_rows(rows):
             aggregate, error = self._aggregate_group(grouped_rows, group_value)

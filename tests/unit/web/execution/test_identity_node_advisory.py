@@ -530,3 +530,95 @@ def test_validate_pipeline_suppresses_advisory_on_failure_path() -> None:
     assert result.is_valid is False, "path_allowlist must block this pipeline"
     advisories = [c for c in result.checks if c.name == CHECK_IDENTITY_NODE_ADVISORY]
     assert advisories == [], "Advisory must NOT emit on the failure path — would drown the structural error in cosmetic noise."
+
+
+# ── Implicit self-publishing producers (elspeth-6632e7a0d2) ─────────────
+
+
+def _make_implicit_publisher(node_id: str, node_type: str, input_field: str) -> NodeSpec:
+    """A node that publishes under its OWN id because on_success is None.
+
+    Shaped per node kind so ``NodeSpec.__post_init__`` accepts it: a coalesce
+    needs branches/policy/merge, an aggregation and a queue do not.
+    """
+    kind_fields: dict[str, Any] = {}
+    if node_type == "coalesce":
+        kind_fields = {"branches": {"a": "branch_a", "b": "branch_b"}, "policy": "require_all", "merge": "union"}
+    elif node_type == "aggregation":
+        kind_fields = {"trigger": {"type": "count", "size": 2}, "output_mode": "transform"}
+    return NodeSpec(
+        id=node_id,
+        node_type=node_type,
+        plugin="batch_stats" if node_type == "aggregation" else None,
+        input=input_field,
+        # THE POINT: no on_success. These publish under their own id.
+        on_success=None,
+        on_error=None,
+        options={"schema": {"mode": "observed"}} if node_type == "aggregation" else {},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=kind_fields.get("branches"),
+        policy=kind_fields.get("policy"),
+        merge=kind_fields.get("merge"),
+        trigger=kind_fields.get("trigger"),
+        output_mode=kind_fields.get("output_mode"),
+    )
+
+
+def _identity_after(node_type: str) -> list[Any]:
+    """Advisories for `source -> <node_type> -> identity passthrough -> sink`."""
+    upstream = _make_implicit_publisher("upstream", node_type, "page_in")
+    identity = _make_passthrough_node(input_field="upstream", on_success="json_out")
+    return _find_identity_node_advisories(_make_state_with(nodes=(upstream, identity), outputs=(_make_observed_sink(),)))
+
+
+def test_every_implicitly_self_publishing_kind_is_visible_as_a_producer() -> None:
+    """Enumerated from the AUTHORITY's own set, not from a hand-written copy.
+
+    ``published_success_connection`` (web/composer/_producer_resolver.py) is THE
+    statement of "what connection does this node publish under". Its
+    ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES`` members all have ``on_success is
+    None`` yet are fully connected, so a hand-written ``if node.on_success``
+    reads every one of them as "not connected".
+
+    Regression: elspeth-6632e7a0d2. This map-build tested ``on_success``
+    directly and then hand-rolled the ``queue`` member — and ONLY that member —
+    in a second loop, so a coalesce or aggregation producer never entered
+    ``producer_by_target`` at all. The identity advisory downstream of either
+    then died at the ``node.input not in producer_by_target`` guard.
+
+    Deriving the parametrization from the frozenset is what makes this a pin
+    rather than a restatement: a member added to the authority is covered here
+    the day it lands. Comparing two hand-written sets (``yaml_generator.py:192``)
+    passes a mutation that adds a member to both, and a bare ``assert``
+    (``web/audit_readiness/service.py:858``) is a no-op under ``python -O``.
+    """
+    from elspeth.web.composer._producer_resolver import _IMPLICIT_SELF_PUBLISHING_NODE_TYPES
+
+    # queue is a DELIBERATE structural exemption downstream (see the sibling
+    # test below), so it is visible as a producer but yields no advisory. The
+    # other kinds must produce one.
+    exempt_downstream = {"queue"}
+
+    for node_type in sorted(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES):
+        findings = _identity_after(node_type)
+        if node_type in exempt_downstream:
+            continue
+        assert [f.node_id for f in findings] == ["forward_summaries"], (
+            f"{node_type!r} publishes under its own id but was invisible as a producer, "
+            f"so the identity passthrough downstream of it was silently skipped"
+        )
+
+
+def test_queue_upstream_stays_exempt_rather_than_invisible() -> None:
+    """The queue silence must come from the EXEMPTION, not from blindness.
+
+    Before elspeth-6632e7a0d2 both a queue and a coalesce upstream produced no
+    advisory — identical from the outside, opposite in mechanism. The queue was
+    a deliberate structural exemption; the coalesce was never in
+    ``producer_by_target`` at all. Agreement between two silences is not
+    corroboration, so this pins the queue half explicitly: recovering the
+    coalesce advisory must not start firing one for queue.
+    """
+    assert _identity_after("queue") == []

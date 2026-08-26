@@ -384,7 +384,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:94643957c29890ad"
+    source_file_hash: str | None = "sha256:6c11a5da7c240be1"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -457,14 +457,13 @@ class ReferenceJoin(BaseTransform):
                     "On the CLI use reference_file: <name>.csv beside settings.yaml; the loader reads it into reference_content.",
                     "In the composer there is no filesystem: create_blob with the table bytes, then "
                     "wire_blob_inline_ref at field_path 'node:<node_id>.options.reference_content'. "
-                    "Pasting a table as a literal option value bloats the composition and hits the inline byte cap.",
+                    "Pasting a table as a literal option value hits the inline byte cap.",
                     "Output expressions see ONLY the matched entry as 'ref'. row[...] is not in scope here and is rejected "
                     "at config load, and a bare column name is not an expression — write ref['description'].",
-                    "Address the matched entry as 'ref' in every output expression, e.g. ref['description'].",
                     "reference_key_name names a column of the reference table; key_field names the column on the arriving row.",
-                    "The table must be rectangular and non-empty: every CSV row needs a cell for every header "
-                    "column (an empty cell is fine, a missing one is not), and a header with no data rows is "
-                    "refused. These are config-load refusals, so a blob you cannot inspect fails the whole run.",
+                    "The table must be rectangular and non-empty: every row needs a cell per header column "
+                    "(empty counts, missing does not), and a header with no data rows is refused. These fire "
+                    "at config load, so a blob you cannot inspect fails the run.",
                     "on_miss defaults to fail, because an unenriched row reaching a sink looks identical to an enriched one.",
                 ),
             )

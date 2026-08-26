@@ -739,17 +739,32 @@ _INTERNAL_TRANSFORM_DETERMINISMS: frozenset[Determinism] = frozenset(
 
 _AUDIT_FLAGGED_DETERMINISMS: frozenset[Determinism] = frozenset(Determinism) - _INTERNAL_TRANSFORM_DETERMINISMS
 
-# Module-load assertion: the exclusion list must be a subset of the
-# live enum. A drop or rename of a Determinism member that leaves a
-# stale name in ``_INTERNAL_TRANSFORM_DETERMINISMS`` would otherwise
-# silently shrink ``_AUDIT_FLAGGED_DETERMINISMS`` without test signal.
-# This assertion runs at import time so a stale exclusion surfaces
-# before any test exercises the predicate.
-assert frozenset(Determinism) >= _INTERNAL_TRANSFORM_DETERMINISMS, (
-    "_INTERNAL_TRANSFORM_DETERMINISMS contains values not in Determinism; "
-    f"stale members: {sorted(_INTERNAL_TRANSFORM_DETERMINISMS - frozenset(Determinism))}. "
-    "Remove the stale entries or restore the missing enum members."
-)
+# Module-load guard: the exclusion list must be a subset of the live enum.
+# A drop or rename of a Determinism member that leaves a stale name in
+# ``_INTERNAL_TRANSFORM_DETERMINISMS`` would otherwise silently SHRINK
+# ``_AUDIT_FLAGGED_DETERMINISMS``, so a transform that should be
+# audit-flagged stops being flagged. It runs at import so a stale
+# exclusion surfaces before any test exercises the predicate.
+#
+# RAISES rather than asserting (elspeth-37941f1731). ``python -O`` strips
+# ``assert`` outright, so as an assertion this guard did not exist in an
+# optimised deployment — and nothing else caught the drift, because no test
+# consumes ``_INTERNAL_TRANSFORM_DETERMINISMS``. Measured, not inferred: with
+# a stale member injected, the module imports clean under ``-O`` and the
+# panel is computed from the corrupted set.
+#
+# Only the EXCLUSION side is hand-written; the other side is the live
+# ``Determinism`` enum. Deriving both would be a tautology no drift could
+# fail — the exclusion is a policy decision about which determinisms are
+# internal, and stating it by hand is what gives this comparison something
+# to check.
+_stale_determinisms = _INTERNAL_TRANSFORM_DETERMINISMS - frozenset(Determinism)
+if _stale_determinisms:
+    raise RuntimeError(
+        "_INTERNAL_TRANSFORM_DETERMINISMS contains values not in Determinism; "
+        f"stale members: {sorted(_stale_determinisms)}. "
+        "Remove the stale entries or restore the missing enum members."
+    )
 
 # Version identifier for the boundary-classification rule encoded by
 # ``_AUDIT_FLAGGED_DETERMINISMS`` and ``_build_plugin_trust_row``. The

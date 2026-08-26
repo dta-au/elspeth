@@ -44,9 +44,90 @@ _SCOPE_FIELDS = frozenset({"name", "opener", "closer", "policy"})
 # Recognised top-level pipeline sections. A parsed document that is a
 # mapping but shares none of these keys is not a pipeline export at all
 # (see the guard in composition_state_from_runtime_yaml).
+#
+# ``source`` is not an ``ElspethSettings`` field: it is the singular shorthand
+# the importer expands to ``sources`` below, so it is stated here rather than
+# derived.
 _PIPELINE_SECTION_KEYS = frozenset(
     {"source", "sources", "transforms", "gates", "row_unions", "aggregations", "coalesce", "queues", "sinks", "collectors", "scopes"}
 )
+
+# Sections that are DELIBERATELY dropped, with the ratified decision that says
+# so. This is not the same act as declining to support a section: the composer's
+# own export already omits ``landscape`` on purpose — "URL comes from
+# WebSettings.get_landscape_url() at execution time (security fix S1)",
+# yaml_generator.py:392 — so an imported document's audit URL must NOT survive
+# into composer state, and refusing the document instead would make 81 of the 94
+# shipped example YAMLs unimportable. A false reject there is worse than the
+# silent drop this change exists to remove.
+#
+# Membership here requires a decision to point at. An entry whose justification
+# is only "the importer happens not to read it" belongs below, not here.
+_INTENTIONALLY_DROPPED_SECTIONS: dict[str, str] = {
+    "landscape": "the audit URL comes from the deployment at execution time (yaml_generator.py:392, security fix S1)",
+}
+
+# Sections ``ElspethSettings`` models that the composer cannot import.
+# ``CompositionState`` carries sources, nodes, edges and outputs and has no
+# field any of these could land in (its dataclass fields are nodes/edges/
+# outputs/metadata/version/guided_session/sources), so importing them would mean
+# inventing state the composer cannot round-trip — which is how they came to be
+# dropped in the first place.
+#
+# Declining is legitimate. Declining SILENTLY is not: a shipped example
+# (examples/chroma_rag_indexed/query_pipeline.yaml) lost its
+# ``commencement_gates`` — an admission control gating the run on a non-empty
+# corpus — and the import reported success (elspeth-9482eda744). This mapping
+# turns each drop into a named refusal, extending the ruling on
+# elspeth-6421ffa028 ("parse it, or reject the document naming the unsupported
+# section — never drop it") from the one section that ticket covered to every
+# section the settings model defines.
+_DECLINED_SECTION_REASONS: dict[str, str] = {
+    "checkpoint": "run-execution settings are not part of a composition",
+    "collection_probes": "dependency preflight is a run concern, not a pipeline topology",
+    "commencement_gates": "run-admission control is not part of a composition",
+    "concurrency": "run-execution settings are not part of a composition",
+    "default_llm_profile": "LLM profile selection is deployment configuration",
+    "depends_on": "cross-pipeline dependencies are a run concern",
+    "llm_profiles": "LLM profiles are deployment configuration, not pipeline topology",
+    "max_bound_region_depth": "run-execution settings are not part of a composition",
+    "payload_store": "payload storage is deployment configuration",
+    "rate_limit": "run-execution settings are not part of a composition",
+    "replay_from": "replay selection is a run invocation concern",
+    "retry": "run-execution settings are not part of a composition",
+    "run_mode": "run mode is a run invocation concern",
+    "telemetry": "telemetry is deployment configuration",
+}
+
+
+def _reject_unimportable_sections(doc: Mapping[str, object]) -> None:
+    """Refuse a document carrying a modelled section the composer cannot hold.
+
+    DERIVED from ``ElspethSettings.model_fields``, never restated: the previous
+    hand-written subset silently discarded the fifteen sections outside it, and
+    adding the missing names by hand would have rebuilt the same defect for the
+    sixteenth. A section this module has no opinion about is a hard error rather
+    than a quiet drop, so a NEW settings section cannot pass through unnoticed —
+    it arrives as a refusal naming itself until someone classifies it.
+    """
+    from elspeth.core.config import ElspethSettings
+
+    modelled = frozenset(ElspethSettings.model_fields)
+    present = [
+        key
+        for key in doc
+        if isinstance(key, str) and key in modelled and key not in _PIPELINE_SECTION_KEYS and key not in _INTENTIONALLY_DROPPED_SECTIONS
+    ]
+    if not present:
+        return
+
+    named = sorted(present)
+    details = "; ".join(f"{section} ({_DECLINED_SECTION_REASONS.get(section, 'not supported by the composer')})" for section in named)
+    raise RuntimeYamlImportError(
+        f"pipeline YAML contains {len(named)} section(s) the composer cannot import: {details}. "
+        f"Importing would silently discard them. Remove the section(s) to import the rest of the "
+        f"pipeline, and keep them in the runtime YAML that the composer's export is merged into."
+    )
 
 
 class RuntimeYamlImportError(ValueError):
@@ -577,6 +658,8 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
             "pipeline YAML must define at least one pipeline section "
             "(source, sources, transforms, gates, row_unions, aggregations, coalesce, collectors, scopes, queues, or sinks)"
         )
+
+    _reject_unimportable_sections(doc)
 
     raw_sources = doc.get("sources")
     if raw_sources is None and doc.get("source") is not None:

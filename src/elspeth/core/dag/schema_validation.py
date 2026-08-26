@@ -630,7 +630,11 @@ def _validate_locked_consumer_guaranteed_extras(
     guarantee means every row WILL carry the field; a locked consumer that
     does not admit it kills every such row at the executor input preflight
     (``engine/executors/transform.py`` ``model_validate``; ``sink.py`` /
-    ``aggregation.py`` for their consumers). That certainty is what makes
+    ``aggregation.py`` / ``collector.py`` for their consumers — ``collector.py``
+    is listed here only as of elspeth-c2fa61cf57, which added the preflight it
+    had never had; until then this list named a runtime backstop that did not
+    exist for collectors, and the deferral was unsound for that one kind).
+    That certainty is what makes
     build-time rejection sound: reject only where the death is certain, never
     on a guess — an abstaining producer has no guarantees, so it cannot trip
     this.
