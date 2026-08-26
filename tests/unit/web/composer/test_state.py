@@ -11629,6 +11629,40 @@ class TestUnionCoalesceGuaranteeExtras:
             warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message
         ], result.warnings
 
+    def test_definite_emits_traverse_nested_coalesce_behind_pass_through(self) -> None:
+        """The nested twin of the site-3 test above — the only topology that
+        arm reaches.
+
+        With an extras-allowing relay between the coalesce and the locked sink,
+        the walk-back and the emit profile never see the coalesce; only
+        ``_connection_definite_emits`` crosses it. Widening the seam without
+        this leg would leave the third of three sites unverified for nested.
+
+        Engine parity, measured on the equivalent settings graph: it rejects
+        the same two-hop pipeline with ``EdgeContractError`` naming
+        ``['branch_a', 'branch_b']`` as the producer's guaranteed fields, and
+        BUILDS it under a lossy policy — the pairing
+        ``test_nested_coalesce_under_a_lossy_policy_promises_nothing`` holds
+        for the one-hop shape.
+        """
+        state = self._state(
+            coalesce=self._coalesce(merge="nested", policy="require_all"),
+            tail=self._passthrough(
+                "pt_mid",
+                "variant_merge",
+                "output",
+                options={"schema": {"mode": "flexible", "fields": ["verdict: str"], "guaranteed_fields": ["verdict"]}},
+            ),
+            output_options=self._locked(["verdict: str"]),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("control_branch", "treatment_branch")
+
     def test_nested_coalesce_under_a_lossy_policy_promises_nothing(self) -> None:
         """A branch may be lost, so no branch name is guaranteed — and the
         engine agrees: the same pipeline under ``policy="first"`` BUILDS.
