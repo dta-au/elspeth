@@ -19,7 +19,7 @@ from sqlalchemy import Engine
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.schema import get_aggregation_contract_options, get_raw_schema_config
+from elspeth.contracts.schema import FieldDefinition, get_aggregation_contract_options, get_raw_schema_config
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import get_catalog_values
 from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionParser
@@ -2600,6 +2600,26 @@ def _numeric_aggregation_diagnostics_for_observed_csv(
     return diagnostics
 
 
+@dataclass(frozen=True, slots=True)
+class _DeclaredConcreteFields:
+    """One component's concretely-typed declared input fields, or an abstention.
+
+    ``schema_unparseable`` carries the Tier-3 parse outcome STRUCTURALLY rather
+    than collapsing it into an empty ``fields`` tuple: "this component declares
+    no concretely-typed field" and "this component's schema block could not be
+    parsed at all" are different facts, and only the first is evidence about
+    the pipeline. Conflating them would make the detector's abstention
+    invisible to its own tests.
+    """
+
+    fields: tuple[FieldDefinition, ...]
+    schema_unparseable: bool
+
+    @property
+    def abstains(self) -> bool:
+        return self.schema_unparseable or not self.fields
+
+
 def _declared_input_type_diagnostics_for_observed_csv(
     state: CompositionState,
     source_name: str,
@@ -2630,21 +2650,26 @@ def _declared_input_type_diagnostics_for_observed_csv(
     observed_header_set = set(observed_headers)
     diagnostics: list[Mapping[str, Any]] = []
 
-    def _declared_concrete_fields(options: Mapping[str, Any], *, owner: str) -> tuple[Any, ...]:
+    def _declared_concrete_fields(options: Mapping[str, Any], *, owner: str) -> _DeclaredConcreteFields:
         # ``options`` is composer/user-authored config re-read from persisted
         # session state — Tier-3 origin. A malformed schema block is
         # recoverable external input owned by the contract-config validation
-        # rules; this proof arm abstains on it rather than double-reporting.
+        # rules, so this proof arm abstains rather than double-reporting — and
+        # records that abstention in the returned value instead of returning a
+        # bare empty tuple that reads identically to "nothing declared".
         try:
             schema_config = get_raw_schema_config(options, owner=owner)
         except ValueError:
-            return ()
+            return _DeclaredConcreteFields(fields=(), schema_unparseable=True)
         if schema_config is None or not schema_config.fields:
-            return ()
-        return tuple(
-            field_def
-            for field_def in schema_config.fields
-            if field_def.field_type not in ("str", "any") and field_def.name in observed_header_set
+            return _DeclaredConcreteFields(fields=(), schema_unparseable=False)
+        return _DeclaredConcreteFields(
+            fields=tuple(
+                field_def
+                for field_def in schema_config.fields
+                if field_def.field_type not in ("str", "any") and field_def.name in observed_header_set
+            ),
+            schema_unparseable=False,
         )
 
     def _mismatch_diagnostic(
@@ -2652,7 +2677,7 @@ def _declared_input_type_diagnostics_for_observed_csv(
         component_kind: str,
         component_id: str,
         plugin: str | None,
-        field_def: Any,
+        field_def: FieldDefinition,
         extra_evidence: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         # ``inferred_types`` is our own Tier-2 derived inspection output —
@@ -2697,7 +2722,10 @@ def _declared_input_type_diagnostics_for_observed_csv(
     for node in state.nodes:
         if node.node_type != "transform":
             continue
-        for field_def in _declared_concrete_fields(node.options, owner=f"node:{node.id}"):
+        declared = _declared_concrete_fields(node.options, owner=f"node:{node.id}")
+        if declared.abstains:
+            continue
+        for field_def in declared.fields:
             if not _source_field_reaches_connection_without_type_change(
                 state,
                 node.input,
@@ -2716,7 +2744,10 @@ def _declared_input_type_diagnostics_for_observed_csv(
             )
 
     for output in state.outputs:
-        for field_def in _declared_concrete_fields(output.options, owner=f"output:{output.name}"):
+        declared = _declared_concrete_fields(output.options, owner=f"output:{output.name}")
+        if declared.abstains:
+            continue
+        for field_def in declared.fields:
             if not _source_field_reaches_sink_without_type_change(
                 state,
                 output.name,

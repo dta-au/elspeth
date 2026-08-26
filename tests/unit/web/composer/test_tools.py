@@ -16552,6 +16552,45 @@ class TestPreviewProofStep:
         assert mismatch[0]["evidence_locator"]["declared_type"] == "int"
         assert result.data["is_valid"] is False
 
+    def test_malformed_node_schema_block_abstains_without_crashing(self) -> None:
+        """A node whose schema block cannot be parsed is an abstention, not a
+        diagnostic: contract-config validation owns reporting it, and the proof
+        step must not double-report or escape as a ValueError through
+        preview_pipeline (the tool dispatcher only catches ToolArgumentError)."""
+        state = self._state_with_csv_source(schema_mode="observed").with_node(
+            self._plain_transform(
+                "tidy",
+                plugin="passthrough",
+                input_connection="rows",
+                on_success="out",
+                options={"schema": {"mode": "flexible", "fields": ["price: not_a_real_type"]}},
+            )
+        )
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        codes = [d["code"] for d in result.data["proof_diagnostics"]]
+        assert "declared_input_type_mismatch_against_source_schema" not in codes
+
+    def test_unparseable_schema_abstention_is_carried_structurally(self) -> None:
+        """The abstention is a distinct fact from "declares nothing typed" —
+        collapsing both into an empty tuple made the detector's own abstention
+        invisible to its tests (lint R6 swallow, review finding)."""
+        from elspeth.web.composer.tools.generation import _DeclaredConcreteFields
+
+        unparseable = _DeclaredConcreteFields(fields=(), schema_unparseable=True)
+        nothing_declared = _DeclaredConcreteFields(fields=(), schema_unparseable=False)
+
+        assert unparseable != nothing_declared
+        assert unparseable.abstains and nothing_declared.abstains
+
     def test_declared_source_schema_types_do_not_trip_the_observed_arm(self) -> None:
         """A source that declares its types coerces at ingestion — no diagnostic."""
         state = self._state_with_csv_source(
