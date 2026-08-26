@@ -171,6 +171,22 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id:
     # local Chroma persist_directory under options.provider_config). Confine
     # the same way as sink paths: rewrite relative values to absolute under
     # data_dir so the allowlist approves what the plugin actually reads/writes.
+    #
+    # DOCUMENTED EXCLUSION: `collectors` and `aggregations` are deliberately not
+    # walked (elspeth-ca79b2c63a). `NESTED_LOCAL_PATH_OPTION_KEYS` is
+    # ("persist_directory",), carried only by `rag_retrieval`, which is not
+    # batch-aware and therefore illegal as a collector. Swept the live registry
+    # at 2026-08-26: none of the 13 batch-aware (collector-legal) transforms
+    # declares `provider_config` at all. This function is also CONSISTENT with
+    # its three siblings in the provider_config family rather than one function
+    # short of a sweep — `composer/tools/_common.py`,
+    # `execution/_validation_authoring.py` and `execution/service.py` all scope
+    # to transforms the same way.
+    #
+    # REACTIVATION TRIGGER — incidental containment with an expiry date. Widen
+    # this walk when any batch-aware plugin declares a `provider_config` holding
+    # a local path key, at which point a collector's relative path would reach
+    # the allowlist unrewritten and be refused for the wrong reason.
     transforms = config.get("transforms")
     if transforms is not None:
         if not isinstance(transforms, list):

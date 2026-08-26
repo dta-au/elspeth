@@ -35,7 +35,31 @@ from elspeth.contracts.blobs_inline import (
     is_widened_blob_ref,
 )
 
-_NODE_COLLECTION_KEYS: Final = ("transforms", "gates", "aggregations", "coalesce")
+# Node-collection keys in the runtime pipeline dict whose entries can carry an
+# ``options`` mapping a blob reference could hide in.
+#
+# The AUTHORITY here is ``generate_pipeline_dict`` — the sole producer of the
+# shape this module walks (``pipeline_dict_from_record`` is
+# ``generate_pipeline_dict(state_from_record(record))``, and the YAML the
+# execution path loads is that same dict serialized). Asking it what it emits
+# gives: options-bearing sections are ``sources``, ``transforms``,
+# ``aggregations``, ``collectors`` and ``sinks``; ``gates`` and ``coalesce``
+# are emitted but PROVABLY INERT — the composer refuses options on them, so
+# both keys below have never matched anything. They are kept rather than
+# removed: deleting a key this walk currently accepts is a behaviour change
+# bought for tidiness, and a persisted record is cheap to keep tolerating.
+# ``collectors`` was the live gap (elspeth-ca79b2c63a).
+#
+# Do NOT replace this with ``core/config.py``'s ``_plugin_bearing_sections()``,
+# tempting though it looks — it is derived, it carries container shape, and it
+# returns these same names today. It requires ``plugin`` AND ``options`` on the
+# element model, and this walk cares about ``options`` ALONE: a section with
+# options but no plugin is exactly the case it would silently skip while
+# reporting success. (No such section exists today, so this is a latent
+# mismatch, not a live one.) ``outputs`` below has no settings-side name at
+# all. ``tests/unit/core/test_blobs_inline.py`` derives the coverage from the
+# emitter, so a new options-bearing kind fails there on the day it is emitted.
+_NODE_COLLECTION_KEYS: Final = ("transforms", "gates", "aggregations", "coalesce", "collectors")
 _OUTPUT_COLLECTION_KEYS: Final = ("outputs", "sinks")
 _VALIDATION_INLINE_CONTENT_PLACEHOLDER: Final = "validated blob-backed inline content placeholder"
 BLOB_INLINE_PER_REF_BYTE_CAP: Final = 256 * 1024

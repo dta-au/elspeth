@@ -12,6 +12,21 @@ import yaml
 PluginCollectionName = Literal["transforms", "aggregations"]
 ContentKind = Literal["text", "yaml"]
 
+# DOCUMENTED EXCLUSION: `collectors` is deliberately absent (elspeth-ca79b2c63a).
+#
+# Not because a collector cannot carry options, but because it cannot carry
+# THESE options. All three file-backed keys (`template_file`, `lookup_file`,
+# `system_prompt_file`) belong to the LLM transform, and `LLMTransform` is not
+# batch-aware — so an `llm` collector is rejected before it runs. Swept the live
+# registry at 2026-08-26: 13 batch-aware (collector-legal) transforms exist and
+# NONE declares any of the three keys, so on a legal collector the key is an
+# extra and `extra="forbid"` rejects it at config load.
+#
+# REACTIVATION TRIGGER — this containment is INCIDENTAL, not designed, and has
+# an expiry date. Add `collectors` here the moment any batch-aware plugin
+# (builtin or third-party) declares a file-backed option field. Today the
+# failure is loud and immediate; after that change it becomes a collector
+# silently receiving a filename where every other node kind receives content.
 PLUGIN_OPTION_COLLECTIONS: tuple[PluginCollectionName, ...] = ("transforms", "aggregations")
 
 

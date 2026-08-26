@@ -1830,7 +1830,28 @@ def _composition_references_blob(
             if _options_reference_blob(source_options, blob_id, storage_path, f"sources[{source_name!r}]"):
                 return True
 
-    for collection_key in ("transforms", "gates", "aggregations", "coalesce"):
+    # AUTHORITY: ``generate_pipeline_dict`` — the sole producer of the dict
+    # this walks (``pipeline_dict_from_record`` is
+    # ``generate_pipeline_dict(state_from_record(record))``). Asking it what it
+    # emits gives the options-bearing sections: ``sources``, ``transforms``,
+    # ``aggregations``, ``collectors``, ``sinks``. ``gates`` and ``coalesce``
+    # are emitted but PROVABLY INERT — the composer refuses options on them, so
+    # neither key has ever matched; kept rather than removed, because dropping a
+    # key this guard accepts is a behaviour change bought for tidiness.
+    # ``collectors`` was the live gap: a blob referenced only from a collector's
+    # options read as unreferenced and deletion was permitted under an active
+    # run (elspeth-ca79b2c63a).
+    #
+    # Do NOT swap in ``core/config.py``'s ``_plugin_bearing_sections()``. It is
+    # derived and returns these same names today, which is what makes the
+    # substitution look safe — but it requires ``plugin`` AND ``options``, and
+    # this guard cares about ``options`` ALONE. A section carrying options
+    # without a plugin is the case it would skip while reporting success. No
+    # such section exists today, so the mismatch is latent, not live.
+    # ``tests/unit/web/blobs/test_composition_references_blob.py`` derives the
+    # coverage from the emitter, so a new options-bearing kind fails there on
+    # the day it is emitted.
+    for collection_key in ("transforms", "gates", "aggregations", "coalesce", "collectors"):
         if collection_key not in composition_state:
             continue
         nodes = composition_state[collection_key]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from copy import deepcopy
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -674,3 +675,113 @@ class TestValidateBlobContentRefs:
             "output:writeback.options.footer",
             "(aggregate)",
         ]
+
+
+# --------------------------------------------------------------------------- #
+# Emitted-section coverage (elspeth-ca79b2c63a)                                #
+#                                                                              #
+# `_NODE_COLLECTION_KEYS` was a hand-written tuple and omitted `collectors`,   #
+# so a blob referenced only from a collector's options was never discovered    #
+# and neither the per-ref byte cap nor the hash check ran on it.               #
+#                                                                              #
+# Nothing below lists a section name. The sections are DERIVED by asking the   #
+# emitter what it produces, so a new options-bearing node kind is covered on   #
+# the day it is emitted rather than the day someone remembers this file.       #
+# --------------------------------------------------------------------------- #
+
+
+def _pipeline_dict_with_every_node_kind() -> dict[str, Any]:
+    """Emit a pipeline dict carrying one node of every declared kind.
+
+    Built through `generate_pipeline_dict` on purpose: it is the sole producer
+    of the shape these walks consume (`pipeline_dict_from_record` is
+    `generate_pipeline_dict(state_from_record(record))`), so what it emits is
+    the authority for what they must walk.
+    """
+    from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+    from elspeth.web.composer.yaml_generator import generate_pipeline_dict
+
+    def node(**overrides: Any) -> NodeSpec:
+        base: dict[str, Any] = {
+            "id": "n",
+            "node_type": "transform",
+            "input": "rows",
+            "plugin": "p",
+            "on_success": "out",
+            "on_error": "discard",
+            "options": {"payload": _marker()},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        return NodeSpec(**{**base, **overrides})
+
+    state = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={"payload": _marker()},
+            on_validation_failure=None,
+            description=None,
+        ),
+        nodes=(
+            node(id="t", node_type="transform"),
+            node(id="g", node_type="gate", plugin=None, options={}, condition="x", routes={"true": "out"}),
+            node(id="a", node_type="aggregation"),
+            node(id="c", node_type="coalesce", plugin=None, options={}, branches=("b1", "b2"), policy="require_all", merge="union"),
+            node(id="r", node_type="row_union", plugin=None, options={}, branches=("b1", "b2")),
+            node(id="q", node_type="queue", plugin=None, input="q", on_success=None, on_error=None, options={}),
+            node(id="k", node_type="collector", scope_name="s", scope_opener="t", scope_policy="require_all"),
+        ),
+        edges=(),
+        outputs=(OutputSpec(name="out", plugin="json", options={"payload": _marker()}, on_write_failure=None, description=None),),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    return generate_pipeline_dict(state)
+
+
+def _options_bearing_sections(pipeline: dict[str, Any]) -> dict[str, list[str]]:
+    """Derive `{section: [entry names]}` for every emitted section with options.
+
+    Deliberately keyed on `options` ALONE. Do not narrow this to sections that
+    also carry `plugin` — a blob reference hides in the options mapping, and
+    whether the entry also names a plugin is a fact about a different concern.
+
+    Handles both emitted container shapes: dict sections (`sources`, `sinks`)
+    are keyed by entry name, list sections carry `name` on each entry.
+    """
+    sections: dict[str, list[str]] = {}
+    for key, value in pipeline.items():
+        named: list[str] = []
+        if isinstance(value, dict):
+            named = [name for name, entry in value.items() if isinstance(entry, dict) and entry.get("options")]
+        elif isinstance(value, list):
+            named = [entry["name"] for entry in value if isinstance(entry, dict) and entry.get("options") and "name" in entry]
+        if named:
+            sections[key] = named
+    return sections
+
+
+def test_inline_discovery_covers_every_options_bearing_emitted_section() -> None:
+    pipeline = _pipeline_dict_with_every_node_kind()
+    sections = _options_bearing_sections(pipeline)
+    assert sections, "the emitter produced no options-bearing section — the fixture is inert"
+
+    refs = _discover_blob_content_refs(pipeline)
+    discovered = {ref.field_path for ref in refs}
+
+    missed = sorted(
+        section
+        for section, names in sections.items()
+        if not any(any(f":{name}." in path or path.startswith(f"{name}.") for path in discovered) for name in names)
+    )
+
+    assert not missed, (
+        f"the emitter produces options-bearing {missed}, but inline discovery never walks {'it' if len(missed) == 1 else 'them'}: "
+        f"neither the per-ref byte cap nor the hash check runs on a blob referenced there. "
+        f"Discovered only {sorted(discovered)}. Derive the walked keys from the emitter rather than listing them."
+    )
