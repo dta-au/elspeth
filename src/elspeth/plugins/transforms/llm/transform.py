@@ -1224,10 +1224,18 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:739801f87cca88b9"
+    source_file_hash: str | None = "sha256:6e407f02767b9bc8"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
+    # elspeth-e6e552ce34: the LLM ADDS response fields and never rewrites an
+    # input field's value in place. A response field colliding with a
+    # guaranteed input is rejected at build by
+    # validate_transform_output_field_collisions, which is what keeps this
+    # promise sound for the type-resolution walk; a stray undeclared column a
+    # response could overwrite is never resolvable (no ancestor vouches for
+    # it), so no build verdict rests on its value.
+    preserves_input_values = True
     _provider: LLMProvider | None
     capability_tags: tuple[str, ...] = ("llm", "generation", "structured-output")
 
