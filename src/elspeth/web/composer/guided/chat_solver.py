@@ -817,14 +817,49 @@ _DEFERRED_INTENT_MANAGEMENT_TOOL: dict[str, Any] = {
 GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY: Final[int] = 8
 
 
-def _deferred_constraint_kind_names() -> tuple[str, ...]:
+def _fold_deferred_constraint_kind_names() -> tuple[str, ...]:
     """The constraint-kind union, read off the schema the model is handed.
 
     Tier-1: ``_DEFERRED_CONSTRAINT_SCHEMA`` is this module's own literal, so a
-    missing key is a framework bug that must crash rather than degrade the
-    teaching prose to a stale hand-written list.
+    malformed variant is a framework bug that must crash rather than degrade
+    the teaching prose to a stale hand-written list.
+
+    The explicit single-member check is the whole point of the rewrite, and it
+    closes a SILENT failure the naive ``["enum"][0]`` fold had. Adding a kind
+    as a SECOND enum member of an existing variant — the natural edit for a
+    variant-shaped sibling — did not raise: it returned the first member and
+    quietly taught the planner a union NARROWER than the tool schema it is
+    handed in the same request. No crash, no log, no test, every guided turn.
+    That is exactly the drift this derivation exists to prevent, so the fold
+    now refuses the shape instead of silently picking a winner.
+
+    Evaluated ONCE at import rather than per prompt assembly. The fold is pure
+    over a module constant with no request-dependent input, so a malformed
+    variant is a boot/collection failure beside the partition assert above it,
+    not a live-turn 500. Previously a shape error surfaced as a KeyError or
+    IndexError escaping every handler in ``_guided_step_chat.py`` — neither is
+    a ``ValueError``, so neither matched ``_guided_tool_transient_exception_types``
+    — and reached the route's broad handler as a durably-failed guided
+    operation and an HTTP 500. Honest, audited, and far too late.
     """
-    return tuple(variant["properties"]["kind"]["enum"][0] for variant in _DEFERRED_CONSTRAINT_SCHEMA["oneOf"])
+    names: list[str] = []
+    for index, variant in enumerate(_DEFERRED_CONSTRAINT_SCHEMA["oneOf"]):
+        enum_values = variant["properties"]["kind"]["enum"]
+        if type(enum_values) is not list or len(enum_values) != 1 or type(enum_values[0]) is not str:
+            raise InvariantError(
+                f"_DEFERRED_CONSTRAINT_SCHEMA oneOf[{index}] must declare its kind as a single-member "
+                f"string enum so the teaching prose can name every kind the schema offers; got {enum_values!r}"
+            )
+        names.append(enum_values[0])
+    return tuple(names)
+
+
+_DEFERRED_CONSTRAINT_KIND_NAMES: Final[tuple[str, ...]] = _fold_deferred_constraint_kind_names()
+
+
+def _deferred_constraint_kind_names() -> tuple[str, ...]:
+    """The import-time fold's result. Kept as a function for its call sites."""
+    return _DEFERRED_CONSTRAINT_KIND_NAMES
 
 
 def _deferred_intent_teaching_block() -> str:
