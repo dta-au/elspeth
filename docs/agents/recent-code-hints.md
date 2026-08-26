@@ -8,6 +8,23 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-26 — a row_union-released token's resume authority is the SCHEDULER
+  JOURNAL, and the workset's mint-frame projection is a known-divergent
+  artifact (elspeth-54edda5699, pinned by
+  `tests/e2e/recovery/test_row_union_released_token_resume.py`).**
+  `get_resume_workset` rebuilds `IncompleteTokenSpec.lineage_path` from MINT
+  frames, so a released token's spec silently regains the FORK frame the
+  union popped — dispatching it would re-run the whole branch into a
+  released barrier (measured under mutation: the scheduler's
+  incompatible-work-item guard fail-closes at the union, attempt 1). The
+  healer is `run_resume_processing_loop`'s drain-first precedence: journal
+  rows carry the popped `lineage_path_json` byte-exactly, and after
+  `drain_scheduled_work` the row-replay set is DISCARDED
+  (`unprocessed_rows = ()`), with mixed journal coverage refused as
+  AuditIntegrityError. Do not "fix" the workset projection to re-pop frames
+  (the journal already owns the truth), and do not weaken the drain-first /
+  coverage-refusal pair — the pin test kills either mutation.
+
 - **2026-08-26 — the guided deferral surface is PLURAL end to end: one
   resolution + 1..K retains per reply (elspeth-3a21f09f09), and every carrier
   field renamed with it.** The R2-F15 pair (one resolve + one retain) is
