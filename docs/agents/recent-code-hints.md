@@ -8,6 +8,34 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-27 — a blob-bound CSV source now carries
+  `schema.guaranteed_fields` STAMPED AT BIND TIME, and a graph fake needs the
+  NAME-keyed transform map** (elspeth-da68332faf / elspeth-d39ec0c4d9). Two
+  test-fixture traps from landing it, both of which redden green-looking
+  suites elsewhere:
+  - Any test that binds a CSV blob (`set_source_from_blob`,
+    `set_source_from_blobs`, `set_pipeline` blob_id/inline_blob) and pins the
+    source options EXACTLY now sees `schema: {mode: observed,
+    guaranteed_fields: [<canonical header keys>]}` instead of the bare
+    observed block — three pins moved in one landing
+    (`test_set_source_from_blobs.py`, `test_set_pipeline_candidate.py`,
+    `test_service.py`). Pin the guarantee where the test is ABOUT the stamp;
+    assert `schema["mode"]` alone where it is not. blob_rows binds stamp the
+    plugin's five fixed custody row fields. The stamp is all-or-nothing
+    (partial guaranteed_fields is a complete-claim violation) and abstains on
+    `columns`/`field_mapping`, author-written `guaranteed_fields`/`fields`,
+    non-observed mode, non-UTF-8 `encoding`, undeclarable or colliding
+    headers, and — on the non-authored path — ANY content-read problem
+    (strictly additive; do not "harden" that abstention into a bind failure).
+  - `_edge_patch_targets_by_dag_id`'s transform arm reads
+    `graph.get_transform_name_id_map()` (builder keys it on
+    `wired.settings.name`, the composer node id) instead of zipping the
+    positional `get_transform_id_map()` against state order. A hand-built
+    graph fake that models only the positional map silently maps NO
+    transforms — diagnostics degrade to "unmapped DAG node" with no error.
+    Model both maps on the fake (`_EdgeSuggestionGraph` in
+    `tests/unit/web/execution/test_validation.py` is the reference).
+
 - **2026-08-26 — `except IntegrityError: raise` must come BEFORE the
   `PayloadNotFoundError` arm, and a single-kind test cannot tell you whether
   it does.** The two payload-store errors are unrelated `Exception` siblings
