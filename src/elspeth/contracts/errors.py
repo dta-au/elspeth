@@ -620,6 +620,9 @@ TransformErrorCategory = Literal[
     "pagination_limit_exceeded",
     "too_many_blocks",
     "result_too_large",
+    # reference_join: the row key was absent from the reference table, or an
+    # output path did not resolve against the entry that matched.
+    "reference_miss",
 ]
 
 
@@ -782,6 +785,10 @@ class TransformErrorReason(TypedDict):
     max_output_rows: NotRequired[int]  # Configured row-expansion limit
     skip_rows: NotRequired[int]  # Configured leading rows to skip
     rows_skipped: NotRequired[int]  # Actual rows skipped before exhaustion
+
+    # Reference-table join context (reference_join)
+    reference_key_value: NotRequired[str]  # The row's join key, as matched against the table
+    unresolved_fields: NotRequired[list[str]]  # Output fields the lookup could not produce
 
     # PDF rasterization context
     detail: NotRequired[str]  # Renderer-supplied detail string (document or page refusal)
