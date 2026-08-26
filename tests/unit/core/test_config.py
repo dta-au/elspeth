@@ -4001,6 +4001,42 @@ class TestEnvPlaceholderGuardIsDerived:
         assert "header row" in message, f"Message does not carry the declared reason: {message}"
         assert "sinks['out']" in message and "'headers'" in message, message
 
+    def test_message_explains_a_restriction_imported_from_a_sibling_kind(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The union's whole cost is a refusal that can look arbitrary.
+
+        With no plugin-name-to-kind lookup, a name registered as both a source
+        and a sink is refused on either one's declaration. Today no dual-kind
+        name declares the same emitted option in two kinds, so this branch has
+        no natural fixture — and an untested branch inside a security control is
+        exactly what "declaration tests pin existence, not truth" warns about.
+        So the two-kind declaration is injected rather than left unproven.
+        """
+        from elspeth.core import config as config_module
+
+        def _two_kinds(plugin_name: str) -> dict[str, list[tuple[str, str]]]:
+            return {
+                "shared_option": [
+                    ("source", "the source writes this into every emitted row"),
+                    ("sink", "the sink writes this into the artifact header"),
+                ]
+            }
+
+        monkeypatch.setattr(config_module, "_declared_emitted_options", _two_kinds)
+
+        with pytest.raises(ValueError) as exc_info:
+            config_module._reject_sensitive_plugin_env_placeholders_before_expansion(
+                {"sinks": {"out": {"plugin": "csv", "options": {"shared_option": self.PLACEHOLDER}}}}
+            )
+
+        message = str(exc_info.value)
+        assert "registered as more than one plugin kind" in message, (
+            f"An imported restriction must say so; an unexplained refusal is a support incident: {message}"
+        )
+        assert "sink, source" in message, f"Message does not list the declaring kinds: {message}"
+        assert "emitted row" in message and "artifact header" in message, (
+            f"Message must carry BOTH declared reasons so the operator can see which one applies: {message}"
+        )
+
     def test_mapping_valued_options_are_scanned_not_just_strings(self) -> None:
         """``csv.headers`` leaks through the MAPPING form, not the string form.
 

@@ -1799,21 +1799,26 @@ sites:
     both present on an llm component. Probed: llm transform with both keys -> Stage 1 is_valid=True; settings
     load raises exactly this message. Stage 1 has no profile/provider exclusivity rule. elspeth-2ed41f0a4a
     census 2026-08-17.'
-- key: 545f5085d49071c7
+- key: 19d4370762325eae
   path: src/elspeth/core/config.py
   qualname: _reject_sensitive_plugin_env_placeholders_before_expansion
   exception: ValueError
-  message: '{}[{}] {} option {} must not contain environment-variable placeholders before env expansion;
-    {} emits this option in user-visible report output'
+  message: '{}[{}] {} option {} must not contain environment-variable placeholders before env expansion:
+    {}.{} Env expansion runs before plugin validation on this path, so '
   ordinal: 0
   disposition: unmirrored
-  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). config.py:2451. This pass is unconditional
-    on the web path (config.py:2969 — it runs regardless of expand_env_vars) and walks `transforms` and
-    `aggregations`, both emitted by the composer. _ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS covers
-    report_assemble''s join_with/title (config.py:2203-2205), and report_assemble is a composer-usable
-    plugin (web/plugin_policy/compiler.py:36). Probed: report_assemble aggregation with title="${SECRET_TITLE}"
-    -> Stage 1 is_valid=True, Stage 2 red with exactly this message; the control (title="Report") is green
-    at both stages. Stage 1 has no ${VAR} check on plugin options. elspeth-2ed41f0a4a census 2026-08-17.'
+  note: 'elspeth-8f0a6b3391. Re-keyed, not newly introduced: this is the same site as 545f5085d49071c7,
+    whose message changed when the guard was inverted to derive its forbidden fields from EmittedToOutput
+    declarations on plugin config models instead of a hand-maintained {plugin: {field}} map. The disposition
+    is INHERITED from that entry''s adjudication (elspeth-96e2dd023f, elspeth-2ed41f0a4a census 2026-08-17):
+    the pass is unconditional on the web path (it runs regardless of expand_env_vars), the shapes are
+    composer-authorable, and Stage 1 has no ${VAR} check on plugin options. That Stage-1 half is unchanged
+    by the inversion — no web/composer file was touched — so the gap persists for the same reason. It is
+    also WIDER: the guard now walks sources and sinks as well as transforms/collectors/aggregations, and
+    covers every plugin that declares an emitted option (report_assemble join_with/title, truncate.suffix,
+    web_scrape.text_separator, batch_classifier_metrics.positive_label, and the sink headers option on
+    csv/json/aws_s3/azure_blob) rather than report_assemble alone. The original Stage-1 probe was NOT re-run
+    for the newly covered shapes; the inheritance rests on Stage 1 being untouched, not on a fresh probe.'
 - key: 00f2bf94a9e053a4
   path: src/elspeth/core/config.py
   qualname: _sanitize_dsn
