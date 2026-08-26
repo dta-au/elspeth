@@ -3882,7 +3882,7 @@ class TestEnvPlaceholderGuardIsDerived:
         for kind, name, plugin_class in plugins:
             try:
                 plugin_class.get_config_model()
-            except Exception as exc:  # noqa: BLE001 - reporting the failure IS the assertion
+            except Exception as exc:  # reporting the failure IS the assertion
                 raised.append(f"{kind}/{name}: {type(exc).__name__}: {exc}")
 
         assert not raised, (
@@ -4015,10 +4015,17 @@ class TestEnvPlaceholderGuardIsDerived:
             ("mapping key", {self.PLACEHOLDER: "Body"}),
             ("bare string", self.PLACEHOLDER),
         ):
-            with pytest.raises(ValueError):
+            try:
                 _reject_sensitive_plugin_env_placeholders_before_expansion(
                     {"sinks": {"out": {"plugin": "csv", "options": {"headers": headers}}}}
                 )
+            except ValueError:
+                continue
+            raise AssertionError(
+                f"The guard walked past a placeholder in the {label} of csv.headers. "
+                f"A top-level isinstance(value, str) check misses the mapping form, which is "
+                f"the shape whose values are written as the artifact's header row."
+            )
 
     def test_clean_values_are_still_accepted(self) -> None:
         """Negative control: the guard must reject placeholders, not the option."""
