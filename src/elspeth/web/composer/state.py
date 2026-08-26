@@ -4749,18 +4749,32 @@ def _check_schema_contracts(
             # (``coalesce_policy_quorum_unsupported``).
             require_all = producer_node.policy == "require_all"
 
-            # Strategy dispatch, mirroring ``merge_coalesce_schema``. ``select``
-            # is a deliberate exclusion rather than a third arm: it forwards ONE
-            # branch's raw schema keyed by a ``select_branch`` a composer
-            # ``NodeSpec`` cannot carry, so there is nothing to mirror.
-            # ``_MIRRORED_COALESCE_MERGES`` keeps it out of every Rule A/B seam
-            # and the validation pass rejects the node outright
-            # (``coalesce_merge_select_unsupported``), so its vote can never gate
-            # an acceptance. It falls through to the union arm below — reachable
-            # only when a select coalesce is a BRANCH of another coalesce —
-            # rather than abstaining there, which would add a second, misleading
-            # contract error to a pipeline the planner must repair at the
-            # ``merge`` field.
+            # Strategy dispatch, mirroring ``merge_coalesce_schema``. A merge
+            # Composer cannot mirror ABSTAINS here rather than falling through
+            # to the union arm below, so this vote and
+            # ``_mirrored_coalesce_merged_guarantees`` read ONE predicate and
+            # cannot give two answers to the same question.
+            #
+            # ``select`` is that population: it forwards ONE branch's raw schema
+            # keyed by a ``select_branch`` a composer ``NodeSpec`` cannot carry
+            # (``select_branch`` is on ``yaml_importer``'s
+            # ``_UNSUPPORTED_COALESCE_FIELDS`` and nothing under
+            # ``web/composer/`` reads it from ``node.options``), so there is
+            # nothing to mirror and no honest answer but abstention.
+            #
+            # Falling through to the union arm was WRONG even though the node is
+            # separately rejected at authoring
+            # (``coalesce_merge_select_unsupported``). A select coalesce is still
+            # REACHED by this walk as a BRANCH of another coalesce, and there it
+            # contributed the union of ALL its branches where the runtime
+            # forwards exactly ONE — an over-claim whenever the branches differ,
+            # the same polarity as the nested defect one layer down. It gates no
+            # acceptance today only because authoring refuses the node; the day
+            # ``select`` is legalised, that fall-through would have been a live
+            # false accept. Abstention is correct by construction instead.
+            if producer_node.merge not in _MIRRORED_COALESCE_MERGES:
+                return False, frozenset()
+
             if producer_node.merge == "nested":
                 # A nested merge does NOT publish the branches' inner fields:
                 # the runtime's own ``merge_coalesce_schema`` keys the merged
@@ -4811,6 +4825,30 @@ def _check_schema_contracts(
                 branch_schemas,
                 require_all=require_all,
             )
+            # ``merge_guaranteed_fields`` documents None and () as SEMANTICALLY
+            # distinct — None is "no branch has effective guarantees, abstain",
+            # () is "branches have guarantees and the merge is empty". The
+            # ``or ()`` therefore looks like it flattens an abstention into an
+            # assertion. It cannot, and the reason is three lines up, not here:
+            #
+            #   * the loop ``continue``s on every non-participating branch, so
+            #     an abstainer never enters ``branch_schemas``;
+            #   * ``if not branch_schemas`` returns participated=False above,
+            #     so the all-abstained case never reaches this call;
+            #   * every surviving entry is built with an explicit
+            #     ``guaranteed_fields=tuple(...)``, never None, so
+            #     ``has_effective_guarantees`` is True for all of them.
+            #
+            # With at least one participating set present, the None limb is
+            # unreachable, and participated=True is the correct answer. The
+            # ``or ()`` stays as a fail-safe rather than an assert: if a future
+            # edit let None through, it would reach
+            # ``_mirrored_coalesce_merged_guarantees``, whose three consumers
+            # all test ``is not None``, and an abstention arriving as
+            # ``frozenset()`` would make them adjudicate the coalesce as a
+            # zero-guarantee producer and false-reject a downstream sink. Any
+            # edit that removes the ``continue`` or the empty-case return owes
+            # this line a real abstention channel.
             return True, frozenset(merged or ())
 
         return _effective_producer_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
@@ -5332,6 +5370,32 @@ def _check_schema_contracts(
     def _parse_producer_guarantees(
         producer: ProducerEntry,
     ) -> tuple[frozenset[str] | None, ValidationEntry | None]:
+        """Guarantees for the NODE direction, which does NOT defer on abstention.
+
+        Discarding ``participated`` is deliberate and is NOT drift from
+        ``_parse_producer_vote`` below. The two spell the vote differently
+        because they feed two different ENGINE rules, measured on both
+        surfaces against the SAME abstaining (observed, no guarantees)
+        producer:
+
+        * NODE direction (a transform's explicit ``required_input_fields``) —
+          the engine REJECTS (``EdgeContractError``, "Producer (csv)
+          guarantees: (none - dynamic schema)"), and Composer rejects with the
+          same shape. An abstention IS a missing guarantee here, so folding it
+          to the empty set is the correct encoding.
+        * SINK direction (``required_fields``) — the engine BUILDS, deferring
+          to per-row enforcement, and Composer stays valid. That direction must
+          keep the flag, which is why ``_parse_producer_vote`` exists.
+
+        Engine-side confirmation of the same asymmetry: Phase 1
+        (``core/dag/schema_validation.py``) has no participation check at all,
+        and sinks are excluded from it precisely BECAUSE their own vote walk
+        performs the deferral (elspeth-3283f2eaec).
+
+        Converging the two spellings would therefore either be a no-op or would
+        start honouring the flag in this direction and accept pipelines the
+        engine rejects — a false accept. Do not "tidy" them into one.
+        """
         try:
             _participates, guarantees = _producer_entry_propagation_vote(producer, visited_fan_in_ids=frozenset())
             return guarantees, None
@@ -5353,6 +5417,15 @@ def _check_schema_contracts(
         intersection; for the source/transform entries the walk-back returned
         historically, the structural dispatch falls through to
         ``_effective_producer_vote`` unchanged.
+
+        The two spellings are two ENGINE rules, not one rule spelled twice, and
+        the difference is measured rather than inferred: against the SAME
+        abstaining producer the engine BUILDS a sink declaring
+        ``required_fields`` (deferring to per-row) but REJECTS a transform
+        declaring ``required_input_fields``. Composer mirrors both. See
+        ``_parse_producer_guarantees`` above for the full table and for why
+        collapsing the flag there is correct — merging these two into one
+        helper would reintroduce a false accept on one of the directions.
         """
         try:
             return _producer_entry_propagation_vote(producer, visited_fan_in_ids=frozenset()), None
