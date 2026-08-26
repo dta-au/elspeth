@@ -4239,6 +4239,7 @@ class TestExpandTemplateFiles:
         (prompts_dir / "template.j2").write_text("Hello {{ row.name }}")
         (prompts_dir / "lookup.yaml").write_text("categories:\n  - Clothing\n")
         (prompts_dir / "system.txt").write_text("Use concise labels.")
+        (prompts_dir / "products.csv").write_text("sku,description\nhats,A fine hat\n")
 
         materializer = TemplateOptionMaterializer(tmp_path / "settings.yaml")
         config = materializer.materialize_config(
@@ -4249,6 +4250,7 @@ class TestExpandTemplateFiles:
                         "options": {
                             "template_file": "prompts/template.j2",
                             "lookup_file": "prompts/lookup.yaml",
+                            "reference_file": "prompts/products.csv",
                         },
                     }
                 ],
@@ -4263,9 +4265,12 @@ class TestExpandTemplateFiles:
             }
         )
 
-        assert frozenset({"template_file", "lookup_file", "system_prompt_file"}) == FILE_BACKED_TEMPLATE_OPTION_KEYS
+        assert frozenset({"template_file", "lookup_file", "reference_file", "system_prompt_file"}) == FILE_BACKED_TEMPLATE_OPTION_KEYS
         assert config["transforms"][0]["options"]["prompt_template"] == "Hello {{ row.name }}"
         assert config["transforms"][0]["options"]["lookup"] == {"categories": ["Clothing"]}
+        # reference_file materializes as TEXT, unlike lookup_file's parsed YAML —
+        # reference_join parses the table itself so one field can serve CSV and JSON.
+        assert config["transforms"][0]["options"]["reference_content"] == "sku,description\nhats,A fine hat\n"
         assert config["aggregations"][0]["options"]["system_prompt"] == "Use concise labels."
 
     def test_expand_template_file_not_found(self, tmp_path: Path) -> None:

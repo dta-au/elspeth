@@ -21,6 +21,7 @@ import copy
 import csv
 import io
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
@@ -177,7 +178,12 @@ class ReferenceIndex:
 def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, object]]:
     """Parse ``reference_content`` into a list of entries, one per table row."""
     if cfg.reference_format == "csv":
-        stream = io.StringIO(cfg.reference_content, newline="")
+        # Strip a leading BOM here rather than in the loader: the table arrives as
+        # text from a file on the CLI and from blob substitution on the web, and
+        # only this point sees both. An Excel-exported CSV keeps the BOM inside the
+        # first header name, so reference_key_name would "not exist" against a
+        # column whose difference from it is invisible in a terminal.
+        stream = io.StringIO(cfg.reference_content.lstrip("\ufeff"), newline="")
         try:
             reader = csv.DictReader(stream, strict=True)
             fieldnames = reader.fieldnames
@@ -186,7 +192,29 @@ def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, obje
             # "Product SKU" to "product_sku" would break an authored path.
             if not fieldnames:
                 raise ReferenceTableError("reference table is empty: no CSV header row")
-            csv_entries: list[Mapping[str, object]] = [dict(record) for record in reader]
+            csv_entries: list[Mapping[str, object]] = []
+            for position, record in enumerate(reader):
+                # DictReader pads a short row with restval and buckets surplus
+                # cells under restkey. Both defaults are None, which would enter
+                # the index as an ordinary value and read back as a resolved
+                # null — indistinguishable from a JSON null and invisible to
+                # on_miss. Row arity is a table defect; refuse it at load.
+                surplus = record.pop(None, None)
+                if surplus is not None:
+                    raise ReferenceTableError(
+                        f"reference table data row {position + 1} has more cells than the "
+                        f"{len(fieldnames)}-column header declares; {surplus!r} belongs to no column."
+                    )
+                # A cell that is present but empty reads as "", so None here can
+                # only be restval — i.e. the row ran out of cells.
+                short = sorted(name for name, value in record.items() if value is None)
+                if short:
+                    raise ReferenceTableError(
+                        f"reference table data row {position + 1} has no cell for {short}. "
+                        "A short row would join as a null value rather than a miss, so on_miss "
+                        "could not see it; pad the row (an empty cell is fine) or fix the header."
+                    )
+                csv_entries.append(dict(record))
         except csv.Error as exc:
             raise ReferenceTableError(f"reference table is not valid CSV: {exc}") from exc
         return csv_entries
@@ -231,6 +259,12 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
     row deep into a run.
     """
     entries = _parse_reference_entries(cfg)
+    if not entries:
+        raise ReferenceTableError(
+            "reference table has no entries: every row would miss the join. "
+            "A CSV header with no data rows, or a JSON [], is an empty container rather than "
+            "sparse data — supply the table, or remove the reference_join node."
+        )
     compiled = _compile_output_expressions(cfg)
 
     resolved: dict[str, dict[str, Any]] = {}
@@ -252,25 +286,36 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
 
         values: dict[str, Any] = {}
         for field_name, parser in compiled.items():
-            # KeyError/IndexError/TypeError here mean the PATH does not fit THIS
-            # entry — a sparse table is legitimate — so they become _UNRESOLVED
-            # and are governed by on_miss, not by crashing the load.
+            # ExpressionEvaluationError carries two different facts. Chained from
+            # KeyError/IndexError it means the PATH does not fit THIS entry — a
+            # sparse table is legitimate — so that becomes _UNRESOLVED and is
+            # governed by on_miss. Chained from anything else (ZeroDivisionError,
+            # ValueError, a TypeError out of a call or comparison) the expression is
+            # BROKEN for this entry, and swallowing it would hide an author error
+            # behind a miss that on_miss cannot tell apart from sparseness.
+            # KeyError/TypeError are deliberately NOT caught: expression_parser
+            # re-raises those as evaluator bugs that must crash through.
             try:
                 values[field_name] = parser.evaluate({REFERENCE_ENTRY_NAME: entry})
-            except (KeyError, IndexError, TypeError, ExpressionEvaluationError):
+            except ExpressionEvaluationError as exc:
+                if not isinstance(exc.__cause__, KeyError | IndexError):
+                    raise ReferenceTableError(
+                        f"output field {field_name!r} failed to evaluate against reference entry "
+                        f"{key!r} (position {position}): {exc}. That is a broken expression rather "
+                        "than a sparse entry, so it is refused at load instead of becoming a miss."
+                    ) from exc
                 values[field_name] = _UNRESOLVED
             else:
                 resolved_count[field_name] += 1
         resolved[key] = values
 
-    if entries:
-        never_resolved = sorted(name for name, count in resolved_count.items() if count == 0)
-        if never_resolved:
-            raise ReferenceTableError(
-                f"output fields {never_resolved} resolved against none of the {len(entries)} reference entries. "
-                "A path that fits no entry is a configuration error, not sparse data; check the expression "
-                "against the table's actual keys."
-            )
+    never_resolved = sorted(name for name, count in resolved_count.items() if count == 0)
+    if never_resolved:
+        raise ReferenceTableError(
+            f"output fields {never_resolved} resolved against none of the {len(entries)} reference entries. "
+            "A path that fits no entry is a configuration error, not sparse data; check the expression "
+            "against the table's actual keys."
+        )
 
     return ReferenceIndex(entries=resolved)
 
@@ -288,8 +333,15 @@ def _coerce_key(value: object) -> str:
         # Guarded before int: bool is an int subclass and "True" is the honest
         # spelling, not "1".
         return "true" if value else "false"
-    if isinstance(value, int | float):
-        return repr(value) if isinstance(value, float) else str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ReferenceTableError(f"reference key must be a finite number, got {value!r}")
+        # An upstream numeric transform or a JSON source can carry 42.0 where the
+        # table holds 42. Spelling those differently would silently miss the join,
+        # so an integral float takes the integer spelling.
+        return str(int(value)) if value.is_integer() else repr(value)
+    if isinstance(value, int):
+        return str(value)
     raise ReferenceTableError(f"reference key must be a string or number, got {type(value).__name__}")
 
 
@@ -376,7 +428,10 @@ class ReferenceJoin(BaseTransform):
 
         self._key_field = cfg.key_field
         self._reference_key = cfg.reference_key_name
-        self._reference_source = cfg.reference_source
+        # Rendered once: the loader writes reference_source only on the file path,
+        # and a miss is the one diagnostic where knowing WHICH table was searched
+        # is what tells an author whether the key or the file is wrong.
+        self._reference_origin = f" in {cfg.reference_source}" if cfg.reference_source else ""
         self._on_miss = cfg.on_miss
         self._default_values = dict(cfg.default_values)
         self._output_field_names = tuple(sorted(cfg.output))
@@ -398,9 +453,9 @@ class ReferenceJoin(BaseTransform):
                 composer_hints=(
                     "The reference table is configuration, not a source: it is fixed when the run starts and is not fetched.",
                     "On the CLI use reference_file: <name>.csv beside settings.yaml; the loader reads it into reference_content.",
-                    "In the composer there is no filesystem: create_blob with the table bytes, then wire_blob_inline_ref "
-                    "with field_path 'node:<node_id>.options.reference_content'. Pasting a whole table as a literal option "
-                    "value works for a handful of rows but bloats the composition and hits the inline byte cap.",
+                    "In the composer there is no filesystem: create_blob with the table bytes, then "
+                    "wire_blob_inline_ref at field_path 'node:<node_id>.options.reference_content'. "
+                    "Pasting a table as a literal option value bloats the composition and hits the inline byte cap.",
                     "Output expressions see ONLY the matched entry as 'ref'. row[...] is not in scope here and is rejected "
                     "at config load, and a bare column name is not an expression — write ref['description'].",
                     "Address the matched entry as 'ref' in every output expression, e.g. ref['description'].",
@@ -458,7 +513,9 @@ class ReferenceJoin(BaseTransform):
                         "reference_key_value": key,
                         "unresolved_fields": missed,
                         "error": (
-                            f"no reference entry for {key!r}" if entry is None else f"reference entry {key!r} did not resolve {missed}"
+                            f"no reference entry for {key!r}{self._reference_origin}"
+                            if entry is None
+                            else f"reference entry {key!r}{self._reference_origin} did not resolve {missed}"
                         ),
                     },
                     retryable=False,

@@ -91,6 +91,8 @@ _AUXILIARY_EXAMPLE_YAMLS: frozenset[tuple[str, str]] = frozenset(
         ("multi_worker", "chaos_config_faults.yaml"),
         ("multi_worker_showcase", "chaos_config.yaml"),
         ("multi_worker_showcase", "chaos_config_faults.yaml"),
+        ("reference_join_fork_llm", "chaos_reply.yaml"),
+        ("reference_join_fork_llm", "chaos_triage.yaml"),
         ("openrouter_multi_query_assessment", "criteria_lookup.yaml"),
         ("schema_contracts_llm_assessment", "criteria_lookup.yaml"),
     }

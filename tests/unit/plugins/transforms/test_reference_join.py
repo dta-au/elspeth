@@ -323,3 +323,194 @@ class TestDeliveryPathsAgree:
         assert "reference_file" in message
         # The remediation list is derived from the registry, so our key is in it.
         assert "reference_content" in message
+
+
+class TestTheTableIsWholeOrItIsRefused:
+    """Every defect below used to LOAD, then misbehave one row at a time.
+
+    The unifying rule: a reference table that cannot answer a lookup honestly is
+    a configuration error, and configuration errors are reported at load. The
+    alternative each of these had before is worse than a crash — a value that
+    reads as resolved, or a miss on every row that on_miss then papers over.
+    """
+
+    def test_a_short_csv_row_is_refused_rather_than_joining_as_a_null(self) -> None:
+        """csv.DictReader pads a short row with restval; the pad must not become data.
+
+        This is the sentinel's whole reason for existing, defeated one layer
+        earlier: a None written by restval is an ordinary value, so it resolves,
+        and on_miss: fail — the strictest policy there is — never sees it.
+        """
+        with pytest.raises(PluginConfigError) as exc:
+            build(reference_content="sku,description,price\nhats,A fine hat\n", on_miss="fail")
+
+        message = str(exc.value)
+        assert "data row 1" in message
+        assert "price" in message
+
+    def test_an_empty_trailing_cell_is_a_value_not_a_short_row(self) -> None:
+        """The refusal above must not swallow the ordinary case it sits next to.
+
+        An empty cell reads as "" and is data the table chose to leave blank; a
+        MISSING cell reads as None and is a row that ran out. Refusing the first
+        would reject most real exports.
+        """
+        transform = build(reference_content="sku,description\nhats,\n", output={"d": "ref['description']"})
+
+        result = transform.process(make_pipeline_row({"product": "hats"}), make_source_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict()["d"] == ""
+
+    def test_surplus_cells_are_refused_and_name_the_orphan_value(self) -> None:
+        """DictReader buckets extra cells under restkey, where no expression can read them."""
+        with pytest.raises(PluginConfigError) as exc:
+            build(reference_content="sku,description\nhats,A fine hat,extra\n")
+
+        assert "belongs to no column" in str(exc.value)
+
+    def test_surplus_cells_are_refused_before_the_missing_key_column_is_sorted(self) -> None:
+        """Regression: this raised a bare TypeError out of config validation.
+
+        With the key column absent AND a surplus cell, the 'available keys'
+        diagnostic sorted a dict keyed by {str, ..., None}, so the author got
+        `'<' not supported between NoneType and str` where a written message
+        was already waiting.
+        """
+        with pytest.raises(PluginConfigError) as exc:
+            build(reference_content="code,description\nhats,A fine hat,extra\n")
+
+        assert "belongs to no column" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        ("label", "content", "reference_format"),
+        [
+            ("csv header with no data rows", "sku,description\n", "csv"),
+            ("json empty array", "[]", "json"),
+        ],
+    )
+    def test_an_empty_table_is_refused_like_any_other_empty_container(self, label: str, content: str, reference_format: str) -> None:
+        """A blank file already refused; these two did not. The inconsistency was the tell.
+
+        An empty table cannot answer any lookup, so every row misses: under the
+        default on_miss: fail the run yields nothing, and under null it silently
+        nulls the enrichment for the whole run.
+        """
+        del label
+        with pytest.raises(PluginConfigError) as exc:
+            build(reference_content=content, reference_format=reference_format, output={"d": "ref['description']"})
+
+        assert "no entries" in str(exc.value)
+
+    def test_a_broken_expression_is_refused_rather_than_becoming_a_miss(self) -> None:
+        """Sparse data and a broken expression are different facts.
+
+        Both used to arrive as _UNRESOLVED, and on_miss cannot tell them apart —
+        so a division by zero on one entry was indistinguishable from a table
+        that legitimately omits that path, which is what the examples teach
+        operators to expect.
+        """
+        table = json.dumps([{"sku": "hats", "n": 1, "q": 2}, {"sku": "coats", "n": 1, "q": 0}])
+        with pytest.raises(PluginConfigError) as exc:
+            build(reference_content=table, reference_format="json", output={"p": "ref['n'] / ref['q']"})
+
+        message = str(exc.value)
+        assert "broken expression" in message
+        assert "'coats'" in message
+
+    def test_a_sparse_entry_is_still_governed_by_on_miss(self) -> None:
+        """The other side of the discrimination above: absence stays a miss."""
+        table = json.dumps([{"sku": "hats", "description": "A fine hat"}, {"sku": "coats"}])
+        transform = build(reference_content=table, reference_format="json", output={"d": "ref['description']"}, on_miss="null")
+        ctx_local = make_source_context()
+
+        result = transform.process(make_pipeline_row({"product": "coats"}), ctx_local)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict()["d"] is None
+
+
+class TestANullIsAValueAndAMissIsNot:
+    """The sentinel's stated purpose, which nothing asserted.
+
+    ``_UNRESOLVED`` exists because ``None`` is a legitimate value a reference
+    table may hold. No fixture in this file carried a table-authored null, so
+    replacing ``_UNRESOLVED = object()`` with ``_UNRESOLVED = None`` left the
+    whole suite green — the design's central distinction was documented and
+    unverified.
+    """
+
+    def test_a_table_authored_null_is_a_hit_under_the_strictest_miss_policy(self) -> None:
+        table = json.dumps([{"sku": "hats", "description": None}])
+        transform = build(reference_content=table, reference_format="json", output={"d": "ref['description']"}, on_miss="fail")
+        ctx_local = make_source_context()
+
+        result = transform.process(make_pipeline_row({"product": "hats"}), ctx_local)
+
+        assert result.status == "success", "a JSON null is a value the table holds, not a failure to resolve"
+        assert result.row is not None
+        assert result.row.to_dict()["d"] is None
+        assert result.success_reason is not None
+        assert result.success_reason["metadata"]["matched"] is True
+        # The discriminator: a null that RESOLVED leaves this list empty, where
+        # a path that did not fit would name the field.
+        assert result.success_reason["metadata"]["unresolved_fields"] == []
+
+    def test_an_absent_path_and_an_authored_null_are_told_apart_in_one_table(self) -> None:
+        """Same field, same run: one entry holds null, the other omits the key."""
+        table = json.dumps([{"sku": "hats", "description": None}, {"sku": "coats"}])
+        transform = build(reference_content=table, reference_format="json", output={"d": "ref['description']"}, on_miss="null")
+        ctx_local = make_source_context()
+
+        authored_null = transform.process(make_pipeline_row({"product": "hats"}), ctx_local)
+        absent_path = transform.process(make_pipeline_row({"product": "coats"}), ctx_local)
+
+        assert authored_null.success_reason is not None
+        assert absent_path.success_reason is not None
+        # Both rows carry d=None. Only the audit trail distinguishes them, which
+        # is exactly what the sentinel buys.
+        assert authored_null.row is not None and authored_null.row.to_dict()["d"] is None
+        assert absent_path.row is not None and absent_path.row.to_dict()["d"] is None
+        assert authored_null.success_reason["metadata"]["unresolved_fields"] == []
+        assert absent_path.success_reason["metadata"]["unresolved_fields"] == ["d"]
+
+
+class TestJoinKeySpelling:
+    def test_an_integral_float_joins_against_an_integer_key(self) -> None:
+        """A JSON source or an upstream numeric transform can carry 42.0 for 42.
+
+        Spelling those differently missed the join silently: under on_miss: fail
+        it quarantined correct data, and under null it nulled it.
+        """
+        table = json.dumps([{"sku": 42, "description": "A fine hat"}])
+        transform = build(reference_content=table, reference_format="json", output={"d": "ref['description']"}, on_miss="fail")
+        ctx_local = make_source_context()
+
+        for spelling in (42, "42", 42.0):
+            result = transform.process(make_pipeline_row({"product": spelling}), ctx_local)
+            assert result.status == "success", f"{spelling!r} should reach the same entry as 42"
+
+    def test_a_non_integral_float_keeps_its_own_spelling(self) -> None:
+        table = json.dumps([{"sku": 7.5, "description": "Half a hat"}])
+        transform = build(reference_content=table, reference_format="json", output={"d": "ref['description']"}, on_miss="fail")
+        ctx_local = make_source_context()
+
+        assert transform.process(make_pipeline_row({"product": 7.5}), ctx_local).status == "success"
+        assert transform.process(make_pipeline_row({"product": "7.5"}), ctx_local).status == "success"
+
+    def test_a_bom_does_not_hide_the_key_column(self) -> None:
+        """An Excel-exported CSV keeps the BOM inside its first header name.
+
+        The refusal it produced named ['description', '﻿sku'] — which in a
+        terminal reads as though 'sku' is present and was rejected anyway.
+        """
+        transform = build(reference_content="﻿sku,description\nhats,A fine hat\n", output={"d": "ref['description']"})
+        ctx_local = make_source_context()
+
+        result = transform.process(make_pipeline_row({"product": "hats"}), ctx_local)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict()["d"] == "A fine hat"
