@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from elspeth.core.config import ElspethSettings
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec, queue_node_contract_error
 from elspeth.web.composer.yaml_generator import generate_public_yaml, generate_yaml
 from elspeth.web.composer.yaml_importer import (
@@ -950,3 +951,170 @@ def test_composition_state_from_runtime_yaml_queue_options_unchanged_by_review_s
     described = _sole_queue(composition_state_from_runtime_yaml("queues:\n  inbound:\n    description: interleave point\n"))
     assert dict(described.options) == {"description": "interleave point"}
     assert queue_node_contract_error(described) is None
+
+
+# ---------------------------------------------------------------------------
+# Every modelled section has an EXPLICIT outcome (elspeth-9482eda744)
+# ---------------------------------------------------------------------------
+
+# THE AUTHORITY. Deriving the parametrisation from the settings model — rather
+# than restating a section list here — is what makes a newly added
+# ElspethSettings section arrive as a NEW failing test case instead of being
+# silently dropped by an importer nobody remembered to update.
+_ELSPETH_SETTINGS_SECTIONS = frozenset(ElspethSettings.model_fields)
+
+# One minimal, VALID document fragment per section. Hand-written on purpose:
+# these are the probe inputs, not a restatement of the importer's own list, and
+# each must be independently valid for its section's schema.
+_SECTION_PROBE_YAML: dict[str, str] = {
+    "aggregations": "aggregations:\n- name: agg\n  plugin: batch_stats\n  input: out\n  on_success: out\n  on_error: discard\n  options:\n    schema:\n      mode: observed\n",
+    "checkpoint": "checkpoint:\n  enabled: true\n",
+    "coalesce": "coalesce:\n- name: co\n  branches: {}\n  on_success: out\n",
+    "collection_probes": "collection_probes:\n- collection: c\n  plugin: chroma\n  options: {}\n",
+    "collectors": "collectors:\n- name: col\n  plugin: passthrough\n  input: out\n  on_success: out\n  on_error: discard\n  options: {}\n",
+    "commencement_gates": 'commencement_gates:\n- name: ready\n  condition: "1 > 0"\n',
+    "concurrency": "concurrency:\n  max_workers: 2\n",
+    "default_llm_profile": "default_llm_profile: fast\n",
+    "depends_on": "depends_on:\n- name: dep\n  path: other.yaml\n",
+    "gates": "gates:\n- name: g\n  input: out\n  condition: \"True\"\n  routes:\n    'true': out\n",
+    "landscape": "landscape:\n  url: sqlite:///runs/audit.db\n",
+    "llm_profiles": "llm_profiles:\n  fast:\n    provider: openrouter\n    model: test\n",
+    "max_bound_region_depth": "max_bound_region_depth: 3\n",
+    "payload_store": "payload_store:\n  backend: filesystem\n",
+    "queues": "queues:\n  inbound: {}\n",
+    "rate_limit": "rate_limit:\n  requests_per_minute: 60\n",
+    "replay_from": "replay_from: run-123\n",
+    "retry": "retry:\n  max_attempts: 2\n",
+    "row_unions": "row_unions:\n- name: ru\n  branches: []\n  on_success: out\n",
+    "run_mode": "run_mode: normal\n",
+    "scopes": "scopes:\n- name: sc\n  opener: out\n  closer: out\n",
+    "sinks": "",  # already present in the base document
+    "sources": "",  # already present in the base document
+    "telemetry": "telemetry:\n  enabled: false\n",
+    "transforms": "transforms:\n- name: t\n  plugin: passthrough\n  input: out\n  on_success: out\n  on_error: discard\n  options:\n    schema:\n      mode: observed\n",
+}
+
+
+def _section_survived(state: CompositionState, section: str) -> bool:
+    """Did the section leave an observable trace in the imported state?
+
+    Deliberately structural rather than a whitelist of section names: the
+    question this test asks is "is it REPRESENTED", and the composition state
+    represents a section as sources, nodes, or outputs.
+    """
+    if section in {"sources", "source"}:
+        return bool(state.sources)
+    if section == "sinks":
+        return bool(state.outputs)
+    return bool(state.nodes) and any(_node_matches_section(node, section) for node in state.nodes)
+
+
+def _node_matches_section(node: NodeSpec, section: str) -> str | bool:
+    """A node kind bearing this section's name (transforms -> transform, ...)."""
+    return node.node_type == section.rstrip("s") or node.node_type == section
+
+
+def _minimal_pipeline_doc() -> str:
+    """A valid one-source, one-sink pipeline the importer accepts."""
+    return (
+        "sources:\n"
+        "  primary:\n"
+        "    plugin: csv\n"
+        "    on_success: out\n"
+        "    options:\n"
+        "      path: in.csv\n"
+        "      schema:\n"
+        "        mode: observed\n"
+        "sinks:\n"
+        "  out:\n"
+        "    plugin: json\n"
+        "    on_write_failure: discard\n"
+        "    options:\n"
+        "      path: out.jsonl\n"
+        "      schema:\n"
+        "        mode: observed\n"
+    )
+
+
+@pytest.mark.parametrize("section", sorted(_ELSPETH_SETTINGS_SECTIONS))
+def test_every_modelled_section_is_imported_or_refused_by_name(section: str) -> None:
+    """PER SECTION: a document carrying it either survives import, or is refused NAMING it.
+
+    The defect this pins (elspeth-9482eda744): ``_PIPELINE_SECTION_KEYS`` was a
+    hand-written subset of ``ElspethSettings.model_fields``, and every section
+    outside it was discarded with no error, no warning, and no partial-import
+    signal. A shipped example (examples/chroma_rag_indexed/query_pipeline.yaml)
+    lost its ``commencement_gates`` — an admission control gating the run on a
+    non-empty corpus — and the import reported SUCCESS.
+
+    Silence reading as fidelity is the defect, not the omission. An importer
+    may legitimately decline a section; it may not pretend it was never there.
+
+    WHY PARAMETRISED OVER THE AUTHORITY RATHER THAN A SET COMPARISON: a
+    set-vs-set assertion between two hand-written frozensets passes when a
+    mutation adds a member to BOTH — the hole that survives in
+    ``yaml_generator``'s node-type drift check. Driving the parametrisation
+    from ``ElspethSettings.model_fields`` means a NEW settings section arrives
+    here as a NEW test case that must be classified, and the behavioural
+    assertion below cannot be satisfied by a matching restatement.
+    """
+    from elspeth.web.composer.yaml_importer import _INTENTIONALLY_DROPPED_SECTIONS
+
+    doc = _minimal_pipeline_doc() + _SECTION_PROBE_YAML[section]
+
+    if section in _INTENTIONALLY_DROPPED_SECTIONS:
+        # THIRD OUTCOME. A ratified decision to drop the section is not the
+        # defect: ``landscape`` is omitted from the composer's own export on
+        # purpose (yaml_generator.py:392, security fix S1), so an imported
+        # audit URL must NOT reach composer state, and refusing the document
+        # instead would make 81 of the 94 shipped examples unimportable.
+        # What the defect actually is, is an UNDOCUMENTED drop — so the bar
+        # here is that the exemption cites the decision that authorises it.
+        composition_state_from_runtime_yaml(doc)
+        assert _INTENTIONALLY_DROPPED_SECTIONS[section].strip(), (
+            f"Section {section!r} is dropped deliberately, which is legitimate — but the exemption "
+            f"must record WHY, so the next reader can tell a ratified decision from an oversight."
+        )
+        return
+
+    try:
+        state = composition_state_from_runtime_yaml(doc)
+    except RuntimeYamlImportError as exc:
+        assert section in str(exc), (
+            f"Section {section!r} is refused, which is legitimate — but the refusal must NAME it "
+            f"so the author knows what was rejected. Got: {exc}"
+        )
+        return
+
+    # Imported rather than refused: the section's content must be REPRESENTED,
+    # not swallowed. A bare "no exception" is exactly the silent-drop defect.
+    assert _section_survived(state, section), (
+        f"Section {section!r} imported without error but left no trace in the composition state. "
+        f"That is the silent drop this test exists to forbid: refuse it by name, or carry it."
+    )
+
+
+def test_a_newly_modelled_section_is_refused_rather_than_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE SIXTEENTH SECTION: an unclassified settings field must not pass through.
+
+    This is the test that makes the DERIVATION load-bearing rather than
+    decorative. The parametrised sweep above passes equally well against a
+    hand-written list of the fifteen known sections — the very restatement that
+    produced this defect — because today those fifteen are the whole set. Only a
+    section nobody has classified separates the two implementations.
+
+    Verified by mutation: pointing ``_reject_unimportable_sections`` at
+    ``_DECLINED_SECTION_REASONS`` instead of ``ElspethSettings.model_fields``
+    leaves the sweep green and turns THIS test red — the new section passes
+    straight through and is silently dropped, exactly as the original fifteen
+    were.
+    """
+    from elspeth.core.config import ElspethSettings
+    from elspeth.web.composer import yaml_importer
+
+    monkeypatch.setitem(ElspethSettings.model_fields, "brand_new_section", ElspethSettings.model_fields["run_mode"])
+
+    doc = _minimal_pipeline_doc() + "brand_new_section: 1\n"
+
+    with pytest.raises(yaml_importer.RuntimeYamlImportError, match="brand_new_section"):
+        composition_state_from_runtime_yaml(doc)
