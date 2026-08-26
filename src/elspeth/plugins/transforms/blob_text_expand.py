@@ -41,6 +41,33 @@ _INVARIANT_PROBE_BLOB_REF = "0" * 64
 # no file format asked for.
 _NEWLINE_PATTERN = re.compile(r"\r\n|\r|\n")
 
+# How much headroom the memory guard allows above `max_output_rows`.
+#
+# THIS IS NOT A SECOND ROW LIMIT AND MUST NOT BE COLLAPSED INTO ONE.
+# `max_output_rows` is the author's contract: how many rows may be EMITTED.
+# The guard below is a resource bound: how many chunks may be MATERIALISED
+# while discovering them. They are different quantities because
+# `skip_blank_lines` drops chunks between the two — a document of 90 real
+# lines and 20 blanks materialises 110 chunks and emits 90.
+#
+# Before elspeth-99ae494995 there was one number doing both jobs, so that
+# document was refused at `max_output_rows: 100` while emitting 90: a legal
+# document quarantined, in the direction that kills rows, with no config the
+# author could write to say "I meant the output".
+#
+# Deleting the guard and splitting unbounded is the tempting simplification
+# and it reintroduces a real hazard: `maxsplit` is what stops a 100 MB blob of
+# nothing but separators from materialising 100 million chunks BEFORE any
+# ceiling is consulted. The guard is what keeps that protection while letting
+# the emitted count be the user-facing limit.
+#
+# The multiplier is generous because blanks are the only thing between the two
+# counts, and a document that is 90% blank lines is already pathological. A
+# blob that trips the guard is refused as `too_many_lines` — a distinct
+# category from `too_many_rows`, so an operator can tell "your document is too
+# big" from "your machine was protected".
+_CHUNK_READ_HEADROOM = 10
+
 
 class BlobTextExpandConfig(TransformDataConfig):
     """Configuration for blob_text_expand."""
@@ -62,7 +89,7 @@ class BlobTextExpandConfig(TransformDataConfig):
     )
     encoding: str = Field(default="utf-8", description="Encoding used to decode the text blob. Decoding is strict.")
     skip_blank_lines: bool = Field(default=False, description="Whether to drop empty chunks instead of emitting a row for each.")
-    max_output_rows: int = Field(default=DEFAULT_MAX_OUTPUT_ROWS, gt=0, description="Maximum chunks read from one input blob.")
+    max_output_rows: int = Field(default=DEFAULT_MAX_OUTPUT_ROWS, gt=0, description="Maximum rows emitted for one input blob.")
     max_blob_bytes: int = Field(default=DEFAULT_MAX_BLOB_BYTES, gt=0, description="Maximum payload size accepted from the blob store.")
 
     @field_validator("blob_ref_field")
@@ -128,6 +155,12 @@ def _split_bounded(text: str, *, delimiter: str | None, max_chunks: int) -> list
     caller to know the ceiling was exceeded — with the tail left unsplit.
     A returned list longer than ``max_chunks`` therefore MEANS "too many", and
     its length is not the blob's true chunk count.
+
+    ``max_chunks`` here is the MEMORY GUARD (``_chunk_read_ceiling``), NOT the
+    author's ``max_output_rows``. The two are different jobs and the caller
+    passes the former: this function bounds what is materialised, while
+    ``max_output_rows`` bounds what is emitted after blank filtering
+    (elspeth-99ae494995).
 
     A SINGLE trailing separator terminates the final chunk rather than opening
     an empty one, which is the universal convention for line-oriented files
@@ -239,6 +272,10 @@ class BlobTextExpand(BaseTransform):
         self._encoding = cfg.encoding
         self._skip_blank_lines = cfg.skip_blank_lines
         self._max_output_rows = cfg.max_output_rows
+        # The memory guard's ceiling, derived from the author's row limit rather
+        # than configured separately: a second knob would be one more thing to
+        # get wrong, and nothing an author knows would tell them how to set it.
+        self._chunk_read_ceiling = cfg.max_output_rows * _CHUNK_READ_HEADROOM
         self._max_blob_bytes = cfg.max_blob_bytes
 
         self.declared_output_fields = frozenset(field.name for field in _blob_text_added_output_fields(cfg))
@@ -387,15 +424,23 @@ class BlobTextExpand(BaseTransform):
                 retryable=False,
             )
 
-        chunks = _split_bounded(text, delimiter=self._delimiter, max_chunks=self._max_output_rows)
-        if len(chunks) > self._max_output_rows:
+        # BOUND 1 of 2 — the memory guard. Caps what is MATERIALISED, so a blob
+        # of nothing but separators cannot explode before any limit is
+        # consulted. It is not the author's row limit and its ceiling is
+        # deliberately far above it; see _CHUNK_READ_HEADROOM.
+        chunks = _split_bounded(text, delimiter=self._delimiter, max_chunks=self._chunk_read_ceiling)
+        if len(chunks) > self._chunk_read_ceiling:
             return TransformResult.error(
                 {
-                    "reason": "too_many_rows",
+                    "reason": "too_many_lines",
                     "field": self._blob_ref_field,
                     "blob_ref": blob_ref,
                     "row_count": len(chunks),
                     "max_output_rows": self._max_output_rows,
+                    "error": (
+                        f"blob holds more than {self._chunk_read_ceiling} chunks, the read ceiling that protects "
+                        f"against unbounded expansion ({_CHUNK_READ_HEADROOM}x max_output_rows)"
+                    ),
                 },
                 retryable=False,
             )
@@ -413,6 +458,23 @@ class BlobTextExpand(BaseTransform):
                     "blob_ref": blob_ref,
                     "fields": collisions,
                     "error": "emitted fields collide with existing input fields",
+                },
+                retryable=False,
+            )
+
+        # BOUND 2 of 2 — the author's contract. Counts what will actually be
+        # EMITTED, after blank filtering, which is what `max_output_rows` says
+        # on the tin. Computed before building any row so an over-ceiling blob
+        # is refused without materialising the rows it would have produced.
+        emitted_count = sum(1 for chunk in chunks if not (self._skip_blank_lines and not chunk))
+        if emitted_count > self._max_output_rows:
+            return TransformResult.error(
+                {
+                    "reason": "too_many_rows",
+                    "field": self._blob_ref_field,
+                    "blob_ref": blob_ref,
+                    "row_count": emitted_count,
+                    "max_output_rows": self._max_output_rows,
                 },
                 retryable=False,
             )

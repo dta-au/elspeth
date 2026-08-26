@@ -378,10 +378,14 @@ class BlobJSONExpand(BaseTransform):
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "
         "row field — and you need one row per record, with nested values preserved as real lists and objects."
     )
-    usage_when_not_to_use: str = (
-        "Not a file source and not an array exploder: use the json source for a pipeline input file, and json_explode "
-        "when the array already sits in a row field as a real list."
-    )
+    # Kept deliberately short: this string is `not_for` in the planner's
+    # discovery digest, which is one of the few plugin fields that reaches the
+    # prompt at all (with name/purpose/required_options/capability_tags —
+    # example_use, the usage prose and composer_hints do NOT). The json_explode
+    # discriminator is the clause carrying planner value, because that is the
+    # confusable sibling; "use the json source instead" is derivable from the
+    # source catalogue and was dropped for budget.
+    usage_when_not_to_use: str = "Not an array exploder: use json_explode when the array already sits in a row field as a real list."
     example_use: str = """transform:
   plugin: blob_json_expand
   options:

@@ -18,17 +18,39 @@ at construction, which is what this gate asserts.
 
 SCOPE, and why it is not "every transform". The defect needs the created field
 and the named column to land on THE SAME ROW: the transform reads the column,
-then writes its own output over it. ``BaseTransform.passes_through_input`` is
-the plugin's own declaration of exactly that — every input field is forwarded
-onto the emitted row — so the roster derives from it rather than restating it.
+then writes its own output over it. ELSPETH has exactly two declarations for
+that — ``passes_through_input`` (every input field survives) and
+``forwards_input_fields`` (every SUCCESS row carries its input's fields, minus
+``removed_input_fields``) — so the roster derives from their UNION rather than
+restating the condition by hand.
 
 That is what puts the aggregate batch family outside the roster, and the
 exclusion is now the CONSEQUENCE of the rule rather than a second rule. They
-declare ``passes_through_input = False``: their created fields appear on a NEW
-summary row, so a generic output name colliding with an input column is the
-DOCUMENTED LEGITIMATE SHAPE ``BaseTransform.consumed_input_fields`` describes —
-"a second-stage aggregation reading an upstream ``mean`` while emitting its
-own".
+declare NEITHER flag: their created fields appear on a NEW summary row, so a
+generic output name colliding with an input column is the DOCUMENTED LEGITIMATE
+SHAPE ``BaseTransform.consumed_input_fields`` describes — "a second-stage
+aggregation reading an upstream ``mean`` while emitting its own".
+
+That exclusion was TRIAGED, not assumed (2026-08-26). All 293 (option, target)
+pairs across the ten accepting aggregates were measured three ways: the emitted
+row REPLACES the input (``batch_stats`` fed ``{mean, id, marker}`` returns only
+``{batch_size, count, mean, sum}``, so no row ever carries both the read column
+and the created one); the pairs that look overwritten are PROVENANCE ECHOES
+(``batch_threshold_summary`` emits ``value_field: "value_field"`` — the column
+NAME it read, not a destroyed value); and the ratified corpus SHIPS the shape,
+``examples/document_review_panel/settings.yaml`` running ``batch_stats`` with
+``value_field: mean`` as a genuine second-stage read. Guarding this family
+would reject four working example pipelines. Verdict: zero defects, and the
+existing partial guards are already drawn on the right line —
+``batch_stats``/``batch_distribution_profile`` guard ``group_by`` (whose value
+BECOMES an output column) and deliberately not ``value_field`` (a pure read).
+
+``batch_outlier_annotator`` is the counter-example that makes the union
+load-bearing: it is the ONE aggregate declaring ``forwards_input_fields =
+True`` (its emitted row is ``**entry.row.to_dict()`` plus annotations) and the
+ONE carrying a full ``value_field`` collision guard. The correlation is causal,
+not coincidental — where created fields really do land on the arriving row, the
+defect is real and its author already closed it.
 
 STATED PLAINLY, because the roster reads as more assurance than it carries:
 ``passes_through_input`` is a proxy for INTENT, not the mechanism. The
@@ -42,26 +64,24 @@ contract violation rather than the transform demanding its own output.
 ``batch_stats`` therefore still constructs, whether that shape survives the
 executor's collision check on the batch dispatch path remains an OPEN QUESTION,
 and this gate does not adjudicate it. Widening the roster to the aggregate
-batch family stays a separate decision, not a tightening of this one; as of
-2026-08-26 ten of them accept a created field across 293 (option, target)
-pairs, which is the size of that decision, not a backlog this gate is
-deferring.
+batch family stays a separate decision, and it was TAKEN on 2026-08-26: the
+293 pairs were triaged to zero defects and the family stays out, on the
+evidence recorded above rather than on this gate deferring them.
 
-``batch_replicate`` is the one batch-aware member IN the roster, and it is in
-for the same derived reason every other member is: it declares
-``passes_through_input = True`` because each emitted copy deep-copies its
-originating input row before ``copy_index`` is written onto it. The predicate
+``batch_replicate`` is the one batch-aware member in the roster on the
+``passes_through_input`` limb, and it is in for the same derived reason every
+other member is: it declares that flag because each emitted copy deep-copies
+its originating input row before ``copy_index`` is written onto it. The predicate
 this replaced — "the config class overrides ``TransformDataConfig.
 declared_input_fields``" — is a naming convention, not the mechanism, and it
 excluded ``batch_replicate`` while ``copies_field: "copy_index"`` was accepted
 unguarded.
 
-Transforms that emit a FRESH row (``passes_through_input = False``) are
-therefore out of scope even when they are row-shaped rather than aggregate —
-``line_explode`` and ``json_explode`` are the live instances. Both already
-reject the shape natively (``output_field and source_field must differ``), so
-the exclusion costs no measured coverage today. It is still an exclusion, not
-an absence of the defect.
+``line_explode`` and ``json_explode`` sit on the ``forwards_input_fields``
+limb, so the union pulls them IN where the old predicate excluded them. Both
+already reject the shape natively (``output_field and source_field must
+differ``), which is why this widening changes no verdict — but they are now
+covered on mechanism rather than by an exclusion that happened to be safe.
 
 The roster is DISCOVERED from a live ``PluginManager``, so a new plugin that
 forwards its input and names a column is swept without being added here.
@@ -133,20 +153,27 @@ import pytest
 from elspeth.plugins.infrastructure.base import BaseTransform, is_column_naming_config_option
 from elspeth.plugins.infrastructure.manager import PluginManager
 
-# Plugins measured to declare an arriving column through a config option. Two
-# were already closed natively when the defect was found (``blob_fetch``,
+# Plugins measured to put a created field on the arriving row. Two were already
+# closed natively when the defect was found (``blob_fetch``,
 # ``blob_csv_expand``); four more were the live repros. ``batch_replicate`` is
 # the fifth repro, measured when the roster stopped being keyed on the config
 # class overriding ``declared_input_fields``: ``copies_field: "copy_index"``
-# constructed cleanly and left ``copy_index`` required on input. If a refactor
-# drops one out of scope, coverage of the defect has been lost silently.
+# constructed cleanly and left ``copy_index`` required on input. The last three
+# joined when the predicate became the ``passes_through_input |
+# forwards_input_fields`` union — they reject natively and always did, so they
+# are anchors for the ROSTER DERIVATION rather than repros: if a refactor drops
+# the forwarding limb, these three fall out silently and the union's whole
+# point is gone. If a refactor drops any member, coverage has been lost.
 _MEASURED_DEFECT_ANCHORS = frozenset(
     {
         "aws_textract_document_analysis",
         "azure_document_intelligence",
+        "batch_outlier_annotator",
         "batch_replicate",
         "blob_csv_expand",
         "blob_fetch",
+        "json_explode",
+        "line_explode",
         "rag_retrieval",
         "web_scrape",
     }
@@ -170,16 +197,44 @@ def _registered_transform_classes() -> tuple[type[BaseTransform], ...]:
     return tuple(manager.get_transforms())
 
 
-def _writes_created_fields_onto_the_arriving_row(cls: type[BaseTransform]) -> bool:
+def _writes_created_fields_onto_the_arriving_row(probe: BaseTransform) -> bool:
     """Whether this plugin's created fields land on the row its config named a column of.
 
-    Derived from the plugin's OWN declaration rather than restated. The defect
+    Derived from the plugin's OWN declarations rather than restated. The defect
     is a transform reading a column and then overwriting it, which needs both
-    on one row; ``passes_through_input`` is precisely the claim that every
-    input field is forwarded onto the emitted row (base.py, "all-or-nothing: it
-    demands that EVERY input field ... "). A transform that emits a FRESH row
-    cannot overwrite the column it read, so a created name colliding with an
-    input name is the legitimate second-stage shape, not this defect.
+    on one row, and ELSPETH has exactly two declarations for "an emitted row
+    carries its input's fields":
+
+    * ``passes_through_input`` — all-or-nothing, "it demands that EVERY input
+      field survive" (base.py).
+    * ``forwards_input_fields`` — the EXTRAS direction, "every SUCCESS row this
+      transform emits carries every field present on its input row, EXCEPT the
+      names in ``removed_input_fields``". It exists precisely because the
+      all-or-nothing form is too strong for a transform that drops whole ROWS
+      while still forwarding every field of the ones it keeps (elspeth-15c72686f2).
+
+    Either one puts the created field on the arriving row, so the union is the
+    mechanism. A transform declaring NEITHER emits a FRESH row and cannot
+    overwrite the column it read, which makes a created name colliding with an
+    input name the legitimate second-stage shape rather than this defect.
+
+    ``batch_outlier_annotator`` is why the union is not merely tidier. It
+    declares ``passes_through_input = False`` (it drops rows) and
+    ``forwards_input_fields = True`` (its emitted row is
+    ``**entry.row.to_dict()`` plus annotations) — and it is the ONE aggregate
+    carrying a full ``value_field`` collision guard, which every sibling
+    aggregate lacks and does not need. Under the ``passes_through_input``-only
+    predicate this gate covered it only by luck: the plugin happened to guard
+    already. Measured 2026-08-26, the union changes no verdict — it is
+    robustness against a future aggregate that starts forwarding, not a fix.
+
+    NOTE THE ARGUMENT TYPE. ``passes_through_input`` is a class attribute, but
+    ``forwards_input_fields`` is per-INSTANCE — declarers compute it from
+    config in ``__init__`` (base.py: "declarers set it in ``__init__``, not in
+    the class body"), so ``BatchOutlierAnnotator.forwards_input_fields`` reads
+    ``False`` off the CLASS and ``True`` off a constructed probe. This takes a
+    probe for that reason; reading either off the class would silently restore
+    the old blind spot.
 
     The predicate this replaced asked whether the CONFIG CLASS overrode
     ``TransformDataConfig.declared_input_fields``. That is a naming convention
@@ -187,10 +242,21 @@ def _writes_created_fields_onto_the_arriving_row(cls: type[BaseTransform]) -> bo
     excluded ``batch_replicate`` — which forwards its input, creates
     ``copy_index``, and accepted ``copies_field: "copy_index"``.
     """
-    return cls.passes_through_input
+    return probe.passes_through_input or probe.forwards_input_fields
 
 
-def _has_a_testable_naming_surface(cls: type[BaseTransform]) -> bool:
+def _in_scope(cls: type[BaseTransform]) -> bool:
+    """Roster membership: one constructed probe answers both halves.
+
+    Constructing is what makes ``forwards_input_fields`` readable at all (see
+    ``_writes_created_fields_onto_the_arriving_row``), so the two predicates
+    share the probe rather than each building their own.
+    """
+    probe = cls(cls.probe_config())
+    return _writes_created_fields_onto_the_arriving_row(probe) and _has_a_testable_naming_surface(cls, probe)
+
+
+def _has_a_testable_naming_surface(cls: type[BaseTransform], probe: BaseTransform) -> bool:
     """Whether this plugin exposes a scalar naming option AND creates a field to aim it at.
 
     ``_writes_created_fields_onto_the_arriving_row`` is a proxy for "this
@@ -217,7 +283,6 @@ def _has_a_testable_naming_surface(cls: type[BaseTransform]) -> bool:
     option cannot name a created field where there is no created field, and
     ``self_created_input_fields`` is the same authority the guard itself reads.
     """
-    probe = cls(cls.probe_config())
     return bool(_input_naming_options(cls, probe)) and bool(probe.self_created_input_fields)
 
 
@@ -249,16 +314,31 @@ def _input_naming_options(cls: type[BaseTransform], probe: BaseTransform) -> dic
     naming alone cannot say which, so ``output_naming_config_keys`` is the
     plugin's own classification and everything else is treated as a read.
     """
+    # Mirrors ``_config_named_input_columns``'s own source choice (base.py):
+    # the VALIDATED config when one was captured, so an option the author
+    # omitted still contributes its default, and the raw authored dict when
+    # none was. ``json_explode`` is the single transform in that second state —
+    # its config is a ``DataPluginConfig``, not a ``TransformDataConfig``, so
+    # it cannot route through ``_initialize_declared_input_fields`` and
+    # ``_validated_config`` keeps its ``None`` class default. Asserting a
+    # validated config here would fail the gate on a plugin that REJECTS the
+    # defect correctly, which is a gate defect rather than a plugin one.
     validated = probe._validated_config
-    assert validated is not None, f"{cls.name}: probe captured no validated config; options cannot be discovered"
-
-    # ``dict(model)`` is pydantic's own field-value view: it yields the raw
-    # (unserialised) value for every declared field by name, so the option
-    # values are read from the model's data surface rather than probed off it.
-    field_values = dict(validated)
+    if validated is None:
+        model_fields = type(probe).config_model.model_fields if type(probe).config_model is not None else {}
+        # The raw dict omits defaulted keys, so read each option's value off
+        # the model default rather than reporting a key the author never wrote
+        # as absent.
+        field_values = {name: probe.config.get(name, info.get_default()) for name, info in model_fields.items()}
+    else:
+        # ``dict(model)`` is pydantic's own field-value view: it yields the raw
+        # (unserialised) value for every declared field by name, so the option
+        # values are read from the model's data surface rather than probed off it.
+        model_fields = type(validated).model_fields
+        field_values = dict(validated)
 
     options: dict[str, Any] = {}
-    for name, info in type(validated).model_fields.items():
+    for name, info in model_fields.items():
         if name in _GENERIC_DECLARATION_OPTIONS or name in cls.output_naming_config_keys:
             continue
         if not is_column_naming_config_option(name):
@@ -271,11 +351,7 @@ def _input_naming_options(cls: type[BaseTransform], probe: BaseTransform) -> dic
 
 class TestInputOptionsDoNotNameCreatedFields:
     def test_every_plugin_declaring_an_input_column_rejects_naming_a_created_field(self) -> None:
-        roster = [
-            cls
-            for cls in _registered_transform_classes()
-            if _writes_created_fields_onto_the_arriving_row(cls) and _has_a_testable_naming_surface(cls)
-        ]
+        roster = [cls for cls in _registered_transform_classes() if _in_scope(cls)]
 
         assert roster, "No transform declares an arriving column; the sweep would pass vacuously"
         discovered = {cls.name for cls in roster}

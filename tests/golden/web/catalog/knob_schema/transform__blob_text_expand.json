@@ -85,7 +85,7 @@
       },
       {
         "default": 100000,
-        "description": "Maximum chunks read from one input blob.",
+        "description": "Maximum rows emitted for one input blob.",
         "kind": "number-int",
         "label": "Max Output Rows",
         "name": "max_output_rows",

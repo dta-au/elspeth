@@ -780,16 +780,59 @@ def test_exactly_max_output_rows_is_accepted() -> None:
     assert [row.to_dict()["document_id"] for row in result.rows] == ["d0", "d1", "d2"]
 
 
-def test_max_output_rows_is_enforced_per_document() -> None:
-    body = json.dumps({"documents": [{"document_id": f"d{i}", "title": "T", "sections": []} for i in range(3)]}).encode()
+def test_one_record_over_the_ceiling_is_rejected() -> None:
+    """The other side of the same transition, at the SAME ceiling as the test above.
 
-    result = _run_blob(body, data_key="documents", max_output_rows=2)
+    The pair is what pins the transition POINT. On its own this test only says
+    the ceiling fires somewhere at or below 4; paired with the at-ceiling test
+    it says the boundary sits exactly between 3 and 4.
+    """
+    records = [{"document_id": f"d{index}", "title": "T", "sections": []} for index in range(4)]
+    body = json.dumps({"documents": records}).encode()
+
+    result = _run_blob(body, data_key="documents", max_output_rows=3)
 
     assert result.status == "error"
     assert result.reason is not None
     assert result.reason["reason"] == "too_many_rows"
-    assert result.reason["row_count"] == 3
-    assert result.reason["max_output_rows"] == 2
+    assert result.reason["row_count"] == 4
+    assert result.reason["max_output_rows"] == 3
+
+
+@pytest.mark.parametrize("source", ["blob", "field"])
+def test_both_arms_transition_at_the_same_record_count(source: str) -> None:
+    """The bound lives in the shared parser, so both arms must move together.
+
+    An arm-specific ceiling would be a silent divergence: the same document
+    accepted through one arm and quarantined through the other.
+    """
+    at_ceiling = json.dumps({"documents": [{"document_id": f"d{i}", "title": "T", "sections": []} for i in range(3)]})
+    over_ceiling = json.dumps({"documents": [{"document_id": f"d{i}", "title": "T", "sections": []} for i in range(4)]})
+
+    def run(document: str) -> Any:
+        if source == "field":
+            transform = BlobJSONExpand(
+                {
+                    "schema": {"mode": "observed", "guaranteed_fields": ["content"]},
+                    "source": "field",
+                    "format": "json",
+                    "data_key": "documents",
+                    "fields": list(DOCUMENT_FIELDS),
+                    "max_output_rows": 3,
+                }
+            )
+            return transform.process(make_pipeline_row({"content": document}), make_context())
+        return _run_blob(document.encode(), data_key="documents", max_output_rows=3)
+
+    accepted = run(at_ceiling)
+    assert accepted.status == "success", accepted.reason
+    assert accepted.rows is not None
+    assert len(accepted.rows) == 3
+
+    rejected = run(over_ceiling)
+    assert rejected.status == "error"
+    assert rejected.reason is not None
+    assert rejected.reason["reason"] == "too_many_rows"
 
 
 def test_max_blob_bytes_is_enforced_before_decode() -> None:

@@ -1159,6 +1159,62 @@
       "release_lane": "local"
     },
     {
+      "plugin_key": "transform:blob_json_expand",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.blob_json_expand",
+      "qualname": "BlobJSONExpand",
+      "source_path": "src/elspeth/plugins/transforms/blob_json_expand.py",
+      "determinism": "io_read",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.blob_json_expand:BlobJSONExpand",
+        "process": "elspeth.plugins.transforms.blob_json_expand:BlobJSONExpand",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.blob_json_expand:BlobJSONExpand"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:blob_text_expand",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.blob_text_expand",
+      "qualname": "BlobTextExpand",
+      "source_path": "src/elspeth/plugins/transforms/blob_text_expand.py",
+      "determinism": "io_read",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.blob_text_expand:BlobTextExpand",
+        "process": "elspeth.plugins.transforms.blob_text_expand:BlobTextExpand",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.blob_text_expand:BlobTextExpand"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
       "plugin_key": "transform:field_mapper",
       "kind": "transform",
       "module": "elspeth.plugins.transforms.field_mapper",

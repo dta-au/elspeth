@@ -12,7 +12,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
-from elspeth.plugins.transforms.blob_text_expand import BlobTextExpand, _split_bounded
+from elspeth.plugins.transforms.blob_text_expand import _CHUNK_READ_HEADROOM, BlobTextExpand, _split_bounded
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
 
@@ -291,13 +291,22 @@ def test_row_count_reported_is_the_bound_plus_one_because_the_split_stops_there(
     """PROVES the ceiling is enforced BY the split, not after materialising every chunk.
 
     An implementation that split the whole blob and then compared lengths would
-    report the true count (400 here). Reporting bound+1 is only possible
+    report the true count (400 here). Reporting ceiling+1 is only possible
     because the split itself was told to stop.
+
+    The ceiling the split is told about is the MEMORY GUARD, not
+    ``max_output_rows`` (elspeth-99ae494995): 400 separators at
+    ``max_output_rows=2`` trips the guard at 2 * _CHUNK_READ_HEADROOM = 20 and
+    reports 21. The claim this test has always made is unchanged — the split
+    stopped early rather than materialising 400 chunks — it is simply asserted
+    against the bound that now governs materialisation.
     """
     _, result = _run(b"x\n" * 400, max_output_rows=2)
 
     assert result.reason is not None
-    assert result.reason["row_count"] == 3
+    assert result.reason["reason"] == "too_many_lines"
+    assert result.reason["row_count"] == 2 * _CHUNK_READ_HEADROOM + 1
+    assert result.reason["row_count"] < 400
 
 
 def test_delimiter_arm_is_bounded_too() -> None:
@@ -695,3 +704,131 @@ def test_init_wires_the_created_field_guard_to_the_LIVE_created_set() -> None:
         created.return_value = frozenset({"url"})
         with pytest.raises(PluginConfigError, match="itself creates"):
             BlobTextExpand(config)
+
+
+# --------------------------------------------------------------------------
+# Two bounds, two jobs (elspeth-99ae494995).
+#
+# `max_output_rows` bounds what is EMITTED; the memory guard bounds what is
+# MATERIALISED. Before the split they were one number, so a legal document
+# could be quarantined for chunks it never emitted.
+# --------------------------------------------------------------------------
+
+
+def test_blanks_do_not_count_toward_max_output_rows() -> None:
+    """THE REPRODUCTION: 90 real lines + 20 blanks at max_output_rows=100.
+
+    110 chunks are materialised, 90 rows are emitted. Under the old single
+    bound this was refused as ``too_many_rows`` — a legal document quarantined
+    for chunks that never became rows, in the direction that kills rows, with
+    no config the author could write to say "I meant the output".
+    """
+    lines: list[str] = []
+    for index in range(90):
+        lines.append(f"line{index}")
+        if index < 20:
+            lines.append("")
+    body = ("\n".join(lines) + "\n").encode("utf-8")
+
+    _, result = _run(body, skip_blank_lines=True, max_output_rows=100)
+
+    assert result.status == "success"
+    assert result.rows is not None
+    assert len(result.rows) == 90
+    assert [row.to_dict()["line"] for row in result.rows] == [f"line{index}" for index in range(90)]
+
+
+def test_the_emitted_bound_counts_rows_not_chunks() -> None:
+    """The same blob passes or fails purely on whether the blanks are emitted."""
+    body = b"a\n\n\n\n\nb\n"  # 6 chunks; 2 non-blank
+
+    _, skipping = _run(body, skip_blank_lines=True, max_output_rows=2)
+    _, keeping = _run(body, skip_blank_lines=False, max_output_rows=2)
+
+    assert skipping.status == "success"
+    assert skipping.rows is not None
+    assert len(skipping.rows) == 2
+
+    assert keeping.status == "error"
+    assert keeping.reason is not None
+    assert keeping.reason["reason"] == "too_many_rows"
+    assert keeping.reason["row_count"] == 6
+
+
+def test_accepts_exactly_max_output_rows_emitted() -> None:
+    """The F1 boundary, re-pointed at the EMITTED bound.
+
+    Mutating ``emitted_count > max_output_rows`` to ``>=`` quarantines a legal
+    blob sitting exactly on the ceiling, and no test that feeds strictly-over
+    input would notice.
+    """
+    _, result = _run(b"a\nb\nc\n", max_output_rows=3)
+
+    assert result.status == "success"
+    assert result.rows is not None
+    assert len(result.rows) == 3
+
+
+def test_rejects_one_emitted_row_over_max_output_rows() -> None:
+    """The refusing side, one row further along, so the pair pins the transition."""
+    _, result = _run(b"a\nb\nc\nd\n", max_output_rows=3)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "too_many_rows"
+    assert result.reason["row_count"] == 4
+    assert result.reason["max_output_rows"] == 3
+
+
+def test_the_boundary_holds_when_blanks_are_dropped() -> None:
+    """Exactly at the ceiling AFTER filtering, with blanks padding the chunk count."""
+    body = b"a\n\nb\n\nc\n\n"  # 6 chunks, 3 non-blank
+
+    _, result = _run(body, skip_blank_lines=True, max_output_rows=3)
+
+    assert result.status == "success"
+    assert result.rows is not None
+    assert [row.to_dict()["line"] for row in result.rows] == ["a", "b", "c"]
+
+
+def test_memory_guard_refuses_a_separator_bomb_as_a_distinct_category() -> None:
+    """The guard survives, and says something different from the row limit.
+
+    A blob of nothing but separators must be refused before it materialises,
+    which is what ``maxsplit`` protects against. It reports ``too_many_lines``
+    rather than ``too_many_rows`` so an operator can tell "your document is too
+    big" from "your machine was protected".
+    """
+    _, result = _run(b"x\n" * 400, max_output_rows=2)
+
+    assert result.status == "error"
+    assert result.retryable is False
+    assert result.reason is not None
+    assert result.reason["reason"] == "too_many_lines"
+    assert result.reason["row_count"] == 2 * _CHUNK_READ_HEADROOM + 1
+    assert "max_output_rows" in str(result.reason.get("error", ""))
+
+
+def test_the_memory_guard_sits_above_the_row_limit_not_at_it() -> None:
+    """A blob between the two bounds is refused by the ROW limit, not the guard.
+
+    This is what proves the guard has headroom rather than being the row limit
+    under another name: collapsing them would make this blob report
+    ``too_many_lines``.
+
+    The chunk count must sit strictly BETWEEN the two bounds — 15 chunks is
+    over ``max_output_rows=2`` but under the guard at 2 * 10 = 20. A count
+    above the guard would trip it first and prove nothing about ordering.
+    """
+    _, result = _run(b"x\n" * 15, max_output_rows=2)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "too_many_rows"
+
+
+def test_the_guard_ceiling_is_derived_from_the_authors_row_limit() -> None:
+    """One knob, not two: nothing an author knows would tell them how to set the guard."""
+    transform = _build_transform(max_output_rows=7)
+
+    assert transform._chunk_read_ceiling == 7 * _CHUNK_READ_HEADROOM
