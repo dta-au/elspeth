@@ -1807,18 +1807,23 @@ sites:
     {}.{} Env expansion runs before plugin validation on this path, so '
   ordinal: 0
   disposition: unmirrored
-  note: 'elspeth-8f0a6b3391. Re-keyed, not newly introduced: this is the same site as 545f5085d49071c7,
-    whose message changed when the guard was inverted to derive its forbidden fields from EmittedToOutput
-    declarations on plugin config models instead of a hand-maintained {plugin: {field}} map. The disposition
-    is INHERITED from that entry''s adjudication (elspeth-96e2dd023f, elspeth-2ed41f0a4a census 2026-08-17):
-    the pass is unconditional on the web path (it runs regardless of expand_env_vars), the shapes are
-    composer-authorable, and Stage 1 has no ${VAR} check on plugin options. That Stage-1 half is unchanged
-    by the inversion — no web/composer file was touched — so the gap persists for the same reason. It is
-    also WIDER: the guard now walks sources and sinks as well as transforms/collectors/aggregations, and
-    covers every plugin that declares an emitted option (report_assemble join_with/title, truncate.suffix,
-    web_scrape.text_separator, batch_classifier_metrics.positive_label, and the sink headers option on
-    csv/json/aws_s3/azure_blob) rather than report_assemble alone. The original Stage-1 probe was NOT re-run
-    for the newly covered shapes; the inheritance rests on Stage 1 being untouched, not on a fresh probe.'
+  note: 'elspeth-8f0a6b3391. Re-keyed, not newly introduced: same site as 545f5085d49071c7, whose message
+    changed when the guard was inverted to derive its forbidden fields from EmittedToOutput declarations
+    on plugin config models instead of a hand-maintained map. Kept unmirrored as the FAIL-SAFE recording,
+    not because it is confirmed: unmirrored over-states the gap, which is safe, while mirrored would be
+    a false clearance. DISPOSITION IS CONTESTED BY FRESH EVIDENCE. Probed 2026-08-26: all seven newly
+    covered shapes are REJECTED by the web loader path (load_settings_from_config_dict with expand_env_vars=False),
+    and Stage 1 reaches exactly that loader - load_runtime_settings calls load_settings_dict and catches
+    ValueError into _settings_failure (web/execution/_validation_runtime.py:198-202), which fails the
+    settings check and yields is_valid=False. validate_runtime_plugins additionally instantiates plugins,
+    constructing config models that now carry the plugin-side validator. Both paths point at MIRRORED.
+    The prior note recorded Stage 1 is_valid=True for report_assemble while also stating the pass ran
+    unconditionally on the web path; that historical claim is UNEXPLAINED and is contradicted by this
+    probe - no reconciliation is offered rather than an invented one. Not yet reclassified because validate_pipeline_for_trained_operator
+    has NOT been run end to end on a real CompositionState, and "the loader rejects" is a different claim
+    from "Stage 1 returns is_valid=False for a composer-authored shape": an earlier phase could fail first,
+    or the composer could normalise the option away before materialisation. That harness is owed and is
+    the pin for the C4 both-loader-paths ruling.'
 - key: 00f2bf94a9e053a4
   path: src/elspeth/core/config.py
   qualname: _sanitize_dsn

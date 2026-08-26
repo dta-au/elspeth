@@ -152,7 +152,7 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4274c3f811508c8f"
+    source_file_hash: str | None = "sha256:bf754e8259e6102f"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
     usage_when_to_use: str = (

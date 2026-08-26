@@ -98,7 +98,7 @@ class ReportAssemble(BaseTransform):
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4d2b810b340578ae"
+    source_file_hash: str | None = "sha256:15e6746e7fb9cdca"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "

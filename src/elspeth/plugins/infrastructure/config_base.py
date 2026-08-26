@@ -276,8 +276,19 @@ class PluginConfig(BaseModel):
         pre-expansion guard in the settings loader closes that window and reads
         the same declarations. Neither is redundant; both derive from here.
         """
-        for field_name, reason in emitted_option_fields(type(self)).items():
-            if env_placeholders_in(getattr(self, field_name)):
+        declared = emitted_option_fields(type(self))
+        if not declared:
+            return self
+
+        # Iterating the model yields (field_name, value) for its own fields —
+        # direct access to an owned type, not a dynamic-attribute probe. A
+        # getattr(self, name) here would read as a masquerade site under
+        # ADR-032 and would need baselining, for no gain: the names come from
+        # this model's own model_fields, so nothing about the lookup is
+        # uncertain.
+        for field_name, value in self:
+            reason = declared[field_name] if field_name in declared else None
+            if reason is not None and env_placeholders_in(value):
                 raise ValueError(f"{field_name} must not contain environment-variable placeholders; {reason}")
         return self
 
