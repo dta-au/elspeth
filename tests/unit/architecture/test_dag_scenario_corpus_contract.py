@@ -613,7 +613,29 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # comparison, confirming no other field moved. No case showed a status
 # change, a row-count change, or a lost record type other than the
 # retirement — a pure rotation, not behaviour drift.
-EXPECTED_CASE_REGISTRY_SHA256 = "75f88906e9a928543864a226da2ae2f87a4e91285e0e7494ce2de704ac1b40ea"
+# Rotated 2026-08-26 for elspeth-e6e552ce34: a PLUGIN PROVENANCE rotation, not
+# a semantic one. csv_source.py gained observed_value_type and passthrough.py
+# gained preserves_input_values, so each plugin's source_file_hash moved
+# (csv 2b4b87f0eaca5602 -> ffb1e0e20cdf780d, passthrough 90f625f0d2cdbed3 ->
+# 4465297d3b60b81e); both new values were recomputed from the live files with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash. The node audit record
+# carries that byte, so the manifest's 17 literal source_file_hash pins and
+# checkpoint-deterministic-resume/reopen-resume's resumed_full_projection_sha256
+# went stale, and this registry (which hashes each case's full model_dump,
+# `expected` included) moved with them. Confinement was proved POSITIVELY
+# rather than by absence: an export of HEAD with ONLY the two declared hash
+# bytes reverted — every other change in the series intact — ran
+# tests/integration/core/dag + tests/unit/architecture at 859 passed / 1
+# failed, that single failure being test_state_engine_catalog_contract::
+# test_main_reports_unexpected_failures_without_traceback, which is equally red
+# at the pre-series base b825ac4ad (243 passed / 0 failed on the dag suite
+# there). So all 32 reds traced to the two provenance bytes and nothing
+# structural moved: no count, disposition, terminal, error_hash, or
+# projection_counts pin changed. No oracle_freeze snapshot moved either — that
+# surface excludes audit_records, and no snapshot contains either hash — so
+# this is a manifest byte correction, NOT a re-freeze, and needs no ruling of
+# the kind META-39/META-41 required for locked-in-buggy oracle semantics.
+EXPECTED_CASE_REGISTRY_SHA256 = "5b4e422f70887d46d1ca9dcc808eaa83ebb099c8daa787af85d8c4d9eb37a504"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
