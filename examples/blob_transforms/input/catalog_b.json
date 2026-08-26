@@ -1,0 +1,10 @@
+{
+  "publisher": "Regional Office B",
+  "documents": [
+    {
+      "document_id": "doc-2001",
+      "title": "Consultation Summary",
+      "sections": ["Method", "Themes", "Next Steps", "Annex"]
+    }
+  ]
+}

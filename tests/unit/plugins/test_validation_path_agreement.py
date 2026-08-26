@@ -346,6 +346,41 @@ _TRANSFORM_REJECTION_CASES = [
         "row_index_field.*collides",
         id="blob_csv_expand-row-index-blob-ref-collision",
     ),
+    # ── batch_replicate ──────────────────────────────────────────────────
+    pytest.param(
+        "batch_replicate",
+        {
+            "schema": _make_observed_schema(),
+            "copies_field": "copy_index",  # names the field batch_replicate creates
+            "include_copy_index": True,
+        },
+        "copies_field",
+        id="batch_replicate-copies-field-names-created-field",
+    ),
+    # ── blob_json_expand ─────────────────────────────────────────────────
+    pytest.param(
+        "blob_json_expand",
+        {
+            "schema": _make_observed_schema(),
+            "blob_ref_field": "blob_ref",
+            "format": "json",
+            "fields": ["title", "body"],
+            "record_index_field": "blob_ref",  # collides with input blob reference
+        },
+        "record_index_field.*collides",
+        id="blob_json_expand-record-index-blob-ref-collision",
+    ),
+    # ── blob_text_expand ─────────────────────────────────────────────────
+    pytest.param(
+        "blob_text_expand",
+        {
+            "schema": _make_observed_schema(),
+            "blob_ref_field": "blob_ref",
+            "output_field": "blob_ref",  # collides with input blob reference
+        },
+        "output_field.*collides",
+        id="blob_text_expand-output-field-blob-ref-collision",
+    ),
     # ── pdf_rasterize ────────────────────────────────────────────────────
     pytest.param(
         "pdf_rasterize",

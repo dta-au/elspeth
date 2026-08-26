@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from functools import cache
 from pathlib import Path
@@ -209,6 +210,11 @@ def _runtime_options(reference: BuiltinReference) -> dict[str, Any]:
     options = _replace_secret_refs(_options(reference))
     assert isinstance(options, dict)
     return options
+
+
+# The blob-expand family naming convention, which is what makes the hint
+# recommendation derivable rather than hand-listed.
+_BLOB_PARSER_NAME = re.compile(r"blob_[a-z0-9_]+_expand")
 
 
 def _composer_hints(name: str) -> str:
@@ -515,10 +521,26 @@ def test_rag_composer_hints_name_only_real_authored_and_provider_config_fields()
 
 
 def test_blob_fetch_composer_hint_recommends_only_a_registered_blob_parser() -> None:
+    """Both directions, derived from the hint text rather than restating a roster.
+
+    A hard-coded roster is a guard that restates the authority it enforces: it
+    goes stale the moment a parser lands, and it cannot tell whether the hint is
+    steering planners at a transform that does not exist. Deriving the
+    recommended set from the hint catches a ghost recommendation AND a parser
+    the hint forgot, and needs no edit when the next one registers.
+    """
     hints = _composer_hints("blob_fetch")
     registered = {plugin_cls.name for plugin_cls in get_shared_plugin_manager().get_transforms()}
+    recommended = set(_BLOB_PARSER_NAME.findall(hints))
+    blob_parsers = {name for name in registered if _BLOB_PARSER_NAME.fullmatch(name)}
 
-    assert "blob_csv_expand" in registered
-    assert "blob_csv_expand" in hints
-    assert "blob_json_expand" not in registered
-    assert "blob_json_expand" not in hints
+    assert blob_parsers, "no blob parser is registered — the probe shape changed"
+    assert recommended, "blob_fetch composer hints recommend no parser to chain"
+    assert not recommended - registered, (
+        f"blob_fetch composer hints recommend unregistered transform(s): {sorted(recommended - registered)}. "
+        "A hint naming a transform no planner can build steers the composer into a dead end."
+    )
+    assert not blob_parsers - recommended, (
+        f"blob_fetch composer hints omit registered blob parser(s): {sorted(blob_parsers - recommended)}. "
+        "An unmentioned parser is one planners route past."
+    )

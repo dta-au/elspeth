@@ -1,0 +1,70 @@
+# blob_json_expand, INLINE arm (`source: field`).
+#
+# No payload store, no blob_ref, no staging script: the JSON document arrives
+# as an ordinary column of the input file. Two things this shows that the blob
+# arm cannot:
+#   * `format` is REQUIRED here — an inline row field carries no stored content
+#     type to infer it from, and nothing guesses.
+#   * `tags` reaches the sink as a REAL JSON LIST, not a JSON-looking string,
+#     which is what lets json_explode consume it downstream.
+#   * `json_text` is CONSUMED: the document does not ride along on every emitted
+#     row. The sink schema is `mode: observed`, so it takes the emitted shape as
+#     it comes; a `mode: fixed` sink here must NOT declare `json_text`.
+sources:
+  primary:
+    plugin: csv
+    on_success: inline_payloads
+    options:
+      path: examples/blob_transforms/input/inline_json_payloads.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'record_id: str'
+        - 'source_label: str'
+        - 'json_text: str'
+      on_validation_failure: discard
+
+transforms:
+- name: expand_inline_json
+  plugin: blob_json_expand
+  input: inline_payloads
+  on_success: output
+  on_error: expansion_failures
+  options:
+    source: field
+    text_field: json_text
+    format: json
+    # No data_key: each document's top level IS the record array.
+    fields:
+    - entry_id
+    - headline
+    - tags
+    include_record_index: true
+    record_index_field: json_record_index
+    schema:
+      mode: fixed
+      fields:
+      - 'record_id: str'
+      - 'source_label: str'
+      - 'json_text: str'
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/blob_transforms/output/expanded_inline_json_rows.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+  expansion_failures:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/blob_transforms/output/inline_json_failures.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/blob_transforms/runs/inline_json_audit.db

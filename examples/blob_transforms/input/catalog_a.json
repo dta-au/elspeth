@@ -1,0 +1,15 @@
+{
+  "publisher": "Regional Office A",
+  "documents": [
+    {
+      "document_id": "doc-1001",
+      "title": "Water Security Review",
+      "sections": ["Findings", "Recommendations", "Appendix"]
+    },
+    {
+      "document_id": "doc-1002",
+      "title": "Grid Upgrade Business Case",
+      "sections": ["Options", "Costs"]
+    }
+  ]
+}

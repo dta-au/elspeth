@@ -8,6 +8,114 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-26 — a `*_field` option with a NON-NONE DEFAULT leaks its column
+  name into `consumed_input_fields` on EVERY arm, including arms that never
+  read it — and an arm-branched `declared_input_fields` does not protect you.**
+  `_config_named_input_columns` (base.py:1105) reads the VALIDATED config, so
+  it sees defaults the author never wrote, and it folds in every option
+  `is_column_naming_config_option` (base.py:82 — `field`/`fields`/`group_by`
+  or a `_field`/`_fields` suffix) accepts that is not listed in
+  `output_naming_config_keys`. It is completely arm-unaware, and it BYPASSES
+  the `declared_input_fields` property, so branching that property on a
+  `source: blob|field` discriminator fixes nothing. It bites only when the
+  leaked name collides with a field the plugin CREATES, because
+  `base.py:1176` (`demote = self_created_input_fields - consumed_input_fields`)
+  is the ONLY functional consumer in `src/` — everything else that mentions
+  the property is a comment. When it does collide, the created field is never
+  demoted, stays required on input, and every row is rejected for missing the
+  field the transform exists to produce (elspeth-d6eeb3a71d) — from a config
+  whose author never wrote the option at all. The shape that fixes it, now in
+  all three blob expanders: default the option to `None`, add `read_<opt>` for
+  the effective spelling (`self.<opt> or DEFAULT_<OPT>`), add `named_<opt>`
+  returning `None` on the arm that does not read it, feed the arm-aware value
+  through `declared_input_fields`, and read `read_<opt>` in `__init__`. Note
+  the asymmetry: `None` keeps the name out of the DERIVED surface while
+  `declared_input_fields` puts it back on the arm that really reads it, so the
+  blob arm's requirement survives. This is INVISIBLE to inspection — the way
+  to find it is to A/B the contract surfaces against the real pre-change
+  plugin: `git show HEAD:<path> > /tmp/old.py`, load it with
+  `importlib.util.spec_from_file_location` so both classes live in one
+  process, and diff `consumed_input_fields` / `self_created_input_fields` /
+  `demoted_input_fields` / `declared_input_fields` / `declared_output_fields`
+  / the `input_schema` required-flag map across a matrix of configs and
+  payloads. Forty config x payload pairs took minutes to run and are the only
+  reason the blob arm could be shown unchanged while the inline arm's leak
+  closed.
+
+- **2026-08-26 — `_reject_input_options_naming_created_fields` must be called
+  at the END of `__init__`, and needs a config-time twin.** It READS
+  `self.self_created_input_fields` rather than capturing it (base.py:984), so
+  a call placed before `declared_output_fields` is populated sees an empty set
+  and passes vacuously — a guard that looks correct and does nothing. Two
+  further traps around it. (a) `validate_transform_config` never CONSTRUCTS
+  the transform, so a guard living only in `__init__` makes pre-validation
+  report a config valid that the engine then rejects; that is exactly the
+  divergence `tests/unit/plugins/test_validation_path_agreement.py` polices,
+  and it only catches you if a rejection case exists for your plugin. Pair the
+  call with a `@model_validator` over the created set that IS knowable at
+  config time, and DERIVE that set from the same function that builds the
+  output fields rather than restating it — `pdf_rasterize` is the reference
+  shape (`_reject_field_name_collisions` at :247 alongside the `__init__` call
+  at :434). (b) A test that calls the helper directly on an instance proves
+  the HELPER works, not that it is WIRED IN; the `__init__` call stays
+  silently deletable and a mutation that removes it survives. Prove the wiring
+  instead by patching `self_created_input_fields` to a name no by-name
+  validator inspects — `patch.object(Cls, "self_created_input_fields",
+  new_callable=PropertyMock)` — and asserting construction is still refused,
+  with a control showing the same config constructs unpatched. The general
+  form of that lesson, worth carrying past this guard: a coverage sweep that
+  exercises one representative member of a set is shielded by whatever sorts
+  first, so a guarded scalar can hide every unguarded member behind it —
+  `tests/invariants/test_input_options_do_not_name_created_fields.py` tested
+  only `sorted(created)[0]` and has since been widened for that reason (see
+  its own note at :76).
+
+- **2026-08-26 — ZERO ROWS IS A FAIL STATE, and an empty ROW is not an empty
+  RESULT.** Ruling from John, and it reverses a call that flip-flopped twice
+  before settling — check this entry rather than trusting a sibling plugin you
+  happen to read first. Nothing downstream can consume zero rows, so a
+  transform that produces none has failed to produce data and must return
+  `TransformResult.error({...}, retryable=False)` so the row leaves through
+  `on_error`. Reuse an existing `TransformErrorCategory` literal; the name
+  does not matter. The distinction that matters is between an empty VALUE and
+  an empty RESULT: a CSV row spelled `,,,` is a row whose values are empty and
+  is perfectly good data, and so is the empty string between two newlines —
+  both must be EMITTED. Only a container that yields no row at all is the
+  failure. Two mistakes follow from getting that backwards: filtering blank
+  values away as if they were not rows, and synthesising a blank row to
+  rescue a genuinely empty container. Do neither. The pair worth testing is
+  one input under two configs — `"\n\n\n"` with `skip_blank_lines: false`
+  emits three empty-valued rows, and the SAME bytes with
+  `skip_blank_lines: true` drop them all and must error. `blob_csv_expand`'s
+  `empty_csv` was right all along; `blob_json_expand` and `blob_text_expand`
+  were brought back into line.
+  The mechanism note this replaces still holds, but ONLY for genuine filters:
+  `can_drop_rows = True` + `TransformResult.success_empty()` is the sole legal
+  zero-emission shape (`success_multi([])` is invalid outright,
+  `contracts/results.py:424`, and `engine/executors/can_drop_rows.py` raises
+  unless BOTH `passes_through_input` and `can_drop_rows` are declared), and
+  `record_empty_expansion` (`token_traversal.py:210`, gated on
+  `creates_tokens`) mints the durable `member_count=0` group record that a
+  bound `require_all` empty-group failure needs. That machinery exists for row
+  FILTERS and bound-group openers. "The container I was handed was empty" is
+  NOT a legitimate use of it — an expander reaching for `can_drop_rows` to
+  make an empty document look successful is the error this entry exists to
+  prevent.
+
+- **2026-08-26 — under concurrent edit, a single read of a file is not
+  evidence; hash before AND after every measurement.** Sibling agents edit
+  plugin files while you review them. During one read-only review
+  `blob_json_expand.py` moved four times, and a scratchpad snapshot taken
+  along the way contained two things that never reached the settled file: a
+  `json.dumps(...)` stringification of nested values in the record
+  projection, and a `@model_validator` named `_unused_*`. Reporting either
+  would have been a confident false finding against a live author. So: stamp
+  every measurement with `sha256sum` at both ends and discard any result whose
+  brackets differ, re-read before accusing, and when you must mutate someone
+  else's module to test it, patch the class attribute at runtime from a
+  scratchpad pytest plugin (`-p my_mutant` with a `pytest_configure` that sets
+  the attribute) rather than writing to their file at all.
+
 - **2026-08-26 — EDITING ANY PLUGIN SOURCE FILE MOVES FROZEN CORPUS BYTES.
   This is a whole-tree trap with no local symptom.** Every plugin declares a
   `source_file_hash` line, and the node audit record carries that byte, and

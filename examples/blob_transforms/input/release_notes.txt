@@ -1,0 +1,2 @@
+Release 2.4 tightens the payload-store permission check.
+"Group-writable stores are refused," the changelog says.

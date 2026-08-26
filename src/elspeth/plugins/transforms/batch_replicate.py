@@ -26,6 +26,11 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 
+# The one field this transform creates. Named once so the emission site, the
+# declared output contract, and the config-time guard cannot drift apart into
+# disagreeing on what ``copies_field`` may not point at.
+COPY_INDEX_FIELD = "copy_index"
+
 
 class BatchReplicateConfig(TransformDataConfig):
     """Configuration for batch replicate transform.
@@ -59,6 +64,32 @@ class BatchReplicateConfig(TransformDataConfig):
     def _default_within_max(self) -> "BatchReplicateConfig":
         if self.default_copies > self.max_copies:
             msg = f"default_copies ({self.default_copies}) exceeds max_copies ({self.max_copies})"
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _copies_field_is_not_the_created_field(self) -> "BatchReplicateConfig":
+        """Reject a ``copies_field`` naming the column this transform creates.
+
+        ``copies_field`` names a column ``process`` READS on every buffered
+        row, and ``copy_index`` is written onto each emitted copy of that same
+        row (``passes_through_input``). Pointing one at the other makes the
+        transform read the column it is about to overwrite, and because
+        ``consumed_input_fields`` then covers ``copy_index``, nothing demotes
+        it: it stays required on the input schema and every row that does not
+        already carry it is rejected for missing the field the transform exists
+        to create (elspeth-d6eeb3a71d).
+
+        Guarded HERE as well as in ``__init__`` so the two validation paths
+        agree — pre-validation runs the config model alone, so an
+        ``__init__``-only guard would reject on the engine path while
+        ``validate_transform_config`` reported the config clean. The created
+        set is fully knowable at config time: it is ``copy_index`` exactly when
+        ``include_copy_index`` is on, and empty otherwise, so a config that
+        disables the index may name it freely.
+        """
+        if self.include_copy_index and self.copies_field == COPY_INDEX_FIELD:
+            msg = f"copies_field {self.copies_field!r} may not name {COPY_INDEX_FIELD!r}, which batch_replicate itself creates; point copies_field at a column that ARRIVES on the row, or set include_copy_index: false"
             raise ValueError(msg)
         return self
 
@@ -98,7 +129,7 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:03bc22d9f674bba6"
+    source_file_hash: str | None = "sha256:36ea627f752063aa"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -167,7 +198,7 @@ class BatchReplicate(BaseTransform):
         self._initialize_declared_input_fields(cfg)
 
         # Declare output fields for centralized collision detection.
-        self.declared_output_fields = frozenset(["copy_index"] if cfg.include_copy_index else [])
+        self.declared_output_fields = frozenset([COPY_INDEX_FIELD] if cfg.include_copy_index else [])
         self._copies_field = cfg.copies_field
         self._default_copies = cfg.default_copies
         self._max_copies = cfg.max_copies
@@ -182,6 +213,18 @@ class BatchReplicate(BaseTransform):
             adds_fields=True,
         )
         self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
+
+        # LAST: the created set is READ here, not captured, so this must run
+        # after declared_output_fields is populated — an earlier call would see
+        # an empty set and pass vacuously.
+        #
+        # _copies_field_is_not_the_created_field already refuses today's only
+        # offending config, so this call cannot currently fire; the pairing is
+        # the same one pdf_rasterize and blob_csv_expand carry, and it is what
+        # keeps the guard attached to the RUNTIME created set. A created field
+        # that is not knowable from the config alone would otherwise be guarded
+        # by neither.
+        self._reject_input_options_naming_created_fields({"copies_field": cfg.copies_field})
 
     def _reject_explicit_copy_index_collision(self, cfg: BatchReplicateConfig) -> None:
         """Reject explicit schemas that would always collide with copy_index emission."""
@@ -286,7 +329,7 @@ class BatchReplicate(BaseTransform):
                 # shallow copy would share nested mutable values across copies
                 output = copy.deepcopy(row.to_dict())
                 if self._include_copy_index:
-                    output["copy_index"] = copy_idx
+                    output[COPY_INDEX_FIELD] = copy_idx
                 valid_rows.append(output)
 
         # If ALL rows were quarantined, return error — no valid output to expand
@@ -318,9 +361,9 @@ class BatchReplicate(BaseTransform):
 
         # Add copy_index as a new inferred field if configured
         if self._include_copy_index:
-            merged_fields["copy_index"] = FieldContract(
-                normalized_name="copy_index",
-                original_name="copy_index",
+            merged_fields[COPY_INDEX_FIELD] = FieldContract(
+                normalized_name=COPY_INDEX_FIELD,
+                original_name=COPY_INDEX_FIELD,
                 python_type=int,
                 required=False,
                 source="inferred",
@@ -335,7 +378,7 @@ class BatchReplicate(BaseTransform):
 
         success_reason: TransformSuccessReason = {
             "action": "processed",
-            "fields_added": ["copy_index"] if self._include_copy_index else [],
+            "fields_added": [COPY_INDEX_FIELD] if self._include_copy_index else [],
         }
         if quarantined:
             success_reason["metadata"] = {

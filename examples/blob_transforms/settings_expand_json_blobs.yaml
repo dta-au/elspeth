@@ -1,0 +1,79 @@
+# blob_json_expand, BLOB arm (`source: blob`, the default).
+#
+# The bytes come from the payload store via blob_ref, exactly like
+# settings_expand_csv_blobs.yaml. Two things differ from the inline JSON
+# variant next door:
+#   * `format` is NOT set — it is inferred from the stored blob_content_type
+#     (application/json), fail-closed. A content type the table does not
+#     recognise is refused with a message naming `format` as the remedy.
+#   * `data_key` selects the record array out of an enclosing object, rather
+#     than the document's top level being the array itself.
+sources:
+  primary:
+    plugin: csv
+    on_success: json_manifest
+    options:
+      path: examples/blob_transforms/input/json_blob_manifest.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'manifest_index: int'
+        - 'source_name: str'
+        - 'source_url: str'
+        - 'blob_ref: str'
+        - 'blob_content_type: str'
+      on_validation_failure: discard
+
+transforms:
+- name: expand_json_blob
+  plugin: blob_json_expand
+  input: json_manifest
+  on_success: output
+  on_error: expansion_failures
+  options:
+    source: blob
+    blob_ref_field: blob_ref
+    content_type_field: blob_content_type
+    data_key: documents
+    # Every declared field is typed `any`: JSON records have no header row, so
+    # this list is what tells DAG validation that `sections` will exist. It also
+    # arrives as a REAL list, which is what json_explode would need downstream.
+    fields:
+    - document_id
+    - title
+    - sections
+    include_record_index: true
+    record_index_field: json_record_index
+    schema:
+      mode: fixed
+      fields:
+      - 'manifest_index: int'
+      - 'source_name: str'
+      - 'source_url: str'
+      - 'blob_ref: str'
+      - 'blob_content_type: str'
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/blob_transforms/output/expanded_json_rows.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+  expansion_failures:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/blob_transforms/output/json_expansion_failures.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/blob_transforms/runs/json_blob_audit.db
+
+payload_store:
+  backend: filesystem
+  base_path: examples/blob_transforms/payloads/offline

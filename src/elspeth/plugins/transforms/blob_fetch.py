@@ -255,7 +255,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b324fc6c21c11889"
+    source_file_hash: str | None = "sha256:d4b8687389d9908c"
     config_model = BlobFetchConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("http", "network", "blob")
@@ -342,7 +342,7 @@ class BlobFetch(BaseTransform):
                 summary="Fetch an HTTP(S) URL into the run payload store and emit a blob reference plus fetch metadata.",
                 composer_hints=(
                     "Use blob_fetch when rows contain document URLs and downstream parser transforms should consume blob_ref, not raw bytes.",
-                    "blob_fetch does not parse content; chain the registered blob_csv_expand transform for CSV content or another registered parser after it.",
+                    "blob_fetch does not parse content; chain a registered parser after it — blob_csv_expand for CSV, blob_json_expand for JSON or JSONL, blob_text_expand for plain text.",
                     "allowed_content_types is a strict exact MIME allowlist; add operator-approved types explicitly.",
                     "http.abuse_contact and http.fetch_reason are mandatory and sent as wire-visible headers.",
                 ),
