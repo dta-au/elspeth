@@ -8,6 +8,59 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-26 — `except IntegrityError: raise` must come BEFORE the
+  `PayloadNotFoundError` arm, and a single-kind test cannot tell you whether
+  it does.** The two payload-store errors are unrelated `Exception` siblings
+  (`contracts/payload_store.py`), so a plain `IntegrityError` propagates under
+  EITHER ordering — and even with the integrity clause deleted outright. A
+  test raising one therefore passes against correct and inverted code alike;
+  two of the three blob expanders shipped with the clauses inverted and a
+  green suite. Only an error matching BOTH clauses discriminates, because
+  `except` matches in source order: define
+  `class _CorruptAndMissingError(IntegrityError, PayloadNotFoundError)` (its
+  `__init__` must delegate to `PayloadNotFoundError.__init__`, which requires
+  a non-empty `content_hash`) and assert it propagates. Pair it with a control
+  asserting an ordinary missing blob still routes as `blob_not_found`, or a
+  mutation that re-raises EVERYTHING passes the integrity test while
+  destroying the quarantine path. Prove both: revert the ordering and ONLY the
+  dual-kind test should die; re-raise everything and the control should die.
+  SCOPE HONESTLY — with today's classes this is LATENT, not live: no class in
+  the tree is both kinds, `IntegrityError` and `PayloadNotFoundError` have no
+  subclasses, and `FilesystemPayloadStore.retrieve` raises plain
+  `IntegrityError` (`core/payload_store.py:286`), which propagates correctly
+  even inverted. It arms the moment anyone relates the two classes or a store
+  raises a subclass of both. Worth fixing, worth pinning, not worth calling a
+  live row-killer — I did, and had to correct it.
+
+- **2026-08-26 — the planner discovery digest carries FAR less than the plugin
+  file does, so the obvious trim targets move a budget by exactly zero.** A
+  plugin's digest entry — what actually reaches the planner prompt — is five
+  fields: `name`, `purpose`, `not_for`, `required_options`, `capability_tags`.
+  `purpose` is the class docstring line and `not_for` is
+  `usage_when_not_to_use`. NOT carried: `example_use`, `usage_when_to_use`
+  verbatim, `composer_hints`, the knob schema — i.e. the four biggest strings
+  in a typical plugin file. Measured 2026-08-26: digest 21639 bytes over 36
+  transforms, median entry 389 bytes, largest 533
+  (`aws_textract_document_analysis`). So when a digest budget is over, only
+  `purpose` and `not_for` are payable and they are small; if the numbers say a
+  plugin cannot pay, the CEILING is the problem and it goes to a ruling rather
+  than deforming a contract to fit. The ceiling inventory lives in
+  `web/composer/planner_authoring_aids.py:949-1056` — `_SCHEMA_EVIDENCE` 96K,
+  `_PLANNER_CONTRACT` 48K, `_DISCOVERY_DIGEST` 24K, its public-text cap 1K,
+  `_MODEL_CATALOG` 32K, `_EXPRESSION_GRAMMAR` 8K. Two corollaries that each
+  cost a wasted cut this session. (a) SOURCE-STRING BYTES ARE NOT BUDGET
+  BYTES: the value travels through canonical JSON nested inside a larger
+  serialization, so sizing a cut by `len(text.encode())` overestimates the
+  saving — an estimated ~204-byte cut landed 69. Measure the budget figure
+  before and after on a scratch copy, never the string. (b) A BUDGET
+  ASSERTION MAY NOT MEASURE YOUR PLUGIN AT ALL:
+  `test_planner_authoring_aids.py:1291-1293` builds its contract list from a
+  hardcoded `("web_scrape", "llm", "field_mapper")`, so a new plugin
+  contributes nothing to it. Before assuming a red budget test is yours, run
+  the counterfactual — delete your files from a copied tree and re-measure.
+  Doing that is what showed the 48K overrun was pre-existing (`llm` alone is
+  39K of it) and had nothing to do with two newly added plugins.
+
 - **2026-08-26 — a `*_field` option with a NON-NONE DEFAULT leaks its column
   name into `consumed_input_fields` on EVERY arm, including arms that never
   read it — and an arm-branched `declared_input_fields` does not protect you.**
@@ -1647,6 +1700,56 @@ to the checklist above:
 
 Sources have the same shape (see 0ec120e2d for the blob_rows list: source
 count/names, registry, catalog, golden, contracts whitelist).
+
+Sites missed again landing `blob_json_expand` + `blob_text_expand`
+(2026-08-26, b288157c3) — these are NOT in either list above:
+
+- `scripts/state_engine_plugin_matrix.py` `EXPECTED_COUNTS` and
+  `EXPECTED_VARIANT_COUNT`, plus `tests/golden/state_engine/plugin_lifecycle_matrix.json`
+  and the PB-09 cases in `docs/architecture/state_engine/proof-catalog/v3/catalog.json`;
+- `src/elspeth/web/audit_readiness/boundary_expectations.py`
+  `EXPECTED_TRANSFORM_DETERMINISMS` — and note that touching this file fires a
+  pre-commit cohort gate demanding the trailer `telemetry-backfill: audit-readiness`
+  in the commit message;
+- `tests/unit/plugins/test_state_engine_plugin_matrix.py` default-variant subjects.
+
+The lifecycle-matrix metadata is DERIVED, not chosen — do not guess the five
+fields to force green. Each is forced independently by the existing corpus:
+PB-04 is batch-transforms only (13/13 members), so every row-transform carries
+exactly `("PB-02","PB-09")`; every non-hermetic `local_fixture`
+(`provider-contract-fake`, `real-process-http`) pairs with an `external_call`
+or `non_deterministic` plugin, so an `io_read` transform has no external call
+to observe and gets `hermetic` / `local` / `external_observation_required: false`.
+Cross-check against the structural twins (`blob_csv_expand`, `pdf_rasterize`).
+Do NOT derive this by clustering: grouping the transforms by the reviewed tuple
+gives EIGHT clusters and NO cluster is purely single-variant `io_read`
+row-transform — the one holding the twins also holds deterministic
+row-transforms, so a cluster-selection argument lands on the right answer for
+the wrong reason. The golden you author cannot discriminate this; only the
+field-by-field derivation can.
+
+The v3 PB-09 *cases* are a substitution, not a judgement: all existing entries
+are byte-identical in `cell_applicability`, so clone a twin's case and swap the
+key.
+
+**Do NOT add the plugin to v3's `first_party_plugins.transforms` inventory**
+(elspeth-5e2068854c). That inventory sits INSIDE the identity-pinned
+`execution_profiles` block, and `CANONICAL_V2_EXECUTION_PROFILES_SHA256`
+(`scripts/state_engine_assessment_lib/common.py:122`) is asserted against BOTH
+v2 and v3 (`…_lib/catalog.py:333`), whose blocks are currently byte-identical.
+Adding names diverges them, and no single value of that constant satisfies both
+while v2 stays byte-frozen — you trade one red for another. `validate-catalog`
+reporting "first-party plugin inventory transforms is stale" is the KNOWN state,
+not a defect you introduced. Read the ticket before touching the constant: the
+open question is whether adding a plugin should rev v3's catalog identity, and
+splitting the constant without answering that silently defeats the guard.
+
+Discovery reads the MAIN CHECKOUT from inside a worktree — the AGENTS.md venv
+trap, running in the READ direction. A sweep of these counts can transiently see
+the sibling branch's plugin set (observed 2026-08-26: the worktree's own two new
+plugins absent, a plugin that exists only on another branch present). Hash-bracket
+the run and re-read at a settled state; a count "corrected" to a transient value
+was never real.
 
 ### 7. CSS barrel structural gates (2026-08-11)
 
