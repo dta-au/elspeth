@@ -35,7 +35,7 @@ def test_checked_golden_matches_live_mechanical_projection_without_writing() -> 
 
     assert result.returncode == 0, result.stderr
     assert GOLDEN.read_bytes() == before
-    assert "52 plugins" in result.stdout
+    assert "53 plugins" in result.stdout
 
 
 def test_checked_golden_has_exact_counts_hashes_and_reviewed_fields() -> None:
@@ -43,7 +43,7 @@ def test_checked_golden_has_exact_counts_hashes_and_reviewed_fields() -> None:
     plugins = matrix["plugins"]
 
     assert matrix["schema_version"] == 1
-    assert [sum(entry["kind"] == kind for entry in plugins) for kind in ("source", "transform", "sink")] == [9, 34, 9]
+    assert [sum(entry["kind"] == kind for entry in plugins) for kind in ("source", "transform", "sink")] == [9, 35, 9]
     assert all(entry["source_hash_present"] is True for entry in plugins)
     assert "UNCLASSIFIED" not in GOLDEN.read_text(encoding="utf-8")
     assert all(
@@ -70,14 +70,14 @@ def test_checked_golden_has_exact_counts_hashes_and_reviewed_fields() -> None:
     )
 
 
-def test_production_config_validation_constructs_exactly_the_73_reviewed_subjects() -> None:
+def test_production_config_validation_constructs_exactly_the_74_reviewed_subjects() -> None:
     matrix = json.loads(GOLDEN.read_text(encoding="utf-8"))
     expected = {(entry["plugin_key"], variant) for entry in matrix["plugins"] for variant in entry["variants"]}
 
     validated = plugin_matrix._validate_variant_configs(plugin_matrix._variant_map())
 
-    assert len(expected) == 73
-    assert sum(variant == "default" for _, variant in validated) == 42
+    assert len(expected) == 74
+    assert sum(variant == "default" for _, variant in validated) == 43
     assert validated == expected
 
 

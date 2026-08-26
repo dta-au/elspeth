@@ -1,0 +1,102 @@
+{
+  "knob_schema": {
+    "fields": [
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true
+      },
+      {
+        "default": null,
+        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Required Input Fields",
+        "name": "required_input_fields",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "description": "The reference table as raw text. Written by the settings loader from 'reference_file' on the CLI, or by inline_content blob substitution on the web. Authoring it directly inline is legal but usually means a file was intended.",
+        "kind": "text",
+        "label": "Reference Content",
+        "name": "reference_content",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "default": null,
+        "description": "Path the reference table was loaded from. Written by the loader; used only in diagnostics.",
+        "kind": "text",
+        "label": "Reference Source",
+        "name": "reference_source",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "description": "How to parse reference_content. Never inferred \u2014 a blob carries no reliable type.",
+        "enum": [
+          "csv",
+          "json"
+        ],
+        "kind": "enum",
+        "label": "Reference Format",
+        "name": "reference_format",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "description": "Input field whose value is matched against the reference table key.",
+        "kind": "text",
+        "label": "Key Field",
+        "name": "key_field",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "description": "Name of the key WITHIN each reference entry (a CSV header, or a JSON object member). Deliberately not named '*_field': it names a column of the reference table, not of the row.",
+        "kind": "text",
+        "label": "Reference Key Name",
+        "name": "reference_key_name",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "description": "Map of output field name to an expression over the matched entry, bound as 'ref' (for example \"ref['description']\" or \"ref['tax']['rate']\").",
+        "kind": "json-object",
+        "label": "Output",
+        "name": "output",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "default": "fail",
+        "description": "What to do when the row key is absent from the table, or an output expression does not resolve against the matched entry: fail the row, write null, or write default_values.",
+        "enum": [
+          "fail",
+          "null",
+          "default"
+        ],
+        "kind": "enum",
+        "label": "On Miss",
+        "name": "on_miss",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "description": "Per-output-field fallback values used when on_miss is 'default'.",
+        "kind": "json-object",
+        "label": "Default Values",
+        "name": "default_values",
+        "nullable": false,
+        "required": false
+      }
+    ]
+  },
+  "plugin_kind": "transform",
+  "plugin_name": "reference_join"
+}

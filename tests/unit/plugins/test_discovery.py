@@ -262,7 +262,7 @@ class TestDiscoverAllPlugins:
 
         # Expected counts verified during migration from hookimpl files
         EXPECTED_SOURCE_COUNT = 9  # Seven original sources plus llm plus blob_rows (elspeth-0c6a343921)
-        EXPECTED_TRANSFORM_COUNT = 34  # Existing 33 plus pdf_rasterize
+        EXPECTED_TRANSFORM_COUNT = 35  # Existing 34 plus reference_join
         EXPECTED_SINK_COUNT = 9  # csv, json, text, document, database, aws_s3, azure_blob, dataverse, chroma_sink
 
         discovered = discover_all_plugins()
@@ -297,7 +297,7 @@ class TestDiscoverAllPlugins:
         pb09 = next(leg for leg in catalog["legs"] if leg["id"] == "PB-09")
         catalog_keys = {case["plugin_key"] for case in pb09["required_cases"]}
 
-        assert len(live_keys) == 52
+        assert len(live_keys) == 53
         assert live_keys == golden_keys == catalog_keys
 
         dataverse_modes = get_args(DataverseAuthConfig.model_fields["method"].annotation)
@@ -320,7 +320,7 @@ class TestDiscoverAllPlugins:
         golden_pairs = {(entry["plugin_key"], variant) for entry in matrix["plugins"] for variant in entry["variants"]}
         catalog_pairs = {(case["plugin_key"], case["variant_id"]) for case in pb09["required_cases"]}
 
-        assert len(expected_pairs) == 73
+        assert len(expected_pairs) == 74
         assert expected_pairs == golden_pairs == catalog_pairs
         assert {case["case_id"] for case in pb09["required_cases"]} == {
             plugin_key if variant == "default" else f"{plugin_key}@{variant}" for plugin_key, variant in expected_pairs

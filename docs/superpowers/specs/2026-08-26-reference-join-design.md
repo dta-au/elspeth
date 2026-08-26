@@ -54,7 +54,7 @@ transforms:
       reference_file: products.csv        # CLI only — see "Table binding"
       reference_format: csv               # csv | json — required, never inferred
       key_field: product                  # ROW field to match on
-      reference_key: sku                  # key WITHIN the reference table
+      reference_key_name: sku                  # key WITHIN the reference table
       output:
         product_description: "ref['description']"
         product_tax_rate: "ref['tax']['rate']"
@@ -220,13 +220,13 @@ kinds, no sweep of `ContentKind` dispatch sites.
 by header.
 
 `reference_format: json` requires a **top-level JSON array of objects** — the
-same list-of-entries shape, with values allowed to nest. `reference_key` names
+same list-of-entries shape, with values allowed to nest. `reference_key_name` names
 a field within each entry in both formats, so the two differ only in whether
 values can nest.
 
 A top-level JSON *object* is REJECTED at load with an error naming the array
 form, even though a key→entry mapping is a plausible reading of "JSON lookup
-table". Admitting both would make `reference_key` meaningful in one shape and
+table". Admitting both would make `reference_key_name` meaningful in one shape and
 meaningless in the other, and the reader would have to infer which from the
 data. One shape, one meaning.
 
@@ -279,7 +279,7 @@ design refuses everywhere else.
 
 ### Duplicate keys: rejected at load, no opt-out
 
-Two entries sharing a `reference_key` value raise `PluginConfigError` at config
+Two entries sharing a `reference_key_name` value raise `PluginConfigError` at config
 validation, naming the key and the offending entry positions. There is no
 "first wins" or "last wins" option, because either makes output depend on file
 ordering, which makes the run unreproducible — the property the whole binding
@@ -336,7 +336,7 @@ either the shared helper or a native validator satisfies it.
 
 Related naming constraint: `is_column_naming_config_option`
 (`plugins/infrastructure/base.py:82-91`) matches `field`, `fields`, `group_by`
-and any `*_field`/`*_fields` suffix. `reference_key` must NOT be named
+and any `*_field`/`*_fields` suffix. `reference_key_name` must NOT be named
 `reference_key_field` — it names a column in the reference TABLE, not on the
 row, and the `_field` suffix would falsely enrol it as a row-column option.
 

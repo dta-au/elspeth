@@ -40,7 +40,7 @@ def build(**overrides: Any) -> ReferenceJoin:
         "reference_content": PRODUCTS_CSV,
         "reference_format": "csv",
         "key_field": "product",
-        "reference_key": "sku",
+        "reference_key_name": "sku",
         "output": {"product_description": "ref['description']"},
     }
     options.update(overrides)
@@ -281,7 +281,7 @@ class TestDeliveryPathsAgree:
                 "reference_file": "products.csv",
                 "reference_format": "csv",
                 "key_field": "product",
-                "reference_key": "sku",
+                "reference_key_name": "sku",
                 "output": {"product_description": "ref['description']"},
             }
         )

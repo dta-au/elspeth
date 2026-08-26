@@ -54,7 +54,7 @@ from elspeth.core.config import (
     _validate_node_name_chars,
     validate_sink_name,
 )
-from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
+from elspeth.core.dag.coalesce_merge import merge_coalesce_schema, merge_guaranteed_fields
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
@@ -87,6 +87,15 @@ _QUEUE_OPTION_KEYS: frozenset[str] = frozenset({"description"})
 # changes its default — the exact drift the normalisation is here to prevent.
 _COALESCE_RUNTIME_POLICY_DEFAULT: Final[str] = CoalesceSettings.model_fields["policy"].default
 _COALESCE_RUNTIME_MERGE_DEFAULT: Final[str] = CoalesceSettings.model_fields["merge"].default
+# Coalesce merge strategies whose guarantee math Composer mirrors from the
+# runtime authority (``core/dag/coalesce_merge.merge_coalesce_schema``). Not a
+# restatement of that authority's vocabulary — it is the subset this surface can
+# ANSWER FOR, and the exclusion is load-bearing: ``select`` forwards ONE branch's
+# raw schema keyed by a ``select_branch`` a composer ``NodeSpec`` cannot carry,
+# so Composer has nothing to mirror and validation rejects the node outright
+# (``coalesce_merge_select_unsupported``). Anything outside this set keeps the
+# honest "not yet checked" abstention rather than a guessed guarantee.
+_MIRRORED_COALESCE_MERGES: Final[frozenset[str]] = frozenset({"union", "nested"})
 # Same one-owner rule for the scope binding: ``ScopeSettings.policy`` is
 # REQUIRED with no default (spec §3), so it deliberately has NO constant here —
 # a Stage-1 default may only RECORD a runtime default, never invent one.
@@ -3742,18 +3751,20 @@ def _check_schema_contracts(
                 return None
             if producer_node.node_type == "coalesce":
                 # Engine parity (elspeth-ae83a6b60c), the third sibling of the
-                # queue and row_union rules below: a UNION coalesce's merged
+                # queue and row_union rules below: a coalesce's merged
                 # guarantee is exactly what the DAG builder stamps on it, so
                 # the contract check proceeds against the coalesce as producer
                 # (the guarantee parsers resolve it through
                 # ``_producer_entry_propagation_vote``). Abstaining here
                 # unconditionally is what made every union-coalesce pipeline
                 # validate green while the runtime build rejected it, with no
-                # error for the authoring loop to repair against. Non-union
-                # merges and a non-participating vote keep the honest "not yet
-                # checked" warning — see ``_union_coalesce_merged_guarantees``
-                # for why the union gate is the whole population.
-                if _union_coalesce_merged_guarantees(current_producer) is not None:
+                # error for the authoring loop to repair against; the same
+                # abstention survived for ``merge: nested`` until the vote
+                # learned the runtime's strategy dispatch. A merge Composer
+                # cannot mirror, and a non-participating vote, keep the honest
+                # "not yet checked" warning — see
+                # ``_mirrored_coalesce_merged_guarantees`` for the population.
+                if _mirrored_coalesce_merged_guarantees(current_producer) is not None:
                     return current_producer
                 warnings.append(
                     _warn(
@@ -3784,7 +3795,7 @@ def _check_schema_contracts(
                     # being checked, so this vote can be the first parse of that
                     # arm's ``options["schema"]`` — ordinary recoverable external
                     # input, not a defect in our own code. Abstain exactly as the
-                    # ``_union_coalesce_merged_guarantees`` sibling already does
+                    # ``_mirrored_coalesce_merged_guarantees`` sibling already does
                     # rather than crashing /validate with an unhandled ValueError.
                     queue_participates = False
                 if queue_participates:
@@ -3817,7 +3828,7 @@ def _check_schema_contracts(
                     )
                 except ValueError:
                     # Same reason as the queue branch above and the
-                    # ``_union_coalesce_merged_guarantees`` sibling: a branch may
+                    # ``_mirrored_coalesce_merged_guarantees`` sibling: a branch may
                     # sit later in ``nodes``, so this can be the first parse of
                     # its schema block. Abstain rather than crash /validate.
                     union_participates = False
@@ -4704,9 +4715,57 @@ def _check_schema_contracts(
             if not producer_node.branches or producer_node.id in visited_fan_in_ids:
                 return False, frozenset()
 
+            branch_names = _coalesce_branch_names(producer_node.branches)
+            # ``require_all`` derives from the policy alone, where the runtime
+            # uses ``CoalesceSettings.has_all_branch_semantics`` — ALSO true for
+            # a quorum whose count equals the branch count. The diverging case is
+            # unreachable from this surface for the reason already recorded at
+            # the ``merge_union_field_flags`` call site above: a composer
+            # ``NodeSpec`` carries no ``quorum_count``, and the validation pass
+            # rejects ``policy: quorum`` outright
+            # (``coalesce_policy_quorum_unsupported``).
+            require_all = producer_node.policy == "require_all"
+
+            # Strategy dispatch, mirroring ``merge_coalesce_schema``. ``select``
+            # is a deliberate exclusion rather than a third arm: it forwards ONE
+            # branch's raw schema keyed by a ``select_branch`` a composer
+            # ``NodeSpec`` cannot carry, so there is nothing to mirror.
+            # ``_MIRRORED_COALESCE_MERGES`` keeps it out of every Rule A/B seam
+            # and the validation pass rejects the node outright
+            # (``coalesce_merge_select_unsupported``), so its vote can never gate
+            # an acceptance. It falls through to the union arm below — reachable
+            # only when a select coalesce is a BRANCH of another coalesce —
+            # rather than abstaining there, which would add a second, misleading
+            # contract error to a pipeline the planner must repair at the
+            # ``merge`` field.
+            if producer_node.merge == "nested":
+                # A nested merge does NOT publish the branches' inner fields:
+                # the runtime's own ``merge_coalesce_schema`` keys the merged
+                # schema BY BRANCH NAME, so the guarantee set is a pure function
+                # of the declared branch names and ``require_all`` and never
+                # reads a branch's guarantees at all. That is why this dispatches
+                # BEFORE the per-branch vote below — the walk is dead work here,
+                # and the vote's participation filter (which drops abstaining
+                # branches) would under-report the branch-name set.
+                #
+                # Running the union arm on a nested merge claimed the branches'
+                # inner fields, so Stage 1 validated GREEN a pipeline the DAG
+                # builder rejects at construction with ``EdgeContractError`` —
+                # a green preview leaves the authoring loop no error to repair
+                # against (sibling of elspeth-ae83a6b60c, opposite polarity:
+                # that one abstained, this one over-claimed).
+                nested_schema = merge_coalesce_schema(
+                    {branch: SchemaConfig(mode="observed", fields=None) for branch in branch_names},
+                    merge_strategy="nested",
+                    require_all=require_all,
+                    branch_order=branch_names,
+                    coalesce_id=producer_node.id,
+                )
+                return True, nested_schema.get_effective_guaranteed_fields()
+
             branch_schemas: dict[str, SchemaConfig] = {}
             for branch_name, branch_connection in zip(
-                _coalesce_branch_names(producer_node.branches),
+                branch_names,
                 _coalesce_branch_connections(producer_node.branches),
                 strict=True,
             ):
@@ -4727,26 +4786,29 @@ def _check_schema_contracts(
 
             merged = merge_guaranteed_fields(
                 branch_schemas,
-                require_all=producer_node.policy == "require_all",
+                require_all=require_all,
             )
             return True, frozenset(merged or ())
 
         return _effective_producer_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
 
-    def _union_coalesce_merged_guarantees(producer: ProducerEntry) -> frozenset[str] | None:
-        """Return a union coalesce's merged guarantee set, or None to abstain.
+    def _mirrored_coalesce_merged_guarantees(producer: ProducerEntry) -> frozenset[str] | None:
+        """Return a coalesce's merged guarantee set, or None to abstain.
 
-        The one seam the three coalesce sites below consult, so a union
-        coalesce stops being opaque to Rule A/B (elspeth-ae83a6b60c: Stage 1
-        abstained at every coalesce while the runtime rejected the identical
-        pipeline at build, leaving the authoring loop no error to repair).
+        The one seam the three coalesce sites below consult, so a coalesce
+        whose merge strategy Composer can mirror stops being opaque to Rule
+        A/B (elspeth-ae83a6b60c: Stage 1 abstained at every coalesce while the
+        runtime rejected the identical pipeline at build, leaving the authoring
+        loop no error to repair).
 
         It computes nothing itself. The merge lives in
-        ``_producer_entry_propagation_vote``'s coalesce branch, which calls the
-        runtime's own ``merge_guaranteed_fields`` on propagation-walked branch
-        votes — the same function, on the same shape of branch schemas, that
-        the DAG builder stamps the coalesce's guarantees with
-        (``core/dag/builder.py``, ``guarantee_branch_schemas``) and that
+        ``_producer_entry_propagation_vote``'s coalesce branch, which dispatches
+        on the merge STRATEGY exactly as the runtime's own
+        ``merge_coalesce_schema`` does, and calls that same authority — the
+        runtime's ``merge_guaranteed_fields`` for a union, ``merge_coalesce_schema``
+        itself for a nested merge. That is the same code, on the same shape of
+        branch schemas, that the DAG builder stamps the coalesce's guarantees
+        with (``core/dag/builder.py``, ``guarantee_branch_schemas``) and that
         ``validate_typed_producer_guaranteed_extras``
         (``core/dag/schema_validation.py``) then enforces. The two surfaces
         read ONE implementation instead of two mirrors free to drift.
@@ -4754,12 +4816,10 @@ def _check_schema_contracts(
         None means "Composer knows nothing here", and every caller keeps its
         pre-existing abstention on it. Three causes:
 
-        * Not a union merge. ``select`` forwards one branch's raw schema and
-          ``nested`` keys the merged schema BY BRANCH NAME; the vote mirrors
-          neither, so treating them as union would invent top-level guarantees
-          and red-line pipelines the runtime runs. ``__post_init__`` defaults
-          an unset ``merge`` to "union", so this gate cannot miss a coalesce
-          that merely omitted the field.
+        * A merge strategy Composer cannot mirror — see
+          ``_MIRRORED_COALESCE_MERGES``. ``__post_init__`` defaults an unset
+          ``merge`` to "union", so this gate cannot miss a coalesce that merely
+          omitted the field.
         * The vote abstained — an unresolvable branch, or a routing cycle the
           fan-in guard turned back.
         * A branch node's contract options do not parse. The Rule A/B call
@@ -4772,13 +4832,14 @@ def _check_schema_contracts(
           iteration. So this abstains for the same reason
           ``_arm_emit_profile`` does rather than crashing /validate.
 
-        No extras-firewall mirror is needed for the union population:
+        No extras-firewall mirror is needed for the mirrored population:
         ``merge_union_fields`` returns observed or flexible mode and never
-        fixed, so a union coalesce's merged schema always allows extras and the
+        fixed, and ``merge_coalesce_schema``'s nested arm returns flexible, so
+        a mirrored coalesce's merged schema always allows extras and the
         runtime's firewall skip can never exclude the edge.
         """
         producer_node = resolver.get_node(producer.producer_id)
-        if producer_node is None or producer_node.node_type != "coalesce" or producer_node.merge != "union":
+        if producer_node is None or producer_node.node_type != "coalesce" or producer_node.merge not in _MIRRORED_COALESCE_MERGES:
             return None
         try:
             participates, merged = _producer_entry_propagation_vote(producer, visited_fan_in_ids=frozenset())
@@ -4899,7 +4960,7 @@ def _check_schema_contracts(
             # ``validate_typed_producer_guaranteed_extras``
             # (``core/dag/schema_validation.py``) enforces it against the
             # consumer — the check this profile feeds Rule A/B.
-            merged = _union_coalesce_merged_guarantees(producer)
+            merged = _mirrored_coalesce_merged_guarantees(producer)
             if merged is not None:
                 return _ProducerEmitProfile(merged, False, frozenset())
         if producer_node.plugin is None:
@@ -5022,19 +5083,20 @@ def _check_schema_contracts(
                 visited_connections=visited_connections | {connection_name},
             )
         if producer_node.node_type == "coalesce":
-            # A union coalesce's merged guarantee DOES definitely arrive, so it
-            # must be contributed here — this is the arm that carries it across
+            # A mirrored coalesce's merged guarantee DOES definitely arrive, so
+            # it must be contributed here — this is the arm that carries it across
             # an intervening extras-allowing pass-through, where the walk-back
             # and the emit profile never see the coalesce at all. Ordered before
             # the opaque arm below, which would otherwise swallow it.
-            merged = _union_coalesce_merged_guarantees(producer)
+            merged = _mirrored_coalesce_merged_guarantees(producer)
             if merged is not None:
                 return merged
         if producer_node.node_type in ("queue", "coalesce"):
             # Opaque to Composer preview: a queue publishes an observed schema
-            # and never merges its predecessors' guarantees, and a NON-UNION
-            # coalesce's merged output is strategy-specific (``select`` forwards
-            # one branch's raw schema, ``nested`` keys fields by branch name).
+            # and never merges its predecessors' guarantees, and an UNMIRRORED
+            # coalesce's merged output is one Composer cannot reconstruct
+            # (``select`` forwards one branch's raw schema, keyed by a
+            # ``select_branch`` a ``NodeSpec`` cannot carry).
             # Contributing nothing keeps the lower bound honest. Extending the
             # extras rule to a queue producer is a drop-in branch here, left to
             # the track that owns queue contract semantics.

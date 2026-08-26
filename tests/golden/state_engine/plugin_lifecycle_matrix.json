@@ -1390,6 +1390,34 @@
       "release_lane": "live-provider"
     },
     {
+      "plugin_key": "transform:reference_join",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.reference_join",
+      "qualname": "ReferenceJoin",
+      "source_path": "src/elspeth/plugins/transforms/reference_join.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.reference_join:ReferenceJoin",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.reference_join:ReferenceJoin"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
       "plugin_key": "transform:report_assemble",
       "kind": "transform",
       "module": "elspeth.plugins.transforms.report_assemble",

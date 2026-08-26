@@ -430,16 +430,19 @@ where the architectural fix landed:
 
   The composer half is now CLOSED (``elspeth-ae83a6b60c``), so this is a
   first-category agreement shape rather than a runtime-only gap. All three
-  sites consult ONE new seam, ``_union_coalesce_merged_guarantees``, which
+  sites consult ONE new seam, ``_mirrored_coalesce_merged_guarantees``, which
   returns the guarantee vote's existing
   ``merge_guaranteed_fields`` merge — the same function the builder
   stamps the coalesce with, so the two surfaces read one implementation instead
   of two mirrors free to drift. Two scope decisions are load-bearing. The seam
-  is gated on ``merge == "union"``: only union merges branch guarantees into
-  top-level fields, so ``nested`` (keys by branch name) and ``select``
-  (forwards one branch's raw schema) keep abstaining with the "runtime
-  validator will check this edge" advisory, and widening the gate would invent
-  guarantees and false-red. And the ticket's own prescription — compose the
+  was originally gated on ``merge == "union"``; it is now gated on
+  ``_MIRRORED_COALESCE_MERGES`` = {union, nested}, because the vote learned the
+  runtime's strategy dispatch and derives a nested merge's guarantees from
+  ``merge_coalesce_schema`` itself (branch names, required iff ``require_all``)
+  rather than misapplying the union math. ``select`` still abstains with the
+  "runtime validator will check this edge" advisory: it forwards ONE branch's
+  raw schema keyed by a ``select_branch`` a composer ``NodeSpec`` cannot carry,
+  so there is nothing to mirror. And the ticket's own prescription — compose the
   emit set from the branches as ``_row_union_definite_emits`` does — was
   REFUTED: a branch-emit union over-claims under non-``require_all`` policies
   and over-predicts against the runtime gate under ``require_all``. The
@@ -6038,7 +6041,7 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
     Bug-verification protocol, COMPOSER half (elspeth-ae83a6b60c): the composer
     leg is pinned on the walk-back escape in
     ``web/composer/state.py::_walk_producer_entry_to_real_producer``'s coalesce
-    branch (``if _union_coalesce_merged_guarantees(current_producer) is not
+    branch (``if _mirrored_coalesce_merged_guarantees(current_producer) is not
     None: return current_producer``). Deleting those two lines restores the
     unconditional abstention and fails exactly ONE of these four tests, the
     same ``test_composer_and_runtime_reject_the_same_guaranteed_extras``, at

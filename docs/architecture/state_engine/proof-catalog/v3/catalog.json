@@ -179,6 +179,7 @@
         "passthrough",
         "pdf_rasterize",
         "rag_retrieval",
+        "reference_join",
         "report_assemble",
         "truncate",
         "type_coerce",
@@ -21969,6 +21970,181 @@
           "case_id": "transform:rag_retrieval@chroma-client",
           "plugin_key": "transform:rag_retrieval",
           "variant_id": "chroma-client",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:reference_join",
+          "plugin_key": "transform:reference_join",
+          "variant_id": "default",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {

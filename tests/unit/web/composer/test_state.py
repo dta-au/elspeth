@@ -4301,6 +4301,8 @@ class TestSchemaContractValidation:
         input: str,
         on_success: str | None,
         branches: tuple[str, ...] | None = None,
+        merge: str = "nested",
+        options: dict[str, Any] | None = None,
     ) -> NodeSpec:
         return NodeSpec(
             id=id,
@@ -4309,13 +4311,13 @@ class TestSchemaContractValidation:
             input=input,
             on_success=on_success,
             on_error=None,
-            options={},
+            options=options or {},
             condition=None,
             routes=None,
             fork_to=None,
             branches=branches if branches is not None else (input,),
             policy="require_all",
-            merge="nested",
+            merge=merge,
         )
 
     def _make_output(self, name: str = "main") -> OutputSpec:
@@ -7696,17 +7698,20 @@ class TestSchemaContractValidation:
         assert any(e.severity == "high" for e in wrapper_errors)
 
     def test_coalesce_producer_emits_skip_warning(self) -> None:
-        """A NON-UNION coalesce producer stays unresolved until runtime validation.
+        """A coalesce Composer cannot MIRROR stays unresolved until runtime.
 
-        ``_make_coalesce`` builds ``merge="nested"``, so this now pins the
-        deliberate scope boundary of elspeth-ae83a6b60c rather than a blanket
-        coalesce abstention: a UNION coalesce resolves through the guarantee
-        walk (``TestUnionCoalesceGuaranteeExtras``), while nested keys the
-        merged schema by branch name and select forwards one branch's raw
-        schema — semantics the propagation vote does not mirror, so abstaining
-        with this advisory is the correct answer for them. Do not "fix" this
-        test by widening the union gate; that would invent top-level guarantees
-        and reject pipelines the runtime runs.
+        The population is ``select`` alone (``_MIRRORED_COALESCE_MERGES``): it
+        forwards ONE branch's raw schema keyed by a ``select_branch`` a
+        composer ``NodeSpec`` cannot carry, so there is nothing to mirror and
+        abstaining with this advisory is the correct answer. Union and nested
+        both resolve through the guarantee walk — see
+        ``TestUnionCoalesceGuaranteeExtras`` and
+        ``test_nested_coalesce_producer_resolves_to_branch_names`` below.
+
+        The node is separately rejected as unauthorable
+        (``coalesce_merge_select_unsupported``), which is why the pipeline is
+        invalid; the abstention under test is that no edge contract is asserted
+        against ``t1``.
         """
         state = self._empty_state()
         state = state.with_source(
@@ -7720,6 +7725,68 @@ class TestSchemaContractValidation:
         # ``coalesce_branch_alias_unreachable``, elspeth-2ed41f0a4a), so the
         # fixture forks first — the abstention under test is about the
         # coalesce's MERGE mode, not its wiring.
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="fork_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("branch_a", "branch_b"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(
+            self._make_coalesce(
+                "after_merge",
+                "branch_a",
+                None,
+                branches=("branch_a", "branch_b"),
+                merge="select",
+                options={"select_branch": "branch_a"},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "after_merge",
+                "main",
+                options={"required_input_fields": ["text"]},
+            )
+        )
+        state = state.with_output(self._make_output())
+        state = state.with_edge(self._make_edge("e1", "source", "fork_gate"))
+        state = state.with_edge(self._make_edge("e2", "after_merge", "t1"))
+
+        result = state.validate()
+
+        assert [error.error_code for error in result.errors] == ["coalesce_merge_select_unsupported"], result.errors
+        assert any("coalesce node" in w.message.lower() and "runtime validator will check" in w.message.lower() for w in result.warnings)
+        assert not any(ec.to_id == "t1" for ec in result.edge_contracts)
+
+    def test_nested_coalesce_producer_resolves_to_branch_names(self) -> None:
+        """The nested half of the same fixture, which no longer abstains.
+
+        Engine parity: the DAG builder stamps a nested coalesce with a flexible
+        schema keyed BY BRANCH NAME, so a consumer requiring an INNER field
+        (``text``, guaranteed by the source) is rejected at build with
+        ``EdgeContractError``. Stage 1 used to hand this back green with a
+        "runtime validator will check this edge" advisory — a preview the
+        authoring loop had nothing to repair against.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="fork_in",
+                options={"schema": {"mode": "fixed", "fields": ["text: str"]}},
+            )
+        )
         state = state.with_node(
             NodeSpec(
                 id="fork_gate",
@@ -7759,9 +7826,11 @@ class TestSchemaContractValidation:
 
         result = state.validate()
 
-        assert result.is_valid, result.errors
-        assert any("coalesce node" in w.message.lower() and "runtime validator will check" in w.message.lower() for w in result.warnings)
-        assert not any(ec.to_id == "t1" for ec in result.edge_contracts)
+        violation = next(error for error in result.errors if error.error_code == "schema_contract_violation")
+        assert "guarantees: [branch_a, branch_b]" in violation.message
+        assert "Missing fields: [text]" in violation.message
+        contract = next(ec for ec in result.edge_contracts if ec.to_id == "t1")
+        assert contract.producer_guarantees == ("branch_a", "branch_b")
 
     # --- Guard tests ---
 
@@ -11486,20 +11555,23 @@ class TestUnionCoalesceGuaranteeExtras:
 
         assert not [error for error in best_effort.errors if error.error_code == "locked_input_extras"], best_effort.errors
 
-    @pytest.mark.parametrize("merge", ["nested", "select"])
-    def test_non_union_coalesce_keeps_the_skip_warning(self, merge: str) -> None:
-        """The ``merge == "union"`` scope gate, in the shape that would trip it.
+    @pytest.mark.parametrize("merge", ["select"])
+    def test_unmirrorable_coalesce_keeps_the_skip_warning(self, merge: str) -> None:
+        """The ``_MIRRORED_COALESCE_MERGES`` scope gate, in the shape that trips it.
 
-        Only ``union`` merges branch guarantees into top-level fields, so only
-        union is the population where a coalesce's guarantees can exceed its
-        declared ones. ``nested`` keys the merged schema BY BRANCH NAME and
-        ``select`` forwards one branch's raw schema; the propagation vote
-        mirrors neither, so extending these rules to them would invent
-        guarantees and false-red. Deleting the gate makes this pipeline gain
-        the union's top-level trio and report extras the runtime does not.
+        ``select`` forwards ONE branch's raw schema keyed by a ``select_branch``
+        a composer ``NodeSpec`` cannot carry, so Composer has nothing to mirror
+        and abstaining with its advisory is the correct answer — the runtime
+        validator remains authoritative for that merge.
 
-        The abstention plus its advisory is the correct answer here — the
-        runtime validator remains authoritative for these merges.
+        Parametrized over a single value deliberately: ``nested`` USED to sit
+        in this population on the argument that "the propagation vote mirrors
+        neither". That argument was empirically false — see
+        ``test_nested_coalesce_reports_the_branch_name_extras`` for the engine
+        rejection this abstention was hiding — so nested moved into the
+        mirrored set and only ``select`` remains. Adding a merge back here
+        needs the same evidence: an engine build that AGREES with the
+        abstention.
         """
         overrides: dict[str, Any] = {"merge": merge}
         if merge == "select":
@@ -11520,6 +11592,65 @@ class TestUnionCoalesceGuaranteeExtras:
         assert [warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message], (
             result.warnings
         )
+
+    def test_nested_coalesce_reports_the_branch_name_extras(self) -> None:
+        """A nested merge emits BRANCH NAMES, and a locked tail must see them.
+
+        The engine builds this exact pipeline and rejects it with
+        ``EdgeContractError``: "Consumer (passthrough) input is locked (mode:
+        fixed) and accepts: ['verdict']. Producer (coalesce:merge_results)
+        guarantees fields: ['branch_a', 'branch_b']". Stage 1 abstained here
+        instead, so the authoring loop got a green preview and a runtime that
+        would not run — the elspeth-ae83a6b60c shape that survived for nested
+        after the union half closed.
+
+        The extras set is NOT re-derived here. The vote dispatches on the merge
+        strategy exactly as ``core/dag/coalesce_merge.merge_coalesce_schema``
+        does and calls that same function, so the branch-name set is the
+        runtime's own.
+        """
+        state = self._state(
+            coalesce=self._coalesce(merge="nested", policy="require_all"),
+            tail=self._passthrough(
+                "after_merge",
+                "variant_merge",
+                "output",
+                options=self._locked(["verdict: str"]),
+            ),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("control_branch", "treatment_branch")
+        assert not [warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message], (
+            result.warnings
+        )
+
+    def test_nested_coalesce_under_a_lossy_policy_promises_nothing(self) -> None:
+        """A branch may be lost, so no branch name is guaranteed — and the
+        engine agrees: the same pipeline under ``policy="first"`` BUILDS.
+
+        The lower-bound discipline of the extras direction: reporting branch
+        names here would be a false red against a runtime that marks every
+        nested field optional (``merge_coalesce_schema``'s
+        ``optional = not require_all``).
+        """
+        state = self._state(
+            coalesce=self._coalesce(merge="nested", policy="first"),
+            tail=self._passthrough(
+                "after_merge",
+                "variant_merge",
+                "output",
+                options=self._locked(["verdict: str"]),
+            ),
+        )
+
+        result = state.validate()
+
+        assert not [error for error in result.errors if error.error_code == "locked_input_extras"], result.errors
 
     def test_unparseable_branch_options_abstain_instead_of_crashing_validate(self) -> None:
         """A branch parsed for the FIRST time here is Tier-3 input, not our bug.

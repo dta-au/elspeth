@@ -83,7 +83,7 @@ class ReferenceJoinConfig(TransformDataConfig):
         description="How to parse reference_content. Never inferred — a blob carries no reliable type.",
     )
     key_field: str = Field(..., description="Input field whose value is matched against the reference table key.")
-    reference_key: str = Field(
+    reference_key_name: str = Field(
         ...,
         description=(
             "Name of the key WITHIN each reference entry (a CSV header, or a JSON object member). "
@@ -109,7 +109,7 @@ class ReferenceJoinConfig(TransformDataConfig):
         EmittedToOutput("reference_join writes these values directly into row data whenever a lookup misses"),
     ] = Field(default_factory=dict, description="Per-output-field fallback values used when on_miss is 'default'.")
 
-    @field_validator("key_field", "reference_key")
+    @field_validator("key_field", "reference_key_name")
     @classmethod
     def _reject_blank(cls, value: str) -> str:
         stripped = value.strip()
@@ -195,7 +195,7 @@ def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, obje
     if not isinstance(loaded, list):
         raise ReferenceTableError(
             f"reference table must be a JSON array of objects, got {type(loaded).__name__}. "
-            "A key-to-entry object is not accepted: reference_key would be meaningless in that shape."
+            "A key-to-entry object is not accepted: reference_key_name would be meaningless in that shape."
         )
     entries: list[Mapping[str, object]] = []
     for index, entry in enumerate(loaded):
@@ -235,10 +235,10 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
     resolved_count = dict.fromkeys(cfg.output, 0)
 
     for position, entry in enumerate(entries):
-        if cfg.reference_key not in entry:
+        if cfg.reference_key_name not in entry:
             available = sorted(entry)
-            raise ReferenceTableError(f"reference entry {position} has no {cfg.reference_key!r} key. Available keys: {available}")
-        key = _coerce_key(entry[cfg.reference_key])
+            raise ReferenceTableError(f"reference entry {position} has no {cfg.reference_key_name!r} key. Available keys: {available}")
+        key = _coerce_key(entry[cfg.reference_key_name])
         if key in resolved:
             raise ReferenceTableError(
                 f"duplicate reference key {key!r} at entries {first_position[key]} and {position}. "
@@ -329,7 +329,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0000000000000000"
+    source_file_hash: str | None = "sha256:8a32a86900a30a7f"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -343,10 +343,10 @@ class ReferenceJoin(BaseTransform):
     example_use: str = """transform:
   plugin: reference_join
   options:
-    reference_file: products.csv
+    reference_content: "sku,description\\nhats,A fine hat\\n"
     reference_format: csv
     key_field: product
-    reference_key: sku
+    reference_key_name: sku
     output:
       product_description: "ref['description']"
     on_miss: fail
@@ -362,7 +362,7 @@ class ReferenceJoin(BaseTransform):
             "reference_content": "sku,description\nprobe,probe value\n",
             "reference_format": "csv",
             "key_field": "reference_join_probe_key",
-            "reference_key": "sku",
+            "reference_key_name": "sku",
             "output": {"reference_join_probe_added_1": "ref['description']"},
         }
 
@@ -372,7 +372,7 @@ class ReferenceJoin(BaseTransform):
         self._initialize_declared_input_fields(cfg)
 
         self._key_field = cfg.key_field
-        self._reference_key = cfg.reference_key
+        self._reference_key = cfg.reference_key_name
         self._reference_source = cfg.reference_source
         self._on_miss = cfg.on_miss
         self._default_values = dict(cfg.default_values)
@@ -394,8 +394,9 @@ class ReferenceJoin(BaseTransform):
                 summary="Add fields to a row by matching one of its values against a key in a fixed reference table.",
                 composer_hints=(
                     "The reference table is configuration, not a source: it is fixed when the run starts and is not fetched.",
+                    "On the CLI use reference_file: <name>.csv beside settings.yaml; the loader reads it into reference_content.",
                     "Address the matched entry as 'ref' in every output expression, e.g. ref['description'].",
-                    "reference_key names a column of the reference table; key_field names the column on the arriving row.",
+                    "reference_key_name names a column of the reference table; key_field names the column on the arriving row.",
                     "on_miss defaults to fail, because an unenriched row reaching a sink looks identical to an enriched one.",
                 ),
             )
