@@ -11555,6 +11555,63 @@ class TestUnionCoalesceGuaranteeExtras:
 
         assert not [error for error in best_effort.errors if error.error_code == "locked_input_extras"], best_effort.errors
 
+    def test_every_runtime_merge_strategy_is_adjudicated(self) -> None:
+        """No merge strategy may be silently unaccounted for.
+
+        The strategy list is READ FROM the runtime model
+        (``CoalesceSettings.model_fields["merge"]``'s Literal), never restated
+        here — the same rule the fix itself follows. Each strategy must be in
+        exactly one of two populations:
+
+        * MIRRORED — Composer derives its guarantees from
+          ``merge_coalesce_schema`` and Rule A/B adjudicate the coalesce;
+        * UNMIRRORABLE — Composer abstains with the "runtime validator will
+          check this edge" advisory, and authoring rejects the node outright so
+          the abstention can never gate an acceptance.
+
+        A new strategy added to the runtime Literal lands in NEITHER and fails
+        here, which is the point: the nested defect existed because a strategy
+        sat in the abstaining population by default with no one adjudicating
+        it. Silence is the failure mode this test removes.
+        """
+        from typing import get_args
+
+        from elspeth.core.config import CoalesceSettings
+        from elspeth.web.composer.state import _MIRRORED_COALESCE_MERGES
+
+        runtime_strategies = frozenset(get_args(CoalesceSettings.model_fields["merge"].annotation))
+        unmirrorable = frozenset({"select"})
+
+        assert runtime_strategies >= _MIRRORED_COALESCE_MERGES, (
+            "Composer claims to mirror a merge strategy the runtime does not define",
+            sorted(_MIRRORED_COALESCE_MERGES - runtime_strategies),
+        )
+        unaccounted = runtime_strategies - _MIRRORED_COALESCE_MERGES - unmirrorable
+        assert not unaccounted, (
+            f"Merge strategy {sorted(unaccounted)} is adjudicated by neither population. "
+            "Either mirror it (derive its guarantees from merge_coalesce_schema, and pin the "
+            "engine's verdict on the same pipeline) or declare it unmirrorable (name the input "
+            "the composer NodeSpec cannot carry, and reject it at authoring).",
+        )
+        assert not (_MIRRORED_COALESCE_MERGES & unmirrorable)
+
+    def test_unmirrorable_merge_is_rejected_at_authoring(self) -> None:
+        """The abstention for ``select`` is safe ONLY because authoring refuses it.
+
+        If a future change legalises ``select`` without giving Composer a
+        ``select_branch`` to mirror with, this seam silently reverts to the
+        nested defect: an abstention that lets a pipeline the runtime rejects
+        validate green. This test is the tripwire for that day.
+        """
+        state = self._state(
+            coalesce=self._coalesce(merge="select", options={"select_branch": "control_branch"}),
+            tail=self._passthrough("after_merge", "variant_merge", "output", options={"schema": {"mode": "observed"}}),
+        )
+
+        result = state.validate()
+
+        assert "coalesce_merge_select_unsupported" in [error.error_code for error in result.errors], result.errors
+
     @pytest.mark.parametrize("merge", ["select"])
     def test_unmirrorable_coalesce_keeps_the_skip_warning(self, merge: str) -> None:
         """The ``_MIRRORED_COALESCE_MERGES`` scope gate, in the shape that trips it.
@@ -11571,7 +11628,8 @@ class TestUnionCoalesceGuaranteeExtras:
         rejection this abstention was hiding — so nested moved into the
         mirrored set and only ``select`` remains. Adding a merge back here
         needs the same evidence: an engine build that AGREES with the
-        abstention.
+        abstention. ``test_every_runtime_merge_strategy_is_adjudicated`` is the
+        gate that makes that decision mandatory rather than optional.
         """
         overrides: dict[str, Any] = {"merge": merge}
         if merge == "select":
