@@ -84,3 +84,61 @@ def test_synthetic_pages_have_distinct_project_names() -> None:
         assert m, f"{name} has no hero <h1>"
         names.append(m.group(1).strip())
     assert len(set(names)) == 3, f"project names must differ across pages, got {names}"
+
+
+# --- multi-doc-sections.json -------------------------------------------------
+# The collector-authoring scenario's canonical prompt cites
+# {base}/tutorial-site/multi-doc-sections.json. It is published from the same
+# tree as the 3 scrape pages, so the URL resolves like they do; the shape below
+# is what the corpus-register variant of that prompt describes (document id,
+# title, list of sections of text).
+
+_MULTI_DOC = _WEBSITE / "multi-doc-sections.json"
+_COLLECTOR_SPEC = _ROOT / "src/elspeth/web/frontend/tests/e2e/tutorial-reliability.staging.spec.ts"
+
+
+def _load_multi_doc() -> dict:
+    import json
+
+    return json.loads(_MULTI_DOC.read_text(encoding="utf-8"))
+
+
+def test_multi_doc_fixture_is_marked_test_data() -> None:
+    assert "SYNTHETIC TEST DATA ONLY — DO NOT USE" in _load_multi_doc()["_notice"]
+
+
+def test_multi_doc_fixture_documents_carry_the_named_shape() -> None:
+    documents = _load_multi_doc()["documents"]
+    assert len(documents) >= 3
+    for doc in documents:
+        assert set(doc) == {"document_id", "title", "sections"}
+        assert doc["document_id"] and doc["title"]
+        assert isinstance(doc["sections"], list) and doc["sections"]
+        assert all(isinstance(s, str) and s.strip() for s in doc["sections"])
+    ids = [doc["document_id"] for doc in documents]
+    assert len(set(ids)) == len(ids), f"document ids must be unique, got {ids}"
+
+
+def test_multi_doc_fixture_section_counts_differ() -> None:
+    # Same discipline as the pages' differing costs/dates/names: per-document
+    # batches must be distinguishable, so a require_all collector that drops a
+    # section is observable rather than masked by a uniform count.
+    counts = [len(doc["sections"]) for doc in _load_multi_doc()["documents"]]
+    assert len(set(counts)) == len(counts), f"section counts must differ, got {counts}"
+
+
+def test_frontend_public_tree_does_not_duplicate_multi_doc_fixture() -> None:
+    assert not (_FRONTEND_PUBLIC / _MULTI_DOC.name).exists()
+
+
+def test_collector_scenario_prompt_url_resolves_to_a_published_file() -> None:
+    # Derived from the prompt itself rather than restated: the scenario's URL
+    # is the authority for what must be published, so a renamed fixture (or a
+    # renamed prompt target) fails here instead of 404-ing at run time.
+    import re
+
+    spec = _COLLECTOR_SPEC.read_text(encoding="utf-8")
+    cited = set(re.findall(r"https://dta-au\.github\.io/elspeth/tutorial-site/([\w.-]+)", spec))
+    assert cited, "collector scenario spec cites no tutorial-site URL"
+    for name in sorted(cited):
+        assert (_WEBSITE / name).exists(), f"{name} is cited by the collector scenario but not published"

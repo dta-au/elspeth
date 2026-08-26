@@ -1,0 +1,35 @@
+{
+  "_notice": "SYNTHETIC TEST DATA ONLY — DO NOT USE. Fixture for the ELSPETH collector-authoring scenario; the projects, figures and dates are invented.",
+  "documents": [
+    {
+      "document_id": "doc-helios",
+      "title": "Project Helios — public-records digitisation",
+      "sections": [
+        "Helios digitises the paper public-records register held across four regional offices. The programme scans, OCRs and indexes roughly 1.2 million pages so that the register can be searched instead of retrieved by hand.",
+        "The largest risk is legacy data corruption on ingest: pages captured out of order lose their file context permanently. Every record is checksummed against the source register before the paper copy is released for storage.",
+        "Discovery completed on 2026-02-15 and pilot ingest is in progress. Go-live is planned for 2026-09-30, with a four-week contingency held against vendor scanning delays.",
+        "Budget is $225,000 across scanning and OCR, platform engineering, and assurance. Assurance is deliberately funded as a separate line so it cannot be traded away against schedule pressure."
+      ]
+    },
+    {
+      "document_id": "doc-borealis",
+      "title": "Project Borealis — grants payment reconciliation",
+      "sections": [
+        "Borealis reconciles grant payments against acquittal reports for eleven programmes that currently reconcile by spreadsheet. The goal is one reconciliation ledger with a per-payment audit trail.",
+        "Duplicate acquittals are the dominant risk. Two programmes accept acquittals through both a portal and email, so the same claim can enter twice under different reference formats and clear twice.",
+        "The pilot covers three programmes only. Extending to the remaining eight is a separate decision that depends on whether the pilot's exception rate falls below two percent."
+      ]
+    },
+    {
+      "document_id": "doc-meridian",
+      "title": "Project Meridian — service-request triage",
+      "sections": [
+        "Meridian classifies inbound service requests so they reach the right team without a manual triage queue. Requests arrive by web form, phone transcript and email in roughly equal volumes.",
+        "Phone transcripts are the weakest input: they carry no structured subject line, so classification depends entirely on the transcript body, and short calls are frequently unclassifiable.",
+        "Misrouted requests are worse than unrouted ones, because a misroute restarts the response clock silently. Anything the classifier is not confident about is held for human triage rather than guessed.",
+        "The measure of success is the share of requests that reach the correct team on the first attempt, sampled weekly against a human-labelled set.",
+        "A quarterly review checks the labelled sample for drift: if the request mix shifts, the classifier is re-evaluated before the next quarter's targets are set."
+      ]
+    }
+  ]
+}
