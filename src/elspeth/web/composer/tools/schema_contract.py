@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping, Sequence
 from copy import deepcopy
-from typing import Any, cast
+from typing import Any, Final, cast
 
 from elspeth.core.config import (
     _MAX_CONNECTION_NAME_LENGTH,
@@ -21,14 +21,14 @@ from elspeth.core.config import (
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 
 
-def _registered_set_pipeline_schema() -> Mapping[str, Any]:
+def _registered_tool_schema(tool_name: str) -> Mapping[str, Any]:
     for definition in get_tool_definitions():
-        if definition["name"] == "set_pipeline":
+        if definition["name"] == tool_name:
             parameters = definition["parameters"]
             if type(parameters) is not dict:  # pragma: no cover - registry integrity guard
-                raise RuntimeError("registered set_pipeline parameters must be a JSON-schema object")
+                raise RuntimeError(f"registered {tool_name} parameters must be a JSON-schema object")
             return parameters
-    raise RuntimeError("registered set_pipeline tool definition is missing")
+    raise RuntimeError(f"registered {tool_name} tool definition is missing")
 
 
 def _schema_mapping(value: object, *, path: str) -> Mapping[str, Any]:
@@ -293,7 +293,7 @@ def assert_set_pipeline_schema_compatible(*, advertised_schema: Mapping[str, Any
     runtime_definitions: Mapping[str, Any] = {}
     if "$defs" in runtime_schema:
         runtime_definitions = _schema_mapping(runtime_schema["$defs"], path="$defs")
-    advertised = _registered_set_pipeline_schema() if advertised_schema is None else advertised_schema
+    advertised = _registered_tool_schema("set_pipeline") if advertised_schema is None else advertised_schema
     advertised_definitions: Mapping[str, Any] = {}
     if "$defs" in advertised:
         advertised_definitions = _schema_mapping(advertised["$defs"], path="$defs")
@@ -484,11 +484,268 @@ def canonical_set_pipeline_schema() -> dict[str, Any]:
     core/config.py enforces at settings_load — see
     `_disclose_runtime_naming_constraints`.
     """
-    registered = _registered_set_pipeline_schema()
+    registered = _registered_tool_schema("set_pipeline")
     augmented: dict[str, Any] = deepcopy(cast(dict[str, Any], registered))
     _disclose_runtime_naming_constraints(augmented)
     assert_set_pipeline_schema_compatible(advertised_schema=augmented)
     return augmented
 
 
-__all__ = ["assert_set_pipeline_schema_compatible", "canonical_set_pipeline_schema"]
+# --------------------------------------------------------------------------- #
+# upsert_node (elspeth-30dc596c79)                                             #
+#                                                                              #
+# The incremental authoring tool advertises a hand-written JSON schema whose    #
+# node_type enum drifted from `NodeType`: `collector` was missing, so ELSPETH   #
+# rejected its own documented collector authoring at                            #
+# `_dispatch._validate_tool_arguments` for every provider, deterministically.   #
+# The missing string was the symptom; the absence of a runtime-vs-advertised    #
+# contract on this tool was the defect. The same directional walker the         #
+# `set_pipeline` contract uses guards every hand-written enum in the file at    #
+# once, so a NEW node kind cannot be added to `NodeType` without the wire        #
+# schema following — which a per-kind membership assertion never caught.        #
+# --------------------------------------------------------------------------- #
+
+# `upsert_node`'s advertised schema is deliberately STRICTER than
+# `_UpsertNodeArgumentsModel` on these properties. The model types them
+# loosely on purpose so a bad value reaches a purpose-built validator with a
+# repair message instead of being bounced by a bare schema rejection, while
+# the wire schema still teaches the planner the closed vocabulary up front.
+# Each entry earns its place ONLY because the advertised vocabulary equals
+# what the named site enforces ON THE AUTHORING PATH — a rule the author would
+# hit anyway, disclosed earlier. A vocabulary enforced somewhere else (at
+# settings_load, say) does NOT qualify: advertising it here would reject an
+# authoring call the composer itself accepts, which is this ticket's defect
+# wearing an allowlist. Each comment names the call path so the next reader can
+# re-verify the claim without redoing the trace.
+#
+# Note the asymmetry the relaxation creates: once a property is disclosed, the
+# directional walker no longer sees its vocabulary at all (the advertised enum
+# is stripped, a closed object is reopened), so a downstream vocabulary that
+# GROWS cannot fail this contract. What holds each pairing is a named test in
+# tests/unit/web/composer/test_tool_schema_contract.py, one per entry below,
+# asserting the advertised vocabulary against the enforcing type AND that the
+# enforcer refuses a value outside it. Add an entry here and you owe both there.
+_UPSERT_NODE_ADVERTISED_DISCLOSURES: Mapping[str, str] = {
+    # Advertised {count, timeout_seconds, condition} under
+    # additionalProperties:False == `TriggerConfig`'s fields under
+    # extra="forbid". Authoring path, and the strictest of the three — it
+    # REJECTS THE MUTATION rather than reporting an entry:
+    #   transforms.py `_execute_upsert_node` (node_type == "aggregation")
+    #     -> `_common._validate_aggregation_trigger`
+    #     -> `TriggerConfig.model_validate` -> "Invalid aggregation trigger:
+    #        Extra inputs are not permitted"
+    # (the splice path calls the same validator; state.py runs the same model
+    # again on read-back as `aggregation_trigger_invalid`).
+    "trigger": "core/config.py TriggerConfig, via _common._validate_aggregation_trigger",
+    # Advertised ["passthrough", "transform"] == `OutputMode`'s members.
+    # Authoring path, but WEAKER than trigger: the mutation still succeeds and
+    # the bad value lands in state. The code is not in
+    # `_common._MUTATION_BLOCKING_INVARIANT_CODES`, so what the author gets is a
+    # high-severity entry on the validation summary every upsert_node result
+    # carries — the pipeline cannot pass validation, but the call is not
+    # rejected:
+    #   state.py `CompositionState.validate` -> `aggregation_output_mode_invalid`
+    # That enforcer derives its membership test from `OutputMode` directly, so
+    # this pairing binds two vocabularies rather than three. It used to restate
+    # the pair by hand, which would have made a grown enum look like a wire
+    # defect and invited the enum entry to be widened instead (review F1).
+    "output_mode": "web/composer/state.py CompositionState.validate, aggregation_output_mode_invalid",
+    # Advertised ["require_all", "best_effort"] == `_SCOPE_POLICY_VOCABULARY`
+    # (derived from `ScopeSettings.policy`). Authoring path, same weaker shape
+    # as output_mode — a summary entry, not a rejected mutation:
+    #   state.py `CompositionState.validate`
+    #     -> `_collector_intrinsic_errors` -> `collector_scope_policy_invalid`
+    #   "Collector '<id>' scope_policy '<value>' is not a valid policy."
+    "scope_policy": "web/composer/state.py _collector_intrinsic_errors, collector_scope_policy_invalid",
+}
+
+
+# JSON-Schema composition keywords this traversal does not descend into. A
+# vocabulary hidden behind one of them would read as "no closed enum" and let
+# the property into the disclosure set, which is a silent bypass of the one
+# guarantee that set makes. Rather than widen the walk to every keyword, refuse
+# to answer for a shape we cannot see through: absent today, loud tomorrow.
+#
+# Not hypothetical, and TWO of these are shapes pydantic 2.13.4 emits today:
+#
+#   `prefixItems`    — what a fixed-length `tuple[NodeType, int]` compiles to.
+#                      Demonstrated end to end: the enum vanished from view,
+#                      `node_type` was admitted as a disclosure, relaxed to a
+#                      bare `{"type": "array"}`, and the contract passed with
+#                      `collector` dropped.
+#   `propertyNames`  — what a CONSTRAINED MAPPING KEY compiles to. Verified on
+#                      pydantic 2.13.4, not a future risk: `dict[NodeType, int]`
+#                      emits the whole node-kind enum inline under
+#                      `propertyNames`, and `dict[SomeStrEnum, V]` emits it as a
+#                      `$ref`. Same bypass as `prefixItems` through a different
+#                      door — retyping the mapping key instead of the sequence.
+#
+# `allOf` is the same risk pointing BACKWARDS — pydantic 2.0-2.8 emitted it for
+# `$ref`-with-siblings, so a dependency DOWNGRADE reintroduces it.
+# `dependentSchemas` and `unevaluatedProperties` are here for the reason
+# `contains` and `not` are: the walk cannot see through them and refusing costs
+# nothing. `then`/`else` need no entry — they are inert without `if`, which
+# already raises.
+_UNTRAVERSED_COMPOSITION_KEYWORDS: Final[tuple[str, ...]] = (
+    "allOf",
+    "prefixItems",
+    "patternProperties",
+    "propertyNames",
+    "dependentSchemas",
+    "unevaluatedProperties",
+    "if",
+    "contains",
+    "not",
+)
+
+
+def _carries_closed_enum(schema: Mapping[str, Any], definitions: Mapping[str, Any], *, path: str) -> bool:
+    """Whether the runtime model pins this property to a closed vocabulary.
+
+    Descends `anyOf`/`oneOf`, `$ref` (to any depth), `properties`, `items`, and
+    mapping `additionalProperties`, and treats `enum`/`const` as a vocabulary.
+
+    Fails CLOSED everywhere else: a shape carrying any
+    `_UNTRAVERSED_COMPOSITION_KEYWORDS` keyword RAISES rather than returning a
+    False the caller would read as "safe to disclose". The distinction matters —
+    False asserts there is no closed vocabulary here, and for those shapes what
+    we actually know is only that we cannot see one.
+
+    Raising rather than returning True is what stays honest AT EVERY DEPTH. A
+    True from inside `properties`/`items`/`additionalProperties` propagates "a
+    closed vocabulary exists" up to a parent that may be legitimately
+    disclosable, so the caller would reject it carrying a claim never
+    established. Only a raise says the true thing at a recursive site.
+    """
+    for branch in _schema_branches(schema, definitions, path=path):
+        for keyword in _UNTRAVERSED_COMPOSITION_KEYWORDS:
+            if keyword in branch:
+                raise RuntimeError(
+                    f"{path}: runtime schema uses {keyword!r}, which this traversal does not "
+                    "descend into, so a closed vocabulary underneath it cannot be ruled out. "
+                    "Extend _carries_closed_enum before disclosing this property."
+                )
+        if "enum" in branch or "const" in branch:
+            return True
+        if "properties" in branch:
+            properties = _schema_mapping(branch["properties"], path=f"{path}.properties")
+            for name, value in properties.items():
+                nested = _schema_mapping(value, path=f"{path}.{name}")
+                if _carries_closed_enum(nested, definitions, path=f"{path}.{name}"):
+                    return True
+        if "items" in branch:
+            items = _schema_mapping(branch["items"], path=f"{path}[]")
+            if _carries_closed_enum(items, definitions, path=f"{path}[]"):
+                return True
+        if "additionalProperties" in branch:
+            extra = branch["additionalProperties"]
+            if type(extra) is not bool:
+                values = _schema_mapping(extra, path=f"{path}.*")
+                if _carries_closed_enum(values, definitions, path=f"{path}.*"):
+                    return True
+    return False
+
+
+def _disclosure_relaxed_advertised_schema(
+    runtime_schema: Mapping[str, Any],
+    advertised_schema: Mapping[str, Any],
+    runtime_definitions: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Return an advertised copy with the documented disclosures relaxed.
+
+    The walker itself stays untouched — `assert_set_pipeline_schema_compatible`
+    runs in production through `canonical_set_pipeline_schema`, so its
+    semantics are not up for negotiation here. Instead each disclosed property
+    is widened back to what the runtime model actually accepts before the
+    unmodified directional check runs over the result.
+
+    The disclosure set is self-checking: a property whose RUNTIME schema pins a
+    closed vocabulary is rejected outright. `node_type` is a `NodeType`
+    Literal, so it can never be listed here to silence a missing node kind —
+    the "kind number eight" hole is closed by construction, not by vigilance.
+
+    That claim holds in BOTH directions because `_carries_closed_enum` fails
+    closed: it descends `anyOf`/`oneOf`, `$ref`, `properties`, `items` and
+    mapping `additionalProperties`, and REFUSES on the composition keywords it
+    cannot see through (`_UNTRAVERSED_COMPOSITION_KEYWORDS`). Retyping a field
+    into a shape that hides its vocabulary therefore raises instead of quietly
+    qualifying for disclosure — which is what a `tuple[NodeType, int]` did
+    before the refusal existed.
+    """
+    runtime_properties = _schema_mapping(runtime_schema["properties"], path="$.properties")
+    relaxed: dict[str, Any] = deepcopy(cast(dict[str, Any], advertised_schema))
+    advertised_properties = _schema_mapping(relaxed["properties"], path="$.properties")
+    if type(advertised_properties) is not dict:  # pragma: no cover - deepcopy preserves dicts
+        raise RuntimeError("$.properties: advertised properties must be an object")
+    for name, enforced_by in _UPSERT_NODE_ADVERTISED_DISCLOSURES.items():
+        path = f"$.{name}"
+        if name not in runtime_properties:
+            raise RuntimeError(f"{path}: disclosed property is absent from the runtime model")
+        if name not in advertised_properties:
+            raise RuntimeError(f"{path}: disclosed property is absent from the advertised schema")
+        runtime_property = _schema_mapping(runtime_properties[name], path=path)
+        if _carries_closed_enum(runtime_property, runtime_definitions, path=path):
+            raise RuntimeError(
+                f"{path}: the runtime model pins a closed vocabulary, so the advertised schema "
+                f"must match it rather than be disclosed as {enforced_by!r}"
+            )
+        disclosed = _schema_mapping(advertised_properties[name], path=path)
+        widened = {key: value for key, value in disclosed.items() if key != "enum"}
+        if "additionalProperties" in widened and widened["additionalProperties"] is False:
+            widened["additionalProperties"] = True
+        advertised_properties[name] = widened
+    return relaxed
+
+
+def assert_upsert_node_schema_compatible(*, advertised_schema: Mapping[str, Any] | None = None) -> None:
+    """Fail if a runtime-valid typed branch is absent from the tool schema.
+
+    Same direction and same walker as
+    :func:`assert_set_pipeline_schema_compatible`: the advertised schema may be
+    looser than `_UpsertNodeArgumentsModel`, never narrower in requiredness,
+    nullability, enum membership, or any typed branch — except at the
+    documented `_UPSERT_NODE_ADVERTISED_DISCLOSURES` properties, where the
+    advertised vocabulary restates a rule a named downstream validator already
+    enforces.
+
+    WHEN IT FIRES differs from its sibling, and the parity above is about
+    direction only. `assert_set_pipeline_schema_compatible` runs in PRODUCTION,
+    inside `canonical_set_pipeline_schema`; this one has no runtime caller and
+    is enforced in CI, when its test module is collected.
+
+    The distinction is not static-vs-runtime, it is WHO CONSTRUCTS THE VALUE
+    production hands out. `canonical_set_pipeline_schema` BUILDS a new object
+    on every call — deepcopy plus `_disclose_runtime_naming_constraints` — and
+    gives it to the planner, so the artifact does not exist until run time and
+    must verify its own construction. `upsert_node`'s advertised schema is not
+    built per call in any meaningful sense: `get_tool_definitions` `deep_thaw`s
+    every entry from a deeply immutable module-level registry, so each call
+    yields a fresh mutable copy of identical content and no production path can
+    alter what the next caller sees. Every consumer either selects by name or
+    copies `parameters` verbatim. Checking it once in CI therefore checks the
+    same bytes production ships.
+    """
+    from elspeth.web.composer.tools.transforms import _UpsertNodeArgumentsModel
+
+    runtime_schema = _UpsertNodeArgumentsModel.model_json_schema()
+    runtime_definitions: Mapping[str, Any] = {}
+    if "$defs" in runtime_schema:
+        runtime_definitions = _schema_mapping(runtime_schema["$defs"], path="$defs")
+    advertised = _registered_tool_schema("upsert_node") if advertised_schema is None else advertised_schema
+    advertised_definitions: Mapping[str, Any] = {}
+    if "$defs" in advertised:
+        advertised_definitions = _schema_mapping(advertised["$defs"], path="$defs")
+    _assert_directional_compatibility(
+        runtime_schema,
+        _disclosure_relaxed_advertised_schema(runtime_schema, advertised, runtime_definitions),
+        runtime_definitions,
+        advertised_definitions,
+        path="$",
+    )
+
+
+__all__ = [
+    "assert_set_pipeline_schema_compatible",
+    "assert_upsert_node_schema_compatible",
+    "canonical_set_pipeline_schema",
+]

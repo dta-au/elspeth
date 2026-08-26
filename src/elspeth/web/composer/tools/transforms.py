@@ -200,11 +200,11 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "id": {"type": "string", "description": "Unique node identifier."},
         "node_type": {
             "type": "string",
-            "enum": ["transform", "gate", "aggregation", "coalesce", "row_union", "queue"],
+            "enum": ["transform", "gate", "aggregation", "coalesce", "row_union", "queue", "collector"],
         },
         "plugin": {
             "type": ["string", "null"],
-            "description": "Plugin name. Required for transform/aggregation. Null for gate/coalesce/row_union/queue.",
+            "description": "Plugin name. Required for transform/aggregation/collector. Null for gate/coalesce/row_union/queue.",
         },
         "input": {
             "type": "string",

@@ -19,6 +19,7 @@ from typing import Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.plugin_protocols import TransformProtocol
@@ -6967,12 +6968,20 @@ class CompositionState:
                     trigger_error = _validate_aggregation_trigger(node.id, node.trigger)
                     if trigger_error is not None:
                         errors.append(trigger_error)
-                # output_mode must be a valid OutputMode value when present
-                if node.output_mode is not None and node.output_mode not in ("passthrough", "transform"):
+                # output_mode must be a valid OutputMode value when present.
+                # Both the test AND the message derive from the enum, never
+                # restate it: a hand-listed tuple here made OutputMode a third
+                # vocabulary beside this check and the upsert_node wire enum, so
+                # growing the enum would have left this rejecting a value the
+                # wire advertises while the message named only the old two
+                # (elspeth-30dc596c79). Same shape as _SCOPE_POLICY_VOCABULARY.
+                valid_output_modes = tuple(member.value for member in OutputMode)
+                if node.output_mode is not None and node.output_mode not in valid_output_modes:
                     errors.append(
                         _err(
                             f"node:{node.id}",
-                            f"Aggregation '{node.id}' output_mode must be 'passthrough' or 'transform', got '{node.output_mode}'.",
+                            f"Aggregation '{node.id}' output_mode must be "
+                            f"{' or '.join(repr(mode) for mode in valid_output_modes)}, got '{node.output_mode}'.",
                             "high",
                             "aggregation_output_mode_invalid",
                         )

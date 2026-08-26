@@ -5,15 +5,28 @@ from __future__ import annotations
 import importlib
 import importlib.util
 from copy import deepcopy
-from typing import Any
+from enum import StrEnum
+from typing import Any, get_args
 
 import pytest
 from jsonschema import Draft202012Validator
+from pydantic import BaseModel, ConfigDict
 
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES
+from elspeth.core.config import OutputMode, TriggerConfig
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.state import (
+    _SCOPE_POLICY_VOCABULARY,
+    CompositionState,
+    NodeSpec,
+    NodeType,
+    PipelineMetadata,
+    _collector_intrinsic_errors,
+)
+from elspeth.web.composer.tools._common import _validate_aggregation_trigger
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
+from elspeth.web.composer.tools.transforms import _UpsertNodeArgumentsModel
 
 
 def _registered_set_pipeline_schema() -> dict[str, Any]:
@@ -684,3 +697,385 @@ def test_canonical_schema_discloses_reserved_label_escape_values_remain_admitted
     on_error_schema = canonical_set_pipeline_schema()["properties"]["nodes"]["items"]["properties"]["on_error"]
     errors = list(Draft202012Validator(on_error_schema).iter_errors("discard"))
     assert errors == []
+
+
+# --------------------------------------------------------------------------- #
+# upsert_node (elspeth-30dc596c79)                                             #
+#                                                                              #
+# The incremental authoring tool's hand-written node_type enum had drifted     #
+# from NodeType — `collector` was missing, so ELSPETH rejected its own          #
+# documented collector authoring at `_validate_tool_arguments` for every        #
+# provider. Nothing below asserts membership of one named kind: the defect      #
+# survived precisely because the wire-schema tests asserted `"queue" in enum`   #
+# and `"row_union" in enum` one kind at a time, and collector never got its     #
+# line. Every case derives from `NodeType` or from the runtime model, so kind   #
+# number eight is covered the day it is declared.                              #
+# --------------------------------------------------------------------------- #
+
+
+def _registered_upsert_node_schema() -> dict[str, Any]:
+    return next(definition["parameters"] for definition in get_tool_definitions() if definition["name"] == "upsert_node")
+
+
+def _advertised_upsert_node_copy() -> dict[str, Any]:
+    return deepcopy(_registered_upsert_node_schema())
+
+
+def _aggregation_node(*, output_mode: str | None) -> NodeSpec:
+    return NodeSpec(
+        id="agg",
+        node_type="aggregation",
+        input="rows",
+        plugin="batch_plugin",
+        on_success="out",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+        output_mode=output_mode,
+    )
+
+
+def _validation_errors_for(node: NodeSpec) -> tuple[Any, ...]:
+    """Run the real authoring-path validator over a state holding one node."""
+    state = CompositionState(
+        source=None,
+        nodes=(node,),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    return tuple(state.validate().errors)
+
+
+def _collector_node(*, scope_policy: str | None) -> NodeSpec:
+    return NodeSpec(
+        id="closer",
+        node_type="collector",
+        input="rows",
+        plugin="batch_plugin",
+        on_success="out",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+        scope_name="scope",
+        scope_opener="opener",
+        scope_policy=scope_policy,
+    )
+
+
+def test_registered_upsert_node_schema_is_directionally_compatible_with_runtime_model() -> None:
+    module = _schema_contract_module()
+    module.assert_upsert_node_schema_compatible()
+
+
+def test_advertised_node_type_enum_carries_every_declared_node_kind() -> None:
+    """The wire enum is the NodeType membership, not a restatement of it."""
+    advertised = _registered_upsert_node_schema()["properties"]["node_type"]["enum"]
+
+    assert set(advertised) == set(get_args(NodeType))
+
+
+@pytest.mark.parametrize("node_kind", get_args(NodeType))
+def test_directional_guard_rejects_a_node_kind_dropped_from_the_advertised_enum(node_kind: str) -> None:
+    """Dropping ANY declared kind from the wire enum fails the contract.
+
+    Parametrising over ``NodeType`` is what makes this un-forgettable: a new
+    kind adds its own case without anyone remembering to write one.
+    """
+    module = _schema_contract_module()
+    advertised = _advertised_upsert_node_copy()
+    node_type = advertised["properties"]["node_type"]
+    node_type["enum"] = [value for value in node_type["enum"] if value != node_kind]
+
+    with pytest.raises(RuntimeError, match="runtime enum values are missing from the advertised schema"):
+        module.assert_upsert_node_schema_compatible(advertised_schema=advertised)
+
+
+def test_documented_disclosure_cannot_bury_a_closed_runtime_vocabulary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing node kind stays a failure even if node_type is disclosed.
+
+    The mutation that matters: the cheapest way to silence this guard for kind
+    number eight would be to add ``node_type`` to the disclosure set. The
+    disclosure set refuses any property the runtime model pins to a closed
+    vocabulary, so that route is closed by construction rather than by anyone
+    remembering not to take it.
+    """
+    module = _schema_contract_module()
+    advertised = _advertised_upsert_node_copy()
+    node_type = advertised["properties"]["node_type"]
+    node_type["enum"] = [value for value in node_type["enum"] if value != "collector"]
+    monkeypatch.setattr(
+        module,
+        "_UPSERT_NODE_ADVERTISED_DISCLOSURES",
+        {**module._UPSERT_NODE_ADVERTISED_DISCLOSURES, "node_type": "state.py NodeType"},
+    )
+
+    with pytest.raises(RuntimeError, match="the runtime model pins a closed vocabulary"):
+        module.assert_upsert_node_schema_compatible(advertised_schema=advertised)
+
+
+def test_disclosure_guard_refuses_a_vocabulary_hidden_behind_an_untraversed_keyword() -> None:
+    """The `prefixItems` bypass, pinned as the shape that defeated the guard.
+
+    Retyping `node_type` to a fixed-length tuple moved its enum under
+    `prefixItems`, which the traversal does not descend into. It read as "no
+    closed vocabulary", `node_type` qualified for disclosure, was relaxed to a
+    bare `{"type": "array"}`, and the contract passed with `collector` dropped.
+    The guard now refuses the shape instead of answering False about it.
+    """
+    module = _schema_contract_module()
+
+    class _TupleTypedNodeType(BaseModel):
+        id: str
+        node_type: tuple[NodeType, int]
+        input: str
+
+        model_config = ConfigDict(extra="forbid")
+
+    runtime = _TupleTypedNodeType.model_json_schema()
+    definitions = runtime["$defs"] if "$defs" in runtime else {}
+
+    with pytest.raises(RuntimeError, match="prefixItems"):
+        module._carries_closed_enum(runtime["properties"]["node_type"], definitions, path="$.node_type")
+
+
+def test_disclosure_guard_refuses_a_vocabulary_hidden_behind_a_constrained_mapping_key() -> None:
+    """The same bypass through a different door, on real pydantic output.
+
+    `prefixItems` was reached by retyping the sequence; this reaches it by
+    retyping the mapping KEY. `dict[NodeType, int]` emits the entire node-kind
+    enum inline under `propertyNames` — a keyword the traversal does not
+    descend — so before the refusal existed the vocabulary was invisible and
+    `node_type` qualified for disclosure.
+    """
+    module = _schema_contract_module()
+
+    class _MappingKeyedNodeType(BaseModel):
+        id: str
+        node_type: dict[NodeType, int]
+        input: str
+
+        model_config = ConfigDict(extra="forbid")
+
+    runtime = _MappingKeyedNodeType.model_json_schema()
+    definitions = runtime["$defs"] if "$defs" in runtime else {}
+    emitted = runtime["properties"]["node_type"]
+    assert "propertyNames" in emitted, "pydantic no longer emits propertyNames for a constrained mapping key"
+
+    with pytest.raises(RuntimeError, match="propertyNames"):
+        module._carries_closed_enum(emitted, definitions, path="$.node_type")
+
+
+def test_untraversed_keyword_list_is_pinned_against_silent_deletion() -> None:
+    """The parametrized test below cannot notice a member LEAVING the constant.
+
+    It parametrizes over the very tuple it guards, so deleting a keyword deletes
+    its own case and the suite stays green while the guard goes blind — proven
+    by mutation: removing `"contains"` left every keyword test passing while
+    `_carries_closed_enum({"contains": {...}})` returned False.
+
+    A hand-written literal normally violates this project's rule that a guard
+    must DERIVE from the authority it enforces. The exemption is warranted here
+    for the one reason that lifts it: `_UNTRAVERSED_COMPOSITION_KEYWORDS` IS the
+    authority. There is no upstream list to derive from — pydantic does not
+    enumerate JSON-Schema keywords, and which ones this walk cannot see through
+    is a judgement about THIS traversal. With no upstream, "derive it" has no
+    referent, so the honest alternative is to make deletion a deliberate
+    two-place edit instead of a silent one. Do not delete this pin citing the
+    derive rule; read this paragraph first.
+    """
+    module = _schema_contract_module()
+
+    assert set(module._UNTRAVERSED_COMPOSITION_KEYWORDS) == {
+        "allOf",
+        "prefixItems",
+        "patternProperties",
+        "propertyNames",
+        "dependentSchemas",
+        "unevaluatedProperties",
+        "if",
+        "contains",
+        "not",
+    }
+
+
+@pytest.mark.parametrize("keyword", _schema_contract_module()._UNTRAVERSED_COMPOSITION_KEYWORDS)
+def test_disclosure_guard_refuses_every_untraversed_composition_keyword(keyword: str) -> None:
+    """`allOf` matters in the other direction: pydantic 2.0-2.8 emitted it for
+    `$ref`-with-siblings, so a dependency DOWNGRADE reintroduces the shape."""
+    module = _schema_contract_module()
+    branch: dict[str, Any] = {"type": "string", keyword: {"type": "string"}}
+
+    with pytest.raises(RuntimeError, match=keyword):
+        module._carries_closed_enum(branch, {}, path="$.probe")
+
+
+def test_untraversed_keyword_refusal_is_a_no_op_on_the_current_runtime_model() -> None:
+    """Failing closed costs nothing today — and says so if that ever changes."""
+    module = _schema_contract_module()
+
+    def keywords_in(node: object, seen: set[str]) -> set[str]:
+        if isinstance(node, dict):
+            seen.update(node)
+            for value in node.values():
+                keywords_in(value, seen)
+        elif isinstance(node, list):
+            for value in node:
+                keywords_in(value, seen)
+        return seen
+
+    present = keywords_in(_UpsertNodeArgumentsModel.model_json_schema(), set())
+    offenders = sorted(set(module._UNTRAVERSED_COMPOSITION_KEYWORDS) & present)
+
+    assert not offenders, (
+        f"_UpsertNodeArgumentsModel now emits {offenders} — the disclosure guard refuses these "
+        "shapes, so extend _carries_closed_enum to descend them rather than removing the refusal."
+    )
+
+
+def test_directional_guard_rejects_an_undocumented_advertised_enum_narrowing() -> None:
+    """Only the documented disclosures may advertise a closed vocabulary."""
+    module = _schema_contract_module()
+    advertised = _advertised_upsert_node_copy()
+    advertised["properties"]["policy"]["enum"] = ["require_all", None]
+
+    with pytest.raises(RuntimeError, match="advertised enum is narrower than the runtime model"):
+        module.assert_upsert_node_schema_compatible(advertised_schema=advertised)
+
+
+def test_directional_guard_rejects_advertised_upsert_node_requiredness_narrowing() -> None:
+    module = _schema_contract_module()
+    advertised = _advertised_upsert_node_copy()
+    advertised["required"] = [*advertised["required"], "plugin"]
+
+    with pytest.raises(RuntimeError, match="required"):
+        module.assert_upsert_node_schema_compatible(advertised_schema=advertised)
+
+
+def test_directional_guard_rejects_advertised_upsert_node_nullability_narrowing() -> None:
+    module = _schema_contract_module()
+    advertised = _advertised_upsert_node_copy()
+    advertised["properties"]["scope_name"]["type"] = "string"
+
+    with pytest.raises(RuntimeError, match="null"):
+        module.assert_upsert_node_schema_compatible(advertised_schema=advertised)
+
+
+def test_directional_guard_requires_every_upsert_node_runtime_field_to_be_advertised() -> None:
+    module = _schema_contract_module()
+    advertised = _advertised_upsert_node_copy()
+    del advertised["properties"]["scope_opener"]
+
+    with pytest.raises(RuntimeError, match=r"scope_opener: typed runtime branch is not explicitly advertised"):
+        module.assert_upsert_node_schema_compatible(advertised_schema=advertised)
+
+
+def test_a_stale_disclosure_entry_fails_rather_than_passing_silently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A disclosure naming a field the runtime model no longer has is fatal."""
+    module = _schema_contract_module()
+    monkeypatch.setattr(
+        module,
+        "_UPSERT_NODE_ADVERTISED_DISCLOSURES",
+        {**module._UPSERT_NODE_ADVERTISED_DISCLOSURES, "retired_field": "nowhere"},
+    )
+
+    with pytest.raises(RuntimeError, match="disclosed property is absent from the runtime model"):
+        module.assert_upsert_node_schema_compatible()
+
+
+# --------------------------------------------------------------------------- #
+# Each disclosure in `_UPSERT_NODE_ADVERTISED_DISCLOSURES` is honest only      #
+# while its advertised vocabulary EQUALS what its named enforcer accepts.      #
+# The relaxation strips the advertised enum before the walker runs, so the     #
+# contract itself cannot see that pairing — these tests are what hold it. A    #
+# downstream vocabulary that grows fails here, which is the same drift shape   #
+# as the node_type enum this section exists for.                              #
+# --------------------------------------------------------------------------- #
+
+
+def test_disclosed_scope_policy_enum_equals_the_enforced_scope_vocabulary() -> None:
+    advertised = _registered_upsert_node_schema()["properties"]["scope_policy"]["enum"]
+
+    assert set(advertised) == {*_SCOPE_POLICY_VOCABULARY, None}
+
+
+def test_enforced_scope_policy_vocabulary_refuses_a_value_outside_it() -> None:
+    """The enforcer really refuses, and with its own message — not a schema bounce."""
+    collector = _collector_node(scope_policy="whenever")
+
+    entries = _collector_intrinsic_errors(collector, nodes=(collector,))
+
+    assert [entry.error_code for entry in entries if entry.error_code == "collector_scope_policy_invalid"]
+
+
+def test_disclosed_output_mode_enum_equals_the_enforced_aggregation_vocabulary() -> None:
+    advertised = _registered_upsert_node_schema()["properties"]["output_mode"]["enum"]
+
+    assert set(advertised) == {*(member.value for member in OutputMode), None}
+
+
+def test_enforced_output_mode_vocabulary_refuses_a_value_outside_it() -> None:
+    """A value outside the vocabulary is rejected, and today's members are not.
+
+    A cheap sanity check only. It cannot detect a hand-listed
+    `("passthrough", "transform")`, because that tuple and the enum agree
+    today — that is
+    `test_enforced_output_mode_vocabulary_derives_from_the_enum`'s job.
+    """
+    entries = _validation_errors_for(_aggregation_node(output_mode="sideways"))
+
+    assert [entry for entry in entries if entry.error_code == "aggregation_output_mode_invalid"]
+
+    for member in OutputMode:
+        accepted = _validation_errors_for(_aggregation_node(output_mode=member.value))
+        assert not [entry for entry in accepted if entry.error_code == "aggregation_output_mode_invalid"]
+
+
+def test_enforced_output_mode_vocabulary_derives_from_the_enum(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A member the enum GROWS must be accepted without editing the enforcer.
+
+    The equality test above binds the wire enum to `OutputMode`; this binds the
+    ENFORCER to it. Asserting only that today's two members are accepted cannot
+    fail on a hand-listed `("passthrough", "transform")`, because that tuple and
+    the enum agree today — so the mutation has to be a grown enum, not a member
+    sweep.
+    """
+    import elspeth.web.composer.state as state_module
+
+    class _GrownOutputMode(StrEnum):
+        PASSTHROUGH = "passthrough"
+        TRANSFORM = "transform"
+        SIDEWAYS = "sideways"
+
+    monkeypatch.setattr(state_module, "OutputMode", _GrownOutputMode)
+    entries = _validation_errors_for(_aggregation_node(output_mode="sideways"))
+
+    assert not [entry for entry in entries if entry.error_code == "aggregation_output_mode_invalid"], (
+        "'sideways' is a declared OutputMode member but CompositionState.validate rejects it — "
+        "the enforcer is restating the vocabulary instead of deriving it."
+    )
+
+
+def test_disclosed_trigger_object_equals_the_enforced_trigger_vocabulary() -> None:
+    trigger = _registered_upsert_node_schema()["properties"]["trigger"]
+
+    assert set(trigger["properties"]) == set(TriggerConfig.model_fields)
+    assert trigger["additionalProperties"] is False
+    assert TriggerConfig.model_config["extra"] == "forbid"
+
+
+def test_enforced_trigger_vocabulary_refuses_a_key_outside_it() -> None:
+    """`_execute_upsert_node` runs this on every authored aggregation."""
+    assert _validate_aggregation_trigger({"condition": "row['batch_count'] >= 2"}) is None
+    assert _validate_aggregation_trigger({"nope": 1}) is not None

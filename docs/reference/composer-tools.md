@@ -220,15 +220,15 @@ Set or replace the pipeline source.
 ### `upsert_node`
 
 Add or update a pipeline node — transforms, gates, aggregations, coalesces,
-row unions, or queues.
+row unions, queues, or collectors.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | **Yes** | Unique node identifier (e.g. `"classifier"`, `"quality_gate"`) |
-| `node_type` | string | **Yes** | `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, or `queue` |
+| `node_type` | string | **Yes** | `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, `queue`, or `collector` |
 | `input` | string | **Yes** | Input connection name (must match an upstream `on_success`) |
-| `plugin` | string | No | Plugin name. Required for transforms and aggregations. Null for gates, coalesces, row unions, and queues. |
-| `on_success` | string | No | Output connection name. Required for transforms and row unions. Null for gates and queues. |
+| `plugin` | string | No | Plugin name. Required for transforms, aggregations, and collectors. Null for gates, coalesces, row unions, and queues. |
+| `on_success` | string | No | Output connection name. Required for transforms, row unions, and collectors. Null for gates and queues. |
 | `on_error` | string | No | Row-error output — a sink name or `"discard"`; for gates this handles expression-evaluation failures, and omission preserves fail-fast execution |
 | `options` | object | No | Plugin-specific configuration |
 | `condition` | string | No | Gate expression (gates only) |
@@ -238,6 +238,9 @@ row unions, or queues.
 | `policy` | string | No | Coalesce policy: `"require_all"`, `"quorum"`, `"best_effort"`, `"first"` |
 | `merge` | string | No | Coalesce merge strategy: `"union"`, `"nested"`, `"select"` |
 | `timeout_seconds` | number | No | Optional finite positive structural-barrier timeout for `coalesce` or `row_union`; this is a top-level node field, not `trigger.timeout_seconds`. |
+| `scope_name` | string | No | Scope identifier for the EXPAND group this collector closes (collectors only) |
+| `scope_opener` | string | No | Node id of the multi-row transform that opens the collector's EXPAND group (collectors only) |
+| `scope_policy` | string | No | Group arrival policy, `"require_all"` or `"best_effort"` (collectors only) — **required for collectors**, there is no default |
 
 **Behaviour:** If a node with the given `id` already exists, it is replaced. The `id` must be unique across all node types.
 
@@ -251,6 +254,7 @@ row unions, or queues.
 | `coalesce` | `branches`, `policy` | Waits according to `policy`, then merges correlated branch payloads according to `merge` |
 | `row_union` | `branches`, `on_success` | A plugin-free, fixed `require_all` N-to-N barrier that releases every original row unchanged in declared branch order |
 | `queue` | `id == input` | Declares a shared pass-through connection for multiple producers; omit plugin and routing fields, and use only an optional `options.description` |
+| `collector` | `plugin`, `on_success`, `scope_name`, `scope_opener`, `scope_policy` | Closes a declared EXPAND scope with a batch-aware plugin. `scope_opener` names the multi-row transform that opens the group and `scope_policy` decides whether a lost member fails it. A collector flushes on end of group only and does not accept `trigger`. |
 
 For `row_union`, branch order is significant. Mapping keys must match the
 upstream gate's `fork_to` names and mapping values name the connection published
@@ -399,7 +403,7 @@ Atomically replace the entire pipeline in one call.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `source` | object | **Yes** | `{plugin, options, on_success, on_validation_failure?}` |
-| `nodes` | array | **Yes** | Array of `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, or `queue` node specs: `[{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, routes?, fork_to?, branches?, policy?, merge?, timeout_seconds?}]` |
+| `nodes` | array | **Yes** | Array of `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, `queue`, or `collector` node specs: `[{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, routes?, fork_to?, branches?, policy?, merge?, timeout_seconds?, scope_name?, scope_opener?, scope_policy?}]` |
 | `edges` | array | **Yes** | Array of edge specs: `[{id, from_node, to_node, edge_type}]` |
 | `outputs` | array | **Yes** | Array of output specs: `[{name, plugin, options, on_write_failure?}]` |
 | `metadata` | object | No | `{name?, description?}` |
