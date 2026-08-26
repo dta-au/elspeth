@@ -216,6 +216,67 @@ describe("PipelineSpecView", () => {
     expect(node).toHaveTextContent("union");
   });
 
+  it("projects a collector's scope binding — which group it closes, under which policy", () => {
+    // Parity gap found by adversarial review of the coalesce fix: that fix
+    // closed the fan-in arm of a defect it had itself diagnosed as general,
+    // and walked past the collector. A collector's `input` names its
+    // connection but says nothing about the scope BINDING — which expand
+    // group it closes (scope_opener / scope_name) and what arrival policy
+    // governs it (scope_policy). All 66 collectors in the saved corpus
+    // populate all three, and COLLECTOR_PHRASE in the prose gloss is a fixed
+    // string that names none of them, so before this the operator had no
+    // surface at all for a collector's wiring.
+    //
+    // scope_policy in particular must be visible: composer/state.py declines
+    // to default it precisely because require_all and best_effort "look
+    // identical and the remedies are inverted".
+    useSessionStore.setState({
+      compositionState: makeComposition(6, {
+        sources: {
+          source: { plugin: "csv", options: {}, on_success: "docs" },
+        },
+        nodes: [
+          {
+            id: "gather_pages",
+            node_type: "collector",
+            plugin: "batch_llm",
+            input: "pages",
+            on_success: "final_out",
+            on_error: null,
+            scope_name: "doc_pages",
+            scope_opener: "explode_pages",
+            scope_policy: "require_all",
+            output_mode: "passthrough",
+            timeout_seconds: 300,
+            options: {},
+          },
+        ],
+        outputs: [
+          {
+            name: "final_out",
+            plugin: "csv",
+            on_write_failure: "discard",
+            options: {},
+          },
+        ],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node gather_pages" });
+    expect(node).toHaveTextContent("scope_name");
+    expect(node).toHaveTextContent("doc_pages");
+    expect(node).toHaveTextContent("scope_opener");
+    expect(node).toHaveTextContent("explode_pages");
+    expect(node).toHaveTextContent("scope_policy");
+    expect(node).toHaveTextContent("require_all");
+    expect(node).toHaveTextContent("output_mode");
+    expect(node).toHaveTextContent("passthrough");
+    expect(node).toHaveTextContent("timeout_seconds");
+    expect(node).toHaveTextContent("300");
+  });
+
   it("omits branches, policy and merge on nodes that carry none", () => {
     // The routing block filters nulls, so widening it must not add empty
     // fan-in rows to every transform card.

@@ -114,21 +114,45 @@ function nodeRows(state: CompositionState): SpecRow[] {
     id: node.id,
     kind: node.node_type,
     plugin: node.plugin,
-    // `branches`/`policy`/`merge` are as authoritative as `routes`/`fork_to`
-    // and must be projected alongside them (elspeth-59684fb0c8). On a fan-in
-    // node (coalesce, row_union) `input` is ONLY the backend-compatible
-    // first-branch placeholder, so a card showing `input` without `branches`
-    // does not merely omit the wiring — it asserts a narrower fan-in than
-    // the state has. The routing block drops nulls, so nodes carrying none
-    // of these are unaffected.
+    // Project every field that describes how a node is WIRED, for every node
+    // kind (elspeth-59684fb0c8). The routing block drops nulls, so a node
+    // carrying none of these is unaffected and gains no empty rows.
     //
-    // `condition` stays out on purpose: the "shows only non-null
-    // authoritative routing fields" test pins it as private graph config.
+    // The rule this enforces: where `input` alone understates a node's
+    // wiring, the card must carry what completes it, or it does not merely
+    // omit the topology — it ASSERTS a narrower one than the state has.
+    //   * fan-in (coalesce, row_union): `input` is ONLY the backend-compatible
+    //     first-branch placeholder; `branches` is the authoritative map.
+    //   * collector: `input` names the connection, but the scope BINDING
+    //     (which expand group it closes, under which arrival policy) lives in
+    //     scope_name/scope_opener/scope_policy — 66 of 66 collectors in the
+    //     saved corpus populate all three, and the collector's prose gloss is
+    //     a fixed string that names none of them.
+    //   * barrier kinds: `timeout_seconds` bounds how long the wait holds.
+    //
+    // `scope_name` is NOT private here. The "authored scope_name stays
+    // private" note in types/guided.ts governs the GUIDED PROPOSAL payload
+    // sent to the planner, where server stable ids replace canonical names.
+    // This view renders the session owner's own accepted CompositionState,
+    // which serialises scope_name openly (composer/state.py:866,894).
+    //
+    // `condition` stays out. The "shows only non-null authoritative routing
+    // fields" test asserts its absence — deliberately, since it is the one
+    // NON-null field that test excludes. The reason is unrecorded, and it is
+    // NOT redaction: the same predicate renders in the Graph tab's inspector
+    // (GraphView.tsx) and is carried verbatim into this very tab's prose by
+    // PipelineGloss. Left excluded rather than flipped on an inference —
+    // tracked for adjudication, not settled here.
     routing: {
       input: node.input,
       branches: node.branches ?? null,
       policy: node.policy ?? null,
       merge: node.merge ?? null,
+      scope_name: node.scope_name ?? null,
+      scope_opener: node.scope_opener ?? null,
+      scope_policy: node.scope_policy ?? null,
+      output_mode: node.output_mode ?? null,
+      timeout_seconds: node.timeout_seconds ?? null,
       on_success: node.on_success,
       on_error: node.on_error,
       routes: node.routes ?? null,
