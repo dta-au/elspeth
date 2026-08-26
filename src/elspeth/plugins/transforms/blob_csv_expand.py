@@ -276,9 +276,24 @@ class BlobCSVExpand(BaseTransform):
         del ctx
         blob_ref = row[self._blob_ref_field]
         if type(blob_ref) is not str:
-            raise TypeError(
-                f"Field '{self._blob_ref_field}' must be a string payload-store hash, got {type(blob_ref).__name__}. "
-                "This indicates an upstream validation bug."
+            # Routed, not raised: a wrong-typed ref is a fact about THIS row,
+            # the same kind as the malformed-hash rejection directly below.
+            # ADR-008 §"TIER_1 registration is load-bearing" (Correction
+            # 2026-08-21, elspeth-181db83da7) — only a RETURNED error reaches
+            # the `result.status == "error"` branch that honours `on_error`.
+            # `error_type` and the no-value-echo both follow the established
+            # blob-ref vocabulary in llm/image_inputs.py:74-81, which pairs
+            # `non_string_ref` (wrong type) with `invalid_payload_ref` (right
+            # type, bad format) and reports the TYPE only — the value itself is
+            # row content and must not reach the audit trail.
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "field": self._blob_ref_field,
+                    "error_type": "non_string_ref",
+                    "error": f"must be a string payload-store hash, got {type(blob_ref).__name__}",
+                },
+                retryable=False,
             )
         if not _is_payload_hash(blob_ref):
             return TransformResult.error(

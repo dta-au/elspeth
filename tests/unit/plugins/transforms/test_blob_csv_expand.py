@@ -161,6 +161,45 @@ def test_blob_csv_expand_routes_malformed_manifest_blob_ref_as_row_error(tmp_pat
     assert result.reason["blob_ref"] == "not-a-sha256"
 
 
+def test_blob_csv_expand_routes_non_string_blob_ref_as_row_error(tmp_path: Path) -> None:
+    """A wrong-TYPED blob_ref routes, exactly as a malformed one does.
+
+    This site had no coverage at all and raised a bare `TypeError`, which
+    matches no clause in `RowProcessor._execute_transform_with_retry` and so
+    aborted the whole run: `on_error` never fired, the row was counted as
+    neither succeeded nor failed, and the operator got a traceback at exit 4
+    (elspeth-5887fb7928). Paired deliberately with the malformed-ref test
+    directly above: right-type/bad-format and wrong-type are both facts about
+    one row and must share a disposition.
+
+    The reason payload carries the TYPE, never the value — a wrong-typed ref
+    is arbitrary row content and must not reach the audit trail.
+    """
+    transform = _build_transform()
+    transform._payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+
+    result = transform.process(
+        make_pipeline_row(
+            {
+                "url": "https://example.test/manifest-row.json",
+                "blob_ref": 12,
+                "manifest_index": 0,
+            }
+        ),
+        make_context(),
+    )
+
+    assert result.status == "error"
+    assert result.retryable is False
+    assert result.reason is not None
+    assert result.reason["reason"] == "invalid_input"
+    assert result.reason["error_type"] == "non_string_ref"
+    assert result.reason["field"] == "blob_ref"
+    assert "got int" in result.reason["error"]
+    assert "blob_ref" not in result.reason or result.reason.get("blob_ref") != 12
+    assert result.rows is None
+
+
 def test_discovery_registers_blob_csv_expand() -> None:
     from elspeth.plugins.infrastructure.manager import PluginManager
 
