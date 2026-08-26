@@ -1011,6 +1011,7 @@ class _BuilderMockSource:
     name = "mock_source"
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
+    observed_value_type: str | None = None
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_validation_failure = "discard"
     on_success = "output"
@@ -1042,6 +1043,7 @@ class _TransformWithTypedSchema:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
+    preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
 
@@ -2530,6 +2532,7 @@ class _SourceWithGuarantees:
     name = "mock_source_guaranteeing"
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
+    observed_value_type: str | None = None
     _on_validation_failure = "discard"
     on_success = "output"
 
@@ -2556,6 +2559,7 @@ class _PassThroughBranchTransform:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = True
+    preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
 

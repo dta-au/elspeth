@@ -47,6 +47,7 @@ class _UsageConsumerTransform:
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
 

@@ -346,3 +346,257 @@ sinks:
         assert TypeCoerce.preserves_input_values is False
         assert ValueTransform.preserves_input_values is False
         assert Truncate.preserves_input_values is False
+
+
+# ---------------------------------------------------------------------------
+# The validation pass (validate_observed_producer_declared_types): repro shape
+# and its green controls, built through the real builder.
+# ---------------------------------------------------------------------------
+
+_REPRO_PIPELINE = """sources:
+  primary:
+    plugin: csv
+    on_success: raw
+    options:
+      path: examples/fork_coalesce/input.csv
+      schema:
+        mode: observed
+        guaranteed_fields: [id, description]
+      on_validation_failure: discard
+
+gates:
+- name: fork_gate
+  input: raw
+  condition: "True"
+  routes:
+    'true': fork
+    'false': discard
+  fork_to:
+    - path_a
+    - path_b
+
+transforms:
+- name: branch_a
+  plugin: {branch_plugin}
+  input: path_a
+  on_success: done_a
+  on_error: discard
+  options:
+{branch_a_options}
+- name: branch_b
+  plugin: passthrough
+  input: path_b
+  on_success: done_b
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+- name: tidy_columns
+  plugin: truncate
+  input: merge_results
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 10
+    suffix: "..."
+    schema:
+      mode: flexible
+      fields:
+      - 'id: {consumer_id_type}'
+      - 'description: str'
+
+coalesce:
+- name: merge_results
+  branches:
+    path_a: done_a
+    path_b: done_b
+  policy: require_all
+  merge: union
+  union_collision_policy: last_wins
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: out.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+"""
+
+_PASSTHROUGH_OBSERVED_OPTIONS = """    schema:
+      mode: observed"""
+
+_TRUNCATE_BRANCH_OPTIONS = """    fields:
+      description: 60
+    suffix: "..."
+    schema:
+      mode: observed"""
+
+
+def _build_repro_graph(
+    *,
+    consumer_id_type: str = "int",
+    branch_plugin: str = "passthrough",
+    branch_a_options: str = _PASSTHROUGH_OBSERVED_OPTIONS,
+    source_schema_override: str | None = None,
+) -> ExecutionGraph:
+    from elspeth.cli_helpers import instantiate_plugins_from_config
+    from elspeth.core.config import load_settings_from_yaml_string
+
+    yaml_text = _REPRO_PIPELINE.format(
+        consumer_id_type=consumer_id_type,
+        branch_plugin=branch_plugin,
+        branch_a_options=branch_a_options,
+    )
+    if source_schema_override is not None:
+        yaml_text = yaml_text.replace(
+            "      schema:\n        mode: observed\n        guaranteed_fields: [id, description]\n",
+            source_schema_override,
+        )
+    settings = load_settings_from_yaml_string(yaml_text)
+    plugins = instantiate_plugins_from_config(settings)
+    return ExecutionGraph.from_plugin_instances(
+        sources=plugins.sources,
+        source_settings_map=plugins.source_settings_map,
+        transforms=plugins.transforms,
+        sinks=plugins.sinks,
+        aggregations=plugins.aggregations,
+        gates=settings.gates,
+        coalesce_settings=settings.coalesce,
+    )
+
+
+class TestObservedProducerDeclaredTypesPass:
+    """The live-repro family fails at BUILD; its neighbours stay green."""
+
+    def test_repro_shape_is_rejected_at_build(self) -> None:
+        """elspeth-e6e552ce34's exact family: observed csv → fork → observed
+        value-preserving branches → observed union coalesce → consumer
+        declaring id: int. Previously built green and quarantined 5/5 rows
+        at runtime."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_repro_graph()
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.type_mismatches == (("id", "int", "str"),)
+        message = str(exc_info.value)
+        assert "Observed-schema type violation" in message
+        assert exc_info.value.to_node_id is not None and exc_info.value.to_node_id.startswith("transform_tidy_columns")
+        # The declaring source is named so the planner can see WHERE str came from.
+        assert "source_primary" in message
+
+    def test_matching_consumer_type_builds(self) -> None:
+        _build_repro_graph(consumer_id_type="str")
+
+    def test_rewriting_branch_abstains_and_builds(self) -> None:
+        """One branch is a truncate (preserves_input_values=False): the walk
+        abstains, so the pass stays silent and the per-row preflight keeps
+        the verdict — the historical posture for unprovable types."""
+        _build_repro_graph(branch_plugin="truncate", branch_a_options=_TRUNCATE_BRANCH_OPTIONS)
+
+    def test_declared_source_coercion_builds(self) -> None:
+        """mode: fixed source declaring id: int coerces at ingest — the
+        declared arm resolves int and the consumer's int agrees."""
+        _build_repro_graph(
+            source_schema_override=(
+                "      schema:\n        mode: fixed\n        fields:\n        - 'id: int'\n        - 'product: str'\n        - 'price: int'\n        - 'category: str'\n        - 'description: str'\n"
+            )
+        )
+
+    def test_direct_observed_edge_is_rejected(self) -> None:
+        """The defect family without the coalesce: source (observed, str) →
+        consumer declaring id: int on a direct edge."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        pipeline = """sources:
+  primary:
+    plugin: csv
+    on_success: raw
+    options:
+      path: examples/fork_coalesce/input.csv
+      schema:
+        mode: observed
+        guaranteed_fields: [id, description]
+      on_validation_failure: discard
+
+transforms:
+- name: tidy_columns
+  plugin: truncate
+  input: raw
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 10
+    suffix: "..."
+    schema:
+      mode: flexible
+      fields:
+      - 'id: int'
+      - 'description: str'
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: out.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+"""
+        from elspeth.cli_helpers import instantiate_plugins_from_config
+        from elspeth.core.config import load_settings_from_yaml_string
+
+        settings = load_settings_from_yaml_string(pipeline)
+        plugins = instantiate_plugins_from_config(settings)
+        with pytest.raises(EdgeContractError) as exc_info:
+            ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=settings.gates,
+                coalesce_settings=settings.coalesce,
+            )
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.type_mismatches == (("id", "int", "str"),)
+
+    def test_missing_field_error_keeps_precedence(self) -> None:
+        """A graph tripping BOTH the phase-1 missing-fields contract and this
+        pass keeps reporting the pre-existing missing-fields error."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        yaml_extra_required = _REPRO_PIPELINE.format(
+            consumer_id_type="int",
+            branch_plugin="passthrough",
+            branch_a_options=_PASSTHROUGH_OBSERVED_OPTIONS,
+        ).replace(
+            "    fields:\n      description: 10\n    suffix: \"...\"\n",
+            "    fields:\n      description: 10\n    suffix: \"...\"\n    required_input_fields:\n    - not_a_column\n",
+        )
+        from elspeth.cli_helpers import instantiate_plugins_from_config
+        from elspeth.core.config import load_settings_from_yaml_string
+
+        settings = load_settings_from_yaml_string(yaml_extra_required)
+        plugins = instantiate_plugins_from_config(settings)
+        with pytest.raises(EdgeContractError) as exc_info:
+            ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=settings.gates,
+                coalesce_settings=settings.coalesce,
+            )
+        assert "Missing fields" in str(exc_info.value)
+        assert "Observed-schema type violation" not in str(exc_info.value)

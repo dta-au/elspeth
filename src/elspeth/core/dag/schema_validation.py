@@ -112,6 +112,12 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # reason (elspeth-85e8afa2f5).
     validate_forgiven_field_ancestor_types(graph)
 
+    # Type-check a typed consumer's required fields across OBSERVED/dynamic
+    # producers — the bypass the forgiven-field pass deliberately keeps
+    # (it scopes to TYPED producers). Runs last for the same
+    # pre-existing-error reason (elspeth-e6e552ce34).
+    validate_observed_producer_declared_types(graph)
+
 
 def validate_single_edge(
     graph: ExecutionGraph,
@@ -498,6 +504,103 @@ def validate_forgiven_field_ancestor_types(graph: ExecutionGraph) -> None:
                 from_node_id=str(from_id),
                 to_node_id=str(to_id),
                 producer_schema_name=producer_schema.__name__,
+                consumer_schema_name=consumer_schema.__name__,
+                compatibility_result=CompatibilityResult(
+                    compatible=False,
+                    type_mismatches=((field_name, expected_name, actual_name),),
+                ),
+                component_type=to_info.node_type.value,
+                from_component_type=from_info.node_type.value,
+            )
+
+
+def validate_observed_producer_declared_types(graph: ExecutionGraph) -> None:
+    """Type-check a typed consumer's required fields across observed producers.
+
+    ``validate_single_edge`` abandons an edge before Phase-2 type validation
+    when either side is dynamic (None) or observed, and
+    ``validate_forgiven_field_ancestor_types`` scopes itself to TYPED
+    producers — so a consumer's concrete declared type was never checked
+    against anything when the producer in between was observed, even where
+    the arriving type is PROVABLE. The live shape (elspeth-e6e552ce34): an
+    observed csv source (every cell str by construction) → value-preserving
+    observed branches → observed union coalesce → field_mapper declaring
+    ``id: int``. Authoring validation and preview passed twice; every merged
+    row then died typed at the consumer's input preflight.
+
+    This pass closes exactly that bypass: for each non-DIVERT edge whose
+    EFFECTIVE producer schema is dynamic or observed and whose consumer
+    declares required model fields, ``resolve_guaranteed_field_type`` walks
+    the guarantee topology (through value-preserving pass-throughs down to a
+    structural source declaration — see the walk's docstring) and
+    ``resolved_guarantee_type_mismatch`` applies the same declared-arm
+    compatibility policy the forgiven-field pass uses. Everywhere the type
+    is not provable — a non-preserving pass-through in the path, a source
+    without a structural type, cross-branch disagreement, a mid-path
+    INTRODUCED field no ancestor vouches for — the walk abstains and the
+    per-row preflight keeps the verdict, the posture these edges have always
+    shipped. Certain death is what makes rejection sound: a REQUIRED field
+    either arrives carrying the provably-wrong type (dies at the type arm)
+    or does not arrive (dies at the required arm).
+
+    Scope notes: COALESCE/ROW_UNION consumers keep their dedicated
+    validators (same exclusion every sibling pass applies); SINK consumers
+    participate — a sink's typed declaration kills rows exactly like a
+    transform's. Runs as a final pass after every pre-existing check, per
+    the house ordering discipline: a graph tripping this AND an earlier
+    check keeps reporting the earlier error.
+    """
+    schema_cache: dict[str, type[PluginSchema] | None] = {}
+    type_cache: dict[tuple[str, str], ResolvedGuaranteeType | None] = {}
+    for from_id, to_id, edge_data in graph._graph.edges(data=True):
+        if edge_data["mode"] == RoutingMode.DIVERT:
+            continue
+        to_info = graph.get_node_info(to_id)
+        if to_info.node_type in (NodeType.COALESCE, NodeType.ROW_UNION):
+            continue
+        consumer_schema = to_info.input_schema
+        if consumer_schema is None or not consumer_schema.model_fields:
+            continue
+        producer_schema = get_effective_producer_schema(graph, from_id, _cache=schema_cache)
+        if producer_schema is not None and producer_schema.model_fields:
+            continue  # typed producer: check_compatibility + the forgiven pass own this edge
+        # NOTE: consumer strictness read directly per the Tier-1 trust model —
+        # PluginSchema owns model_config; a missing key would be our bug.
+        consumer_strict = consumer_schema.model_config["strict"]
+        for field_name, consumer_field in consumer_schema.model_fields.items():
+            if not consumer_field.is_required():
+                continue
+            resolved = resolve_guaranteed_field_type(graph, from_id, field_name, cache=type_cache)
+            if resolved is None:
+                continue  # unknowable: the per-row preflight keeps the verdict
+            mismatch = resolved_guarantee_type_mismatch(
+                resolved.field_type,
+                consumer_field.annotation,
+                consumer_strict=consumer_strict,
+            )
+            if mismatch is None:
+                continue
+            expected_name, actual_name = mismatch
+            from_info = graph.get_node_info(from_id)
+            declared_by = ", ".join(sorted(resolved.declared_by))
+            raise EdgeContractError(
+                f"Observed-schema type violation: edge '{from_id}' → '{to_id}'\n"
+                f"  Consumer ({to_info.plugin_name}) declares '{field_name}' as {expected_name} (required), "
+                f"but rows provably arrive typed {actual_name}: the producing chain is observed-schema, and "
+                f"the value originates at {declared_by}, which types every cell it emits as {actual_name}. "
+                f"Every row would fail the consumer's input preflight at runtime.\n"
+                f"\n"
+                f"Fix: Either:\n"
+                f"  1. Align the consumer's declared type ('{field_name}: {resolved.field_type}') if it "
+                f"should accept what arrives, or\n"
+                f"  2. Insert a type_coerce transform before this consumer converting '{field_name}' to "
+                f"{expected_name} and declaring it in the transform's schema.fields, or\n"
+                f"  3. Declare '{field_name}: {expected_name}' in the SOURCE's schema.fields (mode: fixed "
+                f"or flexible) if the column genuinely holds {expected_name} values — the source then "
+                f"coerces at ingest and the declaration carries the type",
+                from_node_id=str(from_id),
+                to_node_id=str(to_id),
+                producer_schema_name=producer_schema.__name__ if producer_schema is not None else "(dynamic)",
                 consumer_schema_name=consumer_schema.__name__,
                 compatibility_result=CompatibilityResult(
                     compatible=False,

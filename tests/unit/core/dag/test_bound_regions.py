@@ -44,6 +44,7 @@ class _BoundRegionMockSource:
     _on_validation_failure = "discard"
     on_success = "source_out"
     _output_schema_config: SchemaConfig | None = None
+    observed_value_type: str | None = None
 
 
 class _BoundRegionMockSink:
@@ -71,6 +72,7 @@ class _BoundRegionTransform:
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
 
@@ -93,6 +95,7 @@ class _BoundRegionMultiRowTransform:
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
 
@@ -115,6 +118,7 @@ class _BoundRegionCollectorPlugin:
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
 
@@ -136,6 +140,7 @@ class _BoundRegionAggregationTransform:
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
 

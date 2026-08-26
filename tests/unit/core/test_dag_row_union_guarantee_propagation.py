@@ -50,6 +50,7 @@ class _SourceWithGuarantees:
 
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
+    observed_value_type: str | None = None
     _on_validation_failure = "discard"
 
     def __init__(self, guaranteed: tuple[str, ...]) -> None:
@@ -74,6 +75,7 @@ class _BranchTransform:
     output_schema = None
     on_error: str | None = None
     creates_tokens: bool = False
+    preserves_input_values = False
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
@@ -111,6 +113,7 @@ class _RequiringTransform:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
+    preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
 

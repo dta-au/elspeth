@@ -208,6 +208,7 @@ def test_edge_validation_timing_from_plugin_instances() -> None:
         config: ClassVar[dict[str, Any]] = {}
         output_schema: ClassVar[type[PluginSchema]] = ProducerSchema  # Has: id, name
         _output_schema_config: ClassVar[SchemaConfig | None] = None
+        observed_value_type: str | None = None
         _on_validation_failure: ClassVar[str] = "discard"
 
     class MockSink:

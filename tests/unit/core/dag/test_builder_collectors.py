@@ -22,6 +22,7 @@ class _Source:
     _on_validation_failure = "discard"
     on_success = "rows"
     _output_schema_config = None
+    observed_value_type: str | None = None
 
 
 class _Sink:
@@ -48,6 +49,7 @@ class _MultiRowTransform:
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
 
@@ -73,6 +75,7 @@ class _BatchTransform:
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
 
@@ -94,6 +97,7 @@ class _PlainTransform:
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
 

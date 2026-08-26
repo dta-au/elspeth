@@ -166,6 +166,7 @@ class _GroupBindingsMockSource:
     _on_validation_failure = "discard"
     on_success = "source_out"
     _output_schema_config: SchemaConfig | None = None
+    observed_value_type: str | None = None
 
 
 class _GroupBindingsMockSink:
@@ -204,6 +205,7 @@ class _GroupBindingsTransform:
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
 

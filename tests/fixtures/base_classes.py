@@ -72,6 +72,9 @@ class _TestSourceBase:
     on_success: str = "default"
     declared_guaranteed_fields: frozenset[str] = frozenset()
     _output_schema_config: SchemaConfig | None = None
+    # SourceProtocol structural observed-cell type (elspeth-e6e552ce34).
+    # None = no structural fact; the builder threads this onto NodeInfo.
+    observed_value_type: str | None = None
 
     def __init__(self) -> None:
         self.config: dict[str, Any] = {"schema": {"mode": "observed"}}

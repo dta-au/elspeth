@@ -19,6 +19,7 @@ class _Source:
     output_schema = None
     _on_validation_failure = "discard"
     _output_schema_config: SchemaConfig | None = None
+    observed_value_type: str | None = None
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = config if config is not None else {"schema": {"mode": "observed"}}
@@ -52,6 +53,7 @@ class _Transform:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields: frozenset[str] = frozenset()
 

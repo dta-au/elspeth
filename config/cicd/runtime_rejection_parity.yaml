@@ -3225,6 +3225,18 @@ sites:
   disposition: structural
   note: Every node_id reaching NodeInfo comes from builder.node_id(), which emits prefix_name_hash (builder.py:232-236)
     — never empty.
+- key: d87a8b518f46ddca
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.observed_value_type is only meaningful for SOURCE nodes; node {} has type {} with
+    observed_value_type={}.
+  ordinal: 0
+  disposition: structural
+  note: observed_value_type is written only at builder.py's SOURCE add_node site (from
+    SourceProtocol.observed_value_type); any other node type carrying it is misrouted attribute threading
+    — a framework wiring bug, unreachable from authored config. Sibling of the passes_through_input and
+    declared_required_fields guards (elspeth-e6e552ce34).
 - key: ed073ec097a17c2a
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
@@ -3246,6 +3258,17 @@ sites:
   counterpart:
   - transform_missing_plugin
   - aggregation_missing_plugin
+- key: 0d826b613dd13ebc
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.preserves_input_values is only meaningful for TRANSFORM nodes; node {} has type {}.
+  ordinal: 0
+  disposition: structural
+  note: preserves_input_values is written only at builder.py's TRANSFORM add_node site (from
+    TransformProtocol.preserves_input_values); its only consumer — resolve_guaranteed_field_type's
+    pass-through recursion arm — is TRANSFORM-scoped, so any other node type carrying it is a framework
+    wiring bug, unreachable from authored config (elspeth-e6e552ce34).
 - key: 57c9f229abe3f2b8
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
@@ -3414,6 +3437,20 @@ sites:
     population this validator exists for is exactly the fields the producer NEVER declares (schema_validation.py:457-461),
     so Stage 1 has nothing to compare; there is no ancestor-type resolution anywhere in state.py (no resolve_guaranteed_field_type
     equivalent). elspeth-2ed41f0a4a census 2026-08-17'
+- key: af293f6130ecdfd3
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_observed_producer_declared_types
+  exception: EdgeContractError
+  message: 'Observed-schema type violation: edge ''{}'' → ''{}'' Consumer ({}) declares ''{}'' as {} (required),
+    but rows provably arrive typed {}: the producing chain is observe'
+  ordinal: 0
+  disposition: unmirrored
+  note: 'elspeth-e6e552ce34. Reasoned from source, same census as the forgiven-field entry above: Stage 1
+    (state.py) has no resolve_guaranteed_field_type equivalent and no structural source-type channel, so
+    this observed-producer type resolution cannot be compared there. The composer-side coverage for this
+    defect family is the Stage-3 preview proof arm (declared_input_type_mismatch_against_source_schema,
+    generation.py, landed 2026-08-26), which is a proof diagnostic, not a Stage-1 rejection; the runtime
+    preflight (Stage 2) surfaces this raise verbatim through the EdgeContractError formatter.'
 - key: 4bc008dabf653b33
   path: src/elspeth/core/dag/schema_validation.py
   qualname: validate_row_union_compatibility
