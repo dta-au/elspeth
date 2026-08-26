@@ -105,6 +105,44 @@ Registering rather than inventing a private option buys three things at once:
    web loader, on any registered file key. This is not a limitation to work
    around — it is the guard that closes the trap in the next section.
 
+### Registering a fourth key trips a documented tripwire — handle it in the same commit
+
+`PLUGIN_OPTION_COLLECTIONS` deliberately EXCLUDES `collectors`
+(`core/template_materialization.py:15-30`, elspeth-ca79b2c63a), and the
+exclusion rests on a premise this change falsifies: "All three file-backed keys
+… belong to the LLM transform, and `LLMTransform` is not batch-aware." It
+carries an explicit REACTIVATION TRIGGER: add `collectors` the moment any
+batch-aware plugin declares a file-backed option field.
+
+**`reference_join` does not fire that trigger.** It is a per-row enricher and
+leaves `is_batch_aware` at its default `False`
+(`plugins/infrastructure/base.py:396`), so it is not collector-legal, and on a
+legal collector `reference_file` remains an extra that `extra="forbid"` rejects
+at config load. The containment holds. `PLUGIN_OPTION_COLLECTIONS` is NOT
+changed by this work.
+
+Two things must still change in the same commit, because registration makes the
+existing prose false:
+
+1. **The exclusion comment.** "All three file-backed keys belong to the LLM
+   transform" stops being true. Rewrite it to state the property that actually
+   holds — no REGISTERED file-backed key belongs to a batch-aware plugin — and
+   name `reference_join` as the first registered key outside the LLM transform,
+   so the next reader does not re-derive the premise from a stale sentence.
+   AGENTS.md requires a new convention to land with its change.
+2. **The rejection message.** `reject_file_backed_options` hand-enumerates
+   "inline prompt_template, lookup, and system_prompt" (`:142`) while
+   *detecting* via the registry. That is the guard-restates-its-authority smell
+   this spec cites elsewhere, and after registration the message omits our key
+   while the check catches it. Derive the remediation list from
+   `FILE_BACKED_TEMPLATE_OPTION_REGISTRY` rather than adding a fourth word by
+   hand.
+
+**Pinning this so it cannot rot:** if `reference_join` ever becomes
+batch-aware, `collectors` must be added to `PLUGIN_OPTION_COLLECTIONS` in that
+same change. That is the trigger the original comment describes, now with a
+second plugin able to pull it.
+
 ### The trap this closes, stated explicitly
 
 Web path confinement is a **key-name allowlist**, not type-driven:
@@ -139,6 +177,25 @@ the runtime walks `_NODE_COLLECTION_KEYS`, which includes `transforms`
 `bind_source` is NOT usable here: those markers are source-options-only
 (`core/blobs_inline.py:660-661`) and are forbidden from carrying a sha256
 (`contracts/blobs_inline.py:76-77`).
+
+### `reference_source` is audit provenance, and is never opened
+
+The registry writes the path string into `reference_source`, so the config
+model carries that field, optional and defaulting to `None` (the web path never
+sets it). It follows the `lookup_source` precedent exactly: llm emits
+`<response_field>_lookup_source` as audit metadata described as "Config file
+path" (`plugins/transforms/llm/__init__.py:29-30,91-92,286-319`) and never
+reopens it. `reference_source` is likewise **inert as a path** — nothing
+resolves it, reads it, or confines it, because nothing needs to.
+
+Stated so nobody over-reads the registration claim: `reference_source` is a
+`source_key`, not a `file_key`, so it is NOT in
+`FILE_BACKED_TEMPLATE_OPTION_KEYS`, and `reject_file_backed_options` does not
+block a web-authored config from setting it directly. That is acceptable
+precisely because it is never opened — but it IS emitted, so an
+operator-supplied string reaches output. It therefore needs the
+`EmittedToOutput` marker, on the base class, like any other emitted option
+value.
 
 ### The option takes RAW TEXT and the plugin parses it
 
@@ -216,6 +273,10 @@ that one field and keeps the rest; `on_miss: default` substitutes that field's
 entry from `default_values`. One policy covers both cases; there is no second
 knob.
 
+`default_values` keys are validated at construction as a SUBSET of `output`
+keys. An unmatched key would be a silent no-op — the exact failure mode this
+design refuses everywhere else.
+
 ### Duplicate keys: rejected at load, no opt-out
 
 Two entries sharing a `reference_key` value raise `PluginConfigError` at config
@@ -227,10 +288,21 @@ design above exists to protect.
 ### Value addressing: one grammar, the existing one
 
 Output map values are expressions evaluated by the existing `ExpressionParser`
-with the matched entry bound to the single name `ref` — the same nested
-subscript form the engine already parses (`core/expression_parser.py:202,739`).
-CSV entries are flat (`ref['description']`); JSON entries may nest
-(`ref['tax']['rate']`).
+with the matched entry bound to the single name `ref`. CSV entries are flat
+(`ref['description']`); JSON entries may nest (`ref['tax']['rate']`).
+
+This works without touching the parser. `allowed_names` is a constructor
+parameter, not a fixed set (`core/expression_parser.py:774-789`) — it defaults
+to `["row"]`, but commencement gates already pass
+`["collections", "dependency_runs", "env"]`. We pass `["ref"]`. Single-name
+mode makes the bound context BE the value (`:495`, `:510-516`), so evaluating
+`ref['description']` against the matched entry dict is exactly the shape the
+evaluator already supports.
+
+(Note for anyone re-deriving this: the parser's own docstrings at `:202` and
+`:739` illustrate with `row`, and `llm`'s prompt context IS a closed frozenset
+(`_PROMPT_CONTEXT_NAMES`). Neither generalizes to `ExpressionParser`, whose
+name set is open by construction.)
 
 This is deliberately more verbose than a bare `description`. The trade is
 accepted: allowing a bare name "when it is flat" and an expression "when it is
@@ -373,8 +445,19 @@ three agents already import it, so ask before adding a constant.
   asserted, not assumed.
 * **Duplicate keys:** rejected at config load, error names the key and the
   positions.
-* **`key_field` collision:** rejected at construction, error names `key_field`
-  (this is what the live invariant gate exercises).
+* **`key_field` collision:** rejected at construction, error names `key_field`.
+  The live invariant gate exercises this, but **that gate is already RED at
+  HEAD** (`llm.output_fields`), so "the gate passes" cannot be the evidence.
+  Verification is a targeted assertion plus a before/after failure-set DIFF —
+  the gate's finding set must lose nothing and gain nothing but what we
+  intended.
+* **`probe_config()`:** the same gate's anti-vacuity clause requires every
+  roster member to construct under its own `probe_config` and to expose at
+  least one scalar `*_field` option the gate can repoint. `key_field` satisfies
+  the second; `probe_config()` must exist and construct cleanly, or
+  `reference_join` is reported as uncovered rather than counted as passing.
+* **`default_values` keys:** a key absent from `output` is rejected at
+  construction.
 * **Both delivery paths agree:** the same table via `reference_file` and via
   `inline_content` substitution produces identical rows — the regression test
   for the type-mismatch bug this design exists to avoid.
