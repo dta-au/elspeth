@@ -35,6 +35,7 @@ from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.aggregation_result import validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
+from elspeth.engine.executors.batch_contract_validation import validate_batch_inputs, validate_success_outputs
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.journal_restore import CollectorJournalRestorer
 from elspeth.engine.spans import SpanFactory
@@ -964,6 +965,14 @@ class CollectorExecutor:
             resume_checkpoint_id=pending.flush_resume_checkpoint_id,
             auto_fail_phase="collector_flush",
         ) as guard:
+            # Contract preflight, INSIDE the guard so a violation auto-fails
+            # this node_state rather than escaping unrecorded. Its absence was
+            # elspeth-c2fa61cf57: a row violating this node's own `mode: fixed`
+            # contract reached the plugin and the run banked a clean COMPLETED
+            # over it, where the identical plugin under `aggregations:` raised.
+            # Shared with AggregationExecutor rather than copied — both run the
+            # same batch-transform contract (`NESTED_CONTRACT_OPTIONS_NODE_TYPES`).
+            validate_batch_inputs(transform, pipeline_rows, node_kind="Collector")
             result = transform.process(pipeline_rows, ctx)
             if result.status != "success":
                 guard.complete(
@@ -983,6 +992,9 @@ class CollectorExecutor:
                     f"output via TransformResult.success(row) or TransformResult.success_multi(rows)."
                 )
             output_rows: tuple[PipelineRow, ...] = (result.row,) if result.row is not None else tuple(result.rows or ())
+            # Postflight, before the rows are released downstream — the other
+            # half of the aggregation parity restored here.
+            validate_success_outputs(transform, result, node_kind="Collector")
             quarantined = validated_quarantined_indices(result, buffered_token_count=len(members), aggregation_name=collector_name)
             surviving = tuple(entry for index, entry in enumerate(entries) if index not in quarantined)
             if not surviving:

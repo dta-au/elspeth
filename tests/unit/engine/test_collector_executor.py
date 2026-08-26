@@ -14,11 +14,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
+from pydantic import ConfigDict
 
-from elspeth.contracts import TokenInfo
+from elspeth.contracts import PluginSchema, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, PluginContractViolation
@@ -36,6 +37,7 @@ from elspeth.engine.executors.collector import CollectorExecutor, CollectorOutco
 from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_field
 from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.plugins import _EngineTestSchema
 
 _JOURNAL_T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -51,12 +53,50 @@ def _make_observed_contract(*field_names: str) -> SchemaContract:
     return SchemaContract(mode="OBSERVED", fields=fields, locked=True)
 
 
+class _StrictItemSchema(PluginSchema):
+    """A locked contract admitting exactly `item` — `extra="forbid"`.
+
+    Stands in for a closer authored with `schema: {mode: fixed, fields: [...]}`,
+    which is what the elspeth-c2fa61cf57 reproduction used. `seed_group` mints
+    members whose payload IS `{"item": n}`, so this schema is what a CONFORMING
+    group looks like — it is the paired control. `_StrictAssembledSchema` below
+    is the one an arriving member violates.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    item: int
+
+
+class _StrictAssembledSchema(PluginSchema):
+    """A locked contract admitting exactly `assembled`.
+
+    An arriving member `{"item": n}` violates it exactly as the reproduction's
+    forwarded `id` did — an extra the locked contract forbids, plus a required
+    field the row does not carry. The fake's emitted row
+    (`{"assembled": ..., "count": ...}`) violates it too, on `count`.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    assembled: bool
+
+
 class _SpanFactorySentinel:
     """Unused by CollectorExecutor's shown behaviour — stored, never invoked."""
 
 
 class _FakeCollectorTransform:
     """A duck-typed BatchTransformProtocol stand-in with test-controllable behaviour."""
+
+    # `BatchTransformProtocol` REQUIRES these two (plugin_protocols.py:600-601).
+    # The fake omitted them for as long as the collector never read them, which
+    # is the same blind spot as the defect: nothing on this path validated, so
+    # nothing noticed the stand-in was incomplete (elspeth-c2fa61cf57). Both
+    # default to the permissive engine-test schema so existing cases are
+    # unaffected; a test that wants the preflight to BITE swaps in a strict one.
+    input_schema: type[PluginSchema] = _EngineTestSchema
+    output_schema: type[PluginSchema] = _EngineTestSchema
 
     def __init__(self, name: str = "recording_stitch") -> None:
         self.name = name
@@ -884,6 +924,77 @@ class TestFlush:
         release_records = [r for r in records if r["group_id"] != group_id and r["kind"] == "expand"]
         assert len(release_records) == 1
         assert release_records[0]["member_count"] == 0
+
+
+class TestFlushContractPreflight:
+    """elspeth-c2fa61cf57 — the collector must check its own declared contract.
+
+    Before this, `_execute_flush` called `transform.process` with NO preflight
+    (`grep -n model_validate collector.py` returned nothing), while the identical
+    plugin under `aggregations:` raised. A row violating the closer's own
+    `mode: fixed` contract reached the plugin and the run banked a clean
+    COMPLETED over it — under ADR-010's audit-complete posture, silence reads
+    as "checked and passed", so this wrote a WRONG AUDIT FACT rather than
+    merely missing a diagnostic.
+    """
+
+    def test_buffered_row_violating_the_declared_input_contract_raises(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        # The closer admits `assembled` only, so the arriving member `{"item": 0}`
+        # carries a forbidden extra AND misses a required field — the same shape
+        # as the reproduction's forwarded `id`.
+        env.transform.input_schema = _StrictAssembledSchema
+        members, _group_id = env.seed_group(count=1)
+
+        with pytest.raises(PluginContractViolation, match=r"Collector transform .* input validation failed for buffered row 0"):
+            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        # The plugin must never have seen the violating row — preflight, not postmortem.
+        assert env.transform.call_count == 0
+
+    def test_the_preflight_failure_is_audited_against_the_flush_phase(self, collector_env: _CollectorEnv) -> None:
+        # Raised INSIDE the NodeStateGuard, so the flush state auto-fails and
+        # the violation is recorded rather than escaping unattributed. Same
+        # phase the plugin-exception case records.
+        env = collector_env
+        env.transform.input_schema = _StrictAssembledSchema
+        members, _group_id = env.seed_group(count=1)
+
+        with pytest.raises(PluginContractViolation):
+            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        assert env.latest_node_state_error_phase(node="stitch") == "collector_flush"
+
+    def test_emitted_row_violating_the_declared_output_contract_raises(self, collector_env: _CollectorEnv) -> None:
+        # The OUTPUT half. The audit lane could only ARGUE this one, because it
+        # could not author a plugin that violates its own output schema without
+        # writing one — which is exactly what a stand-in transform is for.
+        env = collector_env
+        env.transform.output_schema = _StrictItemSchema
+        members, _group_id = env.seed_group(count=1)
+
+        with pytest.raises(PluginContractViolation, match=r"Collector transform .* output validation failed for emitted row 0"):
+            env.executor.accept(members[0], "stitch", ctx=env.ctx)
+
+        # The plugin DID run — this is postflight, unlike the input case above.
+        assert env.transform.call_count == 1
+
+    def test_a_conforming_group_still_flushes_under_the_same_locked_contract(self, collector_env: _CollectorEnv) -> None:
+        """The paired control, and it must use a LOCKED schema too.
+
+        A control that left the permissive default schema in place would pass
+        whether or not the preflight ran, proving nothing. This one runs the
+        identical `extra="forbid"` machinery over a member that CONFORMS, so it
+        fails if the preflight is over-strict and passes only if it discriminates.
+        """
+        env = collector_env
+        env.transform.input_schema = _StrictItemSchema
+        members, _group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch", ctx=env.ctx)
+        outcome = env.executor.accept(members[1], "stitch", ctx=env.ctx)
+
+        assert outcome.held is False
+        assert env.transform.call_count == 1
 
 
 def test_collector_flush_plugin_exception_autofails_with_phase(collector_env: _CollectorEnv) -> None:
