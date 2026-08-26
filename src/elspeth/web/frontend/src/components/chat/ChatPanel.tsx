@@ -1172,8 +1172,24 @@ export function ChatPanel({
       threshold;
   }
 
+  // The terminal snapshot is deliberately retained after a turn settles so
+  // this indicator bridges the gap until the reply renders (sessionStore:
+  // "composerProgress as the live visible affordance until the final
+  // assistant text lands"). That contract has a second half that was never
+  // implemented — it must RETIRE once the text lands. Nothing else clears
+  // composerProgress until the NEXT compose calls
+  // startComposerProgressPolling, so a bare `|| isTerminal` kept the
+  // indicator mounted indefinitely; docked as a sibling of the messages log
+  // inside the composer's flex column, it held its full completed-turn
+  // height in the input's space until the user sent again. A failed or
+  // cancelled turn lands no complete agent tail, so its outcome still shows.
+  const finalAssistantTurnLanded = useMemo(() => {
+    const tail = chatTurns[chatTurns.length - 1];
+    return tail !== undefined && tail.kind === "agent" && tail.isComplete;
+  }, [chatTurns]);
   const shouldShowComposerProgress =
-    isComposing || isTerminalComposerPhase(composerProgress?.phase);
+    isComposing ||
+    (isTerminalComposerPhase(composerProgress?.phase) && !finalAssistantTurnLanded);
 
   // Auto-scroll to bottom when new messages arrive (unless user scrolled up).
   // Empty sessions render template cards above the sentinel; scrolling to the
