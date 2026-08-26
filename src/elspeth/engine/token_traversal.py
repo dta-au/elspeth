@@ -594,6 +594,115 @@ class TokenTraversalEngine:
             #
             # IMPORTANT: Use outcome.next_node_id (not the caller's node_id param)
             # because we're validating the JUMP TARGET, not the current position.
+            #
+            # The tuple is deliberately TWO-way where process_single_token's
+            # entry check is three-way (it also covers collector). The two
+            # sites have different threat models, so the asymmetry is
+            # justified rather than merely harmless (filigree
+            # elspeth-494491978d):
+            #
+            #   - The entry check validates an ARBITRARY work item's starting
+            #     cursor. Work items are rehydrated from the durable scheduler
+            #     store (SchedulerWorkCodec.work_item_from_scheduler —
+            #     "rehydrate a scheduler work item from its durable payload
+            #     snapshot"), so a cursor naming a barrier is not trusted to be
+            #     well-ordered and every barrier kind must be covered.
+            #   - This site validates a JUMP TARGET resolved in-process from
+            #     the build-time route map. In graphs built by
+            #     ExecutionGraph.from_plugin_instances — the only graph
+            #     constructor in src/ (grepping src/elspeth/ for a bare
+            #     ExecutionGraph constructor call matches this comment and
+            #     nothing else, because the search string appears here; tests
+            #     DO build one directly, ~350 sites, which is exactly how the
+            #     raw-invocation pins below reach shapes the builder refuses)
+            #     — a gate jump past a collector
+            #     barrier cannot be authored. ONE guard closes it:
+            #     validate_sese_regions (barrier-scopes spec §7 rule 4), run
+            #     straight-line at builder.py:1884 over every bound region.
+            #     Every collector is one: a collector with no `scopes:` entry
+            #     is rejected (builder.py:700-706) and group_bindings.py:303-315
+            #     mints an EXPAND binding for every scope unconditionally.
+            #
+            #     DERIVED, not restated: any non-DIVERT gate->target edge makes
+            #     the target forward-reachable from the opener, so rule 4 walks
+            #     it; the walk does not expand through the closer, so a walked
+            #     path avoiding the closer ends either at a sink (sink-inside
+            #     limb) or at a node with no success path back to the closer
+            #     (no-path-to-closer limb). DIVERT edges are the only ones rule
+            #     4 skips, and they only ever target sinks or closers
+            #     (builder.py:1439/1478/1504/1524/1963), never a processing
+            #     node — so an on_error leg can never become a next_node_id.
+            #     And _node_step_map's ORDER is a topological sort of the FULL
+            #     graph (builder.py:1971 calls ExecutionGraph.build_step_map,
+            #     which just numbers get_pipeline_node_sequence — an
+            #     nx.topological_sort over the whole edge set), so this trigger
+            #     jump_target_step > barrier_step implies no path from the
+            #     target back to the collector — exactly what rule 4 rejects.
+            #     This arm's trigger set is a SUBSET of rule 4's.
+            #
+            #     Two refusals fire EARLIER on particular shapes and are NOT
+            #     what makes this safe: routing onto the collector's own
+            #     on_success connection trips the duplicate-producer check
+            #     (builder.py:1018-1024), and that shape and a queue target
+            #     both trip rule 4's sink-inside limb ahead of the
+            #     no-path-to-closer limb. Neuter BOTH and that limb still
+            #     refuses all three (verified by mutation, 2026-08-26).
+            #     Neutering only ONE is not that experiment and does not show
+            #     it: with duplicate-producer alone neutered the sink-inside
+            #     limb catches the closer_output shape, and with sink-inside
+            #     alone neutered duplicate-producer still catches it. BOTH is
+            #     what isolates the guard that actually holds the line.
+            #
+            #     Scope of the guarantee: no token may leave a bound region on
+            #     a SUCCESS path except through its closer. A DIVERT leg
+            #     (on_error) CAN leave it — rule 4 skips DIVERT edges by
+            #     construction — and that is intended: the loss ledger carries
+            #     it. `group_losses` records the escaped member against its own
+            #     group with reason='error_routed', and the token keeps its
+            #     `token_lineage_frames` expand frame on the way out, which is
+            #     what makes the attribution land. Verified by 12 engine runs
+            #     2026-08-26 (single worker, SQLite, json_explode +
+            #     batch_stats); NOT verified under the concurrent scheduler.
+            #     Note this is the DIVERT path only — `fork_token` drops
+            #     `expand_group_id` on the FORK path.
+            #
+            #     Pinned in tests/unit/core/dag/test_bound_regions.py::TestSESEWalk
+            #     (test_gate_jump_onto_collector_output_rejected_by_duplicate_producer,
+            #     test_gate_queue_mediated_escape_from_collector_scope_rejected,
+            #     test_gate_sink_escape_from_collector_scope_rejected), alongside
+            #     test_gate_inside_collector_scope_builds. Those three pin the
+            #     refusals that fire FIRST. The load-bearing no-path-to-closer
+            #     limb — the subject of BREAKAGE TRIGGER (a) below — is pinned
+            #     separately, by
+            #     test_collector_region_gate_leg_without_path_to_closer_rejected
+            #     and its _control_builds sibling.
+            #
+            # SCOPE LIMITATION — everything above is a claim about THIS
+            # BARRIER TUPLE's reachability, and about nothing else in this
+            # function. It must NOT be read as "collector is handled
+            # correctly nearby". A DIFFERENT missing collector arm sits
+            # EARLIER in this same function on the JUMP path — the
+            # resolve_jump_target_sink call above, in
+            # engine/dag_navigator.py, a module in which the string
+            # "collector" does not appear at all. As filed 2026-08-26 that
+            # arm was reachable and fatal: a gate inside a collector-bound
+            # scope WHOSE COLLECTOR CLOSES TO A SINK validates clean and
+            # then aborts the run on the first good row. Filed as
+            # elspeth-b6a0a85a15 (P0) — read the ticket for its current
+            # state rather than trusting this line. A collector that is NOT
+            # terminal runs clean, so the trigger is not the loose "gate in
+            # a collector scope" shape; hunting for that one searches the
+            # wrong pipelines.
+            #
+            # BREAKAGE TRIGGER — widen this tuple to three-way if ANY of these
+            # stops holding: (a) rule 4's no-path-to-closer limb is narrowed or
+            # made conditional; (b) a collector becomes authorable without a
+            # `scopes:` entry, or a scope stops minting an EXPAND binding;
+            # (c) a graph reaches TokenTraversalEngine by any route other than
+            # from_plugin_instances; (d) a gate route target can resolve to a
+            # node reached only by a DIVERT edge. None of this is a reason not
+            # to widen the tuple — it is three lines and one parameter — only
+            # the reason it is not load-bearing today.
             jump_target_step = self._processor._node_step_map[outcome.next_node_id]
             for barrier_node_id, barrier_name, barrier_kind in (
                 (coalesce_node_id, coalesce_name, "coalesce"),
