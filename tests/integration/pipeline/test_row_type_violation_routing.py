@@ -55,6 +55,14 @@ def _build_transform(plugin_id: str) -> BaseTransform:
         from elspeth.plugins.transforms.blob_csv_expand import BlobCSVExpand
 
         return BlobCSVExpand({"schema": DYNAMIC_SCHEMA, "blob_ref_field": "blob_ref"})
+    if plugin_id == "blob_json_expand":
+        from elspeth.plugins.transforms.blob_json_expand import BlobJSONExpand
+
+        return BlobJSONExpand({"schema": DYNAMIC_SCHEMA, "blob_ref_field": "blob_ref", "fields": ["value"]})
+    if plugin_id == "blob_text_expand":
+        from elspeth.plugins.transforms.blob_text_expand import BlobTextExpand
+
+        return BlobTextExpand({"schema": DYNAMIC_SCHEMA, "blob_ref_field": "blob_ref"})
     raise AssertionError(f"unknown plugin id {plugin_id!r}")
 
 
@@ -73,6 +81,18 @@ _CASES = [
     pytest.param("json_explode", {"id": 1, "items": "abc"}, "wrong_type", "str", id="json_explode-str-for-list"),
     pytest.param("line_explode", {"id": 1, "html": ["not", "a", "string"]}, "wrong_type", "tuple", id="line_explode-list-for-str"),
     pytest.param("blob_csv_expand", {"id": 1, "blob_ref": 12}, "non_string_ref", "int", id="blob_csv_expand-int-for-ref"),
+    # blob_json_expand declares `blob_content_type` alongside the ref, so the
+    # row carries it: the engine's declared-required-fields gate fires BEFORE
+    # the plugin and would abort on the missing column instead of exercising
+    # the routing this file exists to prove.
+    pytest.param(
+        "blob_json_expand",
+        {"id": 1, "blob_ref": 12, "blob_content_type": "application/json"},
+        "non_string_ref",
+        "int",
+        id="blob_json_expand-int-for-ref",
+    ),
+    pytest.param("blob_text_expand", {"id": 1, "blob_ref": 12}, "non_string_ref", "int", id="blob_text_expand-int-for-ref"),
 ]
 
 

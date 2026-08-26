@@ -21,48 +21,53 @@
         "required": false
       },
       {
-        "default": null,
-        "description": "Input field containing a payload-store content hash. Defaults to 'blob_ref'.",
+        "default": "blob_ref",
+        "description": "Input field containing a payload-store content hash.",
         "kind": "text",
         "label": "Blob Ref Field",
         "name": "blob_ref_field",
-        "nullable": true,
+        "nullable": false,
         "required": false
       },
       {
-        "default": "blob",
-        "description": "Where the CSV text comes from: 'blob' retrieves bytes from the payload store using blob_ref_field; 'field' reads CSV text already present on the row in text_field.",
-        "enum": [
-          "blob",
-          "field"
-        ],
-        "kind": "enum",
-        "label": "Source",
-        "name": "source",
+        "default": "line",
+        "description": "Output field receiving each emitted line or chunk.",
+        "kind": "text",
+        "label": "Output Field",
+        "name": "output_field",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": true,
+        "description": "Whether to emit the chunk's zero-based position within the blob.",
+        "kind": "checkbox",
+        "label": "Include Index",
+        "name": "include_index",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "line_index",
+        "description": "Output field receiving the chunk's zero-based position within the blob.",
+        "kind": "text",
+        "label": "Index Field",
+        "name": "index_field",
         "nullable": false,
         "required": false
       },
       {
         "default": null,
-        "description": "Input row field holding the text to parse, when source is 'field'. Defaults to 'content'.",
-        "kind": "text",
-        "label": "Text Field",
-        "name": "text_field",
-        "nullable": true,
-        "required": false
-      },
-      {
-        "default": ",",
-        "description": "Single-character delimiter used to split CSV fields.",
+        "description": "Literal separator to split on. Omitted (the default) splits on CRLF, CR, or LF line endings.",
         "kind": "text",
         "label": "Delimiter",
         "name": "delimiter",
-        "nullable": false,
+        "nullable": true,
         "required": false
       },
       {
         "default": "utf-8",
-        "description": "Encoding used to decode the CSV blob. Applies to source: blob only.",
+        "description": "Encoding used to decode the text blob. Decoding is strict.",
         "kind": "text",
         "label": "Encoding",
         "name": "encoding",
@@ -70,48 +75,11 @@
         "required": false
       },
       {
-        "default": 0,
-        "description": "Number of leading CSV records to skip before reading headers or data.",
-        "kind": "number-int",
-        "label": "Skip Rows",
-        "name": "skip_rows",
-        "nullable": false,
-        "required": false
-      },
-      {
-        "default": null,
-        "description": "Explicit normalized column names for headerless CSV blobs.",
-        "item_kind": "text",
-        "kind": "string-list",
-        "label": "Columns",
-        "name": "columns",
-        "nullable": true,
-        "required": false
-      },
-      {
-        "default": null,
-        "description": "Optional mapping from observed CSV headers to normalized names.",
-        "kind": "json-object",
-        "label": "Field Mapping",
-        "name": "field_mapping",
-        "nullable": true,
-        "required": false
-      },
-      {
-        "default": true,
-        "description": "Whether to emit the row index within the parsed CSV document.",
+        "default": false,
+        "description": "Whether to drop empty chunks instead of emitting a row for each.",
         "kind": "checkbox",
-        "label": "Include Row Index",
-        "name": "include_row_index",
-        "nullable": false,
-        "required": false
-      },
-      {
-        "default": "csv_row_index",
-        "description": "Output field receiving the zero-based CSV data row index.",
-        "kind": "text",
-        "label": "Row Index Field",
-        "name": "row_index_field",
+        "label": "Skip Blank Lines",
+        "name": "skip_blank_lines",
         "nullable": false,
         "required": false
       },
@@ -126,7 +94,7 @@
       },
       {
         "default": 104857600,
-        "description": "Maximum payload size accepted from the blob store. Applies to source: blob only.",
+        "description": "Maximum payload size accepted from the blob store.",
         "kind": "number-int",
         "label": "Max Blob Bytes",
         "name": "max_blob_bytes",
@@ -136,5 +104,5 @@
     ]
   },
   "plugin_kind": "transform",
-  "plugin_name": "blob_csv_expand"
+  "plugin_name": "blob_text_expand"
 }

@@ -367,6 +367,62 @@ class TestBatchReplicateConfigValidation:
                 }
             )
 
+    def test_copies_field_naming_copy_index_is_rejected_on_both_validation_paths(self) -> None:
+        """copies_field may not name the column batch_replicate creates.
+
+        ``process`` reads ``copies_field`` on every buffered row and writes
+        ``copy_index`` onto each emitted copy of that same row, so aiming one
+        at the other reads the column it is about to overwrite. Worse, the read
+        puts ``copy_index`` into ``consumed_input_fields``, so ``input_schema``
+        stops demoting it and every row lacking it is rejected for missing the
+        field the transform exists to create (elspeth-d6eeb3a71d).
+
+        Asserted on BOTH paths: the engine constructs the plugin, while
+        pre-validation runs the config model alone and RETURNS errors rather
+        than raising. A guard that lived only in ``__init__`` would let
+        ``validate_transform_config`` report the config clean and then reject
+        it at run time.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.infrastructure.validation import validate_transform_config
+        from elspeth.plugins.transforms.batch_replicate import BatchReplicate
+
+        options = {
+            "schema": {"mode": "observed"},
+            "copies_field": "copy_index",
+            "include_copy_index": True,
+        }
+
+        with pytest.raises(PluginConfigError, match="copies_field"):
+            BatchReplicate(options)
+
+        errors = validate_transform_config("batch_replicate", options)
+        assert errors, "pre-validation accepted a config the engine rejects"
+        assert any("copies_field" in error.message for error in errors), (
+            f"the pre-validation error does not name the option to repoint: {[e.message for e in errors]}"
+        )
+
+    def test_copies_field_may_name_copy_index_when_the_index_is_disabled(self) -> None:
+        """The guard is scoped to what is actually created, not to the name.
+
+        With ``include_copy_index: false`` nothing is created, ``copy_index``
+        is an ordinary arriving column, and reading the copy count from it is
+        legal. A guard that rejected the name unconditionally would refuse a
+        valid config — the failure mode that is worse than the defect it closes.
+        """
+        from elspeth.plugins.transforms.batch_replicate import BatchReplicate
+
+        transform = BatchReplicate(
+            {
+                "schema": {"mode": "observed"},
+                "copies_field": "copy_index",
+                "include_copy_index": False,
+            }
+        )
+
+        assert transform.declared_output_fields == frozenset()
+        assert "copy_index" in transform.consumed_input_fields
+
 
 class TestBatchReplicateSchemaContract:
     """Schema contract tests."""

@@ -1,0 +1,69 @@
+# blob_text_expand, the plugin that exists because CSV-as-text corrupts prose.
+#
+# Expanding a prose blob with blob_csv_expand and a single declared column
+# silently STRIPS the quotes — csv.reader treats them as field delimiters, and
+# the row still reports `success`. blob_text_expand reads bytes as text and
+# never parses a field grammar, so quoted speech survives byte-for-byte.
+#
+# `skip_blank_lines: true` is set deliberately: the fixture has a blank line in
+# the MIDDLE, so the emitted line_index values are 0, 2, 3 — the gap proves
+# index_field is the chunk's position IN THE BLOB, not the emitted-row ordinal.
+sources:
+  primary:
+    plugin: csv
+    on_success: text_manifest
+    options:
+      path: examples/blob_transforms/input/text_blob_manifest.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'manifest_index: int'
+        - 'source_name: str'
+        - 'source_url: str'
+        - 'blob_ref: str'
+      on_validation_failure: discard
+
+transforms:
+- name: expand_text_blob
+  plugin: blob_text_expand
+  input: text_manifest
+  on_success: output
+  on_error: expansion_failures
+  options:
+    blob_ref_field: blob_ref
+    output_field: line
+    include_index: true
+    index_field: line_index
+    skip_blank_lines: true
+    schema:
+      mode: fixed
+      fields:
+      - 'manifest_index: int'
+      - 'source_name: str'
+      - 'source_url: str'
+      - 'blob_ref: str'
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/blob_transforms/output/expanded_text_lines.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+  expansion_failures:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/blob_transforms/output/text_expansion_failures.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/blob_transforms/runs/text_blob_audit.db
+
+payload_store:
+  backend: filesystem
+  base_path: examples/blob_transforms/payloads/offline

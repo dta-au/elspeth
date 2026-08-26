@@ -21,17 +21,8 @@
         "required": false
       },
       {
-        "default": null,
-        "description": "Input field containing a payload-store content hash. Defaults to 'blob_ref'.",
-        "kind": "text",
-        "label": "Blob Ref Field",
-        "name": "blob_ref_field",
-        "nullable": true,
-        "required": false
-      },
-      {
         "default": "blob",
-        "description": "Where the CSV text comes from: 'blob' retrieves bytes from the payload store using blob_ref_field; 'field' reads CSV text already present on the row in text_field.",
+        "description": "Where the JSON text comes from: 'blob' reads the payload store via blob_ref_field, 'field' reads text_field.",
         "enum": [
           "blob",
           "field"
@@ -44,6 +35,24 @@
       },
       {
         "default": null,
+        "description": "Input field containing a payload-store content hash. Defaults to 'blob_ref'.",
+        "kind": "text",
+        "label": "Blob Ref Field",
+        "name": "blob_ref_field",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Input field containing the blob's normalized Content-Type, used to select the parse format. Defaults to 'blob_content_type'.",
+        "kind": "text",
+        "label": "Content Type Field",
+        "name": "content_type_field",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": null,
         "description": "Input row field holding the text to parse, when source is 'field'. Defaults to 'content'.",
         "kind": "text",
         "label": "Text Field",
@@ -52,45 +61,39 @@
         "required": false
       },
       {
-        "default": ",",
-        "description": "Single-character delimiter used to split CSV fields.",
-        "kind": "text",
-        "label": "Delimiter",
-        "name": "delimiter",
-        "nullable": false,
-        "required": false
-      },
-      {
-        "default": "utf-8",
-        "description": "Encoding used to decode the CSV blob. Applies to source: blob only.",
-        "kind": "text",
-        "label": "Encoding",
-        "name": "encoding",
-        "nullable": false,
-        "required": false
-      },
-      {
-        "default": 0,
-        "description": "Number of leading CSV records to skip before reading headers or data.",
-        "kind": "number-int",
-        "label": "Skip Rows",
-        "name": "skip_rows",
-        "nullable": false,
-        "required": false
-      },
-      {
         "default": null,
-        "description": "Explicit normalized column names for headerless CSV blobs.",
-        "item_kind": "text",
-        "kind": "string-list",
-        "label": "Columns",
-        "name": "columns",
+        "description": "Parse format. Required when source is 'field'. When source is 'blob' and this is omitted, the format is inferred fail-closed from the blob's stored content type.",
+        "enum": [
+          "json",
+          "jsonl"
+        ],
+        "kind": "enum",
+        "label": "Format",
+        "name": "format",
         "nullable": true,
         "required": false
       },
       {
         "default": null,
-        "description": "Optional mapping from observed CSV headers to normalized names.",
+        "description": "Optional top-level object key containing the array of records. Omitted means the document's top level is the array.",
+        "kind": "text",
+        "label": "Data Key",
+        "name": "data_key",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "description": "Record keys this transform emits as row fields, each typed 'any'. Required: JSON records carry no header row, so nothing else can tell downstream validation which fields the emitted rows will have.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Fields",
+        "name": "fields",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "default": null,
+        "description": "Optional mapping from normalized JSON record keys to final pipeline field names.",
         "kind": "json-object",
         "label": "Field Mapping",
         "name": "field_mapping",
@@ -98,26 +101,35 @@
         "required": false
       },
       {
-        "default": true,
-        "description": "Whether to emit the row index within the parsed CSV document.",
-        "kind": "checkbox",
-        "label": "Include Row Index",
-        "name": "include_row_index",
+        "default": "utf-8",
+        "description": "Encoding used to decode the JSON blob.",
+        "kind": "text",
+        "label": "Encoding",
+        "name": "encoding",
         "nullable": false,
         "required": false
       },
       {
-        "default": "csv_row_index",
-        "description": "Output field receiving the zero-based CSV data row index.",
+        "default": true,
+        "description": "Whether to emit the record index within the parsed JSON document.",
+        "kind": "checkbox",
+        "label": "Include Record Index",
+        "name": "include_record_index",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "json_record_index",
+        "description": "Output field receiving the zero-based JSON record index.",
         "kind": "text",
-        "label": "Row Index Field",
-        "name": "row_index_field",
+        "label": "Record Index Field",
+        "name": "record_index_field",
         "nullable": false,
         "required": false
       },
       {
         "default": 100000,
-        "description": "Maximum rows emitted for one input blob.",
+        "description": "Maximum rows emitted for one input document.",
         "kind": "number-int",
         "label": "Max Output Rows",
         "name": "max_output_rows",
@@ -126,7 +138,7 @@
       },
       {
         "default": 104857600,
-        "description": "Maximum payload size accepted from the blob store. Applies to source: blob only.",
+        "description": "Maximum payload size accepted from the blob store. Applies to source='blob' only \u2014 a source='field' document is already resident in the row, so max_output_rows is its bound.",
         "kind": "number-int",
         "label": "Max Blob Bytes",
         "name": "max_blob_bytes",
@@ -136,5 +148,5 @@
     ]
   },
   "plugin_kind": "transform",
-  "plugin_name": "blob_csv_expand"
+  "plugin_name": "blob_json_expand"
 }

@@ -1,0 +1,10 @@
+record_id,source_label,csv_text
+survey-a,Regional survey A,"id,text
+1,""It's fine, nothing special""
+2,Absolutely fantastic experience
+3,""Late, but they apologised""
+"
+survey-b,Regional survey B,"id,text
+4,Terrible from start to finish
+5,""Good value, would use again""
+"

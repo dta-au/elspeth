@@ -201,6 +201,8 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "azure_prompt_shield": Determinism.EXTERNAL_CALL,
     "blob_csv_expand": Determinism.IO_READ,
     "blob_fetch": Determinism.EXTERNAL_CALL,
+    "blob_json_expand": Determinism.IO_READ,
+    "blob_text_expand": Determinism.IO_READ,
     "batch_classifier_metrics": Determinism.DETERMINISTIC,
     "batch_data_quality_report": Determinism.DETERMINISTIC,
     "batch_distribution_profile": Determinism.DETERMINISTIC,
