@@ -180,7 +180,27 @@ def _bounded_proof_text(value: object, *, field_name: str) -> str:
     return value[:_MAX_AUTHORITATIVE_PROOF_TEXT_CHARS]
 
 
-def _proof_component_type(code: str) -> str:
+def _proof_component_type(code: str, evidence: Mapping[str, Any]) -> str:
+    """Label a proof blocker with the node kind the DETECTOR recorded.
+
+    A diagnostic that names a node carries that node's ``node_type`` in its
+    evidence_locator, so the kind is read from the detector's own record rather
+    than guessed back out of the diagnostic code. The code-keyed fallbacks below
+    survive only for detectors that do not (yet) record it; guessing was how a
+    collector-hosted batch plugin got labelled "aggregation" on a user-facing
+    blocker (filigree elspeth-1016a47e8f).
+
+    NOT the same question as the node-kind reads in the path-allowlist and
+    managed-identity loops further down this file (elspeth-df8082552d), which
+    take ``node.node_type`` off the NodeSpec. That asks "what IS this node",
+    against live composition state. This asks "what did the DETECTOR see",
+    against a recorded diagnostic that may predate the current state — which is
+    why it must read the evidence and cannot substitute a NodeSpec lookup. Two
+    derived answers to two questions; do not unify them.
+    """
+    recorded_kind = evidence["node_type"] if "node_type" in evidence else None
+    if type(recorded_kind) is str and recorded_kind:
+        return recorded_kind
     if code == "gate_expression_type_mismatch_against_source_schema":
         return "gate"
     if code == "aggregation_numeric_value_field_type_mismatch_against_source_schema":
@@ -231,7 +251,7 @@ def _merge_authoritative_proof_diagnostics(
         node_id = raw_node_id if type(raw_node_id) is str and raw_node_id else None
         if node_id is not None and node_id not in affected_nodes:
             affected_nodes.append(node_id)
-        component_type = _proof_component_type(code)
+        component_type = _proof_component_type(code, evidence)
         errors.append(
             ValidationError(
                 component_id=node_id,
@@ -1333,8 +1353,20 @@ class ExecutionServiceImpl:
             )
 
             allowed_sink_dirs = allowed_sink_directories(str(self._settings.data_dir), session_id=str(session_id))
+            # Every PLUGIN-BEARING node (elspeth-df8082552d). This is the
+            # defence-in-depth mirror of validate_path_policy, and it carried
+            # the IDENTICAL node-kind blind spot — so the "a second gate
+            # catches it" reassurance did not hold: both lines were blind the
+            # same way. See that gate for why the subject set keys on the
+            # plugin rather than on a node-kind set.
+            #
+            # ``node.node_type`` here is the node's OWN kind, read off live
+            # composition state — a different question from
+            # ``_proof_component_type``'s evidence-recorded kind near the top
+            # of this file (elspeth-1016a47e8f). Both derive rather than guess;
+            # they are not competing vocabularies and must not be merged.
             for node in composition_state.nodes:
-                if node.node_type != "transform":
+                if node.plugin is None:
                     continue
                 if "provider_config" not in node.options:
                     continue
@@ -1347,7 +1379,7 @@ class ExecutionServiceImpl:
                         resolved = resolve_sink_data_path(value, str(self._settings.data_dir), session_id=str(session_id))
                         if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
                             raise PathAllowlistViolationError(
-                                f"Transform '{node.id}' {key}='{value}' resolves outside allowed output directories"
+                                f"{node.node_type.capitalize()} '{node.id}' {key}='{value}' resolves outside allowed output directories"
                             )
 
         # The managed-identity + sequential-multi-query retry-budget policy gates
@@ -1408,8 +1440,13 @@ class ExecutionServiceImpl:
         # execution service fail-closed even if that gate were bypassed (the
         # tutorial path calls ``execute`` directly). Running them on the un-lowered
         # ``composition_state`` false-positived operator-profiled multi-query nodes.
+        # Every PLUGIN-BEARING node (elspeth-df8082552d) — same widening as
+        # the validate_pipeline gates this mirrors. This loop's own comment
+        # above calls it the fail-closed backstop "even if that gate were
+        # bypassed"; before this change it shared the blind spot with the
+        # gate, so it could not have caught that bypass.
         for node in policy_result.executable_state.nodes:
-            if node.node_type != "transform":
+            if node.plugin is None:
                 continue
             provider_policy_error = web_rag_provider_config_policy_error(node.options)
             if provider_policy_error is not None:
@@ -1432,7 +1469,7 @@ class ExecutionServiceImpl:
                                 code="managed_identity_policy",
                                 component_id=node.id,
                                 component_type="transform",
-                                detail=f"transform {node.id} enables managed identity from web-authored provider_config",
+                                detail=f"{node.node_type} {node.id} enables managed identity from web-authored provider_config",
                             )
                         ],
                     ),
