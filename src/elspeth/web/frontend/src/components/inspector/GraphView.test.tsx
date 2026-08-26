@@ -2125,6 +2125,41 @@ describe("GraphView", () => {
       ).toBe(false);
     });
 
+    it("drops a stale-label explicit edge into an alias-mapped coalesce", () => {
+      // Phase 1b's reason to exist: `with_node` replaces a node in place and
+      // never reconciles `edges`, and validation only checks that endpoints
+      // resolve — never that a label names a LIVE alias. Renaming branch_b to
+      // branch_c leaves a validation-VALID composition whose edge list still
+      // describes the old wiring. No saved state has drifted this way yet
+      // (every corpus edge is label: null, which the unlabelled fallback
+      // claims), so this arm went live for coalesce with this fix and is
+      // pinned here rather than inferred from the row_union cases.
+      const state = coalesceState();
+      const coalesce = state.nodes.find((node) => node.id === "merge_branches");
+      expect(coalesce).toBeDefined();
+      coalesce!.branches = {
+        branch_a: "pairing_done",
+        branch_c: "hex_done",
+      };
+      state.edges = [
+        makeEdge({
+          id: "e_stale",
+          from_node: "get_hex",
+          to_node: "merge_branches",
+          label: "branch_b",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+      render(<GraphView />);
+
+      // The stale hint is gone; the live alias is drawn from authority.
+      expect(edgeIds()).not.toContain("edge-e-get_hex-merge_branches-0");
+      expect(inboundEdgeIds("merge_branches")).toEqual([
+        "edge-inferred-fan-in-get_hex-merge_branches-branch_c",
+        "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a",
+      ]);
+    });
+
     it("keeps a coalesce's explicit outbound edge when the node declares no outbound authority", () => {
       // The corpus holds `merge_branches -> tidy_columns` on a coalesce whose
       // on_success, on_error and routes are ALL null. Nothing can register an
