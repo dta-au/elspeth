@@ -3529,7 +3529,13 @@ def _check_schema_contracts(
     tuple[EdgeContract, ...],
 ]:
     """Validate producer/consumer schema contracts across declarative routing."""
-    from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id, source_producer_id
+    from elspeth.web.composer._producer_resolver import (
+        ProducerEntry,
+        ProducerResolver,
+        is_source_producer_id,
+        published_success_connection,
+        source_producer_id,
+    )
 
     errors: list[ValidationEntry] = []
     contract_warnings: list[ValidationEntry] = []
@@ -3607,10 +3613,27 @@ def _check_schema_contracts(
             _record_description(source.on_success, source_desc)
 
     for node in nodes:
-        if node.node_type == "coalesce" and node.on_success is None:
-            _record_description(node.id, f"coalesce '{node.id}'")
-        elif node.on_success is not None and node.on_success not in sink_names:
-            _record_description(node.on_success, f"node '{node.id}' on_success")
+        # DERIVED from ``published_success_connection``, not restated: this
+        # bookkeeping must register the same connection the resolver above
+        # registered, because the reporting loop pairs the two by name. A
+        # hand-written "coalesce with no on_success" here listed one of the
+        # three implicit self-publishers, so an aggregation that omits
+        # on_success got a producer entry from the resolver and NO first
+        # description here — and a second producer of that id then indexed
+        # ``duplicate_descs`` for a key nothing had written, raising KeyError
+        # out of ``validate()`` on a planner-authorable shape.
+        published = published_success_connection(node)
+        if published is None:
+            # Publishes nothing on its success channel — a fork gate, whose
+            # output is described by routes / fork_to below instead.
+            pass
+        elif node.on_success is None:
+            # An implicit self-publisher: name the kind, so the duplicate
+            # message says WHICH node the author has to fix rather than
+            # reporting only the node that contended with it.
+            _record_description(published, f"{node.node_type} '{node.id}'")
+        elif published not in sink_names:
+            _record_description(published, f"node '{node.id}' on_success")
         if (
             node.on_error is not None
             and node.on_error != "discard"

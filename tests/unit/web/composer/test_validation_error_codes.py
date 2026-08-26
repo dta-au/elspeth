@@ -292,6 +292,145 @@ class TestStructuralRejectionCodes:
         assert not result.is_valid
         assert _entries_with_code(result, "duplicate_connection_producer"), [e.to_dict() for e in result.errors]
 
+    def test_a_contended_implicitly_publishing_aggregation_reports_instead_of_crashing(self) -> None:
+        """``validate()`` used to raise ``KeyError`` on this shape, not return a rejection.
+
+        An aggregation that omits ``on_success`` publishes under its own id
+        (``core/dag/builder.py`` registers ``agg_settings.name``), so a gate
+        route ALSO naming that id is a genuine duplicate producer, and
+        ``ProducerResolver`` — which asks ``published_success_connection`` —
+        duly flagged it. The schema-contract validator's description
+        bookkeeping restated the publishing rule by hand as "coalesce with no
+        on_success", so it recorded NO first description for the aggregation;
+        the gate's description landed in that slot instead, and the reporting
+        loop's ``duplicate_descs[connection_name][0]`` then indexed a key
+        nothing had written.
+
+        The result was an unhandled ``KeyError`` escaping ``CompositionState.
+        validate()`` on a planner-authorable shape — a crash, not a validation
+        error. Deriving the description from the same helper the resolver uses
+        keeps the two bookkeepings in step by construction.
+        """
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="agg",
+                node_type="aggregation",
+                plugin="batch_stats",
+                input="rows",
+                on_success=None,
+                on_error="main",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                trigger={"count": 10},
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="router",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="row.n > 1",
+                routes={"hit": "agg"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(_make_transform("reader", "agg", "main"))
+        state = state.with_output(_make_output())
+
+        result = state.validate()
+
+        assert not result.is_valid
+        duplicates = _entries_with_code(result, "duplicate_connection_producer")
+        assert duplicates, [e.to_dict() for e in result.errors]
+        message = duplicates[0].message
+        assert "aggregation 'agg'" in message, (
+            "The aggregation is the FIRST producer of 'agg' and must be named as such. Reporting only "
+            f"the gate hides the node the author actually has to fix. Got: {message!r}"
+        )
+
+    def test_implicit_self_publishers_stay_clean_and_gain_no_overlap_error(self) -> None:
+        """Pins the side effect of deriving the producer description from the helper.
+
+        Recording a description also feeds ``internal_connection_names``, which
+        ``connection_sink_name_overlap`` reads — so deriving the description
+        widened that set to include queue and aggregation ids, which the
+        hand-written "coalesce only" form never recorded.
+
+        The widening is inert BY CONSTRUCTION, and this test enforces the
+        reasoning rather than leaving it argued: ``_record_description`` guards
+        the ``internal_connection_names.add`` with ``if connection_name not in
+        sink_names``, so a name capable of joining the overlap set can never be
+        added by the producer side at all. A valid pipeline whose queue and
+        whose on_success-omitting aggregation each publish under their own id
+        must therefore still validate CLEAN.
+        """
+        queue_state = _empty_state()
+        queue_state = queue_state.with_source(_make_source(on_success="q"))
+        queue_state = queue_state.with_node(
+            NodeSpec(
+                id="q",
+                node_type="queue",
+                plugin=None,
+                input="q",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        queue_state = queue_state.with_node(_make_transform("reader", "q", "main"))
+        queue_state = queue_state.with_output(_make_output())
+        queue_result = queue_state.validate()
+        assert queue_result.is_valid, [e.to_dict() for e in queue_result.errors]
+
+        agg_state = _empty_state()
+        agg_state = agg_state.with_source(_make_source(on_success="rows"))
+        agg_state = agg_state.with_node(
+            NodeSpec(
+                id="agg",
+                node_type="aggregation",
+                plugin="batch_stats",
+                input="rows",
+                on_success=None,
+                on_error="main",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                trigger={"count": 2},
+            )
+        )
+        agg_state = agg_state.with_node(_make_transform("reader", "agg", "main"))
+        agg_state = agg_state.with_output(_make_output())
+        agg_result = agg_state.validate()
+        assert agg_result.is_valid, [e.to_dict() for e in agg_result.errors]
+
+        for result in (queue_result, agg_result):
+            assert not _entries_with_code(result, "connection_sink_name_overlap"), [e.to_dict() for e in result.errors]
+            assert not _entries_with_code(result, "duplicate_connection_producer"), [e.to_dict() for e in result.errors]
+
     def test_aggregation_missing_on_error_carries_code(self) -> None:
         state = _empty_state()
         state = state.with_source(_make_source(on_success="agg_in"))
