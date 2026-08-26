@@ -50,8 +50,7 @@ scoring):
   must_discover_schema_before_first_mutation (green_criteria)
       Boolean. AMBER if no get_plugin_schema invocation precedes the
       first state-mutating tool call (set_source, set_output,
-      upsert_node, set_pipeline, set_source_from_blob,
-      set_pipeline). A get_plugin_schema call that fires
+      upsert_node, set_pipeline, set_source_from_blob). A get_plugin_schema call that fires
       ONLY after a rejection still earns an AMBER — the discover-first
       signal requires the schema lookup before the first mutation.
 

@@ -317,7 +317,6 @@ class PlannerDiscoveryPolicy:
                 "plugin.schema",
                 "plugin.assistance",
                 *(() if "model.catalog" in aid_supplied_information else ("model.catalog",)),
-                "recipe.index",
                 "blob.metadata",
                 "validation.code",
                 "secret.reference",

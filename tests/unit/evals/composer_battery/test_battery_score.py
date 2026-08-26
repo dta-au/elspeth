@@ -411,6 +411,23 @@ def test_unattributed_excess_is_visible() -> None:
     assert s.excess == 1 and _classes(s) == ["unattributed_excess"] and not s.clean
 
 
+def test_approval_pending_is_flagged() -> None:
+    """A mutation that returned APPROVAL_REQUIRED is a hard-classed deviation.
+
+    The predecessor bundled this with a ``recipe_used`` assertion and
+    overrode the mutating call's name to ``apply_pipeline_recipe``; it died
+    with the recipe system (e7a85bf8e), leaving the only exercise of a
+    ``"hard"``-classed deviation with no coverage at all. The recipe half was
+    never load-bearing here: the ideal thread's own ``set_pipeline`` is a
+    mutation tool, so the deviation reproduces without touching the name.
+    """
+    rows = tg.ideal_thread(ARGS)
+    rows[-1]["composition_state_id"] = None
+    rows[-1]["content"] = json.dumps({"success": True, "status": "APPROVAL_REQUIRED", "proposal_id": "p1"})
+    s = score_run(tg.capture(rows, state=ARGS), SC)
+    assert "approval_pending" in _classes(s)
+
+
 def test_cancelled_last_row_on_a_wall_timeout_is_hard_not_excluded() -> None:
     dead = [
         tg.user_row(1),
