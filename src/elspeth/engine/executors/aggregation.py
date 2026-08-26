@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from pydantic import ValidationError
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import (
@@ -39,6 +38,7 @@ from elspeth.core.config import AggregationSettings
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine.aggregation_result import aggregation_result_members, validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
+from elspeth.engine.executors.batch_contract_validation import validate_batch_inputs, validate_success_outputs
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.journal_restore import AggregationJournalRestorer
 from elspeth.engine.spans import SpanFactory
@@ -367,34 +367,19 @@ class AggregationExecutor:
 
     @staticmethod
     def _validate_batch_inputs(transform: BatchTransformProtocol, rows: Sequence[PipelineRow]) -> None:
-        """Validate reconstructed batch input rows before plugin execution."""
-        for idx, row in enumerate(rows):
-            try:
-                transform.input_schema.model_validate(row.to_dict(), strict=True)
-            except ValidationError as exc:
-                raise PluginContractViolation(
-                    f"Aggregation transform '{transform.name}' input validation failed for buffered row {idx}: {exc}. "
-                    "This indicates an upstream transform/source schema bug."
-                ) from exc
+        """Validate reconstructed batch input rows before plugin execution.
+
+        Thin seam over the shared check. The body moved to
+        ``batch_contract_validation`` so ``CollectorExecutor`` — which runs the
+        same batch-transform contract and had NO preflight at all
+        (elspeth-c2fa61cf57) — calls the same code rather than a copy of it.
+        """
+        validate_batch_inputs(transform, rows, node_kind="Aggregation")
 
     @staticmethod
     def _validate_success_outputs(transform: BatchTransformProtocol, result: TransformResult) -> None:
         """Validate successful batch output rows before audit completion."""
-        if result.row is not None:
-            emitted_rows: tuple[PipelineRow, ...] = (result.row,)
-        elif result.rows is not None:
-            emitted_rows = tuple(result.rows)
-        else:
-            emitted_rows = ()
-
-        for idx, row in enumerate(emitted_rows):
-            try:
-                transform.output_schema.model_validate(row.to_dict(), strict=True)
-            except ValidationError as exc:
-                raise PluginContractViolation(
-                    f"Aggregation transform '{transform.name}' output validation failed for emitted row {idx}: {exc}. "
-                    "This indicates a transform schema bug."
-                ) from exc
+        validate_success_outputs(transform, result, node_kind="Aggregation")
 
     def _snapshot_flush_inputs(self, *, node_id: NodeID, node: _AggregationNodeState) -> _FlushInputSnapshot:
         """Snapshot buffered tokens and reconstruct batch transform input rows."""
