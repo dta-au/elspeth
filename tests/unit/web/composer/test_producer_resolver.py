@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
-from elspeth.web.composer._producer_resolver import ProducerResolver, published_success_connection
+import ast
+from pathlib import Path
+
+import elspeth
+from elspeth.web.composer._producer_resolver import (
+    _IMPLICIT_SELF_PUBLISHING_NODE_TYPES,
+    ProducerResolver,
+    published_success_connection,
+)
 from elspeth.web.composer.state import NodeSpec, SourceSpec
+
+_STATE_SOURCE_PATH = Path(elspeth.__file__).parent / "web" / "composer" / "state.py"
 
 
 def _node(
@@ -438,3 +448,103 @@ class TestPublishedSuccessConnection:
         producer = resolver.find_producer_for("merge")
         assert producer is not None, "the coalesce must be findable under its own id"
         assert producer.producer_id == "merge"
+
+
+class TestRuntimeConnectionTargetsRestatement:
+    """Pin ``state.py``'s DELIBERATE hand-written twin to the helper it excludes from.
+
+    ``_runtime_connection_targets`` is the one site that must NOT call
+    ``published_success_connection``: a queue's ``input`` IS its own id
+    (``queue_node_contract_error`` enforces it), so adding a queue's id to the
+    reachable TARGET set would let an orphan queue satisfy its own input and
+    silently delete the ``node_input_not_reachable`` check the function exists
+    to make possible.
+
+    That carve-out is correct, but until this guard it was UNPINNED IN BOTH
+    DIRECTIONS: nothing in ``tests/`` referenced either name, so the next kind
+    added to ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES`` would not fail a single
+    test for being absent at that site. That is exactly how ``aggregation``
+    was missed the first time — the hand-written twin listed only
+    ``("coalesce",)`` and the composer rejected a pipeline the runtime runs.
+
+    So the expectation is DERIVED, not restated: the literal enumerated at the
+    site must equal ``helper - {"queue"}``. Neither side may drift alone, and
+    the site may not quietly disappear (the anchor assertions below).
+    """
+
+    @staticmethod
+    def _self_publishing_membership_test() -> ast.Compare:
+        """Return the single ``node.node_type in (...)`` test in the function.
+
+        Located by STRUCTURE, never by line number: the enclosing
+        ``FunctionDef`` by name, then the ``ast.Compare`` whose operator is
+        ``in`` and whose left operand is the ``node.node_type`` attribute
+        access. The function's other comparisons are ``!=`` against discard
+        keywords, so this shape is unambiguous — and the count assertion
+        below proves it stayed that way.
+        """
+        module = ast.parse(_STATE_SOURCE_PATH.read_text(encoding="utf-8"))
+        functions = [node for node in ast.walk(module) if isinstance(node, ast.FunctionDef) and node.name == "_runtime_connection_targets"]
+        assert len(functions) == 1, (
+            f"Expected exactly one `_runtime_connection_targets` definition in {_STATE_SOURCE_PATH.name}, "
+            f"found {len(functions)}. This guard's anchor is ambiguous — fix the anchor, do not delete the guard."
+        )
+        candidates = [
+            node
+            for node in ast.walk(functions[0])
+            if isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.In)
+            and isinstance(node.left, ast.Attribute)
+            and node.left.attr == "node_type"
+            and isinstance(node.left.value, ast.Name)
+            and node.left.value.id == "node"
+        ]
+        assert len(candidates) == 1, (
+            f"Expected exactly one `node.node_type in (...)` test inside `_runtime_connection_targets`, "
+            f"found {len(candidates)}. If the deliberate hand-written restatement of the implicit "
+            f"self-publisher set was removed or duplicated, this guard is no longer watching it — "
+            f"re-anchor it, do not delete it."
+        )
+        return candidates[0]
+
+    def test_the_hand_written_twin_equals_the_helper_minus_queue(self):
+        compare = self._self_publishing_membership_test()
+        comparator = compare.comparators[0]
+        assert isinstance(comparator, ast.Tuple | ast.Set | ast.List), (
+            "Expected an inline literal of node-type names at the restatement site, got "
+            f"{type(comparator).__name__}. A guard can only pin a literal it can read."
+        )
+        enumerated = set()
+        for element in comparator.elts:
+            assert isinstance(element, ast.Constant) and isinstance(element.value, str), (
+                f"Non-literal element {ast.dump(element)} at the restatement site — this guard cannot "
+                "evaluate it. Keep the site a plain literal, or derive it from the helper directly."
+            )
+            enumerated.add(element.value)
+
+        expected = set(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES) - {"queue"}
+        assert enumerated == expected, (
+            "`_runtime_connection_targets` has drifted from its authority.\n"
+            f"  helper `_IMPLICIT_SELF_PUBLISHING_NODE_TYPES`: {sorted(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES)}\n"
+            f"  expected at the site (helper - {{'queue'}}):     {sorted(expected)}\n"
+            f"  actually enumerated at the site:                {sorted(enumerated)}\n"
+            "A kind that publishes implicitly must be listed at BOTH places. `queue` is the sole, "
+            "deliberate exclusion: its `input` is its own id, so listing it there would let an orphan "
+            "queue satisfy its own input and delete `node_input_not_reachable`. If a NEW kind also needs "
+            "excluding, widen the exclusion here with the reason — do not silently drop it from the site."
+        )
+
+    def test_queue_is_excluded_at_the_site_but_present_in_the_helper(self):
+        """The carve-out itself, stated positively so its removal is visible."""
+        assert "queue" in _IMPLICIT_SELF_PUBLISHING_NODE_TYPES, (
+            "A queue publishes under its own id — if it left the helper, `published_success_connection` "
+            "no longer describes the DAG builder's producer registration."
+        )
+        compare = self._self_publishing_membership_test()
+        enumerated = {element.value for element in compare.comparators[0].elts if isinstance(element, ast.Constant)}
+        assert "queue" not in enumerated, (
+            "`queue` was added to `_runtime_connection_targets`'s literal. A queue's `input` IS its own id, "
+            "so a queue's id in the reachable TARGET set lets an orphan queue satisfy its own input — "
+            "silently deleting the `node_input_not_reachable` check this function exists to make possible."
+        )
