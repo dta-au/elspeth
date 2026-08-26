@@ -287,8 +287,15 @@ class TestMCPErrorTypeValidation:
 class TestBoolExcludedFromInt:
     """D.11: bool values rejected from numeric aggregation."""
 
-    def test_bool_value_raises_type_error(self) -> None:
-        """Boolean values should not be treated as int in batch_stats."""
+    def test_bool_value_fails_the_batch_with_wrong_type_reason(self) -> None:
+        """Boolean values should not be treated as int in batch_stats.
+
+        The outcome pinned here is bool-exclusion (type(), not isinstance —
+        bool is an int subclass). Delivery changed at 890a6aca7 under the
+        elspeth-d5034647f0 ruling: a wrong-typed value fails the WHOLE batch
+        with a recorded reason instead of aborting the run with a bare
+        TypeError, so this asserts the TransformResult, not a raise.
+        """
         from elspeth.plugins.transforms.batch_stats import BatchStats
 
         transform = BatchStats({"schema": DYNAMIC_SCHEMA, "value_field": "flag"})
@@ -297,8 +304,14 @@ class TestBoolExcludedFromInt:
         ctx = make_context(run_id="test", landscape=factory.plugin_audit_writer())
         rows = [_make_row({"flag": True})]
 
-        with pytest.raises(TypeError, match="must be numeric"):
-            transform.process(rows, ctx)
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["actual_type"] == "bool"
+        assert "must be numeric" in result.reason["error"]
 
     def test_int_value_accepted(self) -> None:
         """Actual int values should work fine."""
