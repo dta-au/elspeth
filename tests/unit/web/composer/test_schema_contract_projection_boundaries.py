@@ -239,3 +239,141 @@ def test_planner_plugin_contract_is_deeply_frozen_and_thaws_only_on_export() -> 
     exported["json_schema"]["type"] = "string"  # type: ignore[index]
     assert contract.schema_hash == original_hash
     assert contract.to_dict()["json_schema"]["type"] == "object"  # type: ignore[index]
+
+
+def _variant_knobs(
+    discriminator_enum: list[str],
+    coverage: list[object],
+    *,
+    name: str = "shared_knob",
+) -> dict[str, object]:
+    """One lowered discriminated union: a discriminator plus per-variant repeats."""
+    fields: list[dict[str, object]] = [
+        {"name": "provider", "kind": "enum", "required": True, "enum": discriminator_enum},
+    ]
+    fields.extend(
+        {
+            "name": name,
+            "kind": "text",
+            "required": False,
+            "visible_when": {"field": "provider", "equals": variant},
+        }
+        for variant in coverage
+    )
+    return {"fields": fields}
+
+
+def test_contract_knob_schema_collapses_repeats_covering_the_whole_discriminator() -> None:
+    """Full coverage means the knob applies whatever the variant is."""
+    projected = _contract_knob_schema(_variant_knobs(["azure", "bedrock"], ["azure", "bedrock"]))
+
+    assert projected == {
+        "fields": [
+            {"name": "provider", "kind": "enum", "required": True, "enum": ["azure", "bedrock"]},
+            {"name": "shared_knob", "kind": "text", "required": False},
+        ]
+    }
+
+
+def test_contract_knob_schema_keeps_partial_coverage_per_variant() -> None:
+    """``region_name`` under ``bedrock`` alone is a fact, not repetition."""
+    projected = _contract_knob_schema(_variant_knobs(["azure", "bedrock", "gateway"], ["azure", "bedrock"]))
+    fields = projected["fields"]
+    assert isinstance(fields, list)
+
+    assert [field["visible_when"] for field in fields[1:]] == [
+        {"field": "provider", "equals": "azure"},
+        {"field": "provider", "equals": "bedrock"},
+    ]
+
+
+def test_contract_knob_schema_keeps_repeats_whose_discriminator_is_not_projected() -> None:
+    """No visible enum means no variant set, so nothing is known to be covered."""
+    projected = _contract_knob_schema(
+        {
+            "fields": [
+                {
+                    "name": "shared_knob",
+                    "kind": "text",
+                    "required": False,
+                    "visible_when": {"field": "provider", "equals": variant},
+                }
+                for variant in ("azure", "bedrock")
+            ]
+        }
+    )
+    fields = projected["fields"]
+    assert isinstance(fields, list)
+
+    assert len(fields) == 2
+
+
+def test_contract_knob_schema_keeps_repeats_predicated_on_a_non_string() -> None:
+    """A non-string ``equals`` matches no member of a projected enum."""
+    projected = _contract_knob_schema(_variant_knobs(["azure", "bedrock"], ["azure", {"one_of": ["bedrock"]}]))
+    fields = projected["fields"]
+    assert isinstance(fields, list)
+
+    assert len(fields) == 3
+
+
+def test_contract_knob_schema_keeps_repeats_when_the_discriminator_enum_disagrees() -> None:
+    """Two enums under one name name no single variant set."""
+    lowered = _variant_knobs(["azure", "bedrock"], ["azure", "bedrock"])
+    fields = lowered["fields"]
+    assert isinstance(fields, list)
+    fields.insert(1, {"name": "provider", "kind": "enum", "required": True, "enum": ["azure"]})
+
+    projected = _contract_knob_schema(lowered)
+    projected_fields = projected["fields"]
+    assert isinstance(projected_fields, list)
+
+    assert len(projected_fields) == 4
+
+
+def test_contract_knob_schema_collapses_inside_an_item_schema() -> None:
+    """Each field list is its own scope, so a nested union collapses too."""
+    projected = _contract_knob_schema(
+        {
+            "fields": [
+                {
+                    "name": "queries",
+                    "kind": "list",
+                    "required": False,
+                    "item_schema": _variant_knobs(["azure", "bedrock"], ["azure", "bedrock"]),
+                }
+            ]
+        }
+    )
+    fields = projected["fields"]
+    assert isinstance(fields, list)
+    item_schema = fields[0]["item_schema"]
+    assert isinstance(item_schema, dict)
+
+    assert item_schema == {
+        "fields": [
+            {"name": "provider", "kind": "enum", "required": True, "enum": ["azure", "bedrock"]},
+            {"name": "shared_knob", "kind": "text", "required": False},
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        {"name": "provider", "kind": "enum", "required": False, "enum": ["azure", "bedrock"]},
+        {"name": "provider", "kind": "enum", "required": True, "nullable": True, "enum": ["azure", "bedrock"]},
+    ],
+)
+def test_contract_knob_schema_keeps_repeats_under_an_unset_discriminator(authority: dict[str, object]) -> None:
+    """Unset, an enum satisfies none of its members, so full coverage is not always-on."""
+    lowered = _variant_knobs(["azure", "bedrock"], ["azure", "bedrock"])
+    fields = lowered["fields"]
+    assert isinstance(fields, list)
+    fields[0] = authority
+
+    projected = _contract_knob_schema(lowered)
+    projected_fields = projected["fields"]
+    assert isinstance(projected_fields, list)
+
+    assert len(projected_fields) == 3

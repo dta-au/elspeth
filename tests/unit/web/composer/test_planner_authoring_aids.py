@@ -1293,18 +1293,22 @@ class TestDiscoveryDigest:
         refuses real contracts. Importing it means this test tracks whatever
         the planner actually enforces.
 
-        Currently RED and expected to stay red until the ``llm`` contract
-        shrinks (elspeth-623c69c59f): the three contracts AGGREGATE to 50,365
-        bytes against a 49,152-byte budget, so the planner refuses the third
-        ``get_plugin_schema`` call with ``schema_contract_budget_exceeded``.
-        No single contract exceeds the budget — ``llm`` alone is 39,095 bytes,
-        79.5% of it — so this is an aggregate overflow, not one oversized
-        contract. That red IS this test's signal, not a defect in it.
+        Was RED for elspeth-623c69c59f: the three contracts aggregated to
+        50,365 bytes against a 49,152-byte budget, so the planner refused the
+        third ``get_plugin_schema`` call with
+        ``schema_contract_budget_exceeded``. No single contract exceeded the
+        budget — ``llm`` alone was 39,093 bytes, 79.5% of it — so it was an
+        aggregate overflow, not one oversized contract.
 
-        Do NOT green it by raising ``_SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES``.
-        That constant is a ratchet: loosening it silently buys room for the
-        next option pair to overflow again, and it is the developer's call,
-        not a lane's. Shrink the contract instead.
+        Green since ``_collapse_uniform_variant_fields`` stopped the projection
+        re-emitting a discriminated union's shared knobs once per variant. The
+        constant was NOT raised — it is a ratchet, loosening it silently buys
+        room for the next option pair to overflow again, and it is the
+        developer's call, not a lane's. If this goes red again, shrink the
+        contract; do not raise the budget. The post-fix totals are deliberately
+        not restated here: this assertion does not enforce them, and the
+        pre-fix pair above already rotted by two bytes between the ticket's
+        summary and its own measurement table.
         """
         from elspeth.core.canonical import canonical_json
         from elspeth.web.composer.pipeline_planner import _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES
