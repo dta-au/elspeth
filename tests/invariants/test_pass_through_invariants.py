@@ -20,11 +20,15 @@ Core tests here:
   that slip the budget must implement ``probe_config()`` per the contract.
 
 The ``forwards_input_fields`` axis (elspeth-15c72686f2) gets the same
-two-direction treatment: ``test_forwarding_transforms_remove_only_what_they
-_declare`` truth-tests every declared removal set, and
-``test_undeclared_transforms_do_not_forward_unknown_fields`` catches the
-under-declaration direction — a transform that forwards a sentinel extra on
-every emission while declaring nothing.
+two-direction treatment inside a single branching test
+(``test_forwarding_declaration_is_truthful``): declarers get their removal
+set truth-tested, non-declarers get the under-declaration sentinel sweep —
+catching a transform that forwards a sentinel extra on every emission while
+declaring nothing. One test rather than a skip-partitioned pair: the
+declaration is an instance attribute (``FieldMapper``'s flips on
+``select_only``), so the split is only knowable post-instantiation, and
+skip-partitioning would let a future transform fall through both halves
+with a green summary.
 
 The harness uses ``pytest_generate_tests`` to parametrize over registered
 transforms at collection time — with a guard that crashes if the plugin
@@ -463,19 +467,18 @@ def _with_sentinel_field(probe: PipelineRow) -> PipelineRow:
     return PipelineRow(payload, contract)
 
 
-def test_undeclared_transforms_do_not_forward_unknown_fields(
-    _non_pass_through_cls: type[BaseTransform],
+def _assert_undeclared_transform_does_not_forward(
+    cls: type[BaseTransform],
+    transform: BaseTransform,
 ) -> None:
-    """Under-declaration guard for ``forwards_input_fields`` (elspeth-15c72686f2).
+    """Under-declaration arm (elspeth-15c72686f2) — non-declaring transforms.
 
-    The truth-test below verifies every transform that DECLARES forwarding;
-    it skips everything that does not, so a future transform that forwards
-    the row while declaring nothing would silently recreate the original
-    defect class: both definite-emits walks stop at it, upstream extras
-    become invisible to the build-time firewall, and the graph is back to
-    "build green, every row dies at the locked sink". The commit that
-    introduced the declaration relied on a one-time manual audit of the
-    non-declaring transforms; this test makes that audit permanent.
+    A transform that forwards the row while declaring nothing silently
+    recreates the original defect class: both definite-emits walks stop at
+    it, upstream extras become invisible to the build-time firewall, and the
+    graph is back to "build green, every row dies at the locked sink". The
+    commit that introduced the declaration relied on a one-time manual audit
+    of the non-declaring transforms; this arm makes that audit permanent.
 
     Method: seed each probe row with a sentinel field no transform knows.
     A fresh-dict transform (the batch_* family, report_assemble) never emits
@@ -484,14 +487,6 @@ def test_undeclared_transforms_do_not_forward_unknown_fields(
     ``forwards_input_fields=True`` (with its removals) or
     ``passes_through_input=True`` if the stronger claim holds.
     """
-    try:
-        transform = _probe_instantiate(_non_pass_through_cls)
-    except _UnprobeableTransform as exc:
-        pytest.skip(f"{_non_pass_through_cls.__name__}: {exc.reason}")
-
-    if transform.forwards_input_fields:
-        pytest.skip(f"{_non_pass_through_cls.__name__} declares forwarding — verified by the removal truth-test.")
-
     probe_count = 0
     asserted_count = 0
     sentinel_always_forwarded = True
@@ -523,7 +518,7 @@ def test_undeclared_transforms_do_not_forward_unknown_fields(
 
     if probe_count < _SWEEP_MIN_PROBES:
         pytest.fail(
-            f"{_non_pass_through_cls.__name__}: only {probe_count} probe rows "
+            f"{cls.__name__}: only {probe_count} probe rows "
             f"exercised (expected >= {_SWEEP_MIN_PROBES}). Harness probe generation "
             "is under-powered for this transform."
         )
@@ -536,7 +531,7 @@ def test_undeclared_transforms_do_not_forward_unknown_fields(
 
     if sentinel_always_forwarded:
         pytest.fail(
-            f"{_non_pass_through_cls.__name__} forwarded the unknown field "
+            f"{cls.__name__} forwarded the unknown field "
             f"{_FORWARDING_SENTINEL!r} on every successful emission "
             f"({asserted_count} rows) but declares forwards_input_fields=False. "
             "The definite-emits walks stop at undeclared transforms, so upstream "
@@ -546,22 +541,19 @@ def test_undeclared_transforms_do_not_forward_unknown_fields(
         )
 
 
-def test_forwarding_transforms_remove_only_what_they_declare(
-    _non_pass_through_cls: type[BaseTransform],
+def _assert_declared_removals_are_truthful(
+    cls: type[BaseTransform],
+    transform: BaseTransform,
 ) -> None:
-    """Truth-test for the ``forwards_input_fields`` declaration (elspeth-15c72686f2).
+    """Truth-test arm (elspeth-15c72686f2) — declaring transforms.
 
-    ``forwards_input_fields`` is what a transform declares when it forwards the
-    whole row but cannot claim ``passes_through_input`` — because it consumes a
-    column (line_explode's ``source_field``, json_explode's ``array_field``,
-    field_mapper's rename sources) or because it drops whole ROWS
-    (batch_outlier_annotator). Unlike ``passes_through_input`` it has no runtime
-    cross-check, so without this test it would be a claim nothing verifies —
-    and it is a claim the build-time extras firewall REJECTS graphs on, so a
-    wrong one produces a false rejection of a working pipeline.
+    ``forwards_input_fields`` has no runtime cross-check, so without this arm
+    it would be a claim nothing verifies — and it is a claim the build-time
+    extras firewall REJECTS graphs on, so a wrong one produces a false
+    rejection of a working pipeline.
 
     The assertion is per emitted row against the INTERSECTION of the probe's
-    input rows, not their union. The union is what the backward invariant above
+    input rows, not their union. The union is what the backward invariant
     uses, and it is wrong here: batch_outlier_annotator's probe deliberately
     feeds one row that gets skipped entirely, and a field carried only by that
     row legitimately never reaches the output. The intersection asks the
@@ -572,14 +564,6 @@ def test_forwarding_transforms_remove_only_what_they_declare(
     firewall rejects less), which is why this checks only the ``⊇`` direction.
     Under-declaring is the failure this catches.
     """
-    try:
-        transform = _probe_instantiate(_non_pass_through_cls)
-    except _UnprobeableTransform as exc:
-        pytest.skip(f"{_non_pass_through_cls.__name__}: {exc.reason}")
-
-    if not transform.forwards_input_fields:
-        pytest.skip(f"{_non_pass_through_cls.__name__} does not declare forwards_input_fields.")
-
     removed = transform.removed_input_fields
     probe_count = 0
     asserted_count = 0
@@ -616,7 +600,7 @@ def test_forwarding_transforms_remove_only_what_they_declare(
 
     if probe_count < _SWEEP_MIN_PROBES:
         pytest.fail(
-            f"{_non_pass_through_cls.__name__}: only {probe_count} probe rows "
+            f"{cls.__name__}: only {probe_count} probe rows "
             f"exercised (expected >= {_SWEEP_MIN_PROBES}). Harness probe generation "
             "is under-powered for this transform."
         )
@@ -626,7 +610,7 @@ def test_forwarding_transforms_remove_only_what_they_declare(
     # verified at all, and the declaration would ship unchecked.
     if asserted_count == 0:
         pytest.fail(
-            f"{_non_pass_through_cls.__name__} declares forwards_input_fields=True but no "
+            f"{cls.__name__} declares forwards_input_fields=True but no "
             f"probe produced a success emission in {probe_count} rows, so the declaration "
             "was never checked. Override backward_invariant_probe_rows() to return a shape "
             "the transform can actually process."
@@ -634,8 +618,40 @@ def test_forwarding_transforms_remove_only_what_they_declare(
 
     if violations:
         pytest.fail(
-            f"{_non_pass_through_cls.__name__} declares forwards_input_fields=True but "
+            f"{cls.__name__} declares forwards_input_fields=True but "
             f"{violations[0]}. Either widen removed_input_fields to name the field, or drop "
             "the forwards_input_fields declaration — the build-time extras firewall rejects "
             "graphs on this claim, so an under-stated removal set predicts fields that never arrive."
         )
+
+
+def test_forwarding_declaration_is_truthful(
+    _non_pass_through_cls: type[BaseTransform],
+) -> None:
+    """Two-direction governance for ``forwards_input_fields``, one test.
+
+    ``forwards_input_fields`` is what a transform declares when it forwards
+    the whole row but cannot claim ``passes_through_input`` — because it
+    consumes a column (line_explode's ``source_field``, json_explode's
+    ``array_field``, field_mapper's rename sources) or because it drops whole
+    ROWS (batch_outlier_annotator). Declarers take the removal truth-test arm;
+    non-declarers take the sentinel forwarding arm.
+
+    One branching test, deliberately NOT a pair of tests that skip each
+    other's half. The declaration is an INSTANCE attribute —
+    ``FieldMapper``'s flips on ``select_only`` — so which direction applies
+    is only knowable after ``probe_config()`` instantiation, and with a
+    skip-partitioned pair nothing machine-checks the partition: a transform
+    falling through BOTH halves would read as a green summary plus two skip
+    lines nobody audits. Here every probeable transform takes exactly one
+    assertion-bearing arm, and falling through is structurally impossible.
+    """
+    try:
+        transform = _probe_instantiate(_non_pass_through_cls)
+    except _UnprobeableTransform as exc:
+        pytest.skip(f"{_non_pass_through_cls.__name__}: {exc.reason}")
+
+    if transform.forwards_input_fields:
+        _assert_declared_removals_are_truthful(_non_pass_through_cls, transform)
+    else:
+        _assert_undeclared_transform_does_not_forward(_non_pass_through_cls, transform)
