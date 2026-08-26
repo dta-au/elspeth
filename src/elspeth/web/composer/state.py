@@ -2201,6 +2201,14 @@ def _node_published_connections(node: NodeSpec) -> frozenset[str]:
     ``on_error`` and gate ``routes`` skip the ``discard``/``fork`` keywords;
     ``fork_to`` branch names are connections. Sinks are terminal and never
     consume, so a sink-named target contributes no node edge.
+
+    Carries NO queue carve-out, and that is a DEPENDENCY rather than an
+    oversight: a queue publishes under its own id and its ``input`` IS that
+    id, so a queue reaching here would produce a self-edge. It cannot,
+    because ``_node_topology_cycle`` — the only caller — skips queues in both
+    its consumer map and its successor map, so this is never called for one.
+    If that skip is ever removed, this function needs the carve-out in the
+    same commit.
     """
     published: set[str] = set()
     if node.node_type == "coalesce" and node.on_success is None:
@@ -2236,6 +2244,18 @@ def _node_topology_cycle(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...] | None:
     """
     consumers_by_connection: dict[str, list[str]] = {}
     for node in nodes:
+        # LOAD-BEARING, not an optimisation. This skip and its twin in the
+        # successor loop below are what let ``_node_published_connections``
+        # ask ``published_success_connection`` without a queue carve-out.
+        #
+        # A queue's ``input`` IS its own id (``queue_node_contract_error``
+        # enforces it) and a queue publishes under that same id. If a queue
+        # entered EITHER map, the id it publishes would resolve straight back
+        # to itself through ``consumers_by_connection`` — a self-edge, and a
+        # spurious cycle reported on every pipeline containing a queue.
+        #
+        # Remove either skip and you must give ``_node_published_connections``
+        # a queue carve-out in the same commit.
         if node.node_type == "queue":
             continue
         inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
@@ -2244,6 +2264,7 @@ def _node_topology_cycle(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...] | None:
                 consumers_by_connection.setdefault(connection, []).append(node.id)
     successors: dict[str, list[str]] = {}
     for node in nodes:
+        # The twin of the skip above — see it for why both are load-bearing.
         if node.node_type == "queue":
             continue
         targets: list[str] = []
