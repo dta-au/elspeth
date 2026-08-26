@@ -158,12 +158,12 @@ lands, which would widen the engine pass beyond Stage-1's CSV scope.
 
 ### Task 6: Gate + docs + close
 
-- [ ] **Step 1**: `docs/agents/recent-code-hints.md` entry (same commit as Task 4 if not already landed — REQUIRED; otherwise here): the two new contract flags, the abstention edges, the headline-pattern coupling, the plugin-hash recomputes.
-- [ ] **Step 2**: `elspeth-lints check --rules all --root src/elspeth` corpus compare (count findings before/after; delta must be explained — expect zero new).
-- [ ] **Step 3**: `wardline scan . --fail-on ERROR --fail-on-inert --trust-pack scripts.wardline_pack --allow-custom-packs --local-only` → exit 0.
-- [ ] **Step 4**: Full `pytest tests/` as a background job; on green, verify no sibling breakage attributable to this change (xdist zero-collection check: the "N passed" line must exist).
-- [ ] **Step 5**: Filigree: `issue_update` root_cause + severity, close `elspeth-e6e552ce34` with `close_commit`; comment the design (two arms + pass + surfaces) and the deliberate non-scope (other pass-through plugins unaudited → follow-up ticket for the flag audit).
-- [ ] **Step 6**: Report to John: fix summary + preview now failing for the repro shape + what remains held for the reconciliation.
+- [x] **Step 1**: `docs/agents/recent-code-hints.md` entries — landed across 50734a515 and b2c446af3. Three, not one: the frozen-corpus provenance trap (a plugin edit moves manifest bytes), the two contract facts plus the presence-vs-value rule and both fake failure modes, and the `input_schema` census trap (`__init_subclass__` moves it to `_declared_input_schema`, so a naive probe measures nothing). The headline-pattern coupling item is void — see Task 5's withdrawal.
+- [x] **Step 2**: Lint corpus compared as SETS, path-normalized, base b825ac4ad vs HEAD — not as counts, which would have hidden it. 3210 → 3211. Every apparent delta is a line-number shift; the one genuine new finding (`generation.py` R6 `except ValueError:`) belongs to the composer arm and was removed by 1493fc69d. This arm adds zero.
+- [x] **Step 3**: `wardline` run — exit 1, NOT 0, and the plan's "→ exit 0" expectation was wrong for this tree. 6 active ERROR, all pre-existing and tracked as elspeth-5a322bd5ca; 129 recognized boundaries so `--fail-on-inert` passed. This arm adds none. (I first mis-attributed one to the composer arm by inferring from `git log -1 -- <file>`; disproved from wardline's own archived scans — the function had moved and re-fingerprinted.)
+- [x] **Step 4**: Full suite in a git WORKTREE, background — an archive export is the WRONG harness here: ~50 tests shell out to `git ls-files`/`check-ignore` and cannot run without `.git`, inflating an export run to 72 failures against a worktree's 18. 18 failed at 237264a28, set-differenced against a worktree at base: 8 pre-existing (elspeth-9c1595f3f1), 10 new, of which exactly 2 were mine (fixed in b2c446af3) and 8 belong to the llm structured-output lane (now elspeth-8d31b9fabc). Final targeted run at b2c446af3: 8631 passed, 1 failed, that one being the llm lane's.
+- [x] **Step 5**: Filigree — `root_cause` set; design, non-scope, and engine-arm verification commented, including a correction to the composer arm's attribution (2 of its 10 "pre-existing" were mine, introduced before its comparison anchor). Follow-ups filed: elspeth-a8b438f534 (audit remaining pass-through plugins), elspeth-98b238bb3c (Stage-1 mirror; ratchet-back for UNMIRRORED_CEILING 13→14), elspeth-8d31b9fabc (unowned llm-lane reds). NOT closed: the ticket is another lane's claim and sits at `verifying` with both arms' evidence recorded.
+- [x] **Step 6**: Reported to John, and to the composer lane directly.
 
 ## Self-Review Notes
 
