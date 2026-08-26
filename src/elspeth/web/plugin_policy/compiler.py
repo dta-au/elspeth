@@ -33,6 +33,7 @@ REQUIRED_WEB_PLUGIN_IDS = frozenset(
         # the surface does not authorize is one the Composer cannot take.
         PluginId("transform", "line_explode"),
         PluginId("transform", "llm"),
+        PluginId("transform", "reference_join"),
         PluginId("transform", "report_assemble"),
         PluginId("transform", "web_scrape"),
     }
