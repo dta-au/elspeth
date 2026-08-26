@@ -47,18 +47,31 @@ names the option to repoint, which is the actionable half.
 KNOWN LIMITS, so nobody reads more assurance into this than it carries:
 
 * Options are discovered from each plugin's own ``probe_config()``, and only
-  ``str`` or ``None`` valued column-naming options are mutated. LIST-valued
-  ones are skipped — ``azure_document_intelligence.query_fields`` matches the
-  ``*_fields`` naming rule but holds Azure-side query names, not row columns,
-  so mutating it would assert a contract that does not exist. ``llm``'s
-  ``image_inputs`` folds ``field``/``format_field`` into
-  ``declared_input_fields`` (a real column-naming surface — see
-  ``LLMConfig.declared_input_fields``) but those names live inside
-  ``list[ImageInputConfig]`` entries, not a top-level scalar option, so the
-  roster excludes ``llm`` via ``_has_a_scalar_naming_option`` rather than
-  failing the anti-vacuity assertion on a plugin this mechanism cannot probe.
-  ``image_inputs[].field`` naming a created field (e.g. ``response_field``) is
-  therefore NOT swept by this gate.
+  options DECLARED as a scalar column name (``str`` or ``str | None``) are
+  mutated. The declared ANNOTATION is the test, not the probe's runtime value:
+  reading the value admitted ``llm.output_fields`` — annotated
+  ``list[OutputFieldConfig] | None`` and merely defaulting to ``None`` — into a
+  sweep that then assigned it a plain string, so the CONTROL arm died on a
+  pydantic list-type error and the whole gate aborted before reaching its real
+  assertion (elspeth-2865a8efb8; landed by 2b452ff8c, which lifted the
+  multi-query ``output_fields`` to the llm transform's config top level). A
+  value-shaped filter cannot tell "no column configured" from "not a column
+  option at all"; the annotation can, so it is what decides.
+  Genuinely list-valued naming surfaces stay out of scope —
+  ``azure_document_intelligence.query_fields`` matches the ``*_fields`` naming
+  rule but holds Azure-side query names, not row columns, so mutating it would
+  assert a contract that does not exist. ``llm``'s ``image_inputs`` folds
+  ``field``/``format_field`` into ``declared_input_fields`` (a real
+  column-naming surface — see ``LLMConfig.declared_input_fields``) but those
+  names live inside ``list[ImageInputConfig]`` entries, not a top-level scalar
+  option, so ``llm`` exposes NO scalar naming option and leaves the roster via
+  ``_has_a_scalar_naming_option``. ``image_inputs[].field`` naming a created
+  field (e.g. ``response_field``) is therefore NOT swept by this gate — tracked
+  debt, not a silent gap, and pinned below by
+  ``test_llm_is_unswept_because_it_has_no_scalar_naming_option``, which DERIVES
+  llm's absence from the same machinery the roster uses rather than declaring
+  it. The day llm gains a scalar naming option, that test fails and llm rejoins
+  the roster on its own.
 * Mutating a ``None``-valued option can collide with an interlock rather than
   with the created-field rule — ``aws_textract_document_analysis`` makes
   ``bucket`` and ``bucket_field`` mutually exclusive, and a future option in
@@ -70,7 +83,8 @@ KNOWN LIMITS, so nobody reads more assurance into this than it carries:
 from __future__ import annotations
 
 import copy
-from typing import Any
+from types import UnionType
+from typing import Any, Union, get_args, get_origin
 
 import pytest
 
@@ -141,6 +155,37 @@ def _has_a_scalar_naming_option(cls: type[BaseTransform]) -> bool:
     return bool(_input_naming_options(cls, probe))
 
 
+def _declares_a_scalar_column_name(annotation: Any) -> bool:
+    """Whether a config field is DECLARED to hold one column name: ``str`` or ``str | None``.
+
+    The mutation below assigns a plain string, so an option this returns False
+    for cannot be exercised by this gate at all — assigning a string to a
+    list-annotated field fails in pydantic before any plugin guard is reached,
+    which is a fact about the mutation mechanism and not about the plugin.
+
+    ANNOTATION, never the probe's runtime value. The two disagree on exactly the
+    shape that broke this gate: ``llm.output_fields`` is
+    ``list[OutputFieldConfig] | None`` and its probe value is ``None``, so a
+    value-shaped filter (``value is None or isinstance(value, str)``) admitted
+    it as if it were an unset column option (elspeth-2865a8efb8). "No column
+    configured" and "not a column option at all" are indistinguishable in the
+    value and unambiguous in the type.
+
+    ``str | None`` is admitted because an unset scalar option is still a scalar
+    option — ``aws_textract_document_analysis.version_field`` is exactly that,
+    and dropping it would silently narrow the sweep.
+    """
+    if annotation is str:
+        return True
+    if get_origin(annotation) is not UnionType and get_origin(annotation) is not Union:
+        return False
+    # A union qualifies only if it is str-plus-None. Any other member means the
+    # field can legitimately hold a non-string, so a string mutation is not a
+    # test of the plugin's contract.
+    members = set(get_args(annotation))
+    return str in members and members <= {str, type(None)}
+
+
 def _input_naming_options(cls: type[BaseTransform], probe: BaseTransform) -> dict[str, str | None]:
     """Column-naming config options this plugin READS, with their probe values.
 
@@ -157,14 +202,14 @@ def _input_naming_options(cls: type[BaseTransform], probe: BaseTransform) -> dic
     field_values = dict(validated)
 
     options: dict[str, str | None] = {}
-    for name in type(validated).model_fields:
+    for name, field in type(validated).model_fields.items():
         if name in _GENERIC_DECLARATION_OPTIONS or name in cls.output_naming_config_keys:
             continue
         if not is_column_naming_config_option(name):
             continue
-        value = field_values[name]
-        if value is None or isinstance(value, str):
-            options[name] = value
+        if not _declares_a_scalar_column_name(field.annotation):
+            continue
+        options[name] = field_values[name]
     return options
 
 
@@ -250,6 +295,53 @@ class TestInputOptionsDoNotNameCreatedFields:
         assert set(options) == {"url_field"}
         assert options["url_field"] not in probe.self_created_input_fields
         assert sorted(probe.self_created_input_fields)[0] in probe.declared_output_fields
+
+    def test_llm_is_unswept_because_it_has_no_scalar_naming_option(self) -> None:
+        """``llm``'s absence from the roster is DERIVED, never declared.
+
+        ``llm`` really does declare arriving columns — ``LLMConfig.declared_input_fields``
+        folds in every ``image_inputs[].field`` / ``format_field`` — but they
+        live inside ``list[ImageInputConfig]`` entries, and this gate's mutation
+        assigns a top-level string. So llm is genuinely unswept, and that gap is
+        tracked debt (see KNOWN LIMITS), not something this file may quietly
+        launder into looking like coverage.
+
+        The failure mode this test exists to prevent is a STALE EXEMPTION. A test
+        asserting "llm is exempt" would pin EXISTENCE, not TRUTH: it would keep
+        passing on the day llm gains a top-level scalar naming option, which is
+        exactly the day the sweep needed to pick llm back up. So the assertion
+        COMPUTES llm's option set from the same ``_input_naming_options`` the
+        roster uses, and requires it to be empty. Give llm a ``str`` naming
+        option and this fails, pointing at the roster it must now join —
+        the same derive-don't-restate discipline the file's own docstring
+        demands of the plugins it sweeps.
+
+        Both halves are asserted, because they can come apart and the pair is
+        what makes the exemption honest: llm is in scope by the arriving-column
+        predicate, and out of scope only by the scalar-option one.
+        """
+        llm_classes = [cls for cls in _registered_transform_classes() if cls.name == "llm"]
+        assert len(llm_classes) == 1, f"expected exactly one registered 'llm' transform, got {len(llm_classes)}"
+        llm_cls = llm_classes[0]
+
+        assert _declares_an_arriving_column(llm_cls), (
+            "llm no longer declares an arriving column, so the exemption below is describing a plugin "
+            "that has left this gate's scope entirely — re-read LLMConfig.declared_input_fields."
+        )
+
+        probe = llm_cls(llm_cls.probe_config())
+        try:
+            options = _input_naming_options(llm_cls, probe)
+        finally:
+            probe.close()
+
+        assert options == {}, (
+            f"llm now exposes scalar column-naming option(s) {sorted(options)}, so it is no longer outside "
+            f"this gate's mutation mechanism and must be swept like every other plugin. Delete this test's "
+            f"exemption and confirm llm passes the sweep above for the right reason — it will now be in the "
+            f"roster automatically via _has_a_scalar_naming_option."
+        )
+        assert not _has_a_scalar_naming_option(llm_cls), "roster predicate and option discovery disagree about llm"
 
     def test_the_rejection_reaches_the_composer_as_a_config_error(self) -> None:
         """A draft pipeline must get a validation error, not a crashed validate().
