@@ -151,14 +151,23 @@ class TestExtrasFirewallDirection:
 
     THESE TESTS PIN THE KNOWN-AND-DOCUMENTED DIRECTION, NOT DESIRED BEHAVIOUR.
     They exist so the divergence stays one-way — DAG-accept with
-    composer-reject, never the reverse — until elspeth-9c5ff8fa7d gates the
-    walk on the firewall. When that lands,
-    ``test_declared_input_behind_the_firewall_is_accepted`` MUST FLIP to expect
-    ``GraphValidationError``: an unchanged green there after a gated walk means
-    the gate missed this path. ``test_declared_optional_field_still_arrives``
-    is the opposite pin and must stay green through that change — it is the
-    shape a careless gate would break. The composer half lives in
+    composer-reject, never the reverse. The composer half lives in
     ``tests/unit/web/composer/test_state.py::TestExtrasFirewallDirection``.
+
+    SUPERSEDED INSTRUCTION: this docstring previously told a future fixer that
+    ``test_declared_input_behind_the_firewall_is_accepted`` MUST FLIP to expect
+    ``GraphValidationError`` once elspeth-9c5ff8fa7d gated the walk, and that
+    an unchanged green there meant the gate had missed the path. The completeness
+    fix landed WITHOUT gating the field set, so that instruction no longer
+    holds and the test correctly stays green. Closedness rides BESIDE
+    ``vote.fields`` as ``EffectiveGuaranteeVote.closed`` rather than narrowing
+    it, precisely because narrowing would re-tighten the INTERSECTION consumers
+    (``validate_transform_output_field_collisions``, the coalesce branch
+    builder), which are already sound against a lower bound and were never part
+    of the defect. The union pinned below therefore survives, still
+    over-promising and still — against set difference — able only to shrink
+    ``missing``. ``test_declared_optional_field_still_arrives`` remains the
+    opposite pin.
     """
 
     def _firewall_graph(self, llm_fields: list[str] | None = None) -> ExecutionGraph:
