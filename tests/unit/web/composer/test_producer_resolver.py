@@ -473,8 +473,8 @@ class TestRuntimeConnectionTargetsRestatement:
     """
 
     @staticmethod
-    def _self_publishing_membership_test() -> ast.Compare:
-        """Return the single ``node.node_type in (...)`` test in the function.
+    def _self_publishing_membership_test() -> ast.Tuple | ast.Set | ast.List:
+        """Return the literal enumerated by the single ``node.node_type in (...)`` test.
 
         Located by STRUCTURE, never by line number: the enclosing
         ``FunctionDef`` by name, then the ``ast.Compare`` whose operator is
@@ -506,15 +506,17 @@ class TestRuntimeConnectionTargetsRestatement:
             f"self-publisher set was removed or duplicated, this guard is no longer watching it — "
             f"re-anchor it, do not delete it."
         )
-        return candidates[0]
-
-    def test_the_hand_written_twin_equals_the_helper_minus_queue(self):
-        compare = self._self_publishing_membership_test()
-        comparator = compare.comparators[0]
+        comparator = candidates[0].comparators[0]
+        # Hoisted here so BOTH tests below get this written message rather than
+        # one of them getting a bare AttributeError off `.elts`.
         assert isinstance(comparator, ast.Tuple | ast.Set | ast.List), (
             "Expected an inline literal of node-type names at the restatement site, got "
             f"{type(comparator).__name__}. A guard can only pin a literal it can read."
         )
+        return comparator
+
+    def test_the_hand_written_twin_equals_the_helper_minus_queue(self):
+        comparator = self._self_publishing_membership_test()
         enumerated = set()
         for element in comparator.elts:
             assert isinstance(element, ast.Constant) and isinstance(element.value, str), (
@@ -541,8 +543,8 @@ class TestRuntimeConnectionTargetsRestatement:
             "A queue publishes under its own id — if it left the helper, `published_success_connection` "
             "no longer describes the DAG builder's producer registration."
         )
-        compare = self._self_publishing_membership_test()
-        enumerated = {element.value for element in compare.comparators[0].elts if isinstance(element, ast.Constant)}
+        comparator = self._self_publishing_membership_test()
+        enumerated = {element.value for element in comparator.elts if isinstance(element, ast.Constant)}
         assert "queue" not in enumerated, (
             "`queue` was added to `_runtime_connection_targets`'s literal. A queue's `input` IS its own id, "
             "so a queue's id in the reachable TARGET set lets an orphan queue satisfy its own input — "
