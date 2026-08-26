@@ -431,6 +431,21 @@ class SchemaConfig:
     Schema Contracts (for DAG validation):
         - guaranteed_fields: Fields the producer GUARANTEES will exist AND are
           part of the stable API contract. Downstream can safely depend on these.
+
+          This is a COMPLETE claim, not a partial hint, and that is the one
+          surprising thing about it. Declaring any guarantee makes the producer
+          PARTICIPATE in the effective-guarantee vote, and build-time validation
+          then holds it to exactly the set it named — so ADDING a guarantee can
+          narrow what validation accepts. An observed source that lists
+          `guaranteed_fields: [id]` while its rows also carry `colour` will be
+          REJECTED at build time by a sink requiring `colour`, even though the
+          same pipeline builds and runs with the line removed.
+
+          Declaring NOTHING is therefore a meaningful choice, not an omission:
+          a producer with no `guaranteed_fields` ABSTAINS, and sink requirements
+          are enforced per row at runtime instead. Declare the complete set to
+          get build-time enforcement; declare nothing to defer to runtime. A
+          partial declaration is the one option that buys neither.
         - required_fields: Fields the consumer REQUIRES in input.
         - audit_fields: Fields that exist in output but are NOT part of the
           stability contract. These are for audit trail reconstruction and may

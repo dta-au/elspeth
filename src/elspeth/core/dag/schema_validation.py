@@ -1203,15 +1203,43 @@ def _sink_required_violation_message(sink_plugin_name: str, predecessor_id: str,
     Shared by the dedicated sweep and the per-edge combined report so a graph
     tripping BOTH rules states the sink half in exactly the words a graph
     tripping only the sink rule would use.
+
+    The verdict states the CONTRACT, not only the symptom. ``guaranteed_fields``
+    is a COMPLETE claim: a producer that declares any guarantee participates in
+    the vote and is held to exactly the set it named, so ADDING a guarantee can
+    narrow what build-time validation accepts (elspeth-e1f8a84c8b: three
+    strictly-additive lines turn a green pipeline into a build-time reject).
+    That is the ratified semantic — ``TestSinkRequiredFieldsAbstention`` pins
+    the abstain/participate pair deliberately (elspeth-3283f2eaec) — but it is
+    surprising enough that an author meets it only by hitting it, so the message
+    is where it gets said.
+
+    Route 2 is the one no author guesses, because "delete the declaration you
+    just added" is counter-intuitive: a producer declaring NOTHING abstains, and
+    ``SinkExecutor`` enforces the sink's requirement per row instead. Any edit
+    here owes the enumeration all three routes — dropping one leaves an author
+    with a rule they cannot discharge. The route COUNT is pinned by
+    ``tests/unit/core/dag/test_sink_required_message_discharges.py`` rather than
+    the wording, so rephrasing is free and silently losing a route is not.
     """
     return (
         f"Sink '{sink_plugin_name}' requires fields {sorted(missing)} "
         f"but its upstream '{predecessor_id}' does not guarantee them. "
         f"Likely causes: a coalesce union marked these fields optional "
         f"(branch-exclusive or AND-downgraded), or an upstream transform "
-        f"did not declare them as guaranteed output. "
-        f"Fix: ensure the upstream node guarantees these fields, "
-        f"or remove them from the sink's declared_required_fields."
+        f"did not declare them as guaranteed output.\n"
+        f"\n"
+        f"Contract: 'guaranteed_fields' is a COMPLETE claim, not a partial hint. "
+        f"A producer that declares any guarantee is held to exactly that set at "
+        f"build time, so ADDING a guarantee can narrow what validation accepts.\n"
+        f"\n"
+        f"Fix, any one of:\n"
+        f"  1. Complete the upstream declaration so it guarantees "
+        f"{sorted(missing)} as well.\n"
+        f"  2. Remove 'guaranteed_fields' from the upstream entirely — a producer "
+        f"that declares nothing ABSTAINS, and the sink's requirement is enforced "
+        f"per row at runtime instead of at build time.\n"
+        f"  3. Remove {sorted(missing)} from the sink's declared_required_fields."
     )
 
 
