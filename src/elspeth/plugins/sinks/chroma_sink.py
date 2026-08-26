@@ -142,6 +142,20 @@ class ChromaSinkConfig(DataPluginConfig):
         For fixed/flexible schemas, validates that referenced fields exist and
         have compatible types. For observed schemas, fields are unknown at config
         time so validation defers to runtime.
+
+        The fixed/flexible scope is a CLOSED ADJUDICATION, not an oversight:
+        ``elspeth-a7345c7262`` (closed 2026-04-10) specifies it in those words.
+        Do not narrow it to ``fixed`` without a ruling, and note when asking
+        that the house rule for the identical question on the transform side
+        went the other way FOUR MONTHS LATER —
+        ``BaseTransform._reject_unknown_config_named_columns``
+        (``plugins/infrastructure/base.py``, ``elspeth-d3958d90f5``,
+        2026-08-06) gates on ``mode != "fixed"`` because "Flexible schemas
+        admit the column as an extra ... odd configs, not incoherent ones".
+        Under ``flexible`` the runtime does admit the undeclared column, so
+        this rejects a config that would run. Tracked rather than fixed here:
+        the two rules disagree on purpose-built reasoning and reconciling them
+        is a ruling, not a lint.
         """
         if self.schema_config.is_observed:
             return self
@@ -279,7 +293,23 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
             allow_coercion=False,
         )
         self.input_schema = self._schema_class
-        self.declared_required_fields = self._config.schema_config.get_effective_required_fields()
+        # The two fields this sink READS FROM are requirements, exactly as
+        # text_sink/document_sink treat their ``field:``. ``_extract_effect_member``
+        # raises on a row missing either, so a pipeline whose upstream cannot
+        # guarantee them fails per row at write time — after the run has already
+        # started, with rows already committed to other sinks. Declaring them
+        # here moves that to graph-build time, where
+        # ``validate_sink_required_fields`` compares the set against upstream
+        # guarantees, and the composer picks it up with no change of its own
+        # (it reads this same attribute off the constructed sink).
+        #
+        # ``metadata_fields`` are deliberately NOT included: the extractor skips
+        # an absent one (``if field_name not in row: continue``), so requiring
+        # them would reject pipelines the runtime accepts.
+        self.declared_required_fields = self._config.schema_config.get_effective_required_fields() | {
+            self._config.field_mapping.id_field,
+            self._config.field_mapping.document_field,
+        }
 
         self._client: chromadb.api.ClientAPI | None = None
         self._collection: chromadb.Collection | None = None
