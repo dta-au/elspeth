@@ -1018,6 +1018,11 @@ class _FakeRuntimeBundle:
     transforms: tuple[Any, ...] = ()
     sinks: dict[str, Any] = field(default_factory=lambda: {"primary": _FakeSinkPlugin()})
     aggregations: dict[str, Any] = field(default_factory=dict)
+    # _audit_safe_plugin_configs (the compiled-id identity swap,
+    # elspeth-ba01834a57) walks every bundle component family, so the fake
+    # must model the full PluginBundle contract or a profiled snapshot fails
+    # the build with AttributeError instead of exercising the swap.
+    collectors: dict[str, Any] = field(default_factory=dict)
 
 
 def _fake_settings() -> _FakeSettings:
@@ -1189,12 +1194,23 @@ def test_canonical_web_validation_lowers_profiled_s3_source_before_runtime_const
 
     assert result.is_valid is True
     assert all(check.passed for check in result.checks)
-    assert len(yaml_generator.rendered_states) == 1
+    # Two renders since elspeth-ba01834a57: the runtime YAML from the LOWERED
+    # state (private bucket binding), then the compiled-id identity YAML from
+    # the AUTHORED state (profile alias only — the private binding must never
+    # feed node identity, matching the run path's audit-safe swap).
+    assert len(yaml_generator.rendered_states) == 2
     rendered_options = yaml_generator.rendered_states[0].sources["source"].options
     assert rendered_options == {
         "bucket": "operator-private-bucket-marker",
         "key": "incoming/records/input.csv",
         "region_name": "ap-southeast-1",
+        "format": "csv",
+        "schema": {"mode": "observed"},
+    }
+    identity_options = yaml_generator.rendered_states[1].sources["source"].options
+    assert dict(identity_options) == {
+        "profile": "demo-input",
+        "key": "records/input.csv",
         "format": "csv",
         "schema": {"mode": "observed"},
     }
