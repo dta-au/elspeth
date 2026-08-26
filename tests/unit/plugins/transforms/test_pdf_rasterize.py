@@ -333,8 +333,16 @@ def test_input_validation_precedes_rendering(store: FilesystemPayloadStore) -> N
     assert absent.reason["reason"] == "blob_not_found"
     not_pdf = transform.process(make_pipeline_row({"blob_ref": store.store(PNG)}), make_context())
     assert not_pdf.reason["reason"] == "invalid_input" and not_pdf.reason["error_type"] == "document_signature_mismatch"
-    with pytest.raises(TypeError):
-        transform.process(make_pipeline_row({"blob_ref": 12}), make_context())  # Tier-2 type violation: crash (blob_csv_expand precedent)
+    # Tier-2 type violation ROUTES (elspeth-5887fb7928). It used to crash,
+    # citing a blob_csv_expand precedent that was itself the copied convention
+    # this ticket removed; llm/image_inputs.py had the correct disposition all
+    # along and supplies the `non_string_ref` vocabulary used here.
+    wrong_type = transform.process(make_pipeline_row({"blob_ref": 12}), make_context())
+    assert wrong_type.status == "error"
+    assert wrong_type.retryable is False
+    assert wrong_type.reason["reason"] == "invalid_input"
+    assert wrong_type.reason["error_type"] == "non_string_ref"
+    assert "got int" in wrong_type.reason["error"]
     assert renderer.calls == []
 
 

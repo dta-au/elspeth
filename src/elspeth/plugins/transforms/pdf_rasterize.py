@@ -513,9 +513,18 @@ class PDFRasterize(BaseTransform):
             return TransformResult.error({"reason": "missing_field", "field": field_name}, retryable=False)
         blob_ref = row[field_name]
         if type(blob_ref) is not str:
-            raise TypeError(
-                f"Field '{field_name}' must be a string payload-store hash, got {type(blob_ref).__name__}. "
-                "This indicates an upstream validation bug."
+            # Routed, not raised — see blob_csv_expand for the full note. The
+            # missing-field check directly ABOVE and the malformed-hash check
+            # directly BELOW both already take this exit; the type check was
+            # the lone crash between two routable siblings.
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "field": field_name,
+                    "error_type": "non_string_ref",
+                    "error": f"must be a string payload-store hash, got {type(blob_ref).__name__}",
+                },
+                retryable=False,
             )
         if _PAYLOAD_REF_PATTERN.fullmatch(blob_ref) is None:
             return TransformResult.error(
