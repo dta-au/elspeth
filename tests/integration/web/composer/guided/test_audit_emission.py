@@ -84,7 +84,7 @@ def _extract_guided_invocations(client: TestClient, session_id: str) -> dict[str
     """Return a mapping of guided-mode tool_name → list of parsed argument payloads.
 
     Filters to the four guided-mode discriminators from spec §9.1.  Other tool
-    names (``set_source``, ``set_output``, ``apply_pipeline_recipe``, etc.) are
+    names (``set_source``, ``set_output``, ``set_pipeline``, etc.) are
     excluded so callers only see guided-protocol events.
 
     Returns:

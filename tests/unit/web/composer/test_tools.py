@@ -486,137 +486,6 @@ def test_direct_upsert_cannot_name_hidden_registered_plugin() -> None:
     assert result.updated_state.version == 1
 
 
-def test_apply_pipeline_recipe_reports_unavailable_profile_alias() -> None:
-    catalog = _mock_catalog()
-    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    llm_id = PluginId("transform", "llm")
-    snapshot = PluginAvailabilitySnapshot.create(
-        policy_hash="recipe-profile-policy",
-        principal_scope="local:test-user",
-        available=unrestricted.available,
-        unavailable=(),
-        selected=unrestricted.selected,
-        usable_profile_aliases=((llm_id, ("tutorial",)),),
-        selected_profile_aliases=((llm_id, "tutorial"),),
-        binding_generation_fingerprint="recipe-profile-generation",
-    )
-    policy_catalog = PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry))
-
-    result = execute_tool(
-        "apply_pipeline_recipe",
-        {
-            "recipe_name": "classify-rows-llm-jsonl",
-            "slots": {
-                "source_blob_id": str(uuid4()),
-                "classifier_template": "Classify this row",
-                "profile": "missing-profile",
-            },
-        },
-        _empty_state(),
-        policy_catalog,
-        plugin_snapshot=snapshot,
-    )
-
-    assert result.success is False
-    assert result.data["error_code"] == "profile_unavailable"
-    assert result.updated_state.version == 1
-
-
-def test_apply_pipeline_recipe_reports_profile_unavailable_when_required_profile_is_omitted() -> None:
-    catalog = _mock_catalog()
-    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    snapshot = PluginAvailabilitySnapshot.create(
-        policy_hash="recipe-no-profile-policy",
-        principal_scope="local:test-user",
-        available=unrestricted.available,
-        unavailable=(),
-        selected=unrestricted.selected,
-        usable_profile_aliases=(),
-        selected_profile_aliases=(),
-        binding_generation_fingerprint="recipe-no-profile-generation",
-    )
-    policy_catalog = PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry))
-
-    result = execute_tool(
-        "apply_pipeline_recipe",
-        {
-            "recipe_name": "classify-rows-llm-jsonl",
-            "slots": {
-                "source_blob_id": str(uuid4()),
-                "classifier_template": "Classify this row",
-            },
-        },
-        _empty_state(),
-        policy_catalog,
-        plugin_snapshot=snapshot,
-    )
-
-    assert result.success is False
-    assert result.data["error_code"] == "profile_unavailable"
-    assert result.updated_state.version == 1
-
-
-def test_rejected_mutation_validation_preserves_rejection_and_profile_code() -> None:
-    catalog = _mock_catalog()
-    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    snapshot = PluginAvailabilitySnapshot.create(
-        policy_hash="recipe-rejection-policy",
-        principal_scope="web:test-user",
-        available=unrestricted.available,
-        unavailable=(),
-        selected=unrestricted.selected,
-        usable_profile_aliases=(),
-        selected_profile_aliases=(),
-        binding_generation_fingerprint="recipe-rejection-generation",
-    )
-    policy_catalog = PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry))
-
-    result = execute_tool(
-        "apply_pipeline_recipe",
-        {
-            "recipe_name": "classify-rows-llm-jsonl",
-            "slots": {
-                "source_blob_id": str(uuid4()),
-                "classifier_template": "Classify this row",
-            },
-        },
-        _empty_state(),
-        policy_catalog,
-        plugin_snapshot=snapshot,
-    )
-
-    assert not result.success
-    first = result.validation.errors[0]
-    assert first.component == "rejected_mutation"
-    assert first.error_code == "profile_unavailable"
-    assert result.data["error_code"] == first.error_code
-
-
-def test_apply_pipeline_recipe_preserves_disabled_llm_plugin_reason() -> None:
-    catalog = _mock_catalog()
-    llm_id = PluginId("transform", "llm")
-    policy_catalog, snapshot = _restricted_policy_pair(catalog, llm_id)
-
-    result = execute_tool(
-        "apply_pipeline_recipe",
-        {
-            "recipe_name": "classify-rows-llm-jsonl",
-            "slots": {
-                "source_blob_id": str(uuid4()),
-                "classifier_template": "Classify this row",
-                "profile": "missing-profile",
-            },
-        },
-        _empty_state(),
-        policy_catalog,
-        plugin_snapshot=snapshot,
-    )
-
-    assert result.success is False
-    assert result.data["error_code"] == "plugin_not_enabled"
-    assert result.updated_state.version == 1
-
-
 @pytest.mark.parametrize(
     ("tool_name", "arguments", "plugin_id"),
     [
@@ -964,6 +833,34 @@ class TestFailureResult:
         result = _failure_result(state, "rejection text")
         assert result.data["error"] == result.validation.errors[0].message
 
+    def test_data_error_code_mirrors_leading_validation_error_code(self) -> None:
+        """data.error_code and validation.errors[0].error_code must match.
+
+        Same two-channel contract as the message twin above, for the coded
+        channel. One ``error_code`` parameter currently fans into both
+        writes, so this reads as near-tautological today; it exists to fail
+        loudly if a refactor ever splits them, because no server code reads
+        ``data["error_code"]`` — only the serialized envelope's readers (the
+        planner LLM on the freeform/MCP surfaces, and the frontend) would
+        see the disagreement, and they would see two conflicting codes in
+        one payload with nothing to arbitrate.
+
+        Pinned at the constructor, not through a tool. The predecessor test
+        vehicled this through ``apply_pipeline_recipe`` and died with it
+        (e7a85bf8e) even though ``_plugin_policy_failure`` still emits the
+        same shape from five surviving tools.
+        """
+        state = _empty_state()
+        result = _failure_result(state, "rejection text", error_code="profile_unavailable")
+        assert result.data["error_code"] == result.validation.errors[0].error_code
+
+    def test_absent_error_code_is_absent_on_both_channels(self) -> None:
+        """Neither channel invents a code when the caller supplies none."""
+        state = _empty_state()
+        result = _failure_result(state, "rejection text")
+        assert "error_code" not in result.data
+        assert result.validation.errors[0].error_code is None
+
     def test_preserves_warnings_and_semantic_contracts(self) -> None:
         """Non-error fields on the input ValidationSummary survive prepending."""
         # state.validate() on an empty state yields no warnings/suggestions,
@@ -1138,22 +1035,6 @@ class TestAwsS3EndpointUrlComposerPolicy:
 
         _assert_aws_s3_endpoint_url_rejected(result, state)
 
-    def test_aws_s3_apply_pipeline_recipe_delegation_rejects_endpoint_url_without_mutating_state(self) -> None:
-        state = _empty_state()
-        args = _valid_pipeline_args()
-        args["source"]["plugin"] = "aws_s3"
-        args["source"]["options"] = {"endpoint_url": _AWS_S3_ENDPOINT_SENTINEL}
-
-        with patch("elspeth.web.composer.tools.sessions.apply_recipe", return_value=args):
-            result = execute_tool(
-                "apply_pipeline_recipe",
-                {"recipe_name": "aws_s3_policy_fixture", "slots": {}},
-                state,
-                _mock_catalog(),
-            )
-
-        _assert_aws_s3_endpoint_url_rejected(result, state)
-
     def test_aws_s3_set_source_from_blob_rejects_raw_endpoint_url_before_lookup(self) -> None:
         state = _empty_state()
 
@@ -1268,6 +1149,13 @@ class TestAwsS3SourceComposerPolicy:
         assert result.data is not None
         assert "operator profile" in result.data["error"]
         assert result.data["error_code"] == "profile_unavailable"
+        # The ENTRY-level code, not just the envelope. This is the field the
+        # planner actually reads: _rejection_entries ->
+        # _allowlisted_candidate_feedback -> rejection_codes. Envelope
+        # error_code has no server consumer at all, so a suite that pins only
+        # data["error_code"] leaves the planner-facing contract unpinned.
+        assert result.validation.errors[0].component == "rejected_mutation"
+        assert result.validation.errors[0].error_code == "profile_unavailable"
 
     def test_set_source_allows_aws_s3_for_trained_operator_session(self) -> None:
         """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""

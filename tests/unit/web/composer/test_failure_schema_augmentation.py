@@ -2,7 +2,7 @@
 
 When a mutation tool (``set_pipeline``, ``upsert_node``, ``set_source``,
 ``set_output``, ``patch_*_options``, ``set_source_from_blob``,
-``apply_pipeline_recipe``) returns ``success=False`` with at least one
+``set_pipeline``) returns ``success=False`` with at least one
 ``Invalid options for <kind> '<plugin>'`` validation error, the response
 must embed the full ``get_plugin_schema`` payload for every named plugin
 under a top-level ``plugin_schemas`` field. Eliminates the second LLM

@@ -39,7 +39,6 @@ _TYPE_DRIVEN_TOOL_RESULT_TOOLS = (
     "update_blob",
     "set_source_from_blob",
     "set_pipeline",
-    "apply_pipeline_recipe",
     "patch_source_options",
     "patch_node_options",
     "patch_output_options",

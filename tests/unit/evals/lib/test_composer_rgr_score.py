@@ -1047,7 +1047,7 @@ class TestDiscoverBeforeMutation:
 
     def test_mutation_recognises_full_mutating_set(self) -> None:
         # Any of the mutating tool names triggers the check.
-        for mutating in ("set_source", "upsert_node", "set_output", "set_source_from_blob", "apply_pipeline_recipe", "patch_node_options"):
+        for mutating in ("set_source", "upsert_node", "set_output", "set_source_from_blob", "patch_node_options"):
             messages = [
                 _assistant_with_calls(_tool_call("c1", mutating)),
                 _tool_row("c1", success=True),

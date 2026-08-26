@@ -224,14 +224,6 @@ repos:
         files: ^(src/elspeth/.*\.py|scripts/check_contracts\.py|config/cicd/contracts-whitelist\.yaml|tests/unit/core/test_config_alignment\.py)$
         pass_filenames: false
 
-      - id: check-slot-type-cross-language
-        name: SlotType / guided.ts mirror consistency check
-        entry: .venv/bin/python scripts/cicd/check_slot_type_cross_language.py
-        language: system
-        pass_filenames: false
-        # Run when either the Python Literal definition or its TypeScript mirror changes.
-        files: ^(src/elspeth/web/composer/recipes\.py|src/elspeth/web/frontend/src/types/guided\.ts)$
-
       # Composer skill tool-inventory generator drift gate.
       # The Foundation-knowledge bullets in pipeline_composer.md are derived
       # from _REGISTERED_TOOLS + the two named carve-outs. Adding a new tool

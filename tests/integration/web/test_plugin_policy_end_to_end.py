@@ -31,12 +31,9 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginKind, PluginPolicyResponse, PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.prompts import build_catalog_context_string, build_context_string
-from elspeth.web.composer.recipes import get_recipe
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.composer.tools.generation import _execute_get_plugin_assistance, _handle_get_plugin_schema
-from elspeth.web.composer.tools.recipes import _execute_list_recipes
-from elspeth.web.composer.tools.sessions import _execute_apply_pipeline_recipe
 from elspeth.web.composer.tools.sources import _handle_list_sources
 from elspeth.web.composer.tools.transforms import _handle_list_sinks, _handle_list_transforms, _handle_upsert_node
 from elspeth.web.composer.yaml_generator import generate_public_yaml
@@ -355,7 +352,7 @@ def _capability_contract(view: PolicyCatalogView) -> dict[str, tuple[str, ...]]:
     return {capability.value: tuple(map(str, plugin_ids)) for capability, plugin_ids in view.capability_groups().items()}
 
 
-def _seed_recipe_blob(tmp_path: Path) -> tuple[sa.engine.Engine, str, str]:
+def _seed_session_blob(tmp_path: Path) -> tuple[sa.engine.Engine, str, str]:
     engine = create_session_engine(
         "sqlite:///:memory:",
         poolclass=StaticPool,
@@ -409,7 +406,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     expected_selected = _selected_contract(case)
     expected_capabilities = _capability_contract(view)
     empty_state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
-    engine, session_id, blob_id = _seed_recipe_blob(tmp_path)
+    engine, session_id, _blob_id = _seed_session_blob(tmp_path)
     context = ToolContext(catalog=view, plugin_snapshot=snapshot, session_engine=engine, session_id=session_id)
 
     catalog_api, policy_wire = asyncio.run(_catalog_http_surfaces(snapshot=snapshot, policy=policy, profiles=profiles))
@@ -425,7 +422,6 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     freeform_policy = json.loads(prompt.partition("\n")[2])["plugin_policy"]
     freeform_prompt = frozenset(freeform_policy["available_ids"])
     evidence = _build_web_plugin_policy_evidence(snapshot=snapshot, policy=policy)
-    recipe_result = _execute_list_recipes({}, empty_state, context)
     fixture_case = _MATRIX_CASES_BY_NAME[case.name]
     fixture_projection = {
         "principal_scope": fixture_case["principal_scope"],
@@ -496,31 +492,6 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
             )
             assert schema_result.data["error_code"] == expected_code
             assert assistance_result.data["error_code"] == expected_code
-
-    assert recipe_result.success is True
-    assert "web-scrape-llm-rate-jsonl" in {recipe["name"] for recipe in recipe_result.data["recipes"]}
-    for recipe_info in recipe_result.data["recipes"]:
-        recipe = get_recipe(recipe_info["name"])
-        assert recipe is not None
-        assert recipe.required_plugins <= snapshot.available
-        assert all(not alternatives.isdisjoint(snapshot.available) for alternatives in recipe.alternative_plugin_groups)
-
-    recipe_fast_path = _execute_apply_pipeline_recipe(
-        {
-            "recipe_name": "web-scrape-llm-rate-jsonl",
-            "slots": {
-                "source_blob_id": blob_id,
-                "source_plugin": "json",
-                "profile": "tutorial",
-                "abuse_contact": "matrix@example.invalid",
-                "scraping_reason": "five-configuration policy matrix",
-            },
-        },
-        empty_state,
-        context,
-    )
-    assert recipe_fast_path.success is True
-    assert [node.plugin for node in recipe_fast_path.updated_state.nodes] == ["web_scrape", "llm", "field_mapper"]
 
     for plugin_id in _ALL_CONTROLS:
         probe = _control_probe_state(plugin_id)

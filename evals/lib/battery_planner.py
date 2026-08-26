@@ -60,7 +60,6 @@ LOOP_TOOL_TO_INFO: dict[str, str] = {
     "list_transforms": IC.CATALOG_SELECTION.value,
     "list_sinks": IC.CATALOG_SELECTION.value,
     "get_pipeline_state": IC.PIPELINE_CURRENT.value,
-    "list_recipes": IC.RECIPE_INDEX.value,
     "get_audit_info": IC.AUDIT_INFO.value,
 }
 # Planner-code triage (spec §7), keyed by live ComposerPlannerCode values; ``repeated_fingerprint`` is an attempt flag, not a code.

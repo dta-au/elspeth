@@ -10,7 +10,6 @@ Decomposed package. Plane modules:
 - ``transforms`` — node, edge, metadata graph-mutation handlers, plus sink
   discovery (sinks are terminal transforms; no separate plane).
 - ``outputs`` — output (sink-instance) mutation handlers.
-- ``recipes`` — pipeline-recipe discovery and application handlers.
 - ``secrets`` — secret-reference discovery, validation, and wiring handlers.
 - ``sessions`` — pipeline-state and interpretation-review handlers.
 - ``generation`` — preview, diff, explain, plugin schema, proof diagnostics.
@@ -110,7 +109,6 @@ from elspeth.web.composer.tools.sessions import (
     SetPipelineCandidate,
     _check_interpretation_rate_limits,
     _detect_unresolved_interpretation_placeholders_typed,
-    _execute_apply_pipeline_recipe,
     _execute_set_pipeline,
     _handle_request_interpretation_review,
     _utc_day_start,
@@ -120,8 +118,6 @@ from elspeth.web.composer.tools.sources import (
     _execute_patch_source_options,
     _execute_set_source,
     _execute_set_source_from_blob,
-    _resolve_source_blob,
-    _ResolvedSourceBlob,
 )
 from elspeth.web.composer.tools.transforms import (
     _execute_patch_node_options,
@@ -149,7 +145,6 @@ __all__ = [
     "SetPipelineCandidate",
     "ToolContext",
     "ToolResult",
-    "_ResolvedSourceBlob",
     "_apply_merge_patch",
     "_attach_post_call_hints",
     "_blocking_diagnostic",
@@ -157,7 +152,6 @@ __all__ = [
     "_compute_validation_delta",
     "_credential_wiring_contract_failure",
     "_detect_unresolved_interpretation_placeholders_typed",
-    "_execute_apply_pipeline_recipe",
     "_execute_create_blob",
     "_execute_patch_node_options",
     "_execute_patch_output_options",
@@ -174,7 +168,6 @@ __all__ = [
     "_persist_prepared_blob_create",
     "_prepare_blob_create",
     "_prevalidate_plugin_options",
-    "_resolve_source_blob",
     "_session_blob_lock",
     "_sync_list_blobs",
     "_utc_day_start",

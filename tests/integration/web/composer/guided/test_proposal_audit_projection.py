@@ -1952,7 +1952,6 @@ async def test_guided_planner_request_carries_evidence_and_manifest_without_priv
         "discoverable_classes": [
             "plugin.schema",
             "plugin.assistance",
-            "recipe.index",
             "blob.metadata",
             "validation.code",
             "secret.reference",

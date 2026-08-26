@@ -21,8 +21,6 @@ from pydantic import BaseModel
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
 
-from elspeth.contracts.composer_slots import SlotSpec
-
 FieldKind = Literal[
     "text",
     "number-int",
@@ -468,37 +466,6 @@ def _composer_placeholder(info: FieldInfo) -> str | None:
     the user types it.
     """
     return _composer_str_extra(info, "composer_placeholder")
-
-
-_SLOT_TYPE_TO_KIND: dict[str, FieldKind] = {
-    "blob_id": "blob-ref",
-    "str": "text",
-    "int": "number-int",
-    "float": "number-float",
-    "str_list": "string-list",
-}
-
-
-def lower_slot_specs_to_knob_schema(slots: Mapping[str, SlotSpec]) -> KnobSchema:
-    """Lower recipe slot specs to the one-knob schema."""
-    fields: list[KnobField] = []
-    for name, spec in slots.items():
-        kind = _SLOT_TYPE_TO_KIND[spec.slot_type]
-        field: KnobField = {
-            "name": name,
-            "label": name,
-            "kind": kind,
-            "required": spec.required,
-            "nullable": not spec.required,
-        }
-        if spec.description:
-            field["description"] = spec.description
-        if kind == "string-list":
-            field["item_kind"] = "text"
-        if spec.default is not None:
-            field["default"] = spec.default
-        fields.append(field)
-    return {"fields": fields}
 
 
 def lower_discriminated_to_knob_schema(

@@ -618,7 +618,6 @@ _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS = 4096
 _SAFE_TOOL_ARGUMENT_NAMES = frozenset(
     {
         "affected_node_id",
-        "apply_pipeline_recipe arguments",
         "clear_source arguments",
         "composition_state_id",
         "content",
@@ -659,7 +658,6 @@ _SAFE_TOOL_ARGUMENT_NAMES = frozenset(
 
 _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS = MappingProxyType(
     {
-        "apply_pipeline_recipe arguments": "object conforming to ApplyPipelineRecipeArgumentsModel",
         "create_blob arguments": "object conforming to CreateBlobArgumentsModel",
         "inspect_source arguments": "object conforming to InspectSourceArgumentsModel",
         "patch_node_options arguments": "object conforming to PatchNodeOptionsArgumentsModel",
@@ -1332,7 +1330,7 @@ class ComposerService(Protocol):
         interpretation site on ``state`` whose writer-boundary precondition
         holds (all five ``InterpretationKind`` members). Called by the guided
         route persistence seam (``post_guided_respond``) after every committed
-        source / transform / recipe-apply, because the guided dispatch path
+        source or transform commit, because the guided dispatch path
         never reaches the freeform fail-closed orphan gate, and by the
         /validate backstop (elspeth-03f5728c33) with
         ``only_missing_evidence=True`` to repair states stranded by a compose

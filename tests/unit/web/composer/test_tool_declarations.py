@@ -41,10 +41,6 @@ from elspeth.web.composer.tools.declarations import (
     derive_name_set_for,
     derive_tool_definitions_by_name,
 )
-from elspeth.web.composer.tools.sessions import (
-    _APPLY_PIPELINE_RECIPE_DECLARATION,
-    _execute_apply_pipeline_recipe,
-)
 from elspeth.web.composer.tools.sources import (
     _SET_SOURCE_FROM_BLOB_DECLARATION,
     _execute_set_source_from_blob,
@@ -117,34 +113,6 @@ _EXPECTED_DELETE_BLOB_DEFINITION: dict[str, object] = {
             },
         },
         "required": ["blob_id"],
-        "additionalProperties": False,
-    },
-}
-
-
-_EXPECTED_APPLY_PIPELINE_RECIPE_DEFINITION: dict[str, object] = {
-    "name": "apply_pipeline_recipe",
-    "description": (
-        "Apply a registered pipeline recipe with operator-supplied slot values and replace "
-        "the current pipeline state with the resulting configuration. Slots are validated "
-        "against the recipe's declared schema before scaffolding — invalid slots are "
-        "rejected with a repair hint. Call list_recipes to discover available recipes and "
-        "their slot schemas. The resulting state is identical to a hand-authored "
-        "set_pipeline call; the model can refine via patch_*_options afterwards."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "recipe_name": {
-                "type": "string",
-                "description": "Recipe identifier (e.g., 'classify-rows-llm-jsonl')",
-            },
-            "slots": {
-                "type": "object",
-                "description": "Operator-supplied slot values; must match the recipe's slot schema",
-            },
-        },
-        "required": ["recipe_name", "slots"],
         "additionalProperties": False,
     },
 }
@@ -283,26 +251,6 @@ class TestSetSourceFromBlobMigration:
         assert _SET_SOURCE_FROM_BLOB_DECLARATION.blob_store_only is False
 
 
-class TestApplyPipelineRecipeMigration:
-    """apply_pipeline_recipe migration: byte-identity + MUTATION kind (advances CompositionState;
-    does not create blobs on its own dispatch path — recipe slots cannot carry inline_blob)."""
-
-    def test_get_tool_definitions_emits_expected_apply_pipeline_recipe_definition(self) -> None:
-        definitions = get_tool_definitions()
-        emitted = next(d for d in definitions if d["name"] == "apply_pipeline_recipe")
-        assert emitted == _EXPECTED_APPLY_PIPELINE_RECIPE_DEFINITION
-
-    def test_declaration_handler_matches(self) -> None:
-        assert _APPLY_PIPELINE_RECIPE_DECLARATION.handler is _execute_apply_pipeline_recipe
-
-    def test_declaration_kind_is_mutation(self) -> None:
-        assert _APPLY_PIPELINE_RECIPE_DECLARATION.kind is ToolKind.MUTATION
-
-    def test_declaration_blob_kwarg_shape(self) -> None:
-        """apply_pipeline_recipe is not blob-store-only — it replaces CompositionState."""
-        assert _APPLY_PIPELINE_RECIPE_DECLARATION.blob_store_only is False
-
-
 class TestStep2RegistryAggregation:
     """The blob-mutation declarations are aggregated into _REGISTERED_TOOLS at import time."""
 
@@ -323,9 +271,8 @@ class TestStep2RegistryAggregation:
     def test_registered_tools_count_at_least_five(self) -> None:
         from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS
 
-        # Step 2 registered blob-mutation tools plus apply_pipeline_recipe
-        # (MUTATION kind). Step 3 adds more tiers (discovery first); the count
-        # strictly grows as tiers migrate.
+        # Step 2 registered blob-mutation tools. Step 3 adds more tiers
+        # (discovery first); the count strictly grows as tiers migrate.
         assert len(_REGISTERED_TOOLS) >= 5
 
     def test_request_interpretation_review_is_not_a_normal_tool_declaration(self) -> None:
@@ -542,19 +489,6 @@ class TestStep3DiscoveryTierMigration:
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
-    def test_list_recipes(self) -> None:
-        assert self._get("list_recipes") == {
-            "name": "list_recipes",
-            "description": (
-                "List the registered pipeline recipes — deterministic scaffolds for common simple "
-                "intents. Each recipe declares its required slots; apply_pipeline_recipe then "
-                "instantiates the recipe with operator-supplied slot values. Recipes accelerate "
-                "the highest-frequency 'classify CSV with LLM' and 'split rows by threshold' "
-                "patterns; for shapes outside the recipe set, hand-author with set_pipeline."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
-        }
-
     def test_get_pipeline_state(self) -> None:
         assert self._get("get_pipeline_state") == {
             "name": "get_pipeline_state",
@@ -618,7 +552,6 @@ class TestStep3DiscoveryTierMigration:
             "get_plugin_assistance",
             "list_models",
             "get_audit_info",
-            "list_recipes",
         }
         assert expected_cacheable <= cacheable
         # The three session-mutable discovery tools MUST NOT be cacheable.
@@ -837,7 +770,6 @@ class TestStep3MutationTierMigration:
             "patch_output_options",
             "set_pipeline",
             "clear_source",
-            "apply_pipeline_recipe",
             "splice_transform",
         }
         assert names == expected

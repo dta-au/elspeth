@@ -84,7 +84,6 @@ class ComposerPlannerInformationClass(StrEnum):
     CATALOG_DETAILS_SOURCE = "catalog.details.source"
     CATALOG_DETAILS_TRANSFORM = "catalog.details.transform"
     CATALOG_DETAILS_SINK = "catalog.details.sink"
-    RECIPE_INDEX = "recipe.index"
     PLUGIN_SCHEMA = "plugin.schema"
     PLUGIN_ASSISTANCE = "plugin.assistance"
     MODEL_CATALOG = "model.catalog"

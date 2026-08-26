@@ -1,9 +1,4 @@
 {
-  "apply_pipeline_recipe": {
-    "hash": "3219efa35a90d639389d1e690594bece00b6f28bc71e0b8f0f355a78ace30219",
-    "sensitive_path_count": 9,
-    "shape": "type_driven"
-  },
   "clear_source": {
     "hash": "eb700d5632463ccbbd45077aadf4e10703f2c9937cd15cc7f6a7a37d334d22b2",
     "sensitive_path_count": 0,
@@ -81,11 +76,6 @@
   },
   "list_models": {
     "hash": "38b0221d701f20df921941354c8947ddbe0ec98ddc0febe9a7b0830e140be9ac",
-    "sensitive_path_count": 0,
-    "shape": "declarative"
-  },
-  "list_recipes": {
-    "hash": "f6c34d6695a0757b828bc7635f053129e2da1b39f9439763f4b71093897639cd",
     "sensitive_path_count": 0,
     "shape": "declarative"
   },

@@ -23,7 +23,6 @@ const READ_ONLY_TOOL_CALL_DESCRIPTIONS: Record<string, string> = {
   list_sinks: "Browses the catalog of available sink plugins.",
   list_models:
     "Looks up the LLM models available on this deployment's credentials.",
-  list_recipes: "Browses pre-built pipeline recipes that can be applied.",
   list_sessions: "Looks up your previous composer sessions.",
   get_plugin_schema:
     "Reads a plugin's configuration schema to understand its options.",

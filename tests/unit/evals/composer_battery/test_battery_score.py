@@ -48,7 +48,6 @@ SPEC_MUTATION_VOCAB = {
     "remove_output",
     "clear_source",
     "splice_transform",
-    "apply_pipeline_recipe",
     "set_metadata",
 }
 
@@ -74,7 +73,7 @@ def test_ideal_thread_at_floor_is_clean_and_optimal() -> None:
     assert s.clean and s.optimal and s.excluded is None
     assert s.tokens == {"prompt": 200, "completion": 20, "cached_prompt": 0, "unknown_calls": 0}
     assert s.cost == pytest.approx(0.02) and s.wall_ms == 6000  # audit rows :02→:03 and :07→:08
-    assert s.review_rounds == 0 and s.recipe_used is False
+    assert s.review_rounds == 0
 
 
 def test_advisor_bucket_by_model_not_by_null_tools_hash() -> None:
@@ -412,13 +411,21 @@ def test_unattributed_excess_is_visible() -> None:
     assert s.excess == 1 and _classes(s) == ["unattributed_excess"] and not s.clean
 
 
-def test_approval_pending_and_recipe_flag() -> None:
+def test_approval_pending_is_flagged() -> None:
+    """A mutation that returned APPROVAL_REQUIRED is a hard-classed deviation.
+
+    The predecessor bundled this with a ``recipe_used`` assertion and
+    overrode the mutating call's name to ``apply_pipeline_recipe``; it died
+    with the recipe system (e7a85bf8e), leaving the only exercise of a
+    ``"hard"``-classed deviation with no coverage at all. The recipe half was
+    never load-bearing here: the ideal thread's own ``set_pipeline`` is a
+    mutation tool, so the deviation reproduces without touching the name.
+    """
     rows = tg.ideal_thread(ARGS)
-    rows[-2]["tool_calls"][0]["function"]["name"] = "apply_pipeline_recipe"
     rows[-1]["composition_state_id"] = None
     rows[-1]["content"] = json.dumps({"success": True, "status": "APPROVAL_REQUIRED", "proposal_id": "p1"})
     s = score_run(tg.capture(rows, state=ARGS), SC)
-    assert s.recipe_used and "approval_pending" in _classes(s)
+    assert "approval_pending" in _classes(s)
 
 
 def test_cancelled_last_row_on_a_wall_timeout_is_hard_not_excluded() -> None:

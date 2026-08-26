@@ -29,7 +29,6 @@ import pytest
 from pydantic import ValidationError
 
 from elspeth.web.composer.redaction import (
-    ApplyPipelineRecipeArgumentsModel,
     PatchNodeOptionsArgumentsModel,
     PatchOutputOptionsArgumentsModel,
     PatchSourceOptionsArgumentsModel,
@@ -54,11 +53,6 @@ def test_set_source_options_stringified_object_coerces() -> None:
         {"plugin": "text", "on_success": "out", "on_validation_failure": "discard", "options": _OBJECT_JSON}
     )
     assert m.options == _EXPECTED
-
-
-def test_apply_recipe_slots_stringified_object_coerces() -> None:
-    m = ApplyPipelineRecipeArgumentsModel.model_validate({"recipe_name": "r", "slots": '{"output_path": "out.jsonl"}'})
-    assert m.slots == {"output_path": "out.jsonl"}
 
 
 def test_set_source_from_blob_options_stringified_object_coerces() -> None:

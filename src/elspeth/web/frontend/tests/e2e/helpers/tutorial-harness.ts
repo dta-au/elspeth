@@ -98,7 +98,6 @@ const PLANNER_INFORMATION_CLASSES = new Set([
   "catalog.details.source",
   "catalog.details.transform",
   "catalog.details.sink",
-  "recipe.index",
   "plugin.schema",
   "plugin.assistance",
   "model.catalog",

@@ -146,7 +146,6 @@ _CATALOG_DETAIL_INFORMATION_BY_TOOL: Final[Mapping[str, str]] = {
     "list_transforms": "catalog.details.transform",
     "list_sinks": "catalog.details.sink",
 }
-_RECIPE_INDEX_INFORMATION: Final[str] = "recipe.index"
 # The only manifest keys the authoring aids may close. Their palette tools
 # (list_models / get_expression_grammar) stay advertised either way.
 _AID_SUPPLIED_INFORMATION_KEYS: Final[frozenset[str]] = frozenset({"model.catalog", "expression.grammar"})
@@ -159,7 +158,6 @@ def _valid_information_key(key: str) -> bool:
         _PIPELINE_CURRENT_INFORMATION,
         _CATALOG_SELECTION_INFORMATION,
         *_CATALOG_DETAIL_INFORMATION_BY_TOOL.values(),
-        _RECIPE_INDEX_INFORMATION,
         "pipeline.full",
         "pipeline.source",
         "model.catalog",
@@ -319,7 +317,6 @@ class PlannerDiscoveryPolicy:
                 "plugin.schema",
                 "plugin.assistance",
                 *(() if "model.catalog" in aid_supplied_information else ("model.catalog",)),
-                "recipe.index",
                 "blob.metadata",
                 "validation.code",
                 "secret.reference",
@@ -356,8 +353,6 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
         return (f"pipeline.component:{component}",)
     if name in _CATALOG_DETAIL_INFORMATION_BY_TOOL:
         return (_CATALOG_SELECTION_INFORMATION, _CATALOG_DETAIL_INFORMATION_BY_TOOL[name])
-    if name == "list_recipes":
-        return (_RECIPE_INDEX_INFORMATION,)
     if name == "get_plugin_schema":
         plugin_type = arguments["plugin_type"] if "plugin_type" in arguments else None
         plugin_name = arguments["name"] if "name" in arguments else None
