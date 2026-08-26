@@ -9,6 +9,7 @@ Layer: L3 (application).
 from __future__ import annotations
 
 from elspeth.web.audit_readiness.models import PluginPolicyReadinessSnapshot
+from elspeth.web.audit_readiness.service import PLUGIN_HOSTING_NODE_TYPES
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec
 
 
@@ -32,8 +33,8 @@ def build_narrative(
             lines.append(_describe_source(source.plugin, source_name=source_name))
 
     for node in state.nodes:
-        if node.node_type == "transform":
-            lines.append(_describe_transform(node))
+        if node.node_type in PLUGIN_HOSTING_NODE_TYPES:
+            lines.append(_describe_plugin_node(node))
 
     for output in state.outputs:
         lines.append(_describe_output(output))
@@ -74,14 +75,25 @@ def _describe_source(plugin: str, *, source_name: str) -> str:
     return f"{prefix} — each row from the {plugin} source. Row-level hash recorded for every record."
 
 
-def _describe_transform(node: NodeSpec) -> str:
+def _describe_plugin_node(node: NodeSpec) -> str:
+    """Describe one plugin-hosting node: a transform, aggregation, or collector.
+
+    Callers filter to ``PLUGIN_HOSTING_NODE_TYPES``. Every node type in that
+    set is contractually required to carry a plugin (``web/composer/state.py``
+    rejects a plugin on each of the plugin-less kinds), so ``plugin=None``
+    here is a Tier-1 invariant breach and must crash rather than emit prose
+    describing a node that cannot exist.
+
+    Dispatch stays keyed on the PLUGIN name: the tailored prose names the
+    external system a boundary plugin reaches, and that is what an auditor
+    needs regardless of which node kind hosts it. Only the generic fallback
+    is node-kind-aware, because its per-row phrasing does not describe a
+    node that consumes a batch or a collected group.
+    """
     name = node.id
-    # Callers filter to node_type == "transform"; per NodeSpec contract
-    # (state.py docstring, line 113), `plugin` is None only for gates and
-    # coalesces. If None ever appears here, that's a Tier-1 invariant breach.
     plugin = node.plugin
     if plugin is None:
-        raise RuntimeError(f"transform node {name!r} has plugin=None — Tier-1 invariant breach")
+        raise RuntimeError(f"{node.node_type} node {name!r} has plugin=None — Tier-1 invariant breach")
     if plugin == "llm":
         return (
             f"- {name} (LLM transform) — for each row: the full prompt "
@@ -115,6 +127,10 @@ def _describe_transform(node: NodeSpec) -> str:
             f"document analysis request and the extracted content hash "
             f"recorded. External call to Azure AI Services."
         )
+    if node.node_type == "aggregation":
+        return f"- {name} ({plugin} aggregation) — for each batch: the input row hash of every member row, the output row hash(es), and the batch outcome recorded."
+    if node.node_type == "collector":
+        return f"- {name} ({plugin} collector) — for each collected group: the input row hash of every member row, the output row hash(es), and the group outcome recorded."
     return f"- {name} ({plugin} transform) — input row hash, output row hash, and per-row outcome recorded."
 
 

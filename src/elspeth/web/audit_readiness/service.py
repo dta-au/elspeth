@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, get_args
 from uuid import UUID
 
 from elspeth.contracts.composer_interpretation import (
@@ -31,7 +31,7 @@ from elspeth.web.audit_readiness.models import (
     SinkEffectRecoveryDiagnostic,
 )
 from elspeth.web.catalog.schemas import PluginKind
-from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.state import CompositionState, NodeType
 from elspeth.web.execution.completion_gates import CompletionGateFacts, parse_completion_gates
 from elspeth.web.execution.schemas import (
     CHECK_ADVISOR_SIGNOFF,
@@ -761,11 +761,91 @@ assert frozenset(Determinism) >= _INTERNAL_TRANSFORM_DETERMINISMS, (
 # version pin recorded here MUST be stamped alongside each persisted
 # verdict so historical rows remain reproducible.
 #
-# Bump on every semantic change to either the predicate or the
-# ``_AUDIT_FLAGGED_DETERMINISMS`` set (membership, name, or wire-format
-# meaning). The pin is opaque to consumers — they record it verbatim and
-# never parse the version string.
-_BOUNDARY_RULE_VERSION = "phase-7a-v2"
+# Bump on every semantic change to the predicate, to the
+# ``_AUDIT_FLAGGED_DETERMINISMS`` set, to the set of nodes ENUMERATED into
+# the predicate (``PLUGIN_HOSTING_NODE_TYPES``), or to the ``detail`` wire
+# shape (membership, name, or wire-format meaning). The pin is opaque to
+# consumers — they record it verbatim and never parse the version string.
+#
+# The last two clauses were added with the v2 -> v3 bump they authorise
+# (elspeth-1c8a4b6199): that bump changed which nodes are fed to the
+# predicate and the ``[kind]`` token in ``detail``, and touched NEITHER of
+# the two triggers previously listed here. ``boundary_expectations.py``
+# step 5(b) already stated the wire-shape trigger, so the authority and its
+# derived documentation disagreed; this is the authority catching up.
+_BOUNDARY_RULE_VERSION = "phase-7a-v3"
+
+
+# Composer node types that are wired with ``plugin=null`` and therefore
+# host no plugin to classify. ``web/composer/state.py`` enforces this for
+# every member: gate/coalesce via ``structural_node_plugin_error``, queue
+# via ``queue_node_contract_error``, row_union via its forbidden-fields
+# block in ``validate()``.
+#
+# Declared as the EXCLUSION list, by exact analogy with
+# ``_INTERNAL_TRANSFORM_DETERMINISMS`` above and for the same reason: a
+# node type added to ``NodeType`` without an entry here defaults to
+# BOUNDARY-ENUMERATED rather than silently vanishing from the audit
+# inventory. Audit-relevance is the default; opting a new node kind OUT
+# of the panel is an explicit act recorded in this set.
+#
+# This is the fix for elspeth-1c8a4b6199: the three enumeration sites
+# below (``_build_plugin_trust_row``, ``_composition_has_llm_transform``,
+# and ``explain.build_narrative``) each hard-coded ``node_type ==
+# "transform"``, so a boundary plugin hosted on a collector or an
+# aggregation was silently omitted from the boundary inventory — an
+# undercount, with the node dropped from both ``detail`` and
+# ``component_ids``. Enumerating by this shared set puts the panel on the
+# same footing as ``web/plugin_policy/coverage.py``, which resolves a
+# node's plugin without consulting the node kind at all.
+#
+# KNOWN DUPLICATE — this set is the THIRD hand-written statement of the
+# plugin-free node kinds in the tree. The siblings:
+#
+#   - ``web/composer/state.py::_PLUGINLESS_STRUCTURAL_NODE_TYPES``
+#     — {gate, coalesce}. A strict SUBSET, not a disagreement: it backs
+#     ``structural_node_plugin_error``, which enforces plugin=null only
+#     for the two kinds no other validator already covered (queue and
+#     row_union are enforced by ``queue_node_contract_error`` and by
+#     row_union's forbidden-fields block respectively).
+#   - ``web/sessions/routes/composer/guided_chat_intent_management.py::
+#     _STRUCTURAL_NODE_TYPES`` — {gate, coalesce, row_union, queue}.
+#     IDENTICAL membership, DIFFERENT predicate — do not treat the
+#     agreement as corroboration. It is not a validation set at all: it
+#     keyword-matches the USER'S CHAT TEXT to pick a teaching line, and
+#     the tuple itself carries no comment (the rationale lives at its one
+#     call site, ``_model_catalog_identity_chat``, and is about dispatch
+#     ordering, not about hosting a plugin). Two sets answering different
+#     questions may hold the same members today and diverge tomorrow for
+#     entirely valid reasons on either side.
+#
+# All three currently agree BY HAND, not by structure. Nothing in the
+# tree fails if one drifts from the others. Unifying them is
+# elspeth-b3117ec3ac's job (the node-kind vocabulary ticket) — do NOT
+# unify from here, which would add a fourth authority beside the three
+# rather than removing one.
+#
+# For the same reason this set is subtracted from ``get_args(NodeType)``
+# rather than from ``state.py::COMPOSER_NODE_TYPES``: that frozenset is
+# itself a hand-written restatement of the ``NodeType`` Literal declared
+# a few lines above it, and ``NodeType`` is the authority ``NodeSpec.
+# node_type`` is actually annotated against. Deriving from the Literal is
+# what makes the module-load assertion below able to catch drift at all.
+_PLUGINLESS_NODE_TYPES: frozenset[str] = frozenset({"gate", "coalesce", "queue", "row_union"})
+
+# Node types that host a plugin, and whose plugin therefore participates
+# in the boundary partition. Derived by exclusion — see above.
+PLUGIN_HOSTING_NODE_TYPES: frozenset[str] = frozenset(get_args(NodeType)) - _PLUGINLESS_NODE_TYPES
+
+# Module-load assertion mirroring the ``_INTERNAL_TRANSFORM_DETERMINISMS``
+# one: a rename or removal in ``NodeType`` that leaves a stale name in
+# ``_PLUGINLESS_NODE_TYPES`` would otherwise silently widen the panel
+# without test signal.
+assert frozenset(get_args(NodeType)) >= _PLUGINLESS_NODE_TYPES, (
+    "_PLUGINLESS_NODE_TYPES contains values not in NodeType; "
+    f"stale members: {sorted(_PLUGINLESS_NODE_TYPES - frozenset(get_args(NodeType)))}. "
+    "Remove the stale entries or restore the missing NodeType members."
+)
 
 
 def _build_plugin_trust_row(state: CompositionState) -> ReadinessRow:
@@ -783,9 +863,17 @@ def _build_plugin_trust_row(state: CompositionState) -> ReadinessRow:
     is classified correctly at registration time without a separate
     declared attribute.
 
+    "Transform" above is the PLUGIN kind, not the node kind. Collector and
+    aggregation nodes host transform-registry plugins too, so every node
+    type in ``PLUGIN_HOSTING_NODE_TYPES`` is enumerated and its plugin
+    resolved through the transform registry. The detail line reports the
+    NODE kind (``[collector]``, ``[aggregation]``) rather than the registry
+    kind, because the operator locates the component by the vocabulary they
+    authored it in; ``component_ids`` carries the node id either way.
+
     The rule version encoded by this predicate and
     ``_AUDIT_FLAGGED_DETERMINISMS`` is ``_BOUNDARY_RULE_VERSION``
-    (currently ``"phase-7a-v2"``). Bump that constant on any semantic
+    (currently ``"phase-7a-v3"``). Bump that constant on any semantic
     change here. See its module-level docstring for the
     persistence-vs-UX rationale.
 
@@ -798,20 +886,30 @@ def _build_plugin_trust_row(state: CompositionState) -> ReadinessRow:
     boundary: list[tuple[str, str, str]] = []
     unknown: list[tuple[str, str]] = []
 
-    def _record(kind: PluginKind, component_id: str, name: str | None) -> None:
+    def _record(kind: PluginKind, component_id: str, name: str | None, *, label: str | None = None) -> None:
+        """Classify one component; ``label`` overrides the displayed kind.
+
+        ``kind`` is the PLUGIN kind and drives registry resolution — the two
+        registry helpers raise on any value outside the ``PluginKind``
+        Literal, so it must never be widened to a node kind. ``label`` is
+        display-only prose and defaults to ``kind``; a collector or
+        aggregation node passes its node type so the detail line names the
+        component in the vocabulary the operator authored.
+        """
+        display = kind if label is None else label
         if name is None or not _is_registered_plugin(kind, name):
-            unknown.append((kind, component_id))
+            unknown.append((display, component_id))
             return
         plugin_cls = _get_plugin_class_for_kind(kind, name)
         if kind in ("source", "sink") or plugin_cls.determinism in _AUDIT_FLAGGED_DETERMINISMS:
-            boundary.append((kind, component_id, name))
+            boundary.append((display, component_id, name))
 
     for source_name, source in state.sources.items():
         component_id = "source" if source_name == "source" else f"source:{source_name}"
         _record("source", component_id, source.plugin)
     for node in state.nodes:
-        if node.node_type == "transform":
-            _record("transform", node.id, node.plugin)
+        if node.node_type in PLUGIN_HOSTING_NODE_TYPES:
+            _record("transform", node.id, node.plugin, label=node.node_type)
     for output in state.outputs:
         _record("sink", output.name, output.plugin)
 
@@ -920,8 +1018,43 @@ def _composition_has_llm_transform(state: CompositionState) -> bool:
     interpretation-event reads when no LLM transforms are present —
     a composition without LLM transforms cannot have interpretation
     events bound to its nodes.
+
+    Enumerates ``PLUGIN_HOSTING_NODE_TYPES`` rather than ``"transform"``
+    alone so the three panel enumeration sites share one node-kind
+    vocabulary (elspeth-1c8a4b6199). **This widening is a LIVE behaviour
+    change, not a consistency tidy-up**, and the aggregation half is the
+    reason:
+
+      - COLLECTOR: genuinely unreachable for ``llm``. The batch-aware
+        constraint is enforced at composition time by
+        ``collector_plugin_not_batch_aware``, and ``llm`` declares
+        ``is_batch_aware=False``.
+      - AGGREGATION: **reachable.** That constraint is collector-ONLY —
+        it lives inside ``state.py``'s ``_collector_intrinsic_errors``,
+        and ``validate()``'s aggregation arm checks plugin-presence,
+        ``on_error``, ``trigger`` and ``output_mode`` but nothing about
+        ``is_batch_aware``. An ``llm`` transform on an aggregation node
+        validates with ZERO errors; it is rejected only later, at
+        RUNTIME, by ``runtime_factory``.
+
+    So before this widening, a composition with ``llm`` on an aggregation
+    made this predicate return False, which rendered the
+    ``llm_interpretations`` row ``not_applicable`` — "No LLM transforms in
+    this pipeline" — and skipped the interpretation-event reads entirely.
+    That is a second false all-clear of exactly this ticket's shape, on a
+    different row, and widening the predicate closes it.
+
+    The claim previously recorded here — that the widening is a no-op and
+    not independently mutation-checkable — was WRONG on both halves, and
+    wrong because it reasoned from the collector constraint and assumed
+    aggregation shared it. Reverting this line fails
+    ``test_llm_predicate_shares_the_node_kind_vocabulary``.
+
+    The name keeps "transform" because the transform-vs-source contrast it
+    feeds is load-bearing in ``_build_llm_interpretations_row``'s status
+    mapping.
     """
-    return any(n.node_type == "transform" and n.plugin == "llm" for n in state.nodes)
+    return any(n.node_type in PLUGIN_HOSTING_NODE_TYPES and n.plugin == "llm" for n in state.nodes)
 
 
 def _composition_has_llm_source(state: CompositionState) -> bool:

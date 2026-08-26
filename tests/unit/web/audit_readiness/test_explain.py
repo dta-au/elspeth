@@ -177,3 +177,95 @@ def test_transform_node_with_none_plugin_raises_runtime_error():
 
     with pytest.raises(RuntimeError, match=r"bad_transform.*plugin=None"):
         build_narrative(state, retention_days=90)
+
+
+# ---------------------------------------------------------------------------
+# Node-kind widening of the Explain narrative (elspeth-1c8a4b6199).
+#
+# ``build_narrative`` enumerated ``node_type == "transform"`` alone, so a
+# collector or aggregation node contributed NO line at all — the operator
+# read a complete-looking account of what the run records with a whole
+# plugin-hosting node missing from it. The AGGREGATION half of that was
+# LIVE, not latent: an aggregation node hosting ``web_scrape`` validates
+# with zero composer errors today, so the narrative really did omit a real
+# authorable node's external-boundary line. See the header comment in
+# ``test_service.py``'s widening block for the per-kind reachability split.
+# ---------------------------------------------------------------------------
+
+
+def _node_kind_state(node_type):
+    return CompositionState(
+        source=SourceSpec(plugin="csv", on_success="src_out", options={}, on_validation_failure="quarantine"),
+        nodes=(make_node_spec("n1", "web_scrape", input="src_out", on_success="n1_out", node_type=node_type),),
+        edges=(),
+        outputs=(make_output_spec("out", "csv"),),
+        metadata=PipelineMetadata(name="t", description=""),
+        version=1,
+    )
+
+
+@pytest.mark.parametrize("node_type", ["collector", "aggregation"])
+def test_narrative_describes_plugin_hosting_node_kinds(node_type):
+    text = build_narrative(_node_kind_state(node_type), retention_days=90)
+
+    assert "n1" in text
+    assert "web scrape" in text  # the plugin-specific boundary prose, not the fallback
+
+
+@pytest.mark.parametrize("node_type", ["collector", "aggregation"])
+def test_generic_narrative_line_is_node_kind_aware(node_type):
+    """A plugin with no tailored arm falls through to the generic line. The
+    transform wording ("per-row outcome") describes a node that processes
+    one row at a time and is wrong for a node consuming a batch or a
+    collected group, so the fallback carries a per-kind arm.
+    """
+    state = CompositionState(
+        source=SourceSpec(plugin="csv", on_success="src_out", options={}, on_validation_failure="quarantine"),
+        nodes=(make_node_spec("n1", "batch_stats", input="src_out", on_success="n1_out", node_type=node_type),),
+        edges=(),
+        outputs=(make_output_spec("out", "csv"),),
+        metadata=PipelineMetadata(name="t", description=""),
+        version=1,
+    )
+
+    line = next(ln for ln in build_narrative(state, retention_days=90).splitlines() if ln.startswith("- n1 "))
+
+    assert line.startswith(f"- n1 (batch_stats {node_type}) — ")
+    assert "per-row outcome" not in line
+
+
+def test_transform_narrative_line_is_unchanged_by_the_widening():
+    """The transform arm is the control: the widening must not move a single
+    byte of the prose an operator already reads today.
+    """
+    state = CompositionState(
+        source=SourceSpec(plugin="csv", on_success="src_out", options={}, on_validation_failure="quarantine"),
+        nodes=(make_node_spec("n1", "batch_stats", input="src_out", on_success="n1_out", node_type="transform"),),
+        edges=(),
+        outputs=(make_output_spec("out", "csv"),),
+        metadata=PipelineMetadata(name="t", description=""),
+        version=1,
+    )
+
+    text = build_narrative(state, retention_days=90)
+
+    assert "- n1 (batch_stats transform) — input row hash, output row hash, and per-row outcome recorded." in text
+
+
+@pytest.mark.parametrize("node_type", ["collector", "aggregation"])
+def test_plugin_hosting_node_with_none_plugin_raises_runtime_error(node_type):
+    """The Tier-1 guard follows the widening. Skipping ``plugin is None``
+    nodes wholesale would have widened the loop while silently discarding
+    this detection for every kind it widened to.
+    """
+    state = CompositionState(
+        source=SourceSpec(plugin="csv", on_success="src_out", options={}, on_validation_failure="quarantine"),
+        nodes=(make_node_spec("bad_node", None, input="src_out", on_success="n1_out", node_type=node_type),),
+        edges=(),
+        outputs=(make_output_spec("out", "csv"),),
+        metadata=PipelineMetadata(name="t", description=""),
+        version=1,
+    )
+
+    with pytest.raises(RuntimeError, match=rf"{node_type} node 'bad_node' has plugin=None"):
+        build_narrative(state, retention_days=90)
