@@ -217,3 +217,49 @@ describe("buildStepOrder", () => {
     expect(order.get("out")).toBe(3);
   });
 });
+
+// ── elspeth-9f21f3c57d: structural-node description fallback ────────────────
+// The plugin chain cannot label a plugin-less structural node (gate/coalesce/
+// queue/…); its authored description now fills that gap before the callers'
+// raw-id / generic fallbacks. The plugin-resolvable primary path is untouched
+// — a description never overrides a node's own (short) name on card surfaces.
+
+describe("stepLabelForNodeId — structural-node description fallback (elspeth-9f21f3c57d)", () => {
+  const gateNode = (description?: string): NodeSpec => ({
+    id: "fan_out",
+    node_type: "gate",
+    plugin: null,
+    input: "rows",
+    on_success: null,
+    on_error: null,
+    options: {},
+    condition: "row.kind == 'colour'",
+    ...(description !== undefined ? { description } : {}),
+  });
+
+  it("labels a plugin-less structural node by its authored description (label register: trailing stop dropped)", () => {
+    const state = makeCompositionState([gateNode("Send each colour down both branches.")]);
+    expect(stepLabelForNodeId(state, "fan_out")).toBe(
+      "Send each colour down both branches",
+    );
+    expect(humaniseStepLabel(state, "fan_out")).toBe(
+      "Send each colour down both branches",
+    );
+  });
+
+  it("still resolves null (raw-id fallback) for a plugin-less node without a description", () => {
+    const state = makeCompositionState([gateNode()]);
+    expect(stepLabelForNodeId(state, "fan_out")).toBeNull();
+    expect(humaniseStepLabel(state, "fan_out")).toBe("fan_out");
+  });
+
+  it("does not let a description override a plugin-resolvable node's own name", () => {
+    const node = { ...makeNode("rater", "llm"), description: "Rate each row for coolness." };
+    const state = makeCompositionState([node]);
+    expect(stepLabelForNodeId(state, "rater")).toBe("Rater");
+  });
+
+  it("returns null for an id absent from the composition entirely", () => {
+    expect(stepLabelForNodeId(makeCompositionState([]), "ghost")).toBeNull();
+  });
+});

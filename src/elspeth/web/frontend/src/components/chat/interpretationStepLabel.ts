@@ -51,10 +51,26 @@ function escapeRegExp(value: string): string {
  * plus a bare numeric suffix (`llm_2`) — the only shape that carries no
  * author intent, since every id is author/LLM-chosen and there is no id
  * generator to detect instead. Anything else is a real, author-given name.
+ *
+ * Exported for validationHumaniser (elspeth-9f21f3c57d), whose phrase ladder
+ * applies the same author-intent test before title-casing a node id.
  */
-function isPluginDerivedId(id: string, plugin: string): boolean {
+export function isPluginDerivedId(id: string, plugin: string): boolean {
   if (id === plugin) return true;
   return new RegExp(`^${escapeRegExp(plugin)}(_\\d+)?$`).test(id);
+}
+
+/**
+ * Normalise a composer-authored description into label register: trimmed,
+ * trailing full stops dropped (descriptions are one-sentence prose, while the
+ * label slots quote or possessive-prefix them mid-sentence). Null when there
+ * is no usable text.
+ */
+export function descriptionLabel(
+  description: string | null | undefined,
+): string | null {
+  const trimmed = (description ?? "").replace(/[.\s]+$/, "").trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 /**
@@ -112,7 +128,15 @@ export function stepLabelForNodeId(
   nodeId: string | null,
 ): string | null {
   const plugin = resolveNodePlugin(state, nodeId);
-  if (plugin === null || nodeId === null) return null;
+  if (plugin === null || nodeId === null) {
+    // The plugin chain cannot label a structural node (gate/coalesce/queue/…
+    // carry plugin: null), but its authored description still can
+    // (elspeth-9f21f3c57d) — consult it before surrendering to the callers'
+    // raw-id / generic fallbacks. An id absent from the composition entirely
+    // still resolves to null.
+    const node = state?.nodes.find((candidate) => candidate.id === nodeId);
+    return descriptionLabel(node?.description);
+  }
   if (isPluginDerivedId(nodeId, plugin)) {
     return stepLabelForPlugin(plugin);
   }

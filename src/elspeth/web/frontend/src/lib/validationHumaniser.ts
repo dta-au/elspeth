@@ -10,8 +10,9 @@
 // (ReadinessRowDetail), and the chat components alike — so all four
 // novice-register surfaces name steps and phrase failures identically.
 //
-// Depends only on the pure gloss leaf (pipelineGloss) + types; that file
-// imports only types/utils, so there is no import cycle.
+// Depends only on pure leaves (pipelineGloss, interpretationStepLabel,
+// catalog/pluginDisplayName) + types/utils — none of them import React, a
+// store, or this module, so there is no import cycle.
 // ============================================================================
 
 import {
@@ -30,7 +31,16 @@ import {
   WRITE_JSON_PHRASE,
   WRITE_RESULTS_PHRASE,
 } from "@/components/chat/guided/pipelineGloss";
-import type { CompositionState } from "@/types/index";
+import {
+  descriptionLabel,
+  isPluginDerivedId,
+} from "@/components/chat/interpretationStepLabel";
+import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
+import type { CompositionState, NodeSpec } from "@/types/index";
+import {
+  sortedSourceEntries,
+  sourceComponentId,
+} from "@/utils/compositionState";
 
 /**
  * Match the engineer-grade contract-violation dumps that reach the validation
@@ -73,6 +83,17 @@ export interface HumanisedFinding {
   /** The verbatim engineer-grade text, kept behind a details expander.
    *  null when the original message is already headline-register. */
   raw: string | null;
+  /**
+   * How the headline handled step naming (elspeth-9f21f3c57d), consumed by
+   * `stepPrefixPhrase` to decide whether a possessive step prefix would add
+   * a name or duplicate one:
+   *   - "self": the headline template names (or generically references) the
+   *     step itself, in the step-label vocabulary — never prefix it.
+   *   - array: the RESOLVED phrases the headline embedded (generic
+   *     "this step" fallbacks excluded); a component whose phrase is absent
+   *     from the list still benefits from a prefix.
+   */
+  namedSteps: "self" | readonly string[];
 }
 
 /**
@@ -100,6 +121,7 @@ export function humaniseValidationMessage(
           ? `The ${stepLabel} step is waiting for your review.`
           : "A step is waiting for your review.",
       raw: message,
+      namedSteps: "self",
     };
   }
   let match: RegExpExecArray | null = null;
@@ -108,7 +130,7 @@ export function humaniseValidationMessage(
     if (match !== null) break;
   }
   if (match === null) {
-    return { headline: message, raw: null };
+    return { headline: message, raw: null, namedSteps: [] };
   }
   const producerPhrase = phraseFor(match[1] ?? null);
   const consumerPhrase = match[2] !== undefined ? phraseFor(match[2]) : null;
@@ -116,7 +138,11 @@ export function humaniseValidationMessage(
     consumerPhrase !== null
       ? `Two steps aren't connected correctly: the "${producerPhrase}" step's output doesn't match what "${consumerPhrase}" expects.`
       : `A step isn't connected correctly: "${producerPhrase}" doesn't match what the next step expects.`;
-  return { headline, raw: message };
+  const namedSteps = [producerPhrase, consumerPhrase].filter(
+    (phrase): phrase is string =>
+      phrase !== null && phrase !== UNKNOWN_COMPONENT_PHRASE,
+  );
+  return { headline, raw: message, namedSteps };
 }
 
 /**
@@ -137,6 +163,26 @@ export function makePhraseFor(
   compositionState: CompositionState | null | undefined,
 ): (componentId: string | null, componentType?: string | null) => string {
   const phraseMap = buildPlainPhraseMap(compositionState);
+  // Overlay each component's OWN identity over the category gloss
+  // (elspeth-9f21f3c57d): the ladder is authored description →
+  // titleCase(node.id) for an author-meaningful id → the plugin/structural
+  // gloss already in the map → UNKNOWN_COMPONENT_PHRASE. This lives here, on
+  // the validation-prose surface, NOT in pipelineGloss's sentence
+  // composition, whose consecutive-run collapsing needs category phrases.
+  if (compositionState !== null && compositionState !== undefined) {
+    for (const [name, source] of sortedSourceEntries(compositionState)) {
+      const described = descriptionLabel(source.description);
+      if (described !== null) phraseMap.set(sourceComponentId(name), described);
+    }
+    for (const node of compositionState.nodes) {
+      const identity = nodeIdentityPhrase(node);
+      if (identity !== null) phraseMap.set(node.id, identity);
+    }
+    for (const output of compositionState.outputs) {
+      const described = descriptionLabel(output.description);
+      if (described !== null) phraseMap.set(output.name, described);
+    }
+  }
   // Precomputed once per makePhraseFor() call (not per phraseFor()
   // invocation / per unresolved lookup) — elspeth-40d6efac2b: a validation
   // result can carry many findings, each triggering a fuzzy lookup over the
@@ -150,6 +196,18 @@ export function makePhraseFor(
     const stripped = componentId.replace(/^(node|source|output):/, "");
     const strippedPhrase = phraseMap.get(stripped);
     if (strippedPhrase !== undefined) return strippedPhrase;
+    // Defensive compiled-id strip (elspeth-9f21f3c57d) — a FALLBACK only,
+    // after the exact/map paths above, so a composer node literally named
+    // like a compiled id still wins via its direct entry. Recover the
+    // embedded composer id and re-run the map/fuzzy resolution on it.
+    const compiledMatch = COMPILED_DAG_ID_RE.exec(stripped);
+    if (compiledMatch !== null) {
+      const composerId = compiledMatch[1];
+      const composerDirect = phraseMap.get(composerId);
+      if (composerDirect !== undefined) return composerDirect;
+      const composerFuzzy = bestFuzzyMatch(composerId, fuzzyIndex);
+      if (composerFuzzy !== null) return composerFuzzy;
+    }
     // Try the fuzzy known-component match BEFORE the generic role/format
     // guess (elspeth-66f50ba810): a specific phrase for a real, currently
     // -wired component must not be shadowed by a generic guess just because
@@ -160,6 +218,35 @@ export function makePhraseFor(
     if (generatedPhrase !== null) return generatedPhrase;
     return UNKNOWN_COMPONENT_PHRASE;
   };
+}
+
+/**
+ * Compiled-DAG-id anatomy: `<kind prefix>_<composer node id>_<12-hex hash>`.
+ * The prefix vocabulary is the COMPILED node kinds (`config_gate` is the
+ * compiled prefix for gate nodes — not the composer node_type "gate"), and
+ * the composer id is captured GREEDILY because composer ids may themselves
+ * contain underscores: a node named `step_0123456789ab` must resolve.
+ */
+const COMPILED_DAG_ID_RE =
+  /^(?:source|sink|queue|transform|aggregation|config_gate|coalesce|row_union|collector)_(.+)_[0-9a-f]{12}$/;
+
+/**
+ * A node's own identity for validation prose (elspeth-9f21f3c57d): its
+ * authored description when present, else its author-chosen id title-cased
+ * via the ONE acronym-aware title-caser. Null when the node has neither (an
+ * id trivially derived from its plugin — or, for structural plugin-less
+ * nodes, its node_type — carries no author intent), so the category gloss
+ * in the phrase map stands.
+ */
+function nodeIdentityPhrase(node: NodeSpec): string | null {
+  const described = descriptionLabel(node.description);
+  if (described !== null) return described;
+  // ?? null: defensive against under-specified node objects (test fixtures
+  // cast partial nodes into the store) — with nothing to derive from, the id
+  // is all author intent there is.
+  const derivedFrom = node.plugin ?? node.node_type ?? null;
+  if (derivedFrom !== null && isPluginDerivedId(node.id, derivedFrom)) return null;
+  return titleCaseLabel(node.id);
 }
 
 const MIN_FUZZY_COMPONENT_TOKEN_LENGTH = 4;
@@ -374,13 +461,40 @@ function bestFuzzyMatch(componentId: string, index: readonly FuzzyIndexEntry[]):
 }
 
 /**
+ * The possessive step phrase to prefix a finding with, or null when a prefix
+ * would add nothing. Shared by `formatFindingBody` (the status line) and the
+ * chat injection's bullet (stores/subscriptions.ts) so the two surfaces
+ * cannot drift.
+ *
+ * A settings-level finding (componentId === null) owns no step — never
+ * prefix (elspeth-901a404926). An un-humanised finding (raw === null) keeps
+ * the legacy rule: any attributed finding gets its phrase. A humanised
+ * finding gets a prefix only when it ADDS a name the headline lacks
+ * (elspeth-9f21f3c57d — a resolvable component_id must surface even when the
+ * message's own ids were unmappable): never for a "self"-naming headline
+ * (review-pending), never the generic UNKNOWN_COMPONENT_PHRASE, and never a
+ * phrase the headline already embeds.
+ */
+export function stepPrefixPhrase(
+  finding: HumanisedFinding,
+  componentId: string | null,
+  componentType: string | null,
+  phraseFor: (componentId: string | null, componentType?: string | null) => string,
+): string | null {
+  if (componentId === null) return null;
+  const phrase = phraseFor(componentId, componentType);
+  if (finding.raw === null) return phrase;
+  if (finding.namedSteps === "self") return null;
+  if (phrase === UNKNOWN_COMPONENT_PHRASE) return null;
+  if (finding.namedSteps.includes(phrase)) return null;
+  return phrase;
+}
+
+/**
  * Compose the status-line body: "<N> <label> — <headline>", prefixing the
- * finding's plain-language step name ("'rate each row': …") only when the
- * finding is attributed to a resolvable component AND was not already
- * humanised. A settings-level finding (component_id === null — e.g. the
- * missing source/output reframe or empty_pipeline) owns no step, so the
- * possessive prefix would render a bare "'this step':" — omit it there
- * (elspeth-901a404926).
+ * finding's plain-language step name ("'rate each row': …") when
+ * `stepPrefixPhrase` above decides the prefix adds a name the headline
+ * lacks.
  *
  * `componentType` is the SAME finding's structured `component_type`
  * (ValidationError/ValidationWarning) — required (not optional) so a caller
@@ -397,9 +511,9 @@ export function formatFindingBody(
   componentType: string | null,
   phraseFor: (componentId: string | null, componentType?: string | null) => string,
 ): string {
-  const attributed = finding.raw === null && componentId !== null;
-  return attributed
-    ? `${count} ${label} — '${phraseFor(componentId, componentType)}': ${finding.headline}`
+  const prefix = stepPrefixPhrase(finding, componentId, componentType, phraseFor);
+  return prefix !== null
+    ? `${count} ${label} — '${prefix}': ${finding.headline}`
     : `${count} ${label} — ${finding.headline}`;
 }
 

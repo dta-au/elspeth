@@ -9,10 +9,12 @@
 //   * buildPlainPhraseMap(state) — Map<component_id, plain phrase>, keyed by the
 //                                  SAME component_id scheme GraphView uses
 //                                  (source → sourceComponentId(name), node →
-//                                  node.id, output → output.name). Reused by
-//                                  PipelineValidationSummary so a finding's raw
-//                                  component_id renders as "rate each row"
-//                                  rather than "rater".
+//                                  node.id, output → output.name). Consumed by
+//                                  validationHumaniser's makePhraseFor, which
+//                                  overlays each component's own identity
+//                                  (description / title-cased id) over these
+//                                  category phrases (elspeth-9f21f3c57d) so a
+//                                  finding names the actual step.
 //
 // These deliberately live in the guided wrapper, NOT in the shared GraphView —
 // humanising labels there would bleed into the live composer (see Slice C

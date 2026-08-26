@@ -9,7 +9,8 @@ import { makeComposition } from "@/test/composerFixtures";
 import type { ValidationReadiness, ValidationResult } from "@/types/index";
 
 // Seed a source→llm→csv composition so component_ids map to plain phrases:
-//   "source" → "read your data", "rater" → "rate each row", "out" → "write a CSV".
+//   "source" → "read your data", "rater" → "Rater" (author-meaningful id,
+//   title-cased — elspeth-9f21f3c57d), "out" → "write a CSV".
 function seedComposition() {
   useSessionStore.setState({
     compositionState: makeComposition(1, {
@@ -73,7 +74,10 @@ describe("PipelineValidationSummary", () => {
       ],
     });
     render(<PipelineValidationSummary />);
-    expect(screen.getByText(/rate each row/)).toBeInTheDocument();
+    // "rater" is an author-meaningful id, so the phrase ladder title-cases it
+    // (elspeth-9f21f3c57d) — the same name the acknowledgement card shows —
+    // instead of the generic "rate each row" plugin gloss.
+    expect(screen.getByText(/'Rater':/)).toBeInTheDocument();
     expect(screen.getByText(/review the prompt wording/i)).toBeInTheDocument();
     // The raw component_id must NOT be surfaced.
     expect(screen.queryByText(/rater/)).toBeNull();
@@ -218,7 +222,7 @@ describe("PipelineValidationSummary", () => {
     // gloss ("rate each row" / "write a CSV"), never the raw dump.
     const status = screen.getByRole("status");
     expect(status.textContent).toMatch(/aren't connected correctly/i);
-    expect(status.textContent).toMatch(/rate each row/);
+    expect(status.textContent).toMatch(/the "Rater" step's output/);
     expect(status.textContent).toMatch(/write a CSV/);
     expect(status.textContent).not.toMatch(/Schema contract violation/);
     // The verbatim dump survives behind the expander for the engineer read.
@@ -254,7 +258,7 @@ describe("PipelineValidationSummary", () => {
     render(<PipelineValidationSummary />);
     const status = screen.getByRole("status");
     expect(status.textContent).toMatch(/aren't connected correctly/i);
-    expect(status.textContent).toMatch(/rate each row/);
+    expect(status.textContent).toMatch(/the "Rater" step's output/);
     expect(status.textContent).toMatch(/write a CSV/);
     expect(status.textContent).not.toMatch(/Schema contract violation/);
     expect(screen.getByText("Technical details")).toBeInTheDocument();
@@ -489,6 +493,70 @@ describe("PipelineValidationSummary", () => {
     expect(status.textContent).not.toMatch(/the "write a CSV" step's output/i);
   });
 
+  // ── elspeth-9f21f3c57d: the session-2e0c8ea3 banner names the real steps ──
+  it("names both real steps for compiled edge ids when the composition carries descriptions (session 2e0c8ea3)", () => {
+    useSessionStore.setState({
+      compositionState: makeComposition(1, {
+        sources: {},
+        nodes: [
+          {
+            id: "fan_out",
+            node_type: "gate",
+            plugin: null,
+            input: "source",
+            on_success: null,
+            on_error: null,
+            options: {},
+            condition: "row.kind == 'colour'",
+            description: "Send each colour down both branches.",
+          },
+          {
+            id: "recommend_pairing",
+            node_type: "transform",
+            plugin: "llm",
+            input: "fan_out",
+            on_success: null,
+            on_error: null,
+            options: {},
+            description: "Ask the LLM for a complementary colour pairing for this colour.",
+          },
+        ],
+        outputs: [],
+      }),
+    } as never);
+    const rawDump =
+      "Schema contract violation: edge 'config_gate_fan_out_5176d9a61403' → 'transform_recommend_pairing_5176d9a61403'\n" +
+      "  Consumer (llm) requires fields: ['colour']\n" +
+      "  Producer (gate) guarantees: ['kind']\n" +
+      "  Missing fields: ['colour']";
+    setValidation({
+      is_valid: false,
+      checks: [],
+      errors: [
+        {
+          component_id: "transform_recommend_pairing_5176d9a61403",
+          component_type: "transform",
+          message: rawDump,
+          suggestion: null,
+        },
+      ],
+      warnings: [],
+    });
+    render(<PipelineValidationSummary />);
+    const status = screen.getByRole("status");
+    // Compiled ids strip back to the composer nodes, whose descriptions name
+    // the steps — never the old "this step" / "rate each row" mislabels.
+    expect(status.textContent).toContain(
+      'the "Send each colour down both branches" step\'s output',
+    );
+    expect(status.textContent).toContain(
+      'what "Ask the LLM for a complementary colour pairing for this colour" expects',
+    );
+    expect(status.textContent).not.toMatch(/"this step"/);
+    expect(status.textContent).not.toMatch(/rate each row/);
+    expect(screen.getByText("Technical details")).toBeInTheDocument();
+  });
+
   it("humanises the edge-contract preflight dump (Edge contract violation between producer node …)", () => {
     // web/execution/validation.py _format_edge_contract_failure format.
     const rawDump =
@@ -512,7 +580,7 @@ describe("PipelineValidationSummary", () => {
     render(<PipelineValidationSummary />);
     const status = screen.getByRole("status");
     expect(status.textContent).toMatch(/aren't connected correctly/i);
-    expect(status.textContent).toMatch(/rate each row/);
+    expect(status.textContent).toMatch(/the "Rater" step's output/);
     expect(status.textContent).toMatch(/write a CSV/);
     expect(status.textContent).not.toMatch(/Edge contract violation/);
     expect(screen.getByText("Technical details")).toBeInTheDocument();

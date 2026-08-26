@@ -10,7 +10,11 @@ import { useAuditReadinessStore } from "./auditReadinessStore";
 import { useAuthStore } from "./authStore";
 import type { ValidationResult } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
-import { humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
+import {
+  humaniseValidationMessage,
+  makePhraseFor,
+  stepPrefixPhrase,
+} from "@/lib/validationHumaniser";
 import {
   characterisePendingControls,
   pendingControlsInstruction,
@@ -126,12 +130,12 @@ function validationFingerprint(result: ValidationResult | null): string | null {
  * Format one validation finding as a novice-register chat bullet
  * (elspeth-d9e5d157cb). Routes the raw backend message through the SHARED
  * humaniser and drops the engineer-grade "[type] id:" internal-id prefix the
- * old injection leaked verbatim. Prefixes the plain step name only when the
- * finding is attributed to a resolvable component AND was passed through
- * un-humanised (a humanised contract headline already names its steps) —
- * mirrors formatFindingBody (elspeth-901a404926). Interpretation-review-pending
- * findings never reach here (handled by isPendingInterpretationReviewResult
- * above), so no stepLabelFor is needed.
+ * old injection leaked verbatim. Prefixes the plain step name exactly when
+ * the SHARED stepPrefixPhrase (the same decision formatFindingBody renders
+ * from — elspeth-901a404926 / elspeth-9f21f3c57d) says the prefix adds a
+ * name the headline lacks. Interpretation-review-pending findings never
+ * reach here (handled by isPendingInterpretationReviewResult above), so no
+ * stepLabelFor is needed.
  *
  * `componentType` is the SAME finding's structured `component_type` —
  * required (not optional) so this can't silently drop the hint that lets
@@ -145,9 +149,9 @@ function humanisedValidationBullet(
   phraseFor: (componentId: string | null, componentType?: string | null) => string,
 ): string {
   const finding = humaniseValidationMessage(message, phraseFor);
-  const attributed = finding.raw === null && componentId !== null;
-  return attributed
-    ? `- **${phraseFor(componentId, componentType)}:** ${finding.headline}`
+  const prefix = stepPrefixPhrase(finding, componentId, componentType, phraseFor);
+  return prefix !== null
+    ? `- **${prefix}:** ${finding.headline}`
     : `- ${finding.headline}`;
 }
 
