@@ -70,9 +70,6 @@ from elspeth.web.composer.tools.generation import (
 from elspeth.web.composer.tools.outputs import (
     TOOLS_IN_MODULE as _OUTPUTS_TOOLS_IN_MODULE,
 )
-from elspeth.web.composer.tools.recipes import (
-    TOOLS_IN_MODULE as _RECIPES_TOOLS_IN_MODULE,
-)
 from elspeth.web.composer.tools.secrets import (
     TOOLS_IN_MODULE as _SECRETS_TOOLS_IN_MODULE,
 )
@@ -95,7 +92,6 @@ _REGISTERED_TOOLS: Final[tuple[ToolDeclaration, ...]] = (
     *_SOURCES_TOOLS_IN_MODULE,
     *_SESSIONS_TOOLS_IN_MODULE,
     *_GENERATION_TOOLS_IN_MODULE,
-    *_RECIPES_TOOLS_IN_MODULE,
     *_TRANSFORMS_TOOLS_IN_MODULE,
     *_OUTPUTS_TOOLS_IN_MODULE,
     *_SECRETS_TOOLS_IN_MODULE,

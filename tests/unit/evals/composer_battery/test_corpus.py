@@ -121,7 +121,7 @@ def test_corpus_version_matches_every_scenario() -> None:
 
 @pytest.fixture(scope="module")
 def tool_context():
-    """Real builtin catalog + trained-operator policy view — the same wiring tests/unit/web/composer/test_recipes.py uses."""
+    """Real builtin catalog + trained-operator policy view — the same wiring the composer policy tests use."""
     from elspeth.plugins.infrastructure.manager import PluginManager
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.catalog.service import CatalogServiceImpl

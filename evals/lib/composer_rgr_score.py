@@ -51,7 +51,7 @@ scoring):
       Boolean. AMBER if no get_plugin_schema invocation precedes the
       first state-mutating tool call (set_source, set_output,
       upsert_node, set_pipeline, set_source_from_blob,
-      apply_pipeline_recipe). A get_plugin_schema call that fires
+      set_pipeline). A get_plugin_schema call that fires
       ONLY after a rejection still earns an AMBER — the discover-first
       signal requires the schema lookup before the first mutation.
 
@@ -485,7 +485,6 @@ _MUTATING_TOOL_NAMES: frozenset[str] = frozenset(
         "patch_source_options",
         "patch_node_options",
         "patch_output_options",
-        "apply_pipeline_recipe",
         "set_metadata",
     }
 )

@@ -810,15 +810,3 @@ export interface WireStageData {
   blockers: Array<Record<string, unknown>>;
   can_confirm: boolean;
 }
-
-/**
- * CI mirror for Python `SlotType` (`src/elspeth/web/composer/recipes.py`).
- * Not imported by application code — its members are read by the
- * cross-language drift check `scripts/cicd/check_slot_type_cross_language.py`
- * via regex. Removing this interface breaks the CI smoke test
- * `tests/unit/scripts/cicd/test_check_slot_type_cross_language.py`.
- * Recipe decisions render through `KnobSchema`.
- */
-export interface RecipeSlotInput {
-  slot_type: "blob_id" | "str" | "float" | "int" | "str_list";
-}

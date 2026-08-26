@@ -189,7 +189,6 @@ class PathScore:
     audited_provider_calls: int
     deviations: list[Deviation]
     review_rounds: int
-    recipe_used: bool
     is_valid: bool | None
     state: dict[str, Any] | None
     state_empty: bool
@@ -223,7 +222,6 @@ class Score:
     excess: int
     deviations: list[Deviation]
     review_rounds: int
-    recipe_used: bool
     green: bool
     red: bool
     is_valid: bool | None
@@ -268,7 +266,6 @@ def _discovery_key(call: ToolCall) -> tuple[Any, ...]:
         "get_pipeline_state",
         "get_audit_info",
         "get_expression_grammar",
-        "list_recipes",
         "list_models",
         "list_sources",
         "list_transforms",
@@ -395,12 +392,10 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
     seen_discovery: set[tuple[Any, ...]] = set()
     patched: set[tuple[str, str]] = set()
     pending_failed: _Event | None = None
-    applied_any = applied_set_pipeline = blob_created = recipe_used = False
+    applied_any = applied_set_pipeline = blob_created = False
     for ev in events:
         name, args = ev.call.name, ev.call.arguments
         digest = _digest(args)
-        if name == "apply_pipeline_recipe":
-            recipe_used = True
         if is_discovery_tool(name):
             key = _discovery_key(ev.call)
             if key in seen_discovery:
@@ -456,7 +451,7 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
                 deviations.append(Deviation("schema_fumble", (ev.turn_seq, ev.row_seq), name, digest, (), ev.audit_ordinal))
             patched.add(tkey)
         applied_any = True
-        applied_set_pipeline = applied_set_pipeline or name in {"set_pipeline", "apply_pipeline_recipe"}
+        applied_set_pipeline = applied_set_pipeline or name == "set_pipeline"
         seen_discovery.clear()  # a mutation licenses a fresh read
     attempted_any = any(is_mutation_tool(e.call.name) and e.call.name not in _DATA_TOOLS for e in events)
     if pending_failed is not None:
@@ -541,7 +536,6 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
         audited_provider_calls=len(calls),
         deviations=deviations,
         review_rounds=len(capture.reviews),
-        recipe_used=recipe_used,
         is_valid=is_valid,
         state=dict(state) if state is not None else None,
         state_empty=state_empty,
@@ -576,7 +570,6 @@ def _excluded_path(kind: str, evidence: str, *, repeat: int) -> PathScore:
         audited_provider_calls=0,
         deviations=[],
         review_rounds=0,
-        recipe_used=False,
         is_valid=None,
         state=None,
         state_empty=True,
@@ -674,7 +667,6 @@ def judge(scenario: Scenario, path: PathScore) -> Score:
         excess=excess,
         deviations=deviations,
         review_rounds=path.review_rounds,
-        recipe_used=path.recipe_used,
         green=green,
         red=red,
         is_valid=path.is_valid,

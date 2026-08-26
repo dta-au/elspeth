@@ -53,7 +53,7 @@ from elspeth.web.composer.guided_blob_refs import (
     reviewed_source_is_blob_bound,
 )
 from elspeth.web.composer.pipeline_proposal import PipelineProposal
-from elspeth.web.composer.recipes import ReviewedOutputProjectionConflict, reviewed_output_projection_conflict
+from elspeth.web.composer.reviewed_output_projection import ReviewedOutputProjectionConflict, reviewed_output_projection_conflict
 from elspeth.web.composer.state import CompositionState, NodeSpec
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 

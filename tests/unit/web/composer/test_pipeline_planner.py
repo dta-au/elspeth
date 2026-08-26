@@ -725,7 +725,6 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
         "get_plugin_assistance",
         "get_plugin_schema",
         "list_models",
-        "list_recipes",
         "list_sinks",
         "list_sources",
         "list_transforms",
@@ -3089,7 +3088,6 @@ _DISCOVERY_TEST_ARGUMENTS: Mapping[str, Mapping[str, Any]] = {
     "get_plugin_assistance": {"plugin_type": "source", "plugin_name": "csv"},
     "get_plugin_schema": {"plugin_type": "source", "name": "csv"},
     "list_models": {},
-    "list_recipes": {},
     "list_sinks": {},
     "list_sources": {},
     "list_transforms": {},
@@ -8328,21 +8326,21 @@ async def test_aid_supplied_tools_stay_in_the_palette_after_a_discovery_turn(
     """F3/F5: aid-supplied keys keep their parity tools advertised.
 
     Every other supplied key drops its tool from the follow-up palette
-    (list_recipes below proves the drop rule still fires); list_models and
+    (get_audit_info below proves the drop rule still fires); list_models and
     get_expression_grammar stay because the aid channel supplied their
     content and the tools remain the parity/oversize escape.
     """
     completion = _ScriptedCompletion(
-        _response(("list_recipes", {})),
+        _response(("get_audit_info", {})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
     )
 
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
 
     first_names = {tool["function"]["name"] for tool in completion.requests[0]["tools"]}
-    assert {"list_recipes", "list_models", "get_expression_grammar"} <= first_names
+    assert {"get_audit_info", "list_models", "get_expression_grammar"} <= first_names
     second_names = {tool["function"]["name"] for tool in completion.requests[1]["tools"]}
-    assert "list_recipes" not in second_names
+    assert "get_audit_info" not in second_names
     assert {"list_models", "get_expression_grammar"} <= second_names
 
 
@@ -8969,7 +8967,7 @@ async def test_durable_attempt_trail_preserves_seven_step_planner_history(
 ) -> None:
     completion = _ScriptedCompletion(
         _response(("list_sources", {})),
-        _response(("list_recipes", {})),
+        _response(("get_audit_info", {})),
         _response(("list_models", {})),
         _response(("get_expression_grammar", {})),
         _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),

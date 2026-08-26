@@ -1294,7 +1294,7 @@ def _mutation_result(
     mutating tool gets it from the identifiers it already reports — node ids,
     source component ids, and sink names — with no per-tool wiring.
     ``full_replacement`` suppresses that echo for the whole-document authoring
-    tools (``set_pipeline`` / ``apply_pipeline_recipe``): there every component
+    tools (``set_pipeline``): there every component
     is affected, so the echo would be the whole-state read it exists to
     replace, and the model already holds those bytes verbatim in the call it
     just made.

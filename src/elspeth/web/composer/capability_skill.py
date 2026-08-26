@@ -23,7 +23,6 @@ PLANNER_DISCOVERY_TOOL_NAMES: Final[tuple[str, ...]] = (
     "get_plugin_assistance",
     "get_plugin_schema",
     "list_models",
-    "list_recipes",
     "list_sinks",
     "list_sources",
     "list_transforms",

@@ -48,7 +48,7 @@ Classify the user's latest request before acting.
 | Request type | First move |
 | --- | --- |
 | Build, edit, or validate a pipeline | Identify planned plugins; load missing schemas; mutate state; preview or surface review cards. |
-| Ask about plugins, options, recipes, models, secrets, or audit | Use the relevant discovery tool, then answer from its result. |
+| Ask about plugins, options, models, secrets, or audit | Use the relevant discovery tool, then answer from its result. |
 | Ask what happened in a past run | Use Landscape/run-analysis tools outside this composer skill; do not mutate pipeline state. |
 | Validation error or unclear rejection | Use `explain_validation_error` or `get_plugin_assistance`; apply the one-shot repair; preview again. |
 | Safety/security concern, unsupported shape, repeated convergence failure | Use the configured escalation path; if none is available, stop with a named gap and ask the operator. |
@@ -197,9 +197,9 @@ The web composer already sends tool JSON Schemas with the model request. Use
 tools for real work, not for memorising signatures.
 
 <!-- BEGIN AUTOGEN: tool-inventory (generate_skill_inventory.py) -->
-- **Discovery:** `list_sources`, `get_plugin_schema`, `get_expression_grammar`, `get_plugin_assistance`, `get_audit_info`, `list_models`, `list_recipes`, `list_transforms`, `list_sinks`
+- **Discovery:** `list_sources`, `get_plugin_schema`, `get_expression_grammar`, `get_plugin_assistance`, `get_audit_info`, `list_models`, `list_transforms`, `list_sinks`
 - **State / preview:** `get_pipeline_state` (for full state, omit the component argument or use full, all, pipeline, or the empty string), `preview_pipeline`, `diff_pipeline`
-- **Build / edit:** `set_source`, `patch_source_options`, `clear_source`, `set_source_from_blob`, `set_pipeline`, `apply_pipeline_recipe`, `upsert_node`, `splice_transform`, `upsert_edge`, `remove_node`, `remove_edge`, `set_metadata`, `patch_node_options`, `set_output`, `remove_output`, `patch_output_options`
+- **Build / edit:** `set_source`, `patch_source_options`, `clear_source`, `set_source_from_blob`, `set_pipeline`, `upsert_node`, `splice_transform`, `upsert_edge`, `remove_node`, `remove_edge`, `set_metadata`, `patch_node_options`, `set_output`, `remove_output`, `patch_output_options`
 - **Diagnostics:** `explain_validation_error`, `request_advisor_hint`, `request_interpretation_review`
 - **Blobs:** `list_blobs`, `list_composer_blobs`, `get_blob_metadata`, `get_blob_content`, `create_blob`, `update_blob`, `delete_blob`, `wire_blob_inline_ref`, `set_source_from_blobs`, `inspect_source`
 - **Secrets:** `list_secret_refs`, `validate_secret_ref`, `wire_secret_ref`
@@ -891,6 +891,5 @@ Before any `set_pipeline` call containing interpretation requirements, check:
 - The selected cleanup plugin's schema-defined projection/removal option is enabled.
 - Its configured retained-field set excludes raw content, fingerprint, credential, and private intermediate fields.
 
-Use `apply_pipeline_recipe` when `list_recipes` returns a recipe that matches the
-requested shape. If no recipe matches a complex multi-path shape, use advisor
-help when available before hand-authoring.
+For a complex multi-path shape, use advisor help when available before
+hand-authoring.

@@ -27,7 +27,6 @@ describe("read-only / mutating membership", () => {
     "list_transforms",
     "list_sinks",
     "list_models",
-    "list_recipes",
     "list_sessions",
     "get_plugin_schema",
     "get_plugin_assistance",

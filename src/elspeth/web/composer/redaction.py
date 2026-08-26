@@ -1667,14 +1667,11 @@ class CreateBlobArgumentsModel(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# set_pipeline / apply_pipeline_recipe argument models.
+# set_pipeline argument model.
 #
-# set_pipeline is the atomic full-state mutation; apply_pipeline_recipe is the
-# recipe-scaffolded variant that delegates to set_pipeline after composing the
-# arguments from operator-supplied slot values.  Both are promoted to type-
-# driven manifest entries here; the inner ``_execute_set_pipeline`` call from
-# apply_pipeline_recipe also re-validates the recipe-built args because the
-# handler is the single validation site (rev-3 N7 / rev-4 M1).
+# set_pipeline is the atomic full-state mutation, promoted to a type-driven
+# manifest entry here; the handler is the single validation site (rev-3 N7 /
+# rev-4 M1).
 #
 # Field-shape decisions:
 #   * ``source.options`` IS ``Sensitive[dict]`` with the same summarizer
@@ -1816,8 +1813,7 @@ class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
     produces a recoverable ``_failure_result`` with a repair hint that the
     LLM can act on, whereas a Pydantic-level rejection would surface as a
     bare ARG_ERROR with no repair guidance.  Two channels for two failure
-    shapes (type vs semantic) — same pattern as
-    ``apply_pipeline_recipe`` empty-``recipe_name`` handling.
+    shapes (type vs semantic).
     """
 
     blob_id: str | None = None
@@ -2042,61 +2038,6 @@ class _PipelineMetadataModel(BaseModel):
 
     name: str | None = None
     description: str | None = None
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class ApplyPipelineRecipeArgumentsModel(BaseModel):
-    """Redaction-bearing argument model for the ``apply_pipeline_recipe`` tool.
-
-    Mirrors the JSON schema declared at ``tools.py:1462-1485`` and its
-    ``required: ["recipe_name", "slots"]``.  ``apply_pipeline_recipe``
-    delegates to :func:`_execute_set_pipeline` after composing the
-    full-pipeline arguments from operator-supplied slot values; that
-    inner call goes through :class:`SetPipelineArgumentsModel` so the
-    recipe-built args receive the same validation discipline as a
-    hand-authored ``set_pipeline`` call.
-
-    Sensitive marker on ``slots``
-    -----------------------------
-    Recipe slots routinely carry:
-      * filesystem paths (e.g., ``output_path: "outputs/results.jsonl"``),
-      * secret-ref names (e.g., ``api_key_secret: "OPENROUTER_API_KEY"``),
-      * blob references (UUID strings, e.g., ``source_blob_id``),
-      * LLM prompt templates (e.g., ``classifier_template``).
-
-    Marking ``slots`` :class:`Sensitive` with
-    :func:`_summarize_set_source_options` collapses the dict to the
-    canonical-JSON shape summary. The summarizer is reused (NOT a
-    recipe-specific one) for the same structural reasons as
-    :class:`_PipelineNodeModel.options`: recipe slots may carry paths,
-    secret names, blob ids, or prompt templates, so scalar values are not
-    persisted. A future recipe-shape-aware summarizer may preserve more
-    non-sensitive structure.
-
-    Empty-string semantic check on ``recipe_name``
-    ----------------------------------------------
-    The Pydantic model accepts ``recipe_name: str`` including the empty
-    string.  The handler at :func:`_execute_apply_pipeline_recipe`
-    re-checks for emptiness AFTER Pydantic validation and produces a
-    repair-hinting ``_failure_result`` ("Call list_recipes to discover
-    available recipes") rather than a bare ``ToolArgumentError``.  We
-    deliberately do NOT use ``Field(min_length=1)`` here: the
-    repair-hint message is recoverable LLM feedback, whereas a
-    ``ValidationError`` for ``min_length`` would surface as an ARG_ERROR
-    with the generic envelope text and no recipe-discovery guidance.
-    Two channels for two failure shapes (type vs semantic) — same
-    pattern as :class:`SetSourceArgumentsModel` plugin-not-in-catalog
-    handling.
-
-    ``extra="forbid"`` is required (rev-2 M.1).  Fields belonging to
-    neighbouring tools (e.g., ``source``, ``nodes`` on ``set_pipeline``)
-    are intentionally absent so ``extra="forbid"`` rejects misrouted
-    argument shapes early.
-    """
-
-    recipe_name: str
-    slots: _LlmJsonObject
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2677,21 +2618,6 @@ _LIST_MODELS_REASON = HandlesNoSensitiveDataReason(
         "Response is a provider summary or model-id list scoped by the provider filter; "
         "model identifiers are public catalogue values published by the LLM providers "
         "themselves, and the handler never includes API keys, completions, or PII."
-    ),
-)
-
-
-_LIST_RECIPES_REASON = HandlesNoSensitiveDataReason(
-    sensitive_data_locations=("pipeline recipe registry — named recipe declarations bundled at packaging time",),
-    why_arguments_safe=(
-        "list_recipes accepts no arguments — the JSON schema at tools.py:1466 declares "
-        "an empty properties object with empty required, so the LLM cannot place any "
-        "value on this surface; the handler enumerates the static recipe registry."
-    ),
-    why_responses_safe=(
-        "Response is the static recipe registry (recipe_name + slot schema per recipe) "
-        "produced by list_recipes(); recipes are bundled scaffolds composed at packaging "
-        "time and contain no operator slot values — only the slot-schema declarations."
     ),
 )
 
@@ -3353,7 +3279,7 @@ _INSPECT_SOURCE_REASON = HandlesNoSensitiveDataReason(
 # Declarative manifest entries — _BLOB_MUTATION_TOOLS
 # remaining, 2 tools).
 #
-# Excluding create_blob / update_blob / set_source_from_blob / apply_pipeline_recipe,
+# Excluding create_blob / update_blob / set_source_from_blob,
 # ``delete_blob`` and ``wire_blob_inline_ref`` remain in
 # ``_BLOB_MUTATION_TOOLS``. They take scalar identifiers / field paths and
 # return structural ToolResult payloads.
@@ -3582,10 +3508,6 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
             argument_model=SetPipelineArgumentsModel,
             response_model=_ToolResultResponseModel,
         ),
-        "apply_pipeline_recipe": ToolRedaction(
-            argument_model=ApplyPipelineRecipeArgumentsModel,
-            response_model=_ToolResultResponseModel,
-        ),
         # option-patch tools.
         "patch_source_options": ToolRedaction(
             argument_model=PatchSourceOptionsArgumentsModel,
@@ -3646,12 +3568,6 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
             policy=ToolRedactionPolicy(
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_LIST_MODELS_REASON,
-            )
-        ),
-        "list_recipes": ToolRedaction(
-            policy=ToolRedactionPolicy(
-                handles_no_sensitive_data=True,
-                handles_no_sensitive_data_reason_struct=_LIST_RECIPES_REASON,
             )
         ),
         "get_audit_info": ToolRedaction(
