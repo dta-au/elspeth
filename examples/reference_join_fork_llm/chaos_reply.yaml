@@ -1,0 +1,28 @@
+# ChaosLLM config for the reply branch of the reference_join_fork_llm example.
+#
+# Error injection is set to ZERO on purpose. This example teaches a DAG shape —
+# enrich, fork to two model calls, coalesce — and a stochastic fault would make
+# the exit code and the row count depend on a coin flip. The chaosllm_sentiment
+# and chaosllm_endurance examples are where fault handling is exercised.
+
+server:
+  host: "127.0.0.1"
+  port: 8202
+  workers: 1
+
+metrics:
+  database: "file:chaosllm-metrics-reply?mode=memory&cache=shared"
+
+response:
+  mode: preset
+  preset:
+    file: examples/reference_join_fork_llm/reply_responses.jsonl
+    selection: sequential
+
+latency:
+  base_ms: 10
+  jitter_ms: 5
+
+error_injection:
+  burst:
+    enabled: false
