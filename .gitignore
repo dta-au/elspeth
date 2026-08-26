@@ -427,3 +427,4 @@ findings.jsonl
 .playwright-cli/
 output/playwright/
 test-results/.last-run.json
+.claude/settings.json
