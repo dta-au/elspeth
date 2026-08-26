@@ -116,7 +116,24 @@ _CHECK_PLUGINS = RUNTIME_CHECK_PLUGIN_INSTANTIATION
 _CHECK_VALUE_SOURCE_COMPLIANCE = CHECK_VALUE_SOURCE_COMPLIANCE
 _CHECK_GRAPH = RUNTIME_CHECK_GRAPH_STRUCTURE
 _CHECK_SCHEMA = RUNTIME_CHECK_SCHEMA_COMPATIBILITY
-assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA)
+# The local aliases must stay the canonical runtime-check tuple, in order: the
+# names are positional in `RUNTIME_GRAPH_VALIDATION_CHECKS`, so a reordering is
+# as much a drift as a substitution and neither shows up at the use sites.
+#
+# The message names BOTH SIDES rather than leaving a bare comparison
+# (elspeth-37941f1731). Without it this read `assert A == B` and a failure said
+# only that two tuples differed — not which alias moved, nor what it moved to,
+# which is the whole of what the reader needs. Deliberately still an `assert`:
+# the sibling constant in `preflight.py` is re-derived independently by
+# `test_validation.py`, so unlike the two Tier-1 guards this is
+# defence-in-depth, and converting it is a separate decision.
+assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA), (
+    "RUNTIME_GRAPH_VALIDATION_CHECKS drifted from this module's aliases. "
+    f"canonical={RUNTIME_GRAPH_VALIDATION_CHECKS!r}, "
+    f"aliases=({_CHECK_PLUGINS!r}, {_CHECK_GRAPH!r}, {_CHECK_SCHEMA!r}); "
+    f"differing positions: {[i for i, (a, b) in enumerate(zip(RUNTIME_GRAPH_VALIDATION_CHECKS, (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA), strict=False)) if a != b]}. "
+    "Realign the aliases with preflight.RUNTIME_GRAPH_VALIDATION_CHECKS, or update both together."
+)
 
 
 def _execution_ready() -> ValidationReadiness:

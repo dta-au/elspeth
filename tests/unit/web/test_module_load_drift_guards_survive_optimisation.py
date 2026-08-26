@@ -50,8 +50,12 @@ import elspeth
 _SRC_ROOT = Path(elspeth.__file__).resolve().parent.parent
 
 
-def _run_patched_module_under_O(module_path: Path, old: str, new: str) -> subprocess.CompletedProcess[str]:
-    """Import ``module_path``'s source with ``old`` replaced by ``new``, under ``-O``.
+def _run_patched_module(module_path: Path, old: str, new: str, *, optimised: bool) -> subprocess.CompletedProcess[str]:
+    """Import ``module_path``'s source with ``old`` replaced by ``new`` in a subprocess.
+
+    ``optimised`` selects ``python -O``. The ``-O`` runs prove a guard SURVIVES
+    optimisation; an unoptimised run is how a guard's FAILURE MESSAGE is
+    captured, since the message only exists when the guard actually fires.
 
     The module source is read from the live tree, patched in memory, and
     executed under a genuinely optimised interpreter. Nothing on disk is
@@ -74,11 +78,12 @@ def _run_patched_module_under_O(module_path: Path, old: str, new: str) -> subpro
     driver = textwrap.dedent(
         """
         import importlib.util, sys
-        assert sys.flags.optimize > 0, "probe must run optimised or it proves nothing"
-        try:
-            assert False  # noqa: B011, PT015
-        except AssertionError:  # pragma: no cover - would mean -O was not honoured
-            raise SystemExit("assert statements are still live; -O was not honoured")
+        if len(sys.argv) > 3 and sys.argv[3] == "require-optimised":
+            assert sys.flags.optimize > 0, "probe must run optimised or it proves nothing"
+            try:
+                assert False  # noqa: B011, PT015
+            except AssertionError:  # pragma: no cover - would mean -O was not honoured
+                raise SystemExit("assert statements are still live; -O was not honoured")
         source = sys.stdin.read()
         spec = importlib.util.spec_from_file_location(sys.argv[1], sys.argv[2])
         module = importlib.util.module_from_spec(spec)
@@ -88,7 +93,15 @@ def _run_patched_module_under_O(module_path: Path, old: str, new: str) -> subpro
         """
     )
     return subprocess.run(
-        [sys.executable, "-O", "-c", driver, module_name, str(module_path)],
+        [
+            sys.executable,
+            *(["-O"] if optimised else []),
+            "-c",
+            driver,
+            module_name,
+            str(module_path),
+            "require-optimised" if optimised else "unoptimised",
+        ],
         input=patched,
         capture_output=True,
         text=True,
@@ -118,10 +131,11 @@ def test_the_probe_itself_runs_optimised() -> None:
 def test_audit_flagged_determinism_drift_still_fails_under_optimisation() -> None:
     """A stale determinism exclusion must not silently un-flag an audited transform."""
     module_path = _SRC_ROOT / "elspeth" / "web" / "audit_readiness" / "service.py"
-    result = _run_patched_module_under_O(
+    result = _run_patched_module(
         module_path,
         old="        Determinism.IO_WRITE,\n",
         new='        Determinism.IO_WRITE,\n        "stale_determinism_that_drifted",  # type: ignore[arg-type]\n',
+        optimised=True,
     )
 
     assert result.returncode != 0, (
@@ -139,10 +153,11 @@ def test_audit_flagged_determinism_drift_still_fails_under_optimisation() -> Non
 def test_guided_step_coverage_drift_still_fails_under_optimisation() -> None:
     """A GuidedStep with no skill file must not be silently dropped from the composed skill."""
     module_path = _SRC_ROOT / "elspeth" / "web" / "composer" / "guided" / "prompts.py"
-    result = _run_patched_module_under_O(
+    result = _run_patched_module(
         module_path,
         old='    GuidedStep.STEP_4_WIRE: "step_4_wire.md",\n',
         new="",
+        optimised=True,
     )
 
     assert result.returncode != 0, (
@@ -155,3 +170,40 @@ def test_guided_step_coverage_drift_still_fails_under_optimisation() -> None:
         f"the import failed, but not with the drift guard's own message naming the missing step; "
         f"the failure may be unrelated. stderr={result.stderr!r}"
     )
+
+
+def test_the_runtime_check_alias_guard_names_what_drifted() -> None:
+    """A guard that fires with no message tells the reader nothing.
+
+    ``web/execution/validation.py`` pins its local check-name aliases against
+    the canonical ``RUNTIME_GRAPH_VALIDATION_CHECKS``. It carried NO message at
+    all, so a failure reported only that two tuples differed — not which alias
+    moved, nor what it moved to, which is the whole of what a reader needs
+    (elspeth-37941f1731, census site 6).
+
+    Deliberately NOT converted to a raise: the sibling constant is
+    independently re-derived by ``test_validation.py``, making this
+    defence-in-depth rather than sole enforcement, and converting it is a
+    separate decision this lane declined. So this runs UNOPTIMISED — the point
+    is the message the guard emits when it fires, not whether it survives
+    ``-O``.
+
+    Exercises the REAL module's message. An earlier draft of this test rebuilt
+    the comparison and its f-string inline and asserted on that — which is a
+    tautology: it would have passed with the source's message deleted, because
+    it was testing its own copy. Injecting the drift and reading the actual
+    ``AssertionError`` is what makes it a test of the guard.
+    """
+    module_path = _SRC_ROOT / "elspeth" / "web" / "execution" / "validation.py"
+    result = _run_patched_module(
+        module_path,
+        old="_CHECK_PLUGINS = RUNTIME_CHECK_PLUGIN_INSTANTIATION\n",
+        new='_CHECK_PLUGINS = "plugins_moved_here"\n',
+        optimised=False,
+    )
+
+    assert result.returncode != 0, f"the alias drift guard did not fire at all. stdout={result.stdout!r}"
+    stderr = result.stderr
+    assert "plugins_moved_here" in stderr, f"the message does not name the drifted value: {stderr!r}"
+    assert "differing positions: [0]" in stderr, f"the message does not locate the drift: {stderr!r}"
+    assert "RUNTIME_GRAPH_VALIDATION_CHECKS" in stderr, f"the message does not name the canonical authority: {stderr!r}"
