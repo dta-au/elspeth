@@ -20,7 +20,7 @@ import re
 import warnings
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args, get_origin
 from urllib.parse import urlparse
 
 import yaml
@@ -34,6 +34,11 @@ from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_MAX_TOTAL_RECORDS,
     validate_content_namespace,
     validate_credential_free_identifier,
+)
+from elspeth.contracts.emitted_option import (
+    ENV_VAR_REFERENCE_PATTERN,
+    emitted_option_fields,
+    env_placeholders_in,
 )
 from elspeth.contracts.enums import OutputMode, RunMode
 from elspeth.contracts.freeze import deep_thaw
@@ -2419,10 +2424,10 @@ class ElspethSettings(BaseModel):
 
 
 # Regex pattern for ${VAR} or ${VAR:-default} syntax
-_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-_ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS = {
-    "report_assemble": frozenset({"join_with", "title"}),
-}
+# The expansion authority, shared with every check that exists to pre-empt it.
+# Defined once in contracts so the guard cannot guard a different language than
+# the one _expand_env_vars actually substitutes.
+_ENV_VAR_PATTERN = ENV_VAR_REFERENCE_PATTERN
 
 
 def _expand_env_vars(config: dict[str, Any]) -> dict[str, Any]:
@@ -2639,64 +2644,145 @@ def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -
     return raw_config
 
 
-def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mapping[str, object]) -> None:
-    """Reject env placeholders in plugin options that render into artifacts.
+def _plugin_bearing_sections() -> dict[str, str]:
+    """Return ``{section_name: container_shape}`` for every plugin-bearing section.
 
-    Some plugin options are user-visible presentation fields rather than secret
-    references. Reject their raw ``${VAR}`` syntax before the loader expands it,
-    so later plugin validation cannot be bypassed by replacing the marker with
-    a host secret value.
+    DERIVED from ``ElspethSettings`` rather than listed. A section is
+    plugin-bearing when its entries carry both ``plugin`` and ``options``; the
+    shape is ``"dict"`` (name -> entry) or ``"list"``.
 
-    Covers every section that can host a transform-registry plugin:
-    ``transforms``, ``aggregations`` and ``collectors``. Collectors reuse the
-    batch-transform plugin contract, so ``report_assemble`` — the one plugin in
-    the forbidden map — is authorable as a collector and was reachable through
-    exactly this path (elspeth-bc1b2c2959): a collector's ``title: ${VAR}`` was
-    expanded and persisted verbatim into the audit record, while the identical
-    option on a transform was rejected here.
-
-    This guard is NOT redundant with ``_fingerprint_config_for_audit``. That
-    redactor is heuristic on the option NAME, so a presentation field like
-    ``title`` never trips it; containment for these fields exists only here,
-    upstream of expansion.
-
-    ``sources``/``sinks`` are NOT walked, and that exclusion is KNOWN-FALSE
-    rather than deliberate. It was originally justified on the grounds that
-    those sections host the source and sink registries, disjoint from the
-    transform registry the forbidden map is keyed on. That reasoning is the
-    wrong question: what matters is whether the option VALUE reaches row data
-    or an artifact, not which registry the plugin came from. ``csv.headers``
-    falsifies it by execution — its ``{field: display_name}`` mapping is
-    written as the artifact's header row, so a ``${VAR}`` there becomes a host
-    environment value in customer-facing output bytes. Do not read this
-    exclusion as clearance for sinks; it stands only until elspeth-8f0a6b3391
-    replaces the hand-maintained map with a derived one.
+    The previous hand-written tuple omitted whichever section was added last —
+    ``collectors`` first (elspeth-bc1b2c2959), and ``sources``/``sinks``
+    permanently, on a registry argument that ``csv.headers`` falsified
+    (elspeth-8f0a6b3391). Discovering the sections removes that failure mode
+    rather than correcting one instance of it.
     """
-    for collection_name in ("transforms", "aggregations", "collectors"):
-        collection = raw_config[collection_name] if collection_name in raw_config else None
-        if type(collection) is not list:
+    sections: dict[str, str] = {}
+    for name in ElspethSettings.model_fields:
+        annotation = ElspethSettings.model_fields[name].annotation
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+        if origin is dict and len(args) == 2:
+            element, shape = args[1], "dict"
+        elif origin is list and args:
+            element, shape = args[0], "list"
+        else:
             continue
-        for index, plugin_config in enumerate(collection):
-            if type(plugin_config) is not dict:
+        if not (isinstance(element, type) and issubclass(element, BaseModel)):
+            continue
+        if "plugin" in element.model_fields and "options" in element.model_fields:
+            sections[name] = shape
+    return sections
+
+
+def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str]]]:
+    """Return ``{option_name: [(plugin_kind, reason), ...]}`` declared for ``plugin_name``.
+
+    Unioned across all three registries, deliberately, because there is no
+    name-to-kind lookup: the registries are three disjoint maps, and ``csv``,
+    ``json``, ``aws_s3``, ``azure_blob``, ``dataverse``, ``text`` and ``llm``
+    each name a plugin in more than one of them.
+
+    Classifying the section instead — "``sinks`` means look in the sink
+    registry" — would reintroduce a hand-maintained fact whose failure mode is
+    a SILENT FAIL-OPEN: a section mapped to the wrong kind reads the wrong
+    declarations, forbids nothing, and reports success. Unioning fails the
+    other way. A dual-kind name may import a sibling's restriction and refuse a
+    placeholder that would have been harmless, which is loud, happens at config
+    load, and is fixed in one line. For a security control those two residuals
+    are directions, not a trade-off.
+
+    The lookup is by membership rather than by catching a not-found error, so a
+    missing plugin is an ordinary absence here. An unregistered name is left
+    alone: naming a plugin that does not exist is a different error, reported
+    later by the plugin factory with better context than this guard could give.
+    """
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    manager = get_shared_plugin_manager()
+    registries: tuple[tuple[str, list[Any]], ...] = (
+        ("source", list(manager.get_sources())),
+        ("transform", list(manager.get_transforms())),
+        ("sink", list(manager.get_sinks())),
+    )
+
+    declared: dict[str, list[tuple[str, str]]] = {}
+    for kind, plugin_classes in registries:
+        for plugin_class in plugin_classes:
+            if plugin_class.name != plugin_name:
                 continue
-            plugin_name = plugin_config["plugin"] if "plugin" in plugin_config else None
-            if not isinstance(plugin_name, str):
+            for option_name, reason in emitted_option_fields(plugin_class.get_config_model()).items():
+                declared.setdefault(option_name, []).append((kind, reason))
+    return declared
+
+
+def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mapping[str, object]) -> None:
+    """Reject env placeholders in plugin options whose value is written to output.
+
+    Some plugin options are not references or selectors — their literal value is
+    rendered into row data or into an artifact's bytes. Reject their raw
+    ``${VAR}`` before the loader expands it, so the plugin's own validation
+    cannot be bypassed by handing it an already-expanded host value.
+
+    DERIVED, NOT RESTATED. Both the sections and the forbidden fields come from
+    the system's own declarations: the sections from ``ElspethSettings``, and
+    the fields from the :class:`~elspeth.contracts.emitted_option.EmittedToOutput`
+    markers on each plugin's config model — the same declarations the plugin's
+    own validator enforces. This function names no plugin and no option.
+
+    It replaced a hand-maintained ``{plugin: {field, ...}}`` map that held ONE
+    plugin and two fields, and was therefore a no-op for every other plugin.
+    ``truncate.suffix`` and ``csv.headers`` both reached artifact bytes through
+    the gap (elspeth-8f0a6b3391), and ``collectors`` was not walked at all
+    (elspeth-bc1b2c2959). The two artifacts agreed only by luck: one declarer,
+    one map entry.
+
+    This guard is NOT redundant with the plugin-side validator. On the CLI/YAML
+    path ``_expand_env_vars`` runs first, so the plugin validator sees a clean
+    expanded string that no longer matches ``${...}``. Nor is it redundant with
+    ``_fingerprint_config_for_audit``, which matches on the option NAME and so
+    never trips on a presentation field like ``title``.
+
+    Raises:
+        ValueError: An option declared ``EmittedToOutput`` holds an env
+            placeholder. The message names the declaring plugin kind, because a
+            union across registries can refuse a source option on a sink's
+            declaration and an unexplained refusal is worse than the refusal.
+    """
+    for section_name, shape in sorted(_plugin_bearing_sections().items()):
+        section = raw_config[section_name] if section_name in raw_config else None
+        if shape == "dict":
+            entries: list[tuple[object, object]] = list(section.items()) if type(section) is dict else []
+        else:
+            entries = list(enumerate(section)) if type(section) is list else []
+
+        for entry_key, entry in entries:
+            if type(entry) is not dict:
                 continue
-            forbidden_fields = _ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS.get(plugin_name.lower())
-            if not forbidden_fields:
+            plugin_name = entry["plugin"] if "plugin" in entry else None
+            options = entry["options"] if "options" in entry else None
+            if not isinstance(plugin_name, str) or type(options) is not dict:
                 continue
-            options = plugin_config["options"] if "options" in plugin_config else None
-            if type(options) is not dict:
-                continue
-            for option_name in sorted(forbidden_fields):
-                value = options[option_name] if option_name in options else None
-                if not isinstance(value, str) or not _ENV_VAR_PATTERN.search(value):
+
+            declarations = _declared_emitted_options(plugin_name)
+            for option_name in sorted(declarations):
+                if option_name not in options or not env_placeholders_in(options[option_name]):
                     continue
-                raw_name = plugin_config["name"] if "name" in plugin_config else index
+                sources = declarations[option_name]
+                reason = "; ".join(f"as a {kind} plugin, {why}" for kind, why in sources)
+                shared = ""
+                if len({kind for kind, _ in sources}) > 1:
+                    shared = (
+                        f" The name {plugin_name!r} is registered as more than one plugin kind "
+                        f"({', '.join(sorted(kind for kind, _ in sources))}) and this option is declared "
+                        f"emitted by more than one of them, so the restriction applies here regardless of "
+                        f"which kind this section resolves to."
+                    )
                 raise ValueError(
-                    f"{collection_name}[{raw_name!r}] {plugin_name} option {option_name!r} "
-                    "must not contain environment-variable placeholders before env expansion; "
-                    f"{plugin_name} emits this option in user-visible report output"
+                    f"{section_name}[{entry_key!r}] {plugin_name} option {option_name!r} "
+                    f"must not contain environment-variable placeholders before env expansion: "
+                    f"{reason}.{shared} Env expansion runs before plugin validation on this path, so the "
+                    f"placeholder would be replaced by the host value and written out verbatim."
                 )
 
 

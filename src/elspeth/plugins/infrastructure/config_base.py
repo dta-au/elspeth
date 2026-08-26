@@ -16,14 +16,38 @@ Example usage:
 
 import json
 from pathlib import Path
-from typing import Any, ClassVar, Final, Literal, Self
+from typing import Annotated, Any, ClassVar, Final, Literal, Self
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from elspeth.contracts.emitted_option import (
+    EmittedToOutput,
+    emitted_option_fields,
+    env_placeholders_in,
+)
 from elspeth.contracts.header_modes import HeaderMode, parse_header_mode
 from elspeth.contracts.schema import FIELD_TYPE_MAP, SchemaConfig
 
 OutputCollisionPolicy = Literal["fail_if_exists", "auto_increment", "append_or_create"]
+
+# The header-mode option, shared by every sink that writes a header row.
+#
+# Declared once as an annotated alias rather than spelled out per sink. The
+# three declaring models do NOT share a base — ``SinkPathConfig`` descends from
+# ``LocalFileSinkConfig`` while the S3 and Azure sink configs descend straight
+# from ``DataPluginConfig`` — so there is no inherited field to mark, and
+# marking each site by hand is the drift shape this alias exists to prevent.
+# A mixin would unify them but reorders fields in ``model_json_schema()``
+# (inherited fields sort first), which is wire-shape churn for no behavioural
+# gain; the alias changes no emitted schema at all.
+#
+# The CUSTOM mapping form's VALUES are written as the artifact's header row, so
+# a ``${VAR}`` here reaches output bytes as a host environment value
+# (elspeth-8f0a6b3391).
+HeaderModeOption = Annotated[
+    str | dict[str, str] | None,
+    EmittedToOutput("a sink writes these names as the artifact's header row, so the value reaches the output bytes"),
+]
 
 # --- Composer-surface help text -------------------------------------------
 #
@@ -237,6 +261,25 @@ class PluginConfig(BaseModel):
         Error messages use 'schema' to match the user-facing alias.
         """
         return _validate_schema_config(value, require_dict=False)
+
+    @model_validator(mode="after")
+    def _reject_env_placeholders_in_emitted_options(self) -> Self:
+        """Refuse a raw ``${VAR}`` in any field declared :class:`EmittedToOutput`.
+
+        DERIVED, not restated: the fields come from the model's own annotations,
+        so a plugin declares the fact once on the field and gets this check for
+        free. Nothing here lists a plugin or a field name.
+
+        This is the plugin-side half. It is BYPASSABLE on the CLI/YAML path,
+        where ``_expand_env_vars`` runs before plugin validation and hands this
+        validator an already-expanded host value that no longer matches. The
+        pre-expansion guard in the settings loader closes that window and reads
+        the same declarations. Neither is redundant; both derive from here.
+        """
+        for field_name, reason in emitted_option_fields(type(self)).items():
+            if env_placeholders_in(getattr(self, field_name)):
+                raise ValueError(f"{field_name} must not contain environment-variable placeholders; {reason}")
+        return self
 
     @classmethod
     def from_dict(
@@ -604,7 +647,7 @@ class SinkPathConfig(LocalFileSinkConfig):
 
     _plugin_component_type: ClassVar[str | None] = "sink"
 
-    headers: str | dict[str, str] | None = Field(
+    headers: HeaderModeOption = Field(
         default=None,
         description=("Header output mode: 'normalized', 'original', or {field: header} mapping"),
     )

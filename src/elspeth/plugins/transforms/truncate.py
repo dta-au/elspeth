@@ -7,12 +7,13 @@ If the source outputs wrong types, the transform crashes immediately.
 """
 
 import copy
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -31,7 +32,10 @@ class TruncateConfig(TransformDataConfig):
         default_factory=dict,
         description="Mapping of field names to maximum lengths",
     )
-    suffix: str = Field(
+    suffix: Annotated[
+        str,
+        EmittedToOutput("truncate appends this to every truncated value, so it lands in row data and in every downstream artifact"),
+    ] = Field(
         default="",
         description="Suffix to append when truncating (e.g., '...'). Counts toward max length.",
     )

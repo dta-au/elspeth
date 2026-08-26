@@ -10,13 +10,13 @@ flush window and the next flush emits a sibling report.
 from __future__ import annotations
 
 import html
-import re
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
@@ -39,13 +39,11 @@ _REPORT_METADATA_FIELDS = frozenset(
     }
 )
 
+
 # ``title`` and ``join_with`` are rendered into user-visible report output. A
 # ``${VAR}`` placeholder there would be expanded from the host environment (on
 # the operator CLI loader path) and copied into a downloadable artifact, so
 # these presentation fields reject env-var references outright.
-_ENV_VAR_REFERENCE_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}")
-
-
 class ReportAssembleConfig(TransformDataConfig):
     """Configuration for the report_assemble transform."""
 
@@ -55,8 +53,14 @@ class ReportAssembleConfig(TransformDataConfig):
         default="plain_text",
         description="Output rendering format: 'plain_text' for newline-joined text, 'markdown' for # title prefix, or 'html_fragment' for <h1>/<p> block elements (escaped).",
     )
-    join_with: str = Field(default="\n", description="Separator used between input rows")
-    title: str | None = Field(default=None, description="Optional report title")
+    join_with: Annotated[
+        str,
+        EmittedToOutput("report_assemble writes this separator between rows in the user-visible report body"),
+    ] = Field(default="\n", description="Separator used between input rows")
+    title: Annotated[
+        str | None,
+        EmittedToOutput("report_assemble renders this as the report's title in user-visible output"),
+    ] = Field(default=None, description="Optional report title")
 
     @field_validator("text_field", "output_field")
     @classmethod
@@ -71,16 +75,6 @@ class ReportAssembleConfig(TransformDataConfig):
     def _validate_output_identifier(cls, value: str) -> str:
         if not value.isidentifier():
             raise ValueError(f"output_field must be a valid Python identifier, got {value!r}")
-        return value
-
-    @field_validator("join_with", "title")
-    @classmethod
-    def _reject_env_ref_placeholders(cls, value: str | None, info: Any) -> str | None:
-        if value is not None and _ENV_VAR_REFERENCE_PATTERN.search(value):
-            raise ValueError(
-                f"{info.field_name} must not contain environment-variable placeholders; "
-                "report_assemble emits this value in user-visible report output"
-            )
         return value
 
     @model_validator(mode="after")

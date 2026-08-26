@@ -48,7 +48,11 @@ from elspeth.contracts.sink_effects import (
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSink
-from elspeth.plugins.infrastructure.config_base import DataPluginConfig, validate_headers_value
+from elspeth.plugins.infrastructure.config_base import (
+    DataPluginConfig,
+    HeaderModeOption,
+    validate_headers_value,
+)
 from elspeth.plugins.infrastructure.display_headers import (
     apply_display_headers,
     get_effective_display_headers,
@@ -217,7 +221,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
         default_factory=CSVWriteOptions,
         description="CSV writing options (delimiter, encoding, include_header)",
     )
-    headers: str | dict[str, str] | None = Field(
+    headers: HeaderModeOption = Field(
         default=None,
         description="Header output mode: 'normalized', 'original', or {field: header} mapping",
     )

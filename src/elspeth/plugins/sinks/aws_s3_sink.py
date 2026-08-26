@@ -45,7 +45,11 @@ from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.infrastructure.base import BaseSink
-from elspeth.plugins.infrastructure.config_base import DataPluginConfig, validate_headers_value
+from elspeth.plugins.infrastructure.config_base import (
+    DataPluginConfig,
+    HeaderModeOption,
+    validate_headers_value,
+)
 from elspeth.plugins.infrastructure.display_headers import (
     apply_display_headers,
     get_effective_display_headers,
@@ -127,7 +131,7 @@ class AWSS3SinkConfig(DataPluginConfig):
     format: Literal["csv", "json", "jsonl"] = Field(default="csv", description="S3 object data format")
     overwrite: bool = Field(default=True, description="Allow replacement of an existing S3 object")
     csv_options: CSVWriteOptions = Field(default_factory=CSVWriteOptions, description="CSV writing options")
-    headers: str | dict[str, str] | None = Field(
+    headers: HeaderModeOption = Field(
         default=None,
         description="Normalized, original, or custom output headers",
     )

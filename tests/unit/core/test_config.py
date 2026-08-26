@@ -3815,117 +3815,232 @@ class TestAuditRedactionSectionCoverage:
         )
 
 
-class TestEnvPlaceholderGuardSectionCoverage:
-    """Reflection pin: the pre-expansion guard must cover every plugin-bearing section.
+class TestEnvPlaceholderGuardIsDerived:
+    """The pre-expansion guard must enforce every plugin-side declaration.
 
-    ``_reject_sensitive_plugin_env_placeholders_before_expansion`` is the ONLY
-    containment for presentation options like ``report_assemble.title``. The
-    audit redactor cannot substitute for it: that redactor is heuristic on the
-    option NAME, so a field called ``title`` never trips it. So a section
-    missing from this guard leaks the expanded host value into the durable
-    audit record with nothing downstream to catch it.
+    ``_reject_sensitive_plugin_env_placeholders_before_expansion`` is the only
+    containment for an option whose VALUE is written into row data or artifact
+    bytes. The plugin's own validator cannot be that containment on the
+    CLI/YAML path: ``_expand_env_vars`` runs first, so the validator is handed a
+    clean expanded host value that no longer matches ``${...}``.
 
-    That is not hypothetical either. The guard iterated ``transforms`` and
-    ``aggregations`` only, while ``collectors`` reuse the same batch-transform
-    plugin contract — so a collector's ``title: ${VAR}`` was expanded and
-    persisted verbatim into ``runs.settings_json``, while the identical option
-    on a transform was rejected at load (elspeth-bc1b2c2959).
+    It used to hold a hand-maintained ``{plugin: {field, ...}}`` map with ONE
+    entry, making it a no-op for every other plugin — ``truncate.suffix`` and
+    ``csv.headers`` both reached artifact bytes through that gap, and
+    ``sources``/``sinks`` were not walked at all (elspeth-8f0a6b3391). The map
+    and the plugin-side validators agreed only by luck.
 
-    As with the redactor pin, the sections are DISCOVERED rather than listed,
-    and the assertion is behavioural: plant a placeholder in a forbidden field
-    and require a rejection.
+    Both halves now derive from one declaration: the sections from
+    ``ElspethSettings``, the fields from ``EmittedToOutput`` markers on the
+    plugin config models. These tests assert the DERIVATION holds end to end —
+    every declaration in the tree is enforced by the loader — rather than
+    checking a list of today's plugins, which is the shape that reproduced the
+    defect each time it was added to.
     """
 
-    @classmethod
-    def _plugin_bearing_sections(cls) -> dict[str, str]:
-        """Return ``{section_name: container_shape}`` for sections hosting plugins.
+    PLACEHOLDER = "${ELSPETH_TEST_HOST_VALUE}"
 
-        A plugin-bearing section is one whose entries carry BOTH ``plugin`` and
-        ``options`` — the shape the forbidden-field map is keyed against.
+    @staticmethod
+    def _registered_plugins() -> list[tuple[str, str, type]]:
+        """Return ``(kind, name, plugin_class)`` for every registered plugin."""
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        manager = get_shared_plugin_manager()
+        return [
+            (kind, plugin_class.name, plugin_class)
+            for kind, plugin_classes in (
+                ("source", manager.get_sources()),
+                ("transform", manager.get_transforms()),
+                ("sink", manager.get_sinks()),
+            )
+            for plugin_class in plugin_classes
+        ]
+
+    def test_bare_get_config_model_never_raises_for_any_registered_plugin(self) -> None:
+        """Standing precondition of the union-across-registries lookup.
+
+        The guard has no plugin-name-to-kind lookup — the registries are three
+        disjoint maps and ``csv``, ``json``, ``aws_s3``, ``azure_blob``,
+        ``dataverse``, ``text`` and ``llm`` each name a plugin in more than one.
+        So it asks EVERY registry about a name, which means calling
+        ``get_config_model()`` on plugins that are not the one in use.
+
+        A plugin whose bare call raised would therefore break config load for a
+        section that has nothing to do with it. Nothing raises today; this pin
+        keeps that a property rather than a coincidence, because the plugin that
+        breaks it will be added by someone who never read this ticket.
         """
-        from elspeth.core.config import ElspethSettings
+        plugins = self._registered_plugins()
 
-        sections: dict[str, str] = {}
-        for name in ElspethSettings.model_fields:
-            shape, element_models = TestAuditRedactionSectionCoverage._classify(ElspethSettings.model_fields[name].annotation)
-            for element_model in element_models:
-                if "plugin" in element_model.model_fields and "options" in element_model.model_fields:
-                    sections[name] = shape
-        return sections
-
-    def test_transform_registry_sections_are_exactly_the_list_shaped_ones(self) -> None:
-        """Pin the CURRENT guard scope so a new plugin-bearing section forces a decision.
-
-        WARNING — this assertion records what the guard does today, NOT a
-        finding that the sources/sinks exclusion is safe. Read no clearance
-        into it.
-
-        The exclusion was originally justified here on the grounds that
-        ``sources`` and ``sinks`` host the source and sink registries, disjoint
-        from the transform registry the forbidden map is keyed on. **That
-        justification is FALSE** — falsified by execution, not by review.
-        ``csv.headers`` takes a ``{field: display_name}`` mapping whose values
-        are written as the artifact's header row, so a ``${VAR}`` in a sink
-        option reaches customer-facing output bytes as a host environment
-        value. Which registry the plugin came from was never the question; the
-        question is whether the option value reaches row data or an artifact.
-
-        The exclusion stands only because widening the assertion while the
-        policy itself stays a one-entry hand-map would relocate the wrong
-        rationale rather than remove it. elspeth-8f0a6b3391 inverts that
-        dependency — plugins declare, the guard derives — and this assertion
-        is rewritten there, in the same change as the behaviour.
-        """
-        sections = self._plugin_bearing_sections()
-
-        assert {name for name, shape in sections.items() if shape == "dict"} == {"sources", "sinks"}, (
-            f"Plugin-bearing dict-shaped sections changed: {sections}. Decide whether the new section can host a transform-registry plugin."
+        assert len(plugins) > 20, (
+            f"Positive control: registry discovery returned only {len(plugins)} plugins. "
+            f"The registry is populated lazily, so an empty or partial walk would make every "
+            f"assertion in this class pass while testing nothing."
         )
+
+        raised = []
+        for kind, name, plugin_class in plugins:
+            try:
+                plugin_class.get_config_model()
+            except Exception as exc:  # noqa: BLE001 - reporting the failure IS the assertion
+                raised.append(f"{kind}/{name}: {type(exc).__name__}: {exc}")
+
+        assert not raised, (
+            f"Plugins whose bare get_config_model() raises: {raised}. "
+            f"The pre-expansion env guard calls this on every registry that knows a name, so one "
+            f"raising plugin breaks config load for unrelated sections. Give it a bare-callable "
+            f"config model; do not make the guard swallow the error."
+        )
+
+    def test_guard_walks_every_plugin_bearing_section(self) -> None:
+        """Sections are discovered, and sources/sinks are no longer excluded.
+
+        This assertion previously pinned a deliberate sources/sinks exclusion,
+        justified on the registries being disjoint from the transform registry
+        the forbidden map was keyed on. That justification was false —
+        ``csv.headers`` writes its mapping values as the artifact's header row —
+        and with the map gone there is no registry to be disjoint from.
+        """
+        from elspeth.core.config import _plugin_bearing_sections
+
+        sections = _plugin_bearing_sections()
+
+        assert set(sections) == {"sources", "sinks", "transforms", "collectors", "aggregations"}, (
+            f"Plugin-bearing sections changed: {sections}. The guard walks whatever this discovers, "
+            f"so a new section is covered automatically — but confirm its entries really do carry "
+            f"plugin options rather than merely resembling the shape."
+        )
+        assert sections["sources"] == "dict" and sections["sinks"] == "dict"
         assert {name for name, shape in sections.items() if shape == "list"} == {
             "transforms",
             "collectors",
             "aggregations",
-        }, (
-            f"Plugin-bearing list-shaped sections changed: {sections}. "
-            f"A new one must be added to "
-            f"_reject_sensitive_plugin_env_placeholders_before_expansion."
+        }
+
+    def test_every_declared_emitted_option_is_rejected_by_the_loader(self) -> None:
+        """The end-to-end derivation pin: declaration in, rejection out.
+
+        Walks every registered plugin, takes whatever it declares
+        ``EmittedToOutput``, plants a placeholder in that option and requires
+        the loader to refuse it. Nothing here names a plugin or a field, so a
+        newly marked option is covered the moment it is declared — and a
+        declaration the guard cannot see fails loudly instead of silently
+        protecting nothing.
+        """
+        from elspeth.contracts.emitted_option import emitted_option_fields
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        declarations = [
+            (kind, name, option)
+            for kind, name, plugin_class in self._registered_plugins()
+            for option in emitted_option_fields(plugin_class.get_config_model())
+        ]
+
+        assert declarations, (
+            "Positive control: no plugin declares an EmittedToOutput option, so this test would pass without exercising the guard at all."
         )
 
-    def test_every_transform_registry_section_rejects_env_placeholders(self) -> None:
-        """No section hosting a transform-registry plugin may expand a forbidden field."""
-        from elspeth.core.config import (
-            _ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS,
-            _reject_sensitive_plugin_env_placeholders_before_expansion,
-        )
-
-        assert _ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS, (
-            "Positive control: the forbidden-field map is empty, so this test proves nothing."
-        )
-
-        sections = [name for name, shape in self._plugin_bearing_sections().items() if shape == "list"]
         failed_open = []
-        for section in sections:
-            for plugin_name, forbidden_fields in _ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS.items():
-                for option_name in sorted(forbidden_fields):
-                    raw_config = {
-                        section: [
-                            {
-                                "name": "probe",
-                                "plugin": plugin_name,
-                                "options": {option_name: "${ELSPETH_TEST_HOST_VALUE}"},
-                            }
-                        ]
-                    }
-                    try:
-                        _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
-                    except ValueError:
-                        continue
-                    failed_open.append(f"{section}[*] {plugin_name}.{option_name}")
+        for kind, name, option in declarations:
+            raw_config = {"transforms": [{"name": "probe", "plugin": name, "options": {option: self.PLACEHOLDER}}]}
+            try:
+                _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+            except ValueError:
+                continue
+            failed_open.append(f"{kind}/{name}.{option}")
 
         assert not failed_open, (
-            f"Sections that EXPAND a forbidden env placeholder instead of rejecting it: {sorted(failed_open)}. "
-            f"The expanded host value reaches the durable audit record, and the audit redactor "
-            f"cannot catch it because it matches on the option name."
+            f"Options declared EmittedToOutput that the loader guard does NOT reject: {sorted(failed_open)}. "
+            f"The declaration and the guard have come apart, which is the exact failure the derivation "
+            f"exists to make impossible."
+        )
+
+    def test_the_guard_is_not_a_one_plugin_map_in_disguise(self) -> None:
+        """Mutation guard: enforcement must reach beyond the original entry.
+
+        The retired map held ``report_assemble`` alone. A regression that
+        rebuilds a narrow hand-map — or a derivation that silently resolves only
+        the plugin it was first tested against — would still pass a test that
+        checks ``report_assemble`` and nothing else.
+        """
+        from elspeth.core.config import _declared_emitted_options
+
+        enforced = {
+            name
+            for kind, name, _option in [
+                (kind, name, option)
+                for kind, name, plugin_class in self._registered_plugins()
+                for option in _declared_emitted_options(name)
+            ]
+        }
+
+        assert "report_assemble" in enforced, "Positive control: the original declarer is no longer enforced."
+        assert enforced - {"report_assemble"}, (
+            f"Only report_assemble is enforced ({enforced}). The guard has regressed to the single-entry "
+            f"hand-map that let truncate.suffix and csv.headers reach artifact bytes."
+        )
+
+    def test_rejection_message_names_the_declaring_kind(self) -> None:
+        """A union across registries can refuse a source option on a sink's declaration.
+
+        The cost of having no name-to-kind lookup is a refusal that can look
+        arbitrary. It must not also be unexplained: the message carries the
+        declaring kind and the declared reason, so an operator can see why.
+        """
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        raw_config = {
+            "sinks": {"out": {"plugin": "csv", "options": {"headers": {"body": self.PLACEHOLDER}}}},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+
+        message = str(exc_info.value)
+        assert "as a sink plugin" in message, f"Message does not name the declaring kind: {message}"
+        assert "header row" in message, f"Message does not carry the declared reason: {message}"
+        assert "sinks['out']" in message and "'headers'" in message, message
+
+    def test_mapping_valued_options_are_scanned_not_just_strings(self) -> None:
+        """``csv.headers`` leaks through the MAPPING form, not the string form.
+
+        A top-level ``isinstance(value, str)`` check — what the guard did before
+        — walks straight past ``{field: display_name}``, which is exactly the
+        shape whose values are written as the artifact's header row.
+        """
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        for label, headers in (
+            ("mapping value", {"body": self.PLACEHOLDER}),
+            ("mapping key", {self.PLACEHOLDER: "Body"}),
+            ("bare string", self.PLACEHOLDER),
+        ):
+            with pytest.raises(ValueError):
+                _reject_sensitive_plugin_env_placeholders_before_expansion(
+                    {"sinks": {"out": {"plugin": "csv", "options": {"headers": headers}}}}
+                )
+
+    def test_clean_values_are_still_accepted(self) -> None:
+        """Negative control: the guard must reject placeholders, not the option."""
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        _reject_sensitive_plugin_env_placeholders_before_expansion(
+            {
+                "sinks": {"out": {"plugin": "csv", "options": {"headers": {"body": "Body"}}}},
+                "transforms": [{"name": "t", "plugin": "truncate", "options": {"suffix": "..."}}],
+            }
+        )
+
+    def test_unregistered_plugin_names_are_left_to_the_plugin_factory(self) -> None:
+        """An unknown plugin is a different error, reported with better context.
+
+        The guard must not turn "no such plugin" into its own message, and must
+        not crash on the lookup either.
+        """
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        _reject_sensitive_plugin_env_placeholders_before_expansion(
+            {"transforms": [{"name": "t", "plugin": "no_such_plugin", "options": {"title": self.PLACEHOLDER}}]}
         )
 
 

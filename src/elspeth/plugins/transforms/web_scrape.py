@@ -27,6 +27,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.audit import Call
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
@@ -180,7 +181,10 @@ class WebScrapeConfig(TransformDataConfig):
         default="markdown",
         description="Content extraction format to emit: markdown, plain text, or raw HTML.",
     )
-    text_separator: str = Field(
+    text_separator: Annotated[
+        str,
+        EmittedToOutput("web_scrape joins DOM text nodes with this separator, so the value becomes part of the scraped row data"),
+    ] = Field(
         default=" ",
         min_length=1,
         max_length=16,

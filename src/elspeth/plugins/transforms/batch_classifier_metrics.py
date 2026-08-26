@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import SchemaConfig
@@ -104,7 +105,13 @@ class BatchClassifierMetricsConfig(TransformDataConfig):
 
     actual_field: str = Field(description="Name of the field containing ground-truth labels")
     predicted_field: str = Field(description="Name of the field containing predicted labels")
-    positive_label: str | int | bool | None = Field(
+    positive_label: Annotated[
+        str | int | bool | None,
+        EmittedToOutput(
+            "batch_classifier_metrics writes this label back into the emitted metrics row, "
+            "and it reaches the durable audit config snapshot unconditionally"
+        ),
+    ] = Field(
         default=None,
         description="Optional positive label for binary precision/recall/F1 metrics.",
     )
