@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Literal
 
 from hypothesis import given, settings
@@ -82,6 +83,37 @@ def test_lower_model_to_knob_schema_returns_valid_schema_for_generated_models(
         assert field["kind"] in _FIELD_KINDS
         assert field["kind"] == case.expected_kind
         assert field["nullable"] is case.expected_nullable
+
+
+def test_enum_default_lowers_to_its_plain_json_value() -> None:
+    """An Enum-defaulted field must not leak the member object into the knob.
+
+    The knob schema is a wire/persisted projection: the guided turn validator
+    (`_public_json_error`) accepts only exact JSON types, so a raw StrEnum
+    member as ``default`` turns the server-built source form into a 500
+    (invariant violation). The default must lower exactly like the choice
+    set in ``_kind_for_scalar`` — to the member's plain string value.
+    """
+
+    class Format(StrEnum):
+        STANDARD = "standard"
+        STRUCTURED = "structured"
+
+    class EnumDefaultModel(BaseModel):
+        response_format: Format = Format.STANDARD
+
+    schema = lower_model_to_knob_schema(
+        EnumDefaultModel,
+        plugin_kind="property",
+        plugin_name="enum-default",
+    )
+
+    validate_knob_schema(schema, plugin_kind="property", plugin_name="enum-default")
+    (field,) = schema["fields"]
+    assert field["kind"] == "enum"
+    assert field["enum"] == ["standard", "structured"]
+    assert type(field["default"]) is str
+    assert field["default"] == "standard"
 
 
 def test_rich_shapes_lower_to_fallback_knobs_without_raising() -> None:

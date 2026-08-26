@@ -343,7 +343,14 @@ def _lower_field(
 def _attach_default(field: KnobField, info: FieldInfo) -> None:
     if info.is_required() or info.default is PydanticUndefined:
         return
-    field["default"] = info.default
+    default = info.default
+    if isinstance(default, Enum):
+        # The knob schema is a wire/persisted projection and may hold only
+        # plain JSON values (the guided turn validator rejects str subclasses,
+        # StrEnum included). Lower the member exactly as _kind_for_scalar
+        # lowers the choice set, so ``default`` stays inside ``enum``.
+        default = str(default.value)
+    field["default"] = default
 
 
 def _attach_tier(field: KnobField, info: FieldInfo) -> None:
