@@ -437,11 +437,15 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     is the whole reason the collector clause exists (comment 7911). The two
     plugin-bearing kinds then sit together.
 
-    AGGREGATION IS THE THIRD PLUGIN-HOSTING KIND, and it has a clause because
-    AGENTS.md WS6 requires every `node_type` dispatch site to carry a collector
-    arm or a deliberate documented exclusion — and under composition a second
-    true clause costs nothing, so an exclusion would have been the more
-    expensive of the two. Its field list is NOT the collector's and was
+    AGGREGATION IS THE THIRD PLUGIN-HOSTING KIND, and it has a clause on its
+    own merits: under composition a second true clause costs nothing, and an
+    author who names an aggregation needs the same thing a collector author
+    needs. Do NOT cite AGENTS.md WS6 for this, as an earlier version of this
+    docstring did — WS6 requires every `node_type` dispatch site to carry "a
+    collector arm or a deliberate documented exclusion", and the collector arm
+    above already satisfies it. (This function is not really such a dispatch
+    site either: `_message_names_identifier` is a word-boundary regex over user
+    prose, not a dispatch on `node_type`.) Its field list is NOT the collector's and was
     verified separately against `state.py`'s aggregation arm, because the
     obvious guess is wrong in both directions: an aggregation's mandatory
     fields are `plugin` and `on_error` (`aggregation_missing_plugin`,
@@ -452,10 +456,27 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     collector's "it needs A, B and C" shape would print a falsehood; the
     asymmetry is real and the clause states it.
 
-    `transform` is the fourth plugin-hosting kind and is deliberately EXCLUDED:
-    it is the DEFAULT reading of an unavailable catalog identity, so a clause
-    saying "a transform is backed by a transform plugin" teaches nothing the
-    frame has not already implied.
+    `transform` is the fourth plugin-hosting kind and is deliberately EXCLUDED,
+    but NOT for the reason an earlier version of this docstring gave. It is not
+    "the default reading" of an unavailable identity: `catalog_kind` is
+    source|transform|sink and the guard requires a non-null one, so nothing
+    defaults to transform — and when no clause fires the frame never says
+    "transform plugin" at all, so there is nothing already implied. The real
+    reason is narrower: the other clauses exist to correct a specific wrong
+    inference (a plugin-free kind mistaken for a plugin, or a plugin-bearing
+    topology kind mistaken for an ordinary transform). A transform IS an
+    ordinary transform, so there is no wrong inference to correct.
+
+    KNOWN GAPS in this arm, neither introduced here, both worth a reader's
+    caution. PLURALS silently miss: `_message_names_identifier` is
+    word-boundary, so "add collectors" and "add aggregations" emit no clause —
+    the tolerance argument above covers false POSITIVES only, and this is the
+    false negative. And the aggregation clause's "IS backed by a batch-transform
+    plugin" is enforced for a COLLECTOR at composer time
+    (`collector_plugin_not_batch_aware`) but for an aggregation only at RUN time
+    (`orchestrator/aggregation.py`) — `CompositionState.validate()` accepts an
+    aggregation whose plugin is not batch-aware. The sentence states the
+    contract correctly; the composer simply does not check that half of it.
 
     Collector is also deliberately absent from `_STRUCTURAL_NODE_TYPES` itself.
     That tuple is a copy-trigger keyword list whose sole membership rule is that
@@ -480,8 +501,8 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     if _message_names_identifier(user_message, "aggregation"):
         clauses.append(
             "An aggregation is a built-in topology node that IS backed by a batch-transform plugin, and it "
-            "needs on_error; its trigger is optional and defaults to firing once at end of source. Name the "
-            "batch behaviour you want. "
+            "needs on_error; a trigger is optional and only ADDS early flushes, because the end-of-source "
+            "flush always happens. Name the batch behaviour you want. "
         )
     message = (
         "I kept that future-stage instruction, but its structure was not verified. "

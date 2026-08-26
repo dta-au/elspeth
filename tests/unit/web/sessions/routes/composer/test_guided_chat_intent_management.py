@@ -49,8 +49,8 @@ _COLLECTOR_CLAUSE = (
 )
 _AGGREGATION_CLAUSE = (
     "An aggregation is a built-in topology node that IS backed by a batch-transform plugin, and it "
-    "needs on_error; its trigger is optional and defaults to firing once at end of source. Name the "
-    "batch behaviour you want. "
+    "needs on_error; a trigger is optional and only ADDS early flushes, because the end-of-source "
+    "flush always happens. Name the batch behaviour you want. "
 )
 _FRAME_CLOSE = "Clarify the concrete topology structure and I'll firm it up."
 _AGGREGATION_MESSAGE = "Later add an aggregation that rolls the scored rows up per customer."
@@ -312,11 +312,15 @@ def test_aggregation_gets_its_own_clause_with_its_own_field_list() -> None:
     assert "An aggregation is a built-in topology node, not a transform plugin" not in result.chat.assistant_message
 
 
-def test_all_three_plugin_bearing_and_structural_clauses_compose_in_one_frame() -> None:
+def test_both_plugin_bearing_clauses_compose_in_one_frame() -> None:
     """Two plugin-bearing kinds in one message get two clauses, one frame.
 
     Same additive property as the collector/gate pair, extended to the kind
-    added last. Ordering is structural, then collector, then aggregation.
+    added last. Named precisely: this message contains NO member of
+    `_STRUCTURAL_NODE_TYPES`, so it exercises collector + aggregation only, and
+    those are the only two plugin-bearing clauses that exist (transform is
+    deliberately excluded). The structural-before-aggregation half of the
+    stated ordering is pinned by the test below, not by this one.
     """
 
     result = _apply(
@@ -327,6 +331,30 @@ def test_all_three_plugin_bearing_and_structural_clauses_compose_in_one_frame() 
 
     assert type(result) is DeferredRequestRetained
     assert result.chat.assistant_message == _FRAME_OPEN + _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE + _FRAME_CLOSE
+    assert result.chat.assistant_message.count(_FRAME_OPEN) == 1
+    assert result.chat.assistant_message.count(_FRAME_CLOSE) == 1
+
+
+def test_structural_collector_and_aggregation_compose_in_the_stated_order() -> None:
+    """The full stated order, which no other test exercises end to end.
+
+    The docstring on `_model_catalog_identity_chat` claims clause order is
+    structural, then collector, then aggregation. Two of the three adjacencies
+    were pinned; structural-before-aggregation was not, so a reordering could
+    have moved the gate clause below the aggregation clause undetected.
+    """
+
+    result = _apply(
+        _action("rollup_stats"),
+        catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+        message=(
+            "Later add a gate that routes high-value rows, a collector to stitch the exploded pages "
+            "back together, and an aggregation to roll them up per customer."
+        ),
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.chat.assistant_message == (_FRAME_OPEN + _GATE_CLAUSE + _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE + _FRAME_CLOSE)
     assert result.chat.assistant_message.count(_FRAME_OPEN) == 1
     assert result.chat.assistant_message.count(_FRAME_CLOSE) == 1
 
