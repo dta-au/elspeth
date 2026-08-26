@@ -5,12 +5,13 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.errors import PluginContractViolation, RowErrorEntry, TransformErrorReason
 from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -92,7 +93,13 @@ class BatchOutlierAnnotatorConfig(TransformDataConfig):
     """Configuration for batch outlier annotator transform."""
 
     value_field: str = Field(description="Name of the numeric field to annotate")
-    output_prefix: str = Field(
+    output_prefix: Annotated[
+        str,
+        EmittedToOutput(
+            "batch_outlier_annotator builds its emitted annotation field NAMES from this prefix, "
+            "so the value becomes a key in row data and a column in the artifact header"
+        ),
+    ] = Field(
         default="outlier",
         description="Prefix used for emitted annotation fields",
     )

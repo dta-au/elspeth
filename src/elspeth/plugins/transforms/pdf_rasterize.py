@@ -8,7 +8,7 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, model_validator
 
@@ -16,6 +16,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.binary_documents import BINARY_DOCUMENT_MAX_BYTES, binary_document_signature_matches
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.errors import FrameworkBugError, TransformErrorReason
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -160,7 +161,13 @@ class PDFRasterizeConfig(TransformDataConfig):
             "A page with no text layer yields an empty string, not a refusal. When false, page_text_field is not emitted."
         ),
     )
-    page_text_field: str = Field(
+    page_text_field: Annotated[
+        str,
+        EmittedToOutput(
+            "pdf_rasterize uses this as the emitted FieldDefinition name for the page's text, "
+            "so the value becomes a key in row data and a column in the artifact header"
+        ),
+    ] = Field(
         default="page_text",
         min_length=1,
         max_length=256,
