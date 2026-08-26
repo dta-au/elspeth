@@ -1149,6 +1149,13 @@ class TestAwsS3SourceComposerPolicy:
         assert result.data is not None
         assert "operator profile" in result.data["error"]
         assert result.data["error_code"] == "profile_unavailable"
+        # The ENTRY-level code, not just the envelope. This is the field the
+        # planner actually reads: _rejection_entries ->
+        # _allowlisted_candidate_feedback -> rejection_codes. Envelope
+        # error_code has no server consumer at all, so a suite that pins only
+        # data["error_code"] leaves the planner-facing contract unpinned.
+        assert result.validation.errors[0].component == "rejected_mutation"
+        assert result.validation.errors[0].error_code == "profile_unavailable"
 
     def test_set_source_allows_aws_s3_for_trained_operator_session(self) -> None:
         """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
