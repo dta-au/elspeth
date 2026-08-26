@@ -8,6 +8,67 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-26 — A GREEN MEASUREMENT IS NOT A RESULT UNTIL YOU KNOW THE
+  APPARATUS RAN. Five independent instances in ONE afternoon, across four
+  sessions.** Every one produced a confident, wrong, *reassuring* answer —
+  the failure mode is not noise, it is agreement. Verify the apparatus
+  before you believe the reading:
+  - **The dirty shared checkout ACTIVELY HIDES defects, it does not merely
+    fail to show them.** `elspeth-623c69c59f`'s test reproduces ONLY at
+    pristine HEAD; in the shared checkout it PASSES, because an uncommitted
+    fix living in the tree masks it. Four people re-checked responsibly and
+    all four got a false all-clear. A pass in the shared checkout is not a
+    pass at HEAD whenever `git status` is non-empty on ANY file feeding the
+    test. Measure on a clean `git archive <sha> | tar -x` export with
+    `PYTHONPATH=<export>/src`, and assert `elspeth.__file__` resolves INTO
+    the export before trusting one number.
+  - **PROSE IS NOT PROVENANCE.** That same file carries a docstring
+    describing the fix in the PAST TENSE ("Green since `_collapse_...`
+    stopped..."), correct on doctrine, instructing future readers what to do
+    if it regresses — for a fix that has never been committed. It convinced
+    two sessions hours apart. `git log -S"<symbol>"` before believing a
+    docstring's past tense; a confident in-tree narrative is not evidence
+    the code landed.
+  - **A ZERO CAN BE A CRASH.** A trust-tier A/B exported with
+    `git archive HEAD src`, omitting `config/`, made `elspeth-lints` crash on
+    the missing allowlist and report "0 findings" on BOTH passes. Zero
+    findings and zero-because-it-died are indistinguishable in the output.
+    That gate exits 1 with a large known corpus BY DESIGN, so read it as a
+    before/after COUNT over identity SETS (line numbers stripped), never as
+    pass/fail, and never trust a zero you did not positively cause.
+  - **A HARNESS THAT NEVER LOADED THE MUTANT reports every mutation as
+    caught.** "All seven mutations passing" meant the mutant was never
+    imported. A mutation check must first prove the mutant is LIVE by
+    showing it fails something.
+  - **AGREEMENT BETWEEN TWO HAND-WRITTEN SETS READS AS CORROBORATION AND IS
+    NOT.** Twice this epic, and the second time the restatement error was
+    committed INSIDE the guard against restatement: a node-kind partition
+    comment inventoried its sibling authorities, listed two, and there were
+    three — the missed one a BYTE-IDENTICAL tuple in the same feature, edited
+    minutes earlier. It survived review because the two hand-written tuples
+    agreed with each other. Two restatements agreeing is one restatement
+    counted twice; only derivation from the single authority is evidence
+    (fixed at `3f18a95c6` — the tuple now derives from
+    `chat_solver.PLUGIN_FREE_NODE_TYPES`, mutation-verified by dropping
+    `queue` and watching the ROUTES module fail at import).
+
+  - **STRUCTURAL CONFORMANCE IS MEASURED, NOT DECLARED.** Widening a
+    `runtime_checkable` Protocol silently reclassifies every implementation
+    tree-wide with no import-time signal (`ef5e6e593` →
+    `TypeError: Unknown transform type` from the ENGINE at
+    `token_traversal.py:1091`, `elspeth-8783933d99`). ADR-032 already forbids
+    such a Protocol as a SECURITY control; this is the same mechanism as a
+    DISPATCH control. Dispatch on an owned base class or explicit
+    registration so a missing declaration fails at build, not mid-traversal.
+
+  The unifying rule, and the one worth carrying: **confirmations are where
+  this happens, because you are looking for agreement rather than for a
+  result.** Every instance above came from someone re-checking something
+  they already believed. Attribution work that used export discipline all
+  day survived; the single check that "felt like a quick confirmation" did
+  not. Apply the same rigour to the reassuring reading as to the alarming
+  one — and prefer stating "not traced" over a green you cannot account for.
+
 - **2026-08-26 — EDITING ANY PLUGIN SOURCE FILE MOVES FROZEN CORPUS BYTES.
   This is a whole-tree trap with no local symptom.** Every plugin declares a
   `source_file_hash` line, and the node audit record carries that byte, and
