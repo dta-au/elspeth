@@ -74,6 +74,24 @@ is a working document under the normal delivery posture.
     too — HEAD can move while you wait on a lock, which leaves staged blobs
     built on a stale baseline and a MATCH that was true of a tree nobody has.
 
+  - **REMOVING A VALUE CAN BLIND A NEARBY ASSERTION WHILE THE TEST STAYS
+    GREEN.** A guided fixture carried `{"tier": "'high'"}` in the predecessor
+    and `{"tier": "'priority'"}` in the replanned candidate; an assertion keyed
+    on `mapping["tier"]` discriminated on exactly that difference. Repairing the
+    incoherent pair out of BOTH sides was correct for the code and left the two
+    mappings **identical**, so the re-keyed `mapping == {"amount": "amount"}`
+    passed whether the binder carried the replan through or restored the
+    predecessor wholesale. Proven, not argued: mutating the binder to restore
+    the predecessor's node, the old form returned True and the full-options form
+    returned False. The assertion was faithful, true, and no longer looking —
+    and it reads perfectly on its own; only the two fixtures side by side show
+    it. **When a repair removes a value, check whether that value was the only
+    thing making a nearby assertion discriminate** — a removal can be
+    behaviour-preserving for the code and coverage-destroying for the test in
+    the same edit. Prefer the whole-object assertion, which cannot quietly lose
+    discriminating power when a later edit moves one field (fixed at
+    `b06c5f6dc`; the vacuous form shipped in `fe8b0cc4c`).
+
   The unifying rule, and the one worth carrying: **confirmations are where
   this happens, because you are looking for agreement rather than for a
   result.** Every instance above came from someone re-checking something
