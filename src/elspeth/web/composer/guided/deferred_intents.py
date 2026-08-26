@@ -29,6 +29,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.expression_parser import ExpressionParser, ExpressionSecurityError, ExpressionSyntaxError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
+from elspeth.web.composer._producer_resolver import published_success_connection
 from elspeth.web.composer.guided.connection_consumers import ConsumerIdentity, canonical_connection_consumers
 from elspeth.web.composer.guided.errors import GuidedSolverResponseShapeError, InvariantError
 from elspeth.web.composer.guided.stage_subjects import (
@@ -1925,7 +1926,17 @@ class _DeferredCoverageContext:
         else:
             node = next(item for item in self.candidate.nodes if item.id == component.name)
             if edge_type == "on_success":
-                connections = {node.on_success} if node.on_success is not None else set()
+                # DERIVED, not restated. A node that omits ``on_success``
+                # because it publishes under its own id still HAS a success
+                # edge, and ``self.consumers`` is keyed by ``node.input`` so it
+                # already holds that id. Reading ``node.on_success`` alone
+                # returned an empty successor set for a real edge, which an
+                # ``EdgeRouteConstraint`` asserting ABSENCE then read as
+                # satisfied -- a false accept on "must not route to" -- while
+                # ``exclusively_reached_gate`` read it as a dead end and
+                # rejected valid stated-predicate pipelines.
+                published = published_success_connection(node)
+                connections = {published} if published is not None else set()
             elif edge_type == "on_error":
                 connections = {node.on_error} if node.on_error is not None else set()
             elif edge_type in {"route_true", "route_false"}:

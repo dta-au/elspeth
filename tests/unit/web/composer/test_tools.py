@@ -12300,6 +12300,162 @@ class TestPreviewPipeline:
         assert source_to_t1["satisfied"] is True
         assert result.data["is_valid"] is True
 
+    def test_reserved_connection_names_covers_every_implicit_self_publisher(self) -> None:
+        """A repair branch may not be minted onto a name an implicit publisher owns.
+
+        ``_reserved_connection_names`` read ``node.on_success`` directly, so a
+        node publishing under its OWN id contributed nothing. The hole only
+        opens for a DANGLING one — a consumed publisher's id arrives via its
+        consumer's ``input``, and a queue's id is always its own ``input`` —
+        which is exactly why it survived: every ordinary pipeline hides it.
+
+        Enumerated FROM ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES`` so a fourth
+        node kind cannot skip this site, and so the partial fix (restating the
+        set as coalesce+aggregation) fails here.
+        """
+        from elspeth.web.composer._producer_resolver import _IMPLICIT_SELF_PUBLISHING_NODE_TYPES, published_success_connection
+        from elspeth.web.composer.tools._common import _reserved_connection_names
+
+        for kind in sorted(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES):
+            publisher = NodeSpec(
+                id="publisher",
+                node_type=kind,
+                plugin="batch_stats" if kind == "aggregation" else None,
+                # A queue's input IS its own id; the others consume upstream.
+                input="publisher" if kind == "queue" else "feed_out",
+                on_success=None,
+                on_error="main" if kind == "aggregation" else None,
+                options={"schema": {"mode": "observed"}} if kind == "aggregation" else {},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"only": "feed_out"} if kind == "coalesce" else None,
+                policy="all" if kind == "coalesce" else None,
+                merge="row_union" if kind == "coalesce" else None,
+                **({"trigger": {"count": 2}} if kind == "aggregation" else {}),
+            )
+            assert published_success_connection(publisher) == "publisher", kind
+            state = (
+                _empty_state()
+                .with_source(
+                    SourceSpec(
+                        plugin="csv",
+                        on_success="rows",
+                        options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                        on_validation_failure="discard",
+                    )
+                )
+                .with_node(
+                    NodeSpec(
+                        id="feeder",
+                        node_type="transform",
+                        plugin="passthrough",
+                        input="rows",
+                        on_success="feed_out",
+                        on_error="main",
+                        options={"schema": {"mode": "observed"}},
+                        condition=None,
+                        routes=None,
+                        fork_to=None,
+                        branches=None,
+                        policy=None,
+                        merge=None,
+                    )
+                )
+                .with_node(publisher)
+                .with_output(OutputSpec(name="main", plugin="json", options={"schema": {"mode": "observed"}}, on_write_failure="discard"))
+            )
+            assert "publisher" in _reserved_connection_names(state), (
+                f"A dangling '{kind}' publishing under its own id is not a reserved connection name, so a "
+                "repair branch can be minted onto it. Applying that repair introduces a fresh "
+                "duplicate_connection_producer — the planner's own repair breaks the pipeline. "
+                "Ask published_success_connection; do not restate the set here."
+            )
+
+    def test_duplicate_consumer_repair_does_not_mint_a_branch_onto_a_publisher_id(self) -> None:
+        """The consequence, end to end: the repair must not create a new error.
+
+        Measured before the fix on this exact shape — the generated branch
+        name collided with the dangling aggregation's id and applying the
+        suggestion produced:
+
+            Duplicate producer for connection 'shared_to_t1':
+            aggregation 'shared_to_t1' and gate 'fork_shared' fork 'shared_to_t1'
+
+        One error in, a different error out, with the planner having done
+        exactly what it was told.
+        """
+        from elspeth.web.composer.tools._common import _graph_repair_suggestions
+
+        def _passthrough(node_id: str, input_label: str, on_success: str) -> NodeSpec:
+            return NodeSpec(
+                id=node_id,
+                node_type="transform",
+                plugin="passthrough",
+                input=input_label,
+                on_success=on_success,
+                on_error="main",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+
+        state = (
+            _empty_state()
+            .with_source(
+                SourceSpec(
+                    plugin="csv",
+                    on_success="shared",
+                    options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            )
+            .with_node(_passthrough("t1", "shared", "main"))
+            .with_node(_passthrough("t2", "shared", "main"))
+            .with_node(_passthrough("feeder", "shared", "agg_in"))
+            .with_node(
+                NodeSpec(
+                    # id deliberately equals the branch name the repair generates
+                    id="shared_to_t1",
+                    node_type="aggregation",
+                    plugin="batch_stats",
+                    input="agg_in",
+                    on_success=None,
+                    on_error="main",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    trigger={"count": 2},
+                )
+            )
+            .with_output(OutputSpec(name="main", plugin="json", options={"schema": {"mode": "observed"}}, on_write_failure="discard"))
+        )
+
+        validation = state.validate()
+        assert any(error.error_code == "duplicate_connection_consumer" for error in validation.errors)
+
+        generated_branches: list[str] = []
+        for suggestion in _graph_repair_suggestions(state, validation):
+            for tool_call in suggestion["tool_sequence"]:
+                branches = tool_call.get("arguments", {}).get("fork_to")
+                if branches:
+                    generated_branches.extend(branches)
+
+        assert generated_branches, "the duplicate-consumer repair produced no fork branches to check"
+        assert "shared_to_t1" not in generated_branches, (
+            "The repair minted a branch named 'shared_to_t1', which is already the implicit connection id of "
+            f"the dangling aggregation of that name. Generated: {generated_branches}. Applying this repair "
+            "creates a duplicate_connection_producer the pipeline did not have."
+        )
+
     def test_preview_pipeline_suggests_fork_gate_for_duplicate_consumers(self) -> None:
         """Duplicate consumers get a copyable fork-gate repair skeleton."""
         state = (

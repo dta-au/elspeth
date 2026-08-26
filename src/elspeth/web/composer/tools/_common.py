@@ -56,6 +56,7 @@ from elspeth.plugins.infrastructure.validation import (
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._producer_resolver import published_success_connection
 from elspeth.web.composer.plugin_policy_disclosure import (
     WEB_PROHIBITED_PLUGIN_EXPLANATION,
     ProhibitedPluginDisclosure,
@@ -620,8 +621,18 @@ def _reserved_connection_names(state: CompositionState) -> set[str]:
 
     for node in state.nodes:
         names.add(node.input)
-        if node.on_success is not None:
-            names.add(node.on_success)
+        # DERIVED, not restated. An implicit self-publisher (a non-terminal
+        # coalesce, an aggregation omitting on_success, every queue) publishes
+        # under its own node id, so that id IS an occupied connection name.
+        # Reading ``node.on_success`` alone left a DANGLING one unreserved --
+        # a consumed publisher is covered by its consumer's ``input`` above,
+        # which is why the hole only opens when nothing consumes it -- and the
+        # duplicate-consumer fork repair then minted a branch name equal to
+        # that id, producing a fresh ``duplicate_connection_producer`` the
+        # moment the planner applied its own repair (elspeth-8190d4e4cf family).
+        published = published_success_connection(node)
+        if published is not None:
+            names.add(published)
         if node.on_error is not None and node.on_error != "discard":
             names.add(node.on_error)
         if node.routes is not None:
