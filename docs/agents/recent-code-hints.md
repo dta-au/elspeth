@@ -8,7 +8,28 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
-- **2026-08-26 — `except IntegrityError: raise` must come BEFORE the
+- **2026-08-27 — Stage-1 constructor probes CANNOT construct an operator-profiled
+  plugin from authored options, and for a pass-through plugin that failure votes
+  "participates with ZERO guarantees" — a permanent false reject, not a draft
+  error.** A composer llm node never carries `provider`/`endpoint`/`api_key`
+  (the operator profile injects them at LOWERING, after Stage 1), so the probe
+  failed `provider: Field required` on every llm node ever authored, and
+  `_effective_producer_vote`'s known-pass-through fail-closed arm rendered every
+  downstream required-fields consumer `guarantees: [(none)]` — the
+  elspeth-d4ae04b374 blocker, which two prior seats looked for in the coalesce
+  merge (it reproduces on a LINEAR csv→llm→consumer edge; the coalesce only
+  unions the zeros). Conventions from the fix (5d48f67c0): (a)
+  `prepare_validation_probe_options(options, plugin=...)` — `plugin` is a
+  REQUIRED keyword precisely so a new probe call site cannot silently opt out of
+  the stub injection; pass the plugin name, `None` only when genuinely unknown.
+  (b) The llm stub is provider `gateway` (logical-alias model, no local catalog
+  to reject composer model names) with `required_capabilities` DERIVED from
+  `GATEWAY_SUPPORTED_CAPABILITIES` — never restate the closed set. It is sound
+  ONLY because the llm output contract is measured provider-independent (the
+  provider instance is not even built until `on_start`); before adding a stub
+  for another operator-profiled plugin (elspeth-bc527113e7 tracks the roster),
+  prove the same independence first. (c) An authored `provider` (YAML import)
+  is left untouched — the stub fires only when `provider` is absent.
   `PayloadNotFoundError` arm, and a single-kind test cannot tell you whether
   it does.** The two payload-store errors are unrelated `Exception` siblings
   (`contracts/payload_store.py`), so a plain `IntegrityError` propagates under
