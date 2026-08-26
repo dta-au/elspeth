@@ -61,6 +61,19 @@ is a working document under the normal delivery posture.
     DISPATCH control. Dispatch on an owned base class or explicit
     registration so a missing declaration fails at build, not mid-traversal.
 
+  - **A REBUILD-AND-COMPARE CHECK PASSES HARDEST WHEN IT DID NOTHING.** The
+    stage-then-`cmp` procedure (rebuild a file from HEAD, re-apply your hunks,
+    diff the result against what you staged) is only evidence if the apparatus
+    moved. Twice in one lane `git add` failed silently on an index lock, so the
+    index still equalled HEAD, the generated patch was **0 bytes**, and `cmp`
+    printed MATCH — comparing HEAD to HEAD and reporting agreement. Under
+    contention this is the COMMON outcome, not the rare one. Any such procedure
+    must assert its own preconditions before comparing: **the patch must be
+    non-empty, and the index must differ from HEAD.** Both assertions fired on
+    the runs that had silently done nothing. Re-verify against the CURRENT HEAD
+    too — HEAD can move while you wait on a lock, which leaves staged blobs
+    built on a stale baseline and a MATCH that was true of a tree nobody has.
+
   The unifying rule, and the one worth carrying: **confirmations are where
   this happens, because you are looking for agreement rather than for a
   result.** Every instance above came from someone re-checking something
