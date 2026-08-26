@@ -74,6 +74,25 @@ elspeth run --settings examples/<name>/settings.yaml --execute
   tree and returns a *confidently wrong* answer, not an error. Use
   `PYTHONPATH=<worktree>/src <venv>/bin/python -m pytest ...` and verify
   `elspeth.__file__` points into the worktree before trusting a single result.
+- **`<worktree>/src` ALONE IS NOT ENOUGH — it silently leaves `elspeth_lints`
+  resolving to the MAIN checkout.** `elspeth_lints` lives in a *separate source
+  root* (`elspeth-lints/src/`), so the incantation above puts the worktree's
+  `elspeth` on the path and nothing else. Every worktree run of the lints suites
+  written that way measured the main checkout's `elspeth_lints` against the
+  worktree's `elspeth` — a split-tree result, the same class of confidently-wrong
+  answer as an export with no `.git`. Measured 2026-08-26. Use BOTH roots:
+
+  ```bash
+  PYTHONPATH=<worktree>/src:<worktree>/elspeth-lints/src \
+    <venv>/bin/python -m pytest ...
+  ```
+
+  Verify `elspeth_lints.__file__` as well as `elspeth.__file__`, and note the
+  `elspeth-lints` console script is a shebang wrapper hardcoding the main venv's
+  interpreter with no `PYTHONPATH` of its own — it honours the variable when the
+  parent exports it, and resolves to the main checkout when it does not.
+  `elspeth-lints/src` is tracked, so the worktree carries its own copy; it was
+  simply never on the path.
 - Do not silently switch the shared checkout onto a task branch. If work is
   intended to happen on a branch without creating a separate worktree, surface
   that choice to the user before switching; prefer a dedicated worktree for
