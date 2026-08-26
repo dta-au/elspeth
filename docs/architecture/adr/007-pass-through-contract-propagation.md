@@ -66,7 +66,9 @@ Conditional pass-through (drop based on row content) is **forbidden** under this
 
 When a pass-through transform has multiple predecessors (diamond topology via coalesce, fork-to-same-target, etc.), the effective guarantees at the transform's output are the **intersection** of participating predecessors' guarantees, unioned with the transform's own declared output fields.
 
-The pinned-semantics table (reproduced below) covers the 11 edge cases the plan review identified. Intersection (not union) because union would mask silent field drops in one branch: if branch A guarantees `{a,b}` and branch B guarantees only `{a}`, a sink requiring `b` downstream is satisfied only sometimes at runtime — the static contract must reflect the worst case.
+The pinned-semantics table (reproduced below) covers the 11 edge cases the plan review identified, plus a 12th added later (see below). Intersection (not union) because union would mask silent field drops in one branch: if branch A guarantees `{a,b}` and branch B guarantees only `{a}`, a sink requiring `b` downstream is satisfied only sometimes at runtime — the static contract must reflect the worst case.
+
+The propagated set is a **lower bound** in every row of that table: it names fields that are definitely present, never every field that may be present. A validator proving a field ABSENT needs the opposite bound, which only an extras-forbidding schema supplies — carried separately as `EffectiveGuaranteeVote.closed` and derived from `SchemaConfig.allows_extra_fields`. Reading participation as completeness is the elspeth-9c5ff8fa7d family of false rejections, and it does not require a pass-through node to occur: an `observed` source declaring `guaranteed_fields: [id]` participates and still admits any other column.
 
 | Edge case | Behavior | Rationale |
 |-----------|----------|-----------|
@@ -81,6 +83,7 @@ The pinned-semantics table (reproduced below) covers the 11 edge cases the plan 
 | `creates_tokens=True` × `passes_through_input=True` | Both compose: each emitted token row carries input ∪ added fields | BatchReplicate has both |
 | `is_batch_aware=True` × `passes_through_input=True` | Cross-check applies per-row in executor; static contract treats batch as homogeneous | BatchReplicate is batch-aware |
 | Pass-through with `output_schema_config=None` (self abstains) | `own = frozenset()`; `result = inherited` | Transform abstains from its own contract but still propagates inherited |
+| Self participates, ALL predecessors abstain | `result = own`, and the vote is **open** (`EffectiveGuaranteeVote.closed = False`) unless the node's own schema forbids extras | The inverse of the row above, and the case the original 11 left silent. `compose_propagation` returns a bare `frozenset`, so abstention flows IN but not OUT: the node's own added fields come back looking like a complete claim. They are a LOWER bound — the abstaining predecessor's columns are still on the row, unenumerated. A node that cannot see its predecessor's field set must not assert that set is complete (ADR-040: "an abstention that renders as an assertion is a violation"), and the worst-case reasoning that chose intersection over union above applies identically to participation |
 
 ### Decision 3 — Composer parity: fail-closed on probe failure for pass-through transforms
 

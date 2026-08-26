@@ -45,13 +45,35 @@ def compose_propagation(
       ``self_fields | participant``.
     - Multiple participants: result is ``self_fields | intersect(participants)``.
 
+    The return type is deliberately a bare ``frozenset`` rather than a
+    ``frozenset | None`` that could propagate abstention: abstention flows IN
+    but not OUT, and the result of an all-abstaining call is
+    ``self_fields`` — the node's OWN additions. THAT SET IS A LOWER BOUND, NOT
+    A COMPLETE ENUMERATION. Nothing here can say which of a predecessor's
+    unenumerated columns are still riding the row.
+
+    Callers must therefore never read this result as "the fields on rows
+    leaving this node are exactly these". A validator proving a field ABSENT
+    (set DIFFERENCE) needs an upper bound, which only an extras-forbidding
+    schema supplies; that fact travels separately as
+    ``EffectiveGuaranteeVote.closed`` (``core/dag/guarantees.py``), derived
+    from ``SchemaConfig.allows_extra_fields``. Reading participation as
+    completeness is the elspeth-9c5ff8fa7d family of false rejections —
+    build-time rejections of pipelines that run every row green.
+
+    Adding abstention to this signature would not close that gap: the same
+    false rejection occurs with no pass-through node in the graph at all, from
+    an ``observed`` source that names ``guaranteed_fields``. The defect is in
+    what the result MEANS, not in what this function can express.
+
     Args:
         self_fields: Fields this node declares directly.
         predecessor_guarantees: Effective guarantees of each predecessor, or
             ``None`` for predecessors that abstain from the intersection.
 
     Returns:
-        The effective guaranteed field set at this node.
+        The effective guaranteed field set at this node — a LOWER bound. See
+        the note above before using it to prove a field absent.
     """
     participating = [g for g in predecessor_guarantees if g is not None]
     if not participating:

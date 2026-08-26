@@ -76,7 +76,10 @@ class ReferenceJoinConfig(TransformDataConfig):
     # expanded, and DOES land in row data.
     reference_source: str | None = Field(
         default=None,
-        description="Path the reference table was loaded from. Written by the loader; used only in diagnostics.",
+        description=(
+            "Do not set this. The settings loader writes it when it expands 'reference_file', "
+            "and it is used only in diagnostics; nothing resolves or reads the path."
+        ),
     )
     reference_format: Literal["csv", "json"] = Field(
         ...,
@@ -329,7 +332,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8a32a86900a30a7f"
+    source_file_hash: str | None = "sha256:6e05e4eb6cee767c"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -395,6 +398,11 @@ class ReferenceJoin(BaseTransform):
                 composer_hints=(
                     "The reference table is configuration, not a source: it is fixed when the run starts and is not fetched.",
                     "On the CLI use reference_file: <name>.csv beside settings.yaml; the loader reads it into reference_content.",
+                    "In the composer there is no filesystem: create_blob with the table bytes, then wire_blob_inline_ref "
+                    "with field_path 'node:<node_id>.options.reference_content'. Pasting a whole table as a literal option "
+                    "value works for a handful of rows but bloats the composition and hits the inline byte cap.",
+                    "Output expressions see ONLY the matched entry as 'ref'. row[...] is not in scope here and is rejected "
+                    "at config load, and a bare column name is not an expression — write ref['description'].",
                     "Address the matched entry as 'ref' in every output expression, e.g. ref['description'].",
                     "reference_key_name names a column of the reference table; key_field names the column on the arriving row.",
                     "on_miss defaults to fail, because an unenriched row reaching a sink looks identical to an enriched one.",

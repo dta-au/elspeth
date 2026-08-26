@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class EffectiveGuaranteeVote:
-    """Propagation result that preserves fields AND participation state.
+    """Propagation result that preserves fields, participation AND closedness.
 
     ``fields`` alone is not enough for sink validation, because an empty
     effective guarantee set can mean either:
@@ -36,10 +36,31 @@ class EffectiveGuaranteeVote:
 
     Carrying ``participated`` through the recursive walk keeps that contract
     mechanical for downstream validators.
+
+    ``participated`` and ``closed`` are INDEPENDENT axes, and conflating them
+    is what produced the elspeth-9c5ff8fa7d family of false rejections:
+
+    - ``participated`` — the vote has guarantees to contribute. ``fields`` is
+      a LOWER bound: every listed field is definitely present. Sound for the
+      INTERSECTION consumers (``validate_transform_output_field_collisions``,
+      the coalesce branch guarantees builder).
+    - ``closed`` — no row leaving this node can carry a field outside
+      ``fields``. An UPPER bound. Only a schema that forbids extras supplies
+      it, so it is derived from ``SchemaConfig.allows_extra_fields`` — the
+      extras-firewall authority the contract layer already owns — rather than
+      restated. Required by the DIFFERENCE consumers, which prove ABSENCE:
+      subtracting a lower bound reports a miss for every field the producer
+      simply never mentioned, including columns its rows genuinely carry.
+
+    An ``observed`` producer naming ``guaranteed_fields`` is the shape that
+    separates them: it participates (it guarantees those fields) and is open
+    (observed mode admits any other column). Both flags are needed to tell it
+    apart from a ``fixed`` schema listing the same fields.
     """
 
     fields: frozenset[str]
     participated: bool
+    closed: bool
 
 
 def get_schema_config_from_node(graph: ExecutionGraph, node_id: str) -> SchemaConfig | None:
@@ -157,11 +178,17 @@ def walk_effective_guarantee_vote(
     cache: dict[str, EffectiveGuaranteeVote],
     field_cache: dict[str, frozenset[str]] | None = None,
 ) -> EffectiveGuaranteeVote:
-    """Recursive implementation that preserves participation state.
+    """Recursive implementation that preserves participation and closedness.
 
     Pass-through propagation needs more than the final field set. A sink
     validator must be able to distinguish "nobody voted" from "the vote
     participated and collapsed to empty", so this helper carries both.
+
+    It carries CLOSEDNESS for the mirror-image reason: ``fields`` is a lower
+    bound, and a validator proving ABSENCE by set difference needs an upper
+    one. See ``EffectiveGuaranteeVote`` for why the two are independent. Each
+    branch below decides ``closed`` the way it already decides ``participated``
+    — from the same topology, never from a second hand-written rule.
     """
     if node_id in cache:
         return cache[node_id]
@@ -171,6 +198,13 @@ def walk_effective_guarantee_vote(
     own_fields = (
         node_info.output_schema_config.get_effective_guaranteed_fields() if node_info.output_schema_config is not None else frozenset()
     )
+    # An extras firewall (``mode: fixed``) is what makes a field set complete:
+    # a row carrying anything undeclared dies at this node's input model, so
+    # nothing downstream can see it. ``observed``/``flexible`` admit the
+    # undeclared, and a node with no schema config at all proves nothing —
+    # both are open. Derived from the contract layer's own predicate rather
+    # than restated here (ADR-032: nominally type what ELSPETH owns).
+    own_closed = node_info.output_schema_config is not None and not node_info.output_schema_config.allows_extra_fields
 
     # Gates are pure routing: rows pass through unchanged (Rule 0 in
     # validate_edge_schemas enforces input==output schema), so a gate's
@@ -199,21 +233,28 @@ def walk_effective_guarantee_vote(
         # arm vouches for it, and one abstaining (dynamic) arm collapses the
         # whole vote to abstention — preserving sink deferral of dynamic
         # upstreams to per-row enforcement (elspeth-3283f2eaec).
+        #
+        # Closedness follows the same one-arm-delivers-the-row rule: the
+        # released stream can only carry what some arm carried, so it is
+        # closed exactly when EVERY arm is. The queue's own bare observed
+        # declaration must not be consulted — it describes coordination, not a
+        # firewall, and reading it would report every queue open.
         predecessors = list(graph._graph.predecessors(node_id))
         if not predecessors:
             # The builder rejects unwired queues at construction; hand-built
             # test graphs fall back to the queue's own (empty, abstaining)
             # declaration rather than crashing.
-            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates)
+            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates, closed=own_closed)
         else:
             arm_votes = [walk_effective_guarantee_vote(graph, pred_id, cache, field_cache) for pred_id in predecessors]
             if all(vote.participated for vote in arm_votes):
                 result = EffectiveGuaranteeVote(
                     fields=frozenset.intersection(*[vote.fields for vote in arm_votes]),
                     participated=True,
+                    closed=all(vote.closed for vote in arm_votes),
                 )
             else:
-                result = EffectiveGuaranteeVote(fields=frozenset(), participated=False)
+                result = EffectiveGuaranteeVote(fields=frozenset(), participated=False, closed=False)
     elif node_info.node_type is NodeType.ROW_UNION:
         # row_union is the correlated UNION ALL barrier: every released row
         # is exactly one branch's payload, unchanged (elspeth-a5b86149d4).
@@ -234,14 +275,19 @@ def walk_effective_guarantee_vote(
         # builder never wires DIVERT into a row_union today (error routing is
         # terminal — see _live_predecessors in schema_validation.py); this
         # guards the public add_edge surface.
+        #
+        # Closedness composes exactly as it does for a queue, and for the same
+        # reason: one branch delivers each released row, so the stream is
+        # closed only when every branch is. A DIVERT in-edge forces open along
+        # with abstention — an error envelope's shape is not the producer's.
         in_edges = list(graph._graph.in_edges(node_id, data=True))
         if not in_edges:
             # The builder rejects unwired row_unions at construction;
             # hand-built test graphs fall back to the node's own (empty,
             # abstaining) declaration rather than crashing.
-            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates)
+            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates, closed=own_closed)
         elif any(edge_data["mode"] == RoutingMode.DIVERT for _from_id, _to_id, edge_data in in_edges):
-            result = EffectiveGuaranteeVote(fields=frozenset(), participated=False)
+            result = EffectiveGuaranteeVote(fields=frozenset(), participated=False, closed=False)
         else:
             branch_votes = [
                 walk_effective_guarantee_vote(graph, pred_id, cache, field_cache) for pred_id in graph._graph.predecessors(node_id)
@@ -250,9 +296,10 @@ def walk_effective_guarantee_vote(
                 result = EffectiveGuaranteeVote(
                     fields=frozenset.intersection(*[vote.fields for vote in branch_votes]),
                     participated=True,
+                    closed=all(vote.closed for vote in branch_votes),
                 )
             else:
-                result = EffectiveGuaranteeVote(fields=frozenset(), participated=False)
+                result = EffectiveGuaranteeVote(fields=frozenset(), participated=False, closed=False)
     elif node_info.passes_through_input or is_transparent_gate:
         predecessors = list(graph._graph.predecessors(node_id))
         if not predecessors and is_transparent_gate:
@@ -260,7 +307,7 @@ def walk_effective_guarantee_vote(
             # upstream edge; fall back to the gate's own (inherited)
             # declaration rather than crashing — the builder always wires
             # gates, so real graphs never take this branch.
-            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates)
+            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates, closed=own_closed)
         elif not predecessors:
             raise FrameworkBugError(
                 f"Pass-through transform {node_id!r} has no predecessors. Builder must wire transforms with at least one upstream edge."
@@ -271,14 +318,37 @@ def walk_effective_guarantee_vote(
                 own_fields,
                 [vote.fields if vote.participated else None for vote in predecessor_votes],
             )
+            # Closedness does NOT compose the way participation does, and this
+            # is the asymmetry that made the elspeth-9c5ff8fa7d family a false
+            # RED rather than a false green. ``participated`` is a disjunction
+            # — one voter is enough to have voted. Completeness is the node's
+            # own firewall and nothing else:
+            #
+            # - own schema CLOSED: rows arriving with an undeclared column die
+            #   at this node's ``extra='forbid'`` input model, so whatever the
+            #   upstream carried, what LEAVES is exactly the declared set.
+            #   (``result_fields`` may still name more than the firewall admits
+            #   — the un-gated union of elspeth-9c5ff8fa7d — which against set
+            #   difference only ever shrinks ``missing``, so it under-rejects
+            #   and never over-rejects.)
+            # - own schema OPEN: this node may itself add columns its observed
+            #   declaration never names, so the composed set is open however
+            #   closed every predecessor was.
+            #
+            # Reading ``any(predecessor closed)`` here — or inheriting the
+            # disjunction from ``participated`` — is exactly the manufactured
+            # completeness claim ADR-040 forbids: a node that cannot see its
+            # predecessor's field set asserting that set is complete.
             result = EffectiveGuaranteeVote(
                 fields=result_fields,
                 participated=own_participates or any(vote.participated for vote in predecessor_votes),
+                closed=own_closed,
             )
     else:
         result = EffectiveGuaranteeVote(
             fields=own_fields,
             participated=own_participates,
+            closed=own_closed,
         )
 
     cache[node_id] = result

@@ -1592,9 +1592,11 @@ class ExecutionGraph:
         cache: dict[str, _EffectiveGuaranteeVote],
         field_cache: dict[str, frozenset[str]] | None = None,
     ) -> _EffectiveGuaranteeVote:
-        """Recursive guarantee walk that preserves participation state.
+        """Recursive guarantee walk that preserves participation and closedness.
 
-        Delegates to ``dag.guarantees.walk_effective_guarantee_vote``.
+        Delegates to ``dag.guarantees.walk_effective_guarantee_vote``. The
+        vote's ``fields`` are a LOWER bound; ``closed`` is what licenses a
+        caller to prove a field ABSENT from it. See ``EffectiveGuaranteeVote``.
         """
         return guarantees.walk_effective_guarantee_vote(self, node_id, cache, field_cache)
 

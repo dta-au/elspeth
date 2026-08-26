@@ -417,3 +417,165 @@ class TestTextractConfigShapeDependentProjection:
         config = self._config(bucket_field="s3_bucket", version_field="s3_version")
 
         assert config.declared_input_fields == frozenset({"s3_key", "s3_bucket", "s3_version"})
+
+
+# ---------------------------------------------------------------------------
+# Completeness (elspeth-9c5ff8fa7d family) — an OPEN producer proves no absence
+# ---------------------------------------------------------------------------
+
+
+class TestOpenProducerProvesNoAbsence:
+    """Set DIFFERENCE needs a COMPLETE field set, which only a CLOSED schema supplies.
+
+    ``participates_in_propagation`` answers "does this schema have guarantees to
+    contribute to an intersection" — a LOWER bound. This validator subtracts
+    ``vote.fields`` from the declaration and rejects on any remainder, which is
+    sound only against an UPPER bound: a set that enumerates every field a row
+    leaving the producer can carry. A producer whose schema ``allows_extra_fields``
+    (``observed`` or ``flexible``) supplies the first and never the second, so
+    reading participation as completeness rejected pipelines that run.
+
+    The reproduction that pins the polarity: an ``observed`` CSV source feeding
+    ``field_mapper`` runs 2/2 rows green, and adding the strictly ADDITIVE
+    ``guaranteed_fields: [id]`` to that same source turned it into a build-time
+    rejection of the pass-through column ``colour``. Declaring MORE must never
+    reject more.
+
+    ``EffectiveGuaranteeVote.closed`` carries the second predicate, derived from
+    ``SchemaConfig.allows_extra_fields`` — the extras-firewall authority the
+    contract layer already owns — rather than restated here.
+    """
+
+    def _graph(
+        self,
+        *,
+        producer_schema: dict[str, object],
+        mid_schema: dict[str, object] | None = None,
+        declared_input_fields: frozenset[str] = frozenset({"colour"}),
+    ) -> ExecutionGraph:
+        """src -> [optional pass-through] -> web_scrape declaring an input column."""
+        graph = ExecutionGraph()
+        graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="csv", config={"schema": producer_schema})
+        producer = "src"
+        if mid_schema is not None:
+            graph.add_node(
+                "mid",
+                node_type=NodeType.TRANSFORM,
+                plugin_name="passthrough",
+                config={"schema": mid_schema},
+                passes_through_input=True,
+            )
+            graph.add_edge("src", "mid", label="continue", mode=RoutingMode.MOVE)
+            producer = "mid"
+        graph.add_node(
+            "t1",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="web_scrape",
+            config={"schema": {"mode": "observed"}},
+            declared_input_fields=declared_input_fields,
+        )
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json", config={"schema": {"mode": "observed"}})
+        graph.add_edge(producer, "t1", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("t1", "sink", label="out", mode=RoutingMode.MOVE)
+        return graph
+
+    # -- GATE 1: a genuine pass-through column must not be rejected ---------
+
+    def test_observed_producer_with_partial_guarantees_is_not_checked(self) -> None:
+        """No pass-through anywhere: observed mode admits columns the guarantee omits."""
+        graph = self._graph(producer_schema={"mode": "observed", "guaranteed_fields": ["id"]})
+
+        schema_validation.validate_transform_declared_input_fields(graph)
+
+    def test_flexible_producer_is_not_checked(self) -> None:
+        """``flexible`` allows extras exactly as ``observed`` does — same verdict."""
+        graph = self._graph(producer_schema={"mode": "flexible", "fields": ["id: int"]})
+
+        schema_validation.validate_transform_declared_input_fields(graph)
+
+    def test_pass_through_downstream_of_abstainer_is_not_checked(self) -> None:
+        """The ticket shape: a pass-through's OWN additions are not the whole row.
+
+        ``compose_propagation`` returns a bare ``frozenset``, so a pass-through
+        whose predecessors all abstain reports its own added fields as though
+        they were the complete set. The composed set is open for the same
+        reason its predecessor was.
+        """
+        graph = self._graph(
+            producer_schema={"mode": "observed"},
+            mid_schema={"mode": "observed", "guaranteed_fields": ["note"]},
+        )
+
+        schema_validation.validate_transform_declared_input_fields(graph)
+
+    # -- GATE 2: a field NOBODY provides must still be rejected -------------
+
+    def test_closed_producer_missing_field_is_still_rejected(self) -> None:
+        """A fixed schema is a firewall: the column is provably absent, so reject."""
+        graph = self._graph(producer_schema={"mode": "fixed", "fields": ["id: int"]})
+
+        with pytest.raises(GraphValidationError, match="colour"):
+            schema_validation.validate_transform_declared_input_fields(graph)
+
+    def test_closed_pass_through_firewall_is_still_rejected(self) -> None:
+        """The firewall truncates an open upstream, so the composed set closes.
+
+        Rows carrying ``colour`` die at the ``mode: fixed`` pass-through's
+        ``extra='forbid'`` input model, so nothing downstream of it can see the
+        column however dynamic the source was.
+        """
+        graph = self._graph(
+            producer_schema={"mode": "observed"},
+            mid_schema={"mode": "fixed", "fields": ["id: int", "note: str"]},
+        )
+
+        with pytest.raises(GraphValidationError, match="colour"):
+            schema_validation.validate_transform_declared_input_fields(graph)
+
+    def test_closed_producer_guaranteeing_the_field_still_builds(self) -> None:
+        """Positive control for the two rejections above."""
+        graph = self._graph(producer_schema={"mode": "fixed", "fields": ["id: int", "colour: str"]})
+
+        schema_validation.validate_transform_declared_input_fields(graph)
+
+
+class TestVoteCarriesClosedness:
+    """``EffectiveGuaranteeVote.closed`` is the mechanism, pinned directly.
+
+    Testing the verdict alone would leave a validator that skipped every
+    predecessor indistinguishable from one that read completeness correctly.
+    """
+
+    def _producer_vote(self, schema: dict[str, object]) -> Any:
+        from elspeth.core.dag.guarantees import walk_effective_guarantee_vote
+
+        graph = ExecutionGraph()
+        graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="csv", config={"schema": schema})
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json", config={"schema": {"mode": "observed"}})
+        graph.add_edge("src", "sink", label="out", mode=RoutingMode.MOVE)
+        return walk_effective_guarantee_vote(graph, "src", {})
+
+    def test_fixed_schema_is_closed(self) -> None:
+        vote = self._producer_vote({"mode": "fixed", "fields": ["id: int"]})
+
+        assert vote.participated is True
+        assert vote.closed is True
+
+    def test_observed_schema_with_guarantees_participates_but_is_open(self) -> None:
+        """The exact combination that produced the false red: participating AND open."""
+        vote = self._producer_vote({"mode": "observed", "guaranteed_fields": ["id"]})
+
+        assert vote.participated is True
+        assert vote.closed is False
+
+    def test_flexible_schema_is_open(self) -> None:
+        vote = self._producer_vote({"mode": "flexible", "fields": ["id: int"]})
+
+        assert vote.closed is False
+
+    def test_participation_and_closedness_are_independent_axes(self) -> None:
+        """A bare observed schema abstains AND is open — neither implies the other."""
+        vote = self._producer_vote({"mode": "observed"})
+
+        assert vote.participated is False
+        assert vote.closed is False

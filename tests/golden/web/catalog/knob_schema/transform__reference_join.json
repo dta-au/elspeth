@@ -30,7 +30,7 @@
       },
       {
         "default": null,
-        "description": "Path the reference table was loaded from. Written by the loader; used only in diagnostics.",
+        "description": "Do not set this. The settings loader writes it when it expands 'reference_file', and it is used only in diagnostics; nothing resolves or reads the path.",
         "kind": "text",
         "label": "Reference Source",
         "name": "reference_source",

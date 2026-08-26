@@ -192,10 +192,24 @@ Stated so nobody over-reads the registration claim: `reference_source` is a
 `source_key`, not a `file_key`, so it is NOT in
 `FILE_BACKED_TEMPLATE_OPTION_KEYS`, and `reject_file_backed_options` does not
 block a web-authored config from setting it directly. That is acceptable
-precisely because it is never opened — but it IS emitted, so an
-operator-supplied string reaches output. It therefore needs the
-`EmittedToOutput` marker, on the base class, like any other emitted option
-value.
+precisely because it is never opened.
+
+**Correction made during implementation:** this spec previously said
+`reference_source` needs the `EmittedToOutput` marker. It does not — as built,
+it is stored for diagnostics and emitted nowhere. The option that DOES need the
+marker is `default_values`, and the reasoning is worth keeping because it is
+not the obvious one:
+
+* `reference_content` does NOT need it, despite reference values reaching row
+  data. `_expand_config_templates` runs AFTER `_expand_env_vars`
+  (`core/config.py:3296-3300`), so a `${VAR}` inside the table file is never
+  expanded and cannot carry a host secret; the web loader defaults
+  `expand_env_vars=False` for the same reason. Marking it would reject a table
+  whose data legitimately contains `${...}` over an expansion that cannot
+  happen.
+* `default_values` DOES need it. It is authored in the YAML, it IS expanded,
+  and it IS written straight into row data on every miss. That is precisely the
+  `truncate.suffix` / `csv.headers` leak class the marker exists for.
 
 ### The option takes RAW TEXT and the plugin parses it
 
@@ -294,10 +308,20 @@ with the matched entry bound to the single name `ref`. CSV entries are flat
 This works without touching the parser. `allowed_names` is a constructor
 parameter, not a fixed set (`core/expression_parser.py:774-789`) — it defaults
 to `["row"]`, but commencement gates already pass
-`["collections", "dependency_runs", "env"]`. We pass `["ref"]`. Single-name
-mode makes the bound context BE the value (`:495`, `:510-516`), so evaluating
-`ref['description']` against the matched entry dict is exactly the shape the
-evaluator already supports.
+`["collections", "dependency_runs", "env"]`. We pass `["ref"]`.
+
+**Correction made during implementation:** passing `allowed_names` explicitly
+selects NAMESPACE mode, not single-name mode (`:790-793`) — single-name mode is
+`allowed_names is None`. So the evaluation context is a namespace dict,
+`parser.evaluate({"ref": entry})` (`:510-517`), exactly as commencement gates
+already do it. The design is unaffected; the earlier sentence describing it as
+single-name mode was wrong about the mechanism.
+
+A second implementation finding: `evaluate` deliberately re-raises `KeyError`
+and `TypeError` rather than wrapping them (`:1030-1031`), on the grounds that
+they are evaluator bugs. For us they are DATA — a path that does not fit an
+entry — so the call site catches them and maps them to the miss policy rather
+than letting a sparse table crash a run.
 
 (Note for anyone re-deriving this: the parser's own docstrings at `:202` and
 `:739` illustrate with `row`, and `llm`'s prompt context IS a closed frozenset
