@@ -671,7 +671,7 @@ def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
     try:
         transform = get_shared_plugin_manager().create_transform(
             executable_node.plugin,
-            prepare_validation_probe_options(executable_node.options),
+            prepare_validation_probe_options(executable_node.options, plugin=executable_node.plugin),
         )
     except Exception as exc:
         if not _is_config_probe_exception(exc):

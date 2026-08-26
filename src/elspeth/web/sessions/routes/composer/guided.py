@@ -2184,7 +2184,7 @@ def _schema8_schema_authority(
         # exposing or persisting the private executable binding.
         from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 
-        validation_options = prepare_validation_probe_options(lowered.executable_options)
+        validation_options = prepare_validation_probe_options(lowered.executable_options, plugin=plugin)
     config_model = get_source_config_model(plugin, validation_options) if source else get_sink_config_model(plugin)
     model_validated = merged
     if config_model is not None:

@@ -2226,11 +2226,18 @@ def fork_coalesce_exemplar_args(
             ),
         ]
         coalesce_branches = {"branch_a": "sentiment_done", "branch_b": "urgency_done"}
+        # A REAL rename, deliberately: field_mapper's mapping reads
+        # {source: target}, and an all-identity exemplar is direction-blind —
+        # the one authoring aid built for this task never demonstrated which
+        # side names the EXISTING field, so a planner wrote the desired output
+        # name as the key and a column silently vanished (elspeth-d4ae04b374).
+        # The keys below are the llm arms' response fields (what arrives);
+        # the values are the tidied output names (what leaves).
         tidy_mapping = {
             "ticket_id": "ticket_id",
             "body": "body",
-            "sentiment": "sentiment",
-            "urgency": "urgency",
+            "sentiment": "ticket_sentiment",
+            "urgency": "ticket_urgency",
         }
         metadata = {
             "name": "Per-branch LLM assessment",
@@ -2267,11 +2274,16 @@ def fork_coalesce_exemplar_args(
             "name": "Per-branch fan-out and rejoin",
             "description": "Fan rows out to one transform per branch, rejoin with a coalesce, tidy, and save.",
         }
+    # ``schema`` on a field_mapper is its INPUT contract, so it names the
+    # mapping SOURCES; the sink's fixed schema names the emitted TARGETS. An
+    # identity mapping makes the two lists coincide and hides the distinction —
+    # which is exactly how the direction was mis-taught (elspeth-d4ae04b374).
+    tidy_sources = list(tidy_mapping)
     tidy_fields = list(tidy_mapping.values())
     tidy_schema = {
         "mode": "flexible",
-        "fields": [f"{field}: str" for field in tidy_fields],
-        "guaranteed_fields": tidy_fields,
+        "fields": [f"{field}: str" for field in tidy_sources],
+        "guaranteed_fields": tidy_sources,
     }
 
     # Required-control coverage is proved per LLM node: the shield must dominate
