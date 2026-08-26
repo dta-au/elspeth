@@ -319,9 +319,22 @@ single-name mode was wrong about the mechanism.
 
 A second implementation finding: `evaluate` deliberately re-raises `KeyError`
 and `TypeError` rather than wrapping them (`:1030-1031`), on the grounds that
-they are evaluator bugs. For us they are DATA — a path that does not fit an
-entry — so the call site catches them and maps them to the miss policy rather
-than letting a sparse table crash a run.
+they are evaluator bugs.
+
+CORRECTED after an adversarial review (2026-08-26): the first version of this
+section concluded that they are DATA for us and had the call site catch them.
+That was wrong twice over. `visit_Subscript` already wraps a subscript failure
+into `ExpressionEvaluationError`, so the `KeyError`/`TypeError` arms were
+unreachable — and had they been reachable they would have converted an evaluator
+bug into a miss, in direct contradiction of the contract quoted above. The call
+site now catches only `ExpressionEvaluationError`, and discriminates on
+`__cause__`: chained from `KeyError`/`IndexError` the path does not fit THIS
+entry, which is legitimate sparse data and becomes `_UNRESOLVED` under the miss
+policy; chained from anything else (`ZeroDivisionError`, `ValueError`, a
+`TypeError` out of a call or comparison) the expression is BROKEN, and it is
+refused at config load naming the entry. Both facts arrived as `_UNRESOLVED`
+before, and `on_miss` cannot tell them apart — which matters because the shipped
+examples teach operators to expect sparseness.
 
 (Note for anyone re-deriving this: the parser's own docstrings at `:202` and
 `:739` illustrate with `row`, and `llm`'s prompt context IS a closed frozenset
@@ -344,6 +357,24 @@ This does NOT hit `blob_csv_expand`'s abstention hole (`guarantees.py:617-623`):
 that exists because its columns are DATA-DERIVED from CSV headers and it can
 build an empty-tuple shape. Ours are named in config and can never be empty —
 an empty `output:` map is a config error.
+
+The same rule was later extended to the TABLE, which the first implementation
+did not apply it to. A CSV header with no data rows and a JSON `[]` both built
+an empty index and loaded clean, while a fully blank file already refused; that
+inconsistency was the tell. An empty table cannot answer any lookup, so every
+row misses — under the default `on_miss: fail` the run yields nothing, and under
+`null` it silently nulls the enrichment for the whole run. Both are refused at
+load now, and the `never_resolved` guard, which had been disabled by an
+`if entries:` in exactly the case where nothing can ever resolve, is
+unconditional.
+
+Row ARITY belongs to the same rule. `csv.DictReader` pads a short row with
+`restval` and buckets surplus cells under `restkey`, both defaulting to `None`.
+A padded `None` entered the index as an ordinary value, resolved cleanly, and
+reported `matched: True` with nothing unresolved — defeating `_UNRESOLVED` one
+layer earlier, at parse time, so that even `on_miss: fail` could not see it. A
+row is now checked against the header. A cell that is present but EMPTY reads as
+`""` and stays a value; only a MISSING cell is a defect.
 
 ### Construction-time collision validator (required by a live gate)
 

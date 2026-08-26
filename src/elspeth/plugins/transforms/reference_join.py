@@ -393,7 +393,9 @@ class ReferenceJoin(BaseTransform):
     )
     usage_when_not_to_use: str = (
         "Not a way to read a data file at runtime and not a second source: the table is fixed at config "
-        "time. Use a source for pipeline input, and blob_csv_expand when the payload should become rows."
+        "time. Use a source for pipeline input, and blob_csv_expand when the payload should become rows. "
+        "Not for a ragged or empty table either: the whole table is resolved at config load, so a short "
+        "row, a stray extra cell, or a header with no data rows is refused there rather than at runtime."
     )
     example_use: str = """transform:
   plugin: reference_join
@@ -460,6 +462,9 @@ class ReferenceJoin(BaseTransform):
                     "at config load, and a bare column name is not an expression — write ref['description'].",
                     "Address the matched entry as 'ref' in every output expression, e.g. ref['description'].",
                     "reference_key_name names a column of the reference table; key_field names the column on the arriving row.",
+                    "The table must be rectangular and non-empty: every CSV row needs a cell for every header "
+                    "column (an empty cell is fine, a missing one is not), and a header with no data rows is "
+                    "refused. These are config-load refusals, so a blob you cannot inspect fails the whole run.",
                     "on_miss defaults to fail, because an unenriched row reaching a sink looks identical to an enriched one.",
                 ),
             )
