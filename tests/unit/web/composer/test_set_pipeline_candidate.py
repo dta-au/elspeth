@@ -40,7 +40,11 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools import sessions as sessions_tools
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT,
+    SOURCE_AUTHORING_KEY,
+)
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
     PluginAvailabilitySnapshot,
@@ -1607,15 +1611,19 @@ _EXPECTED_WARNINGS = {
     # reads it (`input: "inbound"`); the composition was always fully wired.
     # W3 now derives the answer from published_success_connection rather than
     # testing `on_success is not None` by hand, so the accusation is gone.
+    #
+    # ``_structured_llm_args`` builds ONE llm node and no fetch step of any
+    # kind, so the remote-content draft's claims ("between the external-content
+    # fetch step and this LLM", "routes internet-controlled text") are false for
+    # this graph. The advisory is chosen by provenance (interpretation_state.py
+    # ``_llm_untrusted_remote_content_producers``), so the local-content sibling
+    # is the correct one here. Referenced, never re-typed: this table inlining
+    # the prose is what let it drift silently past the constant it mirrors.
     "structured_llm": (
         {
             "component": "node:classify",
             "message": (
-                "LLM node 'classify' has no authorized prompt-injection shield in front of it. Recommend inserting "
-                "azure_prompt_shield (or the deployment equivalent prompt-injection shield) between the external-content "
-                "fetch step and this LLM. The current draft routes internet-controlled text directly into the LLM without "
-                "that shield, which is a prompt-injection exposure on untrusted remote content, but continuing without it "
-                "is allowed. [user_term: prompt_injection_shield_recommendation]"
+                "LLM node 'classify' has no authorized prompt-injection shield in front of it. " + PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT
             ),
             "severity": "medium",
         },

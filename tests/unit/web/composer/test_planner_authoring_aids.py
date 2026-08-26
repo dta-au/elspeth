@@ -1285,7 +1285,29 @@ class TestDiscoveryDigest:
             discovery_digest(view, summaries=summaries)
 
     def test_three_selected_plugin_contracts_fit_the_canonical_utf8_budget(self) -> None:
+        """The budget is read from the runtime constant, never restated here.
+
+        A hard-coded ``48 * 1024`` has teeth in both directions: raise the
+        constant to unblock the planner and this test still fails, so it reads
+        as a broken fix; lower it and this test passes while the planner
+        refuses real contracts. Importing it means this test tracks whatever
+        the planner actually enforces.
+
+        Currently RED and expected to stay red until the ``llm`` contract
+        shrinks (elspeth-623c69c59f): the three contracts AGGREGATE to 50,365
+        bytes against a 49,152-byte budget, so the planner refuses the third
+        ``get_plugin_schema`` call with ``schema_contract_budget_exceeded``.
+        No single contract exceeds the budget — ``llm`` alone is 39,095 bytes,
+        79.5% of it — so this is an aggregate overflow, not one oversized
+        contract. That red IS this test's signal, not a defect in it.
+
+        Do NOT green it by raising ``_SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES``.
+        That constant is a ratchet: loosening it silently buys room for the
+        next option pair to overflow again, and it is the developer's call,
+        not a lane's. Shrink the contract instead.
+        """
         from elspeth.core.canonical import canonical_json
+        from elspeth.web.composer.pipeline_planner import _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES
 
         view, _snapshot = _trained_view()
         contracts = [
@@ -1293,7 +1315,7 @@ class TestDiscoveryDigest:
             for name in ("web_scrape", "llm", "field_mapper")
         ]
 
-        assert len(canonical_json(contracts).encode("utf-8")) <= 48 * 1024
+        assert len(canonical_json(contracts).encode("utf-8")) <= _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES
 
     def test_text_sink_digest_entry_states_the_multiline_prohibition(self) -> None:
         """The exact g11 regression anchor, held on the stable token only.
