@@ -5720,7 +5720,27 @@ def _check_schema_contracts(
             # here would be a non-determinism bug in our own code, not a fresh
             # Tier-3 parse fault — same judgment as the Rule A site below.
             producer_participates, _producer_vote_fields = _effective_producer_vote(actual_producer)
-            if producer_participates or producer_guaranteed:
+            # CLOSEDNESS, the runtime's second gate (core/dag/guarantees.py,
+            # ``EffectiveGuaranteeVote.closed``). ``producer_guaranteed`` is a
+            # LOWER bound — fields definitely present — while
+            # ``declared_missing`` below is a set DIFFERENCE, which proves
+            # ABSENCE and therefore needs an UPPER one. Only an
+            # extras-forbidding schema supplies that: a row carrying an
+            # undeclared column dies at that node's ``extra='forbid'`` input
+            # model, so what leaves is exactly the declared set. An ``observed``
+            # producer naming ``guaranteed_fields: [id]`` participates AND
+            # admits any other column, so subtracting its guarantee reported a
+            # miss for the very pass-through columns its rows carry
+            # (elspeth-9c5ff8fa7d).
+            #
+            # Read from the same ``allows_extra_fields`` the runtime walker
+            # reads, via the helper that already resolves a producer's computed
+            # output schema — not restated here. ``None`` (draft config, failed
+            # probe) reads as OPEN and skips: an unknown producer proves no
+            # absence, the same polarity ``parse_failed_producers`` takes.
+            producer_schema = _known_producer_schema_config(actual_producer)
+            producer_closed = producer_schema is not None and not producer_schema.allows_extra_fields
+            if (producer_participates or producer_guaranteed) and producer_closed:
                 declared_missing = declared_input - consumer_required - producer_guaranteed
                 if declared_missing:
                     errors.append(

@@ -12358,6 +12358,95 @@ class TestExtrasFirewallDirection:
         assert [error.component for error in result.errors if error.error_code == "schema_contract_violation"] == []
 
 
+class TestOpenProducerProvesNoAbsence:
+    """Composer mirror of the runtime ``TestOpenProducerProvesNoAbsence``.
+
+    ``declared_missing`` is a set DIFFERENCE, so it proves ABSENCE and needs an
+    UPPER bound on what a producer emits. ``producer_guaranteed`` is a LOWER
+    one. An ``observed`` source naming ``guaranteed_fields: [id]`` participates
+    in the vote AND still admits every other column, so subtracting its
+    guarantee reported a miss for the pass-through columns its rows genuinely
+    carry — a false REJECT of a pipeline the engine builds and runs
+    (elspeth-9c5ff8fa7d).
+
+    Both tests are load-bearing and must move together: the first pins that an
+    OPEN producer no longer manufactures a rejection, the second that a CLOSED
+    producer which provably omits the column still does. Gating the block on
+    closedness alone would pass the first; deleting the check entirely would
+    pass the first and FAIL the second.
+    """
+
+    def _state(self, source_options: dict[str, Any]) -> CompositionState:
+        """source -> web_scrape whose ``url_field`` names a column the source never declares."""
+        source = SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options=source_options,
+            on_validation_failure="discard",
+        )
+        scraper = NodeSpec(
+            id="scraper",
+            node_type="transform",
+            plugin="web_scrape",
+            input="rows",
+            on_success="output",
+            on_error="discard",
+            options={
+                "url_field": "colour",
+                "content_field": "page_content",
+                "fingerprint_field": "page_fingerprint",
+                "http": {
+                    "abuse_contact": "ops@dta.gov.au",
+                    "scraping_reason": "contract validation test",
+                    "allowed_hosts": ["127.0.0.0/8"],
+                },
+                "schema": {"mode": "observed"},
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=source,
+            nodes=(scraper,),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="output",
+                    plugin="json",
+                    options={"schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _declared_input_errors(self, state: CompositionState) -> list[str]:
+        return [
+            error.message
+            for error in state.validate().errors
+            if error.error_code == "schema_contract_violation" and "declared by its own options" in error.message
+        ]
+
+    def test_an_open_producer_naming_a_guarantee_proves_no_absence(self) -> None:
+        """The false red: observed + guaranteed_fields participates but admits extras."""
+        state = self._state({"schema": {"mode": "observed", "guaranteed_fields": ["id"]}})
+
+        assert self._declared_input_errors(state) == []
+
+    def test_a_closed_producer_that_omits_the_column_still_rejects(self) -> None:
+        """The gate that must NOT be lost: a fixed schema forbids extras, so absence is provable."""
+        state = self._state({"schema": {"mode": "fixed", "fields": ["id: str"], "guaranteed_fields": ["id"]}})
+
+        messages = self._declared_input_errors(state)
+        assert len(messages) == 1, messages
+        assert "colour" in messages[0]
+
+
 class TestForwardingTransformExtrasReachTheLockedSink:
     """Composer half of elspeth-15c72686f2 — the surface the defect was reported on.
 
