@@ -1092,6 +1092,10 @@ def test_signed_judge_metadata_requires_hmac_key_at_source_root_load(
         ast_path="body[0]",
     )
     monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+    # Pin the second precondition explicitly: an ambient shape-only-when-key-missing
+    # (e.g. exported for an elspeth-lints CLI run in the same shell) downgrades the
+    # load and this fail-closed default never fires.
+    monkeypatch.delenv("ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE", raising=False)
 
     with pytest.raises(ValueError, match=r"ELSPETH_JUDGE_METADATA_HMAC_KEY"):
         load_allowlist(allowlist, valid_rule_ids=set(), source_root=source_root)
