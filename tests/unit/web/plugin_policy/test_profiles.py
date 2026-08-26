@@ -1227,6 +1227,23 @@ def test_public_llm_schema_exposes_alias_not_private_provider_binding() -> None:
 
 
 def test_public_llm_source_schema_is_component_specific() -> None:
+    """The llm SOURCE's public schema carries its own options, not the transform's.
+
+    ``output_fields`` and ``response_format`` are authoring-time output-shape
+    declarations, public on the multi-query surface already and lifted to the
+    llm source by 2b452ff8c ("structured output on every LLM plugin surface").
+    Neither is a provider binding: the private-field authority is
+    ``LLM_PROFILE_PRIVATE_FIELDS`` (core/llm_profiles.py:31), which names
+    neither, and ``profiles.py:292`` derives redaction from that constant.
+    The exclusion of private bindings is pinned by
+    ``test_public_llm_source_schema_excludes_transform_and_private_fields``
+    below, which is the security-bearing half of this pair.
+
+    This expected set had to be updated by hand for that feature and was not
+    (elspeth-11f2ebe216): 2b452ff8c re-recorded the generated web-catalog
+    goldens, but a hand-typed set in a test file is the one artefact a
+    re-record step cannot reach.
+    """
     full = CatalogServiceImpl(_isolated_manager_with_llm_source()).get_schema("source", "llm")
     public = _profile_registry().public_schema(
         PluginId("source", "llm"),
@@ -1243,6 +1260,8 @@ def test_public_llm_source_schema_is_component_specific() -> None:
         "response_field",
         "on_validation_failure",
         "lookup",
+        "output_fields",
+        "response_format",
     }
     assert set(public.json_schema["required"]) == {
         "profile",
