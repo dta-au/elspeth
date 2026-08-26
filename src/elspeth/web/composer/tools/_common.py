@@ -1249,7 +1249,15 @@ def _merged_component_rejection_result(
     The FIRST failing component's envelope is the base — its ``data`` payload
     (including the credential-rejection repair block) and its leading entry
     stay exactly what a single-component rejection would have produced, so
-    ordering is stable and no response shape moves. Later components
+    ordering is stable and no response shape moves. This is also the one
+    place where ``data["error_code"]`` agreeing with ``errors[0].error_code``
+    is NOT structural: ``data`` comes from ``results[0]`` while ``errors``
+    concatenates every result's entries. Agreement therefore rests on an
+    unstated precondition — ``results[0]`` must carry a leading
+    ``rejected_mutation`` entry. Every current feeder satisfies it because
+    all of them construct through ``_failure_result`` /
+    ``_plugin_policy_failure``; a future feeder that does not would publish
+    two disagreeing codes in one envelope. Later components
     contribute their rejection entries only. ``components_withheld`` records
     the components the caller's reporting cap dropped; truncation is never
     silent.

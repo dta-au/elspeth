@@ -833,6 +833,34 @@ class TestFailureResult:
         result = _failure_result(state, "rejection text")
         assert result.data["error"] == result.validation.errors[0].message
 
+    def test_data_error_code_mirrors_leading_validation_error_code(self) -> None:
+        """data.error_code and validation.errors[0].error_code must match.
+
+        Same two-channel contract as the message twin above, for the coded
+        channel. One ``error_code`` parameter currently fans into both
+        writes, so this reads as near-tautological today; it exists to fail
+        loudly if a refactor ever splits them, because no server code reads
+        ``data["error_code"]`` — only the serialized envelope's readers (the
+        planner LLM on the freeform/MCP surfaces, and the frontend) would
+        see the disagreement, and they would see two conflicting codes in
+        one payload with nothing to arbitrate.
+
+        Pinned at the constructor, not through a tool. The predecessor test
+        vehicled this through ``apply_pipeline_recipe`` and died with it
+        (e7a85bf8e) even though ``_plugin_policy_failure`` still emits the
+        same shape from five surviving tools.
+        """
+        state = _empty_state()
+        result = _failure_result(state, "rejection text", error_code="profile_unavailable")
+        assert result.data["error_code"] == result.validation.errors[0].error_code
+
+    def test_absent_error_code_is_absent_on_both_channels(self) -> None:
+        """Neither channel invents a code when the caller supplies none."""
+        state = _empty_state()
+        result = _failure_result(state, "rejection text")
+        assert "error_code" not in result.data
+        assert result.validation.errors[0].error_code is None
+
     def test_preserves_warnings_and_semantic_contracts(self) -> None:
         """Non-error fields on the input ValidationSummary survive prepending."""
         # state.validate() on an empty state yields no warnings/suggestions,
