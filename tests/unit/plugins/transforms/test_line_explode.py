@@ -145,7 +145,14 @@ def test_line_explode_empty_string_returns_error(ctx: PluginContext) -> None:
     assert not result.retryable
 
 
-def test_line_explode_crashes_on_non_string_input(ctx: PluginContext) -> None:
+def test_line_explode_routes_non_string_input_as_a_failed_row(ctx: PluginContext) -> None:
+    """A non-string source_field is a row-level failure, routed via on_error.
+
+    Re-pointed from asserting a TypeError crash (elspeth-5887fb7928): the row
+    must fail ROUTABLY and be counted, not abort the run with the row
+    uncounted. The value is deliberately NOT coerced with `str()` — that would
+    invent a text reading and explode it into lines nobody supplied.
+    """
     from elspeth.plugins.transforms.line_explode import LineExplode
 
     transform = LineExplode(
@@ -156,8 +163,16 @@ def test_line_explode_crashes_on_non_string_input(ctx: PluginContext) -> None:
         }
     )
 
-    with pytest.raises(TypeError, match="must be a string"):
-        transform.process(make_pipeline_row({"html": ["not", "a", "string"]}), ctx)
+    result = transform.process(make_pipeline_row({"html": ["not", "a", "string"]}), ctx)
+
+    assert result.status == "error"
+    assert result.retryable is False
+    assert result.reason["reason"] == "invalid_input"
+    assert result.reason["error_type"] == "wrong_type"
+    assert result.reason["field"] == "html"
+    # PipelineRow deep-freezes lists to tuples, so the reported type is tuple.
+    assert "must be a string, got tuple" in result.reason["error"]
+    assert result.rows is None
 
 
 def test_line_explode_is_discovered_by_plugin_manager() -> None:
