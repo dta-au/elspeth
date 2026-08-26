@@ -16304,6 +16304,281 @@ class TestPreviewProofStep:
         codes = [d["code"] for d in result.data["proof_diagnostics"]]
         assert "aggregation_numeric_value_field_type_mismatch_against_source_schema" not in codes
 
+    # -- declared-input-type mismatch against observed CSV (elspeth-e6e552ce34) --
+
+    @staticmethod
+    def _plain_transform(
+        node_id: str,
+        *,
+        plugin: str,
+        input_connection: str,
+        on_success: str,
+        options: dict[str, object],
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin=plugin,
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options=options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def test_observed_csv_typed_transform_input_declaration_blocks(self) -> None:
+        """A concrete non-str input declaration on a directly-fed transform blocks."""
+        state = self._state_with_csv_source(schema_mode="observed").with_node(
+            self._plain_transform(
+                "tidy",
+                plugin="passthrough",
+                input_connection="rows",
+                on_success="out",
+                options={"schema": {"mode": "flexible", "fields": ["price: float", "customer: str"]}},
+            )
+        )
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        diagnostics = result.data["proof_diagnostics"]
+        mismatch = [d for d in diagnostics if d["code"] == "declared_input_type_mismatch_against_source_schema"]
+        assert mismatch, diagnostics
+        assert len(mismatch) == 1
+        assert mismatch[0]["severity"] == "blocking"
+        assert mismatch[0]["evidence_locator"]["node_id"] == "tidy"
+        assert mismatch[0]["evidence_locator"]["field"] == "price"
+        assert mismatch[0]["evidence_locator"]["declared_type"] == "float"
+        assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
+        assert result.data["is_valid"] is False
+
+    def test_observed_csv_str_input_declaration_does_not_block(self) -> None:
+        """str/any declarations match what an observed CSV actually delivers."""
+        state = self._state_with_csv_source(schema_mode="observed").with_node(
+            self._plain_transform(
+                "tidy",
+                plugin="passthrough",
+                input_connection="rows",
+                on_success="out",
+                options={"schema": {"mode": "flexible", "fields": ["price: str", "customer: any"]}},
+            )
+        )
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        codes = [d["code"] for d in result.data["proof_diagnostics"]]
+        assert "declared_input_type_mismatch_against_source_schema" not in codes
+
+    def test_observed_csv_fork_llm_coalesce_typed_declaration_blocks(self) -> None:
+        """The elspeth-e6e552ce34 incident shape: fork → llm branches → coalesce →
+        field_mapper declaring `id: int` over an observed CSV whose values are str.
+
+        preview_pipeline passed twice on this exact topology in the live
+        incident (session 94bdae4f, run cc2279a3) and every row quarantined at
+        the field_mapper's input preflight. The walk must reach through the
+        pass-through llm nodes and the union coalesce.
+        """
+        from sqlalchemy import update
+
+        from elspeth.web.blobs.service import content_hash as _content_hash
+        from elspeth.web.sessions.models import blobs_table
+
+        csv_content = b"id,question\n1,What causes the seasons on Earth?\n2,Why is the sky blue?\n"
+        self.csv_storage_path.write_bytes(csv_content)
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(blobs_table)
+                .where(blobs_table.c.id == self.csv_blob_id)
+                .values(
+                    size_bytes=len(csv_content),
+                    content_hash=_content_hash(csv_content),
+                )
+            )
+
+        def _branch_llm(node_id: str, branch: str, response_field: str) -> NodeSpec:
+            options = _llm_options_with_api_key({"secret_ref": "OPENROUTER_API_KEY"})
+            options["response_field"] = response_field
+            return self._plain_transform(
+                node_id,
+                plugin="llm",
+                input_connection=branch,
+                on_success=f"answered_{branch}",
+                options=options,
+            )
+
+        state = (
+            self._state_with_csv_source(schema_mode="observed")
+            .with_node(
+                NodeSpec(
+                    id="fan_out",
+                    node_type="gate",
+                    plugin=None,
+                    input="rows",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=("branch_a", "branch_b"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(_branch_llm("llm_a", "branch_a", "answer_a"))
+            .with_node(_branch_llm("llm_b", "branch_b", "answer_b"))
+            .with_node(
+                NodeSpec(
+                    id="merge_branches",
+                    node_type="coalesce",
+                    plugin=None,
+                    input="answered_branch_a",
+                    on_success="merged_rows",
+                    on_error=None,
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches={"branch_a": "answered_branch_a", "branch_b": "answered_branch_b"},
+                    policy="require_all",
+                    merge="union",
+                )
+            )
+            .with_node(
+                self._plain_transform(
+                    "tidy_columns",
+                    plugin="field_mapper",
+                    input_connection="merged_rows",
+                    on_success="out",
+                    options={
+                        "schema": {
+                            "mode": "flexible",
+                            "fields": ["id: int", "question: str", "answer_a: str", "answer_b: str"],
+                            "guaranteed_fields": ["id", "question", "answer_a", "answer_b"],
+                        },
+                        "mapping": {
+                            "id": "id",
+                            "question": "question",
+                            "answer_a": "answer_a",
+                            "answer_b": "answer_b",
+                        },
+                        "select_only": True,
+                    },
+                )
+            )
+        )
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        diagnostics = result.data["proof_diagnostics"]
+        mismatch = [d for d in diagnostics if d["code"] == "declared_input_type_mismatch_against_source_schema"]
+        assert mismatch, diagnostics
+        assert len(mismatch) == 1, mismatch
+        assert mismatch[0]["evidence_locator"]["node_id"] == "tidy_columns"
+        assert mismatch[0]["evidence_locator"]["field"] == "id"
+        assert mismatch[0]["evidence_locator"]["declared_type"] == "int"
+        assert mismatch[0]["evidence_locator"]["inferred_sample_type"] == "int"
+        assert result.data["is_valid"] is False
+
+    def test_observed_csv_typed_sink_schema_blocks(self) -> None:
+        """The same contradiction one node further on: a fixed sink schema
+        declaring `order_id: int` is armed even when every transform is clean."""
+        state = (
+            self._state_with_csv_source(schema_mode="observed")
+            .with_node(
+                self._plain_transform(
+                    "forward",
+                    plugin="passthrough",
+                    input_connection="rows",
+                    on_success="typed_out",
+                    options={"schema": {"mode": "observed"}},
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="typed_out",
+                    plugin="json",
+                    options={
+                        "path": "outputs/typed.json",
+                        "schema": {"mode": "fixed", "fields": ["order_id: int", "customer: str", "price: str"]},
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        diagnostics = result.data["proof_diagnostics"]
+        mismatch = [d for d in diagnostics if d["code"] == "declared_input_type_mismatch_against_source_schema"]
+        assert mismatch, diagnostics
+        assert len(mismatch) == 1, mismatch
+        assert mismatch[0]["evidence_locator"]["output_name"] == "typed_out"
+        assert mismatch[0]["evidence_locator"]["field"] == "order_id"
+        assert mismatch[0]["evidence_locator"]["declared_type"] == "int"
+        assert result.data["is_valid"] is False
+
+    def test_declared_source_schema_types_do_not_trip_the_observed_arm(self) -> None:
+        """A source that declares its types coerces at ingestion — no diagnostic."""
+        state = self._state_with_csv_source(
+            schema_mode="flexible",
+            fields=("order_id: str", "customer: str", "price: float"),
+        ).with_node(
+            self._plain_transform(
+                "tidy",
+                plugin="passthrough",
+                input_connection="rows",
+                on_success="out",
+                options={"schema": {"mode": "flexible", "fields": ["price: float"]}},
+            )
+        )
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        codes = [d["code"] for d in result.data["proof_diagnostics"]]
+        assert "declared_input_type_mismatch_against_source_schema" not in codes
+
     def test_csv_duplicate_headers_registered_as_blocking_code(self) -> None:
         """Registry membership ripples — the constructor would crash if the
         emission site used an unregistered code, so this test pins the
@@ -16312,6 +16587,7 @@ class TestPreviewProofStep:
 
         assert "csv_duplicate_headers" in _BLOCKING_DIAGNOSTIC_CODES
         assert "csv_source_field_resolution_error" in _BLOCKING_DIAGNOSTIC_CODES
+        assert "declared_input_type_mismatch_against_source_schema" in _BLOCKING_DIAGNOSTIC_CODES
 
     # -- missing/unreadable blob --------------------------------------------
 
@@ -16506,6 +16782,169 @@ class TestPreviewProofStep:
                 session_engine=self.engine,
                 session_id=self.session_id,
             )
+
+
+class TestFieldPreservationWalk:
+    """Direct tests of the proof step's field-preservation walk arms.
+
+    Adversarial cases for the fail-closed detector (the walk feeds a BLOCKING
+    diagnostic, so a wrong positive wedges a valid pipeline): each arm is
+    exercised in both the preserve and the abstain direction, against the
+    real plugin registry — no catalog or blob custody needed.
+    """
+
+    @staticmethod
+    def _observed_csv_state():
+        return _empty_state().with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        )
+
+    @staticmethod
+    def _node(node_id: str, **overrides: Any) -> NodeSpec:
+        base: dict[str, Any] = {
+            "id": node_id,
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "rows",
+            "on_success": "done",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        base.update(overrides)
+        return NodeSpec(**base)
+
+    def _walk(self, state, connection: str, field: str) -> bool:
+        from elspeth.web.composer.tools.generation import _source_field_reaches_connection_without_type_change
+
+        return _source_field_reaches_connection_without_type_change(
+            state,
+            connection,
+            source_name="source",
+            field_name=field,
+        )
+
+    def test_type_coerce_declared_fields_abstain(self) -> None:
+        """type_coerce re-declares every input field in its OUTPUT config, so
+        membership abstention covers both the conversion target (the value
+        provably changed type) and the untouched declared field. The second
+        abstention is deliberate conservatism, not a defect: the walk is
+        shared with the gate-sampling arm, which needs VALUE preservation —
+        a declared field may have been rewritten to a different value of the
+        same type, so mere same-type declarations cannot clear it."""
+        state = self._observed_csv_state().with_node(
+            self._node(
+                "coerce",
+                plugin="type_coerce",
+                options={
+                    "schema": {"mode": "flexible", "fields": ["price: str", "customer: str"]},
+                    "conversions": [{"field": "price", "to": "float"}],
+                },
+            )
+        )
+        assert self._walk(state, "done", "price") is False
+        assert self._walk(state, "done", "customer") is False
+
+    def test_llm_pass_through_preserves_undeclared_fields(self) -> None:
+        """An llm declares only its ADDED fields (response_field and its
+        siblings) in its output config, so a source field recurses through —
+        the arm that closed the elspeth-e6e552ce34 walk gap."""
+        options = _llm_options_with_api_key({"secret_ref": "OPENROUTER_API_KEY"})
+        options["response_field"] = "answer_a"
+        state = self._observed_csv_state().with_node(self._node("branch_llm", plugin="llm", options=options))
+        assert self._walk(state, "done", "price") is True
+        assert self._walk(state, "done", "answer_a") is False
+
+    def test_observed_mode_type_coerce_abstains_entirely(self) -> None:
+        """A pass-through transform that declares NO output fields has opted out
+        of the declaration discipline — silence is not type-preservation
+        (the observed-mode type_coerce trap, elspeth-85e8afa2f5)."""
+        state = self._observed_csv_state().with_node(
+            self._node(
+                "coerce",
+                plugin="type_coerce",
+                options={
+                    "schema": {"mode": "observed"},
+                    "conversions": [{"field": "price", "to": "float"}],
+                },
+            )
+        )
+        assert self._walk(state, "done", "price") is False
+        assert self._walk(state, "done", "customer") is False
+
+    def _fork_coalesce_state(self, *, merge: str, branch_b_plugin: str = "passthrough", branch_b_options: dict[str, Any] | None = None):
+        return (
+            self._observed_csv_state()
+            .with_node(
+                self._node(
+                    "fan_out",
+                    node_type="gate",
+                    plugin=None,
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=("branch_a", "branch_b"),
+                )
+            )
+            .with_node(self._node("path_a", input="branch_a", on_success="done_a"))
+            .with_node(
+                self._node(
+                    "path_b",
+                    plugin=branch_b_plugin,
+                    input="branch_b",
+                    on_success="done_b",
+                    options=branch_b_options or {"schema": {"mode": "observed"}},
+                )
+            )
+            .with_node(
+                self._node(
+                    "merge_it",
+                    node_type="coalesce",
+                    plugin=None,
+                    input="done_a",
+                    on_success="merged",
+                    on_error=None,
+                    options={},
+                    branches={"branch_a": "done_a", "branch_b": "done_b"},
+                    policy="require_all",
+                    merge=merge,
+                )
+            )
+        )
+
+    def test_union_coalesce_preserves_when_all_branches_preserve(self) -> None:
+        state = self._fork_coalesce_state(merge="union")
+        assert self._walk(state, "merged", "price") is True
+
+    def test_nested_coalesce_abstains(self) -> None:
+        """A nested merge rewrites the top level to branch names — no top-level
+        source field survives it."""
+        state = self._fork_coalesce_state(merge="nested")
+        assert self._walk(state, "merged", "price") is False
+
+    def test_union_coalesce_abstains_when_one_branch_overwrites(self) -> None:
+        """Unanimity: one branch overwriting the field collapses the vote."""
+        state = self._fork_coalesce_state(
+            merge="union",
+            branch_b_plugin="value_transform",
+            branch_b_options={
+                "schema": {"mode": "observed"},
+                "operations": [{"target": "price", "expression": "1"}],
+            },
+        )
+        assert self._walk(state, "merged", "price") is False
 
 
 class TestBlockingDiagnosticRegistry:

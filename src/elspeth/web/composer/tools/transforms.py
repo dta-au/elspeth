@@ -233,7 +233,14 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
                 "edge; omit it to preserve fail-fast behavior."
             ),
         },
-        "options": {"type": "object", "description": "Plugin-specific config (transform/aggregation only)."},
+        "options": {
+            "type": "object",
+            "description": (
+                "Plugin-specific config (transform/aggregation only). The schema: block declares what "
+                "ARRIVES at the node, never its transformed result; declare arriving types on the "
+                "SOURCE schema or via an upstream type_coerce (observed CSV fields arrive as str)."
+            ),
+        },
         "condition": {"type": ["string", "null"], "description": "Boolean expression (gate only). Evaluated per row."},
         "routes": {
             "type": ["object", "null"],
@@ -1592,7 +1599,10 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                     "Merge-patch to apply to plugin options only. "
                     "Node-level routing fields such as on_success, on_error, input, routes, "
                     "and fork_to are siblings of options; edit them with upsert_edge or upsert_node. "
-                    "For a gate, edit on_error only with upsert_node."
+                    "For a gate, edit on_error only with upsert_node. "
+                    "A patched schema: block declares what ARRIVES at the node, never its transformed "
+                    "result; to change what arrives, declare the type on the SOURCE schema "
+                    "(patch_source_options) or insert a type_coerce upstream."
                 ),
             },
         },

@@ -1914,7 +1914,9 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 },
                 "description": (
                     "Edge specs. edge_type='on_error' is supported for transform/aggregation sink wiring only; "
-                    "a gate's evaluation-error policy is the node's on_error field."
+                    "a gate's evaluation-error policy is the node's on_error field. "
+                    "Advisory display records: node connection fields are the authoritative runtime "
+                    "wiring, and [] is complete for a fully-wired topology."
                 ),
             },
             "outputs": {

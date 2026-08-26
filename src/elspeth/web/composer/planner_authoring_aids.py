@@ -489,8 +489,10 @@ def _prompt_shield_rules(
         "(a sibling of the node's other options).",
         f'Use exactly: {{"kind": "pipeline_decision", "user_term": "{PROMPT_SHIELD_USER_TERM}", "draft": "{draft}"}} '
         "— copy the user_term and draft strings verbatim.",
-        "The review is advisory and never blocks the pipeline, but omitting it hides a "
-        "prompt-injection exposure decision from the operator's review cards.",
+        "The WARNING is advisory, but a staged row costs a mandatory operator acknowledgement "
+        "before /execute — stage it only when externally-fetched content actually reaches the llm.",
+        "Never stage this fetch-step draft on an llm fed only operator-supplied content; the "
+        "validator's warning already carries the correct local-content wording there.",
         "Skip the row only when an authorized prompt-injection shield transform is already wired between that producer node and the llm node.",
     ]
 

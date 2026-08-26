@@ -655,6 +655,49 @@ def test_gate_routed_web_scrape_into_llm_warns_without_prompt_shield() -> None:
     assert all(site.user_term != PROMPT_SHIELD_USER_TERM for site in result.sites)
 
 
+def test_web_scrape_fed_llm_keeps_remote_content_drafts_verbatim() -> None:
+    """The remote-provenance branch is a genuine security advisory: its wording
+    must stay byte-identical in both availability states — the local-content
+    split must never soften a real scrape graph's card."""
+    from elspeth.web.interpretation_state import (
+        PROMPT_SHIELD_AVAILABLE_DRAFT,
+        PROMPT_SHIELD_WARNING_DRAFT,
+    )
+
+    state = _state_with_web_scrape_gate_to_llm()
+
+    pairs_c = prompt_shield_recommendation_warning_pairs(state, shield_available=False)
+    assert any(PROMPT_SHIELD_WARNING_DRAFT in message for _component, message in pairs_c)
+
+    pairs_b = prompt_shield_recommendation_warning_pairs(state, shield_available=True)
+    assert any(PROMPT_SHIELD_AVAILABLE_DRAFT in message for _component, message in pairs_b)
+
+
+def test_refiner_upgrades_local_content_draft_variant() -> None:
+    """C->B upgrade must stay variant-aligned: a local-content warning upgrades
+    to the local-content B draft, never to the remote fetch-step wording."""
+    from elspeth.web.interpretation_state import (
+        PROMPT_SHIELD_AVAILABLE_DRAFT,
+        PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT,
+        PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT,
+        refine_prompt_shield_warnings_for_availability,
+    )
+
+    refined = refine_prompt_shield_warnings_for_availability(
+        [
+            {
+                "component": "node:rate_node",
+                "message": f"lead {PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT}",
+                "severity": "medium",
+            }
+        ],
+        shield_available=True,
+    )
+    assert PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT in refined[0]["message"]
+    assert PROMPT_SHIELD_AVAILABLE_DRAFT not in refined[0]["message"]
+    assert PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT not in refined[0]["message"]
+
+
 def test_gate_routed_web_scrape_through_prompt_shield_emits_no_warning() -> None:
     state = _state_with_web_scrape_gate_shield_to_llm()
 
@@ -1148,16 +1191,29 @@ def test_plain_unshielded_llm_warns_always_on() -> None:
 
 
 def test_prompt_shield_warning_uses_available_draft_in_state_b() -> None:
-    from elspeth.web.interpretation_state import PROMPT_SHIELD_AVAILABLE_DRAFT
+    """A fetch-less graph gets the LOCAL-CONTENT drafts in both states.
+
+    The remote-content constants assert an "external-content fetch step" and
+    "internet-controlled text"; on this graph (plain llm over operator-supplied
+    rows, no upstream producer) those claims are false, and the staged review
+    card carries the draft alone — so the draft itself must tell the truth
+    (build-review finding L2, session 94bdae4f).
+    """
+    from elspeth.web.interpretation_state import (
+        PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT,
+        PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT,
+    )
 
     state = _state_with_plain_llm_only()
     pairs_b = prompt_shield_recommendation_warning_pairs(state, shield_available=True)
     assert pairs_b
-    assert any(PROMPT_SHIELD_AVAILABLE_DRAFT in message for _component, message in pairs_b)
+    assert any(PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT in message for _component, message in pairs_b)
+    assert all("external-content fetch step and this LLM" not in message for _component, message in pairs_b)
 
     pairs_c = prompt_shield_recommendation_warning_pairs(state, shield_available=False)
     assert pairs_c
-    assert any("continuing without it is allowed" in message for _component, message in pairs_c)
+    assert any(PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT in message for _component, message in pairs_c)
+    assert any("continuing without a shield is allowed" in message for _component, message in pairs_c)
 
 
 def test_field_mapper_projection_without_web_scrape_raw_fields_does_not_create_cleanup_review_site() -> None:

@@ -199,6 +199,31 @@ class TestCsvInspection:
             "active": "bool",
         }
 
+    def test_lexical_types_advisory_when_numeric_types_inferred(self) -> None:
+        """int/float/bool inferences carry the runtime framing: CSV delivers str
+        unless the SOURCE schema declares the type (elspeth-e6e552ce34 —
+        planners transcribed the lexical hint into a downstream declared type)."""
+        f = inspect_blob_content(
+            content=b"id,name,price,active\n1,Alice,9.99,true\n2,Bob,19.95,false\n",
+            filename="x.csv",
+            mime_type="text/csv",
+        )
+        advisories = [w for w in f.warnings if w.startswith("csv_lexical_types_advisory:")]
+        assert len(advisories) == 1, f.warnings
+        assert "3 column(s)" in advisories[0]
+        assert "arrives as str" in advisories[0]
+        # Column names are withheld — headerless CSV can make data look like
+        # headers, and warnings mirror into model-visible diagnostics.
+        assert "[" not in advisories[0] and "'price'" not in advisories[0]
+
+    def test_no_lexical_types_advisory_for_all_str_columns(self) -> None:
+        f = inspect_blob_content(
+            content=b"name,city\nAlice,Sydney\nBob,Perth\n",
+            filename="x.csv",
+            mime_type="text/csv",
+        )
+        assert not any(w.startswith("csv_lexical_types_advisory:") for w in f.warnings), f.warnings
+
     def test_int_then_float_promotes_to_float(self) -> None:
         f = inspect_blob_content(
             content=b"v\n1\n2\n3.5\n",

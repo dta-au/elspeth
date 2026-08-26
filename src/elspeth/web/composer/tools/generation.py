@@ -35,6 +35,7 @@ from elspeth.plugins.transforms.llm.model_catalog import (
 from elspeth.web.blobs.protocol import BlobIntegrityError
 from elspeth.web.catalog.protocol import PluginKind
 from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id, source_producer_id
+from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
     derive_extra_column_risk,
@@ -53,6 +54,8 @@ from elspeth.web.composer.state import (
     NodeSpec,
     SourceSpec,
     ValidationEntryDict,
+    _coalesce_branch_connections,
+    _is_config_probe_exception,
     _source_options_have_schema,
     _validate_gate_expression,
 )
@@ -1932,6 +1935,7 @@ _BLOCKING_DIAGNOSTIC_CODES: Final[frozenset[str]] = frozenset(
         "csv_source_field_resolution_error",
         "gate_expression_preview_memory_exhaustion",
         "gate_expression_type_mismatch_against_source_schema",
+        "declared_input_type_mismatch_against_source_schema",
         "gate_expression_unbounded_string_amplification",
         "text_source_url_without_web_scrape",
         "source_inspection_failed",
@@ -2301,6 +2305,63 @@ _NUMERIC_VALUE_FIELD_AGGREGATION_PLUGINS: Final[frozenset[str]] = frozenset(
 )
 
 
+def _pass_through_transform_plugin_names() -> frozenset[str]:
+    """Names of registered transforms declaring ``passes_through_input=True``.
+
+    Re-derived per call from the live registry (the ``_known_pass_through_plugins``
+    discipline in state.py): a plugin registered after module import must be
+    visible, and the read is a bounded scan over class attributes — no
+    instantiation. ``cls.passes_through_input`` is read directly; a missing
+    attribute is a framework bug and must crash loudly.
+    """
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    transforms = get_shared_plugin_manager().get_transforms()
+    return frozenset(cls.name for cls in transforms if cls.passes_through_input)
+
+
+def _probe_transform_output_declared_field_names(plugin: str, options: Mapping[str, Any]) -> frozenset[str] | None:
+    """Field names a transform's own output schema config declares, or None.
+
+    ``None`` means the probe could not construct the plugin from these options
+    (draft/malformed config — the contract-config validation rules own
+    reporting that) — callers must ABSTAIN. An empty frozenset means the
+    plugin constructed but declares no output fields; per the engine's
+    declaration discipline (``resolve_guaranteed_field_type``), a pass-through
+    transform that declares nothing has opted out of stating what it emits,
+    so callers must abstain on that too rather than treating silence as
+    type-preservation (the observed-mode ``type_coerce`` trap,
+    elspeth-85e8afa2f5 panel review).
+
+    Declarations are read from BOTH channels: typed ``fields`` (type_coerce
+    re-declares its whole input with conversion targets retyped) and
+    ``guaranteed_fields`` (an observed-schema llm names its ADDED fields
+    there with ``fields=None`` — the two channels are decoupled by design,
+    see ``validate_typed_producer_guaranteed_extras``).
+    """
+    try:
+        transform = get_shared_plugin_manager().create_transform(
+            plugin,
+            prepare_validation_probe_options(options),
+        )
+    except Exception as exc:
+        if not _is_config_probe_exception(exc):
+            raise
+        return None
+    try:
+        config = transform._output_schema_config
+        if config is None:
+            return frozenset()
+        declared: set[str] = set()
+        if config.fields:
+            declared.update(field_def.name for field_def in config.fields)
+        if config.guaranteed_fields:
+            declared.update(config.guaranteed_fields)
+        return frozenset(declared)
+    finally:
+        transform.close()
+
+
 def _value_transform_preserves_field(node: NodeSpec, field_name: str) -> bool:
     # ``node.options`` is composer/user-authored config re-read from persisted
     # session state — Tier-3 origin. Membership form (not ``.get``) records the
@@ -2318,20 +2379,22 @@ def _value_transform_preserves_field(node: NodeSpec, field_name: str) -> bool:
     return True
 
 
-def _source_field_reaches_connection_without_type_change(
+def _field_preservation_walker(
     state: CompositionState,
-    connection_name: str,
     *,
     source_name: str,
     field_name: str,
-) -> bool:
-    """Return True when a source field flows to a connection unchanged.
+) -> tuple[ProducerResolver, Callable[..., bool], Callable[..., bool]]:
+    """Build the shared field-preservation walk over one composition.
 
-    This intentionally recognises only field-preserving nodes. Declared queues
-    traverse their predecessor set source-by-source; unrelated fan-in never
-    stands in for the target source. Unknown transforms may coerce, overwrite,
-    delete, or synthesize the field, so the proof step abstains instead of
-    emitting a false positive.
+    Returns ``(resolver, producer_preserves, connection_preserves)`` — the
+    closures the connection-form and sink-form entry points below both drive.
+
+    The walk intentionally recognises only field-preserving nodes. Declared
+    queues traverse their predecessor set source-by-source; unrelated fan-in
+    never stands in for the target source. Unknown transforms may coerce,
+    overwrite, delete, or synthesize the field, so the proof step abstains
+    instead of emitting a false positive.
     """
     resolver = ProducerResolver.build(
         source=None,
@@ -2360,10 +2423,37 @@ def _source_field_reaches_connection_without_type_change(
             )
         if node.node_type == "gate":
             return _connection_preserves_field(node.input, visiting=next_visiting)
+        if node.node_type in ("coalesce", "row_union"):
+            # A merged/released row's field value comes from exactly one branch
+            # payload, so the field is provably preserved only when EVERY
+            # branch delivers it from the target source unchanged (unanimity —
+            # the true path is always among those considered, so an extra
+            # branch can only force abstention, never a wrong positive). A
+            # nested-merge coalesce rewrites the top level to branch names, so
+            # no top-level source field survives it.
+            if node.node_type == "coalesce" and node.merge == "nested":
+                return False
+            branch_connections = _coalesce_branch_connections(node.branches)
+            if not branch_connections:
+                return False
+            return all(_connection_preserves_field(connection, visiting=next_visiting) for connection in branch_connections)
         if node.plugin == "value_transform" and _value_transform_preserves_field(node, field_name):
             return _connection_preserves_field(node.input, visiting=next_visiting)
         if node.plugin == "passthrough":
             return _connection_preserves_field(node.input, visiting=next_visiting)
+        if node.node_type == "transform" and node.plugin is not None and node.plugin in _pass_through_transform_plugin_names():
+            # Engine declaration discipline (``resolve_guaranteed_field_type``):
+            # a pass-through transform forwards the whole input row, and one
+            # that rewrites a field in place declares it in its OUTPUT schema
+            # config (type_coerce declares conversion targets, value_transform
+            # its operation targets). Recurse only past a transform that
+            # declares SOMETHING and does not declare this field; a transform
+            # declaring nothing has opted out of that discipline (observed-mode
+            # type_coerce) and the walk abstains rather than guessing.
+            declared_output_fields = _probe_transform_output_declared_field_names(node.plugin, node.options)
+            if declared_output_fields and field_name not in declared_output_fields:
+                return _connection_preserves_field(node.input, visiting=next_visiting)
+            return False
         return False
 
     def _connection_preserves_field(
@@ -2376,7 +2466,53 @@ def _source_field_reaches_connection_without_type_change(
             return False
         return _producer_preserves_field(producer, visiting=visiting)
 
-    return _connection_preserves_field(connection_name, visiting=frozenset())
+    return resolver, _producer_preserves_field, _connection_preserves_field
+
+
+def _source_field_reaches_connection_without_type_change(
+    state: CompositionState,
+    connection_name: str,
+    *,
+    source_name: str,
+    field_name: str,
+) -> bool:
+    """Return True when a source field flows to a connection unchanged."""
+    _resolver, _producer_preserves, connection_preserves = _field_preservation_walker(
+        state,
+        source_name=source_name,
+        field_name=field_name,
+    )
+    return connection_preserves(connection_name, visiting=frozenset())
+
+
+def _source_field_reaches_sink_without_type_change(
+    state: CompositionState,
+    sink_name: str,
+    *,
+    source_name: str,
+    field_name: str,
+) -> bool:
+    """Return True when a source field flows to a sink's input unchanged.
+
+    Sink-targeted edges never enter the resolver's connection map (a sink is
+    terminal), so this walks the sink's direct producers instead. A sink can
+    have fan-in: rows arrive from EVERY producer, so the field is provably
+    str-typed on arrival only when every producer preserves it — one abstaining
+    producer collapses the answer to abstention, mirroring the queue/coalesce
+    unanimity posture.
+    """
+    resolver, producer_preserves, _connection_preserves = _field_preservation_walker(
+        state,
+        source_name=source_name,
+        field_name=field_name,
+    )
+    producers = resolver.sink_producers(sink_name)
+    if not producers:
+        return False
+    # Two route labels from one gate onto one sink are two registration-order
+    # entries for the same producer; dedupe on producer_id before the vote.
+    unique_producers = {producer.producer_id: producer for producer in producers}
+    return all(producer_preserves(producer, visiting=frozenset()) for producer in unique_producers.values())
 
 
 def _numeric_aggregation_diagnostics_for_observed_csv(
@@ -2464,6 +2600,143 @@ def _numeric_aggregation_diagnostics_for_observed_csv(
     return diagnostics
 
 
+def _declared_input_type_diagnostics_for_observed_csv(
+    state: CompositionState,
+    source_name: str,
+    source: SourceSpec,
+    *,
+    blob_id: str,
+    inferred_types: Mapping[str, str] | None,
+    observed_headers: tuple[str, ...] | None,
+) -> list[Mapping[str, Any]]:
+    """Block concretely-typed input declarations fed observed CSV strings.
+
+    The incident class (elspeth-e6e552ce34): a downstream transform (or output)
+    declares an input field with a concrete non-str type (``id: int``) while
+    the field flows unchanged from an observed CSV source — whose values are
+    strings by construction. Authoring validation and the engine's edge
+    validation both bypass observed producers, so without this arm the mismatch
+    first fires as a per-row contract violation at run time, quarantining
+    every row.
+
+    Fires only on a provably field-preserving path (the
+    ``_field_preservation_walker`` entry points) — unknown transforms may
+    coerce the field, so the proof step abstains there rather than emitting a
+    false positive.
+    """
+    if _source_schema_mode(source) != "observed" or observed_headers is None:
+        return []
+
+    observed_header_set = set(observed_headers)
+    diagnostics: list[Mapping[str, Any]] = []
+
+    def _declared_concrete_fields(options: Mapping[str, Any], *, owner: str) -> tuple[Any, ...]:
+        # ``options`` is composer/user-authored config re-read from persisted
+        # session state — Tier-3 origin. A malformed schema block is
+        # recoverable external input owned by the contract-config validation
+        # rules; this proof arm abstains on it rather than double-reporting.
+        try:
+            schema_config = get_raw_schema_config(options, owner=owner)
+        except ValueError:
+            return ()
+        if schema_config is None or not schema_config.fields:
+            return ()
+        return tuple(
+            field_def
+            for field_def in schema_config.fields
+            if field_def.field_type not in ("str", "any") and field_def.name in observed_header_set
+        )
+
+    def _mismatch_diagnostic(
+        *,
+        component_kind: str,
+        component_id: str,
+        plugin: str | None,
+        field_def: Any,
+        extra_evidence: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        # ``inferred_types`` is our own Tier-2 derived inspection output —
+        # same invariant the aggregation arm documents: a non-None map is
+        # guaranteed to carry every observed header, so a missing key must
+        # crash (subscript), never coerce to None.
+        inferred_type = inferred_types[field_def.name] if inferred_types is not None else None
+        return _blocking_diagnostic(
+            code="declared_input_type_mismatch_against_source_schema",
+            message=(
+                f"{component_kind} '{component_id}' ({plugin}) declares input field "
+                f"'{field_def.name}' as {field_def.field_type}, but the field flows "
+                "unchanged from an observed CSV source. Observed CSV source values are "
+                "strings unless the source schema declares explicit field types, so "
+                f"'{field_def.name}' arrives as str and every row would fail this "
+                "consumer's input validation at runtime."
+            ),
+            suggested_repair=(
+                "Patch the SOURCE schema to declare the field with the intended type "
+                f"(for example schema.mode='flexible' with schema.fields including "
+                f"{field_def.name}: {field_def.field_type} — the source coerces values at "
+                "ingestion), or insert a type_coerce node upstream with a conversions "
+                f"entry converting {field_def.name} to {field_def.field_type}, or declare "
+                f"the field as {field_def.name}: str on this consumer if string values are "
+                "acceptable. A node's own schema: block declares what ARRIVES at "
+                "the node, never what it should be converted to."
+            ),
+            evidence_locator={
+                "source": "blob",
+                "blob_id": str(blob_id),
+                "plugin": plugin,
+                "field": field_def.name,
+                "declared_type": field_def.field_type,
+                "observed_type": "str",
+                "inferred_sample_type": inferred_type or "unknown",
+                "source_runtime_type": "str",
+                "source_schema_mode": "observed",
+                **extra_evidence,
+            },
+        )
+
+    for node in state.nodes:
+        if node.node_type != "transform":
+            continue
+        for field_def in _declared_concrete_fields(node.options, owner=f"node:{node.id}"):
+            if not _source_field_reaches_connection_without_type_change(
+                state,
+                node.input,
+                source_name=source_name,
+                field_name=field_def.name,
+            ):
+                continue
+            diagnostics.append(
+                _mismatch_diagnostic(
+                    component_kind="Transform",
+                    component_id=node.id,
+                    plugin=node.plugin,
+                    field_def=field_def,
+                    extra_evidence={"node_id": node.id},
+                )
+            )
+
+    for output in state.outputs:
+        for field_def in _declared_concrete_fields(output.options, owner=f"output:{output.name}"):
+            if not _source_field_reaches_sink_without_type_change(
+                state,
+                output.name,
+                source_name=source_name,
+                field_name=field_def.name,
+            ):
+                continue
+            diagnostics.append(
+                _mismatch_diagnostic(
+                    component_kind="Output",
+                    component_id=output.name,
+                    plugin=output.plugin,
+                    field_def=field_def,
+                    extra_evidence={"output_name": output.name},
+                )
+            )
+
+    return diagnostics
+
+
 def _compute_proof_diagnostics_for_source(
     state: CompositionState,
     *,
@@ -2508,6 +2781,11 @@ def _compute_proof_diagnostics_for_source(
       * ``aggregation_numeric_value_field_type_mismatch_against_source_schema`` —
         observed CSV strings flow unchanged into a numeric aggregation
         ``value_field`` before runtime can reject the batch.
+      * ``declared_input_type_mismatch_against_source_schema`` —
+        a transform or output declares a concretely-typed input field
+        (``id: int``) that flows unchanged from an observed CSV source,
+        whose values are strings by construction — every row would fail
+        that consumer's input validation at runtime (elspeth-e6e552ce34).
       * ``source_inspection_warning`` — every warning surfaced by
         ``inspect_blob_content`` is mirrored here at ``info`` severity
         so the model sees them in the same array as blocking issues.
@@ -2770,6 +3048,16 @@ def _compute_proof_diagnostics_for_source(
         )
         diagnostics.extend(
             _numeric_aggregation_diagnostics_for_observed_csv(
+                state,
+                source_name,
+                source,
+                blob_id=str(blob_id),
+                inferred_types=facts.inferred_types,
+                observed_headers=facts.observed_headers,
+            )
+        )
+        diagnostics.extend(
+            _declared_input_type_diagnostics_for_observed_csv(
                 state,
                 source_name,
                 source,

@@ -681,6 +681,27 @@ def _inspect_csv(
 
     inferred = {h: _merge_types(types_per_column[h]) for h in headers}
 
+    lexical_typed_count = sum(1 for t in inferred.values() if t in ("int", "float", "bool"))
+    if lexical_typed_count:
+        # The inferred int/float/bool hints are LEXICAL observations of quoted
+        # CSV text. At runtime the csv source delivers every value as str
+        # unless the source schema declares the field's type (declared fields
+        # are coerced at ingestion). Without this framing, planners transcribe
+        # the lexical hint into a downstream node's declared input type and
+        # every row dies at that node's preflight (elspeth-e6e552ce34).
+        # Column names are withheld — headerless/malformed CSV can make a data
+        # row look like headers, and this warning is mirrored into
+        # model-visible proof diagnostics; the names are readable from
+        # inferred_types itself where that surface is appropriate.
+        warnings.append(
+            f"csv_lexical_types_advisory: {lexical_typed_count} column(s) have "
+            "int/float/bool inferred_types — these are lexical observations of CSV "
+            "text. At runtime every csv value arrives as str unless the SOURCE "
+            "schema declares the field's type (declared source fields are coerced "
+            "at ingestion). Do not copy an inferred type into a downstream node's "
+            "schema without declaring it on the source or inserting a type_coerce."
+        )
+
     # URL hints inside data cells — sometimes a CSV has a URL column that
     # downstream needs to feed web_scrape.
     url_candidates: list[str] = []

@@ -130,6 +130,31 @@ PROMPT_SHIELD_AVAILABLE_DRAFT: Final[str] = (
     "but you may proceed without it. "
     "[user_term: prompt_injection_shield_recommendation]"
 )
+# Provenance-honest siblings for an LLM with NO externally-fetched content
+# upstream. The remote-content constants above assert an "external-content
+# fetch step" and "internet-controlled text"; staged verbatim onto an
+# operator-supplied-data pipeline those claims are false for the graph, the
+# operator's review card asserts a step that does not exist, and the planner
+# cannot tell (the honest computed lead is discarded on staging — the draft
+# alone is transcribed). Every draft-choosing site must select by provenance:
+# untrusted remote producers present -> the constants above (verbatim,
+# unchanged — they are security advisories); none -> these.
+PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT: Final[str] = (
+    "Recommend inserting azure_prompt_shield (or the deployment equivalent prompt-injection shield) "
+    "in front of this LLM if its input data may carry adversarial text. This pipeline has no "
+    "external-content fetch step: the LLM consumes operator-supplied source content, so the "
+    "exposure is limited to adversarial text already present in that data, and continuing "
+    "without a shield is allowed. "
+    "[user_term: prompt_injection_shield_recommendation]"
+)
+PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT: Final[str] = (
+    "An authorized prompt-injection shield IS available in this deployment. This pipeline has no "
+    "external-content fetch step: the LLM consumes operator-supplied source content, so the "
+    "exposure is limited to adversarial text already present in that data. Wiring the shield in "
+    "front of this LLM is recommended if that data may carry adversarial text, and you may "
+    "proceed without it. "
+    "[user_term: prompt_injection_shield_recommendation]"
+)
 
 _RAW_HTML_CLEANUP_DRAFT_MARKERS: Final[tuple[str, ...]] = ("raw html", "fingerprint")
 
@@ -473,7 +498,6 @@ def prompt_shield_recommendation_warning_pairs(
             continue  # State A — already shielded, silent
         if _llm_has_shield_recommendation(node):
             continue  # review already staged on this node
-        draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_WARNING_DRAFT
         untrusted_producers = _llm_untrusted_remote_content_producers(node, graph)
         if untrusted_producers:
             # Name the producer actually found. Hardcoding "web_scrape" made the
@@ -483,8 +507,14 @@ def prompt_shield_recommendation_warning_pairs(
                 f"LLM node {node.id!r} consumes externally-fetched content from a {named} upstream "
                 "without an authorized prompt-injection shield between them. "
             )
+            draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_WARNING_DRAFT
         else:
+            # Provenance-honest draft: no fetch step exists in this graph, so
+            # the remote-content constants' claims would be false for it —
+            # and the staged review card carries the DRAFT alone, discarding
+            # this computed lead, so the draft itself must tell the truth.
             lead = f"LLM node {node.id!r} has no authorized prompt-injection shield in front of it. "
+            draft = PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT
         warnings.append((f"node:{node.id}", f"{lead}{draft}"))
     return tuple(warnings)
 
@@ -654,10 +684,21 @@ def refine_prompt_shield_warnings_for_availability(
     result: list[dict[str, Any]] = [dict(entry) for entry in warnings]
     if not shield_available:
         return result
+    # C->B upgrades per provenance variant; the replace pairs must stay
+    # variant-aligned so a local-content warning never acquires the
+    # remote-content fetch-step claim.
+    upgrades = (
+        (PROMPT_SHIELD_WARNING_DRAFT, PROMPT_SHIELD_AVAILABLE_DRAFT),
+        (PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT, PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT),
+    )
     for entry in result:
         message = entry.get("message")
-        if isinstance(message, str) and PROMPT_SHIELD_WARNING_DRAFT in message:
-            entry["message"] = message.replace(PROMPT_SHIELD_WARNING_DRAFT, PROMPT_SHIELD_AVAILABLE_DRAFT)
+        if not isinstance(message, str):
+            continue
+        for c_draft, b_draft in upgrades:
+            if c_draft in message:
+                entry["message"] = message.replace(c_draft, b_draft)
+                break
     return result
 
 
