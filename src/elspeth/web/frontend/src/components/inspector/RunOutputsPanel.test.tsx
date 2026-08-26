@@ -212,7 +212,71 @@ describe("RunOutputsPanel", () => {
   // hardcoded plural: the backend sets it to len(lines) when the LINE cap was
   // not hit but the BYTE cap truncated the read, so one very long first line
   // yields truncated=true with exactly one row.
-  it("says 'to 1 row' in the truncation footer, not 'to 1 rows'", async () => {
+  // A dropped final record must SAY it was dropped. Both tests below feed a
+  // preview whose text stops inside a quoted field — the parser reports
+  // endedInQuotes and the fragment is discarded — and assert the operator is
+  // told which of the two reasons applies. Before this, the record vanished
+  // in silence: buildTabularPreviewModel justified the drop by citing the
+  // "Preview truncated" footer, a footer it was never given the flag to see,
+  // and which does not render at all on the malformed-artifact path.
+
+  it("says the final record was cut off when a TRUNCATED preview ends mid-quote", async () => {
+    // The real and common case. The backend caps the preview by PHYSICAL
+    // LINES (web/execution/preview.py:162), so on transform:llm output —
+    // multi-line prose plus a quoted `_usage` dict — the cut routinely lands
+    // inside a value.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: true,
+        row_count_preview: 3,
+        preview_text: 'id,answer\n1,ok\n2,"a half-written ans',
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    expect(
+      await screen.findByText(/cut off by the preview limit/i),
+    ).toBeInTheDocument();
+    // The complete record still renders; only the fragment is withheld.
+    expect(screen.getByText("ok")).toBeInTheDocument();
+    expect(screen.queryByText(/a half-written ans/)).not.toBeInTheDocument();
+  });
+
+  it("reports an unterminated quoted field when an UNtruncated preview ends mid-quote", async () => {
+    // A partially-written or malformed artifact: under both the byte and the
+    // line cap, so the backend reports truncated=false and NO footer renders.
+    // Without a caveat here the record disappears with nothing on screen.
+    // summarizeCsv (utils/contentStructure.ts) has always reported exactly
+    // this condition; this is the same rule reaching the second consumer.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: false,
+        row_count_preview: 3,
+        preview_text: 'id,answer\n1,ok\n2,"a half-written ans',
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    expect(
+      await screen.findByText(/unterminated quoted field/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/preview truncated/i)).not.toBeInTheDocument();
+  });
+
+  // The noun is LINE, not row. This test's own comment above has always said
+  // len(LINES); the footer said "rows", and on LLM output — whose prose
+  // values span many physical lines — that asserted a record count the table
+  // beneath it visibly contradicted (a 30-record file could render 16 rows
+  // under a footer claiming 100). The count is honest; only its label was not.
+  it("says 'to 1 line' in the truncation footer, not 'to 1 lines'", async () => {
     (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
       manifest([fileArtifact()]),
     );
@@ -223,8 +287,8 @@ describe("RunOutputsPanel", () => {
     render(<RunOutputsPanel runId={RUN_ID} />);
 
     const footer = await screen.findByText(/preview truncated/i);
-    expect(footer.textContent).toContain("to 1 row");
-    expect(footer.textContent).not.toContain("to 1 rows");
+    expect(footer.textContent).toContain("to 1 line");
+    expect(footer.textContent).not.toContain("to 1 lines");
   });
 
   it("auto-expands the single previewable artifact, fetching its preview once, and shows the truncation footer", async () => {

@@ -552,7 +552,11 @@ function ArtifactPreviewView({
           truncated={preview.truncated}
         />
       ) : preview.content_type === "csv" || preview.content_type === "jsonl" ? (
-        <TabularPreview text={preview.preview_text} contentType={preview.content_type} />
+        <TabularPreview
+          text={preview.preview_text}
+          contentType={preview.content_type}
+          truncated={preview.truncated}
+        />
       ) : (
         <pre
           style={{
@@ -578,9 +582,14 @@ function ArtifactPreviewView({
             fontSize: 11,
           }}
         >
+          {/* row_count_preview is a PHYSICAL LINE count: the backend caps
+              with `splitlines()` (web/execution/preview.py:162), so a CSV
+              whose values contain newlines yields far fewer records than
+              lines. Calling them rows asserted a number the table below
+              visibly contradicts. */}
           Preview truncated
           {preview.row_count_preview != null &&
-            ` to ${plural(preview.row_count_preview, "row")}`}
+            ` to ${plural(preview.row_count_preview, "line")}`}
           {" — "}
           <Button variant="bare" className="link-button" onClick={onDownload}>
             download for full file
@@ -594,9 +603,23 @@ function ArtifactPreviewView({
 
 // ── TabularPreview ─────────────────────────────────────────────────────────
 
+/**
+ * A rendered table plus the reason a record is missing from it, if one is.
+ *
+ * Local, not a widening of the shared `PreviewTableModel`: the caveat is a
+ * property of reading CSV/JSONL text, and StructuredJsonPreview — the other
+ * consumer of that shared type — has nothing to say through it.
+ */
+interface TabularPreviewModel extends PreviewTableModel {
+  caveat: string | null;
+}
+
 interface TabularPreviewProps {
   text: string;
   contentType: "csv" | "jsonl";
+  /** Whether the backend cut the preview short. Governs how an unterminated
+   *  final field is explained — see buildTabularPreviewModel. */
+  truncated: boolean;
 }
 
 /**
@@ -645,7 +668,8 @@ interface TabularPreviewProps {
 function buildTabularPreviewModel(
   text: string,
   contentType: "csv" | "jsonl",
-): PreviewTableModel | null {
+  truncated: boolean,
+): TabularPreviewModel | null {
   if (contentType === "jsonl") {
     const lines = text.split("\n").filter((line) => line.length > 0);
     if (lines.length === 0) {
@@ -654,6 +678,7 @@ function buildTabularPreviewModel(
     return {
       headers: ["value"],
       rows: lines.map((line) => [line]),
+      caveat: null,
     };
   }
 
@@ -665,12 +690,27 @@ function buildTabularPreviewModel(
   const delimiter = tabCount > commaCount ? "\t" : ",";
 
   const { rows: parsed, endedInQuotes } = parseCsvRows(text, delimiter);
-  // An unterminated quoted field means the text stopped mid-record — either
-  // the preview was cut off, or the artifact is malformed. Either way that
-  // trailing row is a fragment, not a record, and rendering it would show the
-  // operator data that does not exist. Drop it; a truncated preview already
-  // renders a "Preview truncated" notice explaining the shortfall.
+  // An unterminated quoted field means the text stopped mid-record. That
+  // trailing row is a fragment, not a record, so rendering it would show the
+  // operator data that does not exist — drop it. But dropping it SILENTLY is
+  // the defect this once had: the reason the record vanished has to be on
+  // screen, and the two reasons are not the same.
+  //
+  // `truncated` is what distinguishes them, which is why it is threaded in
+  // here rather than assumed. This function used to justify the silent drop
+  // by pointing at the "Preview truncated" notice — a notice it could not
+  // see, gated on a flag it was never given, and absent entirely on the
+  // malformed-artifact path. summarizeCsv (utils/contentStructure.ts) reads
+  // the SAME endedInQuotes flag and has always reported the malformed case
+  // as a caveat; this is that rule, applied to the second consumer.
   const rows_ = endedInQuotes ? parsed.slice(0, -1) : parsed;
+  const caveat = endedInQuotes
+    ? truncated
+      // Real and common: the backend's physical-line cap routinely lands
+      // mid-value on LLM output, whose prose responses span many lines.
+      ? "The last record was cut off by the preview limit and is not shown — download for the full file."
+      : "Content has an unterminated quoted field — the final record could not be read."
+    : null;
   if (rows_.length === 0) {
     return null;
   }
@@ -684,13 +724,28 @@ function buildTabularPreviewModel(
   const rows = bodyRows.map((row) =>
     Array.from({ length: columnCount }, (_, i) => row[i] ?? ""),
   );
-  return { headers, rows };
+  return { headers, rows, caveat };
 }
 
-function TabularPreview({ text, contentType }: TabularPreviewProps) {
-  const table = buildTabularPreviewModel(text, contentType);
+function TabularPreview({ text, contentType, truncated }: TabularPreviewProps) {
+  const table = buildTabularPreviewModel(text, contentType, truncated);
   if (!table) {
     return null;
   }
-  return <PreviewTable table={table} />;
+  return (
+    <>
+      <PreviewTable table={table} />
+      {table.caveat !== null && (
+        <div
+          style={{
+            marginTop: "var(--space-xs)",
+            color: "var(--color-text-muted)",
+            fontSize: 11,
+          }}
+        >
+          {table.caveat}
+        </div>
+      )}
+    </>
+  );
 }
