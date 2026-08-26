@@ -1638,12 +1638,19 @@ def test_bind_replans_selected_node_while_restoring_unselected_node_authority() 
 
     assert bound["nodes"][0] == predecessor.to_dict()["nodes"][0]
     assert bound["nodes"][1] == predecessor.to_dict()["nodes"][1]
-    # The planner's replanned mapping reaches the bound node. Keyed on 'amount'
-    # since the fixture's old `{"tier": "'priority'"}` pair was removed: its
-    # SOURCE was 'tier', which nothing upstream produces, so field_mapper
-    # silently skipped it and no tier column was ever emitted. What this asserts
-    # — that the selected node's planner edit is carried through — is unchanged.
-    assert bound["nodes"][2]["options"]["mapping"] == {"amount": "amount"}
+    # The selected node's PLANNER edit reaches the bound node. Asserted as the
+    # whole options dict, like the sibling test below, because no single key is
+    # a reliable discriminator here: the fixture's mappings are identical on
+    # both sides, so a mapping-only assertion passes whether the binder carried
+    # the replan through or restored the predecessor wholesale. `select_only`
+    # is what actually differs (predecessor False -> candidate True), and the
+    # full dict cannot silently lose that discriminating power the next time a
+    # fixture value is edited.
+    assert bound["nodes"][2]["options"] == {
+        "mapping": {"amount": "amount"},
+        "select_only": True,
+        "schema": {"mode": "observed", "required_fields": ["amount"]},
+    }
 
 
 def test_bind_selected_field_mapper_admits_only_public_option_edits() -> None:
