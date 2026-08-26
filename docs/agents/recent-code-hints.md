@@ -1823,17 +1823,28 @@ The v3 PB-09 *cases* are a substitution, not a judgement: all existing entries
 are byte-identical in `cell_applicability`, so clone a twin's case and swap the
 key.
 
-**Do NOT add the plugin to v3's `first_party_plugins.transforms` inventory**
-(elspeth-5e2068854c). That inventory sits INSIDE the identity-pinned
-`execution_profiles` block, and `CANONICAL_V2_EXECUTION_PROFILES_SHA256`
-(`scripts/state_engine_assessment_lib/common.py:122`) is asserted against BOTH
-v2 and v3 (`…_lib/catalog.py:333`), whose blocks are currently byte-identical.
-Adding names diverges them, and no single value of that constant satisfies both
-while v2 stays byte-frozen — you trade one red for another. `validate-catalog`
-reporting "first-party plugin inventory transforms is stale" is the KNOWN state,
-not a defect you introduced. Read the ticket before touching the constant: the
-open question is whether adding a plugin should rev v3's catalog identity, and
-splitting the constant without answering that silently defeats the guard.
+**The inventory update is a MIRROR sweep across BOTH catalogs — never a
+v3-only edit** (the reference_join sweep, 9fa971fc1, is the exact template;
+pdf_rasterize's da5838874 is the same procedure). An earlier version of this
+paragraph forbade the inventory edit entirely on the premise that v2 is
+byte-frozen; that premise is false — `V2_CATALOG_SHA256` is a
+deliberate-change ratchet that has rotated on every plugin addition
+(4c205e6fb, da5838874, 9fa971fc1), and the tests have required v2 to match
+live discovery since the original contract (f36e6968d). The impossibility the
+old paragraph described is real only for the v3-ONLY edit, which diverges the
+byte-identical `execution_profiles` blocks and trades one red for another
+(`test_v3_transition_is_lossless_outside_pb09` is the lockstep guard working).
+The sweep, in dependency order: add the plugin to `first_party_plugins` and
+PB-09 in BOTH v2 and v3 (surgical text edits — a `json.dumps` round-trip
+reflows v2 and silently re-sorts PB-09, which is kind-grouped); clone the
+twin's `evidence_selectors.json` lane node_ids + 40 cells; re-derive
+`CANONICAL_V2_LEGS_SHA256` then `CANONICAL_V2_EXECUTION_PROFILES_SHA256`
+(`scripts/state_engine_assessment_lib/common.py`) via the validator's own
+`_semantic_sha256`; move the `== N` case-count pin; rotate `V2_CATALOG_SHA256`
+LAST. One constant still satisfies both catalogs because the mirror keeps the
+blocks byte-identical. elspeth-5e2068854c remains open only for the residual
+cleanup (the constant is misnamed `V2_*` while also gating v3, and its error
+text says "identity revision" where practice is rotation in place).
 
 Discovery reads the MAIN CHECKOUT from inside a worktree — the AGENTS.md venv
 trap, running in the READ direction. A sweep of these counts can transiently see

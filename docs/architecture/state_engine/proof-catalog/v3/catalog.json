@@ -171,6 +171,8 @@
         "batch_top_k",
         "blob_csv_expand",
         "blob_fetch",
+        "blob_json_expand",
+        "blob_text_expand",
         "field_mapper",
         "json_explode",
         "keyword_filter",

@@ -32,7 +32,7 @@ V3_ASSESSMENT_SCHEMA_PATH = V3_CATALOG_DIRECTORY / "assessment.schema.json"
 ASSESSMENT_SCRIPT_PATH = REPOSITORY_ROOT / "scripts/state_engine_assessment.py"
 PROFILE_REPORTER_PLUGIN = "scripts.state_engine_profile_reporter"
 V1_CATALOG_SHA256 = "2e025df8fcb61869f4ac2575d2d1b0c5bba5aa63c88c0d059e630431062eef2e"
-V2_CATALOG_SHA256 = "7dd4afce14b91d8d80f0fd469cdce0da48e6309b0f28fe1f71e5603da51c110c"
+V2_CATALOG_SHA256 = "7758406fb6d3b3adcb5ee8df9e5c85ad07994aacf9acced5fac1585bf9c7c191"
 
 
 def _load_catalog(path: Path) -> dict[str, object]:
@@ -164,14 +164,17 @@ def test_v2_catalog_plugin_cases_exhaust_live_inventory() -> None:
     ]
 
     assert pb09["required_cases"] == expected
-    assert len(expected) == 53
+    assert len(expected) == 55
 
 
 def test_v1_catalog_remains_byte_identical_historical_evidence() -> None:
     assert hashlib.sha256(V1_CATALOG_PATH.read_bytes()).hexdigest() == V1_CATALOG_SHA256
 
 
-def test_v2_catalog_remains_byte_identical_historical_evidence() -> None:
+def test_v2_catalog_bytes_change_only_with_a_deliberate_pin_rotation() -> None:
+    """v2 is a maintained mirror of live discovery, not frozen history: a plugin
+    addition edits it and rotates this pin LAST (unlike v1's genuinely frozen
+    bytes above). The pin exists so no edit lands unnoticed."""
     assert hashlib.sha256(V2_CATALOG_PATH.read_bytes()).hexdigest() == V2_CATALOG_SHA256
 
 
