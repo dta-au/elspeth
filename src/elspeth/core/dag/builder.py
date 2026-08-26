@@ -427,6 +427,7 @@ def build_execution_graph(
         )
 
     graph.set_transform_id_map(transform_ids_by_seq)
+    graph.set_transform_name_id_map(transform_ids_by_name)
 
     # Build aggregations
     aggregation_ids: dict[AggregationName, NodeID] = {}

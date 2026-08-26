@@ -78,8 +78,19 @@ def _reframe_settings_missing_parts(exc: PydanticValidationError) -> list[Valida
     ]
 
 
-def _graph_warning_to_validation_warning(warning: GraphValidationWarning) -> ValidationWarning:
+def _graph_warning_to_validation_warning(
+    warning: GraphValidationWarning,
+    *,
+    state: CompositionState | None = None,
+    graph: ExecutionGraph | None = None,
+) -> ValidationWarning:
     component_id = warning.node_ids[0] if warning.node_ids else None
+    if component_id is not None and state is not None and graph is not None:
+        # Attribute the warning to the COMPOSER component when the compiled
+        # id maps back (elspeth-9f21f3c57d); an unmapped id stays as-is.
+        targets = _edge_patch_targets_by_dag_id(state, graph)
+        if component_id in targets:
+            component_id = targets[component_id].component_id
     return ValidationWarning(
         component_id=component_id,
         component_type="graph",
@@ -134,6 +145,14 @@ def _source_schema_patch_target(source_name: str, plugin_name: str | None) -> _E
     )
 
 
+def _first_source_patch_target(state: CompositionState | None) -> _EdgePatchTarget | None:
+    """The single source's patch target, or None when it is ambiguous."""
+    if state is None or len(state.sources) != 1:
+        return None
+    source_name = next(iter(state.sources))
+    return _source_schema_patch_target(source_name, state.sources[source_name].plugin)
+
+
 def _output_schema_patch_target(sink_name: str) -> _EdgePatchTarget:
     return _EdgePatchTarget(
         component_id=sink_name,
@@ -178,13 +197,15 @@ def _edge_patch_targets_by_dag_id(state: CompositionState, graph: ExecutionGraph
             source = state.sources[source_name]
             targets[dag_source_id] = _source_schema_patch_target(source_name, source.plugin)
 
-    transform_nodes = [node for node in state.nodes if node.node_type == "transform"]
-    transform_id_map = graph.get_transform_id_map()
-    for sequence, dag_node_id in transform_id_map.items():
-        if sequence >= len(transform_nodes):
-            continue
-        node = transform_nodes[sequence]
-        targets[str(dag_node_id)] = _node_schema_patch_target(node.id, node.node_type)
+    # NAME-keyed, never positional: the builder keys the map on
+    # ``wired.settings.name``, which IS the composer node id (builder.py's
+    # transform loop), so attribution cannot silently slip if the sequence
+    # order and the state's node order ever diverge (elspeth-9f21f3c57d).
+    transform_name_id_map = graph.get_transform_name_id_map()
+    for transform_name, dag_node_id in transform_name_id_map.items():
+        component_id = str(transform_name)
+        node_type = nodes_by_id[component_id].node_type if component_id in nodes_by_id else "transform"
+        targets[str(dag_node_id)] = _node_schema_patch_target(component_id, node_type)
 
     config_gate_id_map = graph.get_config_gate_id_map()
     for gate_name, dag_node_id in config_gate_id_map.items():
@@ -245,8 +266,23 @@ def _infer_component_type_from_plugin_error(
     return None
 
 
-def _format_edge_contract_message(exc: EdgeContractError) -> str:
-    """Build the stable diagnostic message independently of patch advice."""
+def _format_edge_contract_message(
+    exc: EdgeContractError,
+    *,
+    state: CompositionState | None = None,
+    graph: ExecutionGraph | None = None,
+) -> str:
+    """Build the stable diagnostic message independently of patch advice.
+
+    When ``state``+``graph`` allow it, both ends are printed as COMPOSER node
+    ids (the ids the planner's patch tools accept and the operator recognises)
+    while the compiled DAG ids move to a debug detail line — ALIASED, never
+    truncated (the mcp/analyzers/reports.py precedent: truncation collides).
+    The headline template itself is stable: the frontend humaniser parses
+    ``producer node '<id>' (schema '<name>')`` positionally, so only the id
+    VALUES change, never the shape. On the graph-BUILD failure path
+    (graph=None) the compiled ids remain in place — there is no map to consult.
+    """
     result = exc.compatibility_result
     issue_lines: list[str] = []
     if result.missing_fields:
@@ -268,14 +304,89 @@ def _format_edge_contract_message(exc: EdgeContractError) -> str:
 
     issues_block = "\n".join(issue_lines) if issue_lines else "(no per-field detail available)"
 
+    producer_id = exc.from_node_id
+    consumer_id = exc.to_node_id
+    compiled_detail = ""
+    if state is not None and graph is not None:
+        targets = _edge_patch_targets_by_dag_id(state, graph)
+        translated = False
+        if exc.from_node_id in targets:
+            producer_id = targets[exc.from_node_id].component_id
+            translated = True
+        if exc.to_node_id in targets:
+            consumer_id = targets[exc.to_node_id].component_id
+            translated = True
+        if translated:
+            compiled_detail = f"\nCompiled DAG node ids: producer '{exc.from_node_id}', consumer '{exc.to_node_id}'."
+
     message = (
-        f"Edge contract violation between producer node '{exc.from_node_id}' "
-        f"(schema '{exc.producer_schema_name}') and consumer node '{exc.to_node_id}' "
+        f"Edge contract violation between producer node '{producer_id}' "
+        f"(schema '{exc.producer_schema_name}') and consumer node '{consumer_id}' "
         f"(schema '{exc.consumer_schema_name}'):\n"
         f"{issues_block}"
+        f"{compiled_detail}"
     )
 
     return message
+
+
+_GUARANTEE_COMPLETENESS_WARNING = (
+    "      IMPORTANT: guaranteed_fields is a COMPLETE claim, not a partial hint. List EVERY field the "
+    "source's rows carry — not only the missing ones above — or build-time validation will start "
+    "rejecting the fields you left out."
+)
+
+
+def _concrete_source_guarantee_patch_call(
+    producer: _EdgePatchTarget,
+    state: CompositionState | None,
+    missing_fields: tuple[str, ...],
+) -> str:
+    """Render the exact patch_source_options call that declares the guarantee.
+
+    The fields literal seeds from the sorted missing fields with a trailing
+    ellipsis — the completeness warning beside it tells the planner to extend
+    the list to the source's full row shape.
+    """
+    source_name: str | None = None
+    if producer.component_id == "source":
+        source_name = "source"
+    elif producer.component_id.startswith("source:"):
+        source_name = producer.component_id[len("source:") :]
+    elif state is not None and len(state.sources) == 1:
+        # Build-path degradation left the DAG id in place; a single-source
+        # state still identifies the producer unambiguously.
+        source_name = next(iter(state.sources))
+    fields_literal = ", ".join(repr(field) for field in sorted(missing_fields))
+    patch = f"patch={{'schema': {{'mode': 'observed', 'guaranteed_fields': [{fields_literal}, ...]}}}}"
+    if source_name in (None, "source"):
+        return f"patch_source_options({patch})"
+    return f"patch_source_options(source_name={source_name!r}, {patch})"
+
+
+def _source_guarantee_repair_lines(
+    producer: _EdgePatchTarget,
+    consumer: _EdgePatchTarget,
+    state: CompositionState | None,
+    missing_fields: tuple[str, ...],
+    *,
+    preamble: str,
+) -> str:
+    """Source-remedy-first advice: declare the guarantee where the rows live."""
+    return "\n".join(
+        (
+            preamble,
+            "",
+            "  (a) Declare the source's guaranteed fields — the complete set of fields its rows actually carry:",
+            f"      Tool: {_concrete_source_guarantee_patch_call(producer, state, missing_fields)}",
+            _GUARANTEE_COMPLETENESS_WARNING,
+            "",
+            f"  (b) Or relax the consumer {consumer.display_name}: drop the missing required fields from wherever it "
+            "declares them — its schema.required_fields or its required_input_fields option — if it doesn't actually "
+            "need them.",
+            f"      Tool: {consumer.schema_patch_tool_call}",
+        )
+    )
 
 
 def _build_edge_contract_suggestion_with_resolver(
@@ -329,6 +440,48 @@ def _build_edge_contract_suggestion_with_resolver(
                 f"Repair the real branch producer {producer.display_name} whose output contract failed at the barrier.",
                 f"Tool: {producer.schema_patch_tool_call}",
             )
+        )
+
+    # SOURCE producer (elspeth-d39ec0c4d9): an observed-mode source with no
+    # guaranteed_fields participates with an EMPTY guarantee set, so ANY
+    # downstream required-field declaration fails this edge — including the
+    # exact declaration the LLM-config validator just demanded. The reachable
+    # repair is declaring the guarantee at the source; nothing else can make
+    # this edge green without un-declaring the consumer's real requirement.
+    # Keyed on the raise site's from_component_type via the resolver's
+    # producer target, which carries it even on the graph-BUILD path where
+    # DAG-id resolution degrades (schema_validation.py populates it on both).
+    if producer.component_type == "source" and has_missing:
+        return _source_guarantee_repair_lines(
+            producer,
+            consumer,
+            state,
+            result.missing_fields,
+            preamble=(
+                f"The producer is the pipeline source ({producer.display_name}). An observed-mode source "
+                "guarantees NOTHING until its schema declares guaranteed_fields, so the consumer's required "
+                "fields can never be satisfied statically until the source declares what its rows carry."
+            ),
+        )
+
+    # Plugin-free structural producer (gate/coalesce): there is no plugin
+    # schema to patch on the producer, and the guarantees walk is transparent
+    # through it — the missing guarantee originates UPSTREAM, normally at the
+    # source's declared schema. Without this arm both generic options are
+    # wrong for this shape (session 2e0c8ea3: producer was a plugin-free
+    # config gate and the menu offered relax-consumer / patch-producer-plugin).
+    if producer.component_type in ("gate", "coalesce") and has_missing:
+        source_target = _first_source_patch_target(state)
+        return _source_guarantee_repair_lines(
+            source_target if source_target is not None else producer,
+            consumer,
+            state,
+            result.missing_fields,
+            preamble=(
+                f"The producer {producer.display_name} is a structural {producer.component_type} with no plugin "
+                "schema to patch — its guarantees flow through from UPSTREAM, so the missing guarantee "
+                "originates at the true producer (normally the pipeline source's declared schema)."
+            ),
         )
 
     parts: list[str] = []

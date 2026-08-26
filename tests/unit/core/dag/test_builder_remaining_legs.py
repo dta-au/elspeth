@@ -151,3 +151,34 @@ def test_sink_on_write_failure_rejects_unknown_failsink() -> None:
             source_settings_map=_source_settings(on_success="output"),
             sinks={"output": _Sink(on_write_failure="missing")},  # type: ignore[dict-item]
         )
+
+
+def test_builder_sets_the_name_keyed_transform_id_map() -> None:
+    """The name-keyed transform map is the diagnostics attribution authority
+    (elspeth-9f21f3c57d): its keys are the settings names (composer node ids)
+    and its values agree with the positional sequence map."""
+    transform = _Transform()
+    wired = WiredTransform(
+        plugin=transform,  # type: ignore[arg-type]
+        settings=TransformSettings(
+            name="worker",
+            plugin=transform.name,
+            input="source_out",
+            on_success="output",
+            on_error="output",
+            options={},
+        ),
+    )
+
+    graph = ExecutionGraph.from_plugin_instances(
+        sources={"primary": _Source()},  # type: ignore[arg-type]
+        source_settings_map=_source_settings(on_success="source_out"),
+        transforms=[wired],
+        sinks={"output": _Sink()},  # type: ignore[dict-item]
+    )
+
+    name_map = graph.get_transform_name_id_map()
+    seq_map = graph.get_transform_id_map()
+    assert set(name_map) == {"worker"}
+    assert name_map["worker"] == seq_map[0]
+    assert str(name_map["worker"]).startswith("transform_worker_")

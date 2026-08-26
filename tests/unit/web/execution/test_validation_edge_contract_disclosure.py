@@ -233,3 +233,80 @@ def test_honest_str_declaration_still_derives_float_output_contract(tmp_path: Pa
     transform = bundle.transforms[0].plugin
     assert transform.input_schema.model_fields["score"].annotation is str
     assert transform.output_schema.model_fields["score"].annotation is float
+
+
+def _observed_source_missing_field_state() -> CompositionState:
+    """Observed CSV source (no guaranteed_fields) into a consumer requiring
+    ``colour`` — the elspeth-d39ec0c4d9 contradiction, raised on the BUILD
+    path with ``from_component_type == "source"``."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="classify",
+            options={
+                "path": f"blobs/{_SESSION_ID}/input.csv",
+                "schema": {"mode": "observed"},
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="classify",
+                node_type="transform",
+                plugin="value_transform",
+                input="classify",
+                on_success="results",
+                on_error="discard",
+                options={
+                    "required_input_fields": ["colour"],
+                    "operations": [{"target": "out", "expression": "row['colour']"}],
+                    "schema": {"mode": "observed"},
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="results",
+                plugin="csv",
+                options={"path": "outputs/results.csv", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def test_build_raised_source_producer_failure_discloses_guarantee_repair(tmp_path: Path) -> None:
+    """The source-producer remedy fires through the REAL build path
+    (elspeth-d39ec0c4d9): the suggestion names the concrete
+    patch_source_options guaranteed_fields repair with the completeness
+    warning, and keeps consumer relaxation as the alternative."""
+    source_dir = tmp_path / "blobs" / _SESSION_ID
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "input.csv").write_text("colour\nred\n")
+
+    result = validate_pipeline_for_trained_operator(
+        _observed_source_missing_field_state(),
+        _web_settings(tmp_path),
+        production_yaml_generator,
+        session_id=_SESSION_ID,
+    )
+
+    assert result.is_valid is False
+    error = result.errors[0]
+    assert "colour" in error.message
+    assert error.suggestion is not None
+    assert "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['colour', ...]}})" in error.suggestion
+    assert "COMPLETE claim" in error.suggestion
+    assert "relax the consumer" in error.suggestion.lower()
+    # Phase ownership: still the build path.
+    hard_failures = [check for check in result.checks if not check.passed and check.outcome_code is None]
+    assert [check.name for check in hard_failures] == ["graph_structure"]

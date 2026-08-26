@@ -185,7 +185,10 @@ def _format_edge_contract_failure(
     tool calls and lead with the consumer-side repair before the narrower
     producer-side alternative.
     """
-    return _format_edge_contract_message(exc), _build_edge_contract_suggestion(exc, state=state, graph=graph)
+    return (
+        _format_edge_contract_message(exc, state=state, graph=graph),
+        _build_edge_contract_suggestion(exc, state=state, graph=graph),
+    )
 
 
 def _skipped_checks(from_check: str, *, already_emitted: frozenset[str] = frozenset()) -> list[ValidationCheck]:

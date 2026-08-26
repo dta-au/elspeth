@@ -88,6 +88,7 @@ class ExecutionGraph:
         self._graph: MultiDiGraph[str] = nx.MultiDiGraph()
         self._sink_id_map: dict[SinkName, NodeID] = {}
         self._transform_id_map: dict[int, NodeID] = {}
+        self._transform_name_id_map: dict[str, NodeID] = {}  # settings name (composer node id) -> node_id
         self._config_gate_id_map: dict[GateName, NodeID] = {}  # gate_name -> node_id
         self._aggregation_id_map: dict[AggregationName, NodeID] = {}  # agg_name -> node_id
         self._collector_id_map: dict[CollectorName, NodeID] = {}  # collector_name -> node_id
@@ -825,6 +826,11 @@ class ExecutionGraph:
         self._assert_build_metadata_mutable()
         self._transform_id_map = dict(mapping)
 
+    def set_transform_name_id_map(self, mapping: dict[str, NodeID]) -> None:
+        """Set the transform settings-name -> node_id mapping."""
+        self._assert_build_metadata_mutable()
+        self._transform_name_id_map = dict(mapping)
+
     def set_config_gate_id_map(self, mapping: dict[GateName, NodeID]) -> None:
         """Set the gate_name -> node_id mapping."""
         self._assert_build_metadata_mutable()
@@ -976,6 +982,18 @@ class ExecutionGraph:
             Dict mapping transform sequence position (0-indexed) to node ID.
         """
         return dict(self._transform_id_map)
+
+    def get_transform_name_id_map(self) -> dict[str, NodeID]:
+        """Get explicit settings-name -> node_id mapping for transforms.
+
+        The settings name IS the composer node id for composer-authored
+        pipelines (builder.py keys ``transform_ids_by_name`` on
+        ``wired.settings.name``), so this is the name-keyed sibling of
+        :meth:`get_config_gate_id_map` and the other five id maps —
+        diagnostics that attribute a DAG node back to its authored component
+        must use this, never the positional sequence map.
+        """
+        return dict(self._transform_name_id_map)
 
     def get_node_step_map(self) -> dict[NodeID, int]:
         """Get the builder-assigned node_id -> audit step mapping."""
