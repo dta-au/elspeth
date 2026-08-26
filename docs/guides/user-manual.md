@@ -187,6 +187,7 @@ TRANSFORMS:
   line_explode         - Explode a string field into one output row per line.
   passthrough          - Pass rows through unchanged.
   pdf_rasterize        - Render each page of a PDF into a PNG payload and emit one row per page.
+  reference_join       - Match a row field against a reference table and add named fields to the row.
   report_assemble      - Assemble a paginated report from a flushed batch of text rows.
   truncate             - Truncate string fields to specified maximum lengths.
   type_coerce          - Perform explicit, strict, per-field type normalization.
