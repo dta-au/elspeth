@@ -6859,3 +6859,132 @@ class TestComposerRuntimeCensusAgreement:
         assert any(e.error_code == "node_id_collides_with_source_or_sink" for e in composer.errors), composer.errors
         assert not runtime.is_valid
         assert any("used by both" in e.message for e in runtime.errors), runtime.errors
+
+
+class TestComposerEnvPlaceholderAgreement:
+    """Stage 1 must reject a ``${VAR}`` in an emitted option, not merely the runtime.
+
+    THIS IS THE PIN FOR THE BOTH-LOADER-PATHS RULING (C4 on elspeth-8f0a6b3391).
+
+    ``_reject_sensitive_plugin_env_placeholders_before_expansion`` deliberately
+    runs on BOTH loader paths — the CLI's expanding path and the web's
+    non-expanding one — because a security control that runs on one of two paths
+    is a control with a documented bypass. Nothing in the tree proved the web
+    half kept working; a later change could gate the guard on
+    ``expand_env_vars=True`` and every other test would stay green while the
+    composer silently accepted a host-value leak.
+
+    The distinction this class exists to close: "the loader raises" and "Stage 1
+    returns ``is_valid=False`` for a composer-authored shape" are different
+    claims. An earlier validation phase could fail first, or the composer could
+    normalise the option away before materialisation, and a loader-level probe
+    would not notice either. So these go through
+    ``validate_pipeline_for_trained_operator`` end to end on a real
+    ``CompositionState``.
+
+    The parity baseline records this site as ``unmirrored`` (a known
+    validate-green / runtime-red gap) on evidence that predates the guard
+    inversion. If these tests pass, that disposition is contradicted and should
+    be re-adjudicated to ``mirrored`` — see the note on key ``19d4370762325eae``
+    in ``config/cicd/runtime_rejection_parity.yaml``.
+    """
+
+    PLACEHOLDER = "${ELSPETH_AGREEMENT_HOST_VALUE}"
+
+    @staticmethod
+    def _validation_settings(data_dir: Path) -> SimpleNamespace:
+        return SimpleNamespace(data_dir=data_dir)
+
+    @staticmethod
+    def _csv_input(tmp_path: Path) -> Path:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "input.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("value\n1\n", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _sink_path(tmp_path: Path, name: str) -> Path:
+        out_dir = tmp_path / "outputs" / _AGREEMENT_SESSION_ID
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / name
+
+    def _state(self, tmp_path: Path, *, headers: object) -> CompositionState:
+        """A minimal csv -> csv pipeline whose sink carries a CUSTOM header mapping.
+
+        ``headers`` is the option under test: its mapping VALUES are written as
+        the artifact's header row, so a ``${VAR}`` there reaches output bytes as
+        a host environment value.
+        """
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="default",
+                options={"path": str(self._csv_input(tmp_path)), "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(
+                EdgeSpec(
+                    id="source_to_default",
+                    from_node="source",
+                    to_node="default",
+                    edge_type="on_success",
+                    label="rows to sink",
+                ),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="default",
+                    plugin="csv",
+                    options={
+                        "path": str(self._sink_path(tmp_path, "out.csv")),
+                        "mode": "write",
+                        "collision_policy": "fail_if_exists",
+                        "schema": {"mode": "observed"},
+                        "headers": headers,
+                    },
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(name="env placeholder agreement", description=""),
+            version=1,
+        )
+
+    def _validate(self, state: CompositionState, tmp_path: Path):  # type: ignore[no-untyped-def]
+        return validate_pipeline_for_trained_operator(
+            state,
+            self._validation_settings(tmp_path),
+            composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
+        )
+
+    def test_stage1_rejects_env_placeholder_in_a_sink_header_mapping(self, tmp_path: Path) -> None:
+        """The composer must not return is_valid=True for a shape the runtime refuses."""
+        result = self._validate(self._state(tmp_path, headers={"value": self.PLACEHOLDER}), tmp_path)
+
+        assert result.is_valid is False, (
+            "Stage 1 accepted a ${VAR} in csv.headers. The mapping's values are written as the "
+            "artifact's header row, so on the CLI path env expansion would replace it with a host "
+            "environment value and write that to the output bytes (elspeth-8f0a6b3391)."
+        )
+
+        rendered = " ".join(error.message for error in result.errors)
+        assert "environment-variable placeholders" in rendered, (
+            f"Rejected, but not for the placeholder — the agreement is on the PREDICATE, not merely "
+            f"on is_valid being False. Errors: {[e.message for e in result.errors]}"
+        )
+
+    def test_stage1_accepts_the_same_shape_with_a_clean_header_mapping(self, tmp_path: Path) -> None:
+        """Positive control: the option is not what is refused, the placeholder is.
+
+        Without this, a Stage 1 that rejected every custom header mapping — or
+        that failed on an unrelated earlier phase — would satisfy the test above
+        while proving nothing about the guard.
+        """
+        result = self._validate(self._state(tmp_path, headers={"value": "Value"}), tmp_path)
+
+        assert result.is_valid is True, (
+            f"Positive control failed: a clean CUSTOM header mapping must validate, otherwise the "
+            f"rejection above is not attributable to the placeholder. Errors: "
+            f"{[e.message for e in result.errors]}"
+        )
