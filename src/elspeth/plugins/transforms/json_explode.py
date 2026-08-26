@@ -461,7 +461,6 @@ class JSONExplode(BaseTransform):
 
         Raises:
             KeyError: If array_field is missing (upstream bug)
-            TypeError: If array_field is not a list (upstream bug)
         """
         # Direct access - TRUST that source validated field exists
         # KeyError here = upstream bug (source didn't validate field exists)
@@ -471,9 +470,24 @@ class JSONExplode(BaseTransform):
         # PipelineRow deep-freezes data (list→tuple), so both are valid.
         # Strings/dicts are iterable but would produce garbage - fail explicitly.
         if not isinstance(array_value, (list, tuple)):
-            raise TypeError(
-                f"Field '{self._array_field}' must be a list, got {type(array_value).__name__}. "
-                f"This indicates an upstream validation bug - check source schema or prior transforms."
+            # A wrong-typed value is a ROW-level failure, not a run-level one:
+            # it is a fact about this row's data, identical in kind to the
+            # empty-array rejection below, so it takes the same routable exit.
+            # Raising here instead would abort the whole run — ADR-008
+            # §"TIER_1 registration is load-bearing" (Correction 2026-08-21,
+            # elspeth-181db83da7): only a RETURNED error reaches the
+            # `result.status == "error"` branch that honours `on_error`; a
+            # raised exception escapes every catch site. Not coerced: a str or
+            # dict is not a list, and iterating one would fabricate rows
+            # (one per character, or per key) that the operator never supplied.
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "field": self._array_field,
+                    "error_type": "wrong_type",
+                    "error": f"must be a list, got {type(array_value).__name__}",
+                },
+                retryable=False,
             )
 
         row_data = row.to_dict()
