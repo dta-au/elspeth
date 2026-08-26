@@ -114,8 +114,21 @@ function nodeRows(state: CompositionState): SpecRow[] {
     id: node.id,
     kind: node.node_type,
     plugin: node.plugin,
+    // `branches`/`policy`/`merge` are as authoritative as `routes`/`fork_to`
+    // and must be projected alongside them (elspeth-59684fb0c8). On a fan-in
+    // node (coalesce, row_union) `input` is ONLY the backend-compatible
+    // first-branch placeholder, so a card showing `input` without `branches`
+    // does not merely omit the wiring — it asserts a narrower fan-in than
+    // the state has. The routing block drops nulls, so nodes carrying none
+    // of these are unaffected.
+    //
+    // `condition` stays out on purpose: the "shows only non-null
+    // authoritative routing fields" test pins it as private graph config.
     routing: {
       input: node.input,
+      branches: node.branches ?? null,
+      policy: node.policy ?? null,
+      merge: node.merge ?? null,
       on_success: node.on_success,
       on_error: node.on_error,
       routes: node.routes ?? null,

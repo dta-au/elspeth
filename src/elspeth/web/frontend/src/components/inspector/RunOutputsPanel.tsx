@@ -29,6 +29,7 @@ import {
   StructuredJsonPreview,
   type PreviewTableModel,
 } from "@/components/ui";
+import { parseCsvRows } from "@/utils/contentStructure";
 import { absoluteTime } from "@/utils/time";
 import { plural } from "@/utils/plural";
 import type {
@@ -600,16 +601,34 @@ interface TabularPreviewProps {
 
 /**
  * Builds a headers+rows model for the shared PreviewTable out of raw
- * csv/jsonl preview text. Tolerant of malformed rows — this is
- * deliberately not a full CSV parser (no quoted-comma handling); preview
- * is best-effort, not a data-loading path.
+ * csv/jsonl preview text.
  *
  * Two content types feed this:
- *   * csv  — backend tags both `.csv` and `.tsv` files as content_type
- *            "csv" (see web/execution/preview._CSV_EXTENSIONS), so we
- *            sniff the first line for tab vs comma rather than
- *            hardcoding `,`. Without this, TSV rows collapse into a
- *            single column. The first line is the real header row.
+ *   * csv  — parsed with the shared `parseCsvRows` reader
+ *            (`utils/contentStructure.ts`), which honours RFC4180 quoting:
+ *            a delimiter or a newline INSIDE a quoted field is data, and
+ *            `""` is one literal quote. This used to be a bare
+ *            `line.split(delimiter)`, which shredded every quoted value
+ *            containing a comma — universal in practice, because every
+ *            transform:llm emits `<response_field>_usage` as a dict repr
+ *            full of them. Body rows then parsed wider than the header, so
+ *            `columnCount` grew to the body width and the header was
+ *            right-padded with EMPTY strings: real values rendered under
+ *            nameless columns with no signal anything was wrong
+ *            (elspeth-7f1e148ed6).
+ *
+ *            The backend tags both `.csv` and `.tsv` files as content_type
+ *            "csv" (see web/execution/preview._CSV_EXTENSIONS), so we still
+ *            sniff the first physical line for tab vs comma rather than
+ *            hardcoding `,`. Without this, TSV rows collapse into a single
+ *            column. The first parsed row is the real header row.
+ *
+ *            Quote handling stays ON for the tab delimiter, deliberately:
+ *            the sink writes through `csv.DictWriter(delimiter=...)`
+ *            (plugins/sinks/csv_sink.py), which quotes a field containing
+ *            the delimiter, a quote, or a newline whatever the delimiter
+ *            is. Reading TSV with quoting disabled would therefore
+ *            misparse ELSPETH's own tab-separated output.
  *   * jsonl — each line is a JSON object that must NOT be split on
  *             commas (that fragments the JSON across cells). Each line
  *             is rendered as a single-column row under one synthetic
@@ -617,26 +636,46 @@ interface TabularPreviewProps {
  *             but every PreviewTable still gets a real th scope="col"
  *             header cell rather than the old bold-td fake header
  *             (elspeth-611a05668e).
+ *
+ * Still deliberately tolerant of ragged rows: short rows are padded and
+ * over-wide rows widen the header, because a preview should render what is
+ * there rather than refuse. What it no longer does is MANUFACTURE that
+ * raggedness out of correctly-quoted input.
  */
 function buildTabularPreviewModel(
   text: string,
   contentType: "csv" | "jsonl",
 ): PreviewTableModel | null {
-  const lines = text.split("\n").filter((line) => line.length > 0);
-  if (lines.length === 0) {
-    return null;
-  }
   if (contentType === "jsonl") {
+    const lines = text.split("\n").filter((line) => line.length > 0);
+    if (lines.length === 0) {
+      return null;
+    }
     return {
       headers: ["value"],
       rows: lines.map((line) => [line]),
     };
   }
-  const firstLine = lines[0];
+
+  // Sniff on the first physical line: a header row is never itself quoted
+  // across a newline, so this is safe to do before parsing.
+  const firstLine = text.split("\n", 1)[0] ?? "";
   const tabCount = (firstLine.match(/\t/g) ?? []).length;
   const commaCount = (firstLine.match(/,/g) ?? []).length;
   const delimiter = tabCount > commaCount ? "\t" : ",";
-  const [headerRow, ...bodyRows] = lines.map((line) => line.split(delimiter));
+
+  const { rows: parsed, endedInQuotes } = parseCsvRows(text, delimiter);
+  // An unterminated quoted field means the text stopped mid-record — either
+  // the preview was cut off, or the artifact is malformed. Either way that
+  // trailing row is a fragment, not a record, and rendering it would show the
+  // operator data that does not exist. Drop it; a truncated preview already
+  // renders a "Preview truncated" notice explaining the shortfall.
+  const rows_ = endedInQuotes ? parsed.slice(0, -1) : parsed;
+  if (rows_.length === 0) {
+    return null;
+  }
+
+  const [headerRow = [], ...bodyRows] = rows_;
   const columnCount =
     bodyRows.length === 0
       ? headerRow.length

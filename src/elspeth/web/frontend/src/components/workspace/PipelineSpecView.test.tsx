@@ -165,6 +165,89 @@ describe("PipelineSpecView", () => {
     expect(screen.queryByText("DO_NOT_RENDER_VALIDATION")).not.toBeInTheDocument();
   });
 
+  it("projects a coalesce's fan-in config — branches, policy and merge", () => {
+    // Regression for elspeth-59684fb0c8. nodeRows() mapped only `routes`
+    // and `fork_to`, so a coalesce rendered as `input: pairing_done` and
+    // nothing else. `input` on a fan-in node is just the backend-compatible
+    // FIRST-BRANCH PLACEHOLDER, so showing it alone is actively misleading:
+    // an operator checking the Spec tab because the graph looked wrong
+    // (elspeth-625e85c59b) had the wrong topology confirmed rather than
+    // corrected. Live shape: session 75cec2b2 v22.
+    useSessionStore.setState({
+      compositionState: makeComposition(5, {
+        sources: {
+          source: { plugin: "csv", options: {}, on_success: "colours_raw" },
+        },
+        nodes: [
+          {
+            id: "merge_branches",
+            node_type: "coalesce",
+            plugin: null,
+            input: "pairing_done",
+            on_success: "final_out",
+            on_error: null,
+            branches: { branch_a: "pairing_done", branch_b: "hex_done" },
+            policy: "require_all",
+            merge: "union",
+            options: {},
+          },
+        ],
+        outputs: [
+          {
+            name: "final_out",
+            plugin: "csv",
+            on_write_failure: "discard",
+            options: {},
+          },
+        ],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node merge_branches" });
+    expect(node).toHaveTextContent("branches");
+    // Both aliases, including the one `input` does not name.
+    expect(node).toHaveTextContent("branch_a");
+    expect(node).toHaveTextContent("hex_done");
+    expect(node).toHaveTextContent("policy");
+    expect(node).toHaveTextContent("require_all");
+    expect(node).toHaveTextContent("merge");
+    expect(node).toHaveTextContent("union");
+  });
+
+  it("omits branches, policy and merge on nodes that carry none", () => {
+    // The routing block filters nulls, so widening it must not add empty
+    // fan-in rows to every transform card.
+    useSessionStore.setState({
+      compositionState: makeComposition(2, {
+        sources: {
+          source: { plugin: "csv", options: {}, on_success: "rows" },
+        },
+        nodes: [
+          {
+            id: "enrich",
+            node_type: "transform",
+            plugin: "llm",
+            input: "rows",
+            on_success: "done",
+            on_error: null,
+            options: {},
+          },
+        ],
+        outputs: [],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node enrich" });
+    expect(node).toHaveTextContent("input");
+    expect(node).not.toHaveTextContent("branches");
+    expect(node).not.toHaveTextContent("policy");
+    expect(node).not.toHaveTextContent("merge");
+  });
+
   it("formats options deterministically in focusable labelled code regions", () => {
     useSessionStore.setState({
       compositionState: makeComposition(2, {

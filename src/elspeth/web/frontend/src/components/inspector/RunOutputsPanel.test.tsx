@@ -451,6 +451,113 @@ describe("RunOutputsPanel", () => {
     expect(screen.getByText("19.95")).toBeInTheDocument();
   });
 
+  it("keeps a quoted comma-bearing value in one cell and leaves no blank column headers", async () => {
+    // Regression for elspeth-7f1e148ed6. Every transform:llm emits
+    // `<response_field>_usage` as a dict repr full of commas, so the sink
+    // quotes it and `line.split(delimiter)` shredded it into five cells.
+    // Body rows then parsed wider than the header, `columnCount` grew to
+    // the body width, and the header was right-padded with empty strings —
+    // so the operator read real values under nameless columns. Live shape:
+    // session 75cec2b2, run 6f32968e.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text:
+          'colour,pairing,pairing_usage\n'
+          + 'Crimson,Teal,"{\'completion_tokens\': 6, \'total_tokens\': 51}"\n',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const headerCells = await screen.findAllByRole("columnheader");
+    // Exactly the three declared columns — no padding.
+    expect(headerCells.map((el) => el.textContent)).toEqual([
+      "colour",
+      "pairing",
+      "pairing_usage",
+    ]);
+    // The quoted field survives whole, in its own cell.
+    expect(
+      screen.getByText("{'completion_tokens': 6, 'total_tokens': 51}"),
+    ).toBeInTheDocument();
+    // And the value after it did not slide under the wrong heading.
+    const bodyCells = screen.getAllByRole("cell").map((el) => el.textContent);
+    expect(bodyCells).toEqual([
+      "Crimson",
+      "Teal",
+      "{'completion_tokens': 6, 'total_tokens': 51}",
+    ]);
+  });
+
+  it("keeps a quoted multi-line value in one cell instead of starting a new row", async () => {
+    // The shape elspeth-7f1e148ed6 was originally filed on: an
+    // llm_response holding formatted JSON. `text.split("\n")` turned each
+    // embedded newline into a table row.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'id,llm_response\n1,"line one\nline two"\n2,plain\n',
+        row_count_preview: 3,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("id")).toBeInTheDocument());
+    const rows = screen.getAllByRole("row");
+    // header + exactly two data rows
+    expect(rows).toHaveLength(3);
+    expect(screen.getByText("line one line two")).toBeInTheDocument();
+  });
+
+  it("escaped double quotes inside a quoted field collapse to one quote", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'id,quote\n1,"she said ""hi"", then left"\n',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(screen.getByText('she said "hi", then left')).toBeInTheDocument(),
+    );
+  });
+
+  it("drops the trailing row of a preview cut off inside a quoted field", async () => {
+    // A truncated preview can end mid-quote. Rendering the partial field as
+    // a row would show the operator a record that does not exist; the
+    // "Preview truncated" notice already explains the omission.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'id,note\n1,complete\n2,"cut off mid fie',
+        truncated: true,
+        row_count_preview: 3,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("complete")).toBeInTheDocument());
+    const rows = screen.getAllByRole("row");
+    // header + the one complete data row
+    expect(rows).toHaveLength(2);
+    expect(screen.queryByText(/cut off mid fie/)).not.toBeInTheDocument();
+  });
+
   it("pretty-prints JSON previews and offers a table view for record arrays", async () => {
     (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
       manifest([fileArtifact({ path_or_uri: "file:///data/outputs/results.json" })]),
