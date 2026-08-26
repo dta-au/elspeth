@@ -47,8 +47,13 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
     if plugin == "llm" and "provider" not in prepared:
         from elspeth.plugins.llm.config_validation import GATEWAY_SUPPORTED_CAPABILITIES
 
-        prepared.setdefault("provider", "gateway")
-        prepared.setdefault("endpoint", "https://validation-probe.invalid/v1")
-        prepared.setdefault("api_key", "validation-probe-placeholder")
-        prepared.setdefault("required_capabilities", tuple(sorted(GATEWAY_SUPPORTED_CAPABILITIES)))
+        # Plain assignment, not setdefault: with no authored provider the
+        # whole provider block is the stub's to own — a stray endpoint or
+        # api_key without a provider is not a configuration the runtime can
+        # ever see (lowering writes the full block), so preserving one here
+        # would probe a config that exists on no surface.
+        prepared["provider"] = "gateway"
+        prepared["endpoint"] = "https://validation-probe.invalid/v1"
+        prepared["api_key"] = "validation-probe-placeholder"
+        prepared["required_capabilities"] = tuple(sorted(GATEWAY_SUPPORTED_CAPABILITIES))
     return prepared
