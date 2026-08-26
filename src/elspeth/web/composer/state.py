@@ -7655,13 +7655,29 @@ class CompositionState:
             has_edge_out = node.id in edge_sources
             published = published_success_connection(node)
             if published is not None and published == node.id:
-                # An IMPLICIT self-publisher (queue, non-terminal coalesce,
-                # aggregation without on_success) publishes under its own id,
-                # so "publishes something" is vacuously true for it and cannot
-                # be the test — asking only that traded this warning's false
+                # An IMPLICIT self-publisher publishes under its own id, so
+                # "publishes something" is vacuously true for it and cannot be
+                # the test — asking only that traded this warning's false
                 # POSITIVE for a false NEGATIVE, and a genuinely dead-ended
-                # coalesce went unreported. The real question for these kinds
-                # is whether anything CONSUMES that id.
+                # coalesce went unreported. The real question is whether
+                # anything CONSUMES that id.
+                #
+                # In practice this arm is load-bearing for COALESCE ALONE, and
+                # saying otherwise was the previous version of this comment.
+                # A queue reaching here is already named by the dedicated
+                # ``queue_no_consumer`` error, and an aggregation cannot reach
+                # it at all: ``on_error`` is REQUIRED for an aggregation
+                # (``aggregation_missing_on_error``), so the ``on_error`` limb
+                # of ``has_connection_out`` below is satisfied first and this
+                # value is discarded. Coalesce is the only implicit publisher
+                # with no required on_error to keep the warning quiet on its
+                # behalf — which is exactly why it was the kind that flipped.
+                #
+                # So a dangling AGGREGATION is still unreported here. That gap
+                # predates both this arm and the false positive it replaced
+                # (``on_error is not None`` counts the literal "discard", which
+                # is neither a downstream node nor a sink). Closing it is a
+                # separate change; do not read this arm as covering it.
                 published_is_consumed = published in node_inputs or published in output_names
             else:
                 published_is_consumed = published is not None
