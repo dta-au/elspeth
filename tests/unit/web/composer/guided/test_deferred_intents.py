@@ -2692,3 +2692,129 @@ def test_create_deferred_clarification_intent_is_constraint_free_and_prose_free(
     option = intent_management_module.deferred_intent_management_option(intent)
     assert option.intent_id == intent.intent_id
     assert option.structural_constraints == ()
+
+
+def _count(
+    *,
+    component_kind: str,
+    operator: str,
+    count: int,
+) -> ComponentCountConstraint:
+    return ComponentCountConstraint(
+        kind="component_count",
+        component_kind=component_kind,  # type: ignore[arg-type]
+        plugin_kind=None,
+        plugin_name=None,
+        operator=operator,  # type: ignore[arg-type]
+        count=count,
+    )
+
+
+def _bare_action(*, target_stage: str, constraints: tuple[ComponentCountConstraint, ...]) -> DeferredIntentAction:
+    return DeferredIntentAction(
+        target_stage=target_stage,  # type: ignore[arg-type]
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Retain one structural requirement.",
+        constraints=constraints,
+    )
+
+
+def _validate(action: DeferredIntentAction, *, receiving_stage: str) -> object:
+    return validate_deferred_intent_action(
+        action,
+        receiving_stage=receiving_stage,  # type: ignore[arg-type]
+        catalog=_view((("transform", "llm"),)),
+        guided=GuidedSession.initial(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("component_kind", "receiving_stage", "target_stage"),
+    [
+        ("node", "output", "topology"),
+        ("edge", "output", "wire_review"),
+        ("output", "source", "output"),
+    ],
+    ids=("node-topology", "edge-wire-review", "output-output"),
+)
+def test_at_least_zero_count_is_rejected_as_non_discriminating(
+    component_kind: str,
+    receiving_stage: str,
+    target_stage: str,
+) -> None:
+    """``count >= 0`` holds for every pipeline, so it can never witness delivery.
+
+    Each case passes ``validate_deferred_intent_structure`` on its own — the
+    constraint's responsible stage IS the target stage and the target IS later
+    than the receiving stage — so per-constraint stage gating would not touch
+    it.  Only the non-discrimination guard rejects it (elspeth-fc948ddecf).
+    """
+
+    action = _bare_action(
+        target_stage=target_stage,
+        constraints=(_count(component_kind=component_kind, operator="at_least", count=0),),
+    )
+
+    assert _validate(action, receiving_stage=receiving_stage) == DeferredIntentRejected(reason="non_discriminating_constraint")
+
+
+def test_non_discriminating_filler_is_rejected_even_beside_a_discriminating_sibling() -> None:
+    """One tautological filler poisons the whole action, siblings notwithstanding.
+
+    This is the reported shape: an already-true source count raises the
+    ``max()`` responsible-stage fold nowhere useful while the vacuous node
+    count carries the fold to ``topology``.  Requiring merely ONE
+    discriminating constraint would admit it, because a source count IS
+    discriminating in general — it is only unfalsifiable once the source stage
+    has settled.
+    """
+
+    action = _bare_action(
+        target_stage="topology",
+        constraints=(
+            _count(component_kind="source", operator="at_least", count=1),
+            _count(component_kind="node", operator="at_least", count=0),
+        ),
+    )
+
+    assert _validate(action, receiving_stage="output") == DeferredIntentRejected(reason="non_discriminating_constraint")
+
+
+@pytest.mark.parametrize(
+    ("operator", "count"),
+    [("at_least", 1), ("equals", 0), ("at_most", 0), ("equals", 3)],
+    ids=("at-least-one", "equals-zero", "at-most-zero", "equals-three"),
+)
+def test_discriminating_component_counts_stay_accepted(operator: str, count: int) -> None:
+    """Positive control: a guard that rejected everything would read green.
+
+    ``equals 0`` and ``at_most 0`` matter specifically — both are legal zero
+    counts that a schema-level ``"minimum": 1`` patch would have banned, and
+    both genuinely exclude pipelines (any pipeline with a node fails them).
+    """
+
+    action = _bare_action(
+        target_stage="topology",
+        constraints=(_count(component_kind="node", operator=operator, count=count),),
+    )
+
+    assert _validate(action, receiving_stage="output") == DeferredIntentAccepted(action=action)
+
+
+def test_durable_intent_creation_fails_closed_on_a_non_discriminating_constraint() -> None:
+    """The durable constructor refuses independently of the validate path."""
+
+    action = _bare_action(
+        target_stage="topology",
+        constraints=(_count(component_kind="node", operator="at_least", count=0),),
+    )
+
+    with pytest.raises(InvariantError, match="satisfied by every pipeline"):
+        create_deferred_stage_intent(
+            action,
+            receiving_stage="output",
+            intent_id="00000000-0000-4000-8000-0000000004a1",
+            originating_message_id="00000000-0000-4000-8000-0000000004a2",
+            originating_message_content="Later add a passthrough step before the rows land.",
+        )

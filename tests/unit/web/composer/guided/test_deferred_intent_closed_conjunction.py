@@ -258,11 +258,15 @@ def _action(
     )
 
 
-_BENIGN_CONSTRAINT = _count("edge", "at_least", 0)
+# DISCRIMINATING on purpose. This probe was `edge at_least 0` until
+# elspeth-fc948ddecf, which rejects a constraint no pipeline can falsify: a
+# probe that constrains nothing cannot be admitted, so the carrier now states
+# a real wire-review fact (an edge exists) that no case here contradicts.
+_BENIGN_CONSTRAINT = _count("edge", "at_least", 1)
 
 
 def _benign_action() -> DeferredIntentAction:
-    """A vacuous wire-review constraint used to probe a retained conjunction."""
+    """A minimal wire-review constraint used to probe a retained conjunction."""
 
     return DeferredIntentAction(
         target_stage="wire_review",

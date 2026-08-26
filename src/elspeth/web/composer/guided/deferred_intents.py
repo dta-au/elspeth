@@ -14,7 +14,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast, get_args
 from uuid import UUID
 
 from jsonschema import Draft202012Validator
@@ -217,7 +217,9 @@ DeferredIntentRejectionReason = Literal[
     "option_value_unproven",
     "stated_fact_unproven",
     "constraint_contradiction",
+    "non_discriminating_constraint",
 ]
+_REJECTION_REASONS: frozenset[str] = frozenset(get_args(DeferredIntentRejectionReason))
 
 DeferredContradictionRule = Literal[
     "conflicting_subject_facts",
@@ -275,15 +277,7 @@ class DeferredIntentRejected:
     contradiction: DeferredIntentContradiction | None = None
 
     def __post_init__(self) -> None:
-        if self.reason not in {
-            "target_not_later",
-            "wrong_responsible_stage",
-            "catalog_kind_mismatch",
-            "malformed_catalog_identity",
-            "option_value_unproven",
-            "stated_fact_unproven",
-            "constraint_contradiction",
-        }:
+        if self.reason not in _REJECTION_REASONS:
             raise InvariantError("DeferredIntentRejected.reason is unsupported")
         if self.contradiction is not None and (
             type(self.contradiction) is not DeferredIntentContradiction or self.reason != "constraint_contradiction"
@@ -1279,6 +1273,35 @@ _COMPONENT_KIND_BY_PLUGIN: dict[PluginKind, Literal["source", "node", "output"]]
 _UNRESOLVED_ROUTE_TARGET_PREFIX = "output-name:"
 
 
+def _constraint_is_non_discriminating(constraint: DeferredConstraint) -> bool:
+    """Return whether NO candidate pipeline could ever falsify one constraint.
+
+    A retained intent is evidence that a later stage did the work only when
+    some pipeline fails it.  A constraint no pipeline can fail proves the
+    instruction was delivered against a pipeline that never implemented it,
+    which is the mirror image of the contradiction rules in
+    :func:`_constraint_conjunction_contradiction`: that decides "never
+    satisfiable", this decides "always satisfied".
+
+    The check is sound and deliberately incomplete, and it DERIVES its one
+    decidable case rather than restating a threshold.  Component counts are
+    the only closed constraint family whose satisfaction is decided purely by
+    a cardinality: ``_DeferredCoverageContext.constraint_holds`` computes
+    ``count`` by summing matched components, so ``count >= 0`` holds by
+    construction of the sum for every component kind, whatever the pipeline.
+
+    ``at_most n`` is the other vacuity shape, and it is NOT decided here.
+    Proving it would need a declared per-kind component ceiling, and the
+    composer declares one only for sources and outputs
+    (``GUIDED_MAX_COMPONENTS_PER_KIND``, and only over the GUIDED session, not
+    over the candidate this counts).  Nodes and edges have no ceiling
+    anywhere, so a hand-picked bound would be a restated authority rather than
+    a derived one — the residue is tracked, not guessed at (elspeth-fc948ddecf).
+    """
+
+    return type(constraint) is ComponentCountConstraint and constraint.operator == "at_least" and constraint.count == 0
+
+
 def _count_group_lower_bound(group: list[ComponentCountConstraint]) -> int:
     exacts = [constraint.count for constraint in group if constraint.operator == "equals"]
     if exacts:
@@ -1755,6 +1778,13 @@ def validate_deferred_intent_action(
         raise TypeError("guided must be an exact GuidedSession")
     if structural_rejection is not None:
         return structural_rejection
+    if any(_constraint_is_non_discriminating(constraint) for constraint in action.constraints):
+        # A constraint no pipeline can falsify cannot witness delivery, and it
+        # also raises the max() responsible-stage fold to a stage it does not
+        # really constrain.  Reject the whole action rather than merely
+        # requiring one discriminating sibling: an already-true constraint is
+        # discriminating in general and would otherwise still ride along.
+        return DeferredIntentRejected(reason="non_discriminating_constraint")
 
     prospective_constraints = _prospective_deferred_constraints(guided, action, replacing_intent_id)
     contradiction_rule = _constraint_conjunction_contradiction(prospective_constraints, guided=guided)
@@ -2186,6 +2216,8 @@ def create_deferred_stage_intent(
         for constraint in action.constraints
     ):
         raise InvariantError("stated deferred constraint is not grounded in its originating user message")
+    if any(_constraint_is_non_discriminating(constraint) for constraint in action.constraints):
+        raise InvariantError("deferred constraint is satisfied by every pipeline and cannot witness delivery")
     subject = (
         f"{action.catalog_kind} plugin {action.catalog_name!r}"
         if action.catalog_kind is not None and action.catalog_name is not None
