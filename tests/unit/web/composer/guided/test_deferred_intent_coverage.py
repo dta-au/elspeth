@@ -387,8 +387,46 @@ def test_source_success_route_resolves_connection_through_node_input(present: bo
         _assert_unproven(candidate, constraint)
 
 
+def test_a_queue_is_not_its_own_success_successor() -> None:
+    """A node is never its own successor, and a queue is the case that proves it.
+
+    ``self.consumers`` is keyed by ``node.input`` and a queue's input IS its
+    own id, so deriving the success channel puts a queue in its OWN successor
+    set unless self-identity is excluded.
+
+    SCOPE, measured: excluding self removes the self-edge and nothing more. It
+    does NOT make ``exclusively_reached_gate`` traverse a queue — a queue is
+    also a CONSUMER entry under its own id, so a node publishing to a queue
+    still sees two successors (the queue and its real consumer) and abandons
+    the walk exactly as before. That is a separate change to the consumer
+    projection; this test deliberately does not claim it.
+    """
+    from elspeth.web.composer.guided.deferred_intents import _coverage_context
+
+    candidate = replace(
+        _candidate(),
+        nodes=(
+            _node(node_id=NODE_ID, plugin=None, node_type="queue", input_name=NODE_ID, on_success=None),
+            _node(node_id="copy", input_name=NODE_ID),
+        ),
+    )
+    context = _coverage_context(candidate, _guided())
+    queue_component = context.exact_components[("node", NODE_ID)]
+
+    successors = context.route_targets(queue_component, "on_success")
+
+    assert ("node", NODE_ID) not in successors, (
+        f"The queue is its own success successor: {successors}. `self.consumers` is keyed by `node.input` "
+        "and a queue's input is its own id, so self-identity must be excluded."
+    )
+    assert ("node", "copy") in successors, f"Excluding self must not lose the queue's real consumer. Got {successors}."
+
+
+@pytest.mark.parametrize("publisher_kind", ("aggregation", "queue"))
 @pytest.mark.parametrize(("present", "proven"), ((True, True), (False, False)))
-def test_success_route_through_an_implicit_self_publisher_is_visible(present: bool, proven: bool) -> None:
+def test_success_route_through_an_implicit_self_publisher_is_visible(
+    present: bool, proven: bool, publisher_kind: Literal["aggregation", "queue"]
+) -> None:
     """An aggregation that omits ``on_success`` still HAS a success edge.
 
     ``route_targets`` restated the publication rule as ``node.on_success is
@@ -401,6 +439,11 @@ def test_success_route_through_an_implicit_self_publisher_is_visible(present: bo
     empty set as confirmation and PROVED a claim the pipeline contradicts —
     a false accept. The ``present=True`` half merely refused a valid pipeline.
     """
+    # The QUEUE arm is the discriminating one. A queue's ``input`` IS its own
+    # id, so once the success channel is derived it appears in its OWN
+    # successor set unless self-identity is excluded — and a fix that restated
+    # the set as coalesce+aggregation would leave the queue arm dead. This
+    # parametrization is what makes that partial fix fail here.
     candidate = replace(
         _candidate(),
         nodes=(
@@ -408,11 +451,11 @@ def test_success_route_through_an_implicit_self_publisher_is_visible(present: bo
             # exactly the connection ``copy`` consumes.
             _node(
                 node_id=NODE_ID,
-                plugin="batch_stats",
-                node_type="aggregation",
-                input_name="data",
+                plugin="batch_stats" if publisher_kind == "aggregation" else None,
+                node_type=publisher_kind,
+                input_name="data" if publisher_kind == "aggregation" else NODE_ID,
                 on_success=None,
-                on_error="rows",
+                on_error="rows" if publisher_kind == "aggregation" else None,
             ),
             _node(node_id="copy", input_name=NODE_ID),
         ),

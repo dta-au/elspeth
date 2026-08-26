@@ -1945,7 +1945,24 @@ class _DeferredCoverageContext:
                 connections = {value} if value is not None and value != "fork" else set()
             else:
                 connections = set(node.fork_to or ()) if edge_type == "fork" else set()
-        return {destination for connection in connections for destination in self.consumers.get(connection, ())}
+        # A node is never its own successor. ``self.consumers`` is keyed by
+        # ``node.input``, and a queue's input IS its own id, so once the
+        # success channel is derived a queue appears in its OWN successor set.
+        # Excluding self is derived from identity, not from node kind, so it
+        # holds for any future kind whose input is its own id.
+        #
+        # SCOPE, measured rather than assumed: this removes the self-edge and
+        # nothing more. It does NOT make ``exclusively_reached_gate`` traverse
+        # a queue — a queue is also a CONSUMER entry under its own id, so a
+        # node publishing to a queue still sees two successors (the queue and
+        # the queue's real consumer) and abandons the walk exactly as before.
+        # Making that walk queue-transparent is a separate change to the
+        # consumer projection, not to this filter; do not read this comment as
+        # claiming it.
+        own_identity = (component.kind, component.stable_id)
+        return {
+            destination for connection in connections for destination in self.consumers.get(connection, ()) if destination != own_identity
+        }
 
     def exclusively_reached_gate(self, subject: _CandidateComponent) -> _CandidateComponent | None:
         """Return the first gate on an exclusive success path from ``subject``.
