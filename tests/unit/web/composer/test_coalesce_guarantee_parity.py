@@ -111,9 +111,7 @@ def _engine_graph(*, merge: str, with_consumer: bool) -> ExecutionGraph:
         )
     return ExecutionGraph.from_plugin_instances(
         sources={"src": _Source()},
-        source_settings_map={
-            "src": SourceSettings(plugin="csv", options={"path": "x.csv", "schema": _SOURCE_SCHEMA}, on_success="rows")
-        },
+        source_settings_map={"src": SourceSettings(plugin="csv", options={"path": "x.csv", "schema": _SOURCE_SCHEMA}, on_success="rows")},
         transforms=transforms,
         sinks={"out": _Sink()},  # type: ignore[dict-item]
         aggregations={},

@@ -11625,9 +11625,9 @@ class TestUnionCoalesceGuaranteeExtras:
         detail = entry.contract
         assert detail is not None
         assert detail.extra_fields == ("control_branch", "treatment_branch")
-        assert not [warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message], (
-            result.warnings
-        )
+        assert not [
+            warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message
+        ], result.warnings
 
     def test_nested_coalesce_under_a_lossy_policy_promises_nothing(self) -> None:
         """A branch may be lost, so no branch name is guaranteed — and the
