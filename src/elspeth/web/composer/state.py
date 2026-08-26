@@ -7750,7 +7750,33 @@ class CompositionState:
                                     "row_union_nested_fork_invalid",
                                 )
                             )
-                    for downstream in _runtime_nodes_downstream_of_connection(node.on_success or "", self.nodes):
+                    # NOT ``published_success_connection`` — and that is the
+                    # point, because every sibling in this family was fixed by
+                    # calling it. It returns ``None`` for a row_union with no
+                    # ``on_success`` (row_union is DELIBERATELY absent from
+                    # ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES`` precisely because
+                    # it REQUIRES ``on_success`` and so never publishes
+                    # implicitly — see ``_producer_resolver.py``), so calling it
+                    # here would change nothing.
+                    #
+                    # The defect was ``or ""``. An empty connection name is not
+                    # a no-op to this walk: ``NodeSpec`` accepts ``input=""``,
+                    # so the walk MATCHED any node with an empty input and this
+                    # ban accused it of being downstream of the row_union. A
+                    # row_union with no ``on_success`` plus any empty-input
+                    # coalesce produced "coalesce 'X' is downstream of
+                    # row_union 'Y'" for two nodes with no relationship at all
+                    # (elspeth-6b48bda677).
+                    #
+                    # The state is already invalid here — ``row_union_on_success_invalid``
+                    # reports it in the same pass, since that guard COLLECTS
+                    # rather than short-circuiting — so this ban has no
+                    # connection to walk and must skip, not substitute a
+                    # sentinel that resolves to unrelated nodes.
+                    published_connection = node.on_success or None
+                    for downstream in (
+                        _runtime_nodes_downstream_of_connection(published_connection, self.nodes) if published_connection else ()
+                    ):
                         if downstream.node_type in ("coalesce", "row_union"):
                             errors.append(
                                 _err(

@@ -13203,3 +13203,108 @@ class TestStepDescriptions:
         assert restored.sources["source"].description == "Read the pages."
         assert restored.nodes[0].description == "Summarise each page."
         assert restored.outputs[0].description == "Write the results."
+
+
+class TestRowUnionDownstreamBanDoesNotWalkASentinel:
+    """The ban must skip when there is no connection, not walk ``""``.
+
+    ``row_union_downstream_group_invalid`` forbids a correlated barrier directly
+    downstream of a row_union. It resolved its connection as
+    ``node.on_success or ""`` — and an empty connection name is NOT a no-op to
+    ``_runtime_nodes_downstream_of_connection``: ``NodeSpec`` accepts
+    ``input=""``, so the walk matched any empty-input node and this ban accused
+    it of being downstream of the row_union (elspeth-6b48bda677).
+
+    The state IS already invalid in that case — ``row_union_on_success_invalid``
+    reports it in the same pass, because that guard COLLECTS rather than
+    short-circuiting — which is exactly why the ban still runs and why the
+    sentinel mattered. A second error computed from a state already known bad
+    named two nodes that had no relationship at all.
+
+    Deliberately NOT fixed by calling ``published_success_connection`` like the
+    rest of its family: row_union is absent from
+    ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES`` BECAUSE it requires ``on_success``,
+    so the authority returns ``None`` here and calling it would change nothing.
+    """
+
+    @staticmethod
+    def _state(ru_on_success: str | None, ghost_input: str) -> CompositionState:
+        def node(**kw: Any) -> NodeSpec:
+            base: dict[str, Any] = {
+                "id": None,
+                "node_type": "transform",
+                "plugin": None,
+                "input": None,
+                "on_success": None,
+                "on_error": None,
+                "options": {},
+                "condition": None,
+                "routes": None,
+                "fork_to": None,
+                "branches": None,
+                "policy": None,
+                "merge": None,
+            }
+            base.update(kw)
+            return NodeSpec(**base)
+
+        state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+        state = state.with_source(
+            SourceSpec(
+                plugin="csv", on_success="rows", options={"path": "in.csv", "schema": {"mode": "observed"}}, on_validation_failure="discard"
+            )
+        )
+        state = state.with_node(
+            node(id="fan", node_type="gate", input="rows", condition="'all'", routes={"all": "fork"}, fork_to=("a", "b"))
+        )
+        state = state.with_node(
+            node(id="pa", plugin="passthrough", input="a", on_success="a_out", on_error="discard", options={"schema": {"mode": "observed"}})
+        )
+        state = state.with_node(
+            node(id="pb", plugin="passthrough", input="b", on_success="b_out", on_error="discard", options={"schema": {"mode": "observed"}})
+        )
+        state = state.with_node(
+            node(
+                id="ru",
+                node_type="row_union",
+                input="a_out",
+                branches={"a": "a_out", "b": "b_out"},
+                policy="require_all",
+                on_success=ru_on_success,
+            )
+        )
+        state = state.with_node(
+            node(
+                id="ghost_co",
+                node_type="coalesce",
+                input=ghost_input,
+                branches={"x": ghost_input, "y": ghost_input},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        return state.with_output(
+            OutputSpec(name="main", plugin="csv", options={"path": "o.csv", "schema": {"mode": "observed"}}, on_write_failure="discard")
+        )
+
+    @staticmethod
+    def _codes(state: CompositionState) -> set[str]:
+        return {entry.error_code for entry in state.validate().errors}
+
+    def test_a_genuinely_downstream_barrier_is_still_rejected(self) -> None:
+        """The ban's real job must survive the fix."""
+        assert "row_union_downstream_group_invalid" in self._codes(self._state("ru_out", "ru_out"))
+
+    def test_an_unrelated_empty_input_node_is_not_accused(self) -> None:
+        """THE regression. ``ghost_co`` is not downstream of ``ru`` by any edge.
+
+        Mutating the resolution back to ``node.on_success or ""`` reds exactly
+        this test — a two-case pin (fires with on_success, silent without) passes
+        against the buggy code, which is why the false positive survived the
+        first diagnosis.
+        """
+        assert "row_union_downstream_group_invalid" not in self._codes(self._state(None, ""))
+
+    def test_the_real_error_is_still_reported(self) -> None:
+        """Skipping the ban must not hide why the state is invalid."""
+        assert "row_union_on_success_invalid" in self._codes(self._state(None, ""))
