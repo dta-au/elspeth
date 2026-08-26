@@ -745,8 +745,17 @@ const COLLECTOR_BASELINE: {
   max_provider_calls: number | null;
   max_repair_turns: number | null;
 } = {
-  // PENDING CALIBRATION (Q8-1): filled from John's calibration round, never
-  // guessed. While null, the scenario records and does not grade.
+  // STAYS NULL ON THIS SURFACE (2026-08-26 ruling): collector-authoring cost
+  // is now calibrated on the FREEFORM battery, not through this browser walk
+  // — evals/composer-battery/calibration/run_collector_calibration.py, round
+  // 2026-08-26-collector-calibration-freeform (3/3 authored a require_all
+  // scoped collector; ceiling 13 provider calls). Five guided firings spent
+  // their budget answering wizard turn types that have nothing to do with the
+  // measurement, so the browser scenario keeps its ADR-031 job — proving the
+  // guided lane can author a collector at all — and records without grading.
+  // Do NOT paste the freeform numbers here: a guided walk pays for wizard
+  // turns the freeform planner never makes, so they would grade a cost this
+  // surface was never measured at.
   max_provider_calls: null,
   max_repair_turns: null,
 };
@@ -774,6 +783,8 @@ async function driveCollectorScenarioWalk(page: Page): Promise<void> {
     return text ? text.trim() : null;
   }
   let lastDrivenPhase: string | null = null;
+  const sendsByPhase = new Map<string, number>();
+  let sourceChipClicked = false;
   while (Date.now() < runbookDeadline) {
     if (await completion.isVisible().catch(() => false)) return;
     await resolveVisibleReviews(page);
@@ -797,14 +808,53 @@ async function driveCollectorScenarioWalk(page: Page): Promise<void> {
       continue;
     }
     const phase = await currentPhase();
-    const canSend = await stepChatSend.isEnabled().catch(() => false);
-    if (canSend && phase !== null && drivenPhases.has(phase) && phase !== lastDrivenPhase) {
+    // Wizard select arm: after the scenario prompt has been sent at Source
+    // (its future-stage halves are retained as deferred intents — the
+    // elspeth-3a21f09f09 flow), the step-1 single-select still owns the
+    // source choice. Answer it the way a user would: pick JSON, the
+    // scenario's stated source kind. One click, chat-first guarded.
+    if (!sourceChipClicked && phase === "Source" && (sendsByPhase.get("Source") ?? 0) > 0) {
+      const jsonChip = page.getByRole("button", { name: "JSON", exact: true });
+      if ((await jsonChip.count().catch(() => 0)) > 0 && (await jsonChip.isEnabled().catch(() => false))) {
+        await jsonChip.click().catch(() => {});
+        sourceChipClicked = true;
+        // The select answer re-arms the chat for this phase: the JSON source
+        // wizard turn that follows may need the scenario's URL restated.
+        lastDrivenPhase = null;
+        await page.waitForTimeout(1_000);
+        continue;
+      }
+    }
+    // Gate on the INPUT, not the Send button: with an empty composer Send is
+    // disabled by design (ChatInput requires non-empty text), so checking
+    // Send first spins forever in ordinary guided mode — the 2026-08-26
+    // calibration round's second finding. Tutorial mode masked this via its
+    // prelocked prompt.
+    const canType = await stepChatInput.isEnabled().catch(() => false);
+    // Two sends per phase, not one: with multi-retain intact the planner
+    // holds a real conversation (e.g. it may ask for source structure before
+    // resolving), so a single blocked send per phase deadlocks the walk.
+    if (canType && phase !== null && drivenPhases.has(phase) && (sendsByPhase.get(phase) ?? 0) < 2 && phase !== lastDrivenPhase) {
       // Ordinary guided mode has no prelocked prompt: type the fixed scenario
       // prompt, then Send — one drive per phase, like the tutorial walk.
       await stepChatInput.fill(COLLECTOR_SCENARIO_PROMPT).catch(() => {});
-      await stepChatSend.click().catch(() => {});
-      lastDrivenPhase = phase;
-      await page.waitForTimeout(2_000);
+      const sent = await stepChatSend
+        .isEnabled()
+        .catch(() => false)
+        .then(async (enabled) => {
+          if (!enabled) return false;
+          await stepChatSend.click();
+          return true;
+        })
+        .catch(() => false);
+      if (sent) {
+        lastDrivenPhase = phase;
+        sendsByPhase.set(phase, (sendsByPhase.get(phase) ?? 0) + 1);
+        await page.waitForTimeout(2_000);
+      } else {
+        await stepChatInput.fill("").catch(() => {});
+        await page.waitForTimeout(1_000);
+      }
       continue;
     }
     await page.waitForTimeout(1_000);
@@ -822,18 +872,33 @@ test.describe("collector-authoring scenario (ordinary guided surface)", () => {
   );
 
   test("collector scenario run", async ({ page }) => {
-    let sessionId: string | null = null;
-    page.on("response", (resp) => {
-      const m = resp.url().match(/\/api\/sessions\/([0-9a-f-]{36})\//i);
-      if (m && !sessionId) sessionId = m[1];
-    });
+    // Live planner walk (runbook deadline <=900s) + audit capture: the suite
+    // default timeout cannot hold it (2026-08-26 calibration round finding).
+    test.setTimeout(1_200_000);
 
-    await page.goto("/");
+    // Entry affordance (the driver's named residual, resolved by the same
+    // calibration round): goto "/" resumes the LAST session in whatever mode
+    // it was left in — the first firing landed inside a freeform battery
+    // session and the guided region never appeared. The scenario needs a
+    // FRESH guided session: create + convert via the API (the same
+    // POST /guided/convert the "Switch to guided" affordance calls), then
+    // deep-link it by hash (#/{sessionId}).
+    const entry = await harnessCtx();
+    const created = await entry.post("/api/sessions", { data: {} });
+    if (!created.ok()) throw new Error(`create session failed ${created.status()}: ${await created.text()}`);
+    const sessionId = ((await created.json()) as { id: string }).id;
+    const converted = await entry.post(`/api/sessions/${sessionId}/guided/convert`, {
+      data: { operation_id: crypto.randomUUID() },
+    });
+    if (!converted.ok()) throw new Error(`guided convert failed ${converted.status()}: ${await converted.text()}`);
+    await entry.dispose();
+
+    await page.goto(`/#/${sessionId}`);
     await expect(page.getByLabel(/guided composer/i)).toBeVisible({ timeout: 60_000 });
     await driveCollectorScenarioWalk(page);
 
     const ctx = await harnessCtx();
-    const audit = sessionId === null ? null : await fetchPlannerAuditEvidence(ctx, sessionId).catch(() => null);
+    const audit = await fetchPlannerAuditEvidence(ctx, sessionId).catch(() => null);
     const efficiency = audit === null
       ? unavailablePlannerEfficiency("planner audit evidence unavailable")
       : classifyPlannerEfficiency(audit, true);
