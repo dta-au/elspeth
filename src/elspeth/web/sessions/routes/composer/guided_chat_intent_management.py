@@ -383,22 +383,80 @@ def _retained_unverified_chat(
 
 
 def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepChatResult:
+    """Explain an unavailable model-authored catalog identity the user never named.
+
+    The message is COMPOSED, not selected: a shared frame open, one teaching
+    clause per node kind the message names, and a shared frame close (filigree
+    elspeth-270e81443d, review comment 7977 §7.1). A message naming a collector
+    AND a structural node gets BOTH clauses, and the frame is emitted once
+    either way. Three reasons the collector teaching composes rather than
+    competes:
+
+    * Nothing true is lost. A collector arm that WON would have taken the gate
+      clause away from "add a collector and a gate", trading one teaching line
+      for another; appending buys the collector case at no price.
+    * It deletes the ordering question. `_STRUCTURAL_NODE_TYPES` is scanned with
+      `next()`, which returns the first member in TUPLE order that the message
+      names — for "a queue and a gate" that is `gate`, because `gate` precedes
+      `queue` in the tuple, NOT because of where the words appear in the
+      message. That limitation survives — only ONE structural clause is ever
+      emitted, so "a queue and a gate" teaches `gate` only — but it no longer
+      decides whether the collector clause fires at all.
+    * Every clause is a GENERAL TRUTH, true regardless of what happened in the
+      turn, so no clause CAN be false and none needs a provenance hedge to make
+      it safe. Negation therefore costs at most an unhelpful sentence: "no
+      collector needed" still gets its correct gate clause, plus a true but
+      unsolicited collector definition. Detecting negation is banned —
+      `_message_names_identifier` is a word-boundary regex with no notion of it,
+      and a negation parse would fail in the opposite direction on "no gate, add
+      a collector".
+
+    Note what the frame deliberately does NOT say. The only caller sits inside
+    the `_has_unmentioned_unavailable_action_identity` guard, so an unavailable
+    plugin the user never named is always what happened — that is what the frame
+    open states, and its "for it" refers to the retained instruction, which IS
+    the action the guard just checked. But nothing reaching this function says
+    WHICH node that plugin was for, or what kind of plugin it is.
+    `DeferredIntentAction` carries only target_stage / catalog_kind /
+    catalog_name / redacted_summary / constraints; there is no node_type, and
+    this function receives none of it. So "the plugin I proposed FOR THE
+    COLLECTOR" is unverifiable BY CONSTRUCTION — for "add a collector and a
+    scoring transform" the unavailable plugin may belong to the transform, and
+    `catalog_kind` may be "sink" rather than "transform". No clause may
+    attribute the plugin to a node, and none does.
+
+    Clause order is structural-then-collector, which is NOT the order comment
+    7977 §7.1 lists. Deliberate: it puts "not a transform plugin" directly
+    beside "IS backed by a batch-transform plugin", and that contrast is the
+    whole reason the collector clause exists (comment 7911).
+
+    Collector is also deliberately absent from `_STRUCTURAL_NODE_TYPES` itself.
+    That tuple is a copy-trigger keyword list whose sole membership rule is that
+    "a {x} is a built-in topology node, not a transform plugin" is TRUE of x —
+    exactly the plugin-free kinds. A collector is plugin-BEARING (barrier-scopes
+    spec §3 types it as a transform plugin, and a collector with no `plugin` is
+    rejected outright), so adding it there would print a falsehood.
+    """
+    clauses: list[str] = []
     structural_node = next(
         (node_type for node_type in _STRUCTURAL_NODE_TYPES if _message_names_identifier(user_message, node_type)),
         None,
     )
-    if structural_node is None:
-        message = (
-            "I kept that future-stage instruction, but its structure was not verified. "
-            "The proposed transform identity was not present in your request, so I did not treat it as a deployment problem. "
-            "Clarify the concrete topology structure and I'll firm it up."
+    if structural_node is not None:
+        clauses.append(f"A {structural_node} is a built-in topology node, not a transform plugin. ")
+    if _message_names_identifier(user_message, "collector"):
+        clauses.append(
+            "A collector is a built-in topology node that IS backed by a batch-transform plugin, and it closes "
+            "an EXPAND scope — it needs scope_name, scope_opener and scope_policy. Name the batch behaviour you "
+            "want and the scope it should close. "
         )
-    else:
-        message = (
-            f"I kept your {structural_node} request, but its structure was not verified. "
-            f"A {structural_node} is a built-in topology node, not a transform plugin. "
-            "Clarify the concrete topology structure and I'll firm it up."
-        )
+    message = (
+        "I kept that future-stage instruction, but its structure was not verified. "
+        "The plugin I proposed for it is not available here, and you did not ask for it by name, "
+        "so I did not treat it as a deployment problem. "
+        f"{''.join(clauses)}"
+        "Clarify the concrete topology structure and I'll firm it up."
+    )
     return StepChatResult(
         assistant_message=message,
         status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,

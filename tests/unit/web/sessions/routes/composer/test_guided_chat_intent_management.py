@@ -26,9 +26,28 @@ from elspeth.web.sessions.routes.composer.guided_chat_intent_management import (
 
 _MESSAGE_ID = UUID("11111111-1111-4111-8111-111111111111")
 _INTENT_ID = UUID("22222222-2222-4222-8222-222222222222")
+_SECOND_INTENT_ID = UUID("55555555-5555-4555-8555-555555555555")
 _RETAINED_INTENT_ID = "33333333-3333-4333-8333-333333333333"
 _EDITED_INTENT_ID = "44444444-4444-4444-8444-444444444444"
 _ROUTING_MESSAGE = "Later add a gate that routes rows with amount greater than 500 to high_value, and everything else to standard."
+_COLLECTOR_MESSAGE = "Later add a collector that stitches the exploded pages back into one row per document."
+_COLLECTOR_AND_GATE_MESSAGE = "Later add a collector and a gate so the exploded pages come back together before routing."
+_COLLECTOR_DECLINED_MESSAGE = "Later add a gate that routes high-value rows to review; no collector needed for this one."
+_COLLECTOR_AND_SCORER_MESSAGE = (
+    "Later add a collector that stitches the exploded pages back together, and later score each row for sentiment."
+)
+_FRAME_OPEN = (
+    "I kept that future-stage instruction, but its structure was not verified. "
+    "The plugin I proposed for it is not available here, and you did not ask for it by name, "
+    "so I did not treat it as a deployment problem. "
+)
+_GATE_CLAUSE = "A gate is a built-in topology node, not a transform plugin. "
+_COLLECTOR_CLAUSE = (
+    "A collector is a built-in topology node that IS backed by a batch-transform plugin, and it closes "
+    "an EXPAND scope — it needs scope_name, scope_opener and scope_policy. Name the batch behaviour you "
+    "want and the scope it should close. "
+)
+_FRAME_CLOSE = "Clarify the concrete topology structure and I'll firm it up."
 
 
 def _catalog(*, available: frozenset[PluginId]) -> PolicyCatalogView:
@@ -64,7 +83,7 @@ def _action(catalog_name: str, *, target_stage: StageName = "topology") -> Defer
     )
 
 
-def _apply(action: DeferredIntentAction, *, catalog: PolicyCatalogView) -> DeferredRequestApplication:
+def _apply(action: DeferredIntentAction, *, catalog: PolicyCatalogView, message: str = _ROUTING_MESSAGE) -> DeferredRequestApplication:
     return apply_deferred_request(
         (action,),
         None,
@@ -73,9 +92,31 @@ def _apply(action: DeferredIntentAction, *, catalog: PolicyCatalogView) -> Defer
             catalog=catalog,
             originating_message=GuidedOriginatingUserMessageDraft(
                 message_id=_MESSAGE_ID,
-                content=_ROUTING_MESSAGE,
+                content=message,
             ),
             new_intent_ids=(_INTENT_ID,),
+        ),
+        chat=StepChatResult(
+            assistant_message="model-authored response",
+            status=ComposerChatTurnStatus.SUCCESS,
+            latency_ms=7,
+            error_class=None,
+        ),
+    )
+
+
+def _apply_many(*actions: DeferredIntentAction, catalog: PolicyCatalogView, message: str) -> DeferredRequestApplication:
+    return apply_deferred_request(
+        actions,
+        None,
+        authority=DeferredRequestAuthority(
+            guided=GuidedSession.initial(),
+            catalog=catalog,
+            originating_message=GuidedOriginatingUserMessageDraft(
+                message_id=_MESSAGE_ID,
+                content=message,
+            ),
+            new_intent_ids=(_INTENT_ID, _SECOND_INTENT_ID),
         ),
         chat=StepChatResult(
             assistant_message="model-authored response",
@@ -100,6 +141,112 @@ def test_unmentioned_unavailable_model_catalog_identity_precedes_weaker_routing_
     assert intent.constraints == ()
     assert intent.catalog_kind is None
     assert intent.catalog_name is None
+
+
+def test_unmentioned_unavailable_model_catalog_identity_teaches_collector_scopes() -> None:
+    """A message naming only a collector gets the frame PLUS the collector clause.
+
+    Collector is deliberately absent from `_STRUCTURAL_NODE_TYPES` — that
+    tuple's copy asserts "not a transform plugin", which is false for a
+    plugin-bearing collector — so the teaching composes into the frame instead
+    (filigree elspeth-270e81443d).
+
+    No clause may attribute the unavailable plugin to the collector: nothing
+    reaching `_model_catalog_identity_chat` says which node the plugin was for
+    or what kind it is, so that referent is unverifiable by construction.
+    """
+
+    result = _apply(
+        _action("stitch_pages"),
+        catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+        message=_COLLECTOR_MESSAGE,
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.chat.error_class == "DeferredIntentModelCatalogIdentity"
+    assert result.chat.assistant_message == _FRAME_OPEN + _COLLECTOR_CLAUSE + _FRAME_CLOSE
+    # Nothing may bind the proposed plugin to the collector, and the collector
+    # must never be called "not a transform plugin".
+    assert "proposed for the collector" not in result.chat.assistant_message
+    assert "batch-transform plugin I proposed" not in result.chat.assistant_message
+    assert "A collector is a built-in topology node, not a transform plugin" not in result.chat.assistant_message
+    (intent,) = result.guided.deferred_intents
+    assert intent.constraints == ()
+    assert intent.catalog_kind is None
+    assert intent.catalog_name is None
+
+
+def test_collector_and_structural_clauses_both_emit_inside_one_frame() -> None:
+    """BOTH teaching clauses appear, and the shared frame is emitted ONCE.
+
+    "add a collector and a gate" is the case that made this additive. A
+    collector arm that REPLACED the structural arm would take the true gate
+    clause away; a returning collector branch placed after the `next()` scan
+    would never be reached whenever a structural node was also named. Composing
+    the clauses gives the user both, so no ordering is load-bearing and nothing
+    true is traded away (filigree elspeth-270e81443d, review comment 7977 §7.1).
+    """
+
+    result = _apply(
+        _action("stitch_pages"),
+        catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+        message=_COLLECTOR_AND_GATE_MESSAGE,
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.chat.assistant_message == _FRAME_OPEN + _GATE_CLAUSE + _COLLECTOR_CLAUSE + _FRAME_CLOSE
+    # Exact equality above already pins single emission; these state the
+    # property a reader is looking for when a clause is added.
+    assert result.chat.assistant_message.count(_FRAME_OPEN) == 1
+    assert result.chat.assistant_message.count(_FRAME_CLOSE) == 1
+
+
+def test_declining_a_collector_still_gets_the_true_structural_clause() -> None:
+    """Negation must not turn a TRUE clause into a FALSE one.
+
+    `_message_names_identifier` is a word-boundary regex with no notion of
+    negation, and detecting negation here is banned — it would fail the other
+    way on "no gate, add a collector". Composition makes that safe: "no
+    collector needed" keeps its correct gate clause, and the appended collector
+    clause is a general truth, so it is at worst unhelpful. A precedence arm
+    would have REPLACED the gate clause with collector copy, turning a true
+    message false — the regression this shape exists to prevent.
+    """
+
+    result = _apply(
+        _action("numeric_route"),
+        catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+        message=_COLLECTOR_DECLINED_MESSAGE,
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.chat.assistant_message == _FRAME_OPEN + _GATE_CLAUSE + _COLLECTOR_CLAUSE + _FRAME_CLOSE
+
+
+def test_collector_clause_stays_true_beside_a_successfully_saved_sibling_action() -> None:
+    """Two actions in one turn: the saved-instruction line and the frame coexist.
+
+    `_compose_disposition_chats` joins per-action chats in action order, so a
+    retained sibling prepends "I saved that instruction for the topology stage."
+    to this frame. Under the superseded copy that turn was self-contradictory —
+    it said the COLLECTOR request was unverified because of a plugin that in
+    fact belonged to the scoring transform. The frame now attributes the
+    unavailable plugin to no node, so both halves are true at once
+    (review comment 7977 §2B).
+    """
+
+    result = _apply_many(
+        _action("passthrough"),
+        _action("sentiment_scorer"),
+        catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+        message=_COLLECTOR_AND_SCORER_MESSAGE,
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.chat.assistant_message == (
+        "I saved that instruction for the topology stage. " + _FRAME_OPEN + _COLLECTOR_CLAUSE + _FRAME_CLOSE
+    )
+    assert "collector request" not in result.chat.assistant_message
 
 
 def test_unmentioned_unavailable_identity_cannot_bypass_same_stage_rejection() -> None:
