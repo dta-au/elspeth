@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import pairwise
 from types import MappingProxyType
-from typing import Any, Final, Literal, NotRequired, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, TypedDict, cast, get_args
 from uuid import UUID
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
@@ -76,7 +76,7 @@ from elspeth.web.composer.llm_response_parsing import (
 from elspeth.web.composer.progress import emit_progress, model_call_progress_event, tool_batch_progress_event
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
-from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.state import CompositionState, NodeType
 from elspeth.web.composer.tools._dispatch import get_discovery_tool_definitions
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -679,6 +679,46 @@ _DEFERRED_CONSTRAINT_SCHEMA: dict[str, Any] = {
     ]
 }
 
+# The node-kind partition the retain_deferred_intent description states as
+# fact, in the fixed order it is rendered in (a set would make the tool-schema
+# bytes — and therefore the audited ``messages_hash`` — order-unstable).
+#
+# The membership rule is "does authoring this kind require naming a plugin?",
+# and every arm is enforced by ``CompositionState.validate()``:
+#   plugin FORBIDDEN — gate/coalesce (``structural_node_plugin_forbidden``),
+#     row_union (``row_union_config_invalid``), queue (``queue_config_invalid``)
+#   plugin REQUIRED  — transform (``transform_missing_plugin``), aggregation
+#     (``aggregation_missing_plugin``), collector (``collector_missing_plugin``)
+#
+# Hand-written on purpose. That question has no single owner in the tree today:
+# ``state.py::_PLUGINLESS_STRUCTURAL_NODE_TYPES`` ({gate, coalesce}) and
+# ``audit_readiness/service.py::_PLUGINLESS_NODE_TYPES`` are two more
+# hand-written statements of it with deliberately different predicates and
+# membership, and that module's own comment forbids unifying from a fourth
+# site (elspeth-b3117ec3ac owns the unification). What IS derived is the
+# vocabulary: the assert below reads ``NodeType`` — the ``state.py`` Literal
+# ``NodeSpec.node_type`` is annotated against — and fails at import if a new
+# or renamed member leaves the sentence the planner is handed on every guided
+# turn quietly incomplete. Deriving BOTH sides here would be a tautology.
+_PLUGIN_FREE_NODE_TYPES: Final[tuple[str, ...]] = ("gate", "coalesce", "row_union", "queue")
+_PLUGIN_BEARING_NODE_TYPES: Final[tuple[str, ...]] = ("transform", "aggregation", "collector")
+assert frozenset(_PLUGIN_FREE_NODE_TYPES).isdisjoint(_PLUGIN_BEARING_NODE_TYPES) and frozenset(
+    _PLUGIN_FREE_NODE_TYPES + _PLUGIN_BEARING_NODE_TYPES
+) == frozenset(get_args(NodeType)), (
+    "the retain_deferred_intent node-kind partition no longer partitions NodeType; unpartitioned members: "
+    f"{sorted(frozenset(get_args(NodeType)) ^ frozenset(_PLUGIN_FREE_NODE_TYPES + _PLUGIN_BEARING_NODE_TYPES))}, "
+    f"claimed by both arms: {sorted(frozenset(_PLUGIN_FREE_NODE_TYPES) & frozenset(_PLUGIN_BEARING_NODE_TYPES))}"
+)
+
+
+def _node_kind_phrase(kinds: tuple[str, ...]) -> str:
+    return f"{', '.join(kinds[:-1])}, and {kinds[-1]}"
+
+
+def _sentence_case(phrase: str) -> str:
+    return phrase[:1].upper() + phrase[1:]
+
+
 _DEFERRED_INTENT_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -686,7 +726,9 @@ _DEFERRED_INTENT_TOOL: dict[str, Any] = {
         "description": (
             "Use only when the user gives a concrete instruction whose responsible guided stage is later than the current stage. "
             "Emit structural facts only; never copy raw user prose into redacted_summary. "
-            "Gate, coalesce, row_union, and queue are structural node types, never transform plugins. "
+            f"{_sentence_case(_node_kind_phrase(_PLUGIN_FREE_NODE_TYPES))} are structural node types, never transform plugins; "
+            f"{_node_kind_phrase(_PLUGIN_BEARING_NODE_TYPES)} are node types that each REQUIRE a transform plugin, "
+            "so naming that plugin does not make the node an ordinary transform. "
             "catalog_kind and catalog_name are a pair: set BOTH to the exact known catalog plugin, or BOTH to null "
             "when the instruction does not name one specific plugin. "
             "If this schema cannot faithfully encode the instruction, ask for clarification instead of fabricating a catalog identity."
@@ -755,6 +797,66 @@ _DEFERRED_INTENT_MANAGEMENT_TOOL: dict[str, Any] = {
 # settlement. Breach is a shape error, so the caller's R2-F15 clarification
 # retention net applies — the message is never silently discarded.
 GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY: Final[int] = 8
+
+
+def _deferred_constraint_kind_names() -> tuple[str, ...]:
+    """The constraint-kind union, read off the schema the model is handed.
+
+    Tier-1: ``_DEFERRED_CONSTRAINT_SCHEMA`` is this module's own literal, so a
+    missing key is a framework bug that must crash rather than degrade the
+    teaching prose to a stale hand-written list.
+    """
+    return tuple(variant["properties"]["kind"]["enum"][0] for variant in _DEFERRED_CONSTRAINT_SCHEMA["oneOf"])
+
+
+def _deferred_intent_teaching_block() -> str:
+    """Teach the retain_deferred_intent invariants the server actually enforces.
+
+    Three of them decide whether a retain is accepted and were stated nowhere
+    in the assembled payload, while the surrounding prose pushes hard toward
+    retention: the per-reply cap, the responsible-stage rule, and the
+    message-level stated-fact requirement (filigree elspeth-1ebf08f8ec).
+
+    The two enumerable facts are DERIVED from the authorities that enforce
+    them — ``_DEFERRED_CONSTRAINT_SCHEMA`` for the kind union and
+    ``GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY`` for the cap — never restated by
+    hand, so adding a kind or changing the cap reaches the planner in the same
+    commit that changes the rule. The responsible-stage map is deliberately
+    NOT transcribed: ``_constraint_stage`` resolves it per constraint kind with
+    arms this prose would drift from, so the rule and its remedy are stated and
+    the map is left to the server.
+
+    Emitted only where ``retain_deferred_intent`` is actually attached (steps 1
+    and 2). It must not move into ``base.md``, which renders into steps 3 and 4
+    where the tool does not exist — naming an unattached tool is exactly what
+    base.md's own "use only the tools attached to the current request" rule
+    forbids.
+    """
+    kinds = ", ".join(f"`{kind}`" for kind in _deferred_constraint_kind_names())
+    return (
+        "Retention only preserves an instruction you can actually encode, and encoding it too weakly "
+        "does NOT fail loudly: nothing stops the planner claiming the intent once a pipeline satisfies "
+        "the constraints you wrote, and the approximation is then banked as delivered while the user's "
+        "actual instruction is lost. Constraints nothing can satisfy fail the other way — the planner "
+        "can never claim them, so the item stays pending until the user clears it by hand. When the "
+        "constraint kinds cannot carry what the user asked for, ask them to clarify instead of "
+        "retaining an approximation.\n"
+        f"Constraint kinds: {kinds}; the tool schema gives each one's required fields. "
+        f"At most {GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY} retain calls are accepted in one reply.\n"
+        "`target_stage` must be the LATEST stage the intent's own content belongs to — the stage that "
+        "owns its constraints AND its named plugin, not the stage you are on and not the earliest "
+        "stage it touches. An instruction spanning two stages is TWO intents, one per stage; a single "
+        "intent naming the earlier stage is rejected.\n"
+        "When the user states a routing rule or a comparison in their own words (rows over a threshold "
+        "go to one output, everything else to another), the intent must carry `stated_gate_routing`, "
+        "or `stated_predicate` when they name a condition but no destination. For such a message a "
+        "`component_count` or `subject_presence` constraint is not enough ON ITS OWN, because a "
+        "pipeline containing no gate at all would satisfy it — include the stated constraint alongside "
+        "whatever else you record.\n"
+        "A collector's scope binding — its scope name, opener and policy — cannot be expressed by any "
+        "constraint kind here. Ask the user to settle it at the topology stage rather than "
+        "approximating it with a `component_count`.\n"
+    )
 
 
 def _parse_deferred_intent_tool_arguments(arguments: object) -> DeferredIntentAction:
@@ -994,7 +1096,12 @@ def _build_step_1_source_dynamic_block(
     can be an isolable, byte-stable, markable cache head (``messages[0]``); this
     dynamic block rides in ``messages[1]``. The static tool-instructions tail is
     intentionally part of THIS block (after the dynamic hint/revise content),
-    not the marked head — only the ~1199-token skill is in the cached prefix.
+    not the marked head — only the ~1240-token skill is in the cached prefix.
+    (Estimated at ~4 chars/token over the marked head as actually sent,
+    ``load_step_chat_skill(STEP_1_SOURCE).rstrip()``, 4,961 chars. That compose
+    is ``base.md`` PLUS ``step_1_source.md``, so RE-MEASURE — do not increment —
+    whenever any ``guided/skills/*.md`` edit moves either. It must stay clear of
+    Anthropic's 1024-token cache floor for the marker to bite.)
     """
     if type(available_source_plugins) is not tuple or any(type(plugin) is not str or not plugin for plugin in available_source_plugins):
         raise TypeError("available_source_plugins must be an exact tuple of non-empty strings")
@@ -1052,6 +1159,7 @@ def _build_step_1_source_dynamic_block(
             "concrete instruction for a LATER guided stage, call `retain_deferred_intent` with only "
             "structural constraints and a redacted summary; do not copy the user's raw wording into the "
             "summary. Never call it for the current source stage.\n"
+            f"{_deferred_intent_teaching_block()}"
         )
     reselection_block = ""
     if allow_plugin_reselection and plugin_hint is not None and any(plugin != plugin_hint for plugin in available_source_plugins):
@@ -1090,6 +1198,7 @@ def _build_step_1_source_dynamic_block(
         "`retain_deferred_intent` with only structural constraints and a redacted summary; "
         "do not copy the user's raw wording into the summary. Never call it for the current "
         "source stage.\n"
+        f"{_deferred_intent_teaching_block()}"
     )
 
 
@@ -2370,7 +2479,7 @@ async def maybe_resolve_step_1_source_chat(
     for attempt_index in range(max_attempts):
         # SPLIT the system prompt: the stable per-step skill is the byte-stable,
         # markable head (messages[0]); the dynamic hint/revise context + tool
-        # instructions ride in messages[1]. Only the ~1199-token skill is in the
+        # instructions ride in messages[1]. Only the ~1240-token skill is in the
         # marked cache prefix.
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": load_step_chat_skill(GuidedStep.STEP_1_SOURCE).rstrip()},
@@ -2900,6 +3009,7 @@ def _build_step_2_sink_tool_prompt(
             "review instead, call `retain_deferred_intent` with only structural constraints and a redacted "
             "summary; do not copy the user's raw wording into the summary. Never call it for the current "
             "output stage.\n"
+            f"{_deferred_intent_teaching_block()}"
         )
     return (
         f"{load_step_chat_skill(GuidedStep.STEP_2_SINK).rstrip()}\n"
@@ -2915,6 +3025,7 @@ def _build_step_2_sink_tool_prompt(
         "instruction for topology or wire review instead, call `retain_deferred_intent` "
         "with only structural constraints and a redacted summary; do not copy the user's "
         "raw wording into the summary. Never call it for the current output stage.\n"
+        f"{_deferred_intent_teaching_block()}"
     )
 
 
@@ -3679,9 +3790,14 @@ async def solve_step_chat(
     # kwargs so the SAME marked list feeds both the wire call and the audit
     # ``build_llm_call_record(messages=messages)`` in the finally block — the
     # recorded ``messages_hash`` stays truthful to what was sent. ``solve_step_chat``
-    # attaches no tools, so the tools half is ``None``. Below-floor stages
-    # (STEP_2_SINK ~915 tok, STEP_4_WIRE ~749 tok) are marked here too but the
-    # marker is an inert no-op below Anthropic's 1024-token cache floor.
+    # attaches no tools, so the tools half is ``None``. Every stage is marked
+    # here, but the marker is an inert no-op below Anthropic's 1024-token cache
+    # floor. Re-measured 2026-08-26 at ~4 chars/token over the composed skill:
+    # STEP_1 ~1240, STEP_2 ~1142, STEP_3 ~2024, STEP_4 ~802 — only
+    # STEP_4_WIRE is still below the floor. The "STEP_2_SINK ~915 /
+    # STEP_4_WIRE ~749, both below-floor" text this replaces was measured at
+    # 7ddca3ac1 (same 4 chars/token yardstick) and went stale as the skill
+    # markdown grew; RE-MEASURE these, never increment them.
     if supports_anthropic_prompt_cache_markers(model):
         messages, _ = apply_anthropic_cache_markers(messages, None)
     kwargs: dict[str, Any] = {
