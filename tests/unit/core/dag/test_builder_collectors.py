@@ -7,11 +7,11 @@ from typing import Any, ClassVar
 import pytest
 
 from elspeth.contracts.enums import NodeType
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import SchemaConfig, get_raw_node_required_fields
 from elspeth.contracts.types import CollectorName, NodeID
 from elspeth.core.config import CoalesceSettings, CollectorSettings, GateSettings, ScopeSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
-from elspeth.core.dag.models import GraphValidationError
+from elspeth.core.dag.models import EdgeContractError, GraphValidationError
 from elspeth.core.dag.wiring import WiredTransform
 
 
@@ -334,6 +334,94 @@ class TestCollectorNode:
     def test_three_level_depth_cap_rejects_below_three(self) -> None:
         with pytest.raises(GraphValidationError, match="nesting depth"):
             _build_three_level_expand_fork_fork(max_bound_region_depth=2)
+
+
+class TestCollectorDeclaredRequiredFieldsAreEnforced:
+    """A collector's declared ``schema.required_fields`` is a live build-time
+    contract, not an inert declaration (elspeth-c3cbf5f4cd).
+
+    ``builder.py`` gives a collector the SAME nested-``options`` node-config
+    shape it gives an aggregation, but ``get_raw_node_required_fields``
+    unwrapped that nesting only for ``node_type == "aggregation"``. The
+    identical declaration therefore built clean on a collector and raised
+    ``EdgeContractError`` on an aggregation — a contract the author declares,
+    the system accepts, and nothing ever checks.
+
+    This is NOT the ADR-013 runtime ``declared_input_fields`` contract, which
+    correctly fails closed for batch-aware plugins at construction. This is
+    the separate build-time DAG check that predates it (see
+    ``plugins/infrastructure/base.py`` and elspeth-3790106260), and an
+    aggregation carrying a batch-aware plugin already gets it today.
+    """
+
+    # The node-config shape builder.py writes at builder.py:709-712 — the
+    # authored plugin options nested one level down under "options".
+    _NESTED_NODE_CONFIG: ClassVar[dict[str, Any]] = {
+        "options": {"schema": {"mode": "observed", "required_fields": ["totally_absent_field"]}},
+        "input_schema": {"mode": "observed", "required_fields": ["totally_absent_field"]},
+        "scope": {"name": "document_pages", "opener": "explode", "policy": "require_all"},
+    }
+
+    def test_collector_and_aggregation_read_the_same_nested_contract(self) -> None:
+        """Mutation check: same config, ``node_type`` the only variable.
+
+        Before the fix this returned ``frozenset()`` for "collector" and
+        ``{'totally_absent_field'}`` for "aggregation".
+        """
+        by_node_type = {
+            node_type: get_raw_node_required_fields(self._NESTED_NODE_CONFIG, owner="node:x", node_type=node_type)
+            for node_type in ("collector", "aggregation")
+        }
+        assert by_node_type == {
+            "collector": frozenset({"totally_absent_field"}),
+            "aggregation": frozenset({"totally_absent_field"}),
+        }
+
+    def test_flat_contract_node_types_do_not_unwrap_a_plugin_option_named_options(self) -> None:
+        """The unwrap is a closed membership set, not an unconditional one.
+
+        Only aggregations and collectors get the nested shape from the
+        builder. Every other node kind carries its contract flat, so a key
+        named ``options`` sitting on a flat node config must NOT be mistaken
+        for the wrapper. The reachable case is a planner-authored composer
+        draft, whose ``node.options`` is not validated against the plugin's
+        config model when ``validate()`` runs — see the comment on
+        ``NESTED_CONTRACT_OPTIONS_NODE_TYPES``.
+        """
+        for node_type in ("transform", "gate", "coalesce", "row_union", "queue", "source", "sink", None):
+            assert get_raw_node_required_fields(self._NESTED_NODE_CONFIG, owner="node:x", node_type=node_type) == frozenset()
+
+    def test_collector_required_fields_reject_a_producer_that_cannot_supply_them(self) -> None:
+        """End to end: the declared requirement now fails the build.
+
+        Asserts the ``EdgeContractError`` on the opener -> collector edge, not
+        merely that the unwrap returns a non-empty set.
+        """
+        contract = {"schema": {"mode": "observed", "required_fields": ["totally_absent_field"]}}
+        collector_plugin = _BatchTransform()
+        collector_plugin.config = dict(contract)
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build(
+                collectors={
+                    "page_stitcher": (
+                        collector_plugin,
+                        CollectorSettings(
+                            name="page_stitcher",
+                            plugin="stitch_pages",
+                            input="pages",
+                            on_success="out",
+                            options=dict(contract),
+                        ),
+                    )
+                }
+            )
+
+        error = exc_info.value
+        assert error.compatibility_result is not None
+        assert error.compatibility_result.missing_fields == ("totally_absent_field",)
+        assert error.component_type == "collector"
+        assert "totally_absent_field" in str(error)
 
 
 def test_collector_is_a_rule9_error_routable_closer_at_runtime() -> None:

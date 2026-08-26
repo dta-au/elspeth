@@ -33,6 +33,7 @@ from typing import Annotated, Any, Literal, cast
 
 from pydantic import Field
 
+from elspeth.contracts.enums import NodeType
 from elspeth.contracts.identifiers import validate_field_name, validate_field_names
 
 # Supported field types for schema definitions
@@ -816,17 +817,54 @@ def get_raw_schema_config(
     return parse_raw_schema_config(_get_raw_schema_value(options), owner=owner)
 
 
+# Node kinds whose builder-produced node config nests the authored plugin
+# options under an ``options`` wrapper key, so the input contract lives one
+# level down rather than flat on the node config.
+#
+# ``builder.py`` writes exactly this shape for aggregations (``"options":
+# dict(agg_config.options)``) and, identically, for collectors (``"options":
+# dict(collector_config.options)``). Both are membership-tested here rather
+# than compared against a single ``node_type == "aggregation"`` literal: the
+# literal is what left a collector's declared ``schema.required_fields``
+# unread while the identical declaration was enforced on an aggregation
+# (elspeth-c3cbf5f4cd). Every other node kind carries its contract flat. The
+# unwrap stays a closed membership set rather than an unconditional structural
+# one because the same helper serves the composer, where ``node.options`` is
+# planner-authored and is not validated against the plugin's config model when
+# ``validate()`` runs — a draft carrying a junk key named ``options`` would
+# otherwise have its real flat contract silently replaced. (No plugin config
+# model declares an option named ``options``; every one is ``extra="forbid"``.)
+NESTED_CONTRACT_OPTIONS_NODE_TYPES: frozenset[NodeType] = frozenset({NodeType.AGGREGATION, NodeType.COLLECTOR})
+
+
+def node_type_nests_contract_options(node_type: str | None) -> bool:
+    """Return whether this node kind nests its input contract under ``options``.
+
+    Accepts the raw ``str`` node-type discriminator that graph node info and
+    composer ``NodeSpec`` both carry; ``NodeType`` is a ``StrEnum``, so plain
+    strings match its members.
+    """
+    return node_type in NESTED_CONTRACT_OPTIONS_NODE_TYPES
+
+
 def get_aggregation_contract_options(
     options: Mapping[str, Any],
     *,
     owner: str,
 ) -> tuple[Mapping[str, Any], str]:
-    """Return the mapping that carries an aggregation's input contract.
+    """Return the mapping that carries a node's nested input contract.
 
-    Aggregation nodes accept their input contract under either flat
-    ``options`` or a nested ``options.options`` wrapper. This helper is the
-    single source of truth for that alias resolution; callers in
-    ``contracts/schema.py`` and ``web/composer/state.py`` rely on it.
+    Aggregation and collector nodes accept their input contract under either
+    flat ``options`` or a nested ``options.options`` wrapper — ``builder.py``
+    produces the identical nested shape for both. This helper is the single
+    source of truth for that alias resolution.
+
+    Gate the call on ``node_type_nests_contract_options``. Six composer sites
+    (``web/composer/state.py`` 1556 / 3474 / 4359 / 5276 / 5389 / 6046) still
+    gate on the ``node_type == "aggregation"`` literal and have NOT been
+    widened; they are correct for today's composer collector NodeSpecs, whose
+    options are flat.
+
     Raises ``ValueError`` when ``options["options"]`` exists but is not a
     ``Mapping`` — that is a misconfiguration, not a recoverable shape.
     """
@@ -835,7 +873,7 @@ def get_aggregation_contract_options(
 
     nested_options = options["options"]
     if not isinstance(nested_options, Mapping):
-        raise ValueError(f"{owner} aggregation wrapper options must be a mapping, got {type(nested_options).__name__}")
+        raise ValueError(f"{owner} nested contract options must be a mapping, got {type(nested_options).__name__}")
     return nested_options, f"{owner} options"
 
 
@@ -914,7 +952,7 @@ def get_raw_node_required_fields(
 
     contract_options = options
     contract_owner = owner
-    if node_type == "aggregation":
+    if node_type_nests_contract_options(node_type):
         contract_options, contract_owner = get_aggregation_contract_options(options, owner=owner)
         if contract_options is not options and "required_input_fields" in contract_options:
             required_input = _parse_raw_required_input_fields(
