@@ -2125,6 +2125,123 @@ describe("GraphView", () => {
       ).toBe(false);
     });
 
+    it("applies the runtime's identity-mapping rule to LIST-form branches", () => {
+      // elspeth-625e85c59b follow-up. `branches` is legally a LIST as well as
+      // a map, and the two are NOT equivalent on the wire: the composer
+      // normalises list -> identity mapping ONLY for row_union
+      // (composer/state.py `_row_union_normalized_branches`), while
+      // `_serialize_branches` "preserves list-vs-mapping semantics" for a
+      // coalesce. So a coalesce reaches the frontend still holding a list.
+      //
+      // The runtime's rule for that list is not ambiguous and not ours to
+      // invent: CoalesceSettings.normalize_branches (core/config.py:991-1005)
+      // returns `{b: b for b in v}`. Bailing out on Array.isArray silently
+      // declined that rule and reproduced the ORIGINAL defect — one arm drawn
+      // from the `input` placeholder — on a composition that validates green.
+      const state = coalesceState();
+      const coalesce = state.nodes.find((node) => node.id === "merge_branches");
+      expect(coalesce).toBeDefined();
+      // Identity form: each entry names a connection AND is its own alias.
+      coalesce!.branches = ["pairing_done", "hex_done"];
+      coalesce!.input = "pairing_done";
+      useSessionStore.setState({ compositionState: state });
+      render(<GraphView />);
+
+      expect(inboundEdgeIds("merge_branches")).toEqual([
+        "edge-inferred-fan-in-get_hex-merge_branches-hex_done",
+        "edge-inferred-fan-in-recommend_pairing-merge_branches-pairing_done",
+      ]);
+      expect(
+        screen.getByTestId(
+          "edge-inferred-fan-in-get_hex-merge_branches-hex_done",
+        ),
+      ).toHaveTextContent("hex_done");
+    });
+
+    it("keeps a row_union's explicit outbound edge when a fan-in node consumes it", () => {
+      // Regression guard for the interaction between the two claim ledgers.
+      // Phase 1 claims an explicit edge as an INBOUND branch arm and rewrites
+      // it in place, keeping its id — so it stays in explicitRfEdgeIds. The
+      // OUTBOUND drop loop then judges that same edge by its own ledger,
+      // finds it unclaimed, and splices it. One edge, two ledgers, and the
+      // inbound claim has to count.
+      const state = coalesceState();
+      state.nodes = [
+        makeNode({ id: "p_a", input: "start", on_success: "a1" }),
+        makeNode({ id: "p_b", input: "start", on_success: "b1" }),
+        {
+          id: "u",
+          node_type: "row_union",
+          plugin: null,
+          input: "a1",
+          on_success: "u_out",
+          on_error: null,
+          options: {},
+          branches: { a: "a1", b: "b1" },
+        },
+        {
+          id: "c",
+          node_type: "coalesce",
+          plugin: null,
+          input: "u_out",
+          on_success: "final_out",
+          on_error: null,
+          options: {},
+          branches: { left: "u_out", right: "r_out" },
+        },
+        makeNode({ id: "p_r", input: "start", on_success: "r_out" }),
+      ];
+      state.edges = [
+        makeEdge({ id: "e_u_c", from_node: "u", to_node: "c", label: null }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+      render(<GraphView />);
+
+      // The row_union's arm into the coalesce must survive, labelled by the
+      // alias the coalesce declares for it.
+      const inbound = inboundEdgeIds("c");
+      expect(inbound).toHaveLength(2);
+      expect(
+        inbound.some((id) => id.includes("u") && id.includes("-c")),
+      ).toBe(true);
+    });
+
+    it("redraws a direct node-id producer after phase 1b prunes its stale explicit edge", () => {
+      // Phase 1b's comment claimed `branches` is the ONLY route into an
+      // alias-mapped fan-in node, and that leaving the pruned connection in
+      // `existingConnections` is harmless because it "only ever suppresses
+      // duplicates". Both were false: the direct-sink blocks push into ANY
+      // node id, and after a prune the retained key suppresses a NON-
+      // duplicate. Net effect — the edge is deleted and never redrawn.
+      const state = coalesceState();
+      state.nodes = [
+        makeNode({ id: "p_a", input: "start", on_success: "a1" }),
+        makeNode({ id: "p_b", input: "start", on_success: "b1" }),
+        // Names the coalesce by NODE ID rather than by a connection.
+        makeNode({ id: "direct", input: "start", on_success: "c" }),
+        {
+          id: "c",
+          node_type: "coalesce",
+          plugin: null,
+          input: "a1",
+          on_success: "final_out",
+          on_error: null,
+          options: {},
+          branches: { a: "a1", b: "b1" },
+        },
+      ];
+      state.edges = [
+        makeEdge({ id: "e_direct_c", from_node: "direct", to_node: "c", label: null }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+      render(<GraphView />);
+
+      const inbound = inboundEdgeIds("c");
+      // Both declared arms, plus the direct reference — none silently lost.
+      expect(inbound).toHaveLength(3);
+      expect(inbound.some((id) => id.includes("direct"))).toBe(true);
+    });
+
     it("drops a stale-label explicit edge into an alias-mapped coalesce", () => {
       // Phase 1b's reason to exist: `with_node` replaces a node in place and
       // never reconciles `edges`, and validation only checks that endpoints

@@ -83,11 +83,24 @@ const PARALLEL_HANDLE_INSET = 16;
  * alias -> connection-name mapping — rather than by the scalar `input`, which
  * carries only the backend-compatible first-branch placeholder.
  *
- * Both kinds have always shared this shape; only row_union was ever read that
- * way, so a coalesce fell through to ordinary `input` inference and rendered a
- * single arm from whichever producer happened to own the placeholder
- * connection (elspeth-625e85c59b). `coalesce` is the kind the composer
- * actually authors: across the saved corpus it outnumbers row_union 38 to 0.
+ * Both kinds share this shape in the RUNTIME; they do NOT share it on the
+ * wire. `branches` is legally a list as well as a map, and the composer
+ * normalises list -> identity mapping only for row_union
+ * (composer/state.py `_row_union_normalized_branches`), while
+ * `_serialize_branches` deliberately "preserves list-vs-mapping semantics"
+ * for a coalesce. So a coalesce reaches this component still holding a list,
+ * and `branchEntries` below applies the rule rather than assuming it away.
+ *
+ * Only row_union was ever read through `branches` at all, so a coalesce fell
+ * through to ordinary `input` inference and rendered a single arm from
+ * whichever producer happened to own the placeholder connection
+ * (elspeth-625e85c59b). `coalesce` is the kind the composer's planner
+ * actually authors — every fan-in node in the saved corpus is one, and no
+ * saved session has ever held a row_union. That is a COVERAGE fact, not a
+ * disuse one: row_union is taught to the planner
+ * (composer/planner_authoring_aids.py ships a fork_row_union exemplar), is
+ * used by examples/row_union_ab_experiment, and reaches this component
+ * directly through Import YAML. Neither arm is dead; only one is exercised.
  *
  * This set governs INBOUND inference only. The outbound-semantics rewrite
  * below stays row_union-scoped on purpose — see the comment there.
@@ -96,6 +109,30 @@ const FAN_IN_NODE_TYPES: ReadonlySet<string> = new Set([
   "row_union",
   "coalesce",
 ]);
+
+/**
+ * A fan-in node's alias -> connection pairs, in declaration order.
+ *
+ * The list form is not a second meaning, it is shorthand for the identity
+ * mapping: `CoalesceSettings.normalize_branches` (core/config.py:991-1005)
+ * returns `{b: b for b in v}`, so `["a","b"]` IS `{a: "a", b: "b"}`. That
+ * rule belongs to the runtime; this reads it rather than restating it, and
+ * rather than declining it — bailing out on a list silently reproduced the
+ * very defect this machinery exists to fix, on a composition that validates
+ * green.
+ *
+ * A duplicate entry is an authoring error the backend rejects
+ * (normalize_branches raises); here the alias-key dedup in phase 1 collapses
+ * it to one arm rather than drawing two identical ones.
+ */
+function branchEntries(
+  branches: string[] | Record<string, string> | null | undefined,
+): [string, string][] {
+  if (branches === null || branches === undefined) return [];
+  return Array.isArray(branches)
+    ? branches.map((name) => [name, name])
+    : Object.entries(branches);
+}
 
 const EDGE_LABEL_MAP: Record<string, string> = {
   on_success: "success",
@@ -1111,6 +1148,12 @@ export function GraphView() {
       explicitEdgeIndexesByConnection.set(connectionKey, indexes);
     }
     const claimedExplicitBranchEdges = new Set<number>();
+    // The same claims keyed by edge ID. Phase 1 claims by INDEX (it rewrites
+    // `rfEdges[i]` in place), but the outbound drop loop below runs after
+    // splices have moved every index, and judges by ID. Without this the two
+    // ledgers disagree: an edge phase 1 claimed as an authoritative inbound
+    // branch arm reads as an unclaimed outbound hint and is deleted.
+    const claimedExplicitBranchEdgeIds = new Set<string>();
     function claimExplicitBranchAlias(
       connectionKey: string,
       alias: string,
@@ -1132,6 +1175,8 @@ export function GraphView() {
       if (claimedIndex === undefined) return false;
 
       claimedExplicitBranchEdges.add(claimedIndex);
+      const claimedId = rfEdges[claimedIndex]?.id;
+      if (claimedId !== undefined) claimedExplicitBranchEdgeIds.add(claimedId);
       const isError = edgeType === "error";
       rfEdges[claimedIndex] = {
         ...rfEdges[claimedIndex],
@@ -1283,12 +1328,7 @@ export function GraphView() {
     for (const fanIn of compositionState.nodes.filter(
       (node) => FAN_IN_NODE_TYPES.has(node.node_type),
     )) {
-      const branches =
-        fanIn.branches !== null
-        && fanIn.branches !== undefined
-        && !Array.isArray(fanIn.branches)
-          ? Object.entries(fanIn.branches)
-          : [];
+      const branches = branchEntries(fanIn.branches);
       if (branches.length === 0) continue;
       aliasMappedFanInIds.add(fanIn.id);
       for (const [alias, connection] of branches) {
@@ -1359,8 +1399,14 @@ export function GraphView() {
     // coalesce prunes nothing that the corpus actually contains.
     //
     // Removal is by descending index so the remaining explicit indexes stay
-    // aligned; `existingConnections` is deliberately left intact, since it
-    // only ever suppresses duplicates and phase 1 does not consult it.
+    // aligned. `existingConnections` is then REBUILT from the surviving
+    // edges rather than left as it was: it is a dedup set, and a pruned
+    // edge's key is no longer a duplicate of anything. Leaving it stale
+    // suppressed a later, legitimate draw — the direct-sink blocks below
+    // push into ANY node id, alias-mapped or not, so a node whose
+    // `on_success` names a fan-in node BY ID had its edge pruned here and
+    // then silently declined there. Deriving the set from the edges that
+    // actually exist cannot drift the way a hand-maintained one did.
     const staleFanInEdgeIndexes: number[] = [];
     for (let index = 0; index < explicitEdges.length; index += 1) {
       if (claimedExplicitBranchEdges.has(index)) continue;
@@ -1370,6 +1416,12 @@ export function GraphView() {
     }
     for (const index of staleFanInEdgeIndexes.reverse()) {
       rfEdges.splice(index, 1);
+    }
+    if (staleFanInEdgeIndexes.length > 0) {
+      existingConnections.clear();
+      for (const edge of rfEdges) {
+        existingConnections.add(`${edge.source}->${edge.target}`);
+      }
     }
 
     // Phase 2: draw every producer → queue edge. Deterministic (sorted by
@@ -1649,6 +1701,13 @@ export function GraphView() {
         continue;
       }
       if (claimedExplicitRowUnionOutboundEdgeIds.has(edge.id)) {
+        continue;
+      }
+      // Already spoken for as a CONSUMER's branch arm. Phase 1 rewrote it
+      // from the consumer's `branches`, which is as authoritative for this
+      // edge as the producer's connection properties would be — so it is not
+      // an unclaimed hint, and dropping it would erase a declared arm.
+      if (claimedExplicitBranchEdgeIds.has(edge.id)) {
         continue;
       }
       rfEdges.splice(index, 1);
