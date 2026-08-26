@@ -1670,3 +1670,123 @@ class TestFieldMapperOverlapNormalization:
         assert result.status == "success"
         assert isinstance(result.row, PipelineRow)
         assert result.row.to_dict() == {"a": "charlie", "z": "delta"}
+
+
+class TestFieldMapperInputGuaranteesUseTheDocumentedPredicate:
+    """The two halves of ONE output config must not contradict each other.
+
+    ``SchemaConfig`` documents the type system as a second, implicit source of
+    guarantees: "A schema with mode=fixed, fields=(id, x) where both are
+    required, but guaranteed_fields=None, still guarantees {id, x}".
+    ``get_effective_guaranteed_fields`` is the predicate that says so.
+
+    field_mapper read the RAW ``guaranteed_fields`` tuple instead, at two sites,
+    collapsing ABSTAIN (``None``) into explicit-zero (``()``). A ``mode: fixed``
+    field_mapper then computed no guaranteed targets and abstained in its own
+    output ``guaranteed_fields``, while ``_project_field_declarations_onto_output``
+    still declared the target REQUIRED — so the effective half of the very same
+    config claimed the target the raw half disowned.
+
+    The composer's Rule C (``transform_declared_output_not_guaranteed``) compares
+    exactly those two halves, so it rejected a pipeline the engine builds and
+    RUNS: composer stricter than engine, a FALSE REJECT on a correct pipeline.
+
+    The pin is the AGREEMENT, not the specific field set — that is the invariant
+    a future edit to either half must not break. Rule C is deliberately left
+    alone: making it abstain on ``None`` would silence the true positives below,
+    so the honest emit prediction has to come from the plugin.
+    """
+
+    @staticmethod
+    def _built(mapping: dict[str, str], fields: list[str], *, select_only: bool = True) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        return FieldMapper(
+            {
+                "select_only": select_only,
+                "mapping": mapping,
+                "schema": {"mode": "fixed", "fields": fields},
+            }
+        )
+
+    @staticmethod
+    def _halves(transform: "object") -> tuple[frozenset[str], frozenset[str]]:
+        config = transform._output_schema_config
+        raw = frozenset(config.guaranteed_fields or ())
+        return raw, frozenset(config.get_effective_guaranteed_fields())
+
+    @pytest.mark.parametrize(
+        ("mapping", "fields"),
+        [
+            ({"a": "z"}, ["a: str"]),
+            ({"a": "a"}, ["a: str"]),
+            ({"a": "z", "b": "y"}, ["a: str", "b: str"]),
+        ],
+    )
+    def test_a_closed_emit_set_does_not_disown_what_the_input_guarantees(
+        self,
+        mapping: dict[str, str],
+        fields: list[str],
+    ) -> None:
+        """Each of these had the raw half abstaining while the effective half claimed."""
+        transform = self._built(mapping, fields)
+
+        raw, effective = self._halves(transform)
+
+        assert raw == effective, f"raw={sorted(raw)} contradicts effective={sorted(effective)}"
+
+    @pytest.mark.parametrize(
+        ("mapping", "fields"),
+        [
+            ({"a": "z"}, ["a: str", "b: str"]),
+            ({}, ["a: str"]),
+        ],
+    )
+    def test_an_open_emit_set_is_a_strict_no_op(
+        self,
+        mapping: dict[str, str],
+        fields: list[str],
+    ) -> None:
+        """``select_only: false`` keeps HEAD's answer, bit for bit.
+
+        The wider predicate is gated on ``_emit_set_is_closed`` because applying
+        it here is a CATEGORY ERROR (elspeth-c84fa33f75): this branch's emitted
+        set is ``(upstream - removed) | targets``, knowable only by the ADR-007
+        walk, and ``process`` resolves removal names at RUNTIME. A review panel
+        reproduced four defects in the ungated form — a FALSE build-time
+        rejection of a working pipeline and a runtime
+        ``DeclaredOutputFieldsViolation`` among them — so this asymmetry is the
+        fix, not an omission from it.
+        """
+        transform = self._built(mapping, fields, select_only=False)
+
+        assert transform._output_schema_config.guaranteed_fields is None
+        assert transform.declared_output_fields == frozenset()
+
+    def test_a_guaranteed_target_is_now_derived_from_a_fixed_input_schema(self) -> None:
+        """The concrete consequence: a declared, required source guarantees its target."""
+        transform = self._built({"a": "z"}, ["a: str"])
+
+        assert transform._output_schema_config.guaranteed_fields == ("z",)
+        assert transform.declared_output_fields == frozenset({"z"})
+
+    def test_an_unresolved_original_source_still_abstains(self) -> None:
+        """TRUE POSITIVE, preserved. 'Name' is not a normalization fixed point.
+
+        Which row key it names is unknowable until a row arrives, so the target
+        is not guaranteed however the INPUT contract is declared. Widening the
+        base guarantee set must not reach this case (elspeth-f262a8c678).
+        """
+        transform = self._built({"Name": "nm"}, ["Name: str"])
+
+        assert transform._output_schema_config.guaranteed_fields is None
+        assert transform.declared_output_fields == frozenset()
+
+    def test_an_observed_input_schema_is_unaffected(self) -> None:
+        """``fields is None`` makes effective == explicit, so observed abstains as before."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"select_only": True, "mapping": {"a": "z"}, "schema": DYNAMIC_SCHEMA})
+
+        raw, effective = self._halves(transform)
+        assert raw == effective == frozenset()

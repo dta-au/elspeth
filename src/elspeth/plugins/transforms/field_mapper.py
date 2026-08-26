@@ -227,7 +227,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:06d6c7747f672853"
+    source_file_hash: str | None = "sha256:ab40c07d20b3f9f8"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -363,9 +363,74 @@ class FieldMapper(BaseTransform):
         return self._self_created_input_fields
 
     @classmethod
+    def _emit_set_is_closed(cls, cfg: FieldMapperConfig) -> bool:
+        """True when this node's emitted field set is fully determined by config.
+
+        Under ``select_only`` the output dict starts EMPTY and is written only by
+        mapping entries: no upstream row to delete from, and no unnameable
+        removal. The emit set is ``mapping.values()``, computable at construction.
+
+        Under ``select_only: false`` the emitted set is
+        ``(upstream - removed) | targets``, computable only by the ADR-007 walk.
+        That branch declares its emit set through a DIFFERENT CHANNEL —
+        ``forwards_input_fields`` / ``removed_input_fields`` — and ``process``
+        resolves removal names at RUNTIME via ``contract.resolve_name``, so no
+        construction-time claim about the emitted set is sound there.
+
+        Named rather than written as a bare ``if cfg.select_only`` on purpose
+        (elspeth-c84fa33f75). The failure mode that naming prevents: a sibling
+        reductive plugin with no ``select_only`` option gets the condition copied
+        as ``if cfg.strict`` — the only half that appears to transfer — which
+        reintroduces the defect somewhere Rule C's gate does not protect it.
+        """
+        return cfg.select_only
+
+    @classmethod
+    def _admitted_input_fields(cls, cfg: FieldMapperConfig) -> set[str]:
+        """Input fields this node may treat as present when computing its emit set.
+
+        Two questions live here, and answering only the first was the defect.
+
+        WHICH PREDICATE. ``guaranteed_fields`` is not the whole answer.
+        ``SchemaConfig`` documents the type system as a second, implicit source
+        of guarantees: a ``mode: fixed`` config with required declared ``fields``
+        guarantees them even when ``guaranteed_fields`` is ``None`` — which is an
+        ABSTAIN, not an explicit zero. ``get_effective_guaranteed_fields`` is the
+        predicate that says so, and the sibling builders that already ask it
+        (``BaseTransform._build_output_schema_config``, ``value_transform``,
+        ``json_explode``, the llm builder) are the reference implementations.
+        Reading ``guaranteed_fields or ()`` collapsed abstain into explicit-zero,
+        so the raw half of this node's output config abstained while
+        ``_project_field_declarations_onto_output`` still declared the target
+        required — and the composer's Rule C compares exactly those two halves,
+        rejecting a pipeline the engine builds and RUNS. Composer stricter than
+        engine: a FALSE REJECT.
+
+        WHEN IT MAY BE ASKED. Only where the emit set is CLOSED. Applying the
+        wider predicate unconditionally is the form a review panel rejected with
+        four reproduced defects (elspeth-c84fa33f75): on the non-``select_only``
+        branch it is a CATEGORY ERROR — an emit-set claim placed in the
+        node-local guarantee channel for the one branch whose emit set is only
+        computable at walk time — and it produces both a false build-time
+        rejection and a runtime ``DeclaredOutputFieldsViolation``. Those are one
+        defect on two axes, and this gate cures both because the gate IS the
+        closure predicate. On the open branch the answer is HEAD's, bit for bit.
+
+        The old name (``base_guaranteed``) is what invited the raw-tuple read:
+        it named a config KEY rather than the question being asked.
+
+        One helper for both callers deliberately. ``_mapping_target_is_guaranteed``
+        is shared, so two call sites computing "what the input admits"
+        differently would feed one predicate two answers about one config.
+        """
+        if cls._emit_set_is_closed(cfg):
+            return set(cfg.schema_config.get_effective_guaranteed_fields())
+        return set(cfg.schema_config.guaranteed_fields or ())
+
+    @classmethod
     def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:
         """Derive targets safe for executor-level declared-output checks."""
-        base_guaranteed = set(cfg.schema_config.guaranteed_fields or ())
+        base_guaranteed = cls._admitted_input_fields(cfg)
         return frozenset(
             target
             for source, target in cfg.mapping.items()
@@ -465,7 +530,7 @@ class FieldMapper(BaseTransform):
         When select_only=False: output guarantees are input fields MINUS removed
             sources PLUS new targets.
         """
-        base_guaranteed = set(cfg.schema_config.guaranteed_fields or ())
+        base_guaranteed = self._admitted_input_fields(cfg)
         guaranteed_targets = {
             target for source, target in cfg.mapping.items() if self._mapping_target_is_guaranteed(cfg, source, base_guaranteed)
         }
