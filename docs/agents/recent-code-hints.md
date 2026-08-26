@@ -41,6 +41,22 @@ is a working document under the normal delivery posture.
   distinguishes provenance churn from a behaviour delta the digests would
   otherwise bank silently.
 
+- **2026-08-26 — `getattr(cls, "input_schema")` on a plugin CLASS measures
+  nothing, and returns a confident wrong answer.** `BaseTransform.__init_subclass__`
+  (base.py ~:589) MOVES a class-body `input_schema = SomeModel` into
+  `cls._declared_input_schema` and `delattr`s the class attribute, so the
+  property always wins the MRO (this is deliberate — it stops an undemoted
+  model reintroducing elspeth-d6eeb3a71d). Consequence for anyone auditing
+  plugins: `getattr(cls, "input_schema", None).model_fields` is None for EVERY
+  plugin, so a census reports zero and looks like a finding rather than a
+  failure to look. `inspect.getattr_static` does not save you either — it
+  returns the property. Read `cls._declared_input_schema`, and ALWAYS run a
+  positive control (e.g. `tests/fixtures/dag_scenario_corpus/plugins.py::
+  CorpusEOFBatchSumTransform`, which declares `input_schema = CorpusInputSchema`)
+  — if the control also comes back empty, the probe is broken, not the corpus.
+  For the record, measured correctly: zero builtin plugins carry a code-declared
+  `input_schema`; every consumer schema comes from the authored `schema:` block.
+
 - **2026-08-26 — two new plugin contract facts, and the rule that a PRESENCE
   flag never implies a VALUE promise.** `preserves_input_values` (TRANSFORM,
   `BaseTransform`/`TransformProtocol`) says forwarded values are never

@@ -56,7 +56,20 @@ from scripts.cicd.runtime_rejection_parity import (
 # falsifier built with the real builder; authorable (fork gates, scopes and
 # collectors are NodeSpec-authorable since C4), Stage 1 still has zero rule-5
 # predicate. Same ticket elspeth-239500195b; ratchet back to 10 when it lands.
-UNMIRRORED_CEILING = 13  # 12->13: rule-5 ROW_UNION closer-kind limb (elspeth-9db785ace7); ratchet back with elspeth-239500195b
+# 14 (2026-08-26, elspeth-e6e552ce34): + schema_validation.py::
+# validate_observed_producer_declared_types (key af293f6130ecdfd3) — a consumer
+# declaring a concrete type for a field that provably arrives typed otherwise
+# across an observed producer chain. The composer DOES cover this family, via
+# the blocking preview proof arm declared_input_type_mismatch_against_source_
+# schema (generation.py, edeb498b3) — but preview IS Stage-2 preflight, the very
+# stage this gate measures, so that is coverage, not a mirror. Labelling the
+# entry `mirrored` on its strength would have held the ratchet at 13 while making
+# it the first of 154 mirrored entries to cite a proof arm instead of a Stage-1
+# code, silently redefining what the gate measures. Stage 1 has no
+# resolve_guaranteed_field_type and no structural source-type channel. Tracked as
+# elspeth-98b238bb3c (Stage-1 mirror; shares the probe-plumbing need with
+# elspeth-239500195b); ratchet back to 13 when it lands.
+UNMIRRORED_CEILING = 14  # 13->14: observed-producer declared types (elspeth-e6e552ce34); ratchet back with elspeth-98b238bb3c
 
 
 # --------------------------------------------------------------------------
