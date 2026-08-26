@@ -6,6 +6,19 @@ All notable changes to ELSPETH are documented here.
 
 ## Unreleased
 
+### Removed
+
+- **Composer pipeline recipes** — the `list_recipes` and
+  `apply_pipeline_recipe` tools, the five bundled recipe templates, and the
+  slot-schema contracts behind them. The server-side prose-to-recipe matcher
+  had already been excised; what remained shipped two tool declarations in
+  every composer request and, across 141 sessions and 707 tool calls,
+  produced no pipeline. The `recipe.index` planner information class is
+  retired with them — it was still advertised to the planner as discoverable
+  while no tool could resolve it. Pipeline structure is authored by the
+  planner through `set_pipeline` and the graph-mutation tools, per the
+  standing composer invariant that the LLM does the job.
+
 ## 0.7.2 - Release candidate (Release hardening and recovery correctness)
 
 0.7.2 separates the production-path hardening completed after 0.7.1. It

@@ -551,7 +551,7 @@ The composer tools are exposed via the `elspeth-composer` MCP server
   ("Node config",
    "patch_source_options, patch_node_options, patch_output_options, set_metadata"),
   ("Catalog / introspection",
-   "list_sources, list_transforms, list_sinks, list_models, list_recipes, get_plugin_schema, get_plugin_assistance, get_expression_grammar"),
+   "list_sources, list_transforms, list_sinks, list_models, get_plugin_schema, get_plugin_assistance, get_expression_grammar"),
   ("Validation / preflight",
    "preview_pipeline, diff_pipeline, generate_yaml, explain_validation_error, get_audit_info"),
 )
