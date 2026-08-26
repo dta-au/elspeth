@@ -78,6 +78,25 @@ const PARALLEL_EDGE_TYPE = "parallel-lane";
 const PARALLEL_EDGE_LANE_GAP = 22;
 const PARALLEL_HANDLE_INSET = 16;
 
+/**
+ * Node kinds whose INBOUND topology is declared by `branches` — an
+ * alias -> connection-name mapping — rather than by the scalar `input`, which
+ * carries only the backend-compatible first-branch placeholder.
+ *
+ * Both kinds have always shared this shape; only row_union was ever read that
+ * way, so a coalesce fell through to ordinary `input` inference and rendered a
+ * single arm from whichever producer happened to own the placeholder
+ * connection (elspeth-625e85c59b). `coalesce` is the kind the composer
+ * actually authors: across the saved corpus it outnumbers row_union 38 to 0.
+ *
+ * This set governs INBOUND inference only. The outbound-semantics rewrite
+ * below stays row_union-scoped on purpose — see the comment there.
+ */
+const FAN_IN_NODE_TYPES: ReadonlySet<string> = new Set([
+  "row_union",
+  "coalesce",
+]);
+
 const EDGE_LABEL_MAP: Record<string, string> = {
   on_success: "success",
   on_error: "error",
@@ -278,7 +297,7 @@ const EDGE_DIRECTION_MARKER_SIZE = 12;
  * (elspeth-ddae27dff1).
  *
  * Applied as ONE pass over the finished edge list rather than at each of the
- * nine construction sites: two later phases (claimExplicitRowUnionAlias and the
+ * nine construction sites: two later phases (claimExplicitBranchAlias and the
  * row_union outbound rewrite) restyle an already-built edge from authority, and
  * a per-site marker would keep the old colour while style.stroke moved. Keying
  * the marker on the same data.flowType that every site uses to pick
@@ -1091,8 +1110,8 @@ export function GraphView() {
       indexes.push(index);
       explicitEdgeIndexesByConnection.set(connectionKey, indexes);
     }
-    const claimedExplicitRowUnionEdges = new Set<number>();
-    function claimExplicitRowUnionAlias(
+    const claimedExplicitBranchEdges = new Set<number>();
+    function claimExplicitBranchAlias(
       connectionKey: string,
       alias: string,
       edgeType: EdgeFlowType,
@@ -1101,18 +1120,18 @@ export function GraphView() {
         explicitEdgeIndexesByConnection.get(connectionKey) ?? [];
       const matchingIndex = candidateIndexes.find(
         (index) =>
-          !claimedExplicitRowUnionEdges.has(index)
+          !claimedExplicitBranchEdges.has(index)
           && explicitEdges[index]?.label === alias,
       );
       const unlabelledIndex = candidateIndexes.find(
         (index) =>
-          !claimedExplicitRowUnionEdges.has(index)
+          !claimedExplicitBranchEdges.has(index)
           && explicitEdges[index]?.label === null,
       );
       const claimedIndex = matchingIndex ?? unlabelledIndex;
       if (claimedIndex === undefined) return false;
 
-      claimedExplicitRowUnionEdges.add(claimedIndex);
+      claimedExplicitBranchEdges.add(claimedIndex);
       const isError = edgeType === "error";
       rfEdges[claimedIndex] = {
         ...rfEdges[claimedIndex],
@@ -1250,26 +1269,28 @@ export function GraphView() {
       }
     }
 
-    // Phase 1: draw every producer → row_union edge from the authoritative
+    // Phase 1: draw every producer → fan-in edge from the authoritative
     // alias→connection mapping. NodeSpec.input is only the backend-compatible
-    // first-branch placeholder for row_union; it is deliberately ignored so
-    // the graph cannot invent a duplicate unlabelled input edge.
-    const inferredRowUnionAliases = new Set<string>();
-    // Row unions whose aliases phase 1 actually enumerated. Recorded here, at
-    // the one place the predicate is evaluated, so the phase-1b guard can
-    // never drift from "phase 1 spoke for this node's inbound wiring".
-    const aliasMappedRowUnionIds = new Set<string>();
-    for (const rowUnion of compositionState.nodes.filter(
-      (node) => node.node_type === "row_union",
+    // first-branch placeholder for a fan-in node; it is deliberately ignored
+    // so the graph cannot invent a duplicate unlabelled input edge.
+    const inferredBranchAliases = new Set<string>();
+    // Fan-in nodes whose aliases phase 1 actually enumerated. Recorded here,
+    // at the one place the predicate is evaluated, so the phase-1b and phase-3
+    // guards can never drift from "phase 1 spoke for this node's inbound
+    // wiring" — a branchless fan-in node is NOT in this set and keeps its
+    // ordinary `input` inference.
+    const aliasMappedFanInIds = new Set<string>();
+    for (const fanIn of compositionState.nodes.filter(
+      (node) => FAN_IN_NODE_TYPES.has(node.node_type),
     )) {
       const branches =
-        rowUnion.branches !== null
-        && rowUnion.branches !== undefined
-        && !Array.isArray(rowUnion.branches)
-          ? Object.entries(rowUnion.branches)
+        fanIn.branches !== null
+        && fanIn.branches !== undefined
+        && !Array.isArray(fanIn.branches)
+          ? Object.entries(fanIn.branches)
           : [];
       if (branches.length === 0) continue;
-      aliasMappedRowUnionIds.add(rowUnion.id);
+      aliasMappedFanInIds.add(fanIn.id);
       for (const [alias, connection] of branches) {
         const producers: ProducerInfo[] = queueIds.has(connection)
           ? [{
@@ -1280,30 +1301,30 @@ export function GraphView() {
           : [...(connectionProducers.get(connection) ?? [])]
               .sort((a, b) => a.nodeId.localeCompare(b.nodeId));
         for (const producer of producers) {
-          if (producer.nodeId === rowUnion.id) continue;
-          const connectionKey = `${producer.nodeId}->${rowUnion.id}`;
+          if (producer.nodeId === fanIn.id) continue;
+          const connectionKey = `${producer.nodeId}->${fanIn.id}`;
           const aliasKey = `${connectionKey}:${alias}`;
-          if (inferredRowUnionAliases.has(aliasKey)) continue;
+          if (inferredBranchAliases.has(aliasKey)) continue;
           if (
-            claimExplicitRowUnionAlias(
+            claimExplicitBranchAlias(
               connectionKey,
               alias,
               producer.edgeType,
             )
           ) {
-            inferredRowUnionAliases.add(aliasKey);
+            inferredBranchAliases.add(aliasKey);
             continue;
           }
           const isError = producer.edgeType === "error";
           rfEdges.push({
             id: inferredEdgeId(
-              "row-union-in",
+              "fan-in",
               producer.nodeId,
-              rowUnion.id,
+              fanIn.id,
               alias,
             ),
             source: producer.nodeId,
-            target: rowUnion.id,
+            target: fanIn.id,
             label: alias,
             data: { flowType: producer.edgeType },
             animated: isError,
@@ -1313,36 +1334,41 @@ export function GraphView() {
             },
             labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
           });
-          inferredRowUnionAliases.add(aliasKey);
+          inferredBranchAliases.add(aliasKey);
           existingConnections.add(connectionKey);
         }
       }
     }
 
     // Phase 1b: once phase 1 has spoken, `branches` is the ONLY route into an
-    // alias-mapped row union — every inbound lane, of every edge_type, comes
+    // alias-mapped fan-in node — every inbound lane, of every edge_type, comes
     // from that mapping (phase 1 carries error styling via producer.edgeType).
-    // An explicit edge into such a union that no alias claimed is stale
+    // An explicit edge into such a node that no alias claimed is stale
     // wiring: `with_node` replaces a node in place and never reconciles
     // `edges` (unlike `without_node`, which prunes edges touching the removed
     // node), and validation only checks that edge endpoints resolve — never
     // that a label names a live alias. So a renamed alias or a repointed
     // branch leaves a validation-VALID composition whose edge list still
     // describes the old wiring. Rendering it would show operators — in the
-    // diagram AND in its accessible text alternative — a route into the union
+    // diagram AND in its accessible text alternative — a route into the node
     // that the authoritative state does not have.
+    //
+    // Every one of the 20 saved states that materialises inbound coalesce
+    // edges writes them with label: null, which claimExplicitBranchAlias
+    // claims through its unlabelled fallback — so extending phase 1 to
+    // coalesce prunes nothing that the corpus actually contains.
     //
     // Removal is by descending index so the remaining explicit indexes stay
     // aligned; `existingConnections` is deliberately left intact, since it
     // only ever suppresses duplicates and phase 1 does not consult it.
-    const staleRowUnionEdgeIndexes: number[] = [];
+    const staleFanInEdgeIndexes: number[] = [];
     for (let index = 0; index < explicitEdges.length; index += 1) {
-      if (claimedExplicitRowUnionEdges.has(index)) continue;
+      if (claimedExplicitBranchEdges.has(index)) continue;
       const target = rfEdges[index]?.target;
-      if (target === undefined || !aliasMappedRowUnionIds.has(target)) continue;
-      staleRowUnionEdgeIndexes.push(index);
+      if (target === undefined || !aliasMappedFanInIds.has(target)) continue;
+      staleFanInEdgeIndexes.push(index);
     }
-    for (const index of staleRowUnionEdgeIndexes.reverse()) {
+    for (const index of staleFanInEdgeIndexes.reverse()) {
       rfEdges.splice(index, 1);
     }
 
@@ -1383,7 +1409,12 @@ export function GraphView() {
     // Phase 3: infer edges by matching node.input to its upstream producer.
     for (const node of compositionState.nodes) {
       if (!node.input) continue;
-      if (rowUnionIds.has(node.id)) continue;
+      // Skip only nodes phase 1 actually spoke for. Keying this on the
+      // alias-mapped set rather than on the node KIND is what keeps a
+      // branchless fan-in node from rendering with no inbound edge at all:
+      // phase 1 skips it (`branches.length === 0`), so `input` is still the
+      // only description of its wiring that exists.
+      if (aliasMappedFanInIds.has(node.id)) continue;
 
       // A queue is the SOLE canonical producer of its own connection: synthesise
       // the queue node as the producer (queue → consumer), never the upstream
@@ -1547,6 +1578,17 @@ export function GraphView() {
       }
     }
 
+    // DELIBERATE EXCLUSION: this outbound rewrite stays row_union-scoped and
+    // is NOT widened to the other FAN_IN_NODE_TYPES. It treats "no
+    // authoritative semantic was registered for this connection" as "the
+    // explicit hint is stale" and drops the edge — sound only for a kind that
+    // always declares its outbound wiring. The saved corpus holds a coalesce
+    // with an explicit `merge_branches -> tidy_columns` edge whose on_success,
+    // on_error and routes are ALL null, so widening this loop would erase a
+    // working connection from the diagram. (The same hole exists for a
+    // row_union declaring no outbound wiring; it has never fired, since the
+    // corpus contains none.) Guarded by a test in GraphView.test.tsx.
+    //
     // A row union's connection properties are authoritative for its outbound
     // semantics just as `branches` is authoritative for its inbound topology.
     // Explicit edges are materialized render hints and can retain a stale
@@ -1717,6 +1759,11 @@ export function GraphView() {
   }
 
   const nodeCount = nodes.length;
+  // Deliberately row_union-only, not FAN_IN_NODE_TYPES. This clause exists to
+  // gloss a kind whose name does not read as English (cf. humanNodeType); the
+  // <ol> text alternative below already names each coalesce by its own
+  // self-describing type, so counting them here would add length without
+  // adding information.
   const rowUnionCount =
     compositionState?.nodes.filter((node) => node.node_type === "row_union")
       .length ?? 0;

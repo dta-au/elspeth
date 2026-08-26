@@ -1045,19 +1045,19 @@ describe("GraphView", () => {
 
       const ids = renderedEdgeIds();
       expect(ids).toContain(
-        "edge-inferred-row-union-in-control_score-variant_union-control",
+        "edge-inferred-fan-in-control_score-variant_union-control",
       );
       expect(ids).toContain(
-        "edge-inferred-row-union-in-treatment_score-variant_union-treatment",
+        "edge-inferred-fan-in-treatment_score-variant_union-treatment",
       );
       expect(
         screen.getByTestId(
-          "edge-inferred-row-union-in-control_score-variant_union-control",
+          "edge-inferred-fan-in-control_score-variant_union-control",
         ),
       ).toHaveTextContent("control");
       expect(
         screen.getByTestId(
-          "edge-inferred-row-union-in-treatment_score-variant_union-treatment",
+          "edge-inferred-fan-in-treatment_score-variant_union-treatment",
         ),
       ).toHaveTextContent("treatment");
       expect(
@@ -1799,7 +1799,7 @@ describe("GraphView", () => {
       expect(
         ids.filter((id) => id.includes("-control_score-variant_union")),
       ).toEqual([
-        "edge-inferred-row-union-in-control_score-variant_union-control",
+        "edge-inferred-fan-in-control_score-variant_union-control",
       ]);
       expect(
         Array.from(document.querySelectorAll('[data-testid^="edge-"]')).some(
@@ -1833,7 +1833,7 @@ describe("GraphView", () => {
         ),
       ).toHaveLength(0);
       expect(renderedEdgeIds()).toContain(
-        "edge-inferred-row-union-in-control_score-variant_union-control",
+        "edge-inferred-fan-in-control_score-variant_union-control",
       );
     });
 
@@ -1870,7 +1870,7 @@ describe("GraphView", () => {
         ids.filter((id) => id.includes("-treatment_score-variant_union")),
       ).toEqual([]);
       expect(ids).toContain(
-        "edge-inferred-row-union-in-control_score-variant_union-control",
+        "edge-inferred-fan-in-control_score-variant_union-control",
       );
     });
 
@@ -1914,12 +1914,12 @@ describe("GraphView", () => {
 
       expect(
         screen.getByTestId(
-          "edge-inferred-row-union-in-control_score-variant_union-control",
+          "edge-inferred-fan-in-control_score-variant_union-control",
         ),
       ).toHaveTextContent("control");
       expect(
         screen.getByTestId(
-          "edge-inferred-row-union-in-control_score-variant_union-treatment",
+          "edge-inferred-fan-in-control_score-variant_union-treatment",
         ),
       ).toHaveTextContent("treatment");
     });
@@ -1970,6 +1970,188 @@ describe("GraphView", () => {
         "data-row-union-color",
         "#aeb8ff",
       );
+    });
+  });
+
+  // Regression: bug elspeth-625e85c59b.
+  //
+  // `coalesce` is the fan-in kind the composer actually authors — across 666
+  // saved composition states the corpus holds 38 coalesces and zero row
+  // unions. Both kinds declare their inbound topology the same way, in
+  // `branches`, with `input` carrying only the backend-compatible first-branch
+  // placeholder. Phase 1 originally enumerated `branches` for row_union alone,
+  // so a coalesce fell through to ordinary `input` inference: exactly ONE
+  // inbound edge appeared — from whichever producer happened to own the
+  // placeholder connection — and every other branch producer was drawn nowhere
+  // at all. The operator saw a merge node with a missing arm and no indication
+  // that the arm existed.
+  //
+  // These fixtures are the two shapes the corpus actually contains, reproduced
+  // verbatim.
+  describe("coalesce correlated branch fan-in (elspeth-625e85c59b)", () => {
+    function coalesceState(): CompositionState {
+      return makeState({
+        sources: {
+          colours: {
+            plugin: "csv",
+            options: {},
+            on_success: "colours_raw",
+          },
+        },
+        nodes: [
+          makeNode({
+            id: "fan_out",
+            node_type: "gate",
+            plugin: null,
+            input: "colours_raw",
+            on_success: null,
+            routes: { true: "fork", false: "fork" },
+            fork_to: ["branch_a", "branch_b"],
+          }),
+          makeNode({
+            id: "recommend_pairing",
+            input: "branch_a",
+            on_success: "pairing_done",
+          }),
+          makeNode({
+            id: "get_hex",
+            input: "branch_b",
+            on_success: "hex_done",
+          }),
+          {
+            id: "merge_branches",
+            node_type: "coalesce",
+            plugin: null,
+            // Backend-compatible first-branch placeholder only. Rendering it
+            // through ordinary input inference is what produced the single
+            // mislabelled arm.
+            input: "pairing_done",
+            on_success: "final_out",
+            on_error: null,
+            options: {},
+            branches: {
+              branch_a: "pairing_done",
+              branch_b: "hex_done",
+            },
+            policy: "require_all",
+            merge: "union",
+          },
+        ],
+        outputs: [{ name: "final_out", plugin: "csv", options: {} }],
+        edges: [],
+      });
+    }
+
+    function edgeIds(): string[] {
+      return Array.from(document.querySelectorAll('[data-testid^="edge-"]'))
+        .map((el) => el.getAttribute("data-testid") ?? "")
+        .sort();
+    }
+
+    /** Rendered edge testids whose TARGET is `target`, sorted. */
+    function inboundEdgeIds(target: string): string[] {
+      return Array.from(
+        document.querySelectorAll(`[data-edge-target="${target}"]`),
+      )
+        .map((el) => el.getAttribute("data-testid") ?? "")
+        .sort();
+    }
+
+    it("draws every branch producer into a coalesce by alias, with no placeholder bypass", () => {
+      useSessionStore.setState({ compositionState: coalesceState() });
+      render(<GraphView />);
+
+      const ids = edgeIds();
+      expect(ids).toContain(
+        "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a",
+      );
+      expect(ids).toContain(
+        "edge-inferred-fan-in-get_hex-merge_branches-branch_b",
+      );
+      expect(
+        screen.getByTestId(
+          "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a",
+        ),
+      ).toHaveTextContent("branch_a");
+      expect(
+        screen.getByTestId(
+          "edge-inferred-fan-in-get_hex-merge_branches-branch_b",
+        ),
+      ).toHaveTextContent("branch_b");
+
+      // The placeholder must not also arrive as a generic connection edge:
+      // that is the duplicate-arm regression, and it is the shape the bug
+      // originally rendered ALONE, labelled "success" rather than "branch_a".
+      expect(ids).not.toContain(
+        "edge-inferred-conn-recommend_pairing-merge_branches",
+      );
+      expect(inboundEdgeIds("merge_branches")).toEqual([
+        "edge-inferred-fan-in-get_hex-merge_branches-branch_b",
+        "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a",
+      ]);
+    });
+
+    it("claims and relabels unlabelled explicit branch edges rather than duplicating or pruning them", () => {
+      // Every one of the 20 corpus states that materialises inbound coalesce
+      // edges writes them with label: null. Phase 1 must claim each as its
+      // alias hint; phase 1b must then find nothing unclaimed to prune.
+      const state = coalesceState();
+      state.edges = [
+        makeEdge({
+          id: "e_a_merge",
+          from_node: "recommend_pairing",
+          to_node: "merge_branches",
+          label: null,
+        }),
+        makeEdge({
+          id: "e_b_merge",
+          from_node: "get_hex",
+          to_node: "merge_branches",
+          label: null,
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+      render(<GraphView />);
+
+      const inbound = inboundEdgeIds("merge_branches");
+      expect(inbound).toHaveLength(2);
+      const labels = inbound
+        .map((id) => screen.getByTestId(id).textContent ?? "")
+        .sort();
+      expect(labels[0]).toContain("branch_a");
+      expect(labels[1]).toContain("branch_b");
+      expect(
+        inbound.some((id) => id.startsWith("edge-inferred-fan-in-")),
+      ).toBe(false);
+    });
+
+    it("keeps a coalesce's explicit outbound edge when the node declares no outbound authority", () => {
+      // The corpus holds `merge_branches -> tidy_columns` on a coalesce whose
+      // on_success, on_error and routes are ALL null. Nothing can register an
+      // authoritative outbound semantic for it, so the row_union outbound
+      // rewrite — which drops every unclaimed hint whose source is a row union
+      // — would erase a working connection. That rewrite is therefore
+      // deliberately NOT extended to coalesce, and this test is the guard on
+      // that exclusion.
+      const state = coalesceState();
+      const coalesce = state.nodes.find((node) => node.id === "merge_branches");
+      expect(coalesce).toBeDefined();
+      coalesce!.on_success = null;
+      state.nodes.push(
+        makeNode({ id: "tidy_columns", input: "nothing", on_success: null }),
+      );
+      state.edges = [
+        makeEdge({
+          id: "e_merge_tidy",
+          from_node: "merge_branches",
+          to_node: "tidy_columns",
+          label: null,
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+      render(<GraphView />);
+
+      expect(edgeIds()).toContain("edge-e-merge_branches-tidy_columns-0");
     });
   });
 
