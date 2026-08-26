@@ -39,6 +39,45 @@ def is_source_producer_id(producer_id: str) -> bool:
     return producer_id == "source" or producer_id.startswith("source:")
 
 
+# Node kinds that publish their success output IMPLICITLY, under their own
+# node id, when they declare no ``on_success``. A downstream node reaches
+# them by naming the node id in its ``input``.
+#
+#   queue    — never declares on_success; its id IS the connection its
+#              predecessors publish to and its consumers read from.
+#   coalesce — on_success is OPTIONAL (CoalesceSettings.on_success: "Sink name
+#              for coalesce output. Required when coalesce is terminal (no
+#              downstream transforms)."). Omitted => non-terminal => publishes
+#              under its own id.
+#
+# row_union and collector are deliberately absent: both REQUIRE on_success
+# (RowUnionSettings.validate_on_success — "Unlike coalesce, on_success is
+# required"; CollectorSettings.on_success is a non-optional field), so they
+# never publish implicitly and adding them here would invent a connection
+# name the DAG builder does not resolve.
+_IMPLICIT_SELF_PUBLISHING_NODE_TYPES = frozenset({"queue", "coalesce"})
+
+
+def published_success_connection(node: NodeSpec) -> str | None:
+    """Return the connection name ``node`` publishes its success output under.
+
+    THE single statement of this rule. Every reader that needs to know "what
+    does this node's output connect to" must call this rather than testing
+    ``node.on_success`` directly: a non-terminal coalesce (and every queue)
+    has ``on_success is None`` yet is fully connected, and a hand-written
+    ``node.on_success is not None`` check reads that as "not connected".
+
+    Returns None only when the node genuinely publishes nothing on its
+    success channel (a fork gate, whose output is described by routes /
+    fork_to instead).
+    """
+    if node.on_success is not None:
+        return node.on_success
+    if node.node_type in _IMPLICIT_SELF_PUBLISHING_NODE_TYPES:
+        return node.id
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class ProducerEntry:
     """A producer registered against one or more connection names.
@@ -178,10 +217,7 @@ class ProducerResolver:
                 plugin_name=node.plugin,
                 options=node.options,
             )
-            if node.node_type == "coalesce" and node.on_success is None:
-                register(node.id, entry)
-            else:
-                register(node.on_success, entry)
+            register(published_success_connection(node), entry)
             if node.on_error not in closer_names:
                 register(node.on_error, entry)
             if node.routes is not None:

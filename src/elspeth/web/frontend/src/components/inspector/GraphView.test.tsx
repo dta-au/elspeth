@@ -2091,6 +2091,66 @@ describe("GraphView", () => {
       ]);
     });
 
+    it("draws the outbound edge of a NON-TERMINAL coalesce, which publishes under its own id", () => {
+      // elspeth session 3f02c8fa. `CoalesceSettings.on_success` is OPTIONAL —
+      // "Required when coalesce is terminal (no downstream transforms)". Omit
+      // it and the coalesce publishes under its own NODE ID, which is exactly
+      // what `_producer_resolver.published_success_connection` returns and
+      // what a downstream node names in its `input`. 32 of the 59 coalesces
+      // in the saved corpus are this shape — the majority, and the one the
+      // fixture above does not cover, because it declares on_success.
+      //
+      // Registering producers from `on_success` ALONE leaves this coalesce
+      // publishing nothing, so `select_fields` finds no upstream and the
+      // diagram splits a working pipeline into two disconnected fragments:
+      // source -> fan_out -> 2 llms -> merge (dead end), and
+      // select_fields -> sink (orphan). The pipeline ran perfectly.
+      const state = coalesceState();
+      const merge = state.nodes.find((node) => node.id === "merge_branches")!;
+      merge.on_success = null;
+      state.nodes.push(
+        makeNode({
+          id: "select_fields",
+          plugin: "field_mapper",
+          input: "merge_branches",
+          on_success: "final_out",
+        }),
+      );
+      useSessionStore.setState({ compositionState: state });
+      render(<GraphView />);
+
+      expect(edgeIds()).toContain(
+        "edge-inferred-conn-merge_branches-select_fields",
+      );
+      // ...and the graph is one connected component: the sink is fed THROUGH
+      // select_fields, not by an orphaned fragment.
+      expect(inboundEdgeIds("select_fields")).toEqual([
+        "edge-inferred-conn-merge_branches-select_fields",
+      ]);
+    });
+
+    it("does not invent an implicit outbound connection for a TERMINAL coalesce", () => {
+      // The mirror of the rule: a declared on_success always wins, so a
+      // terminal coalesce must not ALSO publish under its own id. A node
+      // whose input happens to name it gets no edge, because the runtime
+      // resolves no such connection either.
+      const state = coalesceState();
+      state.nodes.push(
+        makeNode({
+          id: "select_fields",
+          plugin: "field_mapper",
+          input: "merge_branches",
+          on_success: "final_out",
+        }),
+      );
+      useSessionStore.setState({ compositionState: state });
+      render(<GraphView />);
+
+      expect(edgeIds()).not.toContain(
+        "edge-inferred-conn-merge_branches-select_fields",
+      );
+    });
+
     it("claims and relabels unlabelled explicit branch edges rather than duplicating or pruning them", () => {
       // Every one of the 20 corpus states that materialises inbound coalesce
       // edges writes them with label: null. Phase 1 must claim each as its

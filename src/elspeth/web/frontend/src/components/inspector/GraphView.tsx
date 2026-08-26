@@ -28,6 +28,7 @@ import {
   type NodeTypes,
   type NodeMouseHandler,
   type OnInit,
+  type ReactFlowInstance,
   type FitViewOptions,
   Background,
   Controls,
@@ -105,6 +106,42 @@ const PARALLEL_HANDLE_INSET = 16;
  * This set governs INBOUND inference only. The outbound-semantics rewrite
  * below stays row_union-scoped on purpose — see the comment there.
  */
+// Node kinds that publish their success output IMPLICITLY, under their own
+// node id, when they declare no `on_success`. A downstream node reaches them
+// by naming the node id in its `input`.
+//
+// This mirrors `_producer_resolver.published_success_connection`, which is the
+// backend authority and the ONLY place the rule is decided:
+//
+//     if node.on_success is not None: return node.on_success
+//     if node.node_type in {"queue", "coalesce"}: return node.id
+//     return None
+//
+// Do not re-derive it from `on_success` here. `CoalesceSettings.on_success` is
+// OPTIONAL ("Required when coalesce is terminal"), and a queue never declares
+// one at all, so asking `node.on_success` directly reports a correctly-wired
+// node as publishing nothing — which drew a working fork/coalesce pipeline as
+// two disconnected fragments (session 3f02c8fa). row_union and collector both
+// REQUIRE on_success and so are deliberately NOT here: giving them an implicit
+// id would invent a connection the DAG builder does not resolve.
+const IMPLICIT_SELF_PUBLISHING_NODE_TYPES: ReadonlySet<string> = new Set([
+  "queue",
+  "coalesce",
+]);
+
+function publishedSuccessConnection(node: {
+  id: string;
+  node_type: string;
+  on_success: string | null;
+}): string | null {
+  if (node.on_success !== null && node.on_success !== undefined) {
+    return node.on_success;
+  }
+  return IMPLICIT_SELF_PUBLISHING_NODE_TYPES.has(node.node_type)
+    ? node.id
+    : null;
+}
+
 const FAN_IN_NODE_TYPES: ReadonlySet<string> = new Set([
   "row_union",
   "coalesce",
@@ -868,15 +905,64 @@ export function GraphView() {
     selectNode(null);
   }, [selectNode]);
 
-  // Fit-to-view ONCE on first render. Using `fitView` as a static prop
-  // re-triggers viewport reset whenever `nodesInitialized` flips (i.e. every
-  // chat-driven topology change), which destroys the operator's pan/zoom.
-  // The imperative call does not inherit the `fitViewOptions` prop, so pass
-  // the same options explicitly or the initial fit uses the library default
-  // maxZoom of 1 and small pipelines render tiny in a large canvas.
-  const handleInit: OnInit = useCallback((instance) => {
+  // Fit-to-view ONCE, at the first moment the canvas can actually be measured.
+  //
+  // "Once" is deliberate: `fitView` as a static prop re-triggers a viewport
+  // reset whenever `nodesInitialized` flips (i.e. every chat-driven topology
+  // change), which destroys the operator's pan/zoom. The imperative call does
+  // not inherit the `fitViewOptions` prop, so pass the same options
+  // explicitly or the initial fit uses the library default maxZoom of 1 and
+  // small pipelines render tiny in a large canvas.
+  //
+  // "When measurable" is the other half, and it is not optional. Below the
+  // workspace's wide-layout breakpoint the authoring and pipeline panes
+  // become TABS, and the losing tab keeps this component MOUNTED at zero
+  // width. onInit fires there, and fitViewport divides by that zero extent:
+  // the zoom clamps to minZoom and the translate lands at
+  // -(contentCentre x minZoom), i.e. the whole pipeline drawn at 0.3x in the
+  // top-left corner. Fitting once meant that poisoned viewport was also the
+  // FINAL one — switching to the Pipeline tab never repaired it.
+  //
+  // Measuring the diagram element rather than trusting onInit's timing is
+  // what makes this derive from the real precondition (a non-empty canvas)
+  // instead of restating an assumption about when React mounts things.
+  const diagramRef = useRef<HTMLDivElement | null>(null);
+  const flowInstanceRef = useRef<ReactFlowInstance | null>(null);
+  const hasFittedRef = useRef(false);
+
+  const fitOnceWhenMeasurable = useCallback(() => {
+    if (hasFittedRef.current) return false;
+    const instance = flowInstanceRef.current;
+    const element = diagramRef.current;
+    if (!instance || !element) return false;
+    const { width, height } = element.getBoundingClientRect();
+    if (width <= 0 || height <= 0) return false;
+    hasFittedRef.current = true;
     void instance.fitView(GRAPH_FIT_VIEW_OPTIONS);
+    return true;
   }, []);
+
+  const handleInit: OnInit = useCallback(
+    (instance) => {
+      flowInstanceRef.current = instance;
+      fitOnceWhenMeasurable();
+    },
+    [fitOnceWhenMeasurable],
+  );
+
+  // Re-attempt the one fit when the canvas first gains a size — the tab
+  // becoming visible is a resize, and it is the only signal that the
+  // precondition onInit could not satisfy has now been met.
+  useEffect(() => {
+    if (hasFittedRef.current) return;
+    const element = diagramRef.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (fitOnceWhenMeasurable()) observer.disconnect();
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [fitOnceWhenMeasurable]);
 
   // Build a map of component_id → validation severity for border coloring
   const nodeValidationMap = useMemo(() => {
@@ -1275,8 +1361,9 @@ export function GraphView() {
     // none of these (their output is implicit under their own id), so they
     // register nothing here.
     for (const node of compositionState.nodes) {
-      if (node.on_success) {
-        registerProducer(node.on_success, {
+      const published = publishedSuccessConnection(node);
+      if (published) {
+        registerProducer(published, {
           nodeId: node.id,
           edgeType: "success",
           label: "success",
@@ -1899,6 +1986,7 @@ export function GraphView() {
             </div>
           )}
           <div
+            ref={diagramRef}
             className="graph-view-diagram"
             aria-label={ariaLabel}
             aria-roledescription="Pipeline DAG diagram"

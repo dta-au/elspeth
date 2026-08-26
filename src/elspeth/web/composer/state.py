@@ -7613,12 +7613,26 @@ class CompositionState:
                     )
                 )
 
-        # W3: Node has no outgoing edges and no connection-field targets
+        # W3: Node has no outgoing edges and no connection-field targets.
+        #
+        # `on_success is not None` is NOT the question — it is a hand-written
+        # restatement of the producer model that a non-terminal coalesce (and
+        # every queue) falsifies: both publish under their own node id with
+        # on_success omitted, and a downstream node reaches them by naming
+        # that id in its `input`. Asking published_success_connection derives
+        # the answer from the one place that rule is stated, so this warning
+        # cannot drift back into accusing a correctly-wired node of being
+        # unconnected (elspeth session 3f02c8fa: a valid, executed fork ->
+        # 2x llm -> coalesce -> field_mapper pipeline was warned about here).
+        from elspeth.web.composer._producer_resolver import published_success_connection
+
         edge_sources = {e.from_node for e in self.edges}
         for node in self.nodes:
             has_edge_out = node.id in edge_sources
             has_connection_out = (
-                node.on_success is not None or node.on_error is not None or (node.routes is not None and len(node.routes) > 0)
+                published_success_connection(node) is not None
+                or node.on_error is not None
+                or (node.routes is not None and len(node.routes) > 0)
             )
             if not has_edge_out and not has_connection_out:
                 warnings.append(

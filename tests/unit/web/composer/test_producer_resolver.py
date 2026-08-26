@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from elspeth.web.composer._producer_resolver import ProducerResolver
+from elspeth.web.composer._producer_resolver import ProducerResolver, published_success_connection
 from elspeth.web.composer.state import NodeSpec, SourceSpec
 
 
@@ -361,3 +361,64 @@ class TestProducerResolverWalkEntry:
         resolver = ProducerResolver.build(source=None, nodes=nodes, sink_names=frozenset({"out"}))
 
         assert resolver.walk_entry_to_real_producer(resolver.sink_producers("out")[0]) is None
+
+
+class TestPublishedSuccessConnection:
+    """The one place the 'what does this node publish under?' rule is stated.
+
+    Regression cover for the defect these tests exist to prevent: a reader
+    asking ``node.on_success is not None`` instead of asking here reads a
+    correctly-wired non-terminal coalesce (or any queue) as unconnected.
+    That mistake shipped twice — as a false-positive W3 authoring warning,
+    and as a missing outbound edge in the pipeline diagram, which drew a
+    working fork/coalesce pipeline as two disconnected fragments.
+    """
+
+    def test_declared_on_success_is_the_published_connection(self):
+        node = _node("step", plugin="t", input="raw", on_success="next")
+        assert published_success_connection(node) == "next"
+
+    def test_non_terminal_coalesce_publishes_under_its_own_id(self):
+        node = _node("merge", plugin=None, node_type="coalesce", input="a_out")
+        assert node.on_success is None, "the shape under test: on_success omitted"
+        assert published_success_connection(node) == "merge"
+
+    def test_terminal_coalesce_publishes_under_its_declared_sink(self):
+        node = _node("merge", plugin=None, node_type="coalesce", input="a_out", on_success="main")
+        assert published_success_connection(node) == "main", "a declared on_success always wins"
+
+    def test_queue_publishes_under_its_own_id(self):
+        node = _node("inbound", plugin=None, node_type="queue", input="inbound")
+        assert published_success_connection(node) == "inbound"
+
+    def test_a_fork_gate_publishes_nothing_on_its_success_channel(self):
+        node = _node(
+            "fan_out",
+            plugin=None,
+            node_type="gate",
+            input="rows",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=("left", "right"),
+        )
+        assert published_success_connection(node) is None, "routes/fork_to describe a gate's output, not on_success"
+
+    def test_row_union_and_collector_never_publish_implicitly(self):
+        """Both REQUIRE on_success, so neither may be given an implicit id.
+
+        Inventing one would name a connection the DAG builder cannot resolve.
+        """
+        for node_type in ("row_union", "collector"):
+            node = _node("closer", plugin=None, node_type=node_type, input="a_out")
+            assert published_success_connection(node) is None, node_type
+
+    def test_a_downstream_input_naming_a_non_terminal_coalesce_resolves_to_it(self):
+        """The end-to-end rule: `input: "<coalesce id>"` finds the coalesce."""
+        nodes = (
+            _node("merge", plugin=None, node_type="coalesce", input="a_out"),
+            _node("select", plugin="field_mapper", input="merge", on_success="out"),
+        )
+        resolver = ProducerResolver.build(source=None, nodes=nodes, sink_names=frozenset({"out"}))
+
+        producer = resolver.find_producer_for("merge")
+        assert producer is not None, "the coalesce must be findable under its own id"
+        assert producer.producer_id == "merge"

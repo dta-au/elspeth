@@ -1600,13 +1600,13 @@ _EXPECTED_STATE_HASHES = {
 }
 
 _EXPECTED_WARNINGS = {
-    "named_multi_source_queue": (
-        {
-            "component": "node:inbound",
-            "message": "Node 'inbound' has no outgoing edges — its output is not connected to any downstream node or sink.",
-            "severity": "medium",
-        },
-    ),
+    # `named_multi_source_queue` deliberately has NO entry. It used to pin a
+    # W3 "node 'inbound' has no outgoing edges" warning against the queue
+    # node — a false positive this file had locked in as expected. `inbound`
+    # is a queue whose id IS its connection name, and `consume_inbound`
+    # reads it (`input: "inbound"`); the composition was always fully wired.
+    # W3 now derives the answer from published_success_connection rather than
+    # testing `on_success is not None` by hand, so the accusation is gone.
     "structured_llm": (
         {
             "component": "node:classify",
