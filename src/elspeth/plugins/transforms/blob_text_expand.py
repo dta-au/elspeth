@@ -219,7 +219,7 @@ class BlobTextExpand(BaseTransform):
     name = "blob_text_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ddc21af6b54c67eb"
+    source_file_hash: str | None = "sha256:2484746b7530125f"
     config_model = BlobTextExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a plain-text blob and you need "
@@ -521,7 +521,12 @@ class BlobTextExpand(BaseTransform):
                     "reason": "invalid_input",
                     "field": self._blob_ref_field,
                     "blob_ref": blob_ref,
-                    "error_type": "empty_expansion",
+                    # "empty_document" matches blob_json_expand's token for the
+                    # same condition. It must NOT be "empty_expansion": that
+                    # token is GroupSettlementReason.EMPTY_EXPANSION, a closed
+                    # settlement vocabulary this transform-error channel may
+                    # not shadow (ADR-042 D1; the AST canary scans src/ for it).
+                    "error_type": "empty_document",
                     "error": "text blob yielded no rows to expand",
                 },
                 retryable=False,

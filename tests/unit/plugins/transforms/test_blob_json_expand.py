@@ -557,7 +557,7 @@ def test_source_field_parses_json_text_from_a_row_field_with_no_payload_store() 
     assert result.rows is not None
     assert result.rows[0].to_dict()["document_id"] == "d1"
     assert result.rows[0].to_dict()["sections"] == ["a"]
-    assert not hasattr(transform, "_payload_store")
+    assert "_payload_store" not in vars(transform)
 
 
 def test_source_field_starts_without_a_payload_store() -> None:
@@ -577,7 +577,7 @@ def test_source_field_starts_without_a_payload_store() -> None:
 
     transform.on_start(_FakeLifecycleContext(None))
 
-    assert not hasattr(transform, "_payload_store")
+    assert "_payload_store" not in vars(transform)
 
 
 def test_source_blob_refuses_to_start_without_a_payload_store() -> None:

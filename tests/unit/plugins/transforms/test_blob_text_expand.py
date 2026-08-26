@@ -224,13 +224,13 @@ def test_empty_blob_is_a_value_level_error() -> None:
     assert result.row is None
     assert result.reason is not None
     assert result.reason["reason"] == "invalid_input"
-    assert result.reason["error_type"] == "empty_expansion"
+    assert result.reason["error_type"] == "empty_document"
     # The zero-emission success path is NOT available to this transform:
     # success_empty() is reserved for filters declaring can_drop_rows.
     assert transform.can_drop_rows is False
 
 
-def test_blank_lines_are_rows_with_empty_values_not_an_empty_expansion() -> None:
+def test_blank_lines_are_rows_with_empty_values_not_an_empty_document() -> None:
     """PROVES the distinction the fail-state rule turns on.
 
     A blob of nothing but newlines is NOT an empty container: each pair of
@@ -258,7 +258,7 @@ def test_the_same_blank_blob_is_an_error_once_skip_blank_lines_removes_the_rows(
     assert result.status == "error"
     assert result.reason is not None
     assert result.reason["reason"] == "invalid_input"
-    assert result.reason["error_type"] == "empty_expansion"
+    assert result.reason["error_type"] == "empty_document"
 
 
 def test_a_blank_line_among_real_lines_is_kept_as_a_row() -> None:
@@ -573,7 +573,7 @@ def test_index_field_collision_is_reported_alongside_the_output_field() -> None:
     assert result.reason["fields"] == ["line", "line_index"]
 
 
-def test_empty_blob_reports_the_empty_expansion_not_a_phantom_collision() -> None:
+def test_empty_blob_reports_the_empty_document_not_a_phantom_collision() -> None:
     """PROVES the collision guard reports overwrites, not merely matching names.
 
     Nothing was emitted, so nothing was overwritten. The row must quarantine
@@ -585,7 +585,7 @@ def test_empty_blob_reports_the_empty_expansion_not_a_phantom_collision() -> Non
     assert result.status == "error"
     assert result.reason is not None
     assert result.reason["reason"] == "invalid_input"
-    assert result.reason["error_type"] == "empty_expansion"
+    assert result.reason["error_type"] == "empty_document"
 
 
 def test_index_field_collision_is_not_reported_when_the_index_is_off() -> None:

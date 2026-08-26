@@ -635,7 +635,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # surface excludes audit_records, and no snapshot contains either hash — so
 # this is a manifest byte correction, NOT a re-freeze, and needs no ruling of
 # the kind META-39/META-41 required for locked-in-buggy oracle semantics.
-EXPECTED_CASE_REGISTRY_SHA256 = "5b4e422f70887d46d1ca9dcc808eaa83ebb099c8daa787af85d8c4d9eb37a504"
+EXPECTED_CASE_REGISTRY_SHA256 = "c6d94417cd643634253a3eb0c387de94605ce5c7d2230b827352741cee5cfe3a"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
