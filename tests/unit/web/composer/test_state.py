@@ -1458,6 +1458,127 @@ class TestStage1Validation:
         assert "t1" in entry.message and "t2" in entry.message
         assert entry.component in ("node:t1", "node:t2")
 
+    def _implicit_aggregation_cycle_state(self) -> CompositionState:
+        """A clean main path, plus a 2-cycle closed through an implicit self-publisher.
+
+        ``agg`` omits ``on_success``, so it publishes under its own id;
+        ``t2`` consumes ``agg`` and routes back to ``agg``'s own input ``b``.
+        Deliberately free of every other defect — one producer per connection,
+        every input reachable — so the ONLY thing under test is the cycle.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="rows"))
+        state = state.with_node(self._make_transform("t0", "rows", "main", on_error="main"))
+        state = state.with_node(
+            NodeSpec(
+                id="agg",
+                node_type="aggregation",
+                plugin="batch_stats",
+                input="b",
+                on_success=None,
+                on_error="main",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                trigger={"count": 2},
+            )
+        )
+        state = state.with_node(self._make_transform("t2", "agg", "b", on_error="main"))
+        return state.with_output(self._make_output("main"))
+
+    def test_cycle_through_an_implicitly_publishing_aggregation_is_rejected(self) -> None:
+        """The composer used to GREEN this and the engine killed it at build.
+
+        A false accept, the worst polarity. ``_node_published_connections``
+        restated the publishing rule by hand as "a coalesce with no
+        ``on_success``", which omits the other implicit self-publishers. An
+        aggregation that omits ``on_success`` publishes under its own id
+        (``core/dag/builder.py`` registers ``agg_settings.name``), so the
+        cycle detector saw no outbound edge from ``agg`` and found nothing.
+
+        Measured on this exact shape before the fix:
+
+            composer : is_valid=True, errors=[]
+            engine   : GraphValidationError: Pipeline contains a cycle:
+                       transform_t2_... -> aggregation_agg_...
+
+        Deriving the success channel from ``published_success_connection``
+        closes it. Do not restate the rule here again.
+        """
+        result = self._implicit_aggregation_cycle_state().validate()
+
+        assert not result.is_valid
+        cycle_errors = [e for e in result.errors if e.error_code == "pipeline_cycle"]
+        assert cycle_errors, [e.to_dict() for e in result.errors]
+        message = cycle_errors[0].message
+        assert "agg" in message and "t2" in message, message
+
+    def test_the_same_cycle_spelled_explicitly_was_always_rejected(self) -> None:
+        """Isolates the blindness to the IMPLICIT arm, not to aggregations.
+
+        Control contributed by the hunt-strategy lane's independent repro. The
+        identical graph, with the aggregation naming ``on_success: "agg"``
+        instead of omitting it, was rejected before this fix and after — the
+        hand restatement's ``elif node.on_success is not None`` arm caught it.
+
+        Without this control, "an aggregation cycle was missed" could equally
+        mean the detector was blind to aggregations generally. It is not: it
+        was blind to the one arm that had to ask the helper.
+        """
+        state = self._implicit_aggregation_cycle_state()
+        explicit = tuple(replace(node, on_success="agg") if node.id == "agg" else node for node in state.nodes)
+        state = replace(state, nodes=explicit)
+
+        result = state.validate()
+
+        assert not result.is_valid
+        assert [e for e in result.errors if e.error_code == "pipeline_cycle"], [e.to_dict() for e in result.errors]
+
+    def test_a_queue_pipeline_gains_no_spurious_cycle(self) -> None:
+        """The guard the aggregation arm must not dissolve.
+
+        A queue's ``input`` IS its own id, and it publishes under that id, so
+        deriving the success channel makes ``published_success_connection``
+        return a queue's own id here. That would be a self-edge — a cycle on
+        EVERY pipeline containing a queue — were it not for
+        ``_node_topology_cycle`` skipping queues in both its consumer and
+        successor maps, which is why this function needs no carve-out.
+
+        This pins that coupling behaviourally: remove either skip and this
+        goes red rather than shipping a spurious rejection.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="q",
+                node_type="queue",
+                plugin=None,
+                input="q",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(self._make_transform("feed", "rows", "q", on_error="main"))
+        state = state.with_node(self._make_transform("drain", "q", "main", on_error="main"))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert not any(e.error_code == "pipeline_cycle" for e in result.errors), [e.to_dict() for e in result.errors]
+        assert result.is_valid, [e.to_dict() for e in result.errors]
+
     def test_gate_routing_back_upstream_is_rejected_as_a_cycle(self) -> None:
         """A gate whose route re-enters an ancestor's input connection is a cycle through the gate."""
         state = self._empty_state()

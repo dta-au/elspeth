@@ -2196,8 +2196,17 @@ def _fork_branch_reaches_sink_before_closer(
 def _node_published_connections(node: NodeSpec) -> frozenset[str]:
     """Connections a node publishes rows to — the forward edges of the runtime graph walk.
 
-    Mirrors :func:`_runtime_nodes_downstream_of_connection`'s edge model
-    exactly: a coalesce without ``on_success`` publishes under its own id;
+    The success channel is DERIVED from ``published_success_connection``, the
+    one place the publishing rule is stated. Restating it here by hand as
+    "a coalesce with no ``on_success``" silently omitted the other implicit
+    self-publishers, and for the only caller — the cycle detector — that is a
+    FALSE ACCEPT: an aggregation that omits ``on_success`` publishes under
+    its own id (``core/dag/builder.py`` registers ``agg_settings.name``), so
+    ``agg.input="b"`` + ``t2.input="agg"`` + ``t2.on_success="b"`` is a real
+    2-cycle that this function reported no edge for. The composer validated
+    it green, with zero errors, and ``ExecutionGraph.validate()`` then killed
+    it at build with "Pipeline contains a cycle".
+
     ``on_error`` and gate ``routes`` skip the ``discard``/``fork`` keywords;
     ``fork_to`` branch names are connections. Sinks are terminal and never
     consume, so a sink-named target contributes no node edge.
@@ -2210,11 +2219,12 @@ def _node_published_connections(node: NodeSpec) -> frozenset[str]:
     If that skip is ever removed, this function needs the carve-out in the
     same commit.
     """
+    from elspeth.web.composer._producer_resolver import published_success_connection
+
     published: set[str] = set()
-    if node.node_type == "coalesce" and node.on_success is None:
-        published.add(node.id)
-    elif node.on_success is not None:
-        published.add(node.on_success)
+    published_success = published_success_connection(node)
+    if published_success is not None:
+        published.add(published_success)
     if node.on_error is not None and node.on_error != _DISCARD_ROUTE_TARGET:
         published.add(node.on_error)
     if node.routes is not None:
