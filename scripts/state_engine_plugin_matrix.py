@@ -40,8 +40,8 @@ from elspeth.plugins.transforms.rag.config import RAGRetrievalConfig, RetrievalP
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 V3_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
 UNCLASSIFIED = "UNCLASSIFIED"
-EXPECTED_COUNTS = {"source": 9, "transform": 36, "sink": 9}
-EXPECTED_VARIANT_COUNT = 75
+EXPECTED_COUNTS = {"source": 9, "transform": 37, "sink": 9}
+EXPECTED_VARIANT_COUNT = 76
 ALLOWED_PB_BOUNDARIES = frozenset({"PB-01", "PB-02", "PB-04", "PB-06", "PB-07", "PB-09"})
 ALLOWED_LOCAL_FIXTURES = frozenset({"hermetic", "provider-contract-fake", "real-process-http"})
 ALLOWED_RELEASE_LANES = frozenset({"local", "live-aws", "live-azure", "live-chroma", "live-dataverse", "live-provider"})

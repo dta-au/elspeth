@@ -25,7 +25,6 @@ are accepted, but quoted strings are recommended for clarity.
 
 from __future__ import annotations
 
-import keyword
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -34,7 +33,7 @@ from typing import Annotated, Any, Literal, cast
 from pydantic import Field
 
 from elspeth.contracts.enums import NodeType
-from elspeth.contracts.identifiers import validate_field_name, validate_field_names
+from elspeth.contracts.identifiers import is_valid_field_name, validate_field_name, validate_field_names
 
 # Supported field types for schema definitions
 SUPPORTED_TYPES = frozenset({"str", "int", "float", "bool", "any"})
@@ -916,7 +915,13 @@ def get_raw_producer_guaranteed_fields(
     guaranteed = schema_config.get_effective_guaranteed_fields()
     if plugin_name in _TEXT_HEURISTIC_PLUGINS and schema_config.mode == "observed" and not schema_config.declares_guaranteed_fields:
         column = options.get("column")
-        if isinstance(column, str) and column.isidentifier() and not keyword.iskeyword(column):
+        # ``is_valid_field_name`` rather than a local ``isidentifier()`` +
+        # ``iskeyword()`` pair: this gate must accept exactly the names
+        # ``TextSourceConfig._validate_column`` accepts, and it does so by
+        # asking that same policy instead of restating it. A restatement reads
+        # identically until the policy moves, and then the gate silently
+        # abstains where the runtime source participates with ``{column}``.
+        if is_valid_field_name(column):
             return frozenset({column})
     # Single-request llm arm (elspeth-db98d3f660): union — not replace — the
     # trio, matching the runtime augmentation in both the LLM source config
@@ -925,7 +930,11 @@ def get_raw_producer_guaranteed_fields(
     # emitted fields are query-prefixed, so it must not claim the bare trio.
     if plugin_name == _LLM_HEURISTIC_PLUGIN and options.get("queries") is None:
         response_field = options.get("response_field", _LLM_DEFAULT_RESPONSE_FIELD)
-        if isinstance(response_field, str) and response_field.isidentifier() and not keyword.iskeyword(response_field):
+        # Same derivation as the text arm above: the runtime twin
+        # (``build_llm_source_output_schema_config``) gates on
+        # ``validate_field_name(response_field, ...)``, so this gate asks that
+        # policy rather than restating its two clauses.
+        if is_valid_field_name(response_field):
             return guaranteed | frozenset(f"{response_field}{suffix}" for suffix in _LLM_GUARANTEED_SUFFIXES)
     return guaranteed
 

@@ -1013,6 +1013,8 @@ def test_input_validation_precedes_rendering(store: FilesystemPayloadStore) -> N
     assert absent.reason["reason"] == "blob_not_found"
     not_pdf = transform.process(make_pipeline_row({"blob_ref": store.store(PNG)}), make_context())
     assert not_pdf.reason["reason"] == "invalid_input" and not_pdf.reason["error_type"] == "document_signature_mismatch"
+    # SUPERSEDED 2026-08-26 (elspeth-5887fb7928): this now ROUTES, it does not
+    # crash. See the note above and the live test in test_pdf_rasterize.py.
     with pytest.raises(TypeError):
         transform.process(make_pipeline_row({"blob_ref": 12}), make_context())  # Tier-2 type violation: crash (blob_csv_expand precedent)
     assert renderer.calls == []
@@ -1234,6 +1236,15 @@ class PDFRasterize(BaseTransform):
 3. "Keep max_page_bytes at or below the downstream max_document_bytes (5 MiB ceiling); dpi 150 fits Letter/A4, raise dpi only with max_page_pixels headroom."
 4. "on_page_failure: fail_document quarantines the whole PDF row on any refused page; emit_rendered emits the surviving pages and records the refused page numbers in the run audit."
 5. "Every page row carries document_id (the PDF's payload hash) and a 1-based page_number for grouping and ordering downstream."
+
+> **SUPERSEDED 2026-08-26 (elspeth-5887fb7928).** The `raise TypeError(...)`
+> below is no longer correct and was never adjudicated — it copied a
+> `blob_csv_expand` precedent that has since been removed as a defect. A bare
+> `TypeError` matches no clause in `RowProcessor._execute_transform_with_retry`,
+> so it ABORTED the run instead of routing the row: `on_error` never fired and
+> the row was counted as neither succeeded nor failed. Both plugins now RETURN
+> `TransformResult.error({... "error_type": "non_string_ref" ...},
+> retryable=False)`. Do not re-derive the crash from this plan.
 
 `process(row, ctx)` order: field present → `type(value) is not str` → `raise TypeError(...)` (Tier-2 type violation, `blob_csv_expand.py:280-284` precedent) → `_PAYLOAD_REF_PATTERN.fullmatch` else `invalid_input`/`invalid_blob_ref` → `retrieve` (`PayloadNotFoundError` → `blob_not_found`; `IntegrityError` re-raise) → empty → `invalid_input`/`empty_document` → `len > max_input_bytes` → `blob_too_large` → `binary_document_signature_matches("pdf", body)` else `invalid_input`/`document_signature_mismatch` → `result, output_dir = self._renderer.render(body)` inside `try/finally: self._renderer.discard(output_dir)` → `_map_document_result(...)`.
 

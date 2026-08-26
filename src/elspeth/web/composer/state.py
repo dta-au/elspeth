@@ -54,7 +54,7 @@ from elspeth.core.config import (
     _validate_node_name_chars,
     validate_sink_name,
 )
-from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
+from elspeth.core.dag.coalesce_merge import merge_coalesce_schema, merge_guaranteed_fields
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
@@ -87,6 +87,15 @@ _QUEUE_OPTION_KEYS: frozenset[str] = frozenset({"description"})
 # changes its default — the exact drift the normalisation is here to prevent.
 _COALESCE_RUNTIME_POLICY_DEFAULT: Final[str] = CoalesceSettings.model_fields["policy"].default
 _COALESCE_RUNTIME_MERGE_DEFAULT: Final[str] = CoalesceSettings.model_fields["merge"].default
+# Coalesce merge strategies whose guarantee math Composer mirrors from the
+# runtime authority (``core/dag/coalesce_merge.merge_coalesce_schema``). Not a
+# restatement of that authority's vocabulary — it is the subset this surface can
+# ANSWER FOR, and the exclusion is load-bearing: ``select`` forwards ONE branch's
+# raw schema keyed by a ``select_branch`` a composer ``NodeSpec`` cannot carry,
+# so Composer has nothing to mirror and validation rejects the node outright
+# (``coalesce_merge_select_unsupported``). Anything outside this set keeps the
+# honest "not yet checked" abstention rather than a guessed guarantee.
+_MIRRORED_COALESCE_MERGES: Final[frozenset[str]] = frozenset({"union", "nested"})
 # Same one-owner rule for the scope binding: ``ScopeSettings.policy`` is
 # REQUIRED with no default (spec §3), so it deliberately has NO constant here —
 # a Stage-1 default may only RECORD a runtime default, never invent one.
@@ -1888,10 +1897,25 @@ def _runtime_connection_targets(
     for source in sources.values():
         targets.add(source.on_success)
     for node in nodes:
-        if node.node_type == "coalesce" and node.on_success is None:
-            targets.add(node.id)
-        elif node.on_success is not None:
+        # Deliberately NOT ``published_success_connection`` — this is the one
+        # site that must exclude ``queue``. A queue's ``input`` IS its own id
+        # (``queue_node_contract_error`` enforces it), so adding a queue's id
+        # to the reachable TARGET set would let the queue satisfy its own
+        # input and silently delete the orphan-queue ``node_input_not_reachable``
+        # check that this function exists to make possible.
+        #
+        # The implicit-publisher kinds that ARE safe here are the ones whose
+        # ``input`` names a DIFFERENT connection, so reaching them still
+        # requires a real upstream producer: coalesce, and aggregation
+        # (``AggregationSettings.on_success`` is ``str | None = None``, and
+        # ``core/dag/builder.py`` registers ``agg_settings.name`` when it is
+        # omitted). Aggregation was missing here, so a pipeline the runtime
+        # builds and runs was rejected with ``node_input_not_reachable`` on
+        # the aggregation's consumer.
+        if node.on_success is not None:
             targets.add(node.on_success)
+        elif node.node_type in ("coalesce", "aggregation"):
+            targets.add(node.id)
         if node.on_error is not None and node.on_error != "discard":
             targets.add(node.on_error)
         if node.routes is not None:
@@ -2028,6 +2052,8 @@ def _runtime_nodes_downstream_of_connection(
     are traversed, identity and mapped barrier inputs are both topology edges,
     and structural queue placeholders are skipped.
     """
+    from elspeth.web.composer._producer_resolver import published_success_connection
+
     reachable_connections = {connection_name}
     reachable_node_ids: set[str] = set()
     ordered_nodes: list[NodeSpec] = []
@@ -2043,10 +2069,13 @@ def _runtime_nodes_downstream_of_connection(
             reachable_node_ids.add(node.id)
             ordered_nodes.append(node)
             changed = True
-            if node.node_type == "coalesce" and node.on_success is None:
-                reachable_connections.add(node.id)
-            elif node.on_success is not None:
-                reachable_connections.add(node.on_success)
+            # DERIVED, not restated. Queues are skipped above, so this only
+            # ever sees a coalesce or an aggregation publishing under its own
+            # id; both name a connection DIFFERENT from their own input, so
+            # the walk still needs a real upstream producer to reach them.
+            published_success = published_success_connection(node)
+            if published_success is not None:
+                reachable_connections.add(published_success)
             if node.on_error is not None and node.on_error != _DISCARD_ROUTE_TARGET:
                 reachable_connections.add(node.on_error)
             if node.routes is not None:
@@ -2073,6 +2102,8 @@ def _closer_backward_reach_connections(nodes: tuple[NodeSpec, ...], closer_node:
     module's own forward walk — deliberately NOT ``_node_published_connections``,
     which includes ``on_error``).
     """
+    from elspeth.web.composer._producer_resolver import published_success_connection
+
     target_connections = set(_coalesce_branch_connections(closer_node.branches))
     seen_node_ids: set[str] = set()
     changed = True
@@ -2082,10 +2113,13 @@ def _closer_backward_reach_connections(nodes: tuple[NodeSpec, ...], closer_node:
             if node.id in seen_node_ids or node.id == closer_node.id:
                 continue
             published: set[str] = set()
-            if node.node_type == "coalesce" and node.on_success is None:
-                published.add(node.id)
-            elif node.on_success is not None:
-                published.add(node.on_success)
+            # DERIVED, not restated. Queue-inert: this walk only visits a node
+            # whose published set already intersects the target set, and a
+            # queue's sole input IS its own id — so a queue is reached only
+            # when its id is already present, and re-adding it is a no-op.
+            published_success = published_success_connection(node)
+            if published_success is not None:
+                published.add(published_success)
             if node.routes is not None:
                 published.update(target for target in node.routes.values() if target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET))
             if node.fork_to is not None:
@@ -2138,6 +2172,8 @@ def _fork_branch_reaches_sink_before_closer(
     single_observed_code`). Firing here too would silently duplicate that
     single-code guarantee with a less specific message.
     """
+    from elspeth.web.composer._producer_resolver import published_success_connection
+
     reachable_connections = set(fork_branches)
     visited_node_ids: set[str] = set()
     changed = True
@@ -2153,10 +2189,13 @@ def _fork_branch_reaches_sink_before_closer(
             changed = True
             if node.id == closer_id:
                 continue
-            if node.node_type == "coalesce" and node.on_success is None:
-                reachable_connections.add(node.id)
-            elif node.on_success is not None:
-                reachable_connections.add(node.on_success)
+            # DERIVED, not restated. Queue-inert for the same reason as the
+            # backward walk above: entry is gated on the node's inputs already
+            # intersecting the reachable set, and a queue's only input is its
+            # own id.
+            published_success = published_success_connection(node)
+            if published_success is not None:
+                reachable_connections.add(published_success)
             if node.routes is not None:
                 reachable_connections.update(
                     target for target in node.routes.values() if target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET)
@@ -2172,17 +2211,35 @@ def _fork_branch_reaches_sink_before_closer(
 def _node_published_connections(node: NodeSpec) -> frozenset[str]:
     """Connections a node publishes rows to — the forward edges of the runtime graph walk.
 
-    Mirrors :func:`_runtime_nodes_downstream_of_connection`'s edge model
-    exactly: a coalesce without ``on_success`` publishes under its own id;
+    The success channel is DERIVED from ``published_success_connection``, the
+    one place the publishing rule is stated. Restating it here by hand as
+    "a coalesce with no ``on_success``" silently omitted the other implicit
+    self-publishers, and for the only caller — the cycle detector — that is a
+    FALSE ACCEPT: an aggregation that omits ``on_success`` publishes under
+    its own id (``core/dag/builder.py`` registers ``agg_settings.name``), so
+    ``agg.input="b"`` + ``t2.input="agg"`` + ``t2.on_success="b"`` is a real
+    2-cycle that this function reported no edge for. The composer validated
+    it green, with zero errors, and ``ExecutionGraph.validate()`` then killed
+    it at build with "Pipeline contains a cycle".
+
     ``on_error`` and gate ``routes`` skip the ``discard``/``fork`` keywords;
     ``fork_to`` branch names are connections. Sinks are terminal and never
     consume, so a sink-named target contributes no node edge.
+
+    Carries NO queue carve-out, and that is a DEPENDENCY rather than an
+    oversight: a queue publishes under its own id and its ``input`` IS that
+    id, so a queue reaching here would produce a self-edge. It cannot,
+    because ``_node_topology_cycle`` — the only caller — skips queues in both
+    its consumer map and its successor map, so this is never called for one.
+    If that skip is ever removed, this function needs the carve-out in the
+    same commit.
     """
+    from elspeth.web.composer._producer_resolver import published_success_connection
+
     published: set[str] = set()
-    if node.node_type == "coalesce" and node.on_success is None:
-        published.add(node.id)
-    elif node.on_success is not None:
-        published.add(node.on_success)
+    published_success = published_success_connection(node)
+    if published_success is not None:
+        published.add(published_success)
     if node.on_error is not None and node.on_error != _DISCARD_ROUTE_TARGET:
         published.add(node.on_error)
     if node.routes is not None:
@@ -2212,6 +2269,18 @@ def _node_topology_cycle(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...] | None:
     """
     consumers_by_connection: dict[str, list[str]] = {}
     for node in nodes:
+        # LOAD-BEARING, not an optimisation. This skip and its twin in the
+        # successor loop below are what let ``_node_published_connections``
+        # ask ``published_success_connection`` without a queue carve-out.
+        #
+        # A queue's ``input`` IS its own id (``queue_node_contract_error``
+        # enforces it) and a queue publishes under that same id. If a queue
+        # entered EITHER map, the id it publishes would resolve straight back
+        # to itself through ``consumers_by_connection`` — a self-edge, and a
+        # spurious cycle reported on every pipeline containing a queue.
+        #
+        # Remove either skip and you must give ``_node_published_connections``
+        # a queue carve-out in the same commit.
         if node.node_type == "queue":
             continue
         inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
@@ -2220,6 +2289,7 @@ def _node_topology_cycle(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...] | None:
                 consumers_by_connection.setdefault(connection, []).append(node.id)
     successors: dict[str, list[str]] = {}
     for node in nodes:
+        # The twin of the skip above — see it for why both are load-bearing.
         if node.node_type == "queue":
             continue
         targets: list[str] = []
@@ -3505,7 +3575,13 @@ def _check_schema_contracts(
     tuple[EdgeContract, ...],
 ]:
     """Validate producer/consumer schema contracts across declarative routing."""
-    from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id, source_producer_id
+    from elspeth.web.composer._producer_resolver import (
+        ProducerEntry,
+        ProducerResolver,
+        is_source_producer_id,
+        published_success_connection,
+        source_producer_id,
+    )
 
     errors: list[ValidationEntry] = []
     contract_warnings: list[ValidationEntry] = []
@@ -3583,10 +3659,27 @@ def _check_schema_contracts(
             _record_description(source.on_success, source_desc)
 
     for node in nodes:
-        if node.node_type == "coalesce" and node.on_success is None:
-            _record_description(node.id, f"coalesce '{node.id}'")
-        elif node.on_success is not None and node.on_success not in sink_names:
-            _record_description(node.on_success, f"node '{node.id}' on_success")
+        # DERIVED from ``published_success_connection``, not restated: this
+        # bookkeeping must register the same connection the resolver above
+        # registered, because the reporting loop pairs the two by name. A
+        # hand-written "coalesce with no on_success" here listed one of the
+        # three implicit self-publishers, so an aggregation that omits
+        # on_success got a producer entry from the resolver and NO first
+        # description here — and a second producer of that id then indexed
+        # ``duplicate_descs`` for a key nothing had written, raising KeyError
+        # out of ``validate()`` on a planner-authorable shape.
+        published = published_success_connection(node)
+        if published is None:
+            # Publishes nothing on its success channel — a fork gate, whose
+            # output is described by routes / fork_to below instead.
+            pass
+        elif node.on_success is None:
+            # An implicit self-publisher: name the kind, so the duplicate
+            # message says WHICH node the author has to fix rather than
+            # reporting only the node that contended with it.
+            _record_description(published, f"{node.node_type} '{node.id}'")
+        elif published not in sink_names:
+            _record_description(published, f"node '{node.id}' on_success")
         if (
             node.on_error is not None
             and node.on_error != "discard"
@@ -3727,18 +3820,20 @@ def _check_schema_contracts(
                 return None
             if producer_node.node_type == "coalesce":
                 # Engine parity (elspeth-ae83a6b60c), the third sibling of the
-                # queue and row_union rules below: a UNION coalesce's merged
+                # queue and row_union rules below: a coalesce's merged
                 # guarantee is exactly what the DAG builder stamps on it, so
                 # the contract check proceeds against the coalesce as producer
                 # (the guarantee parsers resolve it through
                 # ``_producer_entry_propagation_vote``). Abstaining here
                 # unconditionally is what made every union-coalesce pipeline
                 # validate green while the runtime build rejected it, with no
-                # error for the authoring loop to repair against. Non-union
-                # merges and a non-participating vote keep the honest "not yet
-                # checked" warning — see ``_union_coalesce_merged_guarantees``
-                # for why the union gate is the whole population.
-                if _union_coalesce_merged_guarantees(current_producer) is not None:
+                # error for the authoring loop to repair against; the same
+                # abstention survived for ``merge: nested`` until the vote
+                # learned the runtime's strategy dispatch. A merge Composer
+                # cannot mirror, and a non-participating vote, keep the honest
+                # "not yet checked" warning — see
+                # ``_mirrored_coalesce_merged_guarantees`` for the population.
+                if _mirrored_coalesce_merged_guarantees(current_producer) is not None:
                     return current_producer
                 warnings.append(
                     _warn(
@@ -3769,7 +3864,7 @@ def _check_schema_contracts(
                     # being checked, so this vote can be the first parse of that
                     # arm's ``options["schema"]`` — ordinary recoverable external
                     # input, not a defect in our own code. Abstain exactly as the
-                    # ``_union_coalesce_merged_guarantees`` sibling already does
+                    # ``_mirrored_coalesce_merged_guarantees`` sibling already does
                     # rather than crashing /validate with an unhandled ValueError.
                     queue_participates = False
                 if queue_participates:
@@ -3802,7 +3897,7 @@ def _check_schema_contracts(
                     )
                 except ValueError:
                     # Same reason as the queue branch above and the
-                    # ``_union_coalesce_merged_guarantees`` sibling: a branch may
+                    # ``_mirrored_coalesce_merged_guarantees`` sibling: a branch may
                     # sit later in ``nodes``, so this can be the first parse of
                     # its schema block. Abstain rather than crash /validate.
                     union_participates = False
@@ -4689,9 +4784,71 @@ def _check_schema_contracts(
             if not producer_node.branches or producer_node.id in visited_fan_in_ids:
                 return False, frozenset()
 
+            branch_names = _coalesce_branch_names(producer_node.branches)
+            # ``require_all`` derives from the policy alone, where the runtime
+            # uses ``CoalesceSettings.has_all_branch_semantics`` — ALSO true for
+            # a quorum whose count equals the branch count. The diverging case is
+            # unreachable from this surface for the reason already recorded at
+            # the ``merge_union_field_flags`` call site above: a composer
+            # ``NodeSpec`` carries no ``quorum_count``, and the validation pass
+            # rejects ``policy: quorum`` outright
+            # (``coalesce_policy_quorum_unsupported``).
+            require_all = producer_node.policy == "require_all"
+
+            # Strategy dispatch, mirroring ``merge_coalesce_schema``. A merge
+            # Composer cannot mirror ABSTAINS here rather than falling through
+            # to the union arm below, so this vote and
+            # ``_mirrored_coalesce_merged_guarantees`` read ONE predicate and
+            # cannot give two answers to the same question.
+            #
+            # ``select`` is that population: it forwards ONE branch's raw schema
+            # keyed by a ``select_branch`` a composer ``NodeSpec`` cannot carry
+            # (``select_branch`` is on ``yaml_importer``'s
+            # ``_UNSUPPORTED_COALESCE_FIELDS`` and nothing under
+            # ``web/composer/`` reads it from ``node.options``), so there is
+            # nothing to mirror and no honest answer but abstention.
+            #
+            # Falling through to the union arm was WRONG even though the node is
+            # separately rejected at authoring
+            # (``coalesce_merge_select_unsupported``). A select coalesce is still
+            # REACHED by this walk as a BRANCH of another coalesce, and there it
+            # contributed the union of ALL its branches where the runtime
+            # forwards exactly ONE — an over-claim whenever the branches differ,
+            # the same polarity as the nested defect one layer down. It gates no
+            # acceptance today only because authoring refuses the node; the day
+            # ``select`` is legalised, that fall-through would have been a live
+            # false accept. Abstention is correct by construction instead.
+            if producer_node.merge not in _MIRRORED_COALESCE_MERGES:
+                return False, frozenset()
+
+            if producer_node.merge == "nested":
+                # A nested merge does NOT publish the branches' inner fields:
+                # the runtime's own ``merge_coalesce_schema`` keys the merged
+                # schema BY BRANCH NAME, so the guarantee set is a pure function
+                # of the declared branch names and ``require_all`` and never
+                # reads a branch's guarantees at all. That is why this dispatches
+                # BEFORE the per-branch vote below — the walk is dead work here,
+                # and the vote's participation filter (which drops abstaining
+                # branches) would under-report the branch-name set.
+                #
+                # Running the union arm on a nested merge claimed the branches'
+                # inner fields, so Stage 1 validated GREEN a pipeline the DAG
+                # builder rejects at construction with ``EdgeContractError`` —
+                # a green preview leaves the authoring loop no error to repair
+                # against (sibling of elspeth-ae83a6b60c, opposite polarity:
+                # that one abstained, this one over-claimed).
+                nested_schema = merge_coalesce_schema(
+                    {branch: SchemaConfig(mode="observed", fields=None) for branch in branch_names},
+                    merge_strategy="nested",
+                    require_all=require_all,
+                    branch_order=branch_names,
+                    coalesce_id=producer_node.id,
+                )
+                return True, nested_schema.get_effective_guaranteed_fields()
+
             branch_schemas: dict[str, SchemaConfig] = {}
             for branch_name, branch_connection in zip(
-                _coalesce_branch_names(producer_node.branches),
+                branch_names,
                 _coalesce_branch_connections(producer_node.branches),
                 strict=True,
             ):
@@ -4712,26 +4869,53 @@ def _check_schema_contracts(
 
             merged = merge_guaranteed_fields(
                 branch_schemas,
-                require_all=producer_node.policy == "require_all",
+                require_all=require_all,
             )
+            # ``merge_guaranteed_fields`` documents None and () as SEMANTICALLY
+            # distinct — None is "no branch has effective guarantees, abstain",
+            # () is "branches have guarantees and the merge is empty". The
+            # ``or ()`` therefore looks like it flattens an abstention into an
+            # assertion. It cannot, and the reason is three lines up, not here:
+            #
+            #   * the loop ``continue``s on every non-participating branch, so
+            #     an abstainer never enters ``branch_schemas``;
+            #   * ``if not branch_schemas`` returns participated=False above,
+            #     so the all-abstained case never reaches this call;
+            #   * every surviving entry is built with an explicit
+            #     ``guaranteed_fields=tuple(...)``, never None, so
+            #     ``has_effective_guarantees`` is True for all of them.
+            #
+            # With at least one participating set present, the None limb is
+            # unreachable, and participated=True is the correct answer. The
+            # ``or ()`` stays as a fail-safe rather than an assert: if a future
+            # edit let None through, it would reach
+            # ``_mirrored_coalesce_merged_guarantees``, whose three consumers
+            # all test ``is not None``, and an abstention arriving as
+            # ``frozenset()`` would make them adjudicate the coalesce as a
+            # zero-guarantee producer and false-reject a downstream sink. Any
+            # edit that removes the ``continue`` or the empty-case return owes
+            # this line a real abstention channel.
             return True, frozenset(merged or ())
 
         return _effective_producer_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
 
-    def _union_coalesce_merged_guarantees(producer: ProducerEntry) -> frozenset[str] | None:
-        """Return a union coalesce's merged guarantee set, or None to abstain.
+    def _mirrored_coalesce_merged_guarantees(producer: ProducerEntry) -> frozenset[str] | None:
+        """Return a coalesce's merged guarantee set, or None to abstain.
 
-        The one seam the three coalesce sites below consult, so a union
-        coalesce stops being opaque to Rule A/B (elspeth-ae83a6b60c: Stage 1
-        abstained at every coalesce while the runtime rejected the identical
-        pipeline at build, leaving the authoring loop no error to repair).
+        The one seam the three coalesce sites below consult, so a coalesce
+        whose merge strategy Composer can mirror stops being opaque to Rule
+        A/B (elspeth-ae83a6b60c: Stage 1 abstained at every coalesce while the
+        runtime rejected the identical pipeline at build, leaving the authoring
+        loop no error to repair).
 
         It computes nothing itself. The merge lives in
-        ``_producer_entry_propagation_vote``'s coalesce branch, which calls the
-        runtime's own ``merge_guaranteed_fields`` on propagation-walked branch
-        votes — the same function, on the same shape of branch schemas, that
-        the DAG builder stamps the coalesce's guarantees with
-        (``core/dag/builder.py``, ``guarantee_branch_schemas``) and that
+        ``_producer_entry_propagation_vote``'s coalesce branch, which dispatches
+        on the merge STRATEGY exactly as the runtime's own
+        ``merge_coalesce_schema`` does, and calls that same authority — the
+        runtime's ``merge_guaranteed_fields`` for a union, ``merge_coalesce_schema``
+        itself for a nested merge. That is the same code, on the same shape of
+        branch schemas, that the DAG builder stamps the coalesce's guarantees
+        with (``core/dag/builder.py``, ``guarantee_branch_schemas``) and that
         ``validate_typed_producer_guaranteed_extras``
         (``core/dag/schema_validation.py``) then enforces. The two surfaces
         read ONE implementation instead of two mirrors free to drift.
@@ -4739,12 +4923,10 @@ def _check_schema_contracts(
         None means "Composer knows nothing here", and every caller keeps its
         pre-existing abstention on it. Three causes:
 
-        * Not a union merge. ``select`` forwards one branch's raw schema and
-          ``nested`` keys the merged schema BY BRANCH NAME; the vote mirrors
-          neither, so treating them as union would invent top-level guarantees
-          and red-line pipelines the runtime runs. ``__post_init__`` defaults
-          an unset ``merge`` to "union", so this gate cannot miss a coalesce
-          that merely omitted the field.
+        * A merge strategy Composer cannot mirror — see
+          ``_MIRRORED_COALESCE_MERGES``. ``__post_init__`` defaults an unset
+          ``merge`` to "union", so this gate cannot miss a coalesce that merely
+          omitted the field.
         * The vote abstained — an unresolvable branch, or a routing cycle the
           fan-in guard turned back.
         * A branch node's contract options do not parse. The Rule A/B call
@@ -4757,13 +4939,14 @@ def _check_schema_contracts(
           iteration. So this abstains for the same reason
           ``_arm_emit_profile`` does rather than crashing /validate.
 
-        No extras-firewall mirror is needed for the union population:
+        No extras-firewall mirror is needed for the mirrored population:
         ``merge_union_fields`` returns observed or flexible mode and never
-        fixed, so a union coalesce's merged schema always allows extras and the
+        fixed, and ``merge_coalesce_schema``'s nested arm returns flexible, so
+        a mirrored coalesce's merged schema always allows extras and the
         runtime's firewall skip can never exclude the edge.
         """
         producer_node = resolver.get_node(producer.producer_id)
-        if producer_node is None or producer_node.node_type != "coalesce" or producer_node.merge != "union":
+        if producer_node is None or producer_node.node_type != "coalesce" or producer_node.merge not in _MIRRORED_COALESCE_MERGES:
             return None
         try:
             participates, merged = _producer_entry_propagation_vote(producer, visited_fan_in_ids=frozenset())
@@ -4884,7 +5067,7 @@ def _check_schema_contracts(
             # ``validate_typed_producer_guaranteed_extras``
             # (``core/dag/schema_validation.py``) enforces it against the
             # consumer — the check this profile feeds Rule A/B.
-            merged = _union_coalesce_merged_guarantees(producer)
+            merged = _mirrored_coalesce_merged_guarantees(producer)
             if merged is not None:
                 return _ProducerEmitProfile(merged, False, frozenset())
         if producer_node.plugin is None:
@@ -5007,19 +5190,20 @@ def _check_schema_contracts(
                 visited_connections=visited_connections | {connection_name},
             )
         if producer_node.node_type == "coalesce":
-            # A union coalesce's merged guarantee DOES definitely arrive, so it
-            # must be contributed here — this is the arm that carries it across
+            # A mirrored coalesce's merged guarantee DOES definitely arrive, so
+            # it must be contributed here — this is the arm that carries it across
             # an intervening extras-allowing pass-through, where the walk-back
             # and the emit profile never see the coalesce at all. Ordered before
             # the opaque arm below, which would otherwise swallow it.
-            merged = _union_coalesce_merged_guarantees(producer)
+            merged = _mirrored_coalesce_merged_guarantees(producer)
             if merged is not None:
                 return merged
         if producer_node.node_type in ("queue", "coalesce"):
             # Opaque to Composer preview: a queue publishes an observed schema
-            # and never merges its predecessors' guarantees, and a NON-UNION
-            # coalesce's merged output is strategy-specific (``select`` forwards
-            # one branch's raw schema, ``nested`` keys fields by branch name).
+            # and never merges its predecessors' guarantees, and an UNMIRRORED
+            # coalesce's merged output is one Composer cannot reconstruct
+            # (``select`` forwards one branch's raw schema, keyed by a
+            # ``select_branch`` a ``NodeSpec`` cannot carry).
             # Contributing nothing keeps the lower bound honest. Extending the
             # extras rule to a queue producer is a drop-in branch here, left to
             # the track that owns queue contract semantics.
@@ -5232,6 +5416,32 @@ def _check_schema_contracts(
     def _parse_producer_guarantees(
         producer: ProducerEntry,
     ) -> tuple[frozenset[str] | None, ValidationEntry | None]:
+        """Guarantees for the NODE direction, which does NOT defer on abstention.
+
+        Discarding ``participated`` is deliberate and is NOT drift from
+        ``_parse_producer_vote`` below. The two spell the vote differently
+        because they feed two different ENGINE rules, measured on both
+        surfaces against the SAME abstaining (observed, no guarantees)
+        producer:
+
+        * NODE direction (a transform's explicit ``required_input_fields``) —
+          the engine REJECTS (``EdgeContractError``, "Producer (csv)
+          guarantees: (none - dynamic schema)"), and Composer rejects with the
+          same shape. An abstention IS a missing guarantee here, so folding it
+          to the empty set is the correct encoding.
+        * SINK direction (``required_fields``) — the engine BUILDS, deferring
+          to per-row enforcement, and Composer stays valid. That direction must
+          keep the flag, which is why ``_parse_producer_vote`` exists.
+
+        Engine-side confirmation of the same asymmetry: Phase 1
+        (``core/dag/schema_validation.py``) has no participation check at all,
+        and sinks are excluded from it precisely BECAUSE their own vote walk
+        performs the deferral (elspeth-3283f2eaec).
+
+        Converging the two spellings would therefore either be a no-op or would
+        start honouring the flag in this direction and accept pipelines the
+        engine rejects — a false accept. Do not "tidy" them into one.
+        """
         try:
             _participates, guarantees = _producer_entry_propagation_vote(producer, visited_fan_in_ids=frozenset())
             return guarantees, None
@@ -5253,6 +5463,15 @@ def _check_schema_contracts(
         intersection; for the source/transform entries the walk-back returned
         historically, the structural dispatch falls through to
         ``_effective_producer_vote`` unchanged.
+
+        The two spellings are two ENGINE rules, not one rule spelled twice, and
+        the difference is measured rather than inferred: against the SAME
+        abstaining producer the engine BUILDS a sink declaring
+        ``required_fields`` (deferring to per-row) but REJECTS a transform
+        declaring ``required_input_fields``. Composer mirrors both. See
+        ``_parse_producer_guarantees`` above for the full table and for why
+        collapsing the flag there is correct — merging these two into one
+        helper would reintroduce a false accept on one of the directions.
         """
         try:
             return _producer_entry_propagation_vote(producer, visited_fan_in_ids=frozenset()), None
@@ -5620,7 +5839,27 @@ def _check_schema_contracts(
             # here would be a non-determinism bug in our own code, not a fresh
             # Tier-3 parse fault — same judgment as the Rule A site below.
             producer_participates, _producer_vote_fields = _effective_producer_vote(actual_producer)
-            if producer_participates or producer_guaranteed:
+            # CLOSEDNESS, the runtime's second gate (core/dag/guarantees.py,
+            # ``EffectiveGuaranteeVote.closed``). ``producer_guaranteed`` is a
+            # LOWER bound — fields definitely present — while
+            # ``declared_missing`` below is a set DIFFERENCE, which proves
+            # ABSENCE and therefore needs an UPPER one. Only an
+            # extras-forbidding schema supplies that: a row carrying an
+            # undeclared column dies at that node's ``extra='forbid'`` input
+            # model, so what leaves is exactly the declared set. An ``observed``
+            # producer naming ``guaranteed_fields: [id]`` participates AND
+            # admits any other column, so subtracting its guarantee reported a
+            # miss for the very pass-through columns its rows carry
+            # (elspeth-9c5ff8fa7d).
+            #
+            # Read from the same ``allows_extra_fields`` the runtime walker
+            # reads, via the helper that already resolves a producer's computed
+            # output schema — not restated here. ``None`` (draft config, failed
+            # probe) reads as OPEN and skips: an unknown producer proves no
+            # absence, the same polarity ``parse_failed_producers`` takes.
+            producer_schema = _known_producer_schema_config(actual_producer)
+            producer_closed = producer_schema is not None and not producer_schema.allows_extra_fields
+            if (producer_participates or producer_guaranteed) and producer_closed:
                 declared_missing = declared_input - consumer_required - producer_guaranteed
                 if declared_missing:
                     errors.append(
@@ -7638,9 +7877,55 @@ class CompositionState:
         edge_sources = {e.from_node for e in self.edges}
         for node in self.nodes:
             has_edge_out = node.id in edge_sources
+            published = published_success_connection(node)
+            if published is not None and published == node.id:
+                # An IMPLICIT self-publisher publishes under its own id, so
+                # "publishes something" is vacuously true for it and cannot be
+                # the test — asking only that traded this warning's false
+                # POSITIVE for a false NEGATIVE, and a genuinely dead-ended
+                # coalesce went unreported. The real question is whether
+                # anything CONSUMES that id.
+                #
+                # In practice this arm is load-bearing for COALESCE ALONE, and
+                # saying otherwise was the previous version of this comment.
+                # A queue reaching here is already named by the dedicated
+                # ``queue_no_consumer`` error, and an aggregation cannot reach
+                # it at all: ``on_error`` is REQUIRED for an aggregation
+                # (``aggregation_missing_on_error``), so the ``on_error`` limb
+                # of ``has_connection_out`` below is satisfied first and this
+                # value is discarded. Coalesce is the only implicit publisher
+                # with no required on_error to keep the warning quiet on its
+                # behalf — which is exactly why it was the kind that flipped.
+                #
+                # A dangling AGGREGATION reaches this arm only because the
+                # ``on_error`` limb below no longer counts ``discard`` — see
+                # the note on ``has_connection_out``.
+                published_is_consumed = published in node_inputs or published in output_names
+            else:
+                published_is_consumed = published is not None
+            # ``on_error: "discard"`` is NOT a connection out. It is a hole:
+            # the rows go nowhere, and counting it here made this warning
+            # contradict its own message, which promises the output is "not
+            # connected to any downstream node or sink" — discard is neither.
+            # ``_runtime_connection_targets`` in this same module already
+            # excludes it (``node.on_error is not None and node.on_error !=
+            # "discard"``); W3 was the inconsistent sibling.
+            #
+            # This is what makes a dangling aggregation reportable. ``on_error``
+            # is REQUIRED for an aggregation (``aggregation_missing_on_error``),
+            # so before this, an aggregation could satisfy the limb with
+            # ``discard`` and dead-end in silence.
+            #
+            # Deliberately measured, not assumed: across all 715 saved
+            # composition states this changes nothing (5 warned before, 5
+            # after). That is not evidence of safety — it is evidence the
+            # corpus cannot exercise it. ``on_error`` takes only ``discard``
+            # (830) or None (203) across 1033 saved nodes, and every one of
+            # those 830 already satisfies the ``published_is_consumed`` limb
+            # first. The regression tests are the whole evidence base here.
             has_connection_out = (
-                published_success_connection(node) is not None
-                or node.on_error is not None
+                published_is_consumed
+                or (node.on_error is not None and node.on_error != "discard")
                 or (node.routes is not None and len(node.routes) > 0)
             )
             if not has_edge_out and not has_connection_out:

@@ -485,3 +485,108 @@ def test_s3_source_policy_accepts_profile_lowered_source_evidence() -> None:
     assert isinstance(result, PhaseReport)
     assert [(check.name, check.passed) for check in result.checks] == [("aws_s3_source_policy", True)]
     assert "operator profile" in result.checks[0].detail
+
+
+# ---------------------------------------------------------------------------
+# Node-kind widening of the materialization-phase gates
+# (elspeth-df8082552d, sites a / a2 / a3).
+#
+# All three pre-filtered to ``node_type == "transform"``. Two distinct
+# shapes, and only one of them is latent:
+#
+#   - ``validate_managed_identity_policy`` is OPTION-shaped (it reads
+#     ``options["provider"]`` / ``options["provider_config"]`` and never the
+#     plugin name), so ``node_type`` was its ONLY limiter. Measured before
+#     the fix, with a transform control: transform FIRES, aggregation and
+#     collector SILENT.
+#   - ``_llm_policy_components`` feeds the base-URL and tracing egress gates,
+#     which key on the literal plugin name ``"llm"``. Its collector half is
+#     unreachable (``llm`` is not batch-aware), but its AGGREGATION half is
+#     LIVE: ``llm`` on an aggregation validates with zero composer errors,
+#     because the batch-aware constraint lives in ``_collector_intrinsic_errors``
+#     and the aggregation arm never checks it.
+#
+# The name-scoping hole those LLM gates share — a capability-declaring plugin
+# under any other name escapes them on a plain transform node — is NOT closed
+# here and is tracked as elspeth-c7626ae109.
+# ---------------------------------------------------------------------------
+
+_MANAGED_IDENTITY_OPTIONS: dict[str, object] = {
+    "provider": "azure_search",
+    "provider_config": {"use_managed_identity": True},
+}
+
+
+def _kind_node(node_type: str, *, plugin: str, options: dict[str, object]) -> NodeSpec:
+    return NodeSpec(
+        id="n1",
+        node_type=cast(Any, node_type),
+        plugin=plugin,
+        input="node_in",
+        on_success="primary",
+        on_error="discard",
+        options=options,
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+@pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])
+def test_managed_identity_gate_fires_on_every_plugin_bearing_node_kind(node_type: str) -> None:
+    """Credential-egress gate. ``transform`` is the control."""
+    plugin = "rag_retrieval" if node_type == "transform" else "batch_stats"
+    state = _state(nodes=(_kind_node(node_type, plugin=plugin, options=_MANAGED_IDENTITY_OPTIONS),))
+
+    result = validate_managed_identity_policy(_materialized(state))
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "managed_identity_policy"
+    assert result.errors[0].component_id == "n1"
+    assert node_type in result.failed_check.detail.lower()
+
+
+def test_managed_identity_gate_skips_plugin_less_structural_nodes() -> None:
+    """Subject set is ``node.plugin is not None``. A gate's options are inert
+    — nothing resolves a plugin for it, so nothing can act on the value.
+    """
+    gate_node = _kind_node("gate", plugin=cast(Any, None), options=_MANAGED_IDENTITY_OPTIONS)
+
+    result = validate_managed_identity_policy(_materialized(_state(nodes=(gate_node,))))
+
+    assert isinstance(result, PhaseReport)
+
+
+@pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])
+def test_llm_policy_components_include_every_plugin_bearing_node_kind(node_type: str) -> None:
+    """The helper feeding the base-URL and tracing egress gates must present
+    the node at all; before the widening it silently dropped non-transforms.
+    """
+    from elspeth.web.execution._validation_materialization import _llm_policy_components
+
+    plugin = "llm" if node_type != "collector" else "batch_stats"
+    state = _state(nodes=(_kind_node(node_type, plugin=plugin, options={}),))
+
+    components = _llm_policy_components(state)
+
+    subjects = {component.component_id for component in components}
+    assert "n1" in subjects, f"{node_type} node was dropped from the LLM policy subject set"
+
+
+def test_llm_policy_component_labels_the_node_kind_without_widening_the_wire_type() -> None:
+    """``component_type`` is a closed wire Literal AND a semantic branch — the
+    readers use it to choose "LLM nodes" vs "LLM sources" phrasing — so it
+    stays ``"transform"``. The node kind rides on ``label``, which exists only
+    to be interpolated into the human-readable detail string.
+    """
+    from elspeth.web.execution._validation_materialization import _llm_policy_components
+
+    state = _state(nodes=(_kind_node("aggregation", plugin="llm", options={}),))
+
+    node_component = next(component for component in _llm_policy_components(state) if component.component_id == "n1")
+
+    assert node_component.component_type == "transform"
+    assert node_component.label == "Aggregation"

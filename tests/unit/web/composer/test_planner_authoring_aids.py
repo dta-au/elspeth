@@ -1285,7 +1285,33 @@ class TestDiscoveryDigest:
             discovery_digest(view, summaries=summaries)
 
     def test_three_selected_plugin_contracts_fit_the_canonical_utf8_budget(self) -> None:
+        """The budget is read from the runtime constant, never restated here.
+
+        A hard-coded ``48 * 1024`` has teeth in both directions: raise the
+        constant to unblock the planner and this test still fails, so it reads
+        as a broken fix; lower it and this test passes while the planner
+        refuses real contracts. Importing it means this test tracks whatever
+        the planner actually enforces.
+
+        Was RED for elspeth-623c69c59f: the three contracts aggregated to
+        50,365 bytes against a 49,152-byte budget, so the planner refused the
+        third ``get_plugin_schema`` call with
+        ``schema_contract_budget_exceeded``. No single contract exceeded the
+        budget — ``llm`` alone was 39,093 bytes, 79.5% of it — so it was an
+        aggregate overflow, not one oversized contract.
+
+        Green since ``_collapse_uniform_variant_fields`` stopped the projection
+        re-emitting a discriminated union's shared knobs once per variant. The
+        constant was NOT raised — it is a ratchet, loosening it silently buys
+        room for the next option pair to overflow again, and it is the
+        developer's call, not a lane's. If this goes red again, shrink the
+        contract; do not raise the budget. The post-fix totals are deliberately
+        not restated here: this assertion does not enforce them, and the
+        pre-fix pair above already rotted by two bytes between the ticket's
+        summary and its own measurement table.
+        """
         from elspeth.core.canonical import canonical_json
+        from elspeth.web.composer.pipeline_planner import _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES
 
         view, _snapshot = _trained_view()
         contracts = [
@@ -1293,7 +1319,7 @@ class TestDiscoveryDigest:
             for name in ("web_scrape", "llm", "field_mapper")
         ]
 
-        assert len(canonical_json(contracts).encode("utf-8")) <= 48 * 1024
+        assert len(canonical_json(contracts).encode("utf-8")) <= _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES
 
     def test_text_sink_digest_entry_states_the_multiline_prohibition(self) -> None:
         """The exact g11 regression anchor, held on the stable token only.

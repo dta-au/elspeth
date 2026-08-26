@@ -1,0 +1,25 @@
+[
+  {
+    "sku": "hats",
+    "description": "Wide-brimmed sun hat",
+    "pricing": {"unit_price": 25.00, "currency": "AUD"},
+    "tax": {"code": "STD", "rate": 0.10}
+  },
+  {
+    "sku": "coats",
+    "description": "Waxed canvas field coat",
+    "pricing": {"unit_price": 180.00, "currency": "AUD"},
+    "tax": {"code": "STD", "rate": 0.10}
+  },
+  {
+    "sku": "socks",
+    "description": "Merino wool walking socks",
+    "pricing": {"unit_price": 18.50, "currency": "AUD"}
+  },
+  {
+    "sku": "gloves",
+    "description": "Leather driving gloves",
+    "pricing": {"unit_price": 60.00, "currency": "AUD"},
+    "tax": {"code": "STD", "rate": 0.10}
+  }
+]

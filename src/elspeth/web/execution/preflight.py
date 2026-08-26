@@ -177,16 +177,32 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id:
     # ("persist_directory",), carried only by `rag_retrieval`, which is not
     # batch-aware and therefore illegal as a collector. Swept the live registry
     # at 2026-08-26: none of the 13 batch-aware (collector-legal) transforms
-    # declares `provider_config` at all. This function is also CONSISTENT with
-    # its three siblings in the provider_config family rather than one function
-    # short of a sweep — `composer/tools/_common.py`,
-    # `execution/_validation_authoring.py` and `execution/service.py` all scope
-    # to transforms the same way.
+    # declares `provider_config` at all.
     #
-    # REACTIVATION TRIGGER — incidental containment with an expiry date. Widen
-    # this walk when any batch-aware plugin declares a `provider_config` holding
-    # a local path key, at which point a collector's relative path would reach
-    # the allowlist unrewritten and be refused for the wrong reason.
+    # NOTE — this walk is keyed on the generated YAML's top-level `transforms:`
+    # list, NOT on `node_type`. `yaml_generator` emits `transforms:`,
+    # `aggregations:` and `collectors:` as three SEPARATE lists, so this
+    # exclusion is invisible to a `node_type` sweep of the tree. That is how it
+    # survived elspeth-df8082552d's node-kind sweep, which found and widened the
+    # gates below; grep for the vocabulary a surface actually uses.
+    #
+    # The original rationale also argued consistency with the three siblings in
+    # the provider_config family. That argument is RETIRED, not weakened: two of
+    # those three (`execution/_validation_authoring.py::validate_path_policy`
+    # and `execution/service.py`'s runtime mirror) now enumerate every
+    # plugin-bearing node (elspeth-df8082552d), so this function is no longer
+    # consistent with them. The registry sweep above stands entirely on its own
+    # and is the whole of the reason.
+    #
+    # REACTIVATION TRIGGER — incidental containment, and CLOSER than it was.
+    # Widen this walk when any batch-aware plugin declares a `provider_config`
+    # holding a local path key. Note what changed underneath this trigger: it
+    # was written when the path gates could not see collector or aggregation
+    # nodes at all, so an unrewritten relative path was moot. Those gates now
+    # DO inspect those nodes, which makes this normalization the only remaining
+    # step between a collector's relative `persist_directory` and a refusal for
+    # the wrong reason — an allowlist rejection of a legitimate path, rather
+    # than a clean plugin-contract error. One plugin away, not someday.
     transforms = config.get("transforms")
     if transforms is not None:
         if not isinstance(transforms, list):

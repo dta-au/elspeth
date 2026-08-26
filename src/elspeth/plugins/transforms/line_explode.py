@@ -436,9 +436,23 @@ class LineExplode(BaseTransform):
         """Explode a string field into multiple rows."""
         source_value = row[self._source_field]
         if type(source_value) is not str:
-            raise TypeError(
-                f"Field '{self._source_field}' must be a string, got {type(source_value).__name__}. "
-                "This indicates an upstream validation bug - check source schema or prior transforms."
+            # A ROW-level fact, so it takes the same routable exit as the
+            # empty-string and too-many-lines rejections below rather than
+            # aborting the run. ADR-008 §"TIER_1 registration is load-bearing"
+            # (Correction 2026-08-21, elspeth-181db83da7): only a RETURNED
+            # error reaches the `result.status == "error"` branch that honours
+            # `on_error`; a raised exception escapes every catch site.
+            # Not coerced: `str(value)` would invent a text reading of a
+            # non-text value and then explode it into lines the operator never
+            # supplied. A number has no lines.
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "field": self._source_field,
+                    "error_type": "wrong_type",
+                    "error": f"must be a string, got {type(source_value).__name__}",
+                },
+                retryable=False,
             )
 
         lines, line_count = _splitlines_bounded(source_value, max_lines=self._max_lines)

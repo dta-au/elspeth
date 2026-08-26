@@ -414,6 +414,39 @@ def _fanout_marker_for_node(node: NodeSpec) -> str | None:
     if node.node_type == "aggregation" and node.output_mode == "transform":
         return f"aggregation:{node.id}:output_mode=transform"
 
+    if node.node_type == "collector":
+        # UNCONDITIONAL, and that is the derived answer rather than a lazy one
+        # (elspeth-df8082552d). Every other arm above narrows on a declaration
+        # that bounds output cardinality — ``creates_tokens`` for a transform,
+        # ``output_mode`` for an aggregation, ``fork_to`` for a gate. A
+        # collector has no such declaration and no such bound:
+        # ``CollectorExecutor`` flushes
+        # ``output_rows = (result.row,) if result.row is not None else
+        # tuple(result.rows or ())`` and hands it straight to
+        # ``collect_tokens(output_rows=…)``, which mints a fresh EXPAND group
+        # per output row. Any batch-aware plugin may return ``success_multi``
+        # of arbitrary length, so the multiplier is unbounded — precisely the
+        # case this module's docstring says to treat as unbounded "unless a
+        # later implementation can prove a tighter source-to-output
+        # multiplier". Nothing proves one today.
+        #
+        # TRAP — do NOT "tighten" this arm to ``transform_cls.creates_tokens``
+        # by analogy with the transform arm. That flag is a ROW-STAGE token-
+        # minting switch (base.py ~:409: it governs whether the row processor
+        # mints new token_ids for a ``success_multi`` return, and when False
+        # the processor expects same-count passthrough). The collector release
+        # path never reads it — ``collector.py`` contains zero references to
+        # ``creates_tokens`` — and ``batch_replicate`` is the counter-example
+        # that would break silently: it INHERITS ``creates_tokens=False`` (the
+        # flag appears nowhere in ``batch_replicate.py`` — verify by reading the
+        # attribute off the class, not by grepping the file), is
+        # collector-eligible, and multiplies M = sum(copies). Keying on that
+        # flag returns None for it and reinstates exactly the gap this arm
+        # closes.
+        if node.plugin is None:
+            raise RuntimeError(f"Collector node {node.id!r} has no plugin")
+        return f"collector:{node.id}:{node.plugin}"
+
     if node.node_type == "gate" and node.fork_to is not None and len(node.fork_to) > 1:
         return f"gate:{node.id}:fork_to={len(node.fork_to)}"
 

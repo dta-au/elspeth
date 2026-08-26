@@ -11,6 +11,7 @@ from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.execution import _validation_authoring as authoring
 from elspeth.web.execution import _validation_diagnostics as diagnostics
+from elspeth.web.execution import service as execution_service
 from elspeth.web.execution import validation as validation_facade
 
 
@@ -149,3 +150,79 @@ def test_direct_identity_advisory_handles_empty_state() -> None:
     )
 
     assert diagnostics._find_identity_node_advisories(state) == []
+
+
+def _proof_diagnostic(*, code: str, evidence: dict[str, object]) -> dict[str, object]:
+    return {
+        "code": code,
+        "severity": "blocking",
+        "message": "Observed CSV strings reach a numeric value_field.",
+        "suggested_repair": "Declare the field with a numeric type in the source schema.",
+        "evidence_locator": evidence,
+    }
+
+
+def _valid_result() -> execution_service.ValidationResult:
+    return execution_service.ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=execution_service.ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=True,
+            completion_ready=True,
+            blockers=[],
+        ),
+    )
+
+
+@pytest.mark.parametrize("node_kind", ["collector", "aggregation"])
+def test_proof_blocker_is_labelled_with_the_node_kind_the_detector_recorded(node_kind: str) -> None:
+    """The blocker's component_type comes from evidence, not from the code string.
+
+    The numeric value_field diagnostic fires for a batch plugin hosted as an
+    aggregation OR as a collector, but its code name says "aggregation". Keying
+    the label off the code therefore mislabelled every collector-hosted case on
+    a user-facing blocker. The detector records the real kind in
+    ``evidence_locator["node_type"]`` and this is what reads it
+    (filigree elspeth-1016a47e8f).
+    """
+
+    merged = execution_service._merge_authoritative_proof_diagnostics(
+        _valid_result(),
+        [
+            _proof_diagnostic(
+                code="aggregation_numeric_value_field_type_mismatch_against_source_schema",
+                evidence={"node_id": "summarize", "node_type": node_kind},
+            )
+        ],
+    )
+
+    assert [error.component_type for error in merged.errors] == [node_kind]
+    assert [blocker.component_type for blocker in merged.readiness.blockers] == [node_kind]
+    assert [error.component_id for error in merged.errors] == ["summarize"]
+
+
+def test_proof_blocker_falls_back_to_the_code_when_no_kind_was_recorded() -> None:
+    """Detectors that record no node_type keep their previous labelling.
+
+    Only the numeric value_field detector records the kind today; the fallback
+    is what keeps the other blocking codes (and any source-level diagnostic
+    that names no node at all) labelled exactly as before.
+    """
+
+    merged = execution_service._merge_authoritative_proof_diagnostics(
+        _valid_result(),
+        [
+            _proof_diagnostic(
+                code="gate_expression_type_mismatch_against_source_schema",
+                evidence={"node_id": "amount_gate"},
+            ),
+            _proof_diagnostic(
+                code="csv_duplicate_headers",
+                evidence={"source": "blob"},
+            ),
+        ],
+    )
+
+    assert [error.component_type for error in merged.errors] == ["gate", "source"]

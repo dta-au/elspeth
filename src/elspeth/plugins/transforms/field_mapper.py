@@ -62,6 +62,23 @@ def _names_a_row_key(name: str) -> bool:
         return False
 
 
+def _is_static_normalized_source(source: str) -> bool:
+    """Return True when config-time contract math can use ``source``.
+
+    Only a normalization fixed point names a row key config time can state; see
+    ``_names_a_row_key``. Dotted sources are nested reads, not row keys, so they
+    are excluded here and in every complement of this predicate.
+
+    Module-level because BOTH the config model and the transform ask it —
+    ``FieldMapperConfig.declared_input_fields`` derives the node's input
+    requirement from the mapping, and ``FieldMapper`` does its constructor
+    contract math — and the two must never drift into disagreeing about which
+    sources are nameable. ``FieldMapper._is_static_normalized_source`` delegates
+    here rather than restating the test.
+    """
+    return "." not in source and _names_a_row_key(source)
+
+
 def _canonical_row_key(name: str) -> str:
     """The row key a mapping literal collapses to when ``process`` uses it.
 
@@ -133,6 +150,44 @@ class FieldMapperConfig(TransformDataConfig):
     )
     select_only: bool = Field(default=False, description="When true, emit only fields named in the mapping.")
     strict: bool = Field(default=False, description="When true, fail if any mapped source field is missing from an input row.")
+
+    @property
+    def declared_input_fields(self) -> frozenset[str]:
+        """Mapping SOURCES are input fields this transform requires.
+
+        Configuring ``mapping: {source: target}`` IS the author's assertion that
+        ``source`` arrives on the row — the mapping names the field exactly, so
+        the requirement is DERIVED here rather than restated by hand in
+        ``required_input_fields`` (elspeth-d4ae04b374). Without it a mapping
+        naming a field that never arrives produced no error and no quarantine:
+        ``process`` skips a ``MISSING`` source in non-strict mode, so the column
+        simply vanished from the output.
+
+        Joining ``declared_input_fields`` — rather than the explicit
+        ``required_input_fields`` option — is what makes that enforceable.
+        ``validate_transform_declared_input_fields`` (and the composer's mirror
+        of it) gate on the producer's ``EffectiveGuaranteeVote.participated``,
+        so an OBSERVED or otherwise abstaining upstream, which promises nothing
+        because nothing was declared rather than because the field is absent,
+        stays runnable and enforced per-row by the executor's pre-emission
+        check. The explicit option routes instead through ``validate_edge_schemas``
+        Phase 1, a bare set subtraction that fails closed against exactly those
+        upstreams — right for a promise the author wrote by hand, wrong for one
+        inferred from a rename.
+
+        Sources config time cannot resolve to a row key ABSTAIN, via the same
+        predicate the rest of this plugin's contract math uses: a DOTTED source
+        is a nested read rather than a row key, and a non-fixed-point of
+        ``normalize_field_name`` reaches ``process`` through
+        ``contract.resolve_name``, so which key it names is unknowable until a
+        row arrives (elspeth-f262a8c678).
+
+        Note the DIRECTION. This requires mapping SOURCES only. Requiring rename
+        TARGETS on input is the elspeth-d6eeb3a71d trap — they are fields this
+        node CREATES, which is why ``self_created_input_fields`` demotes every
+        one of them.
+        """
+        return super().declared_input_fields | frozenset(source for source in self.mapping if _is_static_normalized_source(source))
 
     @model_validator(mode="after")
     def _reject_duplicate_targets(self) -> FieldMapperConfig:
@@ -227,7 +282,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:06d6c7747f672853"
+    source_file_hash: str | None = "sha256:e44845bae4843de6"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -301,7 +356,7 @@ class FieldMapper(BaseTransform):
         # so the removal is equally unnameable here.
         #
         # Deliberately WITHOUT `_build_field_mapper_output_schema_config`'s
-        # `source in base_guaranteed` filter: that set is the node's own
+        # `source in admitted_on_input` filter: that set is the node's own
         # AUTHORED guarantees, whereas this rule is applied to fields proven
         # present by the upstream walk, which the authored config never names.
         self.forwards_input_fields = not cfg.select_only and not any(self._is_unresolved_original_source(source) for source in cfg.mapping)
@@ -330,7 +385,7 @@ class FieldMapper(BaseTransform):
         state; see ``_names_a_row_key``. Dotted sources are nested reads, not
         row keys, so they are excluded here and in the complement below.
         """
-        return "." not in source and _names_a_row_key(source)
+        return _is_static_normalized_source(source)
 
     @staticmethod
     def _is_unresolved_original_source(source: str) -> bool:
@@ -348,14 +403,14 @@ class FieldMapper(BaseTransform):
         cls,
         cfg: FieldMapperConfig,
         source: str,
-        base_guaranteed: set[str],
+        input_fields_present: set[str],
     ) -> bool:
         """Whether target exists on every successful row for this mapping."""
         if cls._is_unresolved_original_source(source):
             return False
         if cfg.strict:
             return True
-        return cls._is_static_normalized_source(source) and source in base_guaranteed
+        return cls._is_static_normalized_source(source) and source in input_fields_present
 
     @property
     def self_created_input_fields(self) -> frozenset[str]:
@@ -363,13 +418,112 @@ class FieldMapper(BaseTransform):
         return self._self_created_input_fields
 
     @classmethod
+    def _emit_set_is_closed(cls, cfg: FieldMapperConfig) -> bool:
+        """True when this node's emitted field set is fully determined by config.
+
+        Under ``select_only`` the output dict starts EMPTY and is written only by
+        mapping entries: no upstream row to delete from, and no unnameable
+        removal. The emit set is ``mapping.values()``, computable at construction.
+
+        Under ``select_only: false`` the emitted set is
+        ``(upstream - removed) | targets``, computable only by the ADR-007 walk.
+        That branch declares its emit set through a DIFFERENT CHANNEL —
+        ``forwards_input_fields`` / ``removed_input_fields`` — and ``process``
+        resolves removal names at RUNTIME via ``contract.resolve_name``, so no
+        construction-time claim about the emitted set is sound there.
+
+        Named rather than written as a bare ``if cfg.select_only`` on purpose
+        (elspeth-c84fa33f75). The failure mode that naming prevents: a sibling
+        reductive plugin with no ``select_only`` option gets the condition copied
+        as ``if cfg.strict`` — the only half that appears to transfer — which
+        reintroduces the defect somewhere Rule C's gate does not protect it.
+        """
+        return cfg.select_only
+
+    @classmethod
+    def _admitted_input_fields(cls, cfg: FieldMapperConfig) -> set[str]:
+        """Input fields this node may treat as present when computing its emit set.
+
+        Two questions live here, and answering only the first was the defect.
+
+        WHICH PREDICATE. ``guaranteed_fields`` is not the whole answer.
+        ``SchemaConfig`` documents the type system as a second, implicit source
+        of guarantees: a ``mode: fixed`` config with required declared ``fields``
+        guarantees them even when ``guaranteed_fields`` is ``None`` — which is an
+        ABSTAIN, not an explicit zero. ``get_effective_guaranteed_fields`` is the
+        predicate that says so, and the sibling builders that already ask it
+        (``BaseTransform._build_output_schema_config``, ``value_transform``,
+        ``json_explode``, the llm builder) are the reference implementations.
+        Reading ``guaranteed_fields or ()`` collapsed abstain into explicit-zero,
+        so the raw half of this node's output config abstained while
+        ``_project_field_declarations_onto_output`` still declared the target
+        required — and the composer's Rule C compares exactly those two halves,
+        rejecting a pipeline the engine builds and RUNS. Composer stricter than
+        engine: a FALSE REJECT.
+
+        WHEN IT MAY BE ASKED. Only where the emit set is CLOSED. Applying the
+        wider predicate unconditionally is the form a review panel rejected with
+        four reproduced defects (elspeth-c84fa33f75): on the non-``select_only``
+        branch it is a CATEGORY ERROR — an emit-set claim placed in the
+        node-local guarantee channel for the one branch whose emit set is only
+        computable at walk time — and it produces both a false build-time
+        rejection and a runtime ``DeclaredOutputFieldsViolation``. Those are one
+        defect on two axes, and this gate cures both because the gate IS the
+        closure predicate. On the open branch the answer is HEAD's, bit for bit.
+
+        The old name (``base_guaranteed``) is what invited the raw-tuple read:
+        it named a config KEY rather than the question being asked.
+
+        One helper for both callers deliberately. ``_mapping_target_is_guaranteed``
+        is shared, so two call sites computing "what the input admits"
+        differently would feed one predicate two answers about one config.
+        """
+        if cls._emit_set_is_closed(cfg):
+            return set(cfg.schema_config.get_effective_guaranteed_fields())
+        return set(cfg.schema_config.guaranteed_fields or ())
+
+    @classmethod
     def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:
-        """Derive targets safe for executor-level declared-output checks."""
-        base_guaranteed = set(cfg.schema_config.guaranteed_fields or ())
+        """Derive targets safe for executor-level declared-output checks.
+
+        Deliberately reads the RAW ``guaranteed_fields``, not
+        ``_admitted_input_fields``. The two call sites ask different questions
+        and one widened answer is wrong for this one (elspeth-892161b2d5).
+
+        ``_build_field_mapper_output_schema_config`` describes what this node
+        EMITS, and widening it there is the fix for the composer's Rule C false
+        reject. ``declared_output_fields`` is different: it is the trigger for
+        ``TransformExecutor._run_preflight``'s field-collision check, which
+        raises a per-row ``PluginContractViolation`` when a declared output
+        name is already present on the INPUT row.
+
+        Under ``select_only`` that check is a false positive by its own premise.
+        ``process`` starts from ``output: dict[str, Any] = {}`` — a fresh dict —
+        so it cannot overwrite an input field; a mapping that renames onto a
+        name the input also carries DROPS that input, which is precisely what
+        ``select_only`` means. ``field_collision`` scopes itself to transforms
+        that "enrich rows with new fields" and its message says "would overwrite
+        existing input fields"; neither is true here. Widening this set armed
+        that sleeping check on configs whose every valid row then failed —
+        100% row loss at RUNTIME on pipelines that ran fine before.
+
+        The raw read is not a workaround: ``guaranteed_fields`` is the author's
+        EXPLICIT promise, and a name promised on input while also being written
+        on output is the only shape where a collision claim is defensible. The
+        implicit type-system guarantees the wider predicate adds are exactly the
+        ones ``select_only`` consumes rather than collides with.
+        """
+        # NOT ``_admitted_input_fields`` — see this method's docstring. The two
+        # sites deliberately hold DIFFERENT sets, so they carry different names
+        # (elspeth-c84fa33f75's naming finding: one local name over two
+        # semantics is what invited the raw-tuple read in the first place).
+        # This one is the AUTHOR'S EXPLICIT promise; the emit-description site
+        # binds ``admitted_on_input``, which is wider.
+        explicitly_promised_on_input = set(cfg.schema_config.guaranteed_fields or ())
         return frozenset(
             target
             for source, target in cfg.mapping.items()
-            if source != target and cls._mapping_target_is_guaranteed(cfg, source, base_guaranteed)
+            if source != target and cls._mapping_target_is_guaranteed(cfg, source, explicitly_promised_on_input)
         )
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
@@ -465,9 +619,13 @@ class FieldMapper(BaseTransform):
         When select_only=False: output guarantees are input fields MINUS removed
             sources PLUS new targets.
         """
-        base_guaranteed = set(cfg.schema_config.guaranteed_fields or ())
+        # Wider than ``_derive_declared_output_fields``'s
+        # ``explicitly_promised_on_input``, and deliberately so: this describes
+        # what the node EMITS, where the type system's implicit guarantees
+        # count. That site feeds the collision TRIGGER, where they must not.
+        admitted_on_input = self._admitted_input_fields(cfg)
         guaranteed_targets = {
-            target for source, target in cfg.mapping.items() if self._mapping_target_is_guaranteed(cfg, source, base_guaranteed)
+            target for source, target in cfg.mapping.items() if self._mapping_target_is_guaranteed(cfg, source, admitted_on_input)
         }
 
         if cfg.select_only:
@@ -486,9 +644,9 @@ class FieldMapper(BaseTransform):
                 removed_sources = {
                     source
                     for source, target in cfg.mapping.items()
-                    if source != target and self._is_static_normalized_source(source) and source in base_guaranteed
+                    if source != target and self._is_static_normalized_source(source) and source in admitted_on_input
                 }
-                passthrough_fields = base_guaranteed - removed_sources
+                passthrough_fields = admitted_on_input - removed_sources
             output_fields = passthrough_fields | guaranteed_targets
 
         # Always include declared_output_fields (targets that aren't also sources)

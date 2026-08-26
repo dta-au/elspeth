@@ -119,6 +119,15 @@ def test_guided_chat_prompts_name_only_tools_in_their_actual_palette() -> None:
         # The capability core keeps the name for the freeform compose loop,
         # which does carry it — and the core is never part of a chat prompt.
         assert "request_interpretation_review" not in prompt
+        # retain_deferred_intent attaches only at steps 1 and 2, but these
+        # static files render into ALL FOUR steps, so naming it here would
+        # name an unattached tool at steps 3 and 4 — exactly what base.md's
+        # own "use only the tools attached to the current request" rule
+        # forbids. Its teaching therefore lives in the per-step DYNAMIC
+        # blocks (_deferred_intent_teaching_block, chat_solver.py), which
+        # this loop does not load. elspeth-1ebf08f8ec originally proposed
+        # putting it in base.md; this is the pin that refuses that.
+        assert "retain_deferred_intent" not in prompt
 
     assert "list_sinks" not in prompts[GuidedStep.STEP_1_SOURCE]
     assert "get_plugin_schema" not in prompts[GuidedStep.STEP_1_SOURCE]

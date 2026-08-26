@@ -968,6 +968,34 @@ def test_malformed_blob_ref_is_a_value_level_error(tmp_path: Path) -> None:
     assert result.reason["blob_ref"] == "not-a-sha256"
 
 
+def test_non_string_blob_ref_routes_as_a_row_error(tmp_path: Path) -> None:
+    """A wrong-TYPED blob_ref routes, exactly as the malformed one above does.
+
+    A bare `TypeError` matches no clause in
+    `RowProcessor._execute_transform_with_retry`, so it aborted the whole run:
+    `on_error` never fired, the row was counted as neither succeeded nor
+    failed, and the operator got a traceback at exit 4 (elspeth-5887fb7928).
+    Right-type/bad-format and wrong-type are both facts about ONE row and must
+    share a disposition. The reason payload carries the TYPE, never the value —
+    a wrong-typed ref is arbitrary row content and must not reach the audit
+    trail.
+    """
+    transform = _build_transform()
+    transform._payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+
+    result = transform.process(_blob_row(12), make_context())
+
+    assert result.status == "error"
+    assert result.retryable is False
+    assert result.reason is not None
+    assert result.reason["reason"] == "invalid_input"
+    assert result.reason["error_type"] == "non_string_ref"
+    assert result.reason["field"] == "blob_ref"
+    assert "got int" in result.reason["error"]
+    assert result.reason.get("blob_ref") != 12
+    assert result.rows is None
+
+
 def test_payload_store_integrity_failure_crashes_rather_than_quarantines() -> None:
     """Tier 1: ELSPETH's own store returning corrupt bytes is not bad external data.
 

@@ -34,6 +34,7 @@ These run immediately with no setup:
 | `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group; run one `settings*.yaml` at a time. `settings_screened.yaml` screens ahead of the fork and ends SUCCESS (3 tickets screened out before forking); `settings_screened_at_settlement.yaml` screens mid-branch on a post-fork field and ends PARTIAL **by design** (3 tickets discarded inside the control branch, their orphaned treatment siblings fail closed) |
 | `json_explode` | 3 | JSON source with array expansion (3→6 output) |
 | `transform_pipeline` | 5 | Type coercion followed by dependent derived-field calculations |
+| `reference_join` | 5 / 5 / 3 | Keyed enrichment from a config-bound reference table; ships three `settings*.yaml` files, run one at a time. `settings.yaml` joins a flat CSV table, `settings_nested.yaml` a nested JSON table with one deliberately sparse entry (`on_miss: default` fills the one missing value per field), and `settings_missing_product.yaml` ends PARTIAL/exit 1 **by design** — one order names a product the table does not list and the default `on_miss: fail` quarantines it. `reference_file` resolves relative to the SETTINGS directory, not the repo root, which is why `products.csv` sits beside `settings.yaml` |
 | `landscape_journal` | 2 | JSON source, audit journal |
 | `multi_flow` | 4 | Two independent named source flows in one run |
 | `multi_source_queue` | 3 | Multiple named sources fan into a queue |
@@ -52,7 +53,7 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 
 ### Exit 0 is not the corpus gate
 
-Twelve shipped configs end non-zero **by design**. A runner that treats any
+Thirteen shipped configs end non-zero **by design**. A runner that treats any
 non-zero exit as failure will report phantom defects; encode the expected exit
 per config, not a blanket `-eq 0`:
 
@@ -68,10 +69,11 @@ per config, not a blanket `-eq 0`:
 | `ab_llm_experiment/settings_arm_loss.yaml` | 1 | 3 of 24 cases lose an arm; each surviving sibling is invalidated with it |
 | `document_review_panel/settings_incomplete.yaml` | 1 | one page loses a reviewer; the page, then the document verdict, fail closed |
 | `document_review_panel/settings_run_as_row.yaml` | 1 | same loss, run encapsulated as one row — the corpus verdict is refused entirely |
+| `reference_join/settings_missing_product.yaml` | 1 | 1 order names a product absent from the reference table; `on_miss: fail` quarantines it |
 | `chaosweb/settings.yaml` | 1, stochastic | injected fetch faults route to `scrape_failures.csv` |
 | `chaosllm_endurance/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
 
-The first ten are deterministic fixtures with fixed counts. The last two
+The first eleven are deterministic fixtures with fixed counts. The last two
 depend on randomly injected faults, so they may also exit 0 — for those the
 acceptance criterion is **conservation**, not the exit code: every source row
 reaches either the result sink or the error sink, with the failure reason
@@ -137,6 +139,7 @@ category.
 | `chaosllm_sentiment` | 10 | Basic sentiment with fault injection |
 | `rate_limited_llm` | 8 | Rate limiter with ChaosLLM |
 | `chaosllm_endurance` | 10,000 | Long-running endurance test; may end PARTIAL/exit 1 with rows in `quarantined.json` — see "Exit 0 is not the corpus gate" |
+| `reference_join_fork_llm` | 5 | ONE lookup, TWO consumers: `reference_join` enriches each ticket BEFORE a fork, then two `llm` branches (separate endpoints, ports 8201/8202) consume the enriched row alongside the original message, and a `require_all` / `merge: nested` coalesce writes only fully-answered tickets. Run `./examples/reference_join_fork_llm/run.sh` — it starts BOTH ChaosLLM servers with ZERO fault injection and tears them down; ends SUCCESS/exit 0. Shows the config-time payoff of the join declaring its output fields: the downstream `llm` nodes name them in `required_input_fields` and a misspelling refuses the run |
 | `ab_llm_experiment` | 8 + 8 + 24 cases x 2 arms | Fork one case study to TWO LLM arms, `row_union` the pair, compare. Run `./examples/ab_llm_experiment/run.sh` — it starts its OWN ChaosLLM on 8199 (never alongside a shared one), runs all THREE configs and self-verifies each against its own expected exit code. `settings.yaml` varies the PROMPT and `settings_models.yaml` varies the MODEL (8 cases, COMPLETED/exit 0 — a non-zero exit there is a real defect); `settings_arm_loss.yaml` is 24 cases of which 3 lose one arm, and ends PARTIAL/exit 1 **by design** with 21 whole pairs from 45 llm calls |
 | `document_review_panel` | 4 docs / 12 pages | THE COMBINED EXAMPLE: a fork (two LLM reviewers per page) nested inside an EXPAND group (pages closed by a collector), plus a run-level aggregation. Run `./examples/document_review_panel/run.sh` — it starts its OWN ChaosLLM on 8199 and self-verifies all three configs. `settings.yaml` is clean (COMPLETED/exit 0); `settings_incomplete.yaml` omits ONE field from ONE page and ends PARTIAL/exit 1 **by design**, publishing a summary over 3 of 4 documents; `settings_run_as_row.yaml` takes the same loss with the run encapsulated as a single row and ends PARTIAL/exit 1 publishing NOTHING — an empty/absent sink is the PASS there |
 

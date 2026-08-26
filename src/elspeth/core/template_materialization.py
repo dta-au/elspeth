@@ -15,12 +15,16 @@ ContentKind = Literal["text", "yaml"]
 # DOCUMENTED EXCLUSION: `collectors` is deliberately absent (elspeth-ca79b2c63a).
 #
 # Not because a collector cannot carry options, but because it cannot carry
-# THESE options. All three file-backed keys (`template_file`, `lookup_file`,
-# `system_prompt_file`) belong to the LLM transform, and `LLMTransform` is not
-# batch-aware — so an `llm` collector is rejected before it runs. Swept the live
-# registry at 2026-08-26: 13 batch-aware (collector-legal) transforms exist and
-# NONE declares any of the three keys, so on a legal collector the key is an
-# extra and `extra="forbid"` rejects it at config load.
+# THESE options. NO REGISTERED file-backed key belongs to a batch-aware plugin.
+# Three (`template_file`, `lookup_file`, `system_prompt_file`) belong to the LLM
+# transform, and `LLMTransform` is not batch-aware — so an `llm` collector is
+# rejected before it runs. `reference_file` (added 2026-08-26) is the first
+# registered key outside the LLM transform and does not change this: `ReferenceJoin`
+# is a per-row enricher that leaves `is_batch_aware` at its default False, so it
+# is not collector-legal either. Swept the live registry at 2026-08-26: 13
+# batch-aware (collector-legal) transforms exist and NONE declares any registered
+# key, so on a legal collector the key is an extra and `extra="forbid"` rejects it
+# at config load.
 #
 # REACTIVATION TRIGGER — this containment is INCIDENTAL, not designed, and has
 # an expiry date. Add `collectors` here the moment any batch-aware plugin
@@ -63,6 +67,18 @@ FILE_BACKED_TEMPLATE_OPTION_REGISTRY: tuple[FileBackedTemplateOption, ...] = (
         content_key="system_prompt",
         source_key="system_prompt_source",
         label="System prompt file",
+        content_kind="text",
+    ),
+    # content_kind="text" is load-bearing, not a default. The web surface fills
+    # `reference_content` through inline_content blob substitution, which writes
+    # a STRING (core/blobs_inline.py), so a "yaml" kind here would hand the same
+    # pydantic field a parsed dict on the CLI and a str on the web. Text on both
+    # paths; reference_join parses it itself.
+    FileBackedTemplateOption(
+        file_key="reference_file",
+        content_key="reference_content",
+        source_key="reference_source",
+        label="Reference table file",
         content_kind="text",
     ),
 )
@@ -135,11 +151,15 @@ class TemplateOptionMaterializer:
                 if not present:
                     continue
                 raw_name = plugin_config["name"] if "name" in plugin_config else index
+                # The remediation list is DERIVED from the registry, not typed out:
+                # a hand-written list silently omits every key added after it,
+                # which is the failure this check exists to prevent.
+                inline_instead = ", ".join(rule.content_key for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY)
                 raise ValueError(
                     "load_settings_from_yaml_string() cannot expand file-backed template options "
                     f"{present} for {collection_name}[{raw_name!r}] because in-memory web execution "
                     "has no trusted settings file base path. Use load_settings() for file-backed "
-                    "configs, or inline prompt_template, lookup, and system_prompt before web validation/execution."
+                    f"configs, or inline {inline_instead} before web validation/execution."
                 )
 
     def _materialize_plugin_config(self, plugin_config: Any) -> Any:

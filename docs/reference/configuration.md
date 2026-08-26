@@ -935,6 +935,7 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `aws_textract_inline_analysis` | Synchronously analyze payload-store documents (managed blobs) through Amazon Textract `AnalyzeDocument` |
 | `pdf_rasterize` | Render each page of a payload-store PDF into a PNG payload, one output row per page — the on-ramp for multipage PDFs into `aws_textract_inline_analysis` |
 | `rag_retrieval` | Enriches rows with retrieval-augmented context from search providers |
+| `reference_join` | Add named fields to a row by matching one of its values against a key in a reference table bound as configuration (`reference_file` on the CLI, an `inline_content` blob on the web) — fixed at run start, never read at row time |
 
 ### AWS Bedrock LLM
 

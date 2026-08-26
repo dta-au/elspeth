@@ -10223,3 +10223,139 @@ class TestFailureSampleClientEgress:
         assert "decode_failed" in persisted_error, persisted_error
         assert "summarise" in persisted_error, persisted_error
         assert "2x" in persisted_error, persisted_error
+
+
+# ---------------------------------------------------------------------------
+# Collector arm of the fanout marker dispatch (elspeth-df8082552d, site b2).
+#
+# ``_fanout_marker_for_node`` had arms for transform, aggregation and gate and
+# NONE for collector, so a collector never contributed a fanout marker — the
+# same plugin marked on an aggregation went unmarked on a collector, and a
+# collector that genuinely multiplies rows into an LLM node was invisible to
+# the guard.
+#
+# The gap was previously assessed as masked, because a collector's mandatory
+# ``scope_opener`` is a multi-row transform the trace marks anyway. That mask
+# is not load-bearing here: these tests assert the COLLECTOR's own marker is
+# present, not merely that some guard fires. (The mask itself is unsound for a
+# separate reason — nothing enforces that an opener creates tokens; see
+# elspeth-da3032d197.)
+# ---------------------------------------------------------------------------
+
+
+def _collector_marker_node(node_type: str, plugin: str = "batch_replicate") -> Any:
+    """One node hosting ``plugin``, shaped for ``node_type``."""
+    from elspeth.web.composer.state import NodeSpec
+
+    kind_fields: dict[str, Any] = {}
+    if node_type == "aggregation":
+        kind_fields = {"trigger": {"count": 5}, "output_mode": "transform"}
+    elif node_type == "collector":
+        kind_fields = {"scope_name": "s", "scope_opener": "op", "scope_policy": "require_all"}
+    return NodeSpec(
+        id="c1",
+        node_type=node_type,
+        plugin=plugin,
+        input="op_out",
+        on_success="c1_out",
+        on_error="errors",
+        options={"copies": 3},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+        **kind_fields,
+    )
+
+
+class TestFanoutMarkerCollectorArm:
+    def test_collector_contributes_a_fanout_marker(self) -> None:
+        from elspeth.web.execution.fanout_guard import _fanout_marker_for_node
+
+        marker = _fanout_marker_for_node(_collector_marker_node("collector"))
+
+        assert marker == "collector:c1:batch_replicate"
+
+    def test_collector_is_no_longer_asymmetric_with_aggregation(self) -> None:
+        """The defect in one line: the SAME collector-eligible plugin was
+        marked on an aggregation and unmarked on a collector. Both kinds
+        release plugin-authored output rows, so both must be visible.
+        """
+        from elspeth.web.execution.fanout_guard import _fanout_marker_for_node
+
+        assert _fanout_marker_for_node(_collector_marker_node("aggregation")) is not None
+        assert _fanout_marker_for_node(_collector_marker_node("collector")) is not None
+
+    def test_collector_arm_does_not_key_on_creates_tokens(self) -> None:
+        """Pins the trap the arm's comment names.
+
+        ``batch_replicate`` declares ``creates_tokens=False`` yet multiplies
+        M = sum(copies), and it is collector-eligible. Narrowing the collector
+        arm to ``transform_cls.creates_tokens`` by analogy with the transform
+        arm would return None here and silently reinstate the gap. This test
+        fails if anyone does that.
+        """
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.web.execution.fanout_guard import _fanout_marker_for_node
+
+        plugin_cls = get_shared_plugin_manager().get_transform_by_name("batch_replicate")
+        assert plugin_cls.creates_tokens is False, "premise: the counter-example still declares creates_tokens=False"
+        assert plugin_cls.is_batch_aware is True, "premise: the counter-example is still collector-eligible"
+
+        assert _fanout_marker_for_node(_collector_marker_node("collector")) is not None
+
+    def test_collector_marker_reaches_the_guard_trace(self, tmp_path: Path) -> None:
+        """End to end: the collector's marker must appear in the risk row's
+        ``upstream_fanout``, not merely somewhere in the guard. The opener's
+        marker is present too and is the control — before the fix the tuple
+        held only the opener.
+        """
+        import csv
+
+        from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        source_path = tmp_path / "in.csv"
+        with source_path.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["a"])
+            for index in range(20):
+                writer.writerow([f"r{index}"])
+
+        opener = NodeSpec(
+            id="op",
+            node_type="transform",
+            plugin="json_explode",
+            input="src_out",
+            on_success="op_out",
+            on_error="errors",
+            options={"source_field": "a"},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="src_out",
+                options={"path": "in.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(opener, _collector_marker_node("collector"), _fanout_llm_node("c1_out", node_id="gen")),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=str(tmp_path))
+
+        assert guard is not None
+        upstream = guard.risks[0].upstream_fanout
+        assert "collector:c1:batch_replicate" in upstream
+        assert "transform:op:json_explode" in upstream  # control: the opener was always marked

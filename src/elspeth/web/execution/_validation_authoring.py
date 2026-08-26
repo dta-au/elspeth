@@ -373,8 +373,26 @@ def validate_path_policy(
                     ),
                 )
 
+    # Every PLUGIN-BEARING node (elspeth-df8082552d). This gate is
+    # OPTION-shaped — it keys on ``provider_config`` presence, never on the
+    # plugin name — so ``node_type`` was the sole limiter and a collector or
+    # aggregation carrying a traversal ``persist_directory`` passed silently.
+    # Measured before the fix, with a transform control: transform ->
+    # "Path traversal blocked"; aggregation and collector -> gate SILENT.
+    #
+    # ``node.plugin is None`` rather than a node-kind set: only a node that
+    # hosts a plugin can have that plugin act on the path, and this adds no
+    # fifth restatement of the node-kind vocabulary (elspeth-b3117ec3ac).
+    # Structural kinds CAN carry an inert ``provider_config`` today
+    # (gate/queue/coalesce accept it; only row_union rejects non-empty
+    # options), so skipping them is deliberate: gating an option nothing
+    # reads would reject a harmless composition that passes today.
+    #
+    # The gate fires on the RESOLVED PATH, not on the option's presence — an
+    # in-subtree persist_directory passes on every node kind — so widening
+    # the subject set cannot over-reject a legitimate pipeline.
     for node in state.nodes:
-        if node.node_type != "transform":
+        if node.plugin is None:
             continue
         provider_config = node.options["provider_config"] if "provider_config" in node.options else None
         if not isinstance(provider_config, Mapping):
@@ -388,7 +406,7 @@ def validate_path_policy(
                     component_id=node.id,
                     component_type="transform",
                     option_name=key,
-                    detail=f"Transform '{node.id}' {key} must be a string path; got {type(value).__name__}",
+                    detail=f"{node.node_type.capitalize()} '{node.id}' {key} must be a string path; got {type(value).__name__}",
                 )
             path_checked = True
             try:
@@ -398,7 +416,7 @@ def validate_path_policy(
                     component_id=node.id,
                     component_type="transform",
                     option_name=key,
-                    detail=f"Transform '{node.id}' {key} is not a valid path",
+                    detail=f"{node.node_type.capitalize()} '{node.id}' {key} is not a valid path",
                 )
             if not any(resolved.is_relative_to(directory) for directory in allowed_sink_dirs):
                 return PhaseFailure(
@@ -406,7 +424,7 @@ def validate_path_policy(
                     failed_check=ValidationCheck(
                         name=CHECK_PATH_ALLOWLIST,
                         passed=False,
-                        detail=f"Transform '{node.id}' {key} '{value}' is outside allowed output directories",
+                        detail=f"{node.node_type.capitalize()} '{node.id}' {key} '{value}' is outside allowed output directories",
                         affected_nodes=(),
                         outcome_code=None,
                     ),
@@ -414,14 +432,14 @@ def validate_path_policy(
                         ValidationError(
                             component_id=node.id,
                             component_type="transform",
-                            message=f"Path traversal blocked: transform '{node.id}' {key}='{value}' resolves outside allowed directories",
+                            message=f"Path traversal blocked: {node.node_type} '{node.id}' {key}='{value}' resolves outside allowed directories",
                             suggestion="Use a path within this session's output or blob subtree.",
                             error_code=None,
                         ),
                     ),
                     readiness=_blocked_readiness(
                         code="path_allowlist",
-                        detail=f"transform {node.id} {key} resolves outside allowed output directories",
+                        detail=f"{node.node_type} {node.id} {key} resolves outside allowed output directories",
                         component_id=node.id,
                         component_type="transform",
                     ),

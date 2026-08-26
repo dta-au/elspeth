@@ -16192,6 +16192,131 @@ class TestPreviewProofStep:
         codes = [d["code"] for d in result.data["proof_diagnostics"]]
         assert "aggregation_numeric_value_field_type_mismatch_against_source_schema" not in codes
 
+    # -- the same numeric proof for a COLLECTOR-hosted batch plugin (elspeth-1016a47e8f) --
+
+    def _batch_barrier_behind_expand_opener(
+        self,
+        *,
+        barrier_node_type: str,
+        plugin: str = "batch_stats",
+        options: dict[str, Any] | None = None,
+    ):
+        """csv(observed) -> pdf_rasterize (scope opener) -> batch barrier -> out.
+
+        The two barrier kinds differ in EXACTLY ONE field, `node_type` (a
+        collector additionally carries the scope binding it cannot legally omit).
+        Both compositions validate clean, so any difference in the emitted
+        diagnostics is caused by the barrier kind and nothing else.
+        """
+        barrier_options: dict[str, Any] = (
+            options
+            if options is not None
+            else {
+                "schema": {"mode": "observed"},
+                "value_field": "price",
+                "compute_mean": True,
+            }
+        )
+        scope_binding = (
+            {"scope_name": "doc_pages", "scope_opener": "explode", "scope_policy": "require_all"}
+            if barrier_node_type == "collector"
+            else {}
+        )
+        return (
+            self._state_with_csv_source(schema_mode="observed")
+            .with_node(
+                NodeSpec(
+                    id="explode",
+                    node_type="transform",
+                    plugin="pdf_rasterize",
+                    input="rows",
+                    on_success="pages",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="summarize",
+                    node_type=barrier_node_type,  # type: ignore[arg-type]
+                    plugin=plugin,
+                    input="pages",
+                    on_success="out",
+                    on_error="discard",
+                    options=barrier_options,
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    **scope_binding,
+                )
+            )
+        )
+
+    def _proof_codes(self, state) -> list[str]:
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+        return result.data["proof_diagnostics"]
+
+    @pytest.mark.parametrize("barrier_node_type", ["aggregation", "collector"])
+    def test_observed_csv_numeric_value_field_blocks_for_every_batch_barrier_kind(self, barrier_node_type: str) -> None:
+        """The numeric proof must not vanish when the plugin is hosted as a collector.
+
+        Asserting the CODE is load-bearing, not stylistic: `is_valid` is False
+        in BOTH arms of this harness anyway (`runtime_preflight_not_run` is a
+        preview artefact), so a test asserting `is_valid` would pass against the
+        defect. Before the fix the collector arm emitted ZERO diagnostics while
+        the aggregation arm emitted this one — a blocking export diagnostic
+        silently lost to a `node_type` gate (filigree elspeth-1016a47e8f).
+        """
+        diagnostics = self._proof_codes(self._batch_barrier_behind_expand_opener(barrier_node_type=barrier_node_type))
+
+        mismatch = [d for d in diagnostics if d["code"] == "aggregation_numeric_value_field_type_mismatch_against_source_schema"]
+        assert mismatch, [d["code"] for d in diagnostics]
+        assert mismatch[0]["severity"] == "blocking"
+        assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
+        assert mismatch[0]["evidence_locator"]["field"] == "price"
+        assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
+        # The detector records the REAL node kind so the preflight can label the
+        # blocker without guessing it back out of the (historically named) code.
+        assert mismatch[0]["evidence_locator"]["node_type"] == barrier_node_type
+        # Kind-accurate prose: a collector must not be told to fix a node it does
+        # not have, and only a collector is told about its scope.
+        assert mismatch[0]["message"].startswith(f"{barrier_node_type.capitalize()} 'summarize'")
+        assert f"upstream of the {barrier_node_type}" in mismatch[0]["suggested_repair"]
+        assert ("EXPAND scope" in mismatch[0]["suggested_repair"]) is (barrier_node_type == "collector")
+
+    def test_collector_hosting_a_non_numeric_batch_plugin_emits_no_numeric_proof(self) -> None:
+        """NEGATIVE control: the test above must not pass merely because a
+        collector produces diagnostics at all. `batch_top_k` is batch-aware and
+        collector-hostable but is NOT a numeric value_field plugin — it is the
+        very plugin this diagnostic's repair text recommends instead — so it
+        must stay silent on the identical topology.
+        """
+        diagnostics = self._proof_codes(
+            self._batch_barrier_behind_expand_opener(
+                barrier_node_type="collector",
+                plugin="batch_top_k",
+                options={"schema": {"mode": "observed"}, "field": "customer"},
+            )
+        )
+
+        assert "aggregation_numeric_value_field_type_mismatch_against_source_schema" not in [d["code"] for d in diagnostics]
+
     # -- declared-input-type mismatch against observed CSV (elspeth-e6e552ce34) --
 
     @staticmethod

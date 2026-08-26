@@ -13,6 +13,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
+from elspeth.web.composer.guided.chat_solver import PLUGIN_FREE_NODE_TYPES
 from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentAccepted,
     DeferredIntentAction,
@@ -296,7 +297,19 @@ def _deferred_disposition_chat(
 
 
 _MAX_POLICY_VISIBLE_ALTERNATIVES = 5
-_STRUCTURAL_NODE_TYPES = ("gate", "coalesce", "row_union", "queue")
+# DERIVED, not restated. This was a hand-written tuple byte-identical to
+# ``chat_solver.PLUGIN_FREE_NODE_TYPES`` — same four members, same order, same
+# feature — and the two agreed only by hand. They answer the identical
+# question: a kind belongs here exactly when "a {x} is a built-in topology
+# node, not a transform plugin" is TRUE of it, which is the plugin-free
+# partition. Importing it means the module-load assert over ``NodeType`` that
+# guards that partition now guards this clause too, so a new or renamed node
+# kind cannot leave this teaching surface quietly incomplete.
+#
+# ORDER is load-bearing and is inherited deliberately: the ``next()`` scan
+# below returns the first member in TUPLE order that the message names, so
+# reordering the authority changes which clause "a queue and a gate" teaches.
+_STRUCTURAL_NODE_TYPES = PLUGIN_FREE_NODE_TYPES
 
 
 def _message_names_identifier(message: str, identifier: str) -> bool:
@@ -383,22 +396,137 @@ def _retained_unverified_chat(
 
 
 def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepChatResult:
+    """Explain an unavailable model-authored catalog identity the user never named.
+
+    The message is COMPOSED, not selected: a shared frame open, one teaching
+    clause per node kind the message names, and a shared frame close (filigree
+    elspeth-270e81443d, review comment 7977 §7.1). A message naming a collector
+    AND a structural node gets BOTH clauses, and the frame is emitted once
+    either way. Three reasons the collector teaching composes rather than
+    competes:
+
+    * Nothing true is lost. A collector arm that WON would have taken the gate
+      clause away from "add a collector and a gate", trading one teaching line
+      for another; appending buys the collector case at no price.
+    * It deletes the ordering question. `_STRUCTURAL_NODE_TYPES` is scanned with
+      `next()`, which returns the first member in TUPLE order that the message
+      names — for "a queue and a gate" that is `gate`, because `gate` precedes
+      `queue` in the tuple, NOT because of where the words appear in the
+      message. That limitation survives — only ONE structural clause is ever
+      emitted, so "a queue and a gate" teaches `gate` only — but it no longer
+      decides whether the collector clause fires at all.
+    * Every clause is a GENERAL TRUTH, true regardless of what happened in the
+      turn, so no clause CAN be false and none needs a provenance hedge to make
+      it safe. An unwanted match therefore costs at most an unhelpful sentence,
+      never a wrong one. Two classes reach that state, and the second is the
+      larger: NEGATION ("no collector needed" still gets its correct gate
+      clause, plus a true but unsolicited collector definition) and HOMONYMS
+      ("the garbage collector is slow" and "add a data collector for the survey"
+      both emit the full EXPAND-scope paragraph, verified). Detecting negation
+      is banned — `_message_names_identifier` is a word-boundary regex with no
+      notion of it, and a negation parse would fail in the opposite direction on
+      "no gate, add a collector". Homonym disambiguation is worse still: it
+      needs to know what the user meant. Tolerating both is the price of never
+      printing a falsehood, and it is the right trade only because every clause
+      is unconditionally true.
+
+    Note what the frame deliberately does NOT say. The only caller sits inside
+    the `_has_unmentioned_unavailable_action_identity` guard, so an unavailable
+    plugin the user never named is always what happened — that is what the frame
+    open states, and its "for it" refers to the retained instruction, which IS
+    the action the guard just checked. But nothing reaching this function says
+    WHICH node that plugin was for, or what kind of plugin it is.
+    `DeferredIntentAction` carries only target_stage / catalog_kind /
+    catalog_name / redacted_summary / constraints; there is no node_type, and
+    this function receives none of it. So "the plugin I proposed FOR THE
+    COLLECTOR" is unverifiable BY CONSTRUCTION — for "add a collector and a
+    scoring transform" the unavailable plugin may belong to the transform, and
+    `catalog_kind` may be "sink" rather than "transform". No clause may
+    attribute the plugin to a node, and none does.
+
+    Clause order is structural, then collector, then aggregation. Not the order
+    comment 7977 §7.1 lists, deliberately: it puts "not a transform plugin"
+    directly beside "IS backed by a batch-transform plugin", and that contrast
+    is the whole reason the collector clause exists (comment 7911). The two
+    plugin-bearing kinds then sit together.
+
+    AGGREGATION IS THE THIRD PLUGIN-HOSTING KIND, and it has a clause on its
+    own merits: under composition a second true clause costs nothing, and an
+    author who names an aggregation needs the same thing a collector author
+    needs. Do NOT cite AGENTS.md WS6 for this, as an earlier version of this
+    docstring did — WS6 requires every `node_type` dispatch site to carry "a
+    collector arm or a deliberate documented exclusion", and the collector arm
+    above already satisfies it. (This function is not really such a dispatch
+    site either: `_message_names_identifier` is a word-boundary regex over user
+    prose, not a dispatch on `node_type`.) Its field list is NOT the collector's and was
+    verified separately against `state.py`'s aggregation arm, because the
+    obvious guess is wrong in both directions: an aggregation's mandatory
+    fields are `plugin` and `on_error` (`aggregation_missing_plugin`,
+    `aggregation_missing_on_error`); `trigger` is OPTIONAL — runtime treats a
+    missing or empty trigger as end-of-source-only — and `output_mode` is
+    optional too, merely constrained to `OutputMode` when present. There is no
+    `trigger_kinds` field at all. So an aggregation clause modelled on the
+    collector's "it needs A, B and C" shape would print a falsehood; the
+    asymmetry is real and the clause states it.
+
+    `transform` is the fourth plugin-hosting kind and is deliberately EXCLUDED,
+    but NOT for the reason an earlier version of this docstring gave. It is not
+    "the default reading" of an unavailable identity: `catalog_kind` is
+    source|transform|sink and the guard requires a non-null one, so nothing
+    defaults to transform — and when no clause fires the frame never says
+    "transform plugin" at all, so there is nothing already implied. The real
+    reason is narrower: the other clauses exist to correct a specific wrong
+    inference (a plugin-free kind mistaken for a plugin, or a plugin-bearing
+    topology kind mistaken for an ordinary transform). A transform IS an
+    ordinary transform, so there is no wrong inference to correct.
+
+    KNOWN GAPS in this arm, neither introduced here, both worth a reader's
+    caution. PLURALS silently miss: `_message_names_identifier` is
+    word-boundary, so "add collectors" and "add aggregations" emit no clause —
+    the tolerance argument above covers false POSITIVES only, and this is the
+    false negative. And the aggregation clause's "IS backed by a batch-transform
+    plugin" is enforced for a COLLECTOR at composer time
+    (`collector_plugin_not_batch_aware`) but for an aggregation only at RUN time
+    (`orchestrator/aggregation.py`) — `CompositionState.validate()` accepts an
+    aggregation whose plugin is not batch-aware. The sentence states the
+    contract correctly; the composer simply does not check that half of it.
+
+    Collector is also deliberately absent from `_STRUCTURAL_NODE_TYPES`, and
+    that is now enforced rather than merely intended: the tuple IS
+    `chat_solver.PLUGIN_FREE_NODE_TYPES`, whose membership rule is exactly "a
+    {x} is a built-in topology node, not a transform plugin" is TRUE of x. A
+    collector is plugin-BEARING (barrier-scopes spec §3 types it as a
+    transform plugin, and a collector with no `plugin` is rejected outright),
+    so it cannot appear there without failing that module's own partition
+    assert against `NodeType`. Adding it would have printed a falsehood; it is
+    no longer possible to add it here at all.
+    """
+    clauses: list[str] = []
     structural_node = next(
         (node_type for node_type in _STRUCTURAL_NODE_TYPES if _message_names_identifier(user_message, node_type)),
         None,
     )
-    if structural_node is None:
-        message = (
-            "I kept that future-stage instruction, but its structure was not verified. "
-            "The proposed transform identity was not present in your request, so I did not treat it as a deployment problem. "
-            "Clarify the concrete topology structure and I'll firm it up."
+    if structural_node is not None:
+        clauses.append(f"A {structural_node} is a built-in topology node, not a transform plugin. ")
+    if _message_names_identifier(user_message, "collector"):
+        clauses.append(
+            "A collector is a built-in topology node that IS backed by a batch-transform plugin, and it closes "
+            "an EXPAND scope — it needs scope_name, scope_opener and scope_policy. Name the batch behaviour you "
+            "want and the scope it should close. "
         )
-    else:
-        message = (
-            f"I kept your {structural_node} request, but its structure was not verified. "
-            f"A {structural_node} is a built-in topology node, not a transform plugin. "
-            "Clarify the concrete topology structure and I'll firm it up."
+    if _message_names_identifier(user_message, "aggregation"):
+        clauses.append(
+            "An aggregation is a built-in topology node that IS backed by a batch-transform plugin, and it "
+            "needs on_error; a trigger is optional and only ADDS early flushes, because the end-of-source "
+            "flush always happens. Name the batch behaviour you want. "
         )
+    message = (
+        "I kept that future-stage instruction, but its structure was not verified. "
+        "The plugin I proposed for it is not available here, and you did not ask for it by name, "
+        "so I did not treat it as a deployment problem. "
+        f"{''.join(clauses)}"
+        "Clarify the concrete topology structure and I'll firm it up."
+    )
     return StepChatResult(
         assistant_message=message,
         status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,

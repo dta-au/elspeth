@@ -715,3 +715,90 @@ def test_semantic_phase_keeps_the_output_qualifier_on_a_sink_advisory() -> None:
     assert check.name == "semantic_contracts"
     assert check.affected_nodes == ("output:lines",)
     assert "text.field.single_line_text" in check.detail
+
+
+# ---------------------------------------------------------------------------
+# Node-kind widening of the path-traversal gate (elspeth-df8082552d, site c).
+#
+# ``validate_path_policy`` pre-filtered to ``node_type == "transform"``. It is
+# an OPTION-shaped gate — it keys on ``provider_config`` presence, never on a
+# plugin name — so ``node_type`` was the sole limiter and a collector or
+# aggregation carrying a traversal ``persist_directory`` passed it silently.
+#
+# Containment was incidental and LATE, not structural: a batch-aware plugin's
+# config model is ``extra="forbid"`` with no ``provider_config`` field, so
+# such a composition dies at ``validate_runtime_plugins`` — two phases AFTER
+# this gate, with an unrelated error. The gate itself never looked.
+# ---------------------------------------------------------------------------
+
+_TRAVERSAL = "../../../../../../etc/elspeth-pwned"
+
+
+def _provider_config_node(node_type: str, path_value: str) -> NodeSpec:
+    return _node(
+        node_id="n1",
+        plugin="rag_retrieval" if node_type == "transform" else "batch_stats",
+        node_type=node_type,
+        options={"provider_config": {"persist_directory": path_value}},
+    )
+
+
+@pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])
+def test_path_gate_blocks_traversal_on_every_plugin_bearing_node_kind(node_type: str, tmp_path: Path) -> None:
+    """``transform`` is the control: it fired before this fix and must still
+    fire. ``aggregation`` and ``collector`` are the defect — measured SILENT
+    before the widening, with the traversal path admitted.
+    """
+    result = validate_path_policy(
+        _policy(_state(nodes=(_provider_config_node(node_type, _TRAVERSAL),))),
+        data_dir=tmp_path,
+        session_id="11111111-1111-1111-1111-111111111111",
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "path_allowlist"
+    assert result.errors[0].component_id == "n1"
+    # The finding names the node kind the operator authored, not "transform"
+    # for all three — a security finding that mislabels its subject invites
+    # the reader to dismiss it as being about some other node.
+    assert node_type in result.errors[0].message
+
+
+@pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])
+def test_path_gate_admits_a_legitimate_in_subtree_path_on_every_kind(node_type: str, tmp_path: Path) -> None:
+    """The widening cannot over-reject: the gate keys on the RESOLVED PATH,
+    not on the presence of the option. A node carrying a legitimate
+    persist_directory inside the session subtree passes on every node kind.
+    """
+    from elspeth.web.paths import allowed_sink_directories
+
+    session_id = "11111111-1111-1111-1111-111111111111"
+    legit = str(Path(allowed_sink_directories(str(tmp_path), session_id=session_id)[0]) / "chroma_data")
+
+    result = validate_path_policy(
+        _policy(_state(nodes=(_provider_config_node(node_type, legit),))),
+        data_dir=tmp_path,
+        session_id=session_id,
+    )
+
+    assert isinstance(result, PhaseReport)
+
+
+def test_path_gate_still_skips_plugin_less_structural_nodes(tmp_path: Path) -> None:
+    """The subject set is ``node.plugin is not None``, NOT every node.
+
+    gate/queue/coalesce can carry an inert ``provider_config`` through
+    composer validation today (only ``row_union`` rejects non-empty options),
+    and nothing reads it for a plugin-less kind. Gating it would newly reject
+    a nonsense-but-harmless composition that passes today — a behaviour
+    change with no security benefit, since no plugin can act on the value.
+    """
+    gate_node = _node(node_id="g1", plugin=None, node_type="gate", options={"provider_config": {"persist_directory": _TRAVERSAL}})
+
+    result = validate_path_policy(
+        _policy(_state(nodes=(gate_node,))),
+        data_dir=tmp_path,
+        session_id="11111111-1111-1111-1111-111111111111",
+    )
+
+    assert isinstance(result, PhaseReport)

@@ -1292,7 +1292,10 @@ def _contract_json_schema(raw: object) -> dict[str, object] | bool:
     invariant=(
         "raises _SchemaContractProjectionUnsupported on any field shape outside the closed "
         "{name,kind,type,required,nullable,default,enum,choices,item_kind,visible_when,required_when,"
-        "item_schema,items} plus prose-key vocabulary, or when the top-level shape is not exactly {'fields'}"
+        "item_schema,items} plus prose-key vocabulary, when the top-level shape is not exactly {'fields'}, "
+        "or when a projected field body does not canonicalize; the admitted fields are then emitted in "
+        "first-occurrence order with each set of per-variant repeats that covers its discriminator's whole "
+        "enum collapsed to one predicate-free copy"
     ),
     test_ref="tests/unit/web/composer/test_schema_contract_projection_boundaries.py::test_contract_knob_schema_rejects_missing_fields_key",
     test_fingerprint="7cd806e3678d6f8e15df19954921cf662441218973bd39795dbb74726592442e",
@@ -1350,7 +1353,116 @@ def _contract_knob_schema(raw: object) -> dict[str, object]:
             items = raw_field["items"]
             field["items"] = _contract_json_schema(items)
         fields.append(field)
-    return {"fields": fields}
+    return {"fields": _collapse_uniform_variant_fields(fields)}
+
+
+def _uniform_variant_group_key(body: Mapping[str, object]) -> str:
+    """Canonicalize one projected field body into its grouping key.
+
+    A body the canonical encoder cannot represent cannot ride the contract
+    either — ``planner_plugin_contract`` already turns that into
+    ``_SchemaContractProjectionUnsupported`` when it encodes the whole
+    projection — so it raises the same refusal here rather than letting a bare
+    ``TypeError`` escape a projection whose callers catch only that one class.
+    """
+    try:
+        return canonical_json(body)
+    except (CanonicalizationError, TypeError, ValueError) as exc:
+        raise _SchemaContractProjectionUnsupported from exc
+
+
+def _collapse_uniform_variant_fields(fields: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Collapse a discriminated union's per-variant repeats of one shared knob.
+
+    ``web/catalog/knob_schema`` lowers a discriminated union to a FLAT form by
+    re-emitting every shared knob once per variant, separated only by
+    ``visible_when`` (``knob_schema.py:522``). That shape is what the guided
+    form renderer needs — ``SchemaFormTurn.tsx`` compares one field to one
+    scalar, so its predicate grammar has no set operator — but on the planner
+    contract it is repetition the model gains nothing from: the ``llm``
+    transform lowers to 114 fields carrying 36 distinct bodies, 39,093 bytes of
+    a 49,152-byte budget the whole selection shares (elspeth-623c69c59f).
+
+    A knob whose projected body is identical under EVERY variant of its
+    discriminator applies whichever variant is chosen, so one copy with no
+    predicate states the same fact. Partial coverage is a real fact about the
+    plugin — ``region_name`` exists only under ``bedrock`` — and survives
+    untouched, one entry per variant with its predicate intact.
+
+    The variant set is READ FROM the discriminator field's own ``enum`` in this
+    same field list, never restated here: a union whose discriminator this
+    projection cannot see does not collapse, and neither does one whose
+    predicate compares against a non-string, since such a value can match no
+    member of a projected ``enum``. Every refusal is one-directional — they can
+    only leave the lowered form as it stands.
+
+    Order is first-occurrence stable, because ``schema_hash`` canonicalizes
+    this list.
+    """
+    # A lowered union re-emits its discriminator per variant too, so one name
+    # can carry several enums. Agreement is what makes it an authority: a name
+    # whose enums disagree names no single variant set and is dropped rather
+    # than resolved by position. An optional or nullable enum is no authority
+    # either — unset, it satisfies none of its own members, so covering every
+    # member is not the same as always applying.
+    variants_by_discriminator: dict[str, frozenset[str]] = {}
+    ambiguous_discriminators: set[str] = set()
+    for field in fields:
+        if "enum" not in field or field["required"] is not True:
+            continue
+        if "nullable" in field and field["nullable"] is not False:
+            continue
+        enum_values = field["enum"]
+        assert isinstance(enum_values, list)
+        name = field["name"]
+        assert isinstance(name, str)
+        declared = frozenset(value for value in enum_values if isinstance(value, str))
+        if name in variants_by_discriminator and variants_by_discriminator[name] != declared:
+            ambiguous_discriminators.add(name)
+        variants_by_discriminator[name] = declared
+    for name in ambiguous_discriminators:
+        del variants_by_discriminator[name]
+
+    group_order: list[tuple[str, str | None]] = []
+    group_members: dict[tuple[str, str | None], list[dict[str, object]]] = {}
+    group_coverage: dict[tuple[str, str | None], set[str]] = {}
+    collapsible: dict[tuple[str, str | None], bool] = {}
+    for field in fields:
+        discriminator: str | None = None
+        variant: object = None
+        if "visible_when" in field:
+            predicate = field["visible_when"]
+            assert isinstance(predicate, dict)
+            assert isinstance(predicate["field"], str)
+            discriminator = predicate["field"]
+            variant = predicate["equals"]
+        body = {key: value for key, value in field.items() if key != "visible_when"}
+        group = (_uniform_variant_group_key(body), discriminator)
+        if group not in group_members:
+            group_order.append(group)
+            group_members[group] = []
+            group_coverage[group] = set()
+            collapsible[group] = discriminator is not None
+        group_members[group].append(field)
+        if isinstance(variant, str):
+            group_coverage[group].add(variant)
+        else:
+            collapsible[group] = False
+
+    collapsed: list[dict[str, object]] = []
+    for group in group_order:
+        members = group_members[group]
+        discriminator = group[1]
+        if (
+            collapsible[group]
+            and discriminator is not None
+            and discriminator in variants_by_discriminator
+            and group_coverage[group] == variants_by_discriminator[discriminator]
+        ):
+            collapsed.append({key: value for key, value in members[0].items() if key != "visible_when"})
+            continue
+        collapsed.extend(members)
+    return collapsed
 
 
 def _schema_pair_label(pair: tuple[str, str]) -> str:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, get_args
 from uuid import UUID
 
 import pytest
@@ -21,6 +21,7 @@ from elspeth.web.audit_readiness.service import ReadinessService
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
+    NodeType,
     OutputSpec,
     PipelineMetadata,
     SourceSpec,
@@ -1754,3 +1755,159 @@ class TestPluginCatalogHelpers:
         assert call_count == 1, (
             f"PluginManager instantiated {call_count} times; the shared-snapshot contract requires exactly 1 per cache lifetime."
         )
+
+
+# ---------------------------------------------------------------------------
+# Node-kind widening of the boundary inventory (elspeth-1c8a4b6199).
+#
+# The panel used to enumerate ``node_type == "transform"`` alone, so a
+# boundary plugin hosted on a collector or an aggregation was silently
+# dropped from the inventory — from the summary count, from ``detail``, and
+# from ``component_ids``. These tests pin the widening at the level the
+# defect lived: the row builder, called directly.
+#
+# ``web_scrape`` is a real registered transform declaring
+# ``Determinism.EXTERNAL_CALL``, so no registry patching is needed and the
+# ``@lru_cache``d ``_plugin_catalog_snapshot`` is never disturbed.
+#
+# "Latent, not live" is TRUE OF COLLECTORS ONLY — the two halves of this
+# fix have different reachability, and conflating them understates it:
+#
+#   - COLLECTOR: latent. ``web_scrape`` on a collector is Stage-1 INVALID
+#     (``collector_plugin_not_batch_aware``), and no shipped batch-aware
+#     plugin declares a boundary determinism, so no runnable composition
+#     reaches this classifier through a collector today.
+#   - AGGREGATION: **LIVE.** That constraint is collector-only (it lives in
+#     ``state.py``'s ``_collector_intrinsic_errors``); ``validate()``'s
+#     aggregation arm never checks ``is_batch_aware``. Measured: both
+#     ``web_scrape`` and ``llm`` on an aggregation node validate with ZERO
+#     errors. So an EXTERNAL_CALL plugin on an aggregation was a real,
+#     authorable composition whose boundary crossing this panel silently
+#     omitted — not a defect waiting on a future plugin.
+#
+# The row builder never validates and reads only ``.determinism``,
+# so it classifies the node regardless; these tests pin the classifier's
+# contract, not a composition an operator can run today.
+# ---------------------------------------------------------------------------
+
+
+def _boundary_state(node_type: str) -> CompositionState:
+    """csv source -> one ``web_scrape`` node of ``node_type`` -> csv sink."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="src_out",
+            options={},
+            on_validation_failure="quarantine",
+        ),
+        nodes=(make_node_spec("n1", "web_scrape", input="src_out", on_success="n1_out", node_type=node_type),),
+        edges=(),
+        outputs=(make_output_spec("out", "csv"),),
+        metadata=PipelineMetadata(name="t", description=""),
+        version=1,
+    )
+
+
+class TestPluginTrustNodeKindWidening:
+    @pytest.mark.parametrize("node_type", ["collector", "aggregation"])
+    def test_boundary_plugin_on_batch_node_kind_is_inventoried(self, node_type: str) -> None:
+        """The defect, directly: the node must reach both ``detail`` and
+        ``component_ids``. Before the widening it reached neither, and the
+        summary undercounted by exactly one.
+        """
+        row = _service_mod._build_plugin_trust_row(_boundary_state(node_type))
+
+        assert row.summary == "3 external-boundary plugin(s) recorded"
+        assert "n1" in row.component_ids
+        assert f"[{node_type}] n1 (web_scrape)" in (row.detail or "")
+
+    @pytest.mark.parametrize("node_type", ["collector", "aggregation"])
+    def test_batch_node_kind_matches_the_transform_control(self, node_type: str) -> None:
+        """Same plugin, same wiring, only ``node_type`` differs. The
+        inventory must be identical except for the node-kind label — the
+        control is what proves the counts differ by exactly the widened
+        node and not by some other effect of the edit.
+        """
+        widened = _service_mod._build_plugin_trust_row(_boundary_state(node_type))
+        control = _service_mod._build_plugin_trust_row(_boundary_state("transform"))
+
+        assert widened.status == control.status
+        assert widened.summary == control.summary
+        assert widened.component_ids == control.component_ids
+        assert (widened.detail or "").replace(f"[{node_type}]", "[transform]") == (control.detail or "")
+
+    def test_detail_reports_the_node_kind_not_the_registry_kind(self) -> None:
+        """Collector-hosted plugins resolve through the TRANSFORM registry,
+        so the naive detail line reads ``[transform] n1`` for a collector.
+        The operator locates the component by the vocabulary they authored
+        it in, so the label is the node kind.
+        """
+        detail = _service_mod._build_plugin_trust_row(_boundary_state("collector")).detail or ""
+
+        assert "[collector] n1" in detail
+        assert "[transform] n1" not in detail
+
+    def test_plugin_less_structural_node_is_not_enumerated(self) -> None:
+        """A gate carries ``plugin=None`` by contract. Enumerating it would
+        route it to the ``unknown`` branch and flip the whole row to
+        ``error`` — the regression the exclusion set exists to prevent.
+        """
+        state = CompositionState(
+            source=SourceSpec(plugin="csv", on_success="src_out", options={}, on_validation_failure="quarantine"),
+            nodes=(make_node_spec("g1", None, input="src_out", on_success="g1_out", node_type="gate"),),
+            edges=(),
+            outputs=(make_output_spec("out", "csv"),),
+            metadata=PipelineMetadata(name="t", description=""),
+            version=1,
+        )
+
+        row = _service_mod._build_plugin_trust_row(state)
+
+        assert row.status == "ok"
+        assert row.component_ids == ("source", "out")
+
+    def test_node_type_vocabulary_is_an_exhaustive_partition(self) -> None:
+        """The property that makes step 5 of ``boundary_expectations.py``'s
+        checklist true: a NEW node type is enumerated by default, and
+        opting one OUT of the audit inventory requires an explicit entry in
+        ``_PLUGINLESS_NODE_TYPES``. Fails the day someone adds a node type
+        without deciding which side it falls on.
+        """
+        declared = frozenset(get_args(NodeType))
+        hosting = _service_mod.PLUGIN_HOSTING_NODE_TYPES
+        pluginless = _service_mod._PLUGINLESS_NODE_TYPES
+
+        assert hosting | pluginless == declared
+        assert hosting & pluginless == frozenset()
+        assert hosting == frozenset({"transform", "aggregation", "collector"})
+
+    def test_llm_predicate_shares_the_node_kind_vocabulary(self) -> None:
+        """``_composition_has_llm_transform`` is the third enumeration site,
+        and its widening is a LIVE behaviour change — not the no-op an
+        earlier revision of this docstring claimed.
+
+        ``llm`` on an AGGREGATION node validates with zero composer errors:
+        the batch-aware constraint is collector-only
+        (``collector_plugin_not_batch_aware``, inside
+        ``_collector_intrinsic_errors``), and the aggregation arm never
+        checks ``is_batch_aware``. Before the widening that composition made
+        the predicate return False, which rendered the
+        ``llm_interpretations`` row ``not_applicable`` — "No LLM transforms
+        in this pipeline" — a second false all-clear of this ticket's own
+        shape on a different row.
+
+        Reverting the widening fails THIS test (measured: exactly one
+        failure), so the site is mutation-checked, not merely asserted.
+        """
+        assert _service_mod._composition_has_llm_transform(_boundary_state("transform")) is False
+
+        for node_type in sorted(_service_mod.PLUGIN_HOSTING_NODE_TYPES):
+            state = CompositionState(
+                source=SourceSpec(plugin="csv", on_success="src_out", options={}, on_validation_failure="quarantine"),
+                nodes=(make_node_spec("n1", "llm", input="src_out", on_success="n1_out", node_type=node_type),),
+                edges=(),
+                outputs=(make_output_spec("out", "csv"),),
+                metadata=PipelineMetadata(name="t", description=""),
+                version=1,
+            )
+            assert _service_mod._composition_has_llm_transform(state) is True, node_type

@@ -300,8 +300,14 @@ class TestJSONExplodeTypeViolations:
         with pytest.raises(KeyError, match="items"):
             transform.process(make_pipeline_row(row), ctx)
 
-    def test_none_value_crashes(self, ctx: PluginContext) -> None:
-        """None value for array field is upstream bug - should crash (TypeError)."""
+    def test_none_value_routes_as_a_failed_row(self, ctx: PluginContext) -> None:
+        """None for the array field is a ROW-level failure, routed via on_error.
+
+        Re-pointed from asserting a TypeError crash (elspeth-5887fb7928). The
+        concern the old test encoded — never silently produce garbage — is
+        unchanged and still enforced; what changed is that the row now fails
+        ROUTABLY instead of aborting the run with the row uncounted.
+        """
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
@@ -313,16 +319,23 @@ class TestJSONExplodeTypeViolations:
 
         row = {"id": 1, "items": None}
 
-        with pytest.raises(TypeError):
-            transform.process(make_pipeline_row(row), ctx)
+        result = transform.process(make_pipeline_row(row), ctx)
 
-    def test_string_value_crashes_with_type_error(self, ctx: PluginContext) -> None:
-        """String value is upstream bug - should crash with TypeError.
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "items"
+        assert "got NoneType" in result.reason["error"]
 
-        Strings are iterable in Python, but JSONExplode requires lists.
-        A string where a list was expected indicates a source validation bug
-        or misconfigured pipeline. The transform crashes explicitly to surface
-        this bug rather than producing garbage output (one row per character).
+    def test_string_value_routes_as_a_failed_row(self, ctx: PluginContext) -> None:
+        """String value is a row-level failure, routed rather than exploded.
+
+        Strings are iterable in Python, but JSONExplode requires lists. The
+        transform must NOT iterate one — that would fabricate a row per
+        character. It rejects the row explicitly, and (elspeth-5887fb7928)
+        does so via a RETURNED error so `on_error` fires and the row is
+        counted, rather than a raised TypeError that aborted the run.
         """
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
@@ -335,15 +348,19 @@ class TestJSONExplodeTypeViolations:
 
         row = {"id": 1, "items": "abc"}  # String, not array!
 
-        # Should crash with clear error message
-        with pytest.raises(TypeError, match=r"Field 'items' must be a list"):
-            transform.process(make_pipeline_row(row), ctx)
+        result = transform.process(make_pipeline_row(row), ctx)
 
-    def test_dict_value_crashes_with_type_error(self, ctx: PluginContext) -> None:
-        """Dict value is upstream bug - should crash with TypeError.
+        assert result.status == "error"
+        assert result.reason["error_type"] == "wrong_type"
+        assert "got str" in result.reason["error"]
+        # The failure is the POINT: never one row per character.
+        assert result.rows is None
 
-        Dicts are iterable (over keys) in Python, but JSONExplode requires lists.
-        A dict where a list was expected indicates an upstream validation bug.
+    def test_dict_value_routes_as_a_failed_row(self, ctx: PluginContext) -> None:
+        """Dict value is a row-level failure, routed rather than exploded.
+
+        Dicts are iterable (over keys) in Python, but JSONExplode requires
+        lists. Same disposition as the string case above (elspeth-5887fb7928).
         """
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
@@ -356,8 +373,16 @@ class TestJSONExplodeTypeViolations:
 
         row = {"id": 1, "items": {"x": 1, "y": 2}}  # Dict, not list!
 
-        with pytest.raises(TypeError, match=r"Field 'items' must be a list"):
-            transform.process(make_pipeline_row(row), ctx)
+        result = transform.process(make_pipeline_row(row), ctx)
+
+        assert result.status == "error"
+        assert result.reason["error_type"] == "wrong_type"
+        # PipelineRow deep-freezes dicts to MappingProxyType, so the reported
+        # type name is "mappingproxy" — the same deep-freeze fact that turns
+        # lists into tuples. Asserted verbatim so a change to the freeze
+        # wrapper surfaces here rather than in an operator's quarantine sink.
+        assert "got mappingproxy" in result.reason["error"]
+        assert result.rows is None
 
     def test_tuple_value_accepted_after_deep_freeze(self, ctx: PluginContext) -> None:
         """Tuple value is valid — PipelineRow deep-freezes lists to tuples.
@@ -381,8 +406,8 @@ class TestJSONExplodeTypeViolations:
         assert result.rows is not None
         assert len(result.rows) == 3
 
-    def test_non_iterable_value_crashes(self, ctx: PluginContext) -> None:
-        """Non-iterable value is upstream bug - should crash (TypeError)."""
+    def test_non_iterable_value_routes_as_a_failed_row(self, ctx: PluginContext) -> None:
+        """A non-iterable value is a row-level failure, routed (elspeth-5887fb7928)."""
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
@@ -394,8 +419,12 @@ class TestJSONExplodeTypeViolations:
 
         row = {"id": 1, "items": 42}  # int is not iterable
 
-        with pytest.raises(TypeError):
-            transform.process(make_pipeline_row(row), ctx)
+        result = transform.process(make_pipeline_row(row), ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason["error_type"] == "wrong_type"
+        assert "got int" in result.reason["error"]
 
 
 class TestJSONExplodeConfiguration:

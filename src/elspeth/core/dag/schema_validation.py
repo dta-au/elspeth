@@ -1446,14 +1446,29 @@ def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
     against an abstaining upstream would reject every observed-source pipeline
     that names an input column, which the engine runs successfully today.
 
-    Soundness: reject only where the miss is certain. A predecessor is checked
-    only when its effective-guarantee vote actually PARTICIPATED. Here that
-    flag is load-bearing rather than implied — unlike the output-side twin,
-    whose set INTERSECTION is empty for an abstainer anyway, this check uses
-    set DIFFERENCE, which cannot distinguish "abstained" from "participated
-    and guarantees nothing" without it (the distinction ``EffectiveGuaranteeVote``
-    exists to carry, and the one ``validate_sink_required_fields`` rests on).
-    An abstaining upstream stays enforced per-row by the executor contract.
+    Soundness: reject only where the miss is certain, which takes BOTH of the
+    vote's flags. Set DIFFERENCE proves ABSENCE, so it needs a field set that
+    is complete in both directions:
+
+    - PARTICIPATED — the vote has guarantees at all. Load-bearing here rather
+      than implied: the output-side twin's set INTERSECTION is empty for an
+      abstainer anyway, while difference cannot tell "abstained" from
+      "participated and guarantees nothing" without the flag.
+    - CLOSED — no row leaving the predecessor can carry a field outside
+      ``vote.fields``. Reading participation ALONE as completeness is what
+      produced the elspeth-9c5ff8fa7d family of false rejections, because
+      participation only ever meant a LOWER bound. An ``observed`` source
+      naming ``guaranteed_fields: [id]`` participates and still admits any
+      other column: subtracting its guarantee reported a miss for the very
+      pass-through columns its rows carry, and the same pipeline without that
+      strictly ADDITIVE declaration ran green. Declaring more must never
+      reject more. ``closed`` derives from ``SchemaConfig.allows_extra_fields``
+      — the extras-firewall authority the contract layer owns.
+
+    An upstream that is abstaining OR open stays enforced per-row by the
+    executor contract (``DeclaredRequiredFieldsContract.pre_emission_check``),
+    so nothing is unguarded — enforcement moves to the surface that can see
+    the row, which is the only surface that can settle a dynamic schema.
 
     ``_live_predecessors`` filters DIVERT edges for the same never-reject-a-
     runnable-pipeline reason the output twin cites, reached by the opposite
@@ -1461,8 +1476,9 @@ def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
     declared row, so subtracting its fields would report a miss that the rows
     actually traversing the graph never see.
 
-    The vote this rests on is not firewall-aware, and the resulting divergence
-    from the composer runs in ONE direction only (elspeth-9c5ff8fa7d).
+    The vote's FIELD SET is still not firewall-aware — only its ``closed``
+    flag is — and the resulting divergence from the composer runs in ONE
+    direction only (elspeth-9c5ff8fa7d).
     ``walk_effective_guarantee_vote`` unions a predecessor's guarantees through
     every ``passes_through_input`` node without consulting that node's own
     extras firewall, so a ``mode: fixed`` transform mid-pipeline contributes
@@ -1516,7 +1532,7 @@ def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
 
         for predecessor_id in _live_predecessors(graph, node_id):
             vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
-            if not vote.participated:
+            if not vote.participated or not vote.closed:
                 continue
 
             missing = sorted(declared_input - vote.fields)

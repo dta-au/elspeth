@@ -78,6 +78,14 @@ from elspeth.plugins.infrastructure.results import (
     TransformResult,
 )
 
+# Provenance label for a required input field the base class cannot trace to a
+# specific option. It is reached when a config property DERIVED the name (see
+# _reject_unreachable_configured_input_fields) and no column-naming option in
+# the raw config accounts for it. Deliberately generic: naming a specific key
+# here would be a guess, and a wrong key sends the author to edit config they
+# never wrote.
+_DERIVED_INPUT_FIELD_PROVENANCE = "this transform's own options"
+
 
 def is_column_naming_config_option(key: str) -> bool:
     """Whether a config option names a ROW COLUMN rather than an ordinary value.
@@ -734,8 +742,36 @@ class BaseTransform(ABC):
             for item in values:
                 if isinstance(item, str):
                     authored_by.setdefault(item, []).append(key)
+        # PROVENANCE, honestly. ``declared_input_fields`` is multi-provenance:
+        # the author's own ``required_input_fields`` list, and — for the plugins
+        # whose config derives it (web_scrape's ``url_field``, blob_fetch's
+        # ``url_field``, blob_csv_expand's ``blob_ref_field``, textract's
+        # ``key_field``/``bucket_field``/``version_field``, azure document
+        # intelligence's ``source_field``, rag's ``query_field``, field_mapper's
+        # ``mapping``) — an ordinary option the author wrote instead. Naming
+        # ``required_input_fields`` for every member sent the author to edit a
+        # key that is not in their config at all: blob_csv_expand's
+        # ``blob_ref_field`` DEFAULTS to ``blob_ref``, so the message named a
+        # key the author never wrote for a column they never mentioned.
+        #
+        # Claim ``required_input_fields`` only when the author actually wrote
+        # the name there. Otherwise defer to whichever column-naming option the
+        # scan above already matched — that is how ``url_field`` and
+        # ``value_field`` come to be named correctly — and fall back to a
+        # GENERIC BUT TRUE phrase when nothing explains it. The base class
+        # cannot see which option a config property derived a name from, and a
+        # plausible-but-wrong key is worse than an honest vague one: the rest of
+        # the message already names the offending FIELD, which is what the
+        # author searches their options for.
+        authored_required = self.config.get("required_input_fields")
+        authored_required_names = (
+            {value for value in authored_required if isinstance(value, str)} if isinstance(authored_required, (list, tuple)) else set()
+        )
         for name in self.declared_input_fields:
-            authored_by.setdefault(name, []).append("required_input_fields")
+            if name in authored_required_names:
+                authored_by.setdefault(name, []).append("required_input_fields")
+            elif name not in authored_by:
+                authored_by[name] = [_DERIVED_INPUT_FIELD_PROVENANCE]
 
         declared = {field.name for field in schema_config.fields}
         missing = sorted(name for name in authored_by if name not in declared and name.isidentifier())

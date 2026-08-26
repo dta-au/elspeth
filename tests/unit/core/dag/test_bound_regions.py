@@ -1146,6 +1146,238 @@ def _build_crosslimb_no_path_violation() -> None:
     validate_sese_regions(graph, regions)
 
 
+def _build_gate_in_collector_scope(*, escape: str) -> ExecutionGraph:
+    """A plain (non-fork) jump gate INSIDE a collector-bound EXPAND region.
+
+    Pins why ``handle_gate_node``'s post-JUMP barrier re-validation
+    (``token_traversal.py``) needs no collector arm: a gate jump past a
+    collector barrier cannot be authored, because rule 4 refuses the escape
+    at build time (filigree elspeth-494491978d).
+
+    ``escape="control"``: a genuine TWO-TARGET jump gate. The routes land on
+    two DISTINCT in-region legs which converge on the collector through a
+    queue (a direct fan-in of two transforms onto one connection is refused
+    as a duplicate producer). This is what makes the rejections meaningful:
+    without two distinct targets the gate has a single out-edge and is not a
+    jump gate at all, so the rejections would not discriminate "the ESCAPE is
+    refused" from "gates in collector scopes are banned".
+
+    Three escapes. Each pins a distinct AUTHORING shape, NOT a distinct
+    guard. There is one load-bearing guard here — rule 4's
+    NO-PATH-TO-CLOSER limb, pinned by
+    ``_build_collector_region_gate_leg_without_path_to_closer``: an
+    adversarial mutation that neutered BOTH refusals named below still saw
+    all three escapes refused, by that limb. Each test asserts the message
+    that fires TODAY, so a change in which guard trips first shows up as a
+    test failure rather than as a silent shift.
+
+    ``escape="closer_output"``: the gate's second route lands directly on
+    the collector's OWN ``on_success`` connection — the literal jump onto a
+    node strictly past the closer. The builder's duplicate-producer check
+    trips first, because the collector already produces that connection.
+    That is which error arrives first, not what makes the shape safe:
+    neuter that check and rule 4 still refuses it.
+
+    ``escape="sink"``: the gate carries a second route onto a fresh
+    connection whose leg reaches the sink without ever passing through the
+    collector. Rule 4's sink-inside limb trips first. (The sink limb itself
+    is covered elsewhere in this class; what is new here is the
+    collector-bound EXPAND flavour of it.)
+
+    ``escape="queue"``: the gate's second route targets the QUEUE the
+    collector itself feeds. Worth pinning separately because a queue target
+    is the one shape where ``register_producer`` early-returns and never
+    reaches the duplicate-producer check, so neither of the other two
+    rejections implies this one. But the limb that trips is the SAME
+    sink-inside limb as ``escape="sink"`` — the leg is refused for reaching
+    a sink without passing through the closer, not because rule 4 detected
+    a landing strictly past it.
+
+    Honest residual, recorded here because this builder is where the next
+    reader comes looking: if such an escape WERE buildable, a single-member
+    group whose sole member escaped would leave nothing buffered, so no
+    durable BLOCKED row would hold the end-of-input drain loop open and the
+    run would converge with the group never closed. Whether any other
+    end-of-run check catches an unclosed ``group_records`` row was left
+    UNDETERMINED on the ticket.
+
+    Determined 2026-08-26: NOTHING catches it. ``run_lifecycle.py`` and
+    ``ceremony.py`` contain no reference to ``group_records``,
+    ``group_losses``, or open groups; the only end-of-run backstop is
+    ``leader_drain.py``'s end-of-input barrier flush, whose raise sits
+    behind an early return on ``processor.has_blocked_barrier_work()`` —
+    false for a single-member group holding no durable BLOCKED row. Search scope, stated plainly:
+    grep over ``src/elspeth/engine/orchestrator/`` plus a search for any
+    integrity verifier over ``group_records`` in
+    ``src/elspeth/core/landscape/`` (the hits there are read/write models,
+    the exporter and the schema — not end-of-run reconciliation). No engine
+    was run. Still moot for THIS shape, which cannot be built — but it is a
+    live latent gap for any other way a group fails to close (a lost member,
+    a dropped roster settle) and belongs in its own ticket, not here
+    (elspeth-76e936568e).
+    """
+    source = _BoundRegionMockSource()
+    opener = _BoundRegionMultiRowTransform(name="explode_pages", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    stitcher = _BoundRegionCollectorPlugin(name="page_stitcher", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    after = _BoundRegionTransform(name="after_stitch", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    escape_leg = _BoundRegionTransform(name="escape_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    wide_leg = _BoundRegionTransform(name="wide_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    tall_leg = _BoundRegionTransform(name="tall_leg", output_schema_config=SchemaConfig(mode="observed", fields=None))
+
+    queues: dict[str, QueueSettings] = {}
+    collector_on_success = "stitched"
+    after_stitch_input = "stitched"
+    collector_input = "collected"
+    if escape == "queue":
+        queues = {"post_stitch_queue": QueueSettings()}
+        collector_on_success = "post_stitch_queue"
+        after_stitch_input = "post_stitch_queue"
+
+    transforms = [
+        WiredTransform(
+            plugin=opener,  # type: ignore[arg-type]
+            settings=TransformSettings(
+                name="explode_pages", plugin=opener.name, input="source_out", on_success="pages", on_error="discard", options={}
+            ),
+        ),
+        WiredTransform(
+            plugin=after,  # type: ignore[arg-type]
+            settings=TransformSettings(
+                name="after_stitch", plugin=after.name, input=after_stitch_input, on_success="out", on_error="discard", options={}
+            ),
+        ),
+    ]
+
+    routes = {"keep": "collected"}
+    if escape == "closer_output":
+        routes["skip"] = collector_on_success
+    elif escape == "sink":
+        routes["skip"] = "escaped_pages"
+        transforms.append(
+            WiredTransform(
+                plugin=escape_leg,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="escape_leg", plugin=escape_leg.name, input="escaped_pages", on_success="out", on_error="discard", options={}
+                ),
+            )
+        )
+    elif escape == "queue":
+        routes["skip"] = "post_stitch_queue"
+    else:
+        # CONTROL: two DISTINCT in-region targets, both continuing to the
+        # collector. They converge through a queue because a direct fan-in of
+        # two transforms onto one connection is refused as a duplicate
+        # producer — the fan-in mechanism is incidental; what matters is that
+        # the gate genuinely has two out-edges.
+        queues = {"collect_queue": QueueSettings()}
+        collector_input = "collect_queue"
+        routes = {"keep": "wide_pages", "skip": "tall_pages"}
+        transforms.extend(
+            [
+                WiredTransform(
+                    plugin=wide_leg,  # type: ignore[arg-type]
+                    settings=TransformSettings(
+                        name="wide_leg",
+                        plugin=wide_leg.name,
+                        input="wide_pages",
+                        on_success="collect_queue",
+                        on_error="discard",
+                        options={},
+                    ),
+                ),
+                WiredTransform(
+                    plugin=tall_leg,  # type: ignore[arg-type]
+                    settings=TransformSettings(
+                        name="tall_leg",
+                        plugin=tall_leg.name,
+                        input="tall_pages",
+                        on_success="collect_queue",
+                        on_error="discard",
+                        options={},
+                    ),
+                ),
+            ]
+        )
+
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=transforms,
+        sinks={"out": _BoundRegionMockSink("out")},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[GateSettings(name="page_router", input="pages", condition="'keep'", routes=routes)],
+        queues=queues,
+        collectors={
+            "page_stitcher": (
+                stitcher,  # type: ignore[dict-item]
+                CollectorSettings(name="page_stitcher", plugin="stitch_pages", input=collector_input, on_success=collector_on_success),
+            )
+        },
+        scope_settings=[
+            ScopeSettings(
+                name="doc_pages",
+                opener="explode_pages",
+                closer="page_stitcher",
+                policy="require_all",
+            )
+        ],
+    )
+
+
+def _build_collector_region_gate_leg_without_path_to_closer(*, dead_end: bool) -> None:
+    """Rule 4's NO-PATH-TO-CLOSER limb, in a COLLECTOR-bound EXPAND region.
+
+    This is the guard that actually holds the line (filigree elspeth-494491978d).
+    An adversarial mutation that neutered BOTH the duplicate-producer check and
+    rule 4's sink-inside limb still saw every gate escape from a collector scope
+    refused — by THIS limb. It was pinned nowhere: the sibling tests in this
+    class witness the sink-inside limb, and the one existing no-path test
+    (``_build_crosslimb_no_path_violation``) covers a FORK/coalesce region, not
+    an EXPAND/collector one.
+
+    Direct predicate pin over the raw add_edge/GroupBinding surface, the same
+    escape hatch ``_build_crosslimb_no_path_violation`` uses and for the same
+    reason: the connection-namespace check rejects a dangling ``on_success``
+    long before rule 4 runs, so a leg with no outgoing success edge at all is
+    unreachable through settings.
+
+    ``dead_end=False`` is the CONTROL — both gate legs reach the collector, and
+    the region must compute and validate clean. ``dead_end=True`` removes only
+    ``tall_leg``'s edge to the closer.
+    """
+    graph = ExecutionGraph()
+    for node_id, node_type, plugin_name in [
+        ("opener", NodeType.TRANSFORM, "explode_pages"),
+        ("router", NodeType.GATE, "page_router"),
+        ("wide_leg", NodeType.TRANSFORM, "wide_leg"),
+        ("tall_leg", NodeType.TRANSFORM, "tall_leg"),
+        ("stitcher", NodeType.COLLECTOR, "page_stitcher"),
+        ("out", NodeType.SINK, "json"),
+    ]:
+        graph.add_node(node_id, node_type=node_type, plugin_name=plugin_name)
+    graph.add_edge("opener", "router", label="continue", mode=RoutingMode.MOVE)
+    graph.add_edge("router", "wide_leg", label="keep", mode=RoutingMode.MOVE)
+    graph.add_edge("router", "tall_leg", label="skip", mode=RoutingMode.MOVE)
+    graph.add_edge("wide_leg", "stitcher", label="continue", mode=RoutingMode.MOVE)
+    if not dead_end:
+        graph.add_edge("tall_leg", "stitcher", label="continue", mode=RoutingMode.MOVE)
+    graph.add_edge("stitcher", "out", label="continue", mode=RoutingMode.MOVE)
+
+    binding = GroupBinding(
+        kind=FrameKind.EXPAND,
+        opener_node_id=NodeID("opener"),
+        opener_name="explode_pages",
+        closer_node_id=NodeID("stitcher"),
+        closer_name="page_stitcher",
+        closer_kind=CloserKind.COLLECTOR,
+        policy="require_all",
+        member_roster=(),
+    )
+    registry = GroupBindingRegistry(bindings=(binding,))
+    regions = compute_bound_regions(graph, registry, max_depth=5)
+    validate_sese_regions(graph, regions)
+
+
 class TestSESEWalk:
     """Spec §7 rule 4 (bidirectional SESE, success-path edges only).
 
@@ -1273,6 +1505,90 @@ class TestSESEWalk:
         # hole.
         with pytest.raises(GraphValidationError, match="not one of the fork's declared branches"):
             _build_onehop_queue_backdoor()
+
+    def test_gate_inside_collector_scope_builds(self) -> None:
+        # CONTROL for the escapes below (filigree elspeth-494491978d).
+        # A genuine TWO-TARGET jump gate inside a collector-bound EXPAND
+        # region is legal, so the rejections that follow track the ESCAPE and
+        # not gates-in-scopes as a class. The two-target shape is the whole
+        # point: a control whose routes share one target has a single
+        # out-edge and is not a jump gate, so it would not earn that
+        # conclusion. Pin observables, not "did not raise".
+        graph = _build_gate_in_collector_scope(escape="control")
+        (region,) = graph.get_bound_regions()
+        assert region.binding.kind is FrameKind.EXPAND
+        assert region.binding.closer_kind is CloserKind.COLLECTOR
+        assert region.binding.closer_name == "page_stitcher"
+        assert _plugin_names(graph, region.member_node_ids) == {
+            "config_gate:page_router",
+            "wide_leg",
+            "tall_leg",
+            "queue:collect_queue",
+        }
+        gate_node_ids = [n for n in region.member_node_ids if graph.get_node_info(n).node_type is NodeType.GATE]
+        assert len(gate_node_ids) == 1
+        # The gate really does have two distinct out-edges to two distinct
+        # in-region legs — the property that makes this a jump gate at all.
+        gate_targets = {edge.to_node for edge in graph.get_outgoing_edges(gate_node_ids[0])}
+        assert len(gate_targets) == 2
+        assert gate_targets <= region.member_node_ids
+
+    def test_gate_jump_onto_collector_output_rejected_by_duplicate_producer(self) -> None:
+        # elspeth-494491978d: `handle_gate_node`'s post-JUMP barrier
+        # re-validation carries no collector arm. This pins WHY that is
+        # sound — the jump-past-a-collector shape cannot be authored — and
+        # it pins the guard that ACTUALLY refuses the direct edge. The
+        # ticket's falsification attributed this variant to rule 4; the
+        # duplicate-producer check fires first, because landing on a node
+        # strictly past the closer means landing on a connection the
+        # collector already produces.
+        with pytest.raises(GraphValidationError, match=r"Duplicate producer for connection 'stitched'") as exc_info:
+            _build_gate_in_collector_scope(escape="closer_output")
+        assert "page_stitcher" in str(exc_info.value)
+        assert "page_router" in str(exc_info.value)
+
+    def test_gate_sink_escape_from_collector_scope_rejected(self) -> None:
+        # The collector-bound EXPAND flavour of the sink-inside limb: a gate
+        # inside the region routing onto a leg that reaches the sink without
+        # passing through the collector. This is NOT a jump past the closer
+        # (see the duplicate-producer case above for that) — it is the other
+        # way a token could leave a collector's region.
+        with pytest.raises(GraphValidationError, match=r"reaches sink .* before the region's closer") as exc_info:
+            _build_gate_in_collector_scope(escape="sink")
+        assert "page_stitcher" in str(exc_info.value)
+
+    def test_collector_region_gate_leg_without_path_to_closer_control_builds(self) -> None:
+        # CONTROL: both gate legs reach the collector — must validate clean,
+        # so the rejection below is caused by the missing path and not by the
+        # hand-built region set itself.
+        _build_collector_region_gate_leg_without_path_to_closer(dead_end=False)
+
+    def test_collector_region_gate_leg_without_path_to_closer_rejected(self) -> None:
+        # The guard that is ACTUALLY load-bearing here. With both the
+        # duplicate-producer check and the sink-inside limb neutered, this limb
+        # still refuses every gate escape from a collector-bound region — and
+        # until now nothing pinned it for an EXPAND/collector region
+        # (filigree elspeth-494491978d). Assert the limb's own message, not the
+        # sink text its siblings assert, so a future change that collapses the
+        # two limbs into one cannot pass this silently.
+        with pytest.raises(GraphValidationError, match="has no success path to") as exc_info:
+            _build_collector_region_gate_leg_without_path_to_closer(dead_end=True)
+        assert "tall_leg" in str(exc_info.value)
+        assert "page_stitcher" in str(exc_info.value)
+        assert "reaches sink" not in str(exc_info.value)
+
+    def test_gate_queue_mediated_escape_from_collector_scope_rejected(self) -> None:
+        # NOT redundant with the duplicate-producer case: a queue target is
+        # the one shape where `register_producer` early-returns
+        # (builder.py:1015-1017) and never reaches the duplicate-producer
+        # check, so that rejection does not imply this one. But it is the
+        # SAME rule-4 limb as the sink case above — the escape is refused
+        # because the leg reaches a sink without passing through the closer,
+        # not because rule 4 detected a landing strictly past the closer.
+        # What this pins is a different AUTHORING shape, not a second guard.
+        with pytest.raises(GraphValidationError, match=r"reaches sink .* before the region's closer") as exc_info:
+            _build_gate_in_collector_scope(escape="queue")
+        assert "page_stitcher" in str(exc_info.value)
 
 
 class TestFixpointBound:

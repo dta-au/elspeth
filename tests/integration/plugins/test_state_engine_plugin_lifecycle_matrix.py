@@ -136,6 +136,12 @@ def _rows_for(plugin_key: str) -> list[dict[str, object]]:
         "transform:batch_threshold_summary": [{"quality_score": 0.9}, {"quality_score": 0.6}],
         "transform:batch_top_k": [{"predicted_label": "pass", "model": "m"}],
         "transform:blob_csv_expand": [{"blob_ref": "filled-by-harness"}],
+        # Both expanders read the blob arm of their `example_use`, so the row
+        # must carry every column that arm declares — blob_json_expand also
+        # names a `content_type_field`, and the engine's declared-required
+        # fields gate fires before the plugin does.
+        "transform:blob_json_expand": [{"blob_ref": "filled-by-harness", "blob_content_type": "application/json"}],
+        "transform:blob_text_expand": [{"blob_ref": "filled-by-harness"}],
         "transform:blob_fetch": [{"document_url": "filled-by-harness"}],
         "transform:field_mapper": [{"id": 1, "applicant": "Ada", "notes": "ok"}],
         "transform:json_explode": [{"items": ["a", "b"]}],
@@ -146,6 +152,7 @@ def _rows_for(plugin_key: str) -> list[dict[str, object]]:
         "transform:report_assemble": [{"line": "alpha"}, {"line": "beta"}],
         "transform:truncate": [{"notes": "brief"}],
         "transform:type_coerce": [{"price": "2.5", "quantity": "3", "in_stock": "true"}],
+        "transform:reference_join": [{"product": "hats"}],
         "transform:value_transform": [{"price": 2.0, "quantity": 3}],
         "transform:web_scrape": [{"page_url": "filled-by-harness"}],
         "sink:document": [{"announcement_text": "hello"}],
@@ -210,6 +217,13 @@ def _materialize_pipeline(
     if kind in {"transform", "sink"}:
         if case.plugin_key == "transform:blob_csv_expand":
             rows[0]["blob_ref"] = store.store(b"ignored\n1,hello\n")
+        if case.plugin_key == "transform:blob_json_expand":
+            # Keys match the `data_key`/`fields` the example_use declares.
+            rows[0]["blob_ref"] = store.store(
+                json.dumps({"documents": [{"document_id": "d1", "title": "matrix", "sections": ["alpha"]}]}).encode("utf-8")
+            )
+        if case.plugin_key == "transform:blob_text_expand":
+            rows[0]["blob_ref"] = store.store(b"alpha\nbeta\n")
         if case.plugin_key == "transform:pdf_rasterize":
             rows[0]["blob_ref"] = store.store(minimal_pdf(1))
         if case.plugin_key in {"transform:blob_fetch", "transform:web_scrape"}:
@@ -392,7 +406,7 @@ def _stop_server(server: multiprocessing.Process | None) -> None:
 
 def test_local_lifecycle_cases_cover_the_exact_reviewed_subject_set() -> None:
     assert tuple(case.plugin_key for case in LOCAL_LIFECYCLE_CASES) == _reviewed_local_subjects()
-    assert len(LOCAL_LIFECYCLE_CASES) == 35
+    assert len(LOCAL_LIFECYCLE_CASES) == 38
     assert {case.profile_case for case in LOCAL_LIFECYCLE_CASES} == {SQLITE_SINGLE_LEADER}
 
 

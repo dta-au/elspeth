@@ -4802,3 +4802,111 @@ async def test_bounded_acompletion_rejects_absent_or_invalid_timeout() -> None:
         await chat_solver._bounded_acompletion({}, None)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="finite positive"):
         await chat_solver._bounded_acompletion({}, 0)
+
+
+# --- retain_deferred_intent teaching block: derivation and reach pins -------
+#
+# elspeth-1ebf08f8ec landed the teaching block with its ENTIRE output surface
+# unpinned: an adversarial pass found that deleting all four
+# `_deferred_intent_teaching_block()` calls left every existing test green,
+# because the three tests that call the spliced builders assert only redaction
+# and inventory content. "The suite is green" was true and meaningless.
+#
+# These pins are deliberately the INVERSE of the code's own discipline. The
+# block DERIVES the cap and the kind union from the authorities that enforce
+# them; the tests below RESTATE both by hand. That asymmetry is the point —
+# exactly one side derives, so changing an authority turns these red and a
+# human looks at whether the planner-facing prose should follow. A test that
+# re-derived from the same schema would agree with the code by construction
+# and could never fail.
+
+
+def test_teaching_block_reaches_every_site_where_the_retain_tool_is_attached() -> None:
+    """All FOUR splice sites emit the block — two builders, both arms each.
+
+    `retain_deferred_intent` is attached unconditionally at both step-1 and
+    step-2, in both the form-directed-revision arm and the ordinary arm, so a
+    planner that is offered the tool without its rules is the defect this pins.
+    Disconnecting any single site turns this red.
+    """
+
+    marker = "At most"
+    step_1_arms = (
+        _build_step_1_source_dynamic_block(
+            plugin_hint="csv",
+            current_source=None,
+            available_source_plugins=("csv",),
+            form_directed_revision=False,
+        ),
+        _build_step_1_source_dynamic_block(
+            plugin_hint="csv",
+            current_source=None,
+            available_source_plugins=("csv",),
+            form_directed_revision=True,
+        ),
+    )
+    step_2_arms = (
+        _build_step_2_sink_tool_prompt(current_sink=None, form_directed_revision=False),
+        _build_step_2_sink_tool_prompt(current_sink=None, form_directed_revision=True),
+    )
+
+    for prompt in (*step_1_arms, *step_2_arms):
+        assert marker in prompt
+        assert "cannot carry what the user asked for" in prompt
+        assert "must be EXACTLY the latest stage" in prompt
+
+
+def test_teaching_block_cap_tracks_the_constant_that_enforces_it() -> None:
+    """The rendered cap follows `GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY`.
+
+    Monkeypatched rather than asserted against the constant, because reading
+    the constant here would make both sides derive and no mutation could fail
+    it. The literal 8 below is the hand-restated half: change the constant and
+    this goes red on purpose.
+    """
+
+    assert chat_solver.GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY == 8
+    assert "At most 8 retain calls are accepted in one reply." in chat_solver._deferred_intent_teaching_block()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chat_solver, "GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY", 3)
+        assert "At most 3 retain calls are accepted in one reply." in chat_solver._deferred_intent_teaching_block()
+
+
+def test_teaching_block_names_exactly_the_constraint_kinds_the_schema_offers() -> None:
+    """The rendered kind list is the schema's, restated here by hand.
+
+    Adding a constraint kind to `_DEFERRED_CONSTRAINT_SCHEMA` turns this red.
+    That is the intended signal: a new kind that the planner is offered but
+    never taught about is the gap this block exists to close.
+    """
+
+    block = chat_solver._deferred_intent_teaching_block()
+    expected = (
+        "subject_presence",
+        "option_value",
+        "component_count",
+        "stated_predicate",
+        "stated_gate_routing",
+        "edge_route",
+        "failure_route",
+    )
+
+    assert chat_solver._deferred_constraint_kind_names() == expected
+    assert f"Constraint kinds: {', '.join(f'`{kind}`' for kind in expected)};" in block
+
+
+def test_retain_tool_description_states_the_node_kind_partition() -> None:
+    """The tool description's node-kind sentence, restated by hand.
+
+    The code builds it from `_PLUGIN_FREE_NODE_TYPES` / `_PLUGIN_BEARING_NODE_TYPES`,
+    whose module-load assert already proves they partition `NodeType`. What no
+    assert covers is that the partition actually reaches the sentence the
+    planner reads, which is what this pins.
+    """
+
+    description = chat_solver._DEFERRED_INTENT_TOOL["function"]["description"]
+    assert isinstance(description, str)
+
+    assert "Gate, coalesce, row_union, and queue are structural node types, never transform plugins;" in description
+    assert "transform, aggregation, and collector are node types that each REQUIRE a transform plugin," in description

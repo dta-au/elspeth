@@ -1166,7 +1166,13 @@ class TestFieldMapperDeclaredOutputFieldContracts:
 
         transform = FieldMapper(
             {
-                "schema": DECLARED_SCHEMA,
+                # `raw_cuisine` is DECLARED, unlike DECLARED_SCHEMA: a mapping
+                # source is a configured READ, and a mode: fixed schema is
+                # extra='forbid', so a row carrying an undeclared source dies at
+                # input validation and the rename could never fire. Construction
+                # rejects that as incoherent (elspeth-d3958d90f5). The restamp
+                # under test is unaffected — only the config is made coherent.
+                "schema": {"mode": "fixed", "fields": ["dish: str", "cuisine: str", "raw_cuisine: str"]},
                 "mapping": {"raw_cuisine": "cuisine"},
             }
         )
@@ -1670,3 +1676,285 @@ class TestFieldMapperOverlapNormalization:
         assert result.status == "success"
         assert isinstance(result.row, PipelineRow)
         assert result.row.to_dict() == {"a": "charlie", "z": "delta"}
+
+
+class TestFieldMapperInputGuaranteesUseTheDocumentedPredicate:
+    """The two halves of ONE output config must not contradict each other.
+
+    ``SchemaConfig`` documents the type system as a second, implicit source of
+    guarantees: "A schema with mode=fixed, fields=(id, x) where both are
+    required, but guaranteed_fields=None, still guarantees {id, x}".
+    ``get_effective_guaranteed_fields`` is the predicate that says so.
+
+    field_mapper read the RAW ``guaranteed_fields`` tuple instead, at two sites,
+    collapsing ABSTAIN (``None``) into explicit-zero (``()``). A ``mode: fixed``
+    field_mapper then computed no guaranteed targets and abstained in its own
+    output ``guaranteed_fields``, while ``_project_field_declarations_onto_output``
+    still declared the target REQUIRED — so the effective half of the very same
+    config claimed the target the raw half disowned.
+
+    The composer's Rule C (``transform_declared_output_not_guaranteed``) compares
+    exactly those two halves, so it rejected a pipeline the engine builds and
+    RUNS: composer stricter than engine, a FALSE REJECT on a correct pipeline.
+
+    The pin is the AGREEMENT, not the specific field set — that is the invariant
+    a future edit to either half must not break. Rule C is deliberately left
+    alone: making it abstain on ``None`` would silence the true positives below,
+    so the honest emit prediction has to come from the plugin.
+    """
+
+    @staticmethod
+    def _built(mapping: dict[str, str], fields: list[str], *, select_only: bool = True) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        return FieldMapper(
+            {
+                "select_only": select_only,
+                "mapping": mapping,
+                "schema": {"mode": "fixed", "fields": fields},
+            }
+        )
+
+    @staticmethod
+    def _halves(transform: "object") -> tuple[frozenset[str], frozenset[str]]:
+        config = transform._output_schema_config
+        raw = frozenset(config.guaranteed_fields or ())
+        return raw, frozenset(config.get_effective_guaranteed_fields())
+
+    @pytest.mark.parametrize(
+        ("mapping", "fields"),
+        [
+            ({"a": "z"}, ["a: str"]),
+            ({"a": "a"}, ["a: str"]),
+            ({"a": "z", "b": "y"}, ["a: str", "b: str"]),
+        ],
+    )
+    def test_a_closed_emit_set_does_not_disown_what_the_input_guarantees(
+        self,
+        mapping: dict[str, str],
+        fields: list[str],
+    ) -> None:
+        """Each of these had the raw half abstaining while the effective half claimed."""
+        transform = self._built(mapping, fields)
+
+        raw, effective = self._halves(transform)
+
+        assert raw == effective, f"raw={sorted(raw)} contradicts effective={sorted(effective)}"
+
+    @pytest.mark.parametrize(
+        ("mapping", "fields"),
+        [
+            ({"a": "z"}, ["a: str", "b: str"]),
+            ({}, ["a: str"]),
+        ],
+    )
+    def test_an_open_emit_set_is_a_strict_no_op(
+        self,
+        mapping: dict[str, str],
+        fields: list[str],
+    ) -> None:
+        """``select_only: false`` keeps HEAD's answer, bit for bit.
+
+        The wider predicate is gated on ``_emit_set_is_closed`` because applying
+        it here is a CATEGORY ERROR (elspeth-c84fa33f75): this branch's emitted
+        set is ``(upstream - removed) | targets``, knowable only by the ADR-007
+        walk, and ``process`` resolves removal names at RUNTIME. A review panel
+        reproduced four defects in the ungated form — a FALSE build-time
+        rejection of a working pipeline and a runtime
+        ``DeclaredOutputFieldsViolation`` among them — so this asymmetry is the
+        fix, not an omission from it.
+        """
+        transform = self._built(mapping, fields, select_only=False)
+
+        assert transform._output_schema_config.guaranteed_fields is None
+        assert transform.declared_output_fields == frozenset()
+
+    def test_a_guaranteed_target_is_now_derived_from_a_fixed_input_schema(self) -> None:
+        """The concrete consequence: a declared, required source guarantees its target.
+
+        Scoped to the EMIT description. The sibling assertion this once carried
+        — ``declared_output_fields == {"z"}`` — was removed as part of
+        elspeth-892161b2d5: that set is the field-collision check's trigger, not
+        a statement about what the node emits, and asserting the widened value
+        there pinned the very regression it caused. See
+        ``TestSelectOnlyDoesNotArmTheCollisionCheck``, which pins the opposite
+        and is the claim that matters for the runtime path.
+        """
+        transform = self._built({"a": "z"}, ["a: str"])
+
+        assert transform._output_schema_config.guaranteed_fields == ("z",)
+
+    def test_an_unresolved_original_source_still_abstains(self) -> None:
+        """TRUE POSITIVE, preserved. 'Name' is not a normalization fixed point.
+
+        Which row key it names is unknowable until a row arrives, so the target
+        is not guaranteed however the INPUT contract is declared. Widening the
+        base guarantee set must not reach this case (elspeth-f262a8c678).
+        """
+        transform = self._built({"Name": "nm"}, ["Name: str"])
+
+        assert transform._output_schema_config.guaranteed_fields is None
+        assert transform.declared_output_fields == frozenset()
+
+    def test_an_observed_input_schema_is_unaffected(self) -> None:
+        """``fields is None`` makes effective == explicit, so observed abstains as before."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"select_only": True, "mapping": {"a": "z"}, "schema": DYNAMIC_SCHEMA})
+
+        raw, effective = self._halves(transform)
+        assert raw == effective == frozenset()
+
+
+class TestSelectOnlyDoesNotArmTheCollisionCheck:
+    """``select_only`` cannot overwrite an input field, so it must not declare one.
+
+    ``declared_output_fields`` is the trigger for
+    ``TransformExecutor._run_preflight``'s field-collision check, which raises a
+    per-row ``PluginContractViolation`` when a declared output name is already
+    on the INPUT row. Under ``select_only`` that check is a false positive by
+    its own premise: ``process`` starts from a fresh ``{}``, so it cannot
+    overwrite anything, and a mapping that renames onto a name the input also
+    carries DROPS that input — which is what ``select_only`` MEANS.
+
+    Regression: elspeth-892161b2d5. Widening this set to the effective
+    guarantee predicate armed that sleeping check on configs whose every valid
+    row then failed — 100% row loss at RUNTIME on pipelines that ran before.
+    The shipped examples all rename to FRESH names under ``mode: observed``, so
+    the suite stayed green while the defect was live; the coverage gap was that
+    no test paired ``select_only`` with a fixed/flexible schema declaring the
+    target.
+    """
+
+    @staticmethod
+    def _built(mapping: dict[str, str], fields: list[str], mode: str, required: list[str]) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        return FieldMapper(
+            {
+                "select_only": True,
+                "mapping": mapping,
+                "schema": {"mode": mode, "fields": fields, "required_fields": required},
+            }
+        )
+
+    @pytest.mark.parametrize("mode", ["fixed", "flexible"])
+    @pytest.mark.parametrize("required", [["a", "b"], ["a"]])
+    @pytest.mark.parametrize("target", ["b", "fresh"])
+    def test_select_only_declares_no_output_field(self, mode: str, required: list[str], target: str) -> None:
+        """Every shape the regression armed must leave the check ASLEEP."""
+        fields = ["a: str", "b: str"] if target == "b" else ["a: str", "b: str", "fresh: str"]
+        transform = self._built({"a": target}, fields, mode, required)
+
+        assert transform.declared_output_fields == frozenset()
+
+    def test_a_valid_row_does_not_collide(self) -> None:
+        """The end-to-end consequence: the row the regression failed must pass.
+
+        Pinned through the real collision helper rather than by asserting the
+        empty set twice — an empty declaration is only interesting because it is
+        what keeps this row alive.
+        """
+        from elspeth.contracts.field_collision import detect_field_collisions
+
+        transform = self._built({"a": "b"}, ["a: str", "b: str"], "fixed", ["a", "b"])
+
+        assert detect_field_collisions({"a", "b"}, transform.declared_output_fields) is None
+
+    def test_select_only_still_emits_the_renamed_target(self) -> None:
+        """Declaring nothing must not mean emitting nothing.
+
+        The fix narrows a DECLARATION, not behaviour: the rename still happens
+        and the input field it lands on is dropped, not overwritten.
+        """
+        from elspeth.testing import make_pipeline_row
+        from tests.fixtures.factories import make_context
+
+        transform = self._built({"a": "b"}, ["a: str", "b: str"], "fixed", ["a", "b"])
+        transform.on_start(make_context())
+
+        result = transform.process(make_pipeline_row({"a": "1", "b": "2"}), make_context())
+
+        assert result.status == "success"
+        assert result.row.to_dict() == {"b": "1"}
+
+
+class TestFieldMapperDerivedInputRequirement:
+    """``mapping`` sources become ``declared_input_fields`` (elspeth-d4ae04b374).
+
+    John's ruling: "the field mapper should assert a required field when it's
+    configured." Configuring ``mapping: {source: target}`` IS that assertion,
+    so the requirement is DERIVED from the mapping rather than restated by hand
+    in ``required_input_fields`` — a guard must derive from the authority it
+    enforces.
+
+    ``declared_input_fields`` is the right channel rather than the explicit
+    option because its build-time enforcement gates on the producer's
+    ``EffectiveGuaranteeVote.participated``; the explicit option routes through
+    ``validate_edge_schemas`` Phase 1, a bare set subtraction that also rejects
+    an OBSERVED upstream — which promises nothing because nothing was declared,
+    not because the field is absent.
+    """
+
+    @staticmethod
+    def _config(**overrides: object) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
+
+        options: dict[str, object] = {"schema": DYNAMIC_SCHEMA, "mapping": {"colour": "colour"}}
+        options.update(overrides)
+        return FieldMapperConfig.from_dict(options, plugin_name="field_mapper")
+
+    def test_identity_and_rename_sources_are_both_required(self) -> None:
+        """An identity mapping asserts its source just as a rename does."""
+        config = self._config(mapping={"colour": "colour", "complementary_colour": "recommended_pairing"})
+
+        assert config.declared_input_fields == frozenset({"colour", "complementary_colour"})
+
+    def test_rename_targets_are_not_required(self) -> None:
+        """Targets are CREATED here; requiring them on input is elspeth-d6eeb3a71d."""
+        config = self._config(mapping={"colour": "colour", "complementary_colour": "recommended_pairing"})
+
+        assert "recommended_pairing" not in config.declared_input_fields
+
+    def test_dotted_sources_abstain(self) -> None:
+        """A dotted source is a nested READ, never a row key."""
+        config = self._config(mapping={"meta.origin": "origin", "colour": "colour"})
+
+        assert config.declared_input_fields == frozenset({"colour"})
+
+    @pytest.mark.parametrize("source", ["First Name", "B", "Name", "userID", "class"])
+    def test_non_fixed_point_sources_abstain(self, source: str) -> None:
+        """Config time cannot say which row key these name (elspeth-f262a8c678).
+
+        ``normalize_field_name`` lowercases and keyword-suffixes, so each of
+        these reaches ``process`` through ``contract.resolve_name``. Claiming
+        them as required would reject pipelines that run.
+        """
+        config = self._config(mapping={source: "target"})
+
+        assert config.declared_input_fields == frozenset()
+
+    def test_explicit_required_input_fields_are_unioned_not_replaced(self) -> None:
+        """An author may still declare extra requirements the mapping never names."""
+        config = self._config(mapping={"colour": "colour"}, required_input_fields=["audit_id"])
+
+        assert config.declared_input_fields == frozenset({"colour", "audit_id"})
+
+    def test_empty_mapping_declares_nothing(self) -> None:
+        """A field_mapper with no mapping asserts no input contract."""
+        config = self._config(mapping={})
+
+        assert config.declared_input_fields == frozenset()
+
+    def test_transform_instance_carries_the_derivation(self) -> None:
+        """The declaration must survive construction, not just live on the config."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "mapping": {"colour": "colour", "complementary_colour": "recommended_pairing"},
+            }
+        )
+
+        assert transform.declared_input_fields == frozenset({"colour", "complementary_colour"})

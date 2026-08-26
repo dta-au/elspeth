@@ -1,0 +1,10 @@
+{"content": "urgency: high — a reported defect inside the joined warranty window"}
+{"content": "urgency: medium — a cosmetic issue inside the joined warranty window"}
+{"content": "urgency: low — no defect reported; handle as an exchange"}
+{"content": "urgency: medium — wear-related, inside the joined warranty window"}
+{"content": "urgency: high — a structural failure on a warranted item"}
+{"content": "urgency: medium — assessed against the joined support tier"}
+{"content": "urgency: low — customer preference rather than a fault"}
+{"content": "urgency: high — escalate; the joined support tier warrants it"}
+{"content": "urgency: medium — inside warranty, no escalation needed"}
+{"content": "urgency: low — routine request, no defect found"}

@@ -2524,14 +2524,47 @@ def _numeric_aggregation_diagnostics_for_observed_csv(
     inferred_types: Mapping[str, str] | None,
     observed_headers: tuple[str, ...] | None,
 ) -> list[Mapping[str, Any]]:
-    """Block observed CSV strings before numeric aggregation runtime failures."""
+    """Block observed CSV strings before numeric batch-plugin runtime failures.
+
+    Keyed on the PLUGIN alone. There used to be a `node.node_type ==
+    "aggregation"` gate here, which silently dropped the whole diagnostic for
+    the identical plugin wired as a collector (filigree elspeth-1016a47e8f).
+    It was removed rather than widened to `{"aggregation", "collector"}`,
+    because the composer has no canonical set of "batch-barrier node kinds" to
+    derive such a tuple from, and hand-writing one would be a fifth inline copy
+    of a kind literal on an axis sibling elspeth-b3117ec3ac is canonicalizing.
+
+    The gate was redundant, not load-bearing:
+      * every member of ``_NUMERIC_VALUE_FIELD_AGGREGATION_PLUGINS`` has
+        ``supports_row_mode_when_batch_aware=False``, so it is in
+        ``_known_batch_aware_transform_plugins_requiring_aggregation()`` and
+        ``_batch_aware_placement_error`` — the composer's own placement
+        authority — already refuses ``node_type="transform"`` for it;
+      * plugin-free kinds (gate/coalesce/row_union/queue) have
+        ``node.plugin is None`` and can never match the set.
+    So plugin membership already implies a batch-barrier kind for any
+    composition that validates, and the check now derives from the plugin
+    rather than restating a kind list beside it.
+
+    Two consequences, both deliberate and both erring toward OVER-firing a
+    blocking diagnostic rather than under-firing — the correct direction for a
+    validation control:
+      * on an INVALID draft that misplaces one of these plugins as a
+        ``transform``, this now fires alongside the placement error. The
+        statement is still true (the field really does arrive as ``str``) and
+        the draft is already blocked, so the planner simply gets better repair
+        context;
+      * a plugin-bearing node kind added in future inherits the diagnostic
+        automatically instead of silently losing it, which is how this defect
+        arose in the first place.
+    """
     if _source_schema_mode(source) != "observed" or observed_headers is None:
         return []
 
     observed_header_set = set(observed_headers)
     diagnostics: list[Mapping[str, Any]] = []
     for node in state.nodes:
-        if node.node_type != "aggregation" or node.plugin not in _NUMERIC_VALUE_FIELD_AGGREGATION_PLUGINS:
+        if node.plugin not in _NUMERIC_VALUE_FIELD_AGGREGATION_PLUGINS:
             continue
         options, _owner = get_aggregation_contract_options(node.options, owner=f"node:{node.id}")
         # ``options`` is the external-origin (composer/user-authored) node
@@ -2564,29 +2597,47 @@ def _numeric_aggregation_diagnostics_for_observed_csv(
         # Tier-2 invariant break in our own inspection output, which must crash
         # (subscript), not be silently coerced to None by ``.get()``.
         inferred_type = inferred_types[value_field] if inferred_types is not None else None
+        # The node kind is read off the node, never mapped from the code or the
+        # plugin name: a collector told to fix its pipeline "before aggregation"
+        # is being given an instruction about a node it does not have. Both
+        # placements named below were verified to validate clean AND to clear
+        # this diagnostic (elspeth-1016a47e8f).
+        node_kind = node.node_type
+        scope_clause = (
+            f" This {node_kind} closes an EXPAND scope, so the type_coerce node may sit either INSIDE the scope "
+            f"(between the scope opener and the {node_kind}) or upstream of the scope opener — both are valid."
+            if node_kind == "collector"
+            else ""
+        )
         diagnostics.append(
             _blocking_diagnostic(
                 code="aggregation_numeric_value_field_type_mismatch_against_source_schema",
                 message=(
-                    f"Aggregation '{node.id}' ({node.plugin}) uses numeric value_field '{value_field}', "
+                    f"{node_kind.capitalize()} '{node.id}' ({node.plugin}) uses numeric value_field '{value_field}', "
                     "but it is flowing from an observed CSV source. Observed CSV source values are strings "
                     "unless the source schema declares explicit field types or an upstream type_coerce node "
-                    "converts the field before aggregation."
+                    f"converts the field before it reaches the {node_kind}."
                 ),
                 suggested_repair=(
-                    "Patch the source schema to declare the aggregated field with an explicit numeric type "
-                    f"(for example {value_field}: float), or insert a type_coerce node upstream of the aggregation "
-                    "with a conversions entry targeting the numeric type. A type_coerce (or value_transform) node's "
-                    f"own schema: block declares what ARRIVES at the node — here {value_field} arrives as str — never "
-                    "the transformed result; the coerced type belongs to the node's output contract and is derived "
-                    "automatically from its conversions. Declaring the post-coercion type on the node's own schema is "
-                    "an unsatisfiable input contract and is rejected at the edge. If the field is categorical and you "
-                    "want counts/frequencies, use batch_top_k instead of a numeric aggregation."
+                    "Patch the source schema to declare the batched field with an explicit numeric type "
+                    f"(for example {value_field}: float), or insert a type_coerce node upstream of the {node_kind} "
+                    f"with a conversions entry targeting the numeric type.{scope_clause} A type_coerce (or "
+                    f"value_transform) node's own schema: block declares what ARRIVES at the node — here {value_field} "
+                    "arrives as str — never the transformed result; the coerced type belongs to the node's output "
+                    "contract and is derived automatically from its conversions. Declaring the post-coercion type on "
+                    "the node's own schema is an unsatisfiable input contract and is rejected at the edge. If the "
+                    "field is categorical and you want counts/frequencies, use batch_top_k instead of a numeric "
+                    "batch plugin."
                 ),
                 evidence_locator={
                     "source": "blob",
                     "blob_id": str(blob_id),
                     "node_id": node.id,
+                    # The detector knows the node's kind; carrying it here is what
+                    # lets the preflight label the blocker correctly instead of
+                    # guessing the kind back out of the diagnostic code
+                    # (_proof_component_type, web/execution/service.py).
+                    "node_type": node_kind,
                     "plugin": node.plugin,
                     "field": value_field,
                     "observed_type": "str",

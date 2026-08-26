@@ -22,6 +22,8 @@ column as an extra, and observed schemas declare nothing to contradict.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
@@ -138,3 +140,138 @@ class TestSatisfiableShapesStillConstruct:
                     "schema": {"mode": "fixed", "fields": ["id: int"]},
                 }
             )
+
+
+class TestProvenanceIsAttributedHonestly:
+    """The message must name the option the author ACTUALLY wrote.
+
+    ``declared_input_fields`` is multi-provenance: the author's own
+    ``required_input_fields`` list, or — for the plugins whose config DERIVES it
+    from an ordinary option — that option. The guard named
+    ``required_input_fields`` for every member regardless, so an author who had
+    never written that key was sent to edit it.
+
+    ``blob_csv_expand`` is the worst case and the reason a generic label is not
+    good enough on its own: ``blob_ref_field`` DEFAULTS to ``blob_ref``, so the
+    message named a key the author never wrote, for a column they never
+    mentioned, in a config containing neither string.
+
+    A generic-but-true label beats a specific-but-false one. The base class
+    cannot see which option a config property derived a name from, so where no
+    column-naming option in the raw config accounts for the name it says so
+    plainly rather than guessing — the rest of the message already names the
+    offending FIELD, which is what an author searches their options for.
+    """
+
+    _HTTP: ClassVar[dict[str, str]] = {"abuse_contact": "abuse@example.com", "scraping_reason": "contract test"}
+
+    def test_web_scrape_names_url_field_not_required_input_fields(self) -> None:
+        from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+
+        with pytest.raises(PluginConfigError) as excinfo:
+            WebScrapeTransform(
+                {
+                    "url_field": "page_url",
+                    "content_field": "c",
+                    "fingerprint_field": "f",
+                    "http": self._HTTP,
+                    "schema": {"mode": "fixed", "fields": ["c: str", "f: str"]},
+                }
+            )
+
+        assert "'page_url' (named by url_field)" in str(excinfo.value)
+        assert "required_input_fields" not in str(excinfo.value).split("A 'mode: fixed'")[0]
+
+    def test_blob_fetch_names_url_field(self) -> None:
+        from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+        with pytest.raises(PluginConfigError) as excinfo:
+            BlobFetch(
+                {
+                    "url_field": "page_url",
+                    "http": {"abuse_contact": "abuse@example.com", "fetch_reason": "contract test"},
+                    "schema": {"mode": "fixed", "fields": ["id: str"]},
+                }
+            )
+
+        assert "'page_url' (named by url_field)" in str(excinfo.value)
+
+    def test_textract_names_key_field(self) -> None:
+        from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
+
+        with pytest.raises(PluginConfigError) as excinfo:
+            AWSTextractDocumentAnalysis(
+                {
+                    "region": "ap-southeast-2",
+                    "feature_types": ["TABLES"],
+                    "bucket": "example-bucket",
+                    "text_field": "t",
+                    "key_field": "s3_key",
+                    "schema": {"mode": "fixed", "fields": ["id: str"]},
+                }
+            )
+
+        assert "'s3_key' (named by key_field)" in str(excinfo.value)
+
+    def test_azure_document_intelligence_names_source_field(self) -> None:
+        with pytest.raises(PluginConfigError) as excinfo:
+            AzureDocumentIntelligence(
+                {
+                    **_DI_BASE,
+                    "schema": {"mode": "fixed", "fields": ["doc_id: str"]},
+                }
+            )
+
+        assert "'doc_url' (named by source_field)" in str(excinfo.value)
+
+    def test_rag_names_query_field(self) -> None:
+        from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
+
+        with pytest.raises(PluginConfigError) as excinfo:
+            RAGRetrievalTransform(
+                {
+                    "query_field": "q",
+                    "output_prefix": "rag",
+                    "provider": "chroma",
+                    "provider_config": {"collection": "ragcoll", "persist_directory": "/tmp/rag-probe"},
+                    "schema": {"mode": "fixed", "fields": ["id: str"]},
+                }
+            )
+
+        assert "'q' (named by query_field)" in str(excinfo.value)
+
+    def test_blob_csv_expand_defaulted_option_does_not_claim_required_input_fields(self) -> None:
+        """The worst case: the author wrote NEITHER key that HEAD named.
+
+        ``blob_ref_field`` is not in the config at all — its default supplies
+        ``blob_ref`` — so no column-naming option can be credited, and the
+        honest answer is a generic one. What must NOT happen is the message
+        naming ``required_input_fields``, which is nowhere in this config.
+        """
+        from elspeth.plugins.transforms.blob_csv_expand import BlobCSVExpand
+
+        with pytest.raises(PluginConfigError) as excinfo:
+            BlobCSVExpand({"schema": {"mode": "fixed", "fields": ["id: str"]}})
+
+        message = str(excinfo.value)
+        provenance = message.split("A 'mode: fixed'")[0]
+        assert "'blob_ref' (named by this transform's own options)" in message
+        assert "required_input_fields" not in provenance
+
+    def test_an_authored_required_input_field_still_names_that_option(self) -> None:
+        """The one provenance HEAD got right must stay right.
+
+        Narrowing the claim must not silence it: a name the author DID write in
+        ``required_input_fields`` is still attributed there.
+        """
+        with pytest.raises(PluginConfigError) as excinfo:
+            KeywordFilter(
+                {
+                    "fields": ["notes"],
+                    "blocked_patterns": ["x"],
+                    "required_input_fields": ["audit_id"],
+                    "schema": {"mode": "fixed", "fields": ["notes: str"]},
+                }
+            )
+
+        assert "'audit_id' (named by required_input_fields)" in str(excinfo.value)

@@ -2129,6 +2129,48 @@ describe("GraphView", () => {
       ]);
     });
 
+    it("draws the outbound edge of an aggregation that omits on_success", () => {
+        // Same rule as the coalesce above, and missed on the first pass here
+        // AND in the Python: `AggregationSettings.on_success` is
+        // `str | None = None`, and core/dag/builder.py registers
+        // `agg_settings.name` when it is omitted. Excluding aggregation left
+        // its consumer drawn as an orphan, exactly as a non-terminal coalesce
+        // was.
+      const state = coalesceState();
+      const merge = state.nodes.find((node) => node.id === "merge_branches")!;
+      merge.on_success = "rolled_up";
+      state.nodes.push({
+        id: "roll_up",
+        node_type: "aggregation",
+        plugin: "row_batcher",
+        input: "rolled_up",
+        on_success: null,
+        on_error: null,
+        options: {},
+        condition: null,
+        routes: null,
+        fork_to: null,
+        branches: null,
+        policy: null,
+        merge: null,
+      } as unknown as NodeSpec);
+      state.nodes.push(
+        makeNode({
+          id: "select_fields",
+          plugin: "field_mapper",
+          input: "roll_up",
+          on_success: "final_out",
+        }),
+      );
+      useSessionStore.setState({ compositionState: state });
+      render(<GraphView />);
+
+      expect(edgeIds()).toContain("edge-inferred-conn-roll_up-select_fields");
+      expect(inboundEdgeIds("select_fields")).toEqual([
+        "edge-inferred-conn-roll_up-select_fields",
+      ]);
+    });
+
     it("does not invent an implicit outbound connection for a TERMINAL coalesce", () => {
       // The mirror of the rule: a declared on_success always wins, so a
       // terminal coalesce must not ALSO publish under its own id. A node

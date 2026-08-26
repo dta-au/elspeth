@@ -43,19 +43,37 @@ def is_source_producer_id(producer_id: str) -> bool:
 # node id, when they declare no ``on_success``. A downstream node reaches
 # them by naming the node id in its ``input``.
 #
-#   queue    — never declares on_success; its id IS the connection its
-#              predecessors publish to and its consumers read from.
-#   coalesce — on_success is OPTIONAL (CoalesceSettings.on_success: "Sink name
-#              for coalesce output. Required when coalesce is terminal (no
-#              downstream transforms)."). Omitted => non-terminal => publishes
-#              under its own id.
+# The population is decided by ONE authority — ``core/dag/builder.py``'s
+# ``register_producer`` calls — because that is what actually resolves a
+# downstream ``input`` at build time. Read it there; do not infer membership
+# from a kind's "shape".
+#
+#   queue       — never declares on_success; its id IS the connection its
+#                 predecessors publish to and its consumers read from.
+#   coalesce    — on_success is OPTIONAL (CoalesceSettings.on_success: "Sink
+#                 name for coalesce output. Required when coalesce is terminal
+#                 (no downstream transforms)."). Omitted => non-terminal =>
+#                 publishes under its own id.
+#   aggregation — same shape, and MISSED on the first pass of this helper:
+#                 ``AggregationSettings.on_success`` is ``str | None = None``
+#                 (core/config.py) and builder.py does
+#                 ``if agg_settings.on_success is None:
+#                 register_producer(agg_settings.name, ...)``. Omitting it here
+#                 made the composer reject a pipeline the runtime builds and
+#                 runs, with ``node_input_not_reachable`` on the consumer.
 #
 # row_union and collector are deliberately absent: both REQUIRE on_success
 # (RowUnionSettings.validate_on_success — "Unlike coalesce, on_success is
 # required"; CollectorSettings.on_success is a non-optional field), so they
 # never publish implicitly and adding them here would invent a connection
 # name the DAG builder does not resolve.
-_IMPLICIT_SELF_PUBLISHING_NODE_TYPES = frozenset({"queue", "coalesce"})
+#
+# The aggregation miss is worth remembering when editing this list: the first
+# version of this comment enumerated the exclusions confidently and simply
+# never considered aggregation, which made an incomplete set look considered.
+# A new node kind belongs here if and only if builder.py registers it under
+# its own name.
+_IMPLICIT_SELF_PUBLISHING_NODE_TYPES = frozenset({"queue", "coalesce", "aggregation"})
 
 
 def published_success_connection(node: NodeSpec) -> str | None:
@@ -63,9 +81,10 @@ def published_success_connection(node: NodeSpec) -> str | None:
 
     THE single statement of this rule. Every reader that needs to know "what
     does this node's output connect to" must call this rather than testing
-    ``node.on_success`` directly: a non-terminal coalesce (and every queue)
-    has ``on_success is None`` yet is fully connected, and a hand-written
-    ``node.on_success is not None`` check reads that as "not connected".
+    ``node.on_success`` directly: a non-terminal coalesce, an aggregation
+    that omits on_success, and every queue all have ``on_success is None``
+    yet are fully connected, and a hand-written ``node.on_success is not
+    None`` check reads that as "not connected".
 
     Returns None only when the node genuinely publishes nothing on its
     success channel (a fork gate, whose output is described by routes /

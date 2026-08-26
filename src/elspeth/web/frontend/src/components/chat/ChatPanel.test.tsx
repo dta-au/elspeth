@@ -405,6 +405,89 @@ describe("ChatPanel", () => {
     expect(screen.getByText("Revise the request and send it again.")).toBeInTheDocument();
   });
 
+  // The terminal snapshot bridges the gap between a turn settling and its
+  // reply rendering, then must RETIRE. Nothing else clears composerProgress
+  // until the next compose, so a bare `|| isTerminal` left this mounted
+  // indefinitely — and because it is docked inside the composer's flex
+  // column, it held its full completed-turn height in the input's space.
+  // These two pin the retirement RULE (has the reply landed?), not the
+  // symptom (how tall the box got).
+  const terminalCompleteProgress: ComposerProgressSnapshot = {
+    session_id: "session-1",
+    request_id: "message-1",
+    phase: "complete",
+    headline: "The composer has updated the pipeline.",
+    evidence: ["The assistant response has been saved for this session."],
+    likely_next: "Review the response and current pipeline.",
+    reason: null,
+    updated_at: "2026-04-26T10:00:02Z",
+  };
+
+  const idleComposer = {
+    sendMessage: vi.fn(),
+    retryMessage: vi.fn(),
+    cancelComposition: vi.fn(),
+    isComposing: false,
+    compositionState: null,
+    error: null,
+  };
+
+  const soloSession: Session = {
+    id: "session-1",
+    title: "Composer session",
+    created_at: "2026-04-26T10:00:00Z",
+    updated_at: "2026-04-26T10:00:00Z",
+  };
+
+  const chatMsg = (
+    overrides: Partial<ChatMessage> & { id: string; role: ChatMessage["role"] },
+  ): ChatMessage => ({
+    session_id: "session-1",
+    content: "",
+    tool_calls: null,
+    created_at: "2026-04-26T10:00:01Z",
+    ...overrides,
+  });
+
+  it("retires terminal composer progress once the final assistant text lands", () => {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [soloSession],
+      // A complete agent tail: an assistant row carrying non-empty content is
+      // what flips ChatTurn.isComplete (see turns.ts).
+      messages: [
+        chatMsg({ id: "u1", role: "user", content: "Build me a pipeline" }),
+        chatMsg({ id: "a1", role: "assistant", content: "Done — the pipeline is saved." }),
+      ],
+      composerProgress: terminalCompleteProgress,
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.getByText("Done — the pipeline is saved.")).toBeInTheDocument();
+    expect(screen.queryByText("Last composer update")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("The composer has updated the pipeline."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps terminal composer progress while the reply has not landed yet", () => {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [soloSession],
+      // Tail is the user's row — the turn settled but no reply text exists,
+      // so the snapshot is still the only account of what happened.
+      messages: [chatMsg({ id: "u1", role: "user", content: "Build me a pipeline" })],
+      composerProgress: terminalCompleteProgress,
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.getByText("The composer has updated the pipeline.")).toBeInTheDocument();
+  });
+
   it("scopes an unsent freeform draft to its session across switches", () => {
     // elspeth-ca38667856: ChatPanel stays mounted across session switches, so
     // an unscoped inputText leaked session A's unsent draft into session B's
