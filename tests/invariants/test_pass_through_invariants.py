@@ -136,6 +136,15 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         plugins = _non_pass_through_plugins()
         metafunc.parametrize("_non_pass_through_cls", plugins, ids=lambda c: c.__name__)
 
+    if "_preserving_cls" in metafunc.fixturenames:
+        preserving = [cls for cls in _registered_transform_classes() if cls.preserves_input_values]
+        assert preserving, (
+            "Expected at least 1 preserves_input_values=True transform "
+            "(passthrough and llm declare it); plugin registration may have "
+            "failed — the value-preservation harness would silently pass."
+        )
+        metafunc.parametrize("_preserving_cls", preserving, ids=lambda c: c.__name__)
+
 
 def _probe_context(transform: BaseTransform) -> Any:
     """Minimal TransformContext for probe invocations.
@@ -249,6 +258,55 @@ def test_annotated_transforms_preserve_input_fields(
             f"but dropped fields {sorted(dropped)!r} from probe row "
             f"{row.to_dict()!r}. Either fix the implementation or remove "
             "the annotation."
+        )
+
+
+@given(row=probe_row())
+@settings(
+    max_examples=30,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+)
+def test_preserving_transforms_do_not_rewrite_values(
+    _preserving_cls: type[BaseTransform],
+    row: PipelineRow,
+) -> None:
+    """Value invariant — elspeth-e6e552ce34.
+
+    Every emitted row from a ``preserves_input_values=True`` transform must
+    carry each surviving input field with a value ``==`` to its input value.
+    This is the promise that lets the build-time type-resolution walk recurse
+    through the transform; a rewrite here means the annotation is a lie and
+    build verdicts built on it are unsound. Unprobeable declarers (no
+    ``probe_config()``, e.g. llm's provider dependency) skip, exactly like
+    the presence harness above — their truth rests on code review at the
+    declaration site.
+    """
+    try:
+        transform = _probe_instantiate(_preserving_cls)
+    except _UnprobeableTransform as exc:
+        pytest.skip(f"{_preserving_cls.__name__}: {exc.reason}")
+
+    probe_rows = transform.forward_invariant_probe_rows(row)
+    input_values = {name: probe.to_dict()[name] for probe in probe_rows for name in _observed_fields(probe) if name in probe.to_dict()}
+
+    result = transform.execute_forward_invariant_probe(
+        probe_rows,
+        _probe_context(transform),
+    )
+    if result.status != "success":
+        return
+
+    for emitted in _emitted_rows_from_result(result):
+        payload = emitted.to_dict()
+        rewritten = {
+            name: (input_values[name], payload[name]) for name in input_values if name in payload and payload[name] != input_values[name]
+        }
+        assert not rewritten, (
+            f"{_preserving_cls.__name__} is annotated preserves_input_values=True "
+            f"but rewrote {rewritten!r} on probe row {row.to_dict()!r}. Either "
+            "fix the implementation or remove the annotation — the type-"
+            "resolution walk recurses through this transform on that promise."
         )
 
 

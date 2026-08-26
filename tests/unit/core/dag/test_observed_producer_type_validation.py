@@ -266,3 +266,83 @@ class TestValuePreservingPassThroughResolution:
         _append_passthrough(graph, "keep", "src", preserves_input_values=True)
         graph.add_edge("errsrc", "keep", label="divert", mode=RoutingMode.DIVERT)
         assert resolve_guaranteed_field_type(graph, "keep", "id") is None
+
+
+class TestPluginDeclarations:
+    """The real plugins carry the facts, and the builder threads them."""
+
+    _PIPELINE = """sources:
+  primary:
+    plugin: csv
+    on_success: rows
+    options:
+      path: examples/fork_coalesce/input.csv
+      schema:
+        mode: observed
+        guaranteed_fields: [id, description]
+      on_validation_failure: discard
+
+transforms:
+- name: keep
+  plugin: passthrough
+  input: rows
+  on_success: output
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: out.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+"""
+
+    def _graph(self) -> ExecutionGraph:
+        from elspeth.cli_helpers import instantiate_plugins_from_config
+        from elspeth.core.config import load_settings_from_yaml_string
+
+        settings = load_settings_from_yaml_string(self._PIPELINE)
+        plugins = instantiate_plugins_from_config(settings)
+        return ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=settings.gates,
+            coalesce_settings=settings.coalesce,
+        )
+
+    def test_csv_source_declares_str_observed_cells(self) -> None:
+        graph = self._graph()
+        source_ids = [nid for nid, data in graph._graph.nodes(data=True) if data["info"].node_type is NodeType.SOURCE]
+        assert len(source_ids) == 1
+        assert graph.get_node_info(source_ids[0]).observed_value_type == "str"
+
+    def test_passthrough_declares_value_preservation(self) -> None:
+        graph = self._graph()
+        transform_ids = [nid for nid, data in graph._graph.nodes(data=True) if data["info"].node_type is NodeType.TRANSFORM]
+        assert len(transform_ids) == 1
+        assert graph.get_node_info(transform_ids[0]).preserves_input_values is True
+
+    def test_llm_transform_declares_value_preservation(self) -> None:
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        assert LLMTransform.preserves_input_values is True
+
+    def test_rewriting_declarers_stay_false(self) -> None:
+        """type_coerce, value_transform, and truncate rewrite forwarded
+        values in place — the promise must never appear on them."""
+        from elspeth.plugins.transforms.truncate import Truncate
+        from elspeth.plugins.transforms.type_coerce import TypeCoerce
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        assert TypeCoerce.preserves_input_values is False
+        assert ValueTransform.preserves_input_values is False
+        assert Truncate.preserves_input_values is False

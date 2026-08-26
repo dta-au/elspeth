@@ -86,7 +86,13 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2b4b87f0eaca5602"
+    source_file_hash: str | None = "sha256:ffb1e0e20cdf780d"
+    # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
+    # strings, and observed schemas preserve parsed cells untouched (module
+    # docstring), so under mode: observed EVERY emitted cell is str by
+    # construction. Fixed/flexible schemas coerce declared columns and are
+    # unaffected — the declaration carries their types.
+    observed_value_type = "str"
     config_model = CSVSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
