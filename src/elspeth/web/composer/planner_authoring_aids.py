@@ -1413,10 +1413,10 @@ def _collapse_uniform_variant_fields(fields: list[dict[str, object]]) -> list[di
         if "nullable" in field and field["nullable"] is not False:
             continue
         enum_values = field["enum"]
-        assert isinstance(enum_values, list)
+        assert type(enum_values) is list
         name = field["name"]
-        assert isinstance(name, str)
-        declared = frozenset(value for value in enum_values if isinstance(value, str))
+        assert type(name) is str
+        declared = frozenset(value for value in enum_values if type(value) is str)
         if name in variants_by_discriminator and variants_by_discriminator[name] != declared:
             ambiguous_discriminators.add(name)
         variants_by_discriminator[name] = declared
@@ -1432,8 +1432,8 @@ def _collapse_uniform_variant_fields(fields: list[dict[str, object]]) -> list[di
         variant: object = None
         if "visible_when" in field:
             predicate = field["visible_when"]
-            assert isinstance(predicate, dict)
-            assert isinstance(predicate["field"], str)
+            assert type(predicate) is dict
+            assert type(predicate["field"]) is str
             discriminator = predicate["field"]
             variant = predicate["equals"]
         body = {key: value for key, value in field.items() if key != "visible_when"}
@@ -1444,7 +1444,7 @@ def _collapse_uniform_variant_fields(fields: list[dict[str, object]]) -> list[di
             group_coverage[group] = set()
             collapsible[group] = discriminator is not None
         group_members[group].append(field)
-        if isinstance(variant, str):
+        if type(variant) is str:
             group_coverage[group].add(variant)
         else:
             collapsible[group] = False
