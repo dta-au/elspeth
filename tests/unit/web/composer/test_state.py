@@ -2401,6 +2401,114 @@ class TestStage1Validation:
         assert result.is_valid
         assert any("orphan" in w.message and "never receive data" in w.message for w in result.warnings)
 
+    def test_validate_w3_warns_on_a_dead_ended_non_terminal_coalesce(self) -> None:
+        """W3 must still fire when NOTHING consumes the coalesce.
+
+        Regression pair for the two ways this warning has been wrong. It first
+        asked ``node.on_success is not None``, which accused every CONNECTED
+        non-terminal coalesce (a false positive the composer's own planner saw
+        and talked itself past). Replacing that with "does it publish
+        anything?" fixed the false positive and introduced a false NEGATIVE:
+        an implicit self-publisher always publishes — under its own id — so a
+        genuinely dead-ended coalesce went unreported.
+
+        The question that is right in both directions is whether the published
+        connection is CONSUMED. Both halves are pinned here and in
+        ``test_validate_w3_silent_when_the_coalesce_is_consumed`` below; do not
+        "simplify" either back into a presence check.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="fan",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=["ba", "bb"],
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(self._make_transform("a", "ba", "a_out"))
+        state = state.with_node(self._make_transform("b", "bb", "b_out"))
+        state = state.with_node(
+            NodeSpec(
+                id="merge",
+                node_type="coalesce",
+                plugin=None,
+                input="a_out",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"ba": "a_out", "bb": "b_out"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+        result = state.validate()
+        assert any("merge" in (w.component or "") and "no outgoing edges" in w.message for w in result.warnings), [
+            w.to_dict() for w in result.warnings
+        ]
+
+    def test_validate_w3_silent_when_the_coalesce_is_consumed(self) -> None:
+        """The other half: a CONSUMED non-terminal coalesce is not accused."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="fan",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=["ba", "bb"],
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(self._make_transform("a", "ba", "a_out"))
+        state = state.with_node(self._make_transform("b", "bb", "b_out"))
+        state = state.with_node(
+            NodeSpec(
+                id="merge",
+                node_type="coalesce",
+                plugin=None,
+                input="a_out",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"ba": "a_out", "bb": "b_out"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        # The consumer names the coalesce BY ID — the shape the runtime resolves.
+        state = state.with_node(self._make_transform("tidy", "merge", "main"))
+        state = state.with_output(self._make_output("main"))
+        result = state.validate()
+        assert not any("merge" in (w.component or "") and "no outgoing edges" in w.message for w in result.warnings), [
+            w.to_dict() for w in result.warnings
+        ]
+
     def test_validate_source_on_success_mismatch_warns(self) -> None:
         """W2: Source on_success doesn't match any node input."""
         state = self._empty_state()

@@ -7653,11 +7653,19 @@ class CompositionState:
         edge_sources = {e.from_node for e in self.edges}
         for node in self.nodes:
             has_edge_out = node.id in edge_sources
-            has_connection_out = (
-                published_success_connection(node) is not None
-                or node.on_error is not None
-                or (node.routes is not None and len(node.routes) > 0)
-            )
+            published = published_success_connection(node)
+            if published is not None and published == node.id:
+                # An IMPLICIT self-publisher (queue, non-terminal coalesce,
+                # aggregation without on_success) publishes under its own id,
+                # so "publishes something" is vacuously true for it and cannot
+                # be the test — asking only that traded this warning's false
+                # POSITIVE for a false NEGATIVE, and a genuinely dead-ended
+                # coalesce went unreported. The real question for these kinds
+                # is whether anything CONSUMES that id.
+                published_is_consumed = published in node_inputs or published in output_names
+            else:
+                published_is_consumed = published is not None
+            has_connection_out = published_is_consumed or node.on_error is not None or (node.routes is not None and len(node.routes) > 0)
             if not has_edge_out and not has_connection_out:
                 warnings.append(
                     _warn(
