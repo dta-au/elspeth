@@ -3591,3 +3591,261 @@ class TestLLMDeclaredOutputFieldContracts:
             assert emitted.required is True
         # Guarantees continue to admit them, and the declaration now matches.
         assert {"llm_response", "llm_response_usage", "llm_response_model"} <= set(transform._output_schema_config.guaranteed_fields)
+
+
+# ---------------------------------------------------------------------------
+# Single-query structured output (top-level output_fields / response_format)
+# ---------------------------------------------------------------------------
+
+
+class TestSingleQueryStructuredOutputConfig:
+    """Config-time rules for top-level ``output_fields`` / ``response_format``.
+
+    Single-prompt mode lifts the per-query structured-output surface to the
+    config top level. The same Tier-3 parsing/validation applies; fields are
+    written UNPREFIXED (no query name exists to prefix with).
+    """
+
+    def test_structured_config_accepted_in_single_mode(self) -> None:
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            response_format="structured",
+            output_fields=[{"suffix": "score", "type": "integer"}],
+        )
+        transform = LLMTransform(config)
+        assert transform is not None
+
+    def test_output_fields_rejected_alongside_queries(self) -> None:
+        """Multi-query mode owns per-query output_fields; top-level is ambiguous."""
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_multi_query_config(
+            output_fields=[{"suffix": "score", "type": "integer"}],
+        )
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="output_fields"):
+            LLMTransform(config)
+
+    def test_structured_response_format_rejected_alongside_queries(self) -> None:
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_multi_query_config(response_format="structured")
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="response_format"):
+            LLMTransform(config)
+
+    def test_structured_without_output_fields_rejected(self) -> None:
+        """structured mode with nothing to enforce is an authoring mistake."""
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(response_format="structured")
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="output_fields"):
+            LLMTransform(config)
+
+    def test_duplicate_suffixes_rejected(self) -> None:
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            output_fields=[
+                {"suffix": "score", "type": "integer"},
+                {"suffix": "score", "type": "string"},
+            ],
+        )
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="score"):
+            LLMTransform(config)
+
+    def test_suffix_colliding_with_response_field_rejected(self) -> None:
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            output_fields=[{"suffix": "llm_response", "type": "string"}],
+        )
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="llm_response"):
+            LLMTransform(config)
+
+    def test_suffix_colliding_with_operational_field_rejected(self) -> None:
+        """usage/model side fields are written by the transform — not claimable."""
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            output_fields=[{"suffix": "llm_response_usage", "type": "string"}],
+        )
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="llm_response_usage"):
+            LLMTransform(config)
+
+
+class TestSingleQueryStructuredOutputExecution:
+    """Provider wire shape and Tier-3 extraction for single-mode output_fields."""
+
+    def _make_structured_transform(self, **config_overrides: Any) -> tuple[Any, Mock]:
+        base: dict[str, Any] = {
+            "response_format": "structured",
+            "output_fields": [
+                {"suffix": "score", "type": "integer"},
+                {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+            ],
+        }
+        base.update(config_overrides)
+        return _make_transform_with_mock_provider(_make_config(**base))
+
+    def test_structured_sends_json_schema_response_format(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 42, "label": "pass"}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "success"
+        call_kwargs = mock_provider.execute_query.call_args.kwargs
+        assert call_kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "single_output",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "score": {"type": "integer"},
+                        "label": {"type": "string", "enum": ["pass", "fail"]},
+                    },
+                    "required": ["score", "label"],
+                },
+            },
+        }
+        # The prompt is NOT suffixed in structured mode — the API enforces the schema
+        call_messages = mock_provider.execute_query.call_args.args[0]
+        assert call_messages == [ChatMessage(role="user", content="Classify: hello")]
+
+    def test_standard_mode_sends_json_object_and_contract_suffix(self) -> None:
+        transform, mock_provider = self._make_structured_transform(response_format="standard")
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 42, "label": "pass"}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "success"
+        call_kwargs = mock_provider.execute_query.call_args.kwargs
+        assert call_kwargs["response_format"] == {"type": "json_object"}
+        call_messages = mock_provider.execute_query.call_args.args[0]
+        prompt = call_messages[-1].content
+        assert prompt.startswith("Classify: hello\n\nReturn exactly one JSON object")
+        assert '"score":{"type":"integer"}' in prompt
+
+    def test_structured_fields_extracted_unprefixed_with_raw_content(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 42, "label": "pass"}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["score"] == 42
+        assert result.row["label"] == "pass"
+        # Raw content retained for audit traceability
+        assert result.row["llm_response"] == '{"score": 42, "label": "pass"}'
+        assert result.row["llm_response_model"] == "gpt-4o"
+
+    def test_missing_output_field_returns_error(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 42}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["reason"] == "missing_output_field"
+        assert result.reason["field"] == "label"
+
+    def test_field_type_mismatch_returns_error(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": "not-a-number", "label": "pass"}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "field_type_mismatch"
+        assert result.reason["field"] == "score"
+
+    def test_json_parse_failure_returns_error(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content="not json at all",
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "json_parse_failed"
+
+    def test_json_array_returns_error(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='[{"score": 42}]',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_json_type"
+        assert result.reason["expected"] == "object"
+
+    def test_declared_output_fields_include_structured_suffixes(self) -> None:
+        transform, _ = self._make_structured_transform()
+        assert {"score", "label"} <= transform.declared_output_fields
+
+    def test_output_schema_carries_typed_structured_fields(self) -> None:
+        transform, _ = self._make_structured_transform(
+            schema={"mode": "fixed", "fields": ["text: str"]},
+        )
+        model_fields = transform.output_schema.model_fields
+        assert "score" in model_fields
+        assert "label" in model_fields

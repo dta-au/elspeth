@@ -253,6 +253,31 @@ def validate_gateway_structured_output_capability(
     )
 
 
+def validate_gateway_single_prompt_structured_output_capability(
+    structured: bool,
+    required_capabilities: tuple[str, ...],
+) -> None:
+    """Single-prompt twin of :func:`validate_gateway_structured_output_capability`.
+
+    The top-level ``response_format='structured'`` pair (single-prompt
+    transforms and the LLM source) lowers ``output_fields`` into the same
+    API-native ``{"type": "json_schema", ...}`` payload a structured query
+    does, so it makes the identical capability demand — caught at
+    configuration time for the same reason.
+    """
+    if not structured:
+        return
+    if GATEWAY_STRUCTURED_OUTPUT_CAPABILITY in required_capabilities:
+        return
+    raise ValueError(
+        f"response_format='structured' sends an API-native {GATEWAY_STRUCTURED_OUTPUT_CAPABILITY!r} "
+        f"response format the gateway must be able to enforce, but required_capabilities does not "
+        f"declare {GATEWAY_STRUCTURED_OUTPUT_CAPABILITY!r}. Add {GATEWAY_STRUCTURED_OUTPUT_CAPABILITY!r} "
+        "to required_capabilities so readiness rejects an incapable gateway before the run starts, "
+        "or set response_format='standard'."
+    )
+
+
 __all__ = [
     "AZURE_MODEL_VALUE_SOURCES",
     "BEDROCK_MODEL_MAX_LENGTH",
@@ -283,6 +308,7 @@ __all__ = [
     "validate_gateway_capabilities",
     "validate_gateway_contract_major",
     "validate_gateway_endpoint",
+    "validate_gateway_single_prompt_structured_output_capability",
     "validate_gateway_structured_output_capability",
     "validate_openrouter_base_url",
 ]

@@ -45,6 +45,7 @@ from elspeth.contracts.token_usage import TokenUsage
 
 if TYPE_CHECKING:
     from elspeth.contracts import PluginSchema
+    from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig
 
 # Metadata field suffixes for contract-stable fields (downstream can depend on these)
 LLM_GUARANTEED_SUFFIXES: tuple[str, ...] = (
@@ -174,21 +175,27 @@ def _build_llm_output_schema_config(
 def build_llm_source_output_schema_config(
     schema_config: SchemaConfig,
     response_field: str,
+    structured_output_fields: tuple[OutputFieldConfig, ...] = (),
 ) -> SchemaConfig:
     """Add the fields guaranteed by a single-request LLM source.
 
     Explicit authored fields may repeat an LLM output field only with its
-    runtime type; fields, guarantees, and audit_fields outside the three
+    runtime type; fields, guarantees, and audit_fields outside the
     emitted values are rejected because a source has no upstream row from
     which to preserve them, and required_fields are rejected outright
     because a source has no input row to require fields of
     (elspeth-fb202d3793). The returned schema preserves the authored mode
-    and contract metadata while making all three emitted fields required
-    and guaranteed.
+    and contract metadata while making all emitted fields required
+    and guaranteed. ``structured_output_fields`` (the source's top-level
+    structured-output declaration) join the emitted set with their declared
+    runtime types — extraction fails the row before emission when one is
+    missing, so on success they are always present.
     """
     validate_field_name(response_field, "response_field")
-    guaranteed_fields = get_llm_guaranteed_fields(response_field)
+    structured_names = tuple(field.suffix for field in structured_output_fields)
+    guaranteed_fields = (*get_llm_guaranteed_fields(response_field), *structured_names)
     expected_types = {f"{response_field}{suffix}": _SUFFIX_SCHEMA_TYPES[suffix] for suffix in LLM_GUARANTEED_SUFFIXES}
+    expected_types.update({field.suffix: _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value] for field in structured_output_fields})
 
     authored_fields = schema_config.fields or ()
     authored_by_name = {field.name: field for field in authored_fields}
@@ -320,6 +327,7 @@ def _build_augmented_output_schema(
     base_schema_config: SchemaConfig,
     response_field: str,
     schema_name: str,
+    extracted_fields: tuple[tuple[str, _FieldType], ...] | None = None,
 ) -> type[PluginSchema]:
     """Build an output schema that includes LLM-added fields.
 
@@ -335,6 +343,9 @@ def _build_augmented_output_schema(
         base_schema_config: The base schema config from plugin options.
         response_field: Base field name (e.g., "llm_response").
         schema_name: Name for the generated Pydantic model class.
+        extracted_fields: (field_name, schema_type) tuples from single-mode
+            structured output_fields config — unprefixed fields extracted
+            from the LLM JSON response (e.g. (("score", "int"),)).
 
     Returns:
         A PluginSchema subclass with input fields plus LLM output fields.
@@ -363,6 +374,16 @@ def _build_augmented_output_schema(
         for suffix in LLM_GUARANTEED_SUFFIXES
         if f"{response_field}{suffix}" not in existing_names
     )
+    if extracted_fields is not None:
+        seen = existing_names | {field.name for field in extra_fields}
+        extra_fields = (
+            *extra_fields,
+            *(
+                FieldDefinition(name=field_name, field_type=field_type, required=False)
+                for field_name, field_type in extracted_fields
+                if field_name not in seen
+            ),
+        )
 
     augmented_config = SchemaConfig(
         # Use flexible mode so extra fields from upstream are accepted

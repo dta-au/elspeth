@@ -15,7 +15,6 @@ Architecture:
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -34,7 +33,6 @@ from elspeth.contracts.chat_parts import ChatMessage, ContentPart, ImagePart, Te
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
@@ -61,7 +59,7 @@ from elspeth.plugins.transforms.llm import (
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig, resolve_image_parts
 from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer, create_langfuse_tracer
-from elspeth.plugins.transforms.llm.multi_query import QuerySpec, ResponseFormat, resolve_queries
+from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, QuerySpec, ResponseFormat, resolve_queries
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
     LLMAuditParent,
@@ -77,7 +75,11 @@ from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, Gate
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterConfig, OpenRouterLLMProvider
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig, parse_tracing_config
-from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant, strip_markdown_fences, validate_field_value
+from elspeth.plugins.transforms.llm.validation import (
+    build_structured_response_directive,
+    extract_structured_fields,
+    strip_markdown_fences,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -259,6 +261,10 @@ class SingleQueryStrategy:
     image_specs: tuple[ImageInputConfig, ...] = ()
     max_image_bytes: int = 0
     max_images_per_call: int = 0
+    # Top-level structured output (single-prompt lift of the per-query pair).
+    # Extracted fields land UNPREFIXED — no query name exists to prefix with.
+    output_fields: tuple[OutputFieldConfig, ...] = ()
+    response_format: ResponseFormat = ResponseFormat.STANDARD
 
     def execute(
         self,
@@ -308,14 +314,26 @@ class SingleQueryStrategy:
             image_parts = resolved
         tracer_extra_metadata: dict[str, Any] | None = {"image_parts": [p.audit_view() for p in image_parts]} if image_parts else None
 
-        # 2. Build messages
+        # 1c. Build the provider response constraint and exact prompt sent
+        # (shared with multi-query mode and the LLM source). No output_fields
+        # → (None, unchanged prompt), exactly the pre-structured behavior.
+        response_format, provider_prompt = build_structured_response_directive(
+            schema_name="single_output",
+            output_fields=self.output_fields,
+            response_format=self.response_format,
+            prompt=rendered.prompt,
+        )
+
+        # 2. Build messages. Images append AFTER the standard-mode schema
+        # suffix, so the schema text and the images travel in the same user
+        # message (multi-query parity).
         messages: list[ChatMessage] = []
         if self.system_prompt:
             messages.append(ChatMessage(role="system", content=self.system_prompt))
-        user_content: str | tuple[ContentPart, ...] = rendered.prompt
+        user_content: str | tuple[ContentPart, ...] = provider_prompt
         content_hash: str | None = None
         if image_parts:
-            user_content = (TextPart(text=rendered.prompt), *image_parts)
+            user_content = (TextPart(text=provider_prompt), *image_parts)
             content_hash = parts_hash(user_content)
         messages.append(ChatMessage(role="user", content=user_content))
 
@@ -332,13 +350,14 @@ class SingleQueryStrategy:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 audit_parent=trace_parent,
+                response_format=response_format,
             )
         except ContextLengthError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
                 parent=trace_parent,
                 query_name="single",
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
@@ -354,7 +373,7 @@ class SingleQueryStrategy:
             tracer.record_error(
                 parent=trace_parent,
                 query_name="single",
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
@@ -379,7 +398,7 @@ class SingleQueryStrategy:
             tracer.record_error(
                 parent=trace_parent,
                 query_name="single",
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=finish_reason_error.error_message,
                 model=self.model,
                 latency_ms=latency_ms,
@@ -395,7 +414,7 @@ class SingleQueryStrategy:
         tracer.record_success(
             parent=trace_parent,
             query_name="single",
-            prompt=rendered.prompt,
+            prompt=provider_prompt,
             response_content=content,
             model=result.model,
             usage=result.usage,
@@ -404,8 +423,17 @@ class SingleQueryStrategy:
             system_prompt=self.system_prompt,
         )
 
-        # 6. Build output row — operational fields only
+        # 6. Build output row — operational fields plus any declared
+        # structured fields. LLM response content is Tier 3 — parse and
+        # validate immediately (shared with multi-query mode); extracted
+        # fields land unprefixed, raw content stays in response_field for
+        # audit traceability.
         output = row.to_dict()
+        if self.output_fields:
+            extracted, extraction_error = extract_structured_fields(content, self.output_fields)
+            if extraction_error is not None:
+                return TransformResult.error(extraction_error, retryable=False)
+            output.update(extracted)
         output[self.response_field] = content
         populate_llm_operational_fields(
             output,
@@ -439,7 +467,7 @@ class SingleQueryStrategy:
             PipelineRow(output, output_contract),
             success_reason={
                 "action": "enriched",
-                "fields_added": [self.response_field],
+                "fields_added": [self.response_field, *(field.suffix for field in self.output_fields)],
                 "metadata": {
                     "model": result.model,
                     "finish_reason": _serialize_finish_reason(result.finish_reason),
@@ -625,37 +653,14 @@ class MultiQueryStrategy:
             image_parts = resolved
         tracer_extra_metadata: dict[str, Any] | None = {"image_parts": [p.audit_view() for p in image_parts]} if image_parts else None
 
-        # Build the provider response constraint and exact prompt sent for this
-        # query. Structured mode sends the schema through the API-native
-        # response_format contract. Standard JSON mode guarantees only a JSON
-        # object at the API boundary, so the declared field contract must also
-        # be present in the prompt before runtime validation can reasonably
-        # enforce it. Canonical JSON keeps field names and enum values escaped
-        # and deterministic rather than interpolating them as free-form prose.
-        response_format: dict[str, Any] | None = None
-        provider_prompt = rendered.prompt
-        if spec.output_fields:
-            properties = {field.suffix: field.to_json_schema() for field in spec.output_fields}
-            output_schema = {
-                "type": "object",
-                "properties": properties,
-                "required": list(properties),
-            }
-            if spec.response_format == ResponseFormat.STRUCTURED:
-                response_format = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": f"{spec.name}_output",
-                        "schema": output_schema,
-                    },
-                }
-            else:
-                response_format = {"type": "json_object"}
-                provider_prompt = (
-                    f"{rendered.prompt}\n\n"
-                    "Return exactly one JSON object matching this required output contract (JSON Schema):\n"
-                    f"{canonical_json(output_schema)}"
-                )
+        # Build the provider response constraint and exact prompt sent for
+        # this query (shared with single-prompt mode and the LLM source).
+        response_format, provider_prompt = build_structured_response_directive(
+            schema_name=f"{spec.name}_output",
+            output_fields=spec.output_fields or (),
+            response_format=spec.response_format,
+            prompt=rendered.prompt,
+        )
 
         # Build messages. Images append AFTER the standard-mode schema suffix
         # above, so the schema text and the images travel in the same user
@@ -775,65 +780,18 @@ class MultiQueryStrategy:
         # Build partial output for this query
         partial: dict[str, Any] = {}
 
-        # JSON parsing + field extraction when output_fields configured
+        # JSON parsing + field extraction when output_fields configured.
+        # LLM response content is Tier 3 — parse and validate immediately
+        # (shared with single-prompt mode and the LLM source).
         if spec.output_fields:
-            # LLM response content is Tier 3 — parse and validate immediately
-            try:
-                parsed = json.loads(content, parse_constant=reject_nonfinite_constant)
-            except (json.JSONDecodeError, ValueError) as e:
-                return TransformResult.error(
-                    {
-                        "reason": "json_parse_failed",
-                        "query_name": spec.name,
-                        "query_index": query_idx,
-                        "error": str(e),
-                        "raw_response_preview": content[:500],
-                    },
-                    retryable=False,
-                )
-            if not isinstance(parsed, dict):
-                return TransformResult.error(
-                    {
-                        "reason": "invalid_json_type",
-                        "query_name": spec.name,
-                        "query_index": query_idx,
-                        "expected": "object",
-                        "actual": type(parsed).__name__,
-                    },
-                    retryable=False,
-                )
-            # Extract typed fields into prefixed output columns.
-            # Validate field presence — Tier 3 boundary: if the LLM omitted
-            # a declared field, that's an error, not a silent None.
-            for field in spec.output_fields:
-                field_key = f"{spec.name}_{field.suffix}"
-                if field.suffix not in parsed:
-                    return TransformResult.error(
-                        {
-                            "reason": "missing_output_field",
-                            "query_name": spec.name,
-                            "query_index": query_idx,
-                            "field": field.suffix,
-                            "available_fields": list(parsed.keys()),
-                        },
-                        retryable=False,
-                    )
-                # Validate value type — Tier 3 boundary: LLM may return
-                # wrong types in standard mode (no API schema enforcement)
-                type_error = validate_field_value(parsed[field.suffix], field)
-                if type_error is not None:
-                    return TransformResult.error(
-                        {
-                            "reason": "field_type_mismatch",
-                            "query_name": spec.name,
-                            "query_index": query_idx,
-                            "field": field.suffix,
-                            "error": type_error,
-                            "value": repr(parsed[field.suffix])[:200],
-                        },
-                        retryable=False,
-                    )
-                partial[field_key] = parsed[field.suffix]
+            extracted, extraction_error = extract_structured_fields(content, spec.output_fields)
+            if extraction_error is not None:
+                extraction_error["query_name"] = spec.name
+                extraction_error["query_index"] = query_idx
+                return TransformResult.error(extraction_error, retryable=False)
+            # Typed fields land in prefixed output columns.
+            for suffix, value in extracted.items():
+                partial[f"{spec.name}_{suffix}"] = value
             # Also store raw content for audit traceability
             partial[f"{spec.name}_{self.response_field}"] = content
         else:
@@ -1224,7 +1182,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6e407f02767b9bc8"
+    source_file_hash: str | None = "sha256:ed0a0ceb8393efff"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1593,6 +1551,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 extracted_fields=extracted if extracted else None,
             )
         else:
+            single_output_fields = tuple(self._config.output_fields or ())
             self._strategy = SingleQueryStrategy(
                 template=self._template,
                 system_prompt=self._system_prompt,
@@ -1606,10 +1565,18 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 image_specs=image_specs,
                 max_image_bytes=max_image_bytes,
                 max_images_per_call=max_images_per_call,
+                output_fields=single_output_fields,
+                response_format=self._config.response_format,
             )
 
-            # Single-query emits unprefixed fields (operational only — audit goes to success_reason)
-            guaranteed = get_llm_guaranteed_fields(self._response_field)
+            # Single-query emits unprefixed fields: operational side fields
+            # plus any declared structured fields (audit goes to success_reason).
+            # Structured fields are guaranteed on success — extraction fails
+            # the row when one is missing.
+            guaranteed = (
+                *get_llm_guaranteed_fields(self._response_field),
+                *(field.suffix for field in single_output_fields),
+            )
             self.declared_output_fields = frozenset(guaranteed)
 
             # Output schema config with LLM output fields for DAG contract propagation.
@@ -1617,11 +1584,14 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # See: docs/superpowers/specs/2026-03-20-output-schema-contract-enforcement-design.md
             self._output_schema_config = _build_llm_output_schema_config(schema_config, guaranteed)
 
-            # Pydantic output schema with unprefixed LLM fields
+            # Pydantic output schema with unprefixed LLM fields (structured
+            # fields carry their declared runtime types)
             self.output_schema = _build_augmented_output_schema(
                 base_schema_config=schema_config,
                 response_field=self._response_field,
                 schema_name=f"{self.name}OutputSchema",
+                extracted_fields=tuple((field.suffix, _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in single_output_fields)
+                or None,
             )
 
         # Provider instance — deferred to on_start() when recorder/telemetry available

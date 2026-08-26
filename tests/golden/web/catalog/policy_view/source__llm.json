@@ -43,6 +43,79 @@
         "title": "FieldDefinition",
         "type": "object"
       },
+      "OutputFieldConfig": {
+        "additionalProperties": false,
+        "description": "Configuration for a single output field in the LLM response.\n\nAttributes:\n    suffix: Column suffix in output row (e.g., \"score\" -> \"{prefix}_score\")\n    type: Data type for schema enforcement\n    values: Required for enum type - list of allowed values",
+        "properties": {
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/SchemaConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "composer_hidden": true,
+            "default": null,
+            "description": "Schema configuration for data validation.",
+            "title": "Schema"
+          },
+          "suffix": {
+            "description": "Column suffix in output row",
+            "title": "Suffix",
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/$defs/OutputFieldType",
+            "description": "Data type for schema enforcement",
+            "title": "Type"
+          },
+          "values": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Allowed values (required for enum type)",
+            "title": "Values"
+          }
+        },
+        "required": [
+          "suffix",
+          "type"
+        ],
+        "title": "OutputFieldConfig",
+        "type": "object"
+      },
+      "OutputFieldType": {
+        "description": "Supported types for structured output fields.",
+        "enum": [
+          "string",
+          "integer",
+          "number",
+          "boolean",
+          "enum"
+        ],
+        "title": "OutputFieldType",
+        "type": "string"
+      },
+      "ResponseFormat": {
+        "description": "LLM response format modes.\n\n- STANDARD: Uses {\"type\": \"json_object\"} - model outputs JSON but no schema enforcement\n- STRUCTURED: Uses {\"type\": \"json_schema\", ...} - API enforces exact schema compliance",
+        "enum": [
+          "standard",
+          "structured"
+        ],
+        "title": "ResponseFormat",
+        "type": "string"
+      },
       "SchemaConfig": {
         "description": "Configuration for a plugin's data schema.\n\nA schema can be either observed (accept anything, infer types from data)\nor explicit (validate against specified fields).\n\nSchema Contracts (for DAG validation):\n    - guaranteed_fields: Fields the producer GUARANTEES will exist AND are\n      part of the stable API contract. Downstream can safely depend on these.\n    - required_fields: Fields the consumer REQUIRES in input.\n    - audit_fields: Fields that exist in output but are NOT part of the\n      stability contract. These are for audit trail reconstruction and may\n      change between versions. DAG validation does NOT enforce these.\n\nFor explicit schemas (mode='fixed' or 'flexible'), the declared fields are\nimplicitly guaranteed. Use guaranteed_fields/required_fields to express\ncontracts for observed schemas that still have known field requirements.\n\nExample YAML for an observed schema with explicit contracts:\n    schema:\n      mode: observed\n      guaranteed_fields: [customer_id, timestamp]  # Producer guarantees these\n\n    schema:\n      mode: observed\n      required_fields: [customer_id, amount]  # Consumer requires these\n\n    schema:\n      mode: observed\n      guaranteed_fields: [response, response_usage]  # Stable API\n      audit_fields: [response_template_hash]  # May change between versions\n\nAttributes:\n    mode: \"fixed\" (exact fields), \"flexible\" (at least these), or \"observed\" (infer from data)\n    fields: List of FieldDefinitions, or None if observed\n    is_observed: True if schema types are inferred from data\n    guaranteed_fields: Field names the producer guarantees (for observed schemas)\n    required_fields: Field names the consumer requires (for observed schemas)\n    audit_fields: Field names that exist but are not part of stability contract",
         "properties": {
@@ -144,6 +217,23 @@
         "title": "On Validation Failure",
         "type": "string"
       },
+      "output_fields": {
+        "anyOf": [
+          {
+            "items": {
+              "$ref": "#/$defs/OutputFieldConfig"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Typed structured-output field definitions (None = unstructured response)",
+        "title": "Output Fields"
+      },
       "profile": {
         "description": "Operator-approved LLM profile alias",
         "enum": [
@@ -161,6 +251,12 @@
         "description": "Field name for LLM response in output",
         "title": "Response Field",
         "type": "string"
+      },
+      "response_format": {
+        "$ref": "#/$defs/ResponseFormat",
+        "default": "standard",
+        "description": "Response format mode (standard JSON object vs. enforced json_schema)",
+        "title": "Response Format"
       },
       "schema": {
         "$ref": "#/$defs/SchemaConfig",
@@ -254,6 +350,28 @@
         "label": "Response Field",
         "name": "response_field",
         "nullable": false,
+        "required": false
+      },
+      {
+        "default": "standard",
+        "description": "Response format mode (standard JSON object vs. enforced json_schema)",
+        "enum": [
+          "standard",
+          "structured"
+        ],
+        "kind": "enum",
+        "label": "Response Format",
+        "name": "response_format",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Typed structured-output field definitions (None = unstructured response)",
+        "kind": "json-array",
+        "label": "Output Fields",
+        "name": "output_fields",
+        "nullable": true,
         "required": false
       },
       {

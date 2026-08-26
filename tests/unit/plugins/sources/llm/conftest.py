@@ -32,6 +32,7 @@ class FakeProvider:
         )
         self.calls = 0
         self.messages: list[Sequence[ChatMessage]] = []
+        self.response_formats: list[dict[str, Any] | None] = []
         self.audit_parents: list[LLMAuditParent] = []
         self.runtime_preflight_calls = 0
         self.close_calls = 0
@@ -47,9 +48,10 @@ class FakeProvider:
         audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult:
-        del model, temperature, max_tokens, response_format
+        del model, temperature, max_tokens
         self.calls += 1
         self.messages.append(messages)
+        self.response_formats.append(response_format)
         self.audit_parents.append(audit_parent)
         if isinstance(self.result, BaseException):
             raise self.result

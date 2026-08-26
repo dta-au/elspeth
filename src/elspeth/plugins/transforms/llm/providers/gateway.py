@@ -74,6 +74,7 @@ from elspeth.plugins.llm.config_validation import (
     validate_gateway_capabilities,
     validate_gateway_contract_major,
     validate_gateway_endpoint,
+    validate_gateway_single_prompt_structured_output_capability,
     validate_gateway_structured_output_capability,
 )
 from elspeth.plugins.transforms.llm.base import LLMConfig
@@ -166,14 +167,19 @@ class GatewayConfig(LLMConfig):
 
     @model_validator(mode="after")
     def _validate_structured_output_capability(self) -> GatewayConfig:
-        """Reject a structured query the declared gateway cannot be trusted to serve.
+        """Reject a structured request the declared gateway cannot be trusted to serve.
 
-        ``response_format`` is a per-query field, so single-query mode
-        (``queries is None``) can never reach structured output and needs no
-        check. Resolving the queries here mirrors what ``LLMConfig``'s own
-        validators already do.
+        Multi-query mode declares ``response_format`` per query; single-prompt
+        mode declares it at the config top level. Both lower ``output_fields``
+        into the same API-native json_schema payload, so both make the same
+        capability demand. Resolving the queries here mirrors what
+        ``LLMConfig``'s own validators already do.
         """
         if self.queries is None:
+            validate_gateway_single_prompt_structured_output_capability(
+                self.response_format is ResponseFormat.STRUCTURED,
+                self.required_capabilities,
+            )
             return self
         structured = tuple(spec.name for spec in resolve_queries(self.queries) if spec.response_format is ResponseFormat.STRUCTURED)
         validate_gateway_structured_output_capability(structured, self.required_capabilities)

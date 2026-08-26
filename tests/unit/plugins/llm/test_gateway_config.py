@@ -296,8 +296,10 @@ class TestGatewayPrivateOptionsCoverage:
             "lookup",
             "max_image_bytes",
             "max_images_per_call",
+            "output_fields",
             "prompt_template",
             "queries",
+            "response_format",
             "required_input_fields",
             "response_field",
             "schema_config",
@@ -379,12 +381,36 @@ class TestGatewayStructuredOutputCapability:
         config = _gateway_with_queries({"clarity": _structured_query("standard")})
         assert config.required_capabilities == ()
 
-    def test_single_query_mode_needs_no_json_schema_capability(self) -> None:
-        """``response_format`` is a per-query field only — ``SingleQueryStrategy``
-        has no structured mode, so ``queries=None`` can never demand the
-        capability."""
+    def test_single_query_mode_without_output_fields_needs_no_json_schema_capability(self) -> None:
+        """A bare single-prompt config declares no structured output, so it
+        makes no ``json_schema`` demand."""
         config = _make_gateway_config()
         assert config.queries is None
+        assert config.required_capabilities == ()
+
+    def test_single_prompt_structured_requires_declared_json_schema_capability(self) -> None:
+        """The top-level structured pair makes the same demand a structured
+        query does — the lowered json_schema payload is identical."""
+        with pytest.raises(ValidationError, match="json_schema"):
+            _make_gateway_config(
+                response_format="structured",
+                output_fields=[{"suffix": "score", "type": "integer"}],
+            )
+
+    def test_single_prompt_structured_accepted_when_capability_declared(self) -> None:
+        config = _make_gateway_config(
+            response_format="structured",
+            output_fields=[{"suffix": "score", "type": "integer"}],
+            required_capabilities=("json_schema",),
+        )
+        assert config.required_capabilities == ("json_schema",)
+
+    def test_single_prompt_standard_output_fields_need_no_json_schema_capability(self) -> None:
+        """Standard mode sends ``{"type": "json_object"}`` and embeds the field
+        contract in the prompt, so it makes no ``json_schema`` demand."""
+        config = _make_gateway_config(
+            output_fields=[{"suffix": "score", "type": "integer"}],
+        )
         assert config.required_capabilities == ()
 
     def test_rejection_names_the_offending_queries(self) -> None:

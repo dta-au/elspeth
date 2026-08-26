@@ -34,9 +34,11 @@ from elspeth.plugins.llm.config_validation import (
     validate_gateway_capabilities,
     validate_gateway_contract_major,
     validate_gateway_endpoint,
+    validate_gateway_single_prompt_structured_output_capability,
     validate_openrouter_base_url,
 )
-from elspeth.plugins.transforms.llm import build_llm_source_output_schema_config
+from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES, build_llm_source_output_schema_config
+from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, ResponseFormat
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
 _SOURCE_PROMPT_CONTEXT_NAMES = frozenset({"lookup"})
@@ -55,6 +57,23 @@ class LLMSourceConfig(DataPluginConfig):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="Sampling temperature")
     max_tokens: int | None = Field(default=None, gt=0, description="Maximum tokens in response")
     response_field: str = Field(default="llm_response", description="Field name for LLM response in output")
+
+    # Top-level structured output — the same pair the single-prompt LLM
+    # transform carries (LLMConfig.response_format / LLMConfig.output_fields),
+    # with identical semantics: structured mode lowers output_fields into an
+    # API-native json_schema response_format; standard mode appends the field
+    # contract to the prompt and requests json_object. Extracted fields are
+    # emitted unprefixed beside response_field.
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.STANDARD,
+        description="Response format mode (standard JSON object vs. enforced json_schema)",
+    )
+    output_fields: list[OutputFieldConfig] | None = Field(
+        default=None,
+        min_length=1,
+        description="Typed structured-output field definitions (None = unstructured response)",
+    )
+
     on_validation_failure: str = Field(
         ...,
         description="Sink name for non-conformant output, or 'discard' for explicit drop",
@@ -100,11 +119,41 @@ class LLMSourceConfig(DataPluginConfig):
         return value.strip()
 
     @model_validator(mode="after")
+    def _validate_structured_output(self) -> LLMSourceConfig:
+        """Enforce the structured-output rules (mirrors ``LLMConfig``'s single-prompt arm).
+
+        Structured with nothing to enforce is an authoring mistake (the
+        json_schema is built FROM output_fields), and a suffix colliding with
+        the response/operational fields the source itself writes would be
+        destroyed on emission.
+        """
+        if self.response_format is ResponseFormat.STRUCTURED and self.output_fields is None:
+            raise ValueError("response_format='structured' requires output_fields: the enforced json_schema is built from them")
+        if self.output_fields is not None:
+            reserved = {f"{self.response_field}{suffix}" for suffix in LLM_GUARANTEED_SUFFIXES}
+            seen: set[str] = set()
+            for field in self.output_fields:
+                if field.suffix in seen:
+                    raise ValueError(f"Duplicate output field suffix '{field.suffix}'. Each output field must be unique")
+                seen.add(field.suffix)
+                if field.suffix in reserved:
+                    raise ValueError(
+                        f"Output field suffix '{field.suffix}' collides with the source's own "
+                        f"response/operational fields {sorted(reserved)}; choose another suffix "
+                        "or rename response_field"
+                    )
+        return self
+
+    @model_validator(mode="after")
     def _augment_output_schema(self) -> LLMSourceConfig:
         object.__setattr__(
             self,
             "schema_config",
-            build_llm_source_output_schema_config(self.schema_config, self.response_field),
+            build_llm_source_output_schema_config(
+                self.schema_config,
+                self.response_field,
+                tuple(self.output_fields or ()),
+            ),
         )
         return self
 
@@ -220,6 +269,20 @@ class GatewayLLMSourceConfig(LLMSourceConfig):
     @classmethod
     def _validate_required_capabilities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return validate_gateway_capabilities(value)
+
+    @model_validator(mode="after")
+    def _validate_structured_output_capability(self) -> GatewayLLMSourceConfig:
+        """Reject a structured request the declared gateway cannot be trusted to serve.
+
+        Same demand the transform's ``GatewayConfig`` makes: the lowered
+        json_schema payload is identical, so it is caught at configuration
+        time rather than on the first billed completion call.
+        """
+        validate_gateway_single_prompt_structured_output_capability(
+            self.response_format is ResponseFormat.STRUCTURED,
+            self.required_capabilities,
+        )
+        return self
 
     VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = GATEWAY_VALUE_SOURCES
 

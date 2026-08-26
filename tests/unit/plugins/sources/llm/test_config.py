@@ -410,3 +410,87 @@ def test_public_source_schema_helper_rejects_non_emitted_audit_fields() -> None:
             SchemaConfig(mode="observed", audit_fields=("summary_template_hash",)),
             "summary",
         )
+
+
+# ---------------------------------------------------------------------------
+# Structured output (top-level output_fields / response_format)
+# ---------------------------------------------------------------------------
+
+
+def _structured_overrides(**extra: Any) -> dict[str, Any]:
+    overrides: dict[str, Any] = {
+        "response_format": "structured",
+        "output_fields": [{"suffix": "score", "type": "integer"}],
+    }
+    overrides.update(extra)
+    return overrides
+
+
+def test_source_accepts_structured_output_config(provider_configs: dict[str, dict[str, Any]]) -> None:
+    cfg = SOURCE_PROVIDER_CONFIGS["openrouter"].from_dict(
+        {**provider_configs["openrouter"], **_structured_overrides()},
+        plugin_name="llm",
+    )
+    assert [field.suffix for field in cfg.output_fields or ()] == ["score"]
+
+
+def test_source_structured_without_output_fields_rejected(provider_configs: dict[str, dict[str, Any]]) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+    with pytest.raises(PluginConfigError, match="output_fields"):
+        SOURCE_PROVIDER_CONFIGS["openrouter"].from_dict(
+            {**provider_configs["openrouter"], "response_format": "structured"},
+            plugin_name="llm",
+        )
+
+
+def test_source_duplicate_suffixes_rejected(provider_configs: dict[str, dict[str, Any]]) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+    with pytest.raises(PluginConfigError, match="score"):
+        SOURCE_PROVIDER_CONFIGS["openrouter"].from_dict(
+            {
+                **provider_configs["openrouter"],
+                "output_fields": [
+                    {"suffix": "score", "type": "integer"},
+                    {"suffix": "score", "type": "string"},
+                ],
+            },
+            plugin_name="llm",
+        )
+
+
+def test_source_suffix_colliding_with_response_field_rejected(provider_configs: dict[str, dict[str, Any]]) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+    with pytest.raises(PluginConfigError, match="llm_response"):
+        SOURCE_PROVIDER_CONFIGS["openrouter"].from_dict(
+            {**provider_configs["openrouter"], "output_fields": [{"suffix": "llm_response", "type": "string"}]},
+            plugin_name="llm",
+        )
+
+
+def test_source_schema_config_declares_structured_fields(provider_configs: dict[str, dict[str, Any]]) -> None:
+    cfg = SOURCE_PROVIDER_CONFIGS["openrouter"].from_dict(
+        {**provider_configs["openrouter"], **_structured_overrides(), "response_field": "answer"},
+        plugin_name="llm",
+    )
+    assert "score" in set(cfg.schema_config.guaranteed_fields or ())
+
+
+def test_gateway_source_structured_requires_json_schema_capability(provider_configs: dict[str, dict[str, Any]]) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+    with pytest.raises(PluginConfigError, match="json_schema"):
+        SOURCE_PROVIDER_CONFIGS["gateway"].from_dict(
+            {**provider_configs["gateway"], **_structured_overrides()},
+            plugin_name="llm",
+        )
+
+
+def test_gateway_source_structured_accepted_with_capability(provider_configs: dict[str, dict[str, Any]]) -> None:
+    cfg = SOURCE_PROVIDER_CONFIGS["gateway"].from_dict(
+        {**provider_configs["gateway"], **_structured_overrides(), "required_capabilities": ["json_schema"]},
+        plugin_name="llm",
+    )
+    assert cfg.required_capabilities == ("json_schema",)

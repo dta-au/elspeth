@@ -17,8 +17,9 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
+from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
-from elspeth.plugins.transforms.llm.multi_query import QueryDefinition, resolve_queries
+from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, QueryDefinition, ResponseFormat, resolve_queries
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
 # The names PromptTemplate.render actually supplies (templates.py builds the
@@ -113,6 +114,31 @@ class LLMConfig(TransformDataConfig):
     temperature: float = Field(0.0, ge=0.0, le=2.0, description="Sampling temperature")
     max_tokens: int | None = Field(None, gt=0, description="Maximum tokens in response")
     response_field: str = Field("llm_response", description="Field name for LLM response in output")
+
+    # Single-prompt structured output. These are the top-level lift of the
+    # per-query structured-output surface (QueryDefinition.response_format /
+    # QueryDefinition.output_fields): single-prompt mode has no query entry to
+    # carry them, so they live on the config itself and are rejected when
+    # ``queries`` is set (each query owns its own pair there). Semantics are
+    # identical to the multi-query surface — structured mode lowers
+    # output_fields into an API-native json_schema response_format; standard
+    # mode appends the field contract to the prompt and requests json_object —
+    # except the extracted fields land UNPREFIXED (no query name exists).
+    response_format: ResponseFormat = Field(
+        ResponseFormat.STANDARD,
+        description=(
+            "Single-prompt response format mode (standard JSON object vs. enforced json_schema). "
+            "Multi-query mode declares response_format per query instead."
+        ),
+    )
+    output_fields: list[OutputFieldConfig] | None = Field(
+        None,
+        min_length=1,
+        description=(
+            "Typed structured-output field definitions for single-prompt mode (None = unstructured "
+            "response). Multi-query mode declares output_fields per query instead."
+        ),
+    )
 
     # Image inputs (docs/superpowers/specs/2026-08-25-llm-image-input-design.md §4):
     # absent (None) is exactly today's text-only behavior. Each entry names a
@@ -265,6 +291,47 @@ class LLMConfig(TransformDataConfig):
         if self.queries is None:
             return self
         resolve_queries(self.queries)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_single_mode_structured_output(self) -> LLMConfig:
+        """Enforce the top-level structured-output rules (single-prompt mode only).
+
+        Multi-query mode declares ``response_format``/``output_fields`` per
+        query (``QueryDefinition``); the top-level pair is single-prompt-only,
+        so combining either with ``queries`` is rejected rather than silently
+        ignored. In single mode: structured with nothing to enforce is an
+        authoring mistake (the json_schema is built FROM output_fields), and a
+        suffix that collides with the response/operational fields the
+        transform itself writes would be destroyed on emission.
+        """
+        if self.queries is not None:
+            if self.output_fields is not None:
+                raise ValueError(
+                    "output_fields at the config top level is a single-prompt option; "
+                    "multi-query mode declares output_fields on each queries entry"
+                )
+            if self.response_format is not ResponseFormat.STANDARD:
+                raise ValueError(
+                    "response_format at the config top level is a single-prompt option; "
+                    "multi-query mode declares response_format on each queries entry"
+                )
+            return self
+        if self.response_format is ResponseFormat.STRUCTURED and self.output_fields is None:
+            raise ValueError("response_format='structured' requires output_fields: the enforced json_schema is built from them")
+        if self.output_fields is not None:
+            reserved = {f"{self.response_field}{suffix}" for suffix in LLM_GUARANTEED_SUFFIXES}
+            seen: set[str] = set()
+            for field in self.output_fields:
+                if field.suffix in seen:
+                    raise ValueError(f"Duplicate output field suffix '{field.suffix}'. Each output field must be unique")
+                seen.add(field.suffix)
+                if field.suffix in reserved:
+                    raise ValueError(
+                        f"Output field suffix '{field.suffix}' collides with the transform's own "
+                        f"response/operational fields {sorted(reserved)}; choose another suffix "
+                        "or rename response_field"
+                    )
         return self
 
     @model_validator(mode="after")

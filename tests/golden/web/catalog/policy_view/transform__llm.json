@@ -396,6 +396,23 @@
         "title": "Max Images Per Call",
         "type": "integer"
       },
+      "output_fields": {
+        "anyOf": [
+          {
+            "items": {
+              "$ref": "#/$defs/OutputFieldConfig"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
+        "title": "Output Fields"
+      },
       "profile": {
         "description": "Operator-approved LLM profile alias",
         "enum": [
@@ -451,6 +468,12 @@
         "description": "Field name for LLM response in output",
         "title": "Response Field",
         "type": "string"
+      },
+      "response_format": {
+        "$ref": "#/$defs/ResponseFormat",
+        "default": "standard",
+        "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
+        "title": "Response Format"
       },
       "schema": {
         "$ref": "#/$defs/SchemaConfig",
@@ -540,6 +563,18 @@
         "name": "response_field",
         "required": false,
         "type": "string"
+      },
+      {
+        "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
+        "name": "response_format",
+        "required": false,
+        "type": "object"
+      },
+      {
+        "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
+        "name": "output_fields",
+        "required": false,
+        "type": "object"
       },
       {
         "description": "Row columns to resolve as image message parts (absent = text-only)",

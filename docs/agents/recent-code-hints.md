@@ -8,6 +8,33 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-26 — structured output is now a THREE-surface parity set: per-query
+  (multi-query), config top-level (single-prompt transform), and the LLM
+  source — one shared lowering/extraction, and four traps.** The
+  `response_format`/`output_fields` pair exists top-level on `LLMConfig` AND
+  `LLMSourceConfig` (rejected when `queries` is set; structured without
+  output_fields rejected; suffix collisions with `response_field`+operational
+  names rejected). (a) The json_schema lowering and the Tier-3 parse/validate
+  live ONLY in `transforms/llm/validation.py`
+  (`build_structured_response_directive` / `extract_structured_fields`) — all
+  three surfaces call them; do not re-inline a fourth copy, and note
+  `extract_structured_fields` returns `({}, error)` on failure, never
+  `(None, ...)`. (b) A new single-request field on `LLMConfig` propagates by
+  TEST to the source configs (`test_source_provider_schema_stays_in_parity_
+  with_transform_single_request_fields`) and must be filed in
+  `test_gateway_config.py`'s `_DELIBERATELY_PUBLIC_FIELDS` or
+  `_LLM_PRIVATE_OPTIONS` — the field is red on three suites until all three
+  homes are decided. (c) The gateway json_schema capability check now has a
+  single-prompt arm (`validate_gateway_single_prompt_structured_output_
+  capability`) on BOTH `GatewayConfig` and `GatewayLLMSourceConfig`; the old
+  comment "single-query mode can never reach structured output" is gone —
+  do not reintroduce a queries-only guard. (d) The web catalog goldens
+  (`tests/golden/web/catalog/{knob_schema,policy_view}/{transform,source}__
+  llm.json`) pin the config schema bytes: any LLM config field change is a
+  golden re-record you adjudicate (policy_view is written with
+  `json.dumps(..., indent=2, sort_keys=True)` — forget sort_keys and the
+  diff is 700 lines of noise).
+
 - **2026-08-26 — a row_union-released token's resume authority is the SCHEDULER
   JOURNAL, and the workset's mint-frame projection is a known-divergent
   artifact (elspeth-54edda5699, pinned by

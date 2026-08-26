@@ -105,6 +105,36 @@
         }
       },
       {
+        "default": "standard",
+        "description": "Response format mode (standard JSON object vs. enforced json_schema)",
+        "enum": [
+          "standard",
+          "structured"
+        ],
+        "kind": "enum",
+        "label": "Response Format",
+        "name": "response_format",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Typed structured-output field definitions (None = unstructured response)",
+        "kind": "json-array",
+        "label": "Output Fields",
+        "name": "output_fields",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
         "description": "Sink name for non-conformant output, or 'discard' for explicit drop",
         "kind": "text",
         "label": "On Validation Failure",
@@ -320,6 +350,36 @@
         }
       },
       {
+        "default": "standard",
+        "description": "Response format mode (standard JSON object vs. enforced json_schema)",
+        "enum": [
+          "standard",
+          "structured"
+        ],
+        "kind": "enum",
+        "label": "Response Format",
+        "name": "response_format",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Typed structured-output field definitions (None = unstructured response)",
+        "kind": "json-array",
+        "label": "Output Fields",
+        "name": "output_fields",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
         "description": "Sink name for non-conformant output, or 'discard' for explicit drop",
         "kind": "text",
         "label": "On Validation Failure",
@@ -524,6 +584,36 @@
         }
       },
       {
+        "default": "standard",
+        "description": "Response format mode (standard JSON object vs. enforced json_schema)",
+        "enum": [
+          "standard",
+          "structured"
+        ],
+        "kind": "enum",
+        "label": "Response Format",
+        "name": "response_format",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Typed structured-output field definitions (None = unstructured response)",
+        "kind": "json-array",
+        "label": "Output Fields",
+        "name": "output_fields",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
         "description": "Sink name for non-conformant output, or 'discard' for explicit drop",
         "kind": "text",
         "label": "On Validation Failure",
@@ -696,6 +786,36 @@
         "label": "Response Field",
         "name": "response_field",
         "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "standard",
+        "description": "Response format mode (standard JSON object vs. enforced json_schema)",
+        "enum": [
+          "standard",
+          "structured"
+        ],
+        "kind": "enum",
+        "label": "Response Format",
+        "name": "response_format",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Typed structured-output field definitions (None = unstructured response)",
+        "kind": "json-array",
+        "label": "Output Fields",
+        "name": "output_fields",
+        "nullable": true,
         "required": false,
         "visible_when": {
           "equals": "gateway",

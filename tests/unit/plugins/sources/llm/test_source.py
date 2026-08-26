@@ -1251,3 +1251,135 @@ def test_source_does_not_inherit_or_delegate_to_transform(source: LLMSource) -> 
     assert LLMTransform not in type(source).__mro__
     assert "_strategy" not in dir(source)
     assert "_query_executor" not in dir(source)
+
+
+# ---------------------------------------------------------------------------
+# Structured output (top-level output_fields / response_format)
+# ---------------------------------------------------------------------------
+
+
+def _structured_source(openrouter_config: Any, source_context: PluginContext, **overrides: Any) -> LLMSource:
+    options: dict[str, Any] = {
+        "response_field": "answer",
+        "response_format": "structured",
+        "output_fields": [
+            {"suffix": "score", "type": "integer"},
+            {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+        ],
+    }
+    options.update(overrides)
+    config = openrouter_config(**options)
+    instance = LLMSource(config)
+    instance.on_start(source_context)
+    return instance
+
+
+def test_structured_source_sends_json_schema_and_extracts_fields(
+    openrouter_config: Any,
+    source_context: PluginContext,
+) -> None:
+    source = _structured_source(openrouter_config, source_context)
+    provider = FakeProvider(
+        LLMQueryResult(
+            content='{"score": 42, "label": "pass"}',
+            usage=TokenUsage.known(prompt_tokens=7, completion_tokens=3),
+            model="served-model",
+            finish_reason=FinishReason.STOP,
+        )
+    )
+    _install_provider(source, provider)
+
+    rows = list(source.load(source_context))
+
+    assert provider.response_formats == [
+        {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "source_output",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "score": {"type": "integer"},
+                        "label": {"type": "string", "enum": ["pass", "fail"]},
+                    },
+                    "required": ["score", "label"],
+                },
+            },
+        }
+    ]
+    # Structured mode never suffixes the prompt — the API enforces the schema
+    assert provider.messages == [[ChatMessage(role="user", content="Summarise the audit topic.")]]
+    assert len(rows) == 1
+    assert rows[0].row["score"] == 42
+    assert rows[0].row["label"] == "pass"
+    assert rows[0].row["answer"] == '{"score": 42, "label": "pass"}'
+    assert rows[0].row["answer_model"] == "served-model"
+
+
+def test_standard_mode_source_sends_json_object_and_contract_suffix(
+    openrouter_config: Any,
+    source_context: PluginContext,
+) -> None:
+    source = _structured_source(openrouter_config, source_context, response_format="standard")
+    provider = FakeProvider(
+        LLMQueryResult(
+            content='{"score": 1, "label": "fail"}',
+            usage=TokenUsage.known(prompt_tokens=7, completion_tokens=3),
+            model="served-model",
+            finish_reason=FinishReason.STOP,
+        )
+    )
+    _install_provider(source, provider)
+
+    rows = list(source.load(source_context))
+
+    assert provider.response_formats == [{"type": "json_object"}]
+    sent_prompt = provider.messages[0][-1].content
+    assert isinstance(sent_prompt, str)
+    assert sent_prompt.startswith("Summarise the audit topic.\n\nReturn exactly one JSON object")
+    assert len(rows) == 1
+    assert rows[0].row["score"] == 1
+
+
+def test_structured_extraction_failure_routes_to_validation_failure(
+    openrouter_config: Any,
+    source_context: PluginContext,
+) -> None:
+    """A response missing a declared field follows on_validation_failure, not a crash."""
+    source = _structured_source(openrouter_config, source_context, on_validation_failure="quarantine")
+    provider = FakeProvider(
+        LLMQueryResult(
+            content='{"score": 42}',
+            usage=TokenUsage.known(prompt_tokens=7, completion_tokens=3),
+            model="served-model",
+            finish_reason=FinishReason.STOP,
+        )
+    )
+    _install_provider(source, provider)
+
+    rows = list(source.load(source_context))
+
+    assert len(rows) == 1
+    assert rows[0].is_quarantined is True
+    assert rows[0].quarantine_error is not None
+    assert "label" in rows[0].quarantine_error
+
+
+def test_structured_extraction_failure_discard_emits_nothing(
+    openrouter_config: Any,
+    source_context: PluginContext,
+) -> None:
+    source = _structured_source(openrouter_config, source_context)
+    provider = FakeProvider(
+        LLMQueryResult(
+            content="not json",
+            usage=TokenUsage.known(prompt_tokens=7, completion_tokens=3),
+            model="served-model",
+            finish_reason=FinishReason.STOP,
+        )
+    )
+    _install_provider(source, provider)
+
+    rows = list(source.load(source_context))
+
+    assert rows == []

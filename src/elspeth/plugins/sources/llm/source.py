@@ -49,7 +49,11 @@ from elspeth.plugins.transforms.llm.providers.gateway import GatewayLLMProvider
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig, parse_tracing_config
-from elspeth.plugins.transforms.llm.validation import strip_markdown_fences
+from elspeth.plugins.transforms.llm.validation import (
+    build_structured_response_directive,
+    extract_structured_fields,
+    strip_markdown_fences,
+)
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_semantics import OutputSemanticDeclaration
@@ -119,7 +123,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:63b8738c13136224"
+    source_file_hash: str | None = "sha256:3b5107005cfe195a"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -220,6 +224,8 @@ class LLMSource(BaseSource):
         self._temperature = self._config.temperature
         self._max_tokens = self._config.max_tokens
         self._response_field = self._config.response_field
+        self._output_fields = tuple(self._config.output_fields or ())
+        self._response_format = self._config.response_format
         self._on_validation_failure = self._config.on_validation_failure
 
         self._schema_config = self._config.schema_config
@@ -314,10 +320,20 @@ class LLMSource(BaseSource):
         if not rendered.prompt.strip():
             raise LLMClientError("LLM source rendered an empty prompt", retryable=False)
 
+        # Build the provider response constraint and exact prompt sent
+        # (shared with the LLM transform). No output_fields → (None,
+        # unchanged prompt), exactly the pre-structured behavior.
+        response_format, provider_prompt = build_structured_response_directive(
+            schema_name="source_output",
+            output_fields=self._output_fields,
+            response_format=self._response_format,
+            prompt=rendered.prompt,
+        )
+
         messages: list[ChatMessage] = []
         if self._system_prompt:
             messages.append(ChatMessage(role="system", content=self._system_prompt))
-        messages.append(ChatMessage(role="user", content=rendered.prompt))
+        messages.append(ChatMessage(role="user", content=provider_prompt))
         trace_parent = LLMAuditParent.for_operation(operation_id=operation_id)
         started_at = time.monotonic()
         try:
@@ -327,12 +343,13 @@ class LLMSource(BaseSource):
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
                 audit_parent=trace_parent,
+                response_format=response_format,
             )
         except LLMClientError as exc:
             latency_ms = (time.monotonic() - started_at) * 1000
             self._trace_error(
                 parent=trace_parent,
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=str(exc),
                 model=self._model,
                 latency_ms=latency_ms,
@@ -343,7 +360,7 @@ class LLMSource(BaseSource):
             result,
             ctx,
             trace_parent=trace_parent,
-            prompt=rendered.prompt,
+            prompt=provider_prompt,
             latency_ms=latency_ms,
         )
 
@@ -378,9 +395,20 @@ class LLMSource(BaseSource):
             )
             raise LLMClientError("LLM source returned empty content after markdown fence cleanup", retryable=False)
 
-        output: dict[str, Any] = {
-            self._response_field: content,
-        }
+        output: dict[str, Any] = {}
+        if self._output_fields:
+            # LLM response content is Tier 3 — parse and validate immediately
+            # (shared with the LLM transform). An extraction failure is a
+            # content defect and follows on_validation_failure, exactly like
+            # a schema validation failure below.
+            extracted, extraction_error = extract_structured_fields(content, self._output_fields)
+            if extraction_error is not None:
+                failed_output = {self._response_field: content}
+                error_text = ", ".join(f"{key}={value!r}" for key, value in extraction_error.items())
+                yield from self._validation_failure(failed_output, error_text, ctx)
+                return
+            output.update(extracted)
+        output[self._response_field] = content
         populate_llm_operational_fields(
             output,
             self._response_field,

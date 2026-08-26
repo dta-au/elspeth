@@ -230,6 +230,36 @@
         }
       },
       {
+        "default": "standard",
+        "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
+        "enum": [
+          "standard",
+          "structured"
+        ],
+        "kind": "enum",
+        "label": "Response Format",
+        "name": "response_format",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
+        "kind": "json-array",
+        "label": "Output Fields",
+        "name": "output_fields",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
         "default": null,
         "description": "Row columns to resolve as image message parts (absent = text-only)",
         "kind": "json-array",
@@ -675,6 +705,36 @@
         }
       },
       {
+        "default": "standard",
+        "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
+        "enum": [
+          "standard",
+          "structured"
+        ],
+        "kind": "enum",
+        "label": "Response Format",
+        "name": "response_format",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
+        "kind": "json-array",
+        "label": "Output Fields",
+        "name": "output_fields",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
         "default": null,
         "description": "Row columns to resolve as image message parts (absent = text-only)",
         "kind": "json-array",
@@ -1109,6 +1169,36 @@
         }
       },
       {
+        "default": "standard",
+        "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
+        "enum": [
+          "standard",
+          "structured"
+        ],
+        "kind": "enum",
+        "label": "Response Format",
+        "name": "response_format",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
+        "kind": "json-array",
+        "label": "Output Fields",
+        "name": "output_fields",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
         "default": null,
         "description": "Row columns to resolve as image message parts (absent = text-only)",
         "kind": "json-array",
@@ -1511,6 +1601,36 @@
         "label": "Response Field",
         "name": "response_field",
         "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "standard",
+        "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
+        "enum": [
+          "standard",
+          "structured"
+        ],
+        "kind": "enum",
+        "label": "Response Format",
+        "name": "response_format",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
+        "kind": "json-array",
+        "label": "Output Fields",
+        "name": "output_fields",
+        "nullable": true,
         "required": false,
         "visible_when": {
           "equals": "gateway",
