@@ -134,7 +134,7 @@ class TestBatchStatsHappyPath:
         assert result.reason is not None
         assert result.reason["reason"] == "empty_batch"
 
-    def test_non_numeric_values_raise_type_error(self, ctx: PluginContext) -> None:
+    def test_non_numeric_values_fail_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
         """BatchStats raises TypeError on non-numeric values (no coercion).
 
         Per CLAUDE.md Tier 2 trust model: transforms receive pipeline data that
@@ -152,12 +152,30 @@ class TestBatchStatsHappyPath:
 
         rows = [
             _make_row({"id": 1, "amount": 10.0}),
-            _make_row({"id": 2, "amount": "not_a_number"}),  # This must raise, not skip
+            _make_row({"id": 2, "amount": "not_a_number"}),  # Fails the BATCH, never skipped
             _make_row({"id": 3, "amount": 30.0}),
         ]
 
-        with pytest.raises(TypeError, match="must be numeric"):
-            transform.process(rows, ctx)
+        result = transform.process(rows, ctx)
+
+        # BATCH granularity (elspeth-d5034647f0): the bad row is not skipped and
+        # no statistic is published over the surviving two. The whole batch fails.
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+
+        # Requirement 2 of the ruling: it records that it failed and WHY --
+        # specifically, naming the row and field, not just "type error".
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "amount"
+        assert result.reason["expected"] == "numeric (int or float)"
+        assert result.reason["actual_type"] == "str"
+        # WHICH row is named, per the ruling's "record ... why".
+        assert "in row 1" in result.reason["error"]
+        assert "must be numeric (int or float), got str" in result.reason["error"]
+        # The offending VALUE is row content and must not reach the audit trail.
+        assert "not_a_number" not in repr(sorted(result.reason.items()))
 
     def test_backward_probe_rows_drop_original_fields_for_invariant_harness(self, ctx: PluginContext) -> None:
         """Backward invariant probe exercises the aggregate output path, not passthrough."""
