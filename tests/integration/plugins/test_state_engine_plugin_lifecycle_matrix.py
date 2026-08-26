@@ -146,7 +146,7 @@ def _rows_for(plugin_key: str) -> list[dict[str, object]]:
         "transform:report_assemble": [{"line": "alpha"}, {"line": "beta"}],
         "transform:truncate": [{"notes": "brief"}],
         "transform:type_coerce": [{"price": "2.5", "quantity": "3", "in_stock": "true"}],
-        "transform:reference_join": [{"reference_join_probe_key": "probe"}],
+        "transform:reference_join": [{"product": "hats"}],
         "transform:value_transform": [{"price": 2.0, "quantity": 3}],
         "transform:web_scrape": [{"page_url": "filled-by-harness"}],
         "sink:document": [{"announcement_text": "hello"}],
