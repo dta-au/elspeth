@@ -423,6 +423,7 @@ class TestElspethSettingsAlignment:
         "collectors",  # Optional - EXPAND-group closers (barrier-scopes spec §3)
         "scopes",  # Optional - opener/closer scope bindings (barrier-scopes spec §3)
         "max_bound_region_depth",  # Supported bound-region nesting depth (barrier-scopes spec §6.3)
+        "max_expand_group_width",  # Expand fan-out width fence (elspeth-258bd49d81)
         "aggregations",  # Optional - config-driven batching
         "depends_on",  # Optional - pipeline dependencies
         "commencement_gates",  # Optional - pre-flight go/no-go conditions

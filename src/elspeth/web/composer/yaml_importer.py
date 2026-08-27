@@ -91,6 +91,7 @@ _DECLINED_SECTION_REASONS: dict[str, str] = {
     "depends_on": "cross-pipeline dependencies are a run concern",
     "llm_profiles": "LLM profiles are deployment configuration, not pipeline topology",
     "max_bound_region_depth": "run-execution settings are not part of a composition",
+    "max_expand_group_width": "run-execution settings are not part of a composition",
     "payload_store": "payload storage is deployment configuration",
     "rate_limit": "run-execution settings are not part of a composition",
     "replay_from": "replay selection is a run invocation concern",

@@ -22,6 +22,7 @@ from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import ElspethSettings
+from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.engine.token_traversal import _branch_loss_reason
 from elspeth.engine.tokens import TokenManager
 
@@ -42,7 +43,7 @@ def _make_parent_token() -> TokenInfo:
 
 
 def _make_manager(*, ceiling: int | None) -> tuple[TokenManager, Mock]:
-    data_flow = Mock()
+    data_flow = Mock(spec=DataFlowRepository)
     manager = TokenManager(
         data_flow,
         step_resolver=lambda node_id: 1,

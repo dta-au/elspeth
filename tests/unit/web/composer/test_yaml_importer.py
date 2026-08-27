@@ -980,6 +980,7 @@ _SECTION_PROBE_YAML: dict[str, str] = {
     "landscape": "landscape:\n  url: sqlite:///runs/audit.db\n",
     "llm_profiles": "llm_profiles:\n  fast:\n    provider: openrouter\n    model: test\n",
     "max_bound_region_depth": "max_bound_region_depth: 3\n",
+    "max_expand_group_width": "max_expand_group_width: 500\n",
     "payload_store": "payload_store:\n  backend: filesystem\n",
     "queues": "queues:\n  inbound: {}\n",
     "rate_limit": "rate_limit:\n  requests_per_minute: 60\n",

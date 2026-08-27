@@ -459,6 +459,17 @@ sites:
     (yaml_generator writes sources/queues/transforms/gates/row_unions/aggregations/coalesce/collectors/scopes/sinks
     only), so the composer cannot author a value for it at all. Task 12 reviewed this entry and kept not_authorable
     — collector/scope authoring does not reach this field.
+- key: a5086db8ea98e150
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings
+  exception: FieldConstraint
+  message: 'max_expand_group_width: ge, le'
+  ordinal: 0
+  disposition: not_authorable
+  note: max_expand_group_width is an engine tuning field (the expand-width fence, elspeth-258bd49d81)
+    outside every pipeline section the composer emits, exactly like its depth twin max_bound_region_depth
+    above — the composer cannot author a value for it (yaml_importer declines the section by name), so
+    its ge/le constraints are unreachable from any composition.
 - key: b569d1a62f7a5963
   path: src/elspeth/core/config.py
   qualname: ElspethSettings
