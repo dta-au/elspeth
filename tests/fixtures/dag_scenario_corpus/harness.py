@@ -470,6 +470,7 @@ def _semantic_run_settings(raw_settings: object) -> dict[str, object]:
         "collectors": [],
         "scopes": [],
         "max_bound_region_depth": 5,
+        "max_expand_group_width": 100_000,
     }
     for post_pin_section, empty_default in _post_pin_empty_defaults.items():
         if settings.get(post_pin_section) == empty_default:
