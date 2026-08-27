@@ -1616,7 +1616,7 @@ def _producer_declared_field_type(
 
         transform = get_shared_plugin_manager().create_transform(
             producer_node.plugin,
-            prepare_validation_probe_options(producer_node.options),
+            prepare_validation_probe_options(producer_node.options, plugin=producer_node.plugin),
         )
     except Exception as exc:
         if _is_config_probe_exception(exc):
@@ -1849,7 +1849,7 @@ def _probe_sink_declared_required_fields(plugin: str, options: Mapping[str, Any]
         with plugin_preflight_mode(True):
             sink = get_shared_plugin_manager().create_sink(
                 plugin,
-                prepare_validation_probe_options(options),
+                prepare_validation_probe_options(options, plugin=plugin),
             )
     except Exception as exc:
         if not _is_sink_config_probe_exception(exc):
@@ -4060,7 +4060,7 @@ def _check_schema_contracts(
         try:
             transform = get_shared_plugin_manager().create_transform(
                 plugin,
-                prepare_validation_probe_options(options),
+                prepare_validation_probe_options(options, plugin=plugin),
             )
         except Exception as exc:
             if not _is_config_probe_exception(exc):
@@ -4080,7 +4080,7 @@ def _check_schema_contracts(
         """
         try:
             return FieldMapperConfig.from_dict(
-                prepare_validation_probe_options(options),
+                prepare_validation_probe_options(options, plugin="field_mapper"),
                 plugin_name="field_mapper",
             )
         except Exception as exc:
@@ -4268,7 +4268,7 @@ def _check_schema_contracts(
         try:
             transform = get_shared_plugin_manager().create_transform(
                 plugin,
-                prepare_validation_probe_options(options),
+                prepare_validation_probe_options(options, plugin=plugin),
             )
         except Exception as exc:
             if not _is_config_probe_exception(exc):
@@ -4314,7 +4314,7 @@ def _check_schema_contracts(
         try:
             transform = get_shared_plugin_manager().create_transform(
                 plugin,
-                prepare_validation_probe_options(options),
+                prepare_validation_probe_options(options, plugin=plugin),
             )
         except Exception as exc:
             if not _is_config_probe_exception(exc):
@@ -4418,7 +4418,7 @@ def _check_schema_contracts(
 
             transform = get_shared_plugin_manager().create_transform(
                 producer_node.plugin,
-                prepare_validation_probe_options(producer_node.options),
+                prepare_validation_probe_options(producer_node.options, plugin=producer_node.plugin),
             )
             is_pass_through_instance = transform.passes_through_input
             output_schema_config = transform._output_schema_config
@@ -5148,7 +5148,7 @@ def _check_schema_contracts(
 
             transform = get_shared_plugin_manager().create_transform(
                 producer_node.plugin,
-                prepare_validation_probe_options(producer_node.options),
+                prepare_validation_probe_options(producer_node.options, plugin=producer_node.plugin),
             )
         except Exception as exc:
             if not _is_config_probe_exception(exc):

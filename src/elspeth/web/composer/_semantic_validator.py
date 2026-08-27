@@ -148,7 +148,7 @@ def _instantiate_consumer(node: NodeSpec) -> BaseTransform | None:
                 "BaseTransform",
                 get_shared_plugin_manager().create_transform(
                     node.plugin,
-                    prepare_validation_probe_options(node.options),
+                    prepare_validation_probe_options(node.options, plugin=node.plugin),
                 ),
             )
     except Exception as exc:
@@ -184,7 +184,7 @@ def _instantiate_source_producer(producer: ProducerEntry, sources: Mapping[str, 
     source_spec = _source_spec_for(producer, sources)
     if source_spec is None:
         return None
-    probe_options = prepare_validation_probe_options(source_spec.options)
+    probe_options = prepare_validation_probe_options(source_spec.options, plugin=producer.plugin_name)
     probe_options["on_validation_failure"] = source_spec.on_validation_failure
     with _side_effect_free_probe():
         return cast(
@@ -204,7 +204,7 @@ def _instantiate_transform_producer(producer: ProducerEntry) -> BaseTransform | 
             "BaseTransform",
             get_shared_plugin_manager().create_transform(
                 producer.plugin_name,
-                prepare_validation_probe_options(producer.options),
+                prepare_validation_probe_options(producer.options, plugin=producer.plugin_name),
             ),
         )
 
@@ -274,7 +274,7 @@ def _instantiate_sink_consumer(output: OutputSpec) -> BaseSink | None:
                 "BaseSink",
                 get_shared_plugin_manager().create_sink(
                     output.plugin,
-                    prepare_validation_probe_options(output.options),
+                    prepare_validation_probe_options(output.options, plugin=output.plugin),
                 ),
             )
     except Exception as exc:

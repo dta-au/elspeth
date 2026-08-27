@@ -2353,7 +2353,7 @@ def _probe_transform_output_declared_field_names(plugin: str, options: Mapping[s
     try:
         transform = get_shared_plugin_manager().create_transform(
             plugin,
-            prepare_validation_probe_options(options),
+            prepare_validation_probe_options(options, plugin=plugin),
         )
     except Exception as exc:
         if not _is_config_probe_exception(exc):
