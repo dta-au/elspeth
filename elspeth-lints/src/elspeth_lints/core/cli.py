@@ -875,6 +875,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip the interactive confirmation prompt before creating/resuming the private transaction.",
     )
     sign_bundle.add_argument(
+        "--continue-on-block",
+        action="store_true",
+        help=(
+            "Do not stop the transaction on a judged BLOCKED verdict (exit-1 action "
+            "failure): journal the action as blocked, leave its entry fail-closed "
+            "(stale or absent — never signed), and continue with the remaining "
+            "actions. Verification/infrastructure failures (exit 2) still stop the "
+            "transaction. On completion the successful actions publish coherently "
+            "and the blocked keys are printed as a remediation worklist; the "
+            "command exits 3 instead of 0 so a partially-signed run is never "
+            "mistaken for a clean one. Blocked actions stay skipped on resume "
+            "(re-judging a recorded BLOCK would be verdict shopping); remediate "
+            "the code or rationale and re-stage instead."
+        ),
+    )
+    sign_bundle.add_argument(
         "--resume",
         type=Path,
         default=None,
@@ -4267,20 +4283,49 @@ def _execute_sign_bundle(
             stale_delete_sources=stale_delete_sources,
             args=action_args,
         ),
+        continue_on_block=args.continue_on_block,
     )
     if result.exit_code != 0:
+        if result.failed_key is None and result.blocked_count:
+            # --continue-on-block walked the whole bundle but every judge call
+            # was BLOCKED: nothing was signed and the active allowlist is
+            # untouched. Not an infrastructure failure — a worklist.
+            sys.stderr.write(
+                f"sign-bundle: no action was signed; {result.blocked_count} judged-BLOCK action(s) recorded. Remediate and re-stage.\n"
+            )
+            _emit_sign_bundle_blocked_worklist(result)
+            return result.exit_code
         sys.stderr.write(
             f"sign-bundle: transaction stopped after {result.completed_count} completed action(s); "
             f"[{(result.failed_index or 0) + 1}/{len(bundle.actions)}] "
             f"{result.failed_kind} {result.failed_key} exit={result.exit_code}.\n"
         )
+        if result.blocked_count:
+            _emit_sign_bundle_blocked_worklist(result)
         return result.exit_code
     _maybe_regen_fingerprint_baseline(args)
     _refresh_override_rate_counter_snapshot_after_allowlist_write(args.allowlist_dir / "_defaults.yaml")
     _emit_sign_bundle_post_state(args)
     prefix = "recovered completed coherent publish" if result.recovered_publish else "completed"
     sys.stdout.write(f"sign-bundle: {prefix}; {result.completed_count} action(s) applied in one coherent publish.\n")
+    if result.blocked_count:
+        # Partial signing must never read as a clean run: the publish is
+        # coherent, but the blocked entries remain fail-closed and owe
+        # remediation. Distinct exit code 3 = published-with-blocks.
+        sys.stdout.write(
+            f"sign-bundle: {result.blocked_count} judged-BLOCK action(s) were skipped under --continue-on-block "
+            "and remain UNSIGNED (fail-closed).\n"
+        )
+        _emit_sign_bundle_blocked_worklist(result)
+        return 3
     return 0
+
+
+def _emit_sign_bundle_blocked_worklist(result: Any) -> None:
+    """Print the judged-BLOCK remediation worklist, one key per line."""
+    sys.stdout.write("sign-bundle: blocked (not signed) — remediation worklist:\n")
+    for key in result.blocked_keys:
+        sys.stdout.write(f"  BLOCKED {key}\n")
 
 
 def _execute_one_sign_bundle_action(
@@ -4345,6 +4390,8 @@ def _emit_sign_bundle_recovery(args: argparse.Namespace, tx_path: Path, *, reaso
         command.append("--operator-override")
     if args.justify_format != "text":
         command.extend(("--format", args.justify_format))
+    if args.continue_on_block:
+        command.append("--continue-on-block")
     sys.stderr.write(
         f"sign-bundle: {reason}; private decisions preserved at {tx_path}.\n"
         f"sign-bundle: re-verify and resume with:\n  {shlex.join(command)}\n"

@@ -1587,6 +1587,175 @@ def test_sign_bundle_partial_block_preserves_active_allowlist_and_reports_recove
     assert "preserved" in err.lower()
 
 
+def test_sign_bundle_continue_on_block_publishes_survivors_and_reports_worklist(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A judged BLOCK is journalled and skipped; the accepted action still publishes.
+
+    Exit 3 (published-with-blocks) so a partially signed run never reads as a
+    clean one, and the blocked key is printed as the remediation worklist.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    beta = _live_finding(root, "beta/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(beta, "beta/mod.py"),
+            ),
+        ),
+    )
+
+    def _verdict(file_path: str) -> JudgeVerdict:
+        return JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED
+
+    with _patch_judge(_verdict):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 3
+    assert (allowlist_dir / "alpha.yaml").is_file()
+    assert not (allowlist_dir / "beta.yaml").exists()
+    out = capsys.readouterr().out
+    assert "coherent publish" in out
+    assert "BLOCKED" in out
+    assert _canonical_key(beta) in out
+
+
+def test_sign_bundle_continue_on_block_all_blocked_signs_nothing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Every action BLOCKED: nothing is signed and the active allowlist is untouched."""
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),)),
+    )
+
+    with _patch_judge(_block_all):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 1
+    assert _tree_bytes(allowlist_dir) == before
+    captured = capsys.readouterr()
+    assert "no action was signed" in captured.err
+    assert "BLOCKED" in captured.out
+
+
+def test_sign_bundle_continue_on_block_still_stops_on_infrastructure_failure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--continue-on-block skips ONLY judged BLOCKs (exit 1); exit 2 still stops."""
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _fail_beta(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        if action.file_path.startswith("beta/"):
+            return 2
+        return real_execute(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        )
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(cli_module, "_execute_new_judgment_action", side_effect=_fail_beta),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    err = capsys.readouterr().err
+    assert "transaction stopped" in err
+    assert _recovery_path(err).is_dir()
+
+
+def test_sign_bundle_resume_skips_recorded_blocked_actions(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A journalled BLOCK stays skipped on resume — no verdict shopping.
+
+    First run: alpha BLOCKED (journalled, skipped), beta fails exit-2 → stop.
+    Resume with an accept-all judge: only beta is judged; alpha is never
+    re-judged even though the judge would now accept it, and the publish
+    reports it as still blocked (exit 3).
+    """
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    alpha = _live_finding(root, "alpha/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(alpha, "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _fail_beta(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        if action.file_path.startswith("beta/"):
+            return 2
+        return real_execute(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        )
+
+    def _block_alpha(file_path: str) -> JudgeVerdict:
+        return JudgeVerdict.BLOCKED if file_path.startswith("alpha/") else JudgeVerdict.ACCEPTED
+
+    with (
+        _patch_judge(_block_alpha),
+        patch.object(cli_module, "_execute_new_judgment_action", side_effect=_fail_beta),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+    assert rc == 2
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    with _patch_judge(_accept_all) as resume_calls:
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--continue-on-block", "--resume", str(transaction)),
+            )
+        )
+
+    assert rc == 3
+    assert resume_calls == ["beta/mod.py"]
+    assert (allowlist_dir / "beta.yaml").is_file()
+    assert not (allowlist_dir / "alpha.yaml").exists()
+    out = capsys.readouterr().out
+    assert _canonical_key(alpha) in out
+
+
 def test_sign_bundle_resume_reuses_accepted_judgment_and_publishes_coherently(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)

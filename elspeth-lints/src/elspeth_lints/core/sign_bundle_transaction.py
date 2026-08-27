@@ -63,6 +63,11 @@ class SignBundleRunResult:
     failed_kind: str | None = None
     failed_key: str | None = None
     recovered_publish: bool = False
+    # Judged-BLOCK actions skipped under --continue-on-block. They are never
+    # signed: their entries stay stale/absent (fail-closed) and the keys are
+    # surfaced as the operator's remediation worklist.
+    blocked_count: int = 0
+    blocked_keys: tuple[str, ...] = ()
 
 
 def tree_snapshot(root: Path) -> dict[str, str]:
@@ -298,6 +303,8 @@ def load_manifest(tx_path: Path) -> dict[str, Any]:
         raise SignBundleTransactionError("transaction manifest signing_policy must be a mapping")
     if not isinstance(raw.get("completed_actions"), list):
         raise SignBundleTransactionError("transaction manifest completed_actions must be a list")
+    if raw.get("blocked_actions") is not None and not isinstance(raw.get("blocked_actions"), list):
+        raise SignBundleTransactionError("transaction manifest blocked_actions must be a list or absent")
     if not isinstance(raw.get("rotation_base_sha256"), str) or not isinstance(raw.get("rotation_staged_sha256"), str):
         raise SignBundleTransactionError("transaction manifest rotation hashes must be strings")
     if raw.get("checkpoint_snapshot") is not None and not isinstance(raw.get("checkpoint_snapshot"), dict):
@@ -651,8 +658,20 @@ def run_sign_bundle_transaction(
     disposition: str,
     specs_by_stale_key: dict[str, Any],
     execute_action: Callable[[Any, argparse.Namespace], int],
+    continue_on_block: bool = False,
 ) -> SignBundleRunResult:
-    """Reconcile/fire journaled actions and publish one verified candidate."""
+    """Reconcile/fire journaled actions and publish one verified candidate.
+
+    ``continue_on_block`` applies ONLY to exit-1 action failures — the judged
+    BLOCKED verdict, whose executor has already restored the candidate to its
+    pre-action bytes (asserted by the scoped-changes check). Such actions are
+    journalled as ``blocked_actions`` and skipped for the rest of this
+    transaction (including resume — re-judging a recorded BLOCK would be
+    verdict shopping); everything that succeeded still publishes coherently.
+    Exit-2 failures (verification/infrastructure) always stop the transaction.
+    The flag is deliberately NOT part of the signing policy: it changes which
+    actions are attempted, never what any minted signature attests.
+    """
     repair_keys_by_stale_key = {
         item.key: item.repair_key or item.key for item in verification.diagnosis.items if item.key in specs_by_stale_key
     }
@@ -660,6 +679,11 @@ def run_sign_bundle_transaction(
     candidate_args.allowlist_dir = args.allowlist_dir if disposition.startswith("published") else Path(manifest["candidate_dir"])
     candidate_args.rotation_log = tx_path / "rotation-staged.log"
     completed = {int(index) for index in manifest["completed_actions"]}
+    blocked = {int(index) for index in manifest.get("blocked_actions", [])}
+    if blocked & completed:
+        raise SignBundleTransactionError("transaction journal records an action as both completed and blocked")
+    if any(index < 0 or index >= len(bundle.actions) for index in blocked):
+        raise SignBundleTransactionError("transaction blocked_actions index is out of range")
     running = manifest.get("running_action")
     recorded_rotation_hash = cast("str", manifest["rotation_staged_sha256"])
     if running is None:
@@ -671,7 +695,7 @@ def run_sign_bundle_transaction(
             raise SignBundleTransactionError("transaction running-action rotation checkpoint authentication failed")
 
     if disposition.startswith("published"):
-        if completed != set(range(len(bundle.actions))):
+        if completed | blocked != set(range(len(bundle.actions))):
             raise SignBundleTransactionError("published transaction journal does not contain every bundle action")
         _validate_pending_source_publish(
             bundle=bundle,
@@ -696,7 +720,13 @@ def run_sign_bundle_transaction(
         )
         with allowlist_mutation_lock(Path(manifest["allowlist_dir"])):
             finalize_rotation_log(tx_path, manifest)
-        return SignBundleRunResult(0, len(completed), recovered_publish=True)
+        return SignBundleRunResult(
+            0,
+            len(completed),
+            recovered_publish=True,
+            blocked_count=len(blocked),
+            blocked_keys=tuple(bundle.actions[index].key for index in sorted(blocked)),
+        )
 
     if running is not None:
         running_index = int(running)
@@ -788,7 +818,7 @@ def run_sign_bundle_transaction(
         key=lambda indexed: (_ACTION_PRIORITY[indexed[1].kind], indexed[0]),
     )
     for index, action in ordered_actions:
-        if index in completed:
+        if index in completed or index in blocked:
             continue
         source_file = _action_source_file(
             action,
@@ -828,6 +858,15 @@ def run_sign_bundle_transaction(
             verify_semantics=code == 0,
         )
         if code != 0:
+            if code == 1 and continue_on_block:
+                # Judged BLOCK: the executor restored the candidate (asserted
+                # above with verify_semantics=False). Journal it and move on;
+                # the entry stays fail-closed and is reported for remediation.
+                blocked.add(index)
+                manifest["blocked_actions"] = sorted(blocked)
+                manifest["running_action"] = None
+                commit_action_state(tx_path, manifest)
+                continue
             manifest["running_action"] = None
             commit_action_state(tx_path, manifest)
             return SignBundleRunResult(
@@ -836,6 +875,8 @@ def run_sign_bundle_transaction(
                 failed_index=index,
                 failed_kind=action.kind,
                 failed_key=action.key,
+                blocked_count=len(blocked),
+                blocked_keys=tuple(bundle.actions[i].key for i in sorted(blocked)),
             )
         if not _action_is_complete(
             action,
@@ -883,6 +924,15 @@ def run_sign_bundle_transaction(
     # disposition="published" and finalizes the exact staged delta.
     assert_rotation_log_unchanged(tx_path, manifest)
     if manifest["candidate_snapshot"] == manifest["base_snapshot"]:
+        if blocked and not completed:
+            # Every attempted action was a judged BLOCK: nothing was signed,
+            # nothing needs publishing, and the active allowlist is untouched.
+            return SignBundleRunResult(
+                1,
+                0,
+                blocked_count=len(blocked),
+                blocked_keys=tuple(bundle.actions[index].key for index in sorted(blocked)),
+            )
         raise SignBundleTransactionError("refusing coherent publish without an authenticated candidate mutation")
     from datetime import UTC, datetime
 
@@ -901,7 +951,12 @@ def run_sign_bundle_transaction(
             manifest=manifest,
         )
         finalize_rotation_log(tx_path, manifest)
-    return SignBundleRunResult(0, len(completed))
+    return SignBundleRunResult(
+        0,
+        len(completed),
+        blocked_count=len(blocked),
+        blocked_keys=tuple(bundle.actions[index].key for index in sorted(blocked)),
+    )
 
 
 def _action_source_file(
