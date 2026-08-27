@@ -642,6 +642,22 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     forwards_input_fields: bool
     removed_input_fields: frozenset[str]
 
+    # Value-preservation declaration (elspeth-e6e552ce34). See
+    # TransformProtocol above for the contract. The two protocols must not
+    # diverge on data members (elspeth-8783933d99): every conformer is a
+    # BaseTransform subclass carrying the full transform surface, and a
+    # member declared on TransformProtocol but missing here describes a
+    # narrower contract than reality
+    # (test_plugin_protocol_fields.py pins the parity).
+    preserves_input_values: bool
+
+    # ADR-012 empty-emission governance declaration. See TransformProtocol.
+    can_drop_rows: bool
+
+    # Field collision enforcement (centralized in TransformExecutor). See
+    # TransformProtocol.
+    declared_output_fields: frozenset[str]
+
     # ADR-013 pre-emission declaration surface.
     declared_input_fields: frozenset[str]
 
@@ -655,6 +671,17 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # instead of probing for optional methods, preserving a closed lifecycle
     # surface.
     requires_runtime_preflight: bool
+
+    # DAG contract: output schema for transforms that declare output fields.
+    # See TransformProtocol.
+    _output_schema_config: SchemaConfig | None
+
+    def effective_static_contract(self) -> frozenset[str]:
+        """Return the transform's static output guarantee surface.
+
+        See :meth:`TransformProtocol.effective_static_contract`.
+        """
+        ...
 
     # Error routing configuration
     # Injected by runtime_factory.py bridge from AggregationSettings/TransformSettings.

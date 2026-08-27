@@ -504,10 +504,11 @@ def _make_processor(
             node_type = NodeType.TRANSFORM
             plugin_name = plugin.name
         else:
-            # Bare traversal nodes (no plugin) and the deliberately malformed
-            # stand-ins used by TestUnknownTransformType register under the
-            # generic name. The type test mirrors token_traversal's own dispatch,
-            # which is what must reject a malformed plugin — not this harness.
+            # Bare traversal nodes (no plugin) and non-conforming
+            # transform-shaped fakes register under the generic name. This is
+            # harness-side registration bookkeeping only — the engine's own
+            # dispatch is nominal on GateSettings (elspeth-8783933d99) and
+            # never re-measures protocol conformance.
             node_type = NodeType.TRANSFORM
             plugin_name = "transform"
         factory.data_flow.register_node(
@@ -9085,45 +9086,6 @@ class TestNotifyCoalesceOfLostBranch:
                 )
             ).one()
         assert (status, node_id) == ("ready", "coalesce::merge")
-
-
-# =============================================================================
-# Unknown transform type
-# =============================================================================
-
-
-class TestUnknownTransformType:
-    """Tests for the TypeError guard on unknown transform types."""
-
-    def test_unknown_type_raises_type_error(self) -> None:
-        """Transform that is neither TransformProtocol nor GateSettings raises TypeError."""
-        _db, factory = _make_factory()
-        source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
-
-        # Create an object that is NOT a transform or gate
-        class FakePlugin:
-            node_id = "fake-node"
-
-        fake_plugin = FakePlugin()
-        source_node = NodeID("source-0")
-        fake_node = NodeID(fake_plugin.node_id)
-        processor = _make_processor(
-            factory,
-            node_step_map={source_node: 0, fake_node: 1},
-            node_to_next={source_node: fake_node, fake_node: None},
-            node_to_plugin={fake_node: fake_plugin},
-        )
-
-        with pytest.raises(TypeError, match="Unknown transform type"):
-            processor.process_row(
-                row_index=0,
-                source_row=source_row,
-                transforms=[fake_plugin],
-                ctx=ctx,
-                source_row_index=0,
-                ingest_sequence=0,
-            )
 
 
 class TestRoutingInvariantFailures:

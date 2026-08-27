@@ -228,9 +228,13 @@ class DAGNavigator:
                 )
 
             plugin = self.resolve_plugin_for_node(node_id)
+            # Nominal (negative) dispatch — elspeth-8783933d99: any non-gate
+            # plugin is a transform (node_to_plugin is closed by construction).
+            # Re-measuring TransformProtocol conformance here silently skipped
+            # non-conforming transforms and mis-resolved the jump-target sink.
             if isinstance(plugin, GateSettings):
                 encountered_gate = True
-            elif isinstance(plugin, TransformProtocol) and plugin.on_success is not None:
+            elif plugin is not None and plugin.on_success is not None:
                 candidate_sink = plugin.on_success
                 if not self._sink_names or candidate_sink in self._sink_names:
                     resolved_sink = candidate_sink

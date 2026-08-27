@@ -173,22 +173,46 @@ class TestProcessSingleTokenOrchestration:
         with pytest.raises(OrchestrationInvariantError, match="Inner traversal exceeded"):
             processor._process_single_token(token=token, ctx=ctx, current_node_id=looping)
 
-    def test_unknown_plugin_type_raises_type_error(self) -> None:
-        """A node plugin that is neither TransformProtocol nor GateSettings is rejected."""
+    def test_non_gate_plugin_dispatches_as_transform(self) -> None:
+        """Every non-GateSettings plugin takes the transform arm (negative nominal dispatch).
+
+        elspeth-8783933d99: node_to_plugin is closed by construction
+        (graph_wiring), so dispatch keys nominally on GateSettings and treats
+        everything else as a transform — protocol conformance is not
+        re-measured. A transform-shaped object missing a TransformProtocol
+        member must reach the transform handler, not die in dispatch with
+        ``TypeError: Unknown transform type`` (the ef5e6e593 regression).
+        """
+        from elspeth.contracts import TransformProtocol
+        from tests.fixtures.nonconforming_transform import NonConformingTransform
+
         _db, factory = _make_factory()
         ctx = make_context(landscape=factory.plugin_audit_writer())
         source_node = NodeID("source-0")
-        weird = NodeID("weird-1")
+        node = NodeID("nonconforming-1")
+        transform = NonConformingTransform(node_id=str(node), on_success="terminal_sink")
+        assert not isinstance(transform, TransformProtocol)  # precondition, not the pin
         processor = _make_processor(
             factory,
-            node_step_map={source_node: 0, weird: 1},
-            node_to_next={source_node: weird, weird: None},
-            node_to_plugin={weird: object()},  # not a transform, not a gate
+            source_on_success="terminal_sink",
+            node_step_map={source_node: 0, node: 1},
+            node_to_next={source_node: node, node: None},
+            node_to_plugin={node: transform},
         )
         token = make_token_info(data={"value": 1})
+        dispatched: list[object] = []
+        success = TransformResult.success(make_row({"value": 2}), success_reason={"action": "mapped"})
 
-        with pytest.raises(TypeError, match="Unknown transform type"):
-            processor._process_single_token(token=token, ctx=ctx, current_node_id=weird)
+        def _exec(transform, token, ctx, attempt_offset=0):
+            dispatched.append(transform)
+            return success, token, None
+
+        processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
+        result, _child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=node)
+
+        assert dispatched == [transform], "dispatch must hand the non-conforming plugin to the transform arm"
+        assert isinstance(result, RowResult)
+        assert (result.outcome, result.path) == (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW)
 
     def test_gate_route_to_sink_returns_gate_routed_terminal(self) -> None:
         """A gate that routes to a sink terminates the token with GATE_ROUTED."""

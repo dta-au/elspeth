@@ -176,6 +176,26 @@ class TestFindAggregationTransform:
         assert result_transform is t
         assert result_node_id == NodeID("agg-node-1")
 
+    def test_non_conforming_batch_aware_transform_matched(self) -> None:
+        """A transform missing a TransformProtocol member is still found.
+
+        elspeth-8783933d99 mechanism pin: config.transforms is homogeneous
+        (Sequence[RowPlugin]) — re-measuring protocol conformance in the
+        lookup silently dropped any non-conforming transform and reported
+        "No batch-aware transform found" for a transform that exists.
+        """
+        from elspeth.contracts import TransformProtocol
+        from tests.fixtures.nonconforming_transform import NonConformingTransform
+
+        t = NonConformingTransform(node_id="agg-node-1", is_batch_aware=True)
+        assert not isinstance(t, TransformProtocol)  # precondition, not the pin
+        config = _make_config(transforms=[t])
+
+        result_transform, result_node_id = find_aggregation_transform(config, "agg-node-1", "batch1")
+
+        assert result_transform is t
+        assert result_node_id == NodeID("agg-node-1")
+
     def test_non_batch_aware_skipped(self) -> None:
         """Transform with is_batch_aware=False is not matched."""
         t = _make_batch_transform(node_id="agg-node-1", is_batch_aware=False)

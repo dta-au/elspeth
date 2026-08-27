@@ -41,7 +41,7 @@ from elspeth.contracts.results import RowResult
 from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
-from elspeth.core.config import RowUnionSettings
+from elspeth.core.config import GateSettings, RowUnionSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
@@ -394,6 +394,73 @@ class TestAggregationIntakeOrdering:
         assert flush_calls == [(_AGG_NODE, TriggerType.COUNT)]
         assert len(outcome.results) == 1
         assert len(outcome.child_items) == 1
+
+
+class TestAggregationIntakeDispatch:
+    """Nominal (negative) dispatch at the intake flush seam (elspeth-8783933d99).
+
+    The flush guard must key on GateSettings nominally: a gate at the barrier
+    node is its own defect, a non-batch-aware transform is a different one,
+    and a transform-shaped plugin that fails TransformProtocol conformance is
+    NEITHER — protocol membership is measured, not declared, and must not
+    masquerade as "DAG/config inconsistency".
+    """
+
+    def _fired_row_setup(self) -> tuple[RecordingScheduler, RecordingAggregationExecutor, dict[str, _LiveBarrierHold]]:
+        row = _blocked_row(barrier_key=str(_AGG_NODE))
+        scheduler = RecordingScheduler(pending=[row])
+        agg = RecordingAggregationExecutor(should_flush=True)
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_AGG_NODE))}
+        return scheduler, agg, holds
+
+    def test_gate_at_aggregation_node_raises_gate_specific_error(self) -> None:
+        gate = GateSettings(name="not-a-transform", input="default", condition="True", routes={"true": "default", "false": "default"})
+        scheduler, agg, holds = self._fired_row_setup()
+        coordinator = _make_coordinator(
+            scheduler=scheduler,
+            aggregation_executor=agg,
+            live_holds=holds,
+            nav=FakeNav(transform=gate),
+        )
+
+        with pytest.raises(OrchestrationInvariantError, match="resolves to gate"):
+            coordinator.run_intake_pass(_ctx())
+
+    def test_non_batch_aware_transform_at_aggregation_node_raises(self) -> None:
+        from tests.fixtures.nonconforming_transform import NonConformingTransform
+
+        transform = NonConformingTransform(node_id=str(_AGG_NODE), is_batch_aware=False)
+        scheduler, agg, holds = self._fired_row_setup()
+        coordinator = _make_coordinator(
+            scheduler=scheduler,
+            aggregation_executor=agg,
+            live_holds=holds,
+            nav=FakeNav(transform=transform),
+        )
+
+        with pytest.raises(OrchestrationInvariantError, match="is not batch-aware"):
+            coordinator.run_intake_pass(_ctx())
+
+    def test_non_conforming_batch_aware_transform_flushes(self) -> None:
+        """A batch-aware transform missing a TransformProtocol member still flushes."""
+        from tests.fixtures.nonconforming_transform import NonConformingTransform
+
+        transform = NonConformingTransform(node_id=str(_AGG_NODE), is_batch_aware=True)
+        assert not isinstance(transform, TransformProtocol)  # precondition, not the pin
+        scheduler, agg, holds = self._fired_row_setup()
+        flush_calls: list[tuple[NodeID, TriggerType]] = []
+        coordinator = _make_coordinator(
+            scheduler=scheduler,
+            aggregation_executor=agg,
+            live_holds=holds,
+            nav=FakeNav(transform=transform),
+            flush_calls=flush_calls,
+        )
+
+        outcome = coordinator.run_intake_pass(_ctx())
+
+        assert [d.kind for d in outcome.dispositions] == [BarrierIntakeDispositionKind.FLUSH_FIRED]
+        assert flush_calls == [(_AGG_NODE, TriggerType.COUNT)]
 
 
 class TestCoalesceIntakeTaxonomy:

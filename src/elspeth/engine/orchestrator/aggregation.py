@@ -53,13 +53,14 @@ def find_aggregation_transform(
     Raises:
         RuntimeError: If no batch-aware transform found for the aggregation
     """
-    from elspeth.contracts import TransformProtocol
-
     agg_transform: TransformProtocol | None = None
     agg_node_id = NodeID(agg_node_id_str)
 
+    # config.transforms is homogeneous (Sequence[RowPlugin]) — protocol
+    # conformance is deliberately not re-measured here (elspeth-8783933d99):
+    # doing so silently dropped non-conforming transforms from the lookup.
     for t in config.transforms:
-        if isinstance(t, TransformProtocol) and t.node_id == agg_node_id_str and t.is_batch_aware:
+        if t.node_id == agg_node_id_str and t.is_batch_aware:
             agg_transform = t
             break
 

@@ -44,6 +44,7 @@ from elspeth.contracts.identity import LineageFrame, innermost_own_frame, path_f
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, GroupLossSpec, TokenWorkItem
 from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
+from elspeth.core.config import GateSettings
 from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
 from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.scheduler_repository import GroupLoss, token_from_journal_item
@@ -467,10 +468,25 @@ class BarrierIntakeCoordinator:
         if not should_flush:
             return BarrierIntakeDisposition(kind=BarrierIntakeDispositionKind.HELD)
         transform = self._nav.resolve_plugin_for_node(node_id)
-        if not isinstance(transform, TransformProtocol) or not transform.is_batch_aware:
+        # Nominal (negative) dispatch — elspeth-8783933d99: reject the closed
+        # container's known non-transform shapes (structural None, GateSettings)
+        # by their own defect, then check the batch contract. TransformProtocol
+        # conformance is deliberately not measured — a protocol-membership miss
+        # must not masquerade as "DAG/config inconsistency".
+        if transform is None:
             raise OrchestrationInvariantError(
                 f"Aggregation node {node_id!r} fired a {trigger_type} trigger at intake but resolves to "
-                f"{type(transform).__name__!r}, not a batch-aware transform. DAG/config inconsistency."
+                "no plugin (structural node). DAG/config inconsistency."
+            )
+        if isinstance(transform, GateSettings):
+            raise OrchestrationInvariantError(
+                f"Aggregation node {node_id!r} fired a {trigger_type} trigger at intake but resolves to gate "
+                f"{transform.name!r}, not a batch-aware transform. DAG/config inconsistency."
+            )
+        if not transform.is_batch_aware:
+            raise OrchestrationInvariantError(
+                f"Aggregation node {node_id!r} fired a {trigger_type} trigger at intake but transform "
+                f"{transform.name!r} is not batch-aware. DAG/config inconsistency."
             )
         flush_results, flush_child_items = self._flush_batch(
             node_id,

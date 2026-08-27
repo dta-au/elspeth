@@ -4470,10 +4470,20 @@ class RowProcessor:
         tokens_by_id = {token.token_id: token for token in buffered_tokens}
         try:
             node_id = NodeID(receipt.aggregation_node_id)
-            transform = cast(TransformProtocol, self._node_to_plugin[node_id])
+            plugin = self._node_to_plugin[node_id]
             settings = self._aggregation_settings[node_id]
         except (KeyError, ValueError) as exc:
             raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} has unknown routing authority") from exc
+        # Nominal (negative) dispatch — elspeth-8783933d99: a gate at the
+        # receipt's aggregation node must not flow onward as a transform. The
+        # bare cast this replaces let it, and protocol conformance is
+        # deliberately not measured (node_to_plugin is closed by construction).
+        if isinstance(plugin, GateSettings):
+            raise AuditIntegrityError(
+                f"Committed aggregation output {receipt.batch_id!r} routing authority {node_id!r} "
+                f"resolves to gate {plugin.name!r}, not a batch-aware transform"
+            )
+        transform = plugin
         if settings.output_mode.value != receipt.output_mode:
             raise AuditIntegrityError(
                 f"Committed aggregation output {receipt.batch_id!r} mode {receipt.output_mode!r} "

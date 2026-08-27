@@ -297,6 +297,29 @@ class TestResolveJumpTargetSink:
         )
         assert nav.resolve_jump_target_sink(NodeID("branch-t1")) == "branch_sink"
 
+    def test_resolves_through_non_conforming_transform_on_success(self) -> None:
+        """A transform-shaped plugin missing a protocol member still resolves its sink.
+
+        elspeth-8783933d99 mechanism pin: the walk keys nominally on
+        GateSettings (negative form) over the closed node_to_plugin container.
+        Re-measuring TransformProtocol conformance here silently SKIPPED any
+        non-conforming transform and mis-resolved the jump-target sink — pin
+        the VALUE so the silent-skip mutation is caught.
+        """
+        from tests.fixtures.nonconforming_transform import NonConformingTransform
+
+        transform = NonConformingTransform(node_id="branch-t1", on_success="branch_sink")
+        assert not isinstance(transform, TransformProtocol)  # precondition, not the pin
+        nav = _make_nav(
+            node_to_plugin={NodeID("branch-t1"): transform},
+            node_to_next={
+                NodeID("source-0"): NodeID("branch-t1"),
+                NodeID("branch-t1"): None,
+            },
+            sink_names=frozenset({"branch_sink"}),
+        )
+        assert nav.resolve_jump_target_sink(NodeID("branch-t1")) == "branch_sink"
+
     def test_returns_none_for_gate_path(self) -> None:
         """Paths containing a gate return None (gate self-routes)."""
         gate = GateSettings(name="gate1", input="in_conn", condition="True", routes={"true": "out", "false": "err"})

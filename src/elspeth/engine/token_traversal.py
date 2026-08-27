@@ -1115,8 +1115,37 @@ class TokenTraversalEngine:
                 node_id = next_node_id
                 continue
 
-            # Type-safe plugin detection using protocols
-            if isinstance(plugin, TransformProtocol):
+            # Nominal (negative) dispatch — elspeth-8783933d99, ADR-032
+            # addendum. node_to_plugin is closed by construction (graph_wiring
+            # builds it from config.transforms + config.gates and raises on
+            # anything else), so "not a GateSettings" IS the transform arm.
+            # TransformProtocol conformance is deliberately NOT measured here:
+            # widening the runtime_checkable protocol silently de-classified
+            # every implementation missing the new member and the dispatch
+            # raise fired mid-traversal (ef5e6e593).
+            if isinstance(plugin, GateSettings):
+                # NOTE: child_items is mutated inside (fork paths, coalesce notifications).
+                gate_outcome = self.handle_gate_node(
+                    plugin,
+                    current_token,
+                    ctx,
+                    node_id,
+                    child_items,
+                    coalesce_node_id,
+                    coalesce_name,
+                    last_on_success_sink,
+                    row_union_node_id,
+                    row_union_name,
+                )
+                if isinstance(gate_outcome, _GateTerminal):
+                    return gate_outcome.result, child_items
+                current_token = gate_outcome.updated_token
+                last_on_success_sink = gate_outcome.updated_sink
+                if gate_outcome.next_node_id is not None:
+                    node_id = gate_outcome.next_node_id
+                    continue
+
+            elif not isinstance(plugin, GateSettings):
                 row_transform = plugin
                 # Check if this is a batch-aware transform at an aggregation node
                 transform_node_id = row_transform.node_id
@@ -1174,30 +1203,11 @@ class TokenTraversalEngine:
                     return transform_outcome.result, child_items
                 current_token = transform_outcome.updated_token
                 last_on_success_sink = transform_outcome.updated_sink
-            elif isinstance(plugin, GateSettings):
-                # NOTE: child_items is mutated inside (fork paths, coalesce notifications).
-                gate_outcome = self.handle_gate_node(
-                    plugin,
-                    current_token,
-                    ctx,
-                    node_id,
-                    child_items,
-                    coalesce_node_id,
-                    coalesce_name,
-                    last_on_success_sink,
-                    row_union_node_id,
-                    row_union_name,
-                )
-                if isinstance(gate_outcome, _GateTerminal):
-                    return gate_outcome.result, child_items
-                current_token = gate_outcome.updated_token
-                last_on_success_sink = gate_outcome.updated_sink
-                if gate_outcome.next_node_id is not None:
-                    node_id = gate_outcome.next_node_id
-                    continue
-
             else:
-                raise TypeError(f"Unknown transform type: {type(plugin).__name__}. Expected TransformProtocol or GateSettings.")
+                # Genuinely unreachable: the two arms above are complementary.
+                # This can no longer mean "failed protocol conformance" — kept
+                # as a tripwire against a future edit reintroducing a third arm.
+                raise TypeError(f"Malformed plugin dispatch for node {node_id!r}: {type(plugin).__name__} matched neither dispatch arm.")
 
             node_id = next_node_id
 
