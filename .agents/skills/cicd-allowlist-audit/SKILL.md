@@ -189,7 +189,6 @@ cd "$REPO_ROOT"
 PYTHONPATH="$REPO_ROOT/elspeth-lints/src" \
   .venv/bin/python -m elspeth_lints.core.cli check
 .venv/bin/python -m scripts.check_contracts
-.venv/bin/python scripts/cicd/check_slot_type_cross_language.py
 .venv/bin/pytest tests/
 .venv/bin/python -m mypy src/elspeth
 .venv/bin/python -m ruff check src/ tests/ scripts/ examples/

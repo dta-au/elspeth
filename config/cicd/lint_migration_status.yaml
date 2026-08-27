@@ -4,6 +4,10 @@ version: 1
 # scripts/cicd/*.py policy script during the elspeth-lints migration.
 # Status lifecycle:
 #   pending -> shadow -> cutover -> deleted
+# `deleted` covers two exit paths, told apart by new_rule:
+#   new_rule: <rule id>  the script migrated to that elspeth-lints rule
+#   new_rule: null       the script was obsoleted with its subject and has no
+#                        successor; the per-row comment names what removed it
 #
 # Shadow entries must include:
 #   new_rule: <elspeth-lints rule id>
@@ -25,9 +29,14 @@ rules:
     new_rule: null
     status: pending
     migration_issue: elspeth-313cd53771
+  # Obsoleted, not migrated: the script mirrored SlotType across the Python and
+  # TypeScript sides of the pipeline recipe system, and went away with its
+  # subject in e7a85bf8e (chore(composer): remove the pipeline recipe system).
+  # `new_rule: null` on a deleted row is the marker for that second exit path —
+  # a check whose subject no longer exists needs no successor rule.
   - old_script: scripts/cicd/check_slot_type_cross_language.py
     new_rule: null
-    status: pending
+    status: deleted
     migration_issue: elspeth-313cd53771
   - old_script: scripts/cicd/enforce_adapter_budget.py
     new_rule: contract_invariants.adapter_method_budget
