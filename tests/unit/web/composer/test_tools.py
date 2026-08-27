@@ -54,7 +54,13 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.execution.schemas import ValidationCheck, ValidationError, ValidationReadiness, ValidationResult
+from elspeth.web.execution.schemas import (
+    ValidationCheck,
+    ValidationError,
+    ValidationReadiness,
+    ValidationReadinessBlocker,
+    ValidationResult,
+)
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_SHIELD_USER_TERM,
@@ -13133,6 +13139,234 @@ class TestPreviewPipeline:
         assert absent["is_valid"] is False
         assert absent["runtime_preflight"] is None
         assert marker_codes(absent) == ["runtime_preflight_not_run"]
+
+
+def _handoff_strict_preflight() -> _SyncCallRecorder:
+    """A strict Stage-2 verdict in the pending-review handoff shape."""
+    return _SyncCallRecorder(
+        ValidationResult(
+            is_valid=False,
+            checks=[
+                ValidationCheck(
+                    name="interpretation_review",
+                    passed=False,
+                    detail="Interpretation review pending.",
+                    affected_nodes=(),
+                    outcome_code=None,
+                )
+            ],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=False,
+                completion_ready=True,
+                blockers=[
+                    ValidationReadinessBlocker(
+                        code="interpretation_review_pending",
+                        component_id="summarize",
+                        component_type="transform",
+                        detail="1 pending interpretation review.",
+                    )
+                ],
+            ),
+        )
+    )
+
+
+def _tolerant_result(*, valid: bool) -> ValidationResult:
+    if valid:
+        return ValidationResult(
+            is_valid=True,
+            checks=[ValidationCheck(name="graph_structure", passed=True, detail="Graph OK.", affected_nodes=(), outcome_code=None)],
+            errors=[],
+            readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+        )
+    return ValidationResult(
+        is_valid=False,
+        checks=[
+            ValidationCheck(
+                name="plugin_instantiation",
+                passed=False,
+                detail="llm node 'summarize' rejected its configuration.",
+                affected_nodes=("summarize",),
+                outcome_code=None,
+            ),
+            # A downstream stage skipped after the failure above: derived
+            # noise the projection must drop.
+            ValidationCheck(
+                name="graph_structure",
+                passed=False,
+                detail="Skipped after failure.",
+                affected_nodes=(),
+                outcome_code="validation.skipped_after_failure",
+            ),
+        ],
+        errors=[
+            ValidationError(
+                component_id="edge:summarize->main",
+                component_type="edge",
+                message="consumer requires ['colour'], producer guarantees (none)",
+                suggestion="Declare the field on the producer.",
+                error_code=None,
+            )
+        ],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=False, completion_ready=False, blockers=[]),
+    )
+
+
+def _pending_prompt_template_llm_node() -> NodeSpec:
+    """An llm node whose prompt parts carry a PENDING interpretation ref.
+
+    ``materialize_state_for_authoring`` must substitute placeholder text for
+    the pending ref, so a state carrying this node materializes to a
+    DIFFERENT object — the ``masking_applied=True`` arm.
+    """
+    return NodeSpec(
+        id="summarize",
+        node_type="transform",
+        plugin="llm",
+        input="summarize",
+        on_success="main",
+        on_error="discard",
+        options={
+            "profile": "default",
+            "required_input_fields": ["colour"],
+            "prompt_template_parts": [
+                {"kind": "text", "text": "Rate {{ row.colour }} as "},
+                {"kind": "interpretation_ref", "requirement_id": "req-1"},
+            ],
+            "interpretation_requirements": [
+                {
+                    "id": "req-1",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "status": "pending",
+                    "draft": "a 1-10 coolness scale",
+                }
+            ],
+            "schema": {"mode": "observed"},
+        },
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+class TestPreviewPipelineStructuralPreview:
+    """The additive ``data["structural_preview"]`` block (elspeth-229e9e8195).
+
+    Four handler branches: no callback → block absent; tolerant green →
+    block with empty findings; tolerant red with ``masking_applied=False``
+    → "equivalent" framing; tolerant red with ``masking_applied=True`` →
+    "provisional" report-don't-blindly-repair framing. ``is_valid`` stays
+    the strict conjunct in every branch — the block never joins it.
+    """
+
+    def _preview(
+        self,
+        state: CompositionState,
+        *,
+        structural_preflight: _SyncCallRecorder | None,
+    ) -> dict[str, Any]:
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            data_dir="/data",
+            runtime_preflight=_handoff_strict_preflight(),
+            structural_preflight=structural_preflight,
+        )
+        assert result.success is True
+        return result.data
+
+    def test_no_structural_callback_leaves_block_absent(self) -> None:
+        data = self._preview(_stage1_valid_preview_state(), structural_preflight=None)
+        assert "structural_preview" not in data
+        assert data["is_valid"] is False  # strict handoff verdict governs
+
+    def test_tolerant_green_yields_block_with_empty_findings(self) -> None:
+        data = self._preview(
+            _stage1_valid_preview_state(),
+            structural_preflight=_SyncCallRecorder(_tolerant_result(valid=True)),
+        )
+        block = data["structural_preview"]
+        assert block["is_valid"] is True
+        assert list(block["failing_checks"]) == []
+        assert list(block["errors"]) == []
+        # No prompt-bearing node: masking was a no-op, findings are exact.
+        assert block["masking_applied"] is False
+        assert block["confidence"] == "equivalent"
+        # The strict conjunct is untouched by a green tolerant pass.
+        assert data["is_valid"] is False
+
+    def test_tolerant_red_without_masking_is_framed_equivalent(self) -> None:
+        data = self._preview(
+            _stage1_valid_preview_state(),
+            structural_preflight=_SyncCallRecorder(_tolerant_result(valid=False)),
+        )
+        block = data["structural_preview"]
+        assert block["is_valid"] is False
+        assert block["masking_applied"] is False
+        assert block["confidence"] == "equivalent"
+        assert [check["name"] for check in block["failing_checks"]] == ["plugin_instantiation"]
+        assert block["errors"][0]["message"] == "consumer requires ['colour'], producer guarantees (none)"
+        # The skipped-after-failure stamp is derived noise and must be dropped.
+        assert all(check["outcome_code"] != "validation.skipped_after_failure" for check in block["failing_checks"])
+        assert data["is_valid"] is False
+
+    def test_tolerant_red_with_masking_is_framed_provisional(self) -> None:
+        """The ticket's false-positive shape: a pending prompt-template ref.
+
+        ``materialize_state_for_authoring`` substitutes placeholder text for
+        the pending interpretation ref, so a tolerant red at
+        ``plugin_instantiation`` may be an artifact of the placeholder — the
+        block must say so and instruct report-not-repair.
+        """
+        from elspeth.web.interpretation_state import materialize_state_for_authoring
+
+        state = _stage1_valid_preview_state().with_node(_pending_prompt_template_llm_node())
+        # Premise check: this state genuinely materializes to a new object.
+        assert materialize_state_for_authoring(state) is not state
+
+        data = self._preview(state, structural_preflight=_SyncCallRecorder(_tolerant_result(valid=False)))
+        block = data["structural_preview"]
+        assert block["is_valid"] is False
+        assert block["masking_applied"] is True
+        assert block["confidence"] == "provisional"
+        assert "placeholder" in block["note"]
+        assert "Report" in block["note"]
+        assert [check["name"] for check in block["failing_checks"]] == ["plugin_instantiation"]
+        assert data["is_valid"] is False
+
+    def test_masking_noop_state_is_framed_equivalent_with_prompt_node(self) -> None:
+        """A resolved-parts prompt renders identically → identical state object."""
+        from dataclasses import replace as dc_replace
+
+        from elspeth.web.interpretation_state import materialize_state_for_authoring
+
+        node = _pending_prompt_template_llm_node()
+        resolved_options = dict(node.options)
+        resolved_options["interpretation_requirements"] = [
+            {
+                "id": "req-1",
+                "kind": "vague_term",
+                "user_term": "cool",
+                "status": "resolved",
+                "accepted_value": "a 1-10 coolness scale",
+            }
+        ]
+        resolved_options["prompt_template"] = "Rate {{ row.colour }} as a 1-10 coolness scale"
+        resolved_node = dc_replace(node, options=resolved_options)
+        state = _stage1_valid_preview_state().with_node(resolved_node)
+        assert materialize_state_for_authoring(state) is state
+
+        data = self._preview(state, structural_preflight=_SyncCallRecorder(_tolerant_result(valid=False)))
+        assert data["structural_preview"]["masking_applied"] is False
+        assert data["structural_preview"]["confidence"] == "equivalent"
 
 
 class TestPrevalidatePluginOptions:

@@ -75,6 +75,7 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_cache import (
     tool_result_mutated_composition_state as _tool_result_mutated_composition_state,
 )
+from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.pipeline_custody import (
     finalize_pipeline_custody,
     inline_custody_audit_projection,
@@ -1819,6 +1820,7 @@ async def run_tool_batch(
         # execute_tool() synchronous and bounds the async I/O cost
         # before it enters the worker thread pool.
         runtime_preflight_callback: RuntimePreflight | None = None
+        structural_preflight_callback: RuntimePreflight | None = None
         if tool_name == "preview_pipeline":
             try:
                 preview_preflight = await ctx.service._cached_runtime_preflight(
@@ -1849,6 +1851,51 @@ async def run_tool_batch(
                 return _callback
 
             runtime_preflight_callback = _make_preflight_callback()
+
+            # elspeth-229e9e8195: while an interpretation review is pending
+            # the strict verdict above is handoff-shaped and every stage past
+            # ``review_interpretations`` is SKIPPED_AFTER_FAILURE — so also
+            # precompute the interpretation-tolerant preflight and let the
+            # preview surface its structural findings during authoring
+            # instead of first at completion. Same cache and snapshot as the
+            # completion path's ``_pending_handoff_outstanding_findings``, so
+            # the two tolerant lookups share one engine run per state. A
+            # tolerant-pass infrastructure failure propagates exactly like
+            # the strict one (the completion path takes the same position):
+            # an explicit failure beats silently withholding findings this
+            # turn claimed to check for.
+            if is_pending_interpretation_handoff(preview_preflight):
+                try:
+                    structural_preflight_result = await ctx.service._cached_runtime_preflight(
+                        state,
+                        user_id=user_id,
+                        session_id=session_id,
+                        cache=runtime_preflight_cache,
+                        initial_version=initial_version,
+                        session_scope=session_scope,
+                        llm_calls=recorder.llm_calls,
+                        plugin_snapshot=ctx.plugin_snapshot,
+                        interpretation_tolerant=True,
+                    )
+                except ComposerRuntimePreflightError as preflight_exc:
+                    recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
+                    raise ComposerRuntimePreflightError.capture(
+                        preflight_exc.original_exc,
+                        state=state,
+                        initial_version=initial_version,
+                        tool_invocations=recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                    ) from preflight_exc.original_exc
+
+                def _make_structural_callback(
+                    _result: ValidationResult = structural_preflight_result,
+                ) -> RuntimePreflight:
+                    def _callback(_state: CompositionState) -> ValidationResult:
+                        return _result
+
+                    return _callback
+
+                structural_preflight_callback = _make_structural_callback()
 
         # All tool calls are offloaded to a worker to avoid blocking
         # the event loop.
@@ -1911,6 +1958,7 @@ async def run_tool_batch(
             _state: CompositionState = state,
             _last_validation: ValidationSummary | None = last_validation,
             _runtime_preflight_callback: RuntimePreflight | None = runtime_preflight_callback,
+            _structural_preflight_callback: RuntimePreflight | None = structural_preflight_callback,
             _user_message_id: str | None = user_message_id,
             _user_message_content: str | None = user_message_content,
             _composer_model_identifier: str = ctx.service._model,
@@ -1940,6 +1988,7 @@ async def run_tool_batch(
                 user_id=user_id,
                 prior_validation=_last_validation,
                 runtime_preflight=_runtime_preflight_callback,
+                structural_preflight=_structural_preflight_callback,
                 max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
                 user_message_id=_user_message_id,
                 user_message_content=_user_message_content,

@@ -1327,6 +1327,20 @@ class _TerminalNoToolAdvisorGateOutcome:
     advisor_review_state: _AdvisorReviewState | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _PlannerPreviewPreflightCallbacks:
+    """Precomputed ``preview_pipeline`` Stage-2 callbacks for one planner request.
+
+    ``runtime`` is the strict verdict; ``structural`` is the interpretation-
+    tolerant verdict, wired only when the strict verdict is handoff-shaped
+    (elspeth-229e9e8195). Either may be ``None`` — an absent callback leaves
+    the preview on its honest un-run / block-absent arm.
+    """
+
+    runtime: RuntimePreflight | None = None
+    structural: RuntimePreflight | None = None
+
+
 def _advance_advisor_review_state(
     review_state: _AdvisorReviewState,
     *,
@@ -3451,6 +3465,13 @@ class ComposerServiceImpl:
         if not self._availability.available:
             raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
 
+        preview_preflight_callbacks = await self._planner_preview_preflight(
+            current_state,
+            user_id=originating_message.user_id,
+            session_id=originating_message.session_id,
+            plugin_snapshot=plugin_snapshot,
+            llm_calls=recorder.llm_calls,
+        )
         # Await inside a try so a typed planner failure is logged with its
         # code+rejection_codes before re-raising to the (signed) guided route
         # (see _log_guided_planner_failure); the coroutine runs nothing until
@@ -3514,13 +3535,8 @@ class ComposerServiceImpl:
                 session_engine=self._session_engine,
                 max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
                 secret_service=self._secret_service,
-                runtime_preflight=await self._planner_preview_preflight(
-                    current_state,
-                    user_id=originating_message.user_id,
-                    session_id=originating_message.session_id,
-                    plugin_snapshot=plugin_snapshot,
-                    llm_calls=recorder.llm_calls,
-                ),
+                runtime_preflight=preview_preflight_callbacks.runtime,
+                structural_preflight=preview_preflight_callbacks.structural,
                 write_fence=BlobGuidedOperationWriteFence(
                     session_id=operation_fence.session_id,
                     operation_id=operation_fence.operation_id,
@@ -3668,18 +3684,20 @@ class ComposerServiceImpl:
             "transform": frozenset(item.name for item in policy_catalog.list_transforms()),
             "sink": frozenset(item.name for item in policy_catalog.list_sinks()),
         }
+        preview_preflight_callbacks = await self._planner_preview_preflight(
+            current_state,
+            user_id=user_id,
+            session_id=originating_message.session_id,
+            plugin_snapshot=plugin_snapshot,
+            llm_calls=recorder.llm_calls,
+        )
         custody_config = PlannerCustodyConfig(
             data_dir=self._data_dir,
             session_engine=self._session_engine,
             max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
             secret_service=self._secret_service,
-            runtime_preflight=await self._planner_preview_preflight(
-                current_state,
-                user_id=user_id,
-                session_id=originating_message.session_id,
-                plugin_snapshot=plugin_snapshot,
-                llm_calls=recorder.llm_calls,
-            ),
+            runtime_preflight=preview_preflight_callbacks.runtime,
+            structural_preflight=preview_preflight_callbacks.structural,
             write_fence=BlobGuidedOperationWriteFence(
                 session_id=operation_fence.session_id,
                 operation_id=operation_fence.operation_id,
@@ -3972,8 +3990,8 @@ class ComposerServiceImpl:
         session_id: str,
         plugin_snapshot: PluginAvailabilitySnapshot | None,
         llm_calls: tuple[ComposerLLMCall, ...] = (),
-    ) -> RuntimePreflight | None:
-        """Stage-2 callback for ``preview_pipeline`` inside a planner request.
+    ) -> _PlannerPreviewPreflightCallbacks:
+        """Stage-2 callbacks for ``preview_pipeline`` inside a planner request.
 
         Precompute-then-close-over, the same shape ``tool_batch`` uses for the
         compose loop: ``execute_tool`` is synchronous, so the async preflight
@@ -3984,14 +4002,22 @@ class ComposerServiceImpl:
         returns a changed ``updated_state`` — so the one state this callback
         can ever be asked about is the one preflighted here.
 
-        Returns ``None`` (leaving ``preview_pipeline`` on its fail-closed
-        ``runtime_preflight_not_run`` branch) in the two cases where a verdict
-        would be noise rather than signal:
+        Returns empty callbacks (leaving ``preview_pipeline`` on its
+        fail-closed ``runtime_preflight_not_run`` branch) in the two cases
+        where a verdict would be noise rather than signal:
 
         * a structurally empty pipeline — there is nothing to dry-run, and the
           empty-topology planner passes one by construction;
         * the preflight itself failed — a planner request must not die because
           Stage 2 broke, and the un-run tripwire already reports it honestly.
+
+        When the strict verdict is handoff-shaped (invalid with the
+        ``interpretation_review_pending`` blocker), the interpretation-
+        tolerant preflight is additionally precomputed as the ``structural``
+        callback so the preview surfaces the structural findings the strict
+        ledger skipped (elspeth-229e9e8195). A tolerant-pass failure degrades
+        to no structural callback under the same must-not-die rule — the
+        block is then absent, which claims nothing.
 
         ``ComposerRuntimePreflightError`` is the only catch because the
         coordinator funnels every ``Exception`` (timeouts included) into that
@@ -3999,25 +4025,51 @@ class ComposerServiceImpl:
         propagates, so a cancelled planner request still aborts.
         """
         if _state_is_structurally_empty(current_state):
-            return None
+            return _PlannerPreviewPreflightCallbacks()
+        # One request-local cache for both passes: the strict and tolerant
+        # entries key separately (``interpretation_tolerant`` is in the key),
+        # and the process-wide coordinator dedupes each against any
+        # concurrent same-key run elsewhere.
+        cache: _RuntimePreflightCache = {}
         try:
             preflight_result = await self._cached_runtime_preflight(
                 current_state,
                 user_id=user_id,
                 session_id=session_id,
-                cache={},
+                cache=cache,
                 initial_version=current_state.version,
                 session_scope=f"session:{session_id}",
                 llm_calls=llm_calls,
                 plugin_snapshot=plugin_snapshot,
             )
         except ComposerRuntimePreflightError:
-            return None
+            return _PlannerPreviewPreflightCallbacks()
 
         def _callback(_state: CompositionState, _result: ValidationResult = preflight_result) -> ValidationResult:
             return _result
 
-        return _callback
+        if not _is_pending_interpretation_handoff(preflight_result):
+            return _PlannerPreviewPreflightCallbacks(runtime=_callback)
+
+        try:
+            tolerant_result = await self._cached_runtime_preflight(
+                current_state,
+                user_id=user_id,
+                session_id=session_id,
+                cache=cache,
+                initial_version=current_state.version,
+                session_scope=f"session:{session_id}",
+                llm_calls=llm_calls,
+                plugin_snapshot=plugin_snapshot,
+                interpretation_tolerant=True,
+            )
+        except ComposerRuntimePreflightError:
+            return _PlannerPreviewPreflightCallbacks(runtime=_callback)
+
+        def _structural_callback(_state: CompositionState, _result: ValidationResult = tolerant_result) -> ValidationResult:
+            return _result
+
+        return _PlannerPreviewPreflightCallbacks(runtime=_callback, structural=_structural_callback)
 
     async def _stage_pipeline_plan(
         self,
@@ -4226,23 +4278,25 @@ class ComposerServiceImpl:
             content=message,
             user_id=user_id,
         )
+        # Resolves to empty callbacks today — this surface plans an EMPTY
+        # topology by construction, and the helper's structurally-empty guard
+        # is the single source of that rule. Routed through it anyway so the
+        # callbacks appear by themselves if this dispatch ever accepts a
+        # non-empty state, rather than silently staying un-run.
+        preview_preflight_callbacks = await self._planner_preview_preflight(
+            state,
+            user_id=user_id,
+            session_id=session_id,
+            plugin_snapshot=plugin_snapshot,
+            llm_calls=recorder.llm_calls,
+        )
         custody_config = PlannerCustodyConfig(
             data_dir=self._data_dir,
             session_engine=self._session_engine,
             max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
             secret_service=self._secret_service,
-            # Resolves to ``None`` today — this surface plans an EMPTY topology
-            # by construction, and the helper's structurally-empty guard is the
-            # single source of that rule. Routed through it anyway so the
-            # callback appears by itself if this dispatch ever accepts a
-            # non-empty state, rather than silently staying un-run.
-            runtime_preflight=await self._planner_preview_preflight(
-                state,
-                user_id=user_id,
-                session_id=session_id,
-                plugin_snapshot=plugin_snapshot,
-                llm_calls=recorder.llm_calls,
-            ),
+            runtime_preflight=preview_preflight_callbacks.runtime,
+            structural_preflight=preview_preflight_callbacks.structural,
         )
         planner_llm_start = len(recorder.llm_calls)
         planner_attempt_start = len(recorder.planner_attempts)

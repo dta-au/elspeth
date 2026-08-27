@@ -2953,6 +2953,53 @@ def test_every_restricted_discovery_success_uses_the_closed_provider_envelope(
         assert payload["data"] == authoritative_data
 
 
+@pytest.mark.parametrize(
+    "surface",
+    [PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE],
+)
+def test_restricted_preview_projection_strips_the_structural_preview_block(
+    tmp_path: Path,
+    surface: PlannerSurface,
+) -> None:
+    """elspeth-229e9e8195: the additive ``structural_preview`` block must not
+    leak through the restricted provider envelope — a restricted preview
+    success fail-closes to the closed error payload, block included."""
+    canary = "STRUCTURAL_PREVIEW_NOTE_CANARY_51C9"
+    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
+    provider_state = guided_redacted_current_state_context(current_state)
+    result = ToolResult(
+        success=True,
+        updated_state=current_state,
+        validation=current_state.validate(),
+        affected_nodes=(),
+        data={
+            "is_valid": False,
+            "structural_preview": {
+                "is_valid": False,
+                "confidence": "equivalent",
+                "masking_applied": False,
+                "failing_checks": [],
+                "errors": [],
+                "note": canary,
+            },
+        },
+    )
+    call = _ParsedToolCall(call_id="call-1", name="preview_pipeline", raw_arguments="{}", arguments={})
+
+    serialized = _serialize_provider_discovery_result(
+        call=call,
+        result=result,
+        surface=surface,
+        provider_current_state=provider_state,
+    )
+
+    assert canary not in serialized
+    assert "structural_preview" not in serialized
+    payload = json.loads(serialized)
+    assert payload["success"] is False
+    assert payload["data"]["error_code"] == "surface_projection_unavailable"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("surface", "profile"),

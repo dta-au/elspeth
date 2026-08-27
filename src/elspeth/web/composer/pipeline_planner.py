@@ -965,6 +965,10 @@ class PlannerCustodyConfig:
     max_storage_per_session: int
     secret_service: WebSecretResolver | None
     runtime_preflight: RuntimePreflight | None
+    # Interpretation-tolerant Stage-2 callback, wired only when the strict
+    # verdict is handoff-shaped so preview_pipeline can surface the
+    # structural findings the strict ledger skipped (elspeth-229e9e8195).
+    structural_preflight: RuntimePreflight | None = None
     write_fence: BlobGuidedOperationWriteFence | None = None
     # Guided-full defers inline-custody finalization into the atomic staging
     # settlement: the blob row's composite lineage FK requires the originating
@@ -3572,6 +3576,7 @@ async def _plan_pipeline_inner(
         baseline=current_state,
         current_validation=current_validation.validation,
         runtime_preflight=custody_config.runtime_preflight,
+        structural_preflight=custody_config.structural_preflight,
         max_blob_storage_per_session_bytes=custody_config.max_storage_per_session,
         user_message_id=originating_message.message_id,
         user_message_content=originating_message.content,
