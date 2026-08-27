@@ -27,6 +27,7 @@ from elspeth.core.security.web import NetworkError, SSRFBlockedError, SSRFSafeRe
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     filter_response_headers,
     fingerprint_headers,
+    fingerprint_url,
 )
 from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
@@ -346,8 +347,10 @@ class DataverseClient:
         hostname = parsed.hostname
 
         if hostname is None:
+            # The message persists via error_data["message"], so the embedded
+            # URL is fingerprinted; request_url keeps the raw value for callers.
             raise DataverseClientError(
-                f"Cannot extract hostname from URL: {url!r}",
+                f"Cannot extract hostname from URL: {fingerprint_url(url)!r}",
                 retryable=False,
                 request_url=url,
             )
@@ -366,7 +369,7 @@ class DataverseClient:
             return validate_url_for_ssrf(url)
         except (SSRFBlockedError, NetworkError) as exc:
             raise DataverseClientError(
-                f"URL {url!r} failed IP-pinning SSRF validation: {exc}",
+                f"URL {fingerprint_url(url)!r} failed IP-pinning SSRF validation: {exc}",
                 retryable=False,
                 error_category="ssrf_rejected",
                 request_url=url,

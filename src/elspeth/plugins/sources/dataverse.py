@@ -36,6 +36,7 @@ from elspeth.plugins.infrastructure.clients.dataverse import (
     DataversePageResponse,
     validate_additional_domain,
 )
+from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig, declared_source_schema_field_names
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
@@ -274,7 +275,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3e3573fdf0286ccd"
+    source_file_hash: str | None = "sha256:89bb255e6778c16b"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -674,17 +675,21 @@ class DataverseSource(BaseSource):
             error: DataverseClientError (for errors)
             error_reason: Additional error context
         """
+        # After page 1 the url IS the server-supplied @odata.nextLink (Tier-3
+        # data), so every persisted copy rides fingerprint_url like the
+        # AuditedHTTPClient path; pagination keeps using the raw DTO values.
+        safe_url = fingerprint_url(url) if url is not None else None
         if page is not None:
             request_data: dict[str, Any] = {
                 "method": "GET",
-                "url": url,
+                "url": safe_url,
                 "headers": page.request_headers,  # Already fingerprinted by client
             }
             response_data = {
                 "status_code": page.status_code,
                 "row_count": len(page.rows),
                 "headers": page.headers,
-                "next_link": page.next_link,
+                "next_link": fingerprint_url(page.next_link) if page.next_link is not None else None,
                 "paging_cookie": page.paging_cookie,
                 "more_records": page.more_records,
             }
@@ -702,13 +707,13 @@ class DataverseSource(BaseSource):
             except Exception as exc:
                 raise AuditIntegrityError(
                     f"Failed to record successful page fetch to audit trail "
-                    f"(url={url!r}). "
+                    f"(url={safe_url!r}). "
                     f"Page fetch completed but audit record is missing."
                 ) from exc
         elif error is not None:
             request_data = {
                 "method": "GET",
-                "url": url,
+                "url": safe_url,
                 "headers": error.request_headers,  # Fingerprinted by client; mirrors the success path
             }
             error_data = {
@@ -731,7 +736,7 @@ class DataverseSource(BaseSource):
             except Exception as exc:
                 raise AuditIntegrityError(
                     f"Failed to record error page fetch to audit trail "
-                    f"(url={url!r}, error={error!r}). "
+                    f"(url={safe_url!r}, error={error!r}). "
                     f"Error occurred but audit record is missing."
                 ) from exc
 

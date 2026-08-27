@@ -19,6 +19,7 @@ from elspeth.plugins.infrastructure.clients.dataverse import (
     DataverseClientError,
     DataversePageResponse,
 )
+from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 
 # Dynamic schema config for tests
@@ -1639,7 +1640,9 @@ class TestDataverseSourceLoadFetchXML:
         assert ctx.record_call.call_count == 2
         audit_call = ctx.record_call.call_args.kwargs
         assert audit_call["status"] == CallStatus.ERROR
-        assert audit_call["request_data"]["url"] == expected_url
+        # Persisted copy rides fingerprint_url (elspeth-3f583950c1); the full
+        # candidate URL survives because fetchXml is not a sensitive param.
+        assert audit_call["request_data"]["url"] == fingerprint_url(expected_url)
         audit_headers = audit_call["request_data"]["headers"]
         assert audit_headers["Accept"] == "application/json"
         auth_value = audit_headers.get("Authorization")
@@ -2030,7 +2033,10 @@ class TestRecordPageCall:
 
         response_data = ctx.record_call.call_args.kwargs["response_data"]
         assert response_data["headers"] == page.headers
-        assert response_data["next_link"] == page.next_link
+        # Persisted copy is fingerprinted (elspeth-3f583950c1): benign query
+        # params survive modulo re-encoding ($ -> %24).
+        assert response_data["next_link"] == fingerprint_url(page.next_link)
+        assert "skiptoken=def" in response_data["next_link"]
         assert response_data["paging_cookie"] is None
         assert response_data["more_records"] is None
 
@@ -2090,6 +2096,129 @@ class TestRecordPageCall:
         source._record_page_call(ctx, url="https://test.com/api", page=page)
 
         assert len(events) == 1
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: server-controlled pagination URLs fingerprinted before persistence
+# (elspeth-3f583950c1)
+# ---------------------------------------------------------------------------
+
+
+HOSTILE_URL = "https://alice:s3cret-pass@myorg.crm.dynamics.com/api/data/v9.2/contacts?sig=RAW_QUERY_SECRET&view=full#frag-secret"
+HOSTILE_NEXT_LINK = "https://bob:n3xt-pass@myorg.crm.dynamics.com/api/data/v9.2/contacts?token=RAW_LINK_SECRET&$skiptoken=2#next-frag"
+_RAW_MARKERS = ("s3cret-pass", "RAW_QUERY_SECRET", "frag-secret", "n3xt-pass", "RAW_LINK_SECRET", "next-frag")
+
+
+def _assert_no_raw_markers(text: str) -> None:
+    for marker in _RAW_MARKERS:
+        assert marker not in text, f"raw sensitive value {marker!r} persisted: {text!r}"
+
+
+class TestRecordPageCallUrlFingerprinting:
+    """After page 1, url IS the server-supplied @odata.nextLink — Tier-3 data.
+
+    Persisted copies must ride the same fingerprint_url treatment the
+    sibling AuditedHTTPClient path applies (blob_fetch.py / http.py
+    convention); pagination itself keeps using the raw DTO value.
+    """
+
+    def _make_source_with_client(self) -> Any:
+        source = _make_source(_base_config())
+        source._client = _DataverseClientFake()
+        return source
+
+    def _hostile_page(self) -> DataversePageResponse:
+        return DataversePageResponse(
+            status_code=200,
+            rows=[{"id": "1"}],
+            latency_ms=42.0,
+            headers={"content-type": "application/json"},
+            request_headers={"Authorization": "<fingerprint:test-fake>"},
+            request_url=HOSTILE_URL,
+            next_link=HOSTILE_NEXT_LINK,
+            paging_cookie=None,
+            more_records=None,
+        )
+
+    def test_success_branch_fingerprints_url_and_next_link(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "dataverse-test-key")
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        source = self._make_source_with_client()
+        ctx = _mock_source_context()
+
+        source._record_page_call(ctx, url=HOSTILE_URL, page=self._hostile_page())
+
+        kwargs = ctx.record_call.call_args.kwargs
+        persisted_url = kwargs["request_data"]["url"]
+        persisted_next = kwargs["response_data"]["next_link"]
+        for persisted in (persisted_url, persisted_next):
+            _assert_no_raw_markers(persisted)
+            assert "myorg.crm.dynamics.com" in persisted  # redaction is surgical, not blinding
+        query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(persisted_url).query))
+        assert query["sig"].startswith("<fingerprint:")
+        assert query["view"] == "full"
+        next_query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(persisted_next).query))
+        assert next_query["token"].startswith("<fingerprint:")
+        assert next_query["$skiptoken"] == "2"
+
+    def test_success_branch_preserves_none_next_link(self) -> None:
+        source = self._make_source_with_client()
+        ctx = _mock_source_context()
+
+        page = DataversePageResponse(
+            status_code=200,
+            rows=[],
+            latency_ms=1.0,
+            headers={},
+            request_headers={},
+            request_url="https://myorg.crm.dynamics.com/api/data/v9.2/contacts",
+            next_link=None,
+            paging_cookie=None,
+            more_records=False,
+        )
+        source._record_page_call(ctx, url=page.request_url, page=page)
+
+        assert ctx.record_call.call_args.kwargs["response_data"]["next_link"] is None
+
+    def test_error_branch_fingerprints_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "dataverse-test-key")
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        source = self._make_source_with_client()
+        ctx = _mock_source_context()
+
+        error = DataverseClientError("Server error", retryable=True, status_code=500, latency_ms=100.0)
+        source._record_page_call(ctx, url=HOSTILE_URL, error=error, error_reason="pagination_error")
+
+        persisted_url = ctx.record_call.call_args.kwargs["request_data"]["url"]
+        _assert_no_raw_markers(persisted_url)
+        assert "myorg.crm.dynamics.com" in persisted_url
+
+    def test_success_branch_audit_miss_message_fingerprints_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "dataverse-test-key")
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        source = self._make_source_with_client()
+        ctx = _mock_source_context()
+        ctx.record_call = _CallRecorder(side_effect=RuntimeError("db down"))
+
+        with pytest.raises(AuditIntegrityError) as excinfo:
+            source._record_page_call(ctx, url=HOSTILE_URL, page=self._hostile_page())
+        _assert_no_raw_markers(str(excinfo.value))
+
+    def test_error_branch_audit_miss_message_fingerprints_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "dataverse-test-key")
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        source = self._make_source_with_client()
+        ctx = _mock_source_context()
+        ctx.record_call = _CallRecorder(side_effect=RuntimeError("db down"))
+
+        error = DataverseClientError("Server error", retryable=True, status_code=500, latency_ms=100.0)
+        with pytest.raises(AuditIntegrityError) as excinfo:
+            source._record_page_call(ctx, url=HOSTILE_URL, error=error, error_reason="pagination_error")
+        _assert_no_raw_markers(str(excinfo.value))
 
 
 # ---------------------------------------------------------------------------
@@ -2171,7 +2300,10 @@ class TestAuditUrlPerPage:
         source._record_page_call(ctx, url=page2.request_url, page=page2)
 
         call_kwargs = ctx.record_call.call_args.kwargs
-        assert call_kwargs["request_data"]["url"] == next_url
+        # fingerprint_url re-encodes the query ($ -> %24) but keeps the
+        # nextLink identity — the page-2 URL, not the rebuilt initial URL.
+        assert call_kwargs["request_data"]["url"] == fingerprint_url(next_url)
+        assert "skiptoken=abc" in call_kwargs["request_data"]["url"]
 
     def _make_source_with_client(self) -> Any:
         source = _make_source(_base_config())

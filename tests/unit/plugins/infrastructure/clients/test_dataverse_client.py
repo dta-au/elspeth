@@ -704,6 +704,38 @@ class TestPaginateOdata:
         ):
             list(client.paginate_odata(f"{ENV_URL}/api/data/v9.2/accounts"))
 
+    def test_ssrf_ip_pinning_failure_message_fingerprints_url(self, client: DataverseClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The IP-pinning rejection message persists via error_data['message'] —
+        the embedded URL must be fingerprinted, not raw (elspeth-3f583950c1)."""
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "dataverse-test-key")
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        hostile = f"{ENV_URL}/api/data/v9.2/accounts?sig=RAW_MSG_SECRET&$skiptoken=abc"
+
+        with (
+            patch(
+                "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
+                side_effect=SSRFBlockedError("DNS rebinding detected"),
+            ),
+            pytest.raises(DataverseClientError) as excinfo,
+        ):
+            client._validate_url_ssrf(hostile)
+
+        message = str(excinfo.value)
+        assert "RAW_MSG_SECRET" not in message
+        assert "myorg.crm.dynamics.com" in message
+        assert excinfo.value.request_url == hostile  # attribute keeps the raw value for callers
+
+    def test_no_hostname_rejection_message_fingerprints_url(self, client: DataverseClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hostname-less URL rejection must not embed raw query secrets."""
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "dataverse-test-key")
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        hostile = "https:///steal?sig=RAW_MSG_SECRET"
+
+        with pytest.raises(DataverseClientError) as excinfo:
+            client._validate_url_ssrf(hostile)
+
+        assert "RAW_MSG_SECRET" not in str(excinfo.value)
+
     def test_pre_request_ssrf_rejection_carries_request_context(self, client: DataverseClient) -> None:
         """A rejected candidate URL retains its audit URL and safe headers."""
         url = f"{ENV_URL}/api/data/v9.2/accounts?fetchXml=%3Cfetch%3E%3C/fetch%3E"
