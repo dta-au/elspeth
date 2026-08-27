@@ -43,6 +43,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _branch_loss_reason(transform_result: TransformResult, *, default: str) -> str:
+    """Bounded loss-ledger category for a failed transform result.
+
+    ONE derivation for both error arms (quarantine and error-routed) —
+    coalesce_branch_losses.reason / group_losses.reason is a String(64)
+    category token; the failure detail travels as an error_hash, never here.
+    Categories that carry their own audit meaning pass through explicitly;
+    everything else takes the arm's default.
+    """
+    reason = transform_result.reason
+    if reason is None:
+        return default
+    category = reason["reason"]
+    if category == "retry_exhausted":
+        return "max_retries_exceeded"
+    if category == "expand_width_exceeded":
+        # The expand-width fence (elspeth-258bd49d81): the refusal must be
+        # explicit in the loss ledger, not folded into "quarantined".
+        return "expand_width_exceeded"
+    return default
+
+
 # --- Discriminated union types for _process_single_token extraction ---
 
 
@@ -246,6 +268,34 @@ class TokenTraversalEngine:
                     f"(Multi-row is allowed in aggregation passthrough mode.)"
                 )
 
+            # Expand-width fence (elspeth-258bd49d81): refuse an over-wide
+            # expansion HERE, ahead of the eager mint transaction, and route
+            # the parent through the ordinary transform error channel — the
+            # transform's own on_error decides quarantine vs error sink, and
+            # _settle_member_losses records the enclosing-group losses with
+            # the explicit expand_width_exceeded reason. The would-be group is
+            # never minted, so nothing downstream can wait on it. TokenManager
+            # carries the same ceiling as a fail-closed backstop at the mint
+            # seam for callers without a loss channel.
+            width_ceiling = self._processor._max_expand_group_width
+            if width_ceiling is not None and len(transform_result.rows) > width_ceiling:
+                refusal = TransformResult.error(
+                    {
+                        "reason": "expand_width_exceeded",
+                        "message": (
+                            f"Expansion at transform '{transform.name}' would mint {len(transform_result.rows)} "
+                            f"members, exceeding max_expand_group_width={width_ceiling}. Refused before the "
+                            f"mint transaction (settings.max_expand_group_width)."
+                        ),
+                    },
+                    retryable=False,
+                )
+                # error_sink from the execute call above is None here (the
+                # transform SUCCEEDED; the engine refuses the expansion), so
+                # route by the transform's own on_error — always non-None at
+                # runtime (TransformSettings requires it).
+                return self.handle_transform_error_status(refusal, current_token, transform.on_error, child_items)
+
             # Deaggregation: create child tokens for each output row
             # NOTE: Parent EXPANDED outcome is recorded atomically in expand_token()
             # Contract consistency is enforced by TransformResult.success_multi()
@@ -369,11 +419,7 @@ class TokenTraversalEngine:
             # never inline — an unbounded repr overflows the column on
             # PostgreSQL and the audit write kills the run (elspeth-74b795208f).
             error_detail = str(transform_result.reason) if transform_result.reason else "unknown_error"
-            branch_loss_reason = (
-                "max_retries_exceeded"
-                if transform_result.reason is not None and transform_result.reason["reason"] == "retry_exhausted"
-                else "quarantined"
-            )
+            branch_loss_reason = _branch_loss_reason(transform_result, default="quarantined")
             quarantine_error_hash = compute_error_hash(error_detail)
             self._processor._data_flow.record_token_outcome(
                 ref=TokenRef(token_id=current_token.token_id, run_id=self._processor._run_id),
@@ -420,7 +466,7 @@ class TokenTraversalEngine:
         # Category token only (see the quarantine arm above): the detail rides
         # the FailureInfo below, which the accumulator hashes onto the outcome.
         error_detail = str(transform_result.reason)
-        branch_loss_reason = "max_retries_exceeded" if transform_result.reason["reason"] == "retry_exhausted" else "error_routed"
+        branch_loss_reason = _branch_loss_reason(transform_result, default="error_routed")
 
         sibling_results = self._processor._settle_member_losses(
             current_token,

@@ -2141,6 +2141,21 @@ class ElspethSettings(BaseModel):
         description="Maximum supported bound-region nesting depth (builder-enforced, spec §6.3)",
     )
 
+    # Width twin of the depth fence above (elspeth-258bd49d81): expand/batch
+    # fan-out is DATA-dependent, so it cannot be fenced at build — the engine
+    # refuses an over-wide expansion at the opener, before the eager mint
+    # transaction, and the row leaves through the transform error channel
+    # (on_error / quarantine) with reason expand_width_exceeded — fully
+    # audited, never an OOM. Raise this ONLY if you knowingly accept the
+    # memory and audit-DB cost of wider groups; the model stays correct at
+    # any width.
+    max_expand_group_width: int = Field(
+        default=100_000,
+        ge=1,
+        le=10_000_000,
+        description="Maximum members one expansion may mint (engine-enforced at the opener, before the mint transaction)",
+    )
+
     # Optional - aggregations (config-driven batching)
     aggregations: list[AggregationSettings] = Field(
         default_factory=list,

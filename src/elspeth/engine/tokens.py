@@ -63,6 +63,7 @@ class TokenManager:
         *,
         step_resolver: StepResolver,
         group_bindings: GroupBindingRegistry | None = None,
+        max_expand_group_width: int | None = None,
     ) -> None:
         """Initialize with data flow repository and step resolver.
 
@@ -82,10 +83,20 @@ class TokenManager:
                 ``by_opener_node()`` is resolved ONCE here, not per mint — ``bindings``
                 is build-time immutable, only the registry's own ``_expand_groups``
                 index mutates.
+            max_expand_group_width: Fail-closed backstop for the expand-width
+                fence (elspeth-258bd49d81, settings.max_expand_group_width).
+                ``expand_token`` refuses a wider mint BEFORE any DB work.
+                Callers with a loss channel (the traversal's multi-row arm)
+                gate ahead of the mint and route the refusal through
+                on_error/quarantine + settlement; this backstop is what a
+                caller that skips that gate hits instead. None = unfenced
+                (executor-internal managers that never call ``expand_token``,
+                and direct test constructions).
         """
         self._data_flow = data_flow
         self._step_resolver = step_resolver
         self._group_bindings = group_bindings
+        self._max_expand_group_width = max_expand_group_width
         self._opener_binding_by_node_id: dict[NodeID, GroupBinding] = group_bindings.by_opener_node() if group_bindings is not None else {}
         # META-38: per-(run_id, group_id) memo of the durable release fact.
         # Populated ONLY by is_release_group's durable read — never seeded
@@ -574,6 +585,22 @@ class TokenManager:
             Expanded rows are dicts from transform output; we wrap them in PipelineRow
             with the output_contract (post-transform schema), not parent's contract.
         """
+        # Expand-width fence backstop (elspeth-258bd49d81): refuse BEFORE any
+        # DB work — the mint is one eager transaction (every child INSERT plus
+        # depth-many lineage-frame rows), so an over-wide group must never
+        # reach it. The traversal's multi-row arm gates ahead of this call and
+        # routes the refusal through the transform error channel (on_error /
+        # quarantine + member-loss settlement); reaching THIS raise means a
+        # caller skipped that gate (e.g. an aggregation flush emitting a
+        # pathological row count), and the run fails closed rather than OOM.
+        if self._max_expand_group_width is not None and len(expanded_rows) > self._max_expand_group_width:
+            raise OrchestrationInvariantError(
+                f"Expansion at node '{node_id}' would mint {len(expanded_rows)} members, exceeding "
+                f"max_expand_group_width={self._max_expand_group_width} (settings.max_expand_group_width). "
+                f"Refused before the mint transaction. Callers with a loss channel must gate ahead of "
+                f"expand_token and route the refusal as expand_width_exceeded."
+            )
+
         # Guard - contract must be locked before any expansion side effects.
         # Expansion writes child tokens and may record parent EXPANDED outcome
         # atomically in the recorder; validate preconditions first.

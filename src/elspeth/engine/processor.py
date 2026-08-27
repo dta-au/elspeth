@@ -460,6 +460,7 @@ class RowProcessor:
         run_coordination: RunCoordinationRepository | None = None,
         follower_barrier_node_ids: frozenset[NodeID] | None = None,
         mode: ProcessorMode = ProcessorMode.LEADER,
+        max_expand_group_width: int | None = None,
     ) -> None:
         """Initialize processor.
 
@@ -539,6 +540,15 @@ class RowProcessor:
                 journal-intake adopts the arrival and runs trigger evaluation
                 (§B.2: trigger evaluation is leader-only).  Non-follower
                 processors leave this None (no-op path).
+            max_expand_group_width: The expand-width fence
+                (elspeth-258bd49d81, settings.max_expand_group_width). The
+                traversal's multi-row arm refuses a wider expansion ahead of
+                the mint and routes the row through the transform error
+                channel (reason ``expand_width_exceeded``); the same value is
+                threaded to this processor's TokenManager as the fail-closed
+                backstop at the mint seam itself. None = unfenced (direct
+                test constructions); the production factory always passes
+                the settings value.
             mode: Explicit processor role (elspeth-577179bba1). LEADER (the
                 default) is the production role: maintenance requires
                 ``coordination_token`` and always uses strict recovery. Direct
@@ -654,10 +664,12 @@ class RowProcessor:
                 error_edge_ids[node_id] = edge_id
         self._error_edge_ids = error_edge_ids
 
+        self._max_expand_group_width = max_expand_group_width
         self._token_manager = TokenManager(
             data_flow,
             step_resolver=self._step_resolver,
             group_bindings=self._group_bindings,
+            max_expand_group_width=max_expand_group_width,
         )
         self._transform_executor = TransformExecutor(
             execution,
