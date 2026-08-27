@@ -7,7 +7,6 @@ fixed task-local OTLP metric reader plus pipeline overlay in AWS ECS mode.
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import threading
 import time
@@ -35,7 +34,6 @@ from elspeth.web.config import WebSettings
 
 AWS_OTLP_ENDPOINT = "http://127.0.0.1:4317"
 _EXPORT_TIMEOUT_MILLIS = 5_000
-_SHUTDOWN_WALL_TIMEOUT_SECONDS = 5.5
 
 AWS_OPERATOR_PIPELINE_METRIC_NAMES: frozenset[str] = frozenset(
     {
@@ -281,36 +279,38 @@ class OperatorTelemetryRuntime:
     resource: Resource
     health: _ExportHealth
     pipeline_metrics: _OperatorPipelineMetrics | None = None
-    _shutdown_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _shutdown_state_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _shutdown_started: bool = False
     _shutdown_complete: bool = False
+
+    def _begin_shutdown(self) -> bool:
+        with self._shutdown_state_lock:
+            if self._shutdown_started or self._shutdown_complete:
+                return False
+            self._shutdown_started = True
+            return True
+
+    def _finish_shutdown(self) -> None:
+        with self._shutdown_state_lock:
+            self._shutdown_complete = True
 
     async def shutdown(self) -> None:
         if self.mode != "aws-otlp":
             return
-        async with self._shutdown_lock:
-            if self._shutdown_complete:
-                return
+        if not self._begin_shutdown():
+            return
+        try:
             try:
-                flushed = await asyncio.wait_for(
-                    asyncio.to_thread(self.provider.force_flush, timeout_millis=_EXPORT_TIMEOUT_MILLIS),
-                    timeout=_SHUTDOWN_WALL_TIMEOUT_SECONDS,
-                )
-                if not flushed:
-                    _log.warning("operator_otlp_force_flush_incomplete", destination="task-local")
-            except TimeoutError:
-                _log.warning("operator_otlp_force_flush_timeout", destination="task-local")
-            except TELEMETRY_TRANSPORT_ERRORS:
-                _log.warning("operator_otlp_force_flush_unavailable", destination="task-local")
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self.provider.shutdown, timeout_millis=_EXPORT_TIMEOUT_MILLIS),
-                    timeout=_SHUTDOWN_WALL_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                _log.warning("operator_otlp_shutdown_timeout", destination="task-local")
+                # Run the SDK's synchronous shutdown inline. A timed-out or
+                # cancelled to_thread() await leaves its worker alive and can
+                # keep the interpreter running after shutdown appears
+                # complete. The concrete exporter and reader both receive
+                # this bounded five-second deadline.
+                self.provider.shutdown(timeout_millis=_EXPORT_TIMEOUT_MILLIS)
             except TELEMETRY_TRANSPORT_ERRORS:
                 _log.warning("operator_otlp_shutdown_unavailable", destination="task-local")
-            self._shutdown_complete = True
+        finally:
+            self._finish_shutdown()
 
 
 _runtime: OperatorTelemetryRuntime | None = None
@@ -443,7 +443,15 @@ def bootstrap_operator_telemetry(
         readers: list[object] = [selected.prometheus_reader()]
         health = _ExportHealth()
         if settings.operator_telemetry == "aws-otlp":
-            raw_exporter = selected.otlp_exporter(endpoint=AWS_OTLP_ENDPOINT, insecure=True, headers={})
+            # The gRPC exporter ignores the timeout passed by the periodic
+            # reader and uses its constructor deadline for each RPC. Align it
+            # with the provider's five-second shutdown deadline.
+            raw_exporter = selected.otlp_exporter(
+                endpoint=AWS_OTLP_ENDPOINT,
+                insecure=True,
+                headers={},
+                timeout=_EXPORT_TIMEOUT_MILLIS / 1_000,
+            )
             exporter = _HealthTrackingMetricExporter(raw_exporter, health)
             readers.append(
                 selected.periodic_reader(
@@ -532,11 +540,41 @@ def apply_operator_pipeline_telemetry(settings: ElspethSettings, web_settings: W
 
 
 def reset_operator_telemetry_for_tests() -> None:
-    """Forget the module runtime; callers must inject factories after reset."""
+    """Detach test state and close only providers that are safe to replace.
+
+    OpenTelemetry's process-global provider is write-once. Shutting it down
+    here would leave every later ``metrics.get_meter()`` call bound to a dead
+    provider, so a globally installed provider remains process-owned. Tests
+    that need a replaceable runtime must inject factories whose setter does
+    not install it globally.
+    """
 
     global _runtime
     with _runtime_lock:
-        _runtime = None
+        runtime = _runtime
+        if runtime is None:
+            return
+        provider_is_global = metrics.get_meter_provider() is runtime.provider
+        with runtime._shutdown_state_lock:
+            if runtime._shutdown_complete:
+                _runtime = None
+                return
+            if runtime._shutdown_started:
+                raise RuntimeError("operator telemetry shutdown is already in progress")
+            if provider_is_global:
+                _runtime = None
+                return
+            runtime._shutdown_started = True
+        try:
+            try:
+                runtime.provider.shutdown(timeout_millis=_EXPORT_TIMEOUT_MILLIS)
+            except TimeoutError:
+                _log.warning("operator_telemetry_test_reset_timeout")
+            except TELEMETRY_TRANSPORT_ERRORS:
+                _log.warning("operator_telemetry_test_reset_unavailable")
+        finally:
+            runtime._finish_shutdown()
+            _runtime = None
 
 
 __all__ = [

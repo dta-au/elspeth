@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -181,11 +182,12 @@ class _FakeReader:
 
 
 class _FakeExporter(MetricExporter):
-    def __init__(self, *, endpoint: str, insecure: bool, headers: dict[str, str]) -> None:
+    def __init__(self, *, endpoint: str, insecure: bool, headers: dict[str, str], timeout: float) -> None:
         super().__init__()
         self.endpoint = endpoint
         self.insecure = insecure
         self.headers = headers
+        self.timeout = timeout
         self.results: list[MetricExportResult] = []
 
     def export(self, _data: object, timeout_millis: float = 10_000, **_kwargs: object) -> MetricExportResult:
@@ -247,6 +249,25 @@ def test_aws_metric_export_preserves_only_bounded_acceptance_correlation() -> No
         provider.shutdown()
 
 
+def test_periodic_reader_shutdown_performs_final_collection() -> None:
+    inner = _CapturingMetricExporter()
+    reader = PeriodicExportingMetricReader(inner, export_interval_millis=60_000)
+    provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
+    counter = provider.get_meter("shutdown-contract").create_counter("shutdown.final_collection")
+    counter.add(1)
+
+    provider.shutdown(timeout_millis=5_000)
+
+    metric_names = {
+        metric.name
+        for export in inner.exports
+        for resource_metric in export.resource_metrics
+        for scope_metric in resource_metric.scope_metrics
+        for metric in scope_metric.metrics
+    }
+    assert "shutdown.final_collection" in metric_names
+
+
 @dataclass
 class _FakeSynchronousInstrument:
     points: list[tuple[int | float, dict[str, object] | None]] = field(default_factory=list)
@@ -266,6 +287,8 @@ class _FakeProvider:
     force_flush_calls: list[float] = field(default_factory=list)
     shutdown_calls: list[float] = field(default_factory=list)
     force_flush_error: BaseException | None = None
+    shutdown_error: BaseException | None = None
+    shutdown_observer: Any | None = None
     gauges: dict[str, list[Any]] = field(default_factory=dict)
     synchronous_instruments: dict[str, _FakeSynchronousInstrument] = field(default_factory=dict)
 
@@ -294,6 +317,10 @@ class _FakeProvider:
 
     def shutdown(self, timeout_millis: float = 30_000) -> None:
         self.shutdown_calls.append(timeout_millis)
+        if self.shutdown_observer is not None:
+            self.shutdown_observer()
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
 
 
 def _factories(record: dict[str, object]) -> OperatorTelemetryFactories:
@@ -364,6 +391,7 @@ def test_process_bootstrap_aws_adds_one_fixed_otlp_reader_and_safe_resource() ->
     assert exporter.endpoint == AWS_OTLP_ENDPOINT
     assert exporter.insecure is True
     assert exporter.headers == {}
+    assert exporter.timeout == 5.0
     assert runtime.readers[1].interval_ms == 17_000
     assert runtime.resource.attributes == {
         "service.name": "elspeth-web",
@@ -546,13 +574,15 @@ async def test_shutdown_is_bounded_and_once_only() -> None:
     await runtime.shutdown()
 
     provider = record["providers"][0]  # type: ignore[index]
-    assert provider.force_flush_calls == [5_000]
+    # MeterProvider.shutdown() performs the reader's final collection. A
+    # preceding force_flush() would spend the same exporter budget twice.
+    assert provider.force_flush_calls == []
     assert provider.shutdown_calls == [5_000]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flush_error", [TimeoutError(), ConnectionError("collector unavailable")])
-async def test_shutdown_is_still_attempted_once_after_handled_flush_failure(flush_error: BaseException) -> None:
+@pytest.mark.parametrize("shutdown_error", [TimeoutError(), ConnectionError("collector unavailable")])
+async def test_shutdown_failure_is_handled_once(shutdown_error: BaseException) -> None:
     record: dict[str, object] = {}
     settings = _web_settings(
         deployment_target="aws-ecs",
@@ -566,10 +596,68 @@ async def test_shutdown_is_still_attempted_once_after_handled_flush_failure(flus
     )
     runtime = bootstrap_operator_telemetry(settings, factories=_factories(record))
     provider = record["providers"][0]  # type: ignore[index]
-    provider.force_flush_error = flush_error
+    provider.shutdown_error = shutdown_error
 
     await runtime.shutdown()
     await runtime.shutdown()
 
-    assert provider.force_flush_calls == [5_000]
+    assert provider.force_flush_calls == []
     assert provider.shutdown_calls == [5_000]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_finishes_on_calling_thread() -> None:
+    record: dict[str, object] = {}
+    runtime = bootstrap_operator_telemetry(
+        _web_settings(
+            deployment_target="aws-ecs",
+            operator_telemetry="aws-otlp",
+            operator_telemetry_environment="production",
+            operator_telemetry_release="git-deadbeef",
+            operator_telemetry_ecs_cluster="elspeth-production",
+            operator_telemetry_ecs_service="elspeth-web",
+            operator_telemetry_task_definition_family="elspeth-web-task",
+            operator_telemetry_task_definition_revision="42",
+        ),
+        factories=_factories(record),
+    )
+    provider = record["providers"][0]  # type: ignore[index]
+    calling_thread = threading.get_ident()
+    shutdown_threads: list[int] = []
+    provider.shutdown_observer = lambda: shutdown_threads.append(threading.get_ident())
+
+    await runtime.shutdown()
+
+    assert shutdown_threads == [calling_thread]
+    assert runtime._shutdown_complete is True
+
+
+def test_reset_shuts_down_provider_before_forgetting_runtime() -> None:
+    record: dict[str, object] = {}
+    runtime = bootstrap_operator_telemetry(
+        _web_settings(),
+        factories=_factories(record),
+    )
+    provider = record["providers"][0]  # type: ignore[index]
+    observed_runtimes: list[object | None] = []
+    provider.shutdown_observer = lambda: observed_runtimes.append(operator_telemetry._runtime)
+
+    reset_operator_telemetry_for_tests()
+
+    assert provider.shutdown_calls == [5_000]
+    assert observed_runtimes == [runtime]
+    replacement = bootstrap_operator_telemetry(_web_settings(), factories=_factories({}))
+    assert replacement is not runtime
+
+
+def test_reset_does_not_shutdown_process_global_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    record: dict[str, object] = {}
+    runtime = bootstrap_operator_telemetry(_web_settings(), factories=_factories(record))
+    provider = record["providers"][0]  # type: ignore[index]
+    monkeypatch.setattr(operator_telemetry.metrics, "get_meter_provider", lambda: provider)
+
+    reset_operator_telemetry_for_tests()
+
+    assert provider.shutdown_calls == []
+    replacement = bootstrap_operator_telemetry(_web_settings(), factories=_factories({}))
+    assert replacement is not runtime

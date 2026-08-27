@@ -9,10 +9,10 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar, get_origin
+from typing import Any, ClassVar, cast, get_origin
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -20,6 +20,9 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader, MetricExporter, MetricExportResult, MetricsData
+from opentelemetry.sdk.resources import Resource
 from pydantic import SecretBytes, ValidationError
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import Engine
@@ -31,6 +34,7 @@ from structlog.testing import capture_logs
 
 import elspeth.web.app as app_module
 import elspeth.web.deployment_contract as deployment_contract_module
+import elspeth.web.operator_telemetry as operator_telemetry_module
 from elspeth.contracts import RunStatus
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -52,6 +56,7 @@ from elspeth.web.config import _JSON_COLLECTION_FIELDS, WebSettings, settings_fr
 from elspeth.web.dependencies import get_settings
 from elspeth.web.deployment_contract import DeploymentConfigurationError
 from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
+from elspeth.web.operator_telemetry import OperatorTelemetryFactories, OperatorTelemetryRuntime
 from elspeth.web.readiness import READINESS_CHECK_NAMES, ReadinessCache, ReadinessCheck, ReadinessProbeRunner, ReadinessReport
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX,
@@ -62,6 +67,83 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+
+
+class _HermeticMetricExporter(MetricExporter):
+    """No-network exporter for app-factory tests that select AWS policy."""
+
+    def export(self, _metrics_data: MetricsData, timeout_millis: float = 10_000, **_kwargs: object) -> MetricExportResult:
+        del timeout_millis
+        return MetricExportResult.SUCCESS
+
+    def force_flush(self, timeout_millis: float = 10_000) -> bool:
+        del timeout_millis
+        return True
+
+    def shutdown(self, timeout_millis: float = 30_000, **_kwargs: object) -> None:
+        del timeout_millis
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_operator_telemetry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Exercise bootstrap policy without process-global providers or OTLP I/O."""
+
+    isolated_runtime: OperatorTelemetryRuntime | None = None
+    previous_runtime: OperatorTelemetryRuntime | None = None
+    runtime_swapped = False
+
+    def meter_provider(readers: Sequence[object], *, resource: Resource, views: tuple[object, ...]) -> MeterProvider:
+        return MeterProvider(
+            metric_readers=cast(Sequence[Any], readers),
+            resource=resource,
+            views=cast(Sequence[Any], views),
+            shutdown_on_exit=False,
+        )
+
+    factories = OperatorTelemetryFactories(
+        prometheus_reader=InMemoryMetricReader,
+        otlp_exporter=lambda **_kwargs: _HermeticMetricExporter(),
+        periodic_reader=lambda _exporter, **_kwargs: InMemoryMetricReader(),
+        meter_provider=meter_provider,
+        set_meter_provider=lambda _provider: None,
+    )
+
+    def bootstrap(settings: WebSettings) -> OperatorTelemetryRuntime:
+        nonlocal isolated_runtime, previous_runtime, runtime_swapped
+        if isolated_runtime is not None:
+            return isolated_runtime
+
+        # bootstrap owns a process singleton in production. Save any runtime
+        # installed by an earlier module, then keep this test's injected
+        # runtime active so module-level event projection reaches the same
+        # provider retained by the app. Teardown restores the prior runtime.
+        with operator_telemetry_module._runtime_lock:
+            previous_runtime = operator_telemetry_module._runtime
+            operator_telemetry_module._runtime = None
+        try:
+            isolated_runtime = operator_telemetry_module.bootstrap_operator_telemetry(settings, factories=factories)
+            runtime_swapped = True
+        except BaseException:
+            with operator_telemetry_module._runtime_lock:
+                operator_telemetry_module._runtime = previous_runtime
+            raise
+        assert isolated_runtime is not None
+        return isolated_runtime
+
+    monkeypatch.setattr(app_module, "bootstrap_operator_telemetry", bootstrap)
+    try:
+        yield
+    finally:
+        try:
+            if isolated_runtime is not None and isolated_runtime._begin_shutdown():
+                try:
+                    isolated_runtime.provider.shutdown(timeout_millis=5_000)
+                finally:
+                    isolated_runtime._finish_shutdown()
+        finally:
+            if runtime_swapped:
+                with operator_telemetry_module._runtime_lock:
+                    operator_telemetry_module._runtime = previous_runtime
 
 
 @pytest.fixture(autouse=True)
@@ -297,6 +379,23 @@ class TestCreateApp:
         second = create_app(_settings(tmp_path / "second"))
 
         assert first.state.operator_telemetry is second.state.operator_telemetry
+
+    def test_app_metrics_bind_to_hermetic_runtime_provider(self, tmp_path) -> None:
+        app = create_app(_settings(tmp_path))
+        assert operator_telemetry_module._runtime is app.state.operator_telemetry
+        app_module._COMPOSER_BOOT_CONFIG_COUNTER.add(1, {"surface": "unit-test"})
+        reader = app.state.operator_telemetry.readers[0]
+        assert isinstance(reader, InMemoryMetricReader)
+
+        data = reader.get_metrics_data()
+        assert data is not None
+        metric_names = {
+            metric.name
+            for resource_metric in data.resource_metrics
+            for scope_metric in resource_metric.scope_metrics
+            for metric in scope_metric.metrics
+        }
+        assert "composer.boot_config" in metric_names
 
     def test_invalid_aws_operator_policy_fails_before_provider_bootstrap(self, tmp_path) -> None:
         settings = _aws_settings(tmp_path, operator_telemetry="prometheus")

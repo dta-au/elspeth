@@ -25,7 +25,6 @@ from fastapi.exception_handlers import http_exception_handler as fastapi_http_ex
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from opentelemetry import metrics
 from opentelemetry.metrics import Counter, Histogram
 from opentelemetry.util.types import AttributeValue
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -38,6 +37,7 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
 
 import elspeth.contracts.errors as contract_errors
+from elspeth import __version__
 from elspeth.contracts import RunStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.secrets import (
@@ -977,7 +977,7 @@ def _create_app(
         enforce_external_state_contract(settings, resolved_state_mode=resolved_state_mode)
 
     operator_runtime = bootstrap_operator_telemetry(settings)
-    operator_meter = metrics.get_meter(__name__)
+    operator_meter = operator_runtime.provider.get_meter(__name__, __version__)
     global _COMPOSER_BOOT_CONFIG_COUNTER, _COMPOSER_BOOT_CONFIG_PROBE_LATENCY
     _COMPOSER_BOOT_CONFIG_COUNTER = operator_meter.create_counter(
         "composer.boot_config",
@@ -1327,7 +1327,9 @@ def _create_app(
     # any future surface). The counters are intentionally process-scoped —
     # one Counter per metric, not one per consumer — so OTel aggregates by
     # attribute set instead of by injection site.
-    sessions_telemetry = build_sessions_telemetry(meter=metrics.get_meter("elspeth.web.composer"))
+    sessions_telemetry = build_sessions_telemetry(
+        meter=operator_runtime.provider.get_meter("elspeth.web.composer", __version__)
+    )
     app.state.sessions_telemetry = sessions_telemetry
 
     app.state.session_engine = session_engine  # available to guided step handlers
