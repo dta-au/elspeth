@@ -20,7 +20,7 @@ from elspeth.contracts import TransformProtocol
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
-from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
+from elspeth.contracts.types import CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
 from elspeth.engine.dag_navigator import DAGNavigator
 from elspeth.engine.processor import DAGTraversalContext
@@ -65,6 +65,8 @@ def _make_nav(
     sink_names: frozenset[str] | None = None,
     branch_first_node: dict[str, NodeID] | None = None,
     row_union_node_ids: dict[RowUnionName, NodeID] | None = None,
+    collector_node_ids: dict[CollectorName, NodeID] | None = None,
+    collector_on_success_map: dict[CollectorName, str] | None = None,
 ) -> DAGNavigator:
     """Create a DAGNavigator with sensible defaults."""
     _node_to_plugin = node_to_plugin or {}
@@ -85,6 +87,8 @@ def _make_nav(
         sink_names=sink_names or frozenset(),
         branch_first_node=branch_first_node or {},
         row_union_node_ids=row_union_node_ids or {},
+        collector_node_ids=collector_node_ids or {},
+        collector_on_success_map=collector_on_success_map or {},
     )
 
 
@@ -355,6 +359,70 @@ class TestResolveJumpTargetSink:
         )
         assert nav.resolve_jump_target_sink(coalesce_node) == "merged_sink"
 
+    def test_resolves_terminal_collector_on_success(self) -> None:
+        """Walk resolves sink from a terminal collector's on_success map.
+
+        Regression for elspeth-b6a0a85a15: the terminal arm recognised
+        coalesce only, so a jump landing at (or upstream of) a terminal
+        collector raised the no-sink invariant on a builder-accepted graph.
+        """
+        collector_node = NodeID("collector::stitch")
+        nav = _make_nav(
+            node_to_next={
+                NodeID("source-0"): collector_node,
+                collector_node: None,
+            },
+            structural_node_ids=frozenset({collector_node}),
+            collector_node_ids={CollectorName("stitch"): collector_node},
+            collector_on_success_map={CollectorName("stitch"): "stitched_sink"},
+            sink_names=frozenset({"stitched_sink"}),
+        )
+        assert nav.resolve_jump_target_sink(collector_node) == "stitched_sink"
+
+    def test_resolves_through_transform_into_terminal_collector(self) -> None:
+        """The ticket's repro shape: jump target is a transform whose chain ends
+        at a terminal collector barrier — the walk must read the collector's
+        sink, not raise."""
+        collector_node = NodeID("collector::stitch")
+        transform = _make_mock_transform(node_id="mid-t", on_success="pages")
+        nav = _make_nav(
+            node_to_plugin={NodeID("mid-t"): transform},
+            node_to_next={
+                NodeID("mid-t"): collector_node,
+                collector_node: None,
+            },
+            structural_node_ids=frozenset({collector_node}),
+            collector_node_ids={CollectorName("stitch"): collector_node},
+            collector_on_success_map={CollectorName("stitch"): "stitched_sink"},
+            sink_names=frozenset({"stitched_sink"}),
+        )
+        assert nav.resolve_jump_target_sink(NodeID("mid-t")) == "stitched_sink"
+
+    def test_terminal_collector_missing_from_on_success_map_raises(self) -> None:
+        """A terminal collector absent from the on_success map is an invariant
+        violation named for the collector, not the generic no-sink raise."""
+        collector_node = NodeID("collector::stitch")
+        nav = _make_nav(
+            node_to_next={collector_node: None},
+            structural_node_ids=frozenset({collector_node}),
+            collector_node_ids={CollectorName("stitch"): collector_node},
+        )
+        with pytest.raises(OrchestrationInvariantError, match="Collector 'stitch' not in on_success map"):
+            nav.resolve_jump_target_sink(collector_node)
+
+    def test_terminal_row_union_raises_named_invariant(self) -> None:
+        """A row_union can never be terminal (builder forces its on_success to a
+        processing connection); a walk ending there names the broken invariant
+        instead of the generic no-sink raise."""
+        union_node = NodeID("row_union::stitch")
+        nav = _make_nav(
+            node_to_next={union_node: None},
+            structural_node_ids=frozenset({union_node}),
+            row_union_node_ids={RowUnionName("stitch"): union_node},
+        )
+        with pytest.raises(OrchestrationInvariantError, match=r"row_union 'stitch'.*cannot be terminal"):
+            nav.resolve_jump_target_sink(union_node)
+
 
 # =============================================================================
 # WorkItemFactory.create
@@ -566,6 +634,43 @@ class TestFromTraversalContext:
             sink_names=frozenset({"out", "err"}),
         )
         assert nav.resolve_coalesce_sink(CoalesceName("merge"), context="test") == "out"
+
+    def test_derives_collector_arm_from_context(self) -> None:
+        """collector_node_map + collector_on_success_map reach the walk's
+        terminal arm through the factory (elspeth-b6a0a85a15)."""
+        collector_node = NodeID("collector::stitch")
+        traversal = DAGTraversalContext(
+            node_step_map={NodeID("source-0"): 0, collector_node: 1},
+            node_to_plugin={},
+            node_to_next={NodeID("source-0"): collector_node, collector_node: None},
+            coalesce_node_map={},
+            collector_node_map={CollectorName("stitch"): collector_node},
+        )
+
+        nav = DAGNavigator.from_traversal_context(
+            traversal,
+            collector_on_success_map={CollectorName("stitch"): "out"},
+            sink_names=frozenset({"out"}),
+        )
+        assert nav.resolve_jump_target_sink(collector_node) == "out"
+
+    def test_collector_nodes_are_structural_even_when_snapshot_omits_them(self) -> None:
+        """The factory's own structural union covers collectors — the belt for
+        snapshot implementations that do not union barrier ids themselves
+        (DAGTraversalContext does; the Protocol does not promise it)."""
+
+        class _BareSnapshot:
+            def __init__(self) -> None:
+                self.coalesce_node_map: dict[CoalesceName, NodeID] = {}
+                self.row_union_node_map: dict[RowUnionName, NodeID] = {}
+                self.collector_node_map = {CollectorName("stitch"): NodeID("collector::stitch")}
+                self.node_to_plugin: dict[NodeID, object] = {}
+                self.node_to_next: dict[NodeID, NodeID | None] = {NodeID("collector::stitch"): None}
+                self.branch_first_node: dict[str, NodeID] = {}
+                self.structural_node_ids: frozenset[NodeID] = frozenset()
+
+        nav = DAGNavigator.from_traversal_context(_BareSnapshot())
+        assert nav.resolve_plugin_for_node(NodeID("collector::stitch")) is None
 
 
 # =============================================================================

@@ -639,6 +639,7 @@ class RowProcessor:
         self._nav = DAGNavigator.from_traversal_context(
             traversal,
             coalesce_on_success_map=self._coalesce_on_success_map,
+            collector_on_success_map=self._collector_on_success_map,
             sink_names=self._sink_names,
         )
         self._work_items = WorkItemFactory(self._nav)

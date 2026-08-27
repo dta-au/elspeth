@@ -698,6 +698,7 @@ class TestConstructorErrorEdgeMap:
         _, factory = _make_factory()
         nav = SimpleNamespace()
         coalesce_on_success = {CoalesceName("merge"): "out"}
+        collector_on_success = {CollectorName("stitch"): "out"}
         sink_names = frozenset({"out", "error"})
 
         with patch("elspeth.engine.processor.DAGNavigator.from_traversal_context", return_value=nav) as from_traversal:
@@ -705,6 +706,7 @@ class TestConstructorErrorEdgeMap:
                 factory,
                 scheduler=factory.scheduler,
                 coalesce_on_success_map=coalesce_on_success,
+                collector_on_success_map=collector_on_success,
                 sink_names=sink_names,
             )
 
@@ -713,6 +715,7 @@ class TestConstructorErrorEdgeMap:
         assert from_traversal.call_args.args == (processor._traversal,)
         assert from_traversal.call_args.kwargs == {
             "coalesce_on_success_map": coalesce_on_success,
+            "collector_on_success_map": collector_on_success,
             "sink_names": sink_names,
         }
 
