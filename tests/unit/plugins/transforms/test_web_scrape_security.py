@@ -529,6 +529,90 @@ class TestRedirectAllowedRangesBehavior:
         assert result.row["fetch_url_final"] == "http://localhost/redirected"
         assert result.row["fetch_url_final_ip"] == "127.0.0.1"
 
+    def test_redirect_final_url_is_redacted_before_persistence(self, allowed_loopback_transform, mock_ctx, monkeypatch):
+        """A redirect's credentials and secret query values never reach the row.
+
+        ``fetch_url_final`` is PERSISTED — onto the row and through it into the
+        audit trail — and the redirect target is attacker-influenced. Matches
+        blob_fetch's hardening (7e8840bad) and file_fetch. The sibling test
+        above pins a plain ``http://localhost/redirected``, which
+        ``fingerprint_url`` returns unchanged; this one supplies the shape
+        where redaction is observable.
+        """
+        import urllib.parse
+
+        from elspeth.core.security.web import SSRFSafeRequest
+
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "web-scrape-test-key")
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        hostile_final = "http://alice:password@localhost/redirected?sig=FINAL_SECRET&view=full#fragment-secret"
+
+        initial_safe = SSRFSafeRequest(
+            original_url="http://example.com/start",
+            resolved_ip="93.184.216.34",
+            host_header="example.com",
+            port=80,
+            path="/start",
+            scheme="http",
+            bare_hostname="example.com",
+        )
+        redirect_safe = SSRFSafeRequest(
+            original_url=hostile_final,
+            resolved_ip="127.0.0.1",
+            host_header="localhost",
+            port=80,
+            path="/redirected",
+            scheme="http",
+            bare_hostname="localhost",
+        )
+
+        with (
+            patch(
+                "elspeth.plugins.transforms.web_scrape.validate_url_for_ssrf",
+                return_value=initial_safe,
+            ),
+            patch(
+                "elspeth.plugins.infrastructure.clients.http.validate_url_for_ssrf",
+                return_value=redirect_safe,
+            ),
+            patch("httpx.Client") as httpx_client_factory,
+        ):
+            initial_response = httpx.Response(
+                301,
+                headers={"location": hostile_final},
+                request=httpx.Request("GET", "http://93.184.216.34:80/start"),
+            )
+            hop_response = httpx.Response(
+                200,
+                text="<html>Local content</html>",
+                request=httpx.Request("GET", "http://127.0.0.1:80/redirected"),
+            )
+            httpx_client_factory.side_effect = [
+                _HTTPClientDouble(),
+                _HTTPClientDouble(initial_response),
+                _HTTPClientDouble(hop_response),
+            ]
+
+            result = allowed_loopback_transform.process(make_pipeline_row({"url": "http://example.com/start"}), mock_ctx)
+
+        assert result.status == "success"
+        persisted = result.row["fetch_url_final"]
+        parsed = urllib.parse.urlsplit(persisted)
+        # The reachable defect is a secret query value / fragment persisting: the
+        # SSRF validator already rejects userinfo on every hop, so the fragment
+        # and fingerprint assertions carry the mutation signal — keep them first.
+        assert parsed.fragment == ""
+        assert urllib.parse.parse_qs(parsed.query)["sig"][0].startswith("<fingerprint:")
+        # A non-sensitive parameter survives, so this is redaction, not blanking.
+        assert urllib.parse.parse_qs(parsed.query)["view"] == ["full"]
+        # Defence-in-depth: userinfo could only arrive here past the validator,
+        # but if it ever does, it must not persist.
+        assert parsed.username is None
+        assert parsed.password is None
+        assert "password" not in persisted
+        assert "FINAL_SECRET" not in persisted
+        assert "fragment-secret" not in persisted
+
     def test_redirect_to_non_allowed_private_ip_blocked(self, allowed_loopback_transform, mock_ctx):
         """Redirect chain where hop targets a non-allowed private IP — must block."""
         from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest

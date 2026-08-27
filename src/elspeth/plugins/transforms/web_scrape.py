@@ -41,6 +41,7 @@ from elspeth.core.security.web import (
     validate_url_for_ssrf,
 )
 from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -486,7 +487,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:54370e3106c6c19d"
+    source_file_hash: str | None = "sha256:8fc5c28ec460ddf3"
     config_model = WebScrapeConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("http", "network", "scraping")
@@ -630,7 +631,8 @@ class WebScrapeTransform(BaseTransform):
                     "URLs MUST include explicit scheme (http:// or https://). Bare hostnames are rejected by the SSRF guard at fetch time.",
                     "schema is required; use schema: {mode: observed} unless you need fixed/flexible field contracts. For raw HTML, set format to raw, not html.",
                     "web_scrape passes through upstream row fields that the input schema guarantees, and also guarantees content_field, fingerprint_field, fetch_status, fetch_url_final, and fetch_url_final_ip.",
-                    "Do not make downstream LLM templates require a URL field unless the upstream source schema or web_scrape schema guarantees that field. If the final fetched URL is acceptable, use fetch_url_final; if the original URL is required, preserve and guarantee that source field upstream.",
+                    "Do not make downstream LLM templates require a URL field unless the upstream source schema or web_scrape schema guarantees that field; if the original URL is required, preserve and guarantee that source field upstream.",
+                    "fetch_url_final is a persistence-safe rendering of the final URL (userinfo/fragment stripped, known-sensitive query values fingerprinted, query re-encoded) — use it to identify the fetched resource, not to re-fetch it.",
                     "If validation says a downstream URL field is missing, do not patch web_scrape guaranteed_fields by guess; repair the producer schema, add an explicit mapper, or narrow the downstream template requirements.",
                     "http.abuse_contact and http.scraping_reason are mandatory and recorded in the audit trail — operator must declare them, not the model.",
                     "If the user-facing output should exclude raw scraped content, route the final path through field_mapper with select_only: true before the sink; a sink name or output name is not cleanup.",
@@ -903,7 +905,12 @@ class WebScrapeTransform(BaseTransform):
         output[self._content_field] = content
         output[self._fingerprint_field] = fingerprint
         output["fetch_status"] = response.status_code
-        output["fetch_url_final"] = final_hostname_url
+        # Redirects are attacker-influenced and this value is PERSISTED — onto the
+        # row and through it into the audit trail — so userinfo and the fragment
+        # are stripped and known-sensitive query values fingerprinted first.
+        # Matches blob_fetch (7e8840bad); a query-free URL passes through
+        # unchanged, but a query string is parse/re-encode normalised.
+        output["fetch_url_final"] = fingerprint_url(final_hostname_url)
         output["fetch_url_final_ip"] = final_resolved_ip
 
         # Propagate contract so FIXED schemas can access fields added during enrichment
