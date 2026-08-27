@@ -69,6 +69,53 @@ function assertNever(value: never): never {
   throw new Error(`Unhandled interpretation kind: ${String(value)}`);
 }
 
+/**
+ * Parsed shape of the server-computed source_data_contract draft JSON
+ * (src/elspeth/web/composer/source_demand.py::build_source_data_contract_draft).
+ * The draft carries the FACTS — demanded fields, illustrative sample header,
+ * per-field sample misses — and this card carries the prose.
+ */
+interface DataContractDraft {
+  demandedFields: string[];
+  sampleHeader: string[] | null;
+  missingFromSample: string[];
+}
+
+export function parseDataContractDraft(draft: string): DataContractDraft | null {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(draft);
+  } catch {
+    return null;
+  }
+  if (typeof payload !== "object" || payload === null) return null;
+  const record = payload as Record<string, unknown>;
+  const demanded = record["demanded_fields"];
+  if (
+    !Array.isArray(demanded) ||
+    !demanded.every((field) => typeof field === "string")
+  ) {
+    return null;
+  }
+  const sample = record["sample_header"];
+  const sampleHeader =
+    sample === null || sample === undefined
+      ? null
+      : Array.isArray(sample) && sample.every((cell) => typeof cell === "string")
+        ? (sample as string[])
+        : null;
+  const missing = record["missing_from_sample"];
+  const missingFromSample =
+    Array.isArray(missing) && missing.every((field) => typeof field === "string")
+      ? (missing as string[])
+      : [];
+  return {
+    demandedFields: demanded as string[],
+    sampleHeader,
+    missingFromSample,
+  };
+}
+
 interface CardPresentation {
   /** Title row: humanised step label · kind (e.g. "Summarise step · model"). */
   title: string;
@@ -121,6 +168,19 @@ function getCardPresentation(
         title: "Source data",
         line: "The LLM invented this source data — review before fetching.",
         acceptAriaLabel: "Acknowledge the invented source data",
+      };
+    case "source_data_contract":
+      return {
+        title: "Data contract",
+        line: (
+          <>
+            This pipeline relies on certain columns from{" "}
+            {stepLabel ? <em>{stepLabel}</em> : "this source"}. Acknowledging
+            promises that <strong>whatever you feed this pipeline</strong> will
+            carry these columns — not just the file you uploaded.
+          </>
+        ),
+        acceptAriaLabel: "Acknowledge the source data contract",
       };
     case "vague_term":
     case null:
@@ -277,6 +337,72 @@ export function AcknowledgementCard({
 
   const presentation = getCardPresentation(event, stepLabel);
   const chooseMode = mode === "choose" || !showAmend;
+
+  // Data-contract body: the demanded columns with per-field sample warnings,
+  // the illustrative sample note, and the honest consequence of acknowledging
+  // (rows missing a promised column QUARANTINE; the run continues). Falls back
+  // to the raw draft when the payload cannot be parsed — an attestation
+  // surface must never silently render a degraded summary as the real one.
+  const dataContract =
+    event.kind === "source_data_contract"
+      ? parseDataContractDraft(llmDraft)
+      : null;
+  const dataContractBody =
+    event.kind === "source_data_contract" ? (
+      dataContract !== null ? (
+        <div className="ack-card-data-contract">
+          <ul className="ack-card-data-contract-fields">
+            {dataContract.demandedFields.map((field) => {
+              const missingFromSample =
+                dataContract.missingFromSample.includes(field);
+              return (
+                <li key={field}>
+                  <code>{field}</code>
+                  {missingFromSample && (
+                    <span
+                      className="ack-card-data-contract-warning"
+                      role="alert"
+                    >
+                      {" "}
+                      — your data doesn't appear to have this. Fix the data or
+                      change the pipeline.
+                    </span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          <p className="ack-card-data-contract-note">
+            {dataContract.sampleHeader !== null ? (
+              <>
+                Sample columns seen in your file:{" "}
+                {dataContract.sampleHeader.join(", ")} (illustrative only — the
+                promise covers every row you feed this pipeline, not this
+                sample).
+              </>
+            ) : (
+              <>
+                No sample of this source's data was available; the promise
+                covers every row you feed this pipeline.
+              </>
+            )}
+          </p>
+          <p className="ack-card-data-contract-note">
+            A column only needs to be <em>present</em> on each row — it may be
+            empty. Rows missing one of these columns will be set aside
+            (quarantined) and the run continues.
+          </p>
+        </div>
+      ) : (
+        <div className="ack-card-data-contract">
+          <p className="ack-card-data-contract-note">
+            The data-contract details could not be parsed; showing the stored
+            card payload as-is.
+          </p>
+          <CodeBlock code={llmDraft} prettyJson ariaLabel="Data contract" />
+        </div>
+      )
+    ) : null;
 
   // Resolved-prompt rendering (elspeth-990f5ea562): re-render the prompt
   // from the live composition state so accepted interpretation values appear
@@ -472,6 +598,7 @@ export function AcknowledgementCard({
 
       <div className="ack-card-main">
         <p className="ack-card-line">{presentation.line}</p>
+        {dataContractBody}
         {/* Gate note: says WHY Approve is disabled and names the unlock
             condition, so the gated primary is never an unexplained dead
             control (successor of the old scroll-gate note, elspeth-3b35abf148

@@ -161,6 +161,7 @@ def test_interpretation_kind_closed_set() -> None:
         "llm_prompt_template",
         "pipeline_decision",
         "llm_model_choice",
+        "source_data_contract",
     ]
 
 

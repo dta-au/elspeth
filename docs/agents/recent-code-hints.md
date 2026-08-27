@@ -8,6 +8,56 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-27 — `source_data_contract` is the SIXTH InterpretationKind, its
+  demand set is a DELTA-RUN of Stage-1's own edge-contract ledger, and the
+  /validate remedy for the uploaded-source missing-field shape is now the
+  CARD, not the patch_source_options prose** (elspeth-da68332faf work item 2).
+  Traps for anyone touching interpretation kinds or source guarantees:
+  - A new InterpretationKind is a WIDE parity sweep: the contracts enum + its
+    exact-list test, `ck_interpretation_events_kind` in sessions/models.py
+    (no Alembic — delete data/sessions.db), BOTH resolve dispatches in
+    sessions/service.py (each ends in AssertionError→500), the
+    `request_interpretation_review` tool enum (_dispatch.py) AND its pinned
+    test, `_assert_affected_component` (tools/sessions.py), frontend
+    `INTERPRETATION_KIND_VALUES` + every compile-forced switch (tsc finds
+    them: AcknowledgementCard, ChatInput's `pendingSubjectNoun`,
+    executionStore's run-blocker copy) + the exactly-N interpretation.test.ts
+    pin, and the two `ids=[kind.value for kind in InterpretationKind ...]`
+    parametrizations in test_request_interpretation_review_tool.py, which are
+    a deliberate collection-time tripwire — exclude a kind there ONLY with a
+    comment naming where its equivalent property is pinned.
+  - The demand backtrace (`web/composer/source_demand.py`) derives by
+    re-running `CompositionState.validate()` on a hypothetically-stamped
+    source and diffing per-edge `missing_fields` — never restate the
+    guarantees walk. Consequence: any test state feeding it must be
+    structurally clean enough for Stage-1 to REACH the edge-contract loop —
+    two nodes both routing `on_error` to the same unknown sink name
+    short-circuits validation with zero edge_contracts and reads as
+    "no demand" (use `on_error="discard"`), and an llm node whose prompt
+    references row fields needs `required_input_fields` declared (even `[]`)
+    plus a `schema` block or the producer-side probe fails and the
+    pass-through vote fail-closes to zero guarantees.
+  - `validate_pipeline_for_trained_operator` on (uploaded/path-bound observed
+    source + downstream demand) now reports `interpretation_review_pending`
+    for the data-contract card BEFORE the edge-contract error — the
+    elspeth-d39ec0c4d9 guarantee-repair advice no longer fires for
+    card-ELIGIBLE sources on that path (still pinned at unit level and still
+    live for card-ineligible shapes). Do not "fix" the ordering back.
+  - The card's draft is SERVER-COMPUTED (canonical JSON: demanded_fields +
+    illustrative sample_header + missing_from_sample); the writer boundary
+    recomputes it and rejects any planner-supplied field list. The resolved
+    requirement's `accepted_artifact_hash` binds the FIELD SET
+    (`source_data_contract_artifact_hash`), never the sample — drift
+    re-opens the card via `_pending_source_data_contract_sites`, which is
+    DERIVED per read (no mutation-time staging), so demand arising after
+    bind blocks and re-asks with no staging hook.
+  - Known gap: `_backend_surface_args_for_site` (composer/service.py) has no
+    source_data_contract arm yet, so the kind-general settlement surfacer
+    (freeform + guided wire-confirm) skips the site — the event minting path
+    is the planner's `request_interpretation_review`; guided sessions that
+    reach the blocked state have no card until that arm lands (follow-up on
+    elspeth-da68332faf).
+
 - **2026-08-27 — server-owned option metadata is a THREE-surface parity set:
   planner projection, echo-tolerant write gates, and disclosure provenance**
   (elspeth-c67fbbbd83). The keys are `source_authoring`,

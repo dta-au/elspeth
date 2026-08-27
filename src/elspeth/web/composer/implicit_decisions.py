@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, TypedDict
 
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
@@ -42,6 +43,7 @@ DecisionProvenance = Literal[
     "picked",
     "policy_required",
     "server_stamped",
+    "user_acknowledged",
 ]
 
 
@@ -359,13 +361,42 @@ def _is_structural_blob_rows_guarantee(source: SourceSpec, field_path: str) -> b
     )
 
 
+def _is_user_acknowledged_guarantee(source: SourceSpec, field_path: str) -> bool:
+    """Detect a ``schema.guaranteed_fields`` stamped by a data-contract answer.
+
+    The structural marker is the resolved ``source_data_contract``
+    interpretation requirement the resolve arm upserts beside the stamp
+    (sessions/service.py::_resolve_source_data_contract): the user
+    acknowledged the graph's demanded field set as a forward-looking promise
+    about rows that will arrive (elspeth-da68332faf work item 2). Checked
+    before the content arm — an acknowledged uploaded source never carries
+    ``source_authoring``, so the two markers are disjoint today, but the
+    ordering keeps the USER ANSWER attribution authoritative if that ever
+    changes.
+    """
+    if field_path not in ("schema.guaranteed_fields", "schema_config.guaranteed_fields"):
+        return False
+    requirements = parse_interpretation_requirements(source.options)
+    return requirements is not None and any(
+        InterpretationKind(row["kind"]) is InterpretationKind.SOURCE_DATA_CONTRACT and row["status"] == "resolved" for row in requirements
+    )
+
+
 def _source_provenance(source: SourceSpec, field_path: str, value: object) -> DecisionProvenance:
+    if _is_user_acknowledged_guarantee(source, field_path):
+        return "user_acknowledged"
     if _is_content_derived_guarantee(source, field_path) or _is_structural_blob_rows_guarantee(source, field_path):
         return "derived_from_content"
     return _provenance_for_path(f"source.{field_path}", value)
 
 
 def _note_for_source_option(source: SourceSpec, field_path: str) -> str | None:
+    if _is_user_acknowledged_guarantee(source, field_path):
+        return (
+            "Guaranteed fields stamped from the user's data-contract "
+            "acknowledgement — the user's answer, not the planner, is the "
+            "evidence for this claim; enforced per-row at runtime (ADR-016)."
+        )
     if _is_content_derived_guarantee(source, field_path):
         return (
             "Guaranteed fields derived from the bound file's own content at bind "

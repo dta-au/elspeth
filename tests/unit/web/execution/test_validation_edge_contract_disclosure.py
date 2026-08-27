@@ -284,11 +284,14 @@ def _observed_source_missing_field_state() -> CompositionState:
     )
 
 
-def test_build_raised_source_producer_failure_discloses_guarantee_repair(tmp_path: Path) -> None:
-    """The source-producer remedy fires through the REAL build path
-    (elspeth-d39ec0c4d9): the suggestion names the concrete
-    patch_source_options guaranteed_fields repair with the completeness
-    warning, and keeps consumer relaxation as the alternative."""
+def test_build_raised_source_producer_failure_surfaces_the_data_contract_review(tmp_path: Path) -> None:
+    """The elspeth-d39ec0c4d9 contradiction shape now routes to the ask-the-user
+    data-contract card (elspeth-da68332faf work item 2): an uploaded/path-bound
+    observed source the pipeline demands fields from is a pending
+    ``source_data_contract`` review, and the readiness path reports THAT —
+    superseding the prose patch_source_options remedy for card-eligible
+    sources. The guarantee-repair advice arm stays pinned at the unit level
+    (``test_validation.py``) for the shapes that still reach it."""
     source_dir = tmp_path / "blobs" / _SESSION_ID
     source_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "input.csv").write_text("colour\nred\n")
@@ -302,11 +305,9 @@ def test_build_raised_source_producer_failure_discloses_guarantee_repair(tmp_pat
 
     assert result.is_valid is False
     error = result.errors[0]
-    assert "colour" in error.message
-    assert error.suggestion is not None
-    assert "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['colour']}})" in error.suggestion
-    assert "COMPLETE claim" in error.suggestion
-    assert "relax the consumer" in error.suggestion.lower()
-    # Phase ownership: still the build path.
+    assert error.error_code == "interpretation_review_pending"
+    assert "source_data_contract" in error.message
+    # Phase ownership moved with the semantics: the readiness ledger reports
+    # the interpretation-review blocker, not a graph-structure failure.
     hard_failures = [check for check in result.checks if not check.passed and check.outcome_code is None]
-    assert [check.name for check in hard_failures] == ["graph_structure"]
+    assert [check.name for check in hard_failures] == ["interpretation_review"]

@@ -82,6 +82,7 @@ export const INTERPRETATION_KIND_VALUES = [
   "llm_prompt_template",
   "pipeline_decision",
   "llm_model_choice",
+  "source_data_contract",
 ] as const;
 
 export type InterpretationKind = (typeof INTERPRETATION_KIND_VALUES)[number];

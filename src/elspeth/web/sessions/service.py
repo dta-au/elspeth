@@ -70,6 +70,12 @@ from elspeth.web.composer.provider_telemetry import (
 )
 from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.composer.source_demand import (
+    build_source_data_contract_draft,
+    sample_header_for_source,
+    source_data_contract_artifact_hash,
+    stamp_source_options_with_guarantees,
+)
 
 # Phase 8 cohort-emit helper (Sub-task 7e — B3 cohort b1). The opt-out
 # audit row is committed inside ``record_session_interpretation_opt_out``
@@ -88,7 +94,9 @@ from elspeth.web.interpretation_state import (
     PROMPT_TEMPLATE_PARTS_KEY,
     SOURCE_AUTHORING_KEY,
     SOURCE_COMPONENT_ID,
+    current_source_data_contract_demand,
     model_choice_artifact_hash,
+    parse_interpretation_requirements,
     pipeline_decision_artifact_hash,
     prompt_structure_hash_from_options,
     source_name_from_component_id,
@@ -2544,6 +2552,41 @@ def _review_requirement_identity(
     }
 
 
+def _source_data_contract_demand_from_state_record(
+    state_record: CompositionStateRecord,
+    *,
+    affected_node_id: str,
+    context: str,
+) -> tuple[str, tuple[str, ...]]:
+    """Resolve ``(source_name, demand)`` for a data-contract review target.
+
+    The demand set is computed server-side from the state record through the
+    single shared derivation (``current_source_data_contract_demand``) — the
+    planner may REQUEST the review, but the field set always comes from the
+    graph. Raises typed interpretation errors (never bare ValueError) so the
+    tool handler's ARG_ERROR routing keeps working: an ineligible source
+    (composer-authored content) or an empty demand means there is nothing to
+    acknowledge and no card may exist for it.
+    """
+    source_name = source_name_from_component_id(affected_node_id)
+    if source_name is None:
+        raise InterpretationNodeMissingError(
+            f"{context}: source_data_contract must target a source component ({SOURCE_COMPONENT_ID!r} or {SOURCE_COMPONENT_ID!r}:<name>)"
+        )
+    state = state_from_record(state_record)
+    if source_name not in state.sources:
+        raise InterpretationNodeMissingError(f"{context}: source_data_contract requires persisted source {source_name!r}")
+    if SOURCE_AUTHORING_KEY in state.sources[source_name].options:
+        raise InterpretationPlaceholderConsumedError(
+            f"{context}: source {source_name!r} carries composer-authored content ({SOURCE_AUTHORING_KEY}); "
+            "its guarantees derive from content, so no forward-looking data contract applies"
+        )
+    demand = current_source_data_contract_demand(state, source_name)
+    if not demand:
+        raise InterpretationPlaceholderConsumedError(f"{context}: source {source_name!r} has no outstanding data-contract demand")
+    return source_name, demand
+
+
 def _reviewed_content_identity(
     state_record: CompositionStateRecord,
     *,
@@ -2599,6 +2642,22 @@ def _reviewed_content_identity(
             context=context,
         )
         domain["artifact_hash"] = content_hash
+        return stable_hash(domain)
+
+    if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+        # The reviewed artifact is the backtraced demand FIELD SET alone —
+        # recomputed server-side from the state record, never read from the
+        # event text. The sample header is illustrative card evidence and is
+        # deliberately outside the identity: a re-read sample must not abandon
+        # or unstick a card whose demanded fields are unchanged. No staged
+        # requirement row participates either — the card derives from graph
+        # demand, so there may legitimately be none at surfacing time.
+        _source_name, demand = _source_data_contract_demand_from_state_record(
+            state_record,
+            affected_node_id=affected_node_id,
+            context=context,
+        )
+        domain["artifact_hash"] = source_data_contract_artifact_hash(demand)
         return stable_hash(domain)
 
     if kind is InterpretationKind.PIPELINE_DECISION:
@@ -3348,6 +3407,100 @@ def _resolve_invented_source(
     patched_source["options"] = patched_options
     # Splice only the reviewed source back into the sources map. Every sibling
     # source carries its own independent review authority and is left untouched.
+    patched_sources = dict(sources_map)
+    patched_sources[source_name] = patched_source
+    return patched_sources, list(state_record.nodes or ()), None
+
+
+def _resolve_source_data_contract(
+    state_record: CompositionStateRecord,
+    *,
+    event_id: str,
+    affected_node_id: str,
+    user_term: str,
+    llm_draft: str,
+    accepted_value: str,
+) -> tuple[Mapping[str, Mapping[str, Any]], list[Mapping[str, Any]], None]:
+    """Resolve a ``source_data_contract`` acknowledgement (elspeth-da68332faf).
+
+    Mirrors :func:`_resolve_invented_source` structurally, with two deliberate
+    differences rooted in John's rulings:
+
+    * The acknowledged field set is the server-recomputed demand backtrace at
+      resolution time — NEVER a field list read from the event or the planner.
+      The caller's surfacing-vs-live identity gate has already proven the live
+      demand matches what the card showed, so the stamp is exactly what the
+      user acknowledged.
+    * The requirement row is UPSERTED rather than patched-from-pending: the
+      card derives from graph demand (a demand can arise from a node mutation
+      long after bind), so a pending row need not pre-exist on the source.
+
+    Resolution stamps the demand into ``schema.guaranteed_fields`` (observed
+    mode preserved — participate-but-open), which is what ADR-016's
+    ``SourceGuaranteedFieldsContract`` then enforces per-row at runtime: a
+    broken promise quarantines rows, it never aborts the run.
+    """
+    source_name = source_name_from_component_id(affected_node_id)
+    if source_name is None:
+        raise InterpretationNodeMissingError(
+            "resolve_interpretation_event: source_data_contract must target a source component "
+            f"({SOURCE_COMPONENT_ID!r} or {SOURCE_COMPONENT_ID!r}:<name>)"
+        )
+    sources_map = _require_mapping(
+        state_record.sources,
+        message="resolve_interpretation_event: source_data_contract requires a persisted sources mapping",
+    )
+    source = _require_mapping(
+        sources_map[source_name] if source_name in sources_map else None,
+        message=f"resolve_interpretation_event: source_data_contract requires persisted source {source_name!r}",
+    )
+    options = _require_mapping(
+        source["options"] if "options" in source else None,
+        message="resolve_interpretation_event: source_data_contract requires source.options",
+    )
+    _same_source_name, demand = _source_data_contract_demand_from_state_record(
+        state_record,
+        affected_node_id=affected_node_id,
+        context="resolve_interpretation_event",
+    )
+    stamped_options = stamp_source_options_with_guarantees(options, demand)
+    if stamped_options is None:
+        raise InterpretationPlaceholderConsumedError(
+            f"resolve_interpretation_event: source {source_name!r} schema cannot carry a guarantee stamp "
+            "(explicit schema.fields, non-observed mode, or malformed schema block)"
+        )
+
+    requirement_row: dict[str, Any] = {
+        "id": f"source-data-contract-{source_name}",
+        "kind": InterpretationKind.SOURCE_DATA_CONTRACT.value,
+        "user_term": user_term.strip(),
+        "status": "resolved",
+        "draft": llm_draft,
+        "event_id": event_id,
+        "accepted_value": accepted_value,
+        "accepted_artifact_hash": source_data_contract_artifact_hash(demand),
+        "resolved_prompt_template_hash": None,
+    }
+    # Validated accessor, not a hand walk: a malformed persisted row is a
+    # Tier-1 audit anomaly and crashes here rather than being coerced.
+    parsed_rows = parse_interpretation_requirements(options)
+    requirements: list[dict[str, Any]] = [dict(row) for row in parsed_rows] if parsed_rows is not None else []
+    replaced = False
+    for index, existing in enumerate(requirements):
+        if InterpretationKind(existing["kind"]) is InterpretationKind.SOURCE_DATA_CONTRACT:
+            requirement_row["id"] = existing["id"]
+            requirements[index] = requirement_row
+            replaced = True
+            break
+    if not replaced:
+        requirements.append(requirement_row)
+
+    patched_options = dict(stamped_options)
+    patched_options[INTERPRETATION_REQUIREMENTS_KEY] = requirements
+    patched_source = dict(source)
+    patched_source["options"] = patched_options
+    # Splice only the acknowledged source back; sibling sources keep their own
+    # independent review authority.
     patched_sources = dict(sources_map)
     patched_sources[source_name] = patched_source
     return patched_sources, list(state_record.nodes or ()), None
@@ -7196,6 +7349,28 @@ class SessionServiceImpl:
                         draft=draft,
                         context="create_pending_interpretation_event",
                     )
+                elif kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+                    # No staged requirement row participates (the card derives
+                    # from graph demand). The writer boundary instead proves
+                    # the draft IS the server-computed canonical card for this
+                    # state: demand recomputed from the persisted record and
+                    # the sample header re-read, so a planner-supplied or
+                    # stale field list is structurally impossible to persist.
+                    _boundary_source_name, boundary_demand = _source_data_contract_demand_from_state_record(
+                        state_record,
+                        affected_node_id=affected_node_id,
+                        context="create_pending_interpretation_event",
+                    )
+                    boundary_state = state_from_record(state_record)
+                    expected_draft = build_source_data_contract_draft(
+                        boundary_demand,
+                        sample_header_for_source(boundary_state.sources[_boundary_source_name]),
+                    )
+                    if llm_draft != expected_draft:
+                        raise InterpretationDraftMismatchError(
+                            "create_pending_interpretation_event: source_data_contract event draft does not match "
+                            "the server-computed data-contract card for the current state"
+                        )
                 else:
                     if nodes is None:
                         raise ValueError(
@@ -7470,6 +7645,15 @@ class SessionServiceImpl:
                             llm_draft=llm_draft,
                             accepted_value=llm_draft,
                         )
+                    elif kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+                        final_sources, final_nodes, resolved_prompt_template_hash = _resolve_source_data_contract(
+                            live_state_record,
+                            event_id=event_id,
+                            affected_node_id=affected_node_id,
+                            user_term=user_term,
+                            llm_draft=llm_draft,
+                            accepted_value=llm_draft,
+                        )
                     elif kind is InterpretationKind.PIPELINE_DECISION:
                         final_sources, final_nodes, resolved_prompt_template_hash = _resolve_pipeline_decision_review(
                             live_state_record,
@@ -7490,8 +7674,6 @@ class SessionServiceImpl:
                         )
                     else:
                         raise AssertionError(f"unhandled InterpretationKind {kind!r}")
-
-                    from elspeth.web.sessions.converters import state_from_record
 
                     patched_state_record = replace(
                         live_state_record,
@@ -7713,6 +7895,9 @@ class SessionServiceImpl:
                     InterpretationKind.INVENTED_SOURCE,
                     InterpretationKind.LLM_PROMPT_TEMPLATE,
                     InterpretationKind.PIPELINE_DECISION,
+                    # A data contract is acknowledged or declined, never edited:
+                    # the field set is the graph's own demand, not user prose.
+                    InterpretationKind.SOURCE_DATA_CONTRACT,
                 }:
                     raise InterpretationUnsupportedChoiceError(
                         f"resolve_interpretation_event: {kind.value} does not support inline amendment in this release"
@@ -7813,6 +7998,15 @@ class SessionServiceImpl:
                     )
                 elif kind is InterpretationKind.INVENTED_SOURCE:
                     final_sources, final_nodes, resolved_prompt_template_hash = _resolve_invented_source(
+                        state_record,
+                        event_id=eid,
+                        affected_node_id=event_row.affected_node_id,
+                        user_term=event_row.user_term,
+                        llm_draft=event_row.llm_draft,
+                        accepted_value=accepted_value,
+                    )
+                elif kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+                    final_sources, final_nodes, resolved_prompt_template_hash = _resolve_source_data_contract(
                         state_record,
                         event_id=eid,
                         affected_node_id=event_row.affected_node_id,

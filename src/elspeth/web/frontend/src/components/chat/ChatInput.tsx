@@ -70,6 +70,10 @@ function pendingSubjectNoun(
         : `${count} models the composer picked`;
     case "invented_source":
       return "source data the composer invented";
+    case "source_data_contract":
+      return count === 1
+        ? "the data contract for your source"
+        : `${count} source data contracts`;
     case "vague_term":
     case null:
       return count === 1

@@ -697,7 +697,11 @@ async def _seed_event_liveness_session(
             "anthropic/claude-sonnet-4.5",
         ),
     ],
-    ids=[kind.value for kind in InterpretationKind],
+    # source_data_contract is deliberately excluded: its card carries no
+    # staged draft to go stale — the liveness gate is the server-recomputed
+    # demand identity, pinned by
+    # tests/unit/web/sessions/test_source_data_contract_service.py.
+    ids=[kind.value for kind in InterpretationKind if kind is not InterpretationKind.SOURCE_DATA_CONTRACT],
 )
 async def test_only_event_for_exact_current_draft_can_settle(
     service: SessionServiceImpl,
@@ -934,7 +938,10 @@ async def test_delayed_surface_after_review_site_removal_abandons_the_previous_c
         (InterpretationKind.PIPELINE_DECISION, "Approve the configured scraping identity."),
         (InterpretationKind.LLM_MODEL_CHOICE, "anthropic/claude-haiku-4.5"),
     ],
-    ids=[kind.value for kind in InterpretationKind],
+    # source_data_contract excluded for the same reason as the settle matrix
+    # above: no staged draft — its identity is the server-recomputed demand,
+    # pinned in tests/unit/web/sessions/test_source_data_contract_service.py.
+    ids=[kind.value for kind in InterpretationKind if kind is not InterpretationKind.SOURCE_DATA_CONTRACT],
 )
 async def test_review_event_identity_supersedes_same_text_changed_artifact(
     service: SessionServiceImpl,
@@ -1302,6 +1309,7 @@ def test_01_tool_registered_in_get_tool_definitions() -> None:
         "llm_prompt_template",
         "pipeline_decision",
         "llm_model_choice",
+        "source_data_contract",
     ]
     assert "Do not ask the user in assistant prose" in tool["description"]
     assert "review surface" in tool["description"]

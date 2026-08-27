@@ -312,6 +312,67 @@ def test_blob_rows_guarantee_attributes_to_plugin_contract() -> None:
     assert "plugin" in str(entry["note"])
 
 
+def test_acknowledged_data_contract_guarantee_attributes_to_user_answer() -> None:
+    """A guarantee stamped by the source_data_contract acknowledgement flow
+    (elspeth-da68332faf work item 2) is evidenced by the USER'S ANSWER —
+    detected by the resolved requirement the resolve arm upserts beside the
+    stamp — and must never read as the planner's own claim."""
+    by_path = _entries_by_path(
+        _state_with_source_options(
+            {
+                "path": "/data/input.csv",
+                "schema": {"mode": "observed", "guaranteed_fields": ["colour"]},
+                "interpretation_requirements": [
+                    {
+                        "id": "source-data-contract-source",
+                        "kind": "source_data_contract",
+                        "user_term": "source_data_contract",
+                        "status": "resolved",
+                        "draft": '{"demanded_fields":["colour"]}',
+                        "event_id": "11111111-1111-1111-1111-111111111111",
+                        "accepted_value": '{"demanded_fields":["colour"]}',
+                        "accepted_artifact_hash": "b" * 64,
+                        "resolved_prompt_template_hash": None,
+                    }
+                ],
+            }
+        )
+    )
+
+    entry = by_path["source.schema.guaranteed_fields"]
+    assert entry["provenance"] == "user_acknowledged"
+    assert "acknowledgement" in str(entry["note"])
+
+
+def test_pending_data_contract_does_not_reattribute_guarantees() -> None:
+    """Only a RESOLVED acknowledgement is a user answer; a pending row leaves
+    an author-written guarantee with its ordinary provenance."""
+    by_path = _entries_by_path(
+        _state_with_source_options(
+            {
+                "path": "/data/input.csv",
+                "schema": {"mode": "observed", "guaranteed_fields": ["colour"]},
+                "interpretation_requirements": [
+                    {
+                        "id": "source-data-contract-source",
+                        "kind": "source_data_contract",
+                        "user_term": "source_data_contract",
+                        "status": "pending",
+                        "draft": '{"demanded_fields":["colour"]}',
+                        "event_id": None,
+                        "accepted_value": None,
+                        "accepted_artifact_hash": None,
+                        "resolved_prompt_template_hash": None,
+                    }
+                ],
+            }
+        )
+    )
+
+    entry = by_path["source.schema.guaranteed_fields"]
+    assert entry["provenance"] == "composer_selected"
+
+
 def test_non_blob_source_guaranteed_fields_keep_ordinary_provenance() -> None:
     """Without a blob binding there is no content evidence to attribute."""
     by_path = _entries_by_path(

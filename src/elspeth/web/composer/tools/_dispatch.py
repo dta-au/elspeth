@@ -241,8 +241,20 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["vague_term", "invented_source", "llm_prompt_template", "pipeline_decision", "llm_model_choice"],
-                    "description": "Class of assumption being surfaced for review.",
+                    "enum": [
+                        "vague_term",
+                        "invented_source",
+                        "llm_prompt_template",
+                        "pipeline_decision",
+                        "llm_model_choice",
+                        "source_data_contract",
+                    ],
+                    "description": (
+                        "Class of assumption being surfaced for review. source_data_contract asks the user to "
+                        "acknowledge the data contract for an uploaded/path-bound source the pipeline requires "
+                        "fields from: target 'source' or 'source:<name>', set user_term='source_data_contract', "
+                        "and OMIT llm_draft — the server computes the demanded field set from the graph."
+                    ),
                 },
                 "user_term": {
                     "type": "string",
