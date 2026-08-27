@@ -1753,7 +1753,7 @@ class TestFieldMapperInputGuaranteesUseTheDocumentedPredicate:
         mapping: dict[str, str],
         fields: list[str],
     ) -> None:
-        """``select_only: false`` keeps HEAD's answer, bit for bit.
+        """``select_only: false`` keeps HEAD's EMIT answer, bit for bit.
 
         The wider predicate is gated on ``_emit_set_is_closed`` because applying
         it here is a CATEGORY ERROR (elspeth-c84fa33f75): this branch's emitted
@@ -1763,26 +1763,29 @@ class TestFieldMapperInputGuaranteesUseTheDocumentedPredicate:
         rejection of a working pipeline and a runtime
         ``DeclaredOutputFieldsViolation`` among them — so this asymmetry is the
         fix, not an omission from it.
+
+        Scoped to the EMIT description only: ``declared_output_fields`` is a
+        per-TARGET guarantee claim, not an emit-set claim, and it DOES widen on
+        this branch (elspeth-0d1da6dc44 — see
+        ``TestOpenBranchDeclarationChannelStability``).
         """
         transform = self._built(mapping, fields, select_only=False)
 
         assert transform._output_schema_config.guaranteed_fields is None
-        assert transform.declared_output_fields == frozenset()
 
     def test_a_guaranteed_target_is_now_derived_from_a_fixed_input_schema(self) -> None:
         """The concrete consequence: a declared, required source guarantees its target.
 
-        Scoped to the EMIT description. The sibling assertion this once carried
-        — ``declared_output_fields == {"z"}`` — was removed as part of
-        elspeth-892161b2d5: that set is the field-collision check's trigger, not
-        a statement about what the node emits, and asserting the widened value
-        there pinned the very regression it caused. See
-        ``TestSelectOnlyDoesNotArmTheCollisionCheck``, which pins the opposite
-        and is the claim that matters for the runtime path.
+        Both channels agree since the collision consumers became
+        capability-keyed (elspeth-6ea3619737 / elspeth-0d1da6dc44):
+        ``declared_output_fields`` claims the target too, honestly, and the
+        gate's safety lives at the consumer — see
+        ``TestSelectOnlyCannotTripTheCollisionGate``.
         """
         transform = self._built({"a": "z"}, ["a: str"])
 
         assert transform._output_schema_config.guaranteed_fields == ("z",)
+        assert transform.declared_output_fields == frozenset({"z"})
 
     def test_an_unresolved_original_source_still_abstains(self) -> None:
         """TRUE POSITIVE, preserved. 'Name' is not a normalization fixed point.
@@ -1806,28 +1809,29 @@ class TestFieldMapperInputGuaranteesUseTheDocumentedPredicate:
         assert raw == effective == frozenset()
 
 
-class TestSelectOnlyDoesNotArmTheCollisionCheck:
-    """``select_only`` cannot overwrite an input field, so it must not declare one.
+class TestSelectOnlyCannotTripTheCollisionGate:
+    """``select_only`` cannot overwrite an input field, and the CONSUMER knows it.
 
-    ``declared_output_fields`` is the trigger for
-    ``TransformExecutor._run_preflight``'s field-collision check, which raises a
-    per-row ``PluginContractViolation`` when a declared output name is already
-    on the INPUT row. Under ``select_only`` that check is a false positive by
-    its own premise: ``process`` starts from a fresh ``{}``, so it cannot
-    overwrite anything, and a mapping that renames onto a name the input also
-    carries DROPS that input — which is what ``select_only`` MEANS.
+    ``declared_output_fields`` is an honest guarantee claim — "this target is on
+    every successful output row". The field-collision consumers
+    (``TransformExecutor._run_preflight``, the build-time twin, composer Rule D)
+    are capability-keyed on ``can_overwrite_input_fields``: they arm only when
+    the write path preserves the input row. Under ``select_only`` ``process``
+    starts from a fresh ``{}`` — it cannot overwrite anything, and a mapping
+    that renames onto a name the input also carries DROPS that input, which is
+    what ``select_only`` MEANS — so both presence channels are False and the
+    gate stays asleep however much this node declares.
 
-    Regression: elspeth-892161b2d5. Widening this set to the effective
-    guarantee predicate armed that sleeping check on configs whose every valid
-    row then failed — 100% row loss at RUNTIME on pipelines that ran before.
-    The shipped examples all rename to FRESH names under ``mode: observed``, so
-    the suite stayed green while the defect was live; the coverage gap was that
-    no test paired ``select_only`` with a fixed/flexible schema declaring the
-    target.
+    History: elspeth-892161b2d5 armed the gate by widening the declaration
+    (100% row loss at runtime); the interim cure narrowed the declaration back,
+    which left the strict and explicit-``guaranteed_fields`` families still
+    armed (elspeth-6ea3619737) and starved the open branch's gate
+    (elspeth-0d1da6dc44). The capability key at the consumers fixes both
+    polarities and lets the declaration stay honest.
     """
 
     @staticmethod
-    def _built(mapping: dict[str, str], fields: list[str], mode: str, required: list[str]) -> "object":
+    def _built(mapping: dict[str, str], fields: list[str], mode: str, required: list[str], **extra: object) -> "object":
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         return FieldMapper(
@@ -1835,37 +1839,76 @@ class TestSelectOnlyDoesNotArmTheCollisionCheck:
                 "select_only": True,
                 "mapping": mapping,
                 "schema": {"mode": mode, "fields": fields, "required_fields": required},
+                **extra,
             }
         )
 
     @pytest.mark.parametrize("mode", ["fixed", "flexible"])
     @pytest.mark.parametrize("required", [["a", "b"], ["a"]])
     @pytest.mark.parametrize("target", ["b", "fresh"])
-    def test_select_only_declares_no_output_field(self, mode: str, required: list[str], target: str) -> None:
-        """Every shape the regression armed must leave the check ASLEEP."""
+    def test_select_only_declares_its_guaranteed_targets(self, mode: str, required: list[str], target: str) -> None:
+        """The declaration is honest: a target with an effectively guaranteed source is claimed.
+
+        Every one of these shapes used to pin ``frozenset()`` — a narrowing
+        that existed only to keep the declaration-keyed collision gate asleep.
+        With the consumers capability-keyed, the guarantee walk gets the truth.
+        """
         fields = ["a: str", "b: str"] if target == "b" else ["a: str", "b: str", "fresh: str"]
         transform = self._built({"a": target}, fields, mode, required)
 
-        assert transform.declared_output_fields == frozenset()
+        assert transform.declared_output_fields == frozenset({target})
 
-    def test_a_valid_row_does_not_collide(self) -> None:
-        """The end-to-end consequence: the row the regression failed must pass.
+    def test_select_only_disarms_both_capability_channels(self) -> None:
+        """The mechanism that keeps the declaring node alive: no presence promise.
 
-        Pinned through the real collision helper rather than by asserting the
-        empty set twice — an empty declaration is only interesting because it is
-        what keeps this row alive.
+        ``can_overwrite_input_fields`` is the consumers' arming predicate; a
+        select_only mapper answers False on both of its inputs, so declaring a
+        colliding target cannot trip any collision gate.
         """
-        from elspeth.contracts.field_collision import detect_field_collisions
+        from elspeth.contracts.field_collision import can_overwrite_input_fields
 
         transform = self._built({"a": "b"}, ["a: str", "b: str"], "fixed", ["a", "b"])
 
-        assert detect_field_collisions({"a", "b"}, transform.declared_output_fields) is None
+        assert transform.passes_through_input is False
+        assert transform.forwards_input_fields is False
+        assert (
+            can_overwrite_input_fields(
+                passes_through_input=transform.passes_through_input,
+                forwards_input_fields=transform.forwards_input_fields,
+            )
+            is False
+        )
+
+    def test_strict_select_only_declares_without_any_schema_promise(self) -> None:
+        """The elspeth-6ea3619737 family-1 shape: strict guarantees every target.
+
+        No ``guaranteed_fields``, no declared fields — ``strict: true`` alone
+        promises the source (a row missing it fails), so the target is honestly
+        declared. This is the config that lost 100% of rows under the
+        declaration-keyed gate; its safety now lives in the capability key,
+        pinned end-to-end in
+        ``tests/unit/engine/test_executors.py::TestTransformExecutor::
+        test_select_only_field_mapper_rename_onto_occupied_name_survives_preflight``.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "select_only": True,
+                "strict": True,
+                "mapping": {"a": "b"},
+                "schema": {"mode": "observed"},
+            }
+        )
+
+        assert transform.declared_output_fields == frozenset({"b"})
+        assert transform.forwards_input_fields is False
 
     def test_select_only_still_emits_the_renamed_target(self) -> None:
-        """Declaring nothing must not mean emitting nothing.
+        """Behaviour, unchanged through every declaration revision.
 
-        The fix narrows a DECLARATION, not behaviour: the rename still happens
-        and the input field it lands on is dropped, not overwritten.
+        The rename still happens and the input field it lands on is dropped,
+        not overwritten.
         """
         from elspeth.testing import make_pipeline_row
         from tests.fixtures.factories import make_context
@@ -1877,6 +1920,70 @@ class TestSelectOnlyDoesNotArmTheCollisionCheck:
 
         assert result.status == "success"
         assert result.row.to_dict() == {"b": "1"}
+
+
+class TestOpenBranchDeclarationChannelStability:
+    """One promise, two spellings, ONE verdict (elspeth-0d1da6dc44).
+
+    Under ``select_only: false`` a rename onto a field the input guarantees is
+    a REAL overwrite: ``process`` deep-copies the row and then writes the
+    target. The input guarantee can be spelled ``guaranteed_fields: [a, c]`` or
+    ``mode: fixed`` with required declared fields — ``SchemaConfig`` documents
+    both as guarantees (``get_effective_guaranteed_fields``). Reading the raw
+    tuple collapsed the fixed-schema ABSTAIN into explicit-zero, so the second
+    spelling disarmed all three collision gates while the first was rejected:
+    opposite verdicts on identical runtime behaviour, keyed on spelling.
+    """
+
+    @staticmethod
+    def _mapper(schema: dict[str, object]) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        return FieldMapper({"mapping": {"a": "c"}, "schema": schema})
+
+    def test_fixed_schema_and_guaranteed_fields_declare_identically(self) -> None:
+        """The cure, pinned as an equality so the channels cannot drift apart."""
+        via_fixed = self._mapper({"mode": "fixed", "fields": ["a: str", "c: str"]})
+        via_guaranteed = self._mapper({"mode": "observed", "guaranteed_fields": ["a", "c"]})
+
+        assert via_fixed.declared_output_fields == via_guaranteed.declared_output_fields == frozenset({"c"})
+
+    def test_open_branch_keeps_the_forwarding_promise_that_arms_the_gate(self) -> None:
+        """The consumer half of the FN cure: the open branch answers True.
+
+        A declared target is only rejected when the row survives onto the
+        output — which is exactly what the open branch promises through
+        ``forwards_input_fields``.
+        """
+        from elspeth.contracts.field_collision import can_overwrite_input_fields
+
+        transform = self._mapper({"mode": "fixed", "fields": ["a: str", "c: str"]})
+
+        assert transform.forwards_input_fields is True
+        assert (
+            can_overwrite_input_fields(
+                passes_through_input=transform.passes_through_input,
+                forwards_input_fields=transform.forwards_input_fields,
+            )
+            is True
+        )
+
+    def test_optional_fixed_field_source_still_abstains(self) -> None:
+        """An optional declared field is NOT guaranteed, so its target is not declared.
+
+        ``get_effective_guaranteed_fields`` unions only REQUIRED declared
+        fields; a ``?``-marked source may be absent, so promising its target
+        would be a false guarantee.
+        """
+        transform = self._mapper({"mode": "fixed", "fields": ["a: str?", "c: str"]})
+
+        assert transform.declared_output_fields == frozenset()
+
+    def test_bare_observed_schema_still_abstains(self) -> None:
+        """No promise in either channel means no declaration — unchanged."""
+        transform = self._mapper({"mode": "observed"})
+
+        assert transform.declared_output_fields == frozenset()
 
 
 class TestFieldMapperDerivedInputRequirement:

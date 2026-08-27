@@ -574,8 +574,16 @@ def _collision_graph(
     *,
     source_schema: dict[str, object],
     declared_output_fields: frozenset[str],
+    passes_through_input: bool = True,
+    forwards_input_fields: bool = False,
 ) -> ExecutionGraph:
-    """source -> transform -> sink, with the transform's declaration under test."""
+    """source -> transform -> sink, with the transform's declaration under test.
+
+    ``passes_through_input`` defaults True because the node models the llm
+    enricher class truthfully: the collision gate is capability-keyed
+    (``can_overwrite_input_fields``, elspeth-6ea3619737) and a node with
+    neither presence promise is deliberately not checked.
+    """
     graph = ExecutionGraph()
     graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="text", config={"schema": source_schema})
     graph.add_node(
@@ -584,6 +592,8 @@ def _collision_graph(
         plugin_name="llm",
         config={"schema": {"mode": "observed"}},
         declared_output_fields=declared_output_fields,
+        passes_through_input=passes_through_input,
+        forwards_input_fields=forwards_input_fields,
     )
     graph.add_node("sink", node_type=NodeType.SINK, plugin_name="text", config={"schema": {"mode": "observed"}})
     graph.add_edge("src", "t1", label="continue", mode=RoutingMode.MOVE)
@@ -625,6 +635,44 @@ class TestTransformOutputFieldCollisions:
 
         with pytest.raises(GraphValidationError, match="headline"):
             graph.validate_edge_compatibility()
+
+    def test_fresh_row_transform_is_not_collision_checked(self) -> None:
+        """Capability key: no presence promise means no possible overwrite.
+
+        Same colliding declaration as the rejection test, but the node builds
+        its output from a fresh dict (``passes_through_input=False``,
+        ``forwards_input_fields=False`` — the select_only field_mapper shape).
+        A declared name the input also carries is consumed-and-replaced there,
+        never overwritten; rejecting it was the elspeth-6ea3619737 false
+        positive (100% row loss at runtime on the executor twin).
+        """
+        graph = _collision_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["headline"]},
+            declared_output_fields=frozenset({"headline"}),
+            passes_through_input=False,
+            forwards_input_fields=False,
+        )
+
+        schema_validation.validate_transform_output_field_collisions(graph)
+
+    def test_forwarding_transform_is_collision_checked(self) -> None:
+        """The second capability limb: ``forwards_input_fields`` alone arms the gate.
+
+        The open-branch field_mapper and both explode transforms answer
+        ``passes_through_input=False`` but forward the input row minus a named
+        removal set — a declared output the row carries IS a real overwrite
+        there (elspeth-0d1da6dc44). A key of ``passes_through_input`` alone
+        would disarm those true positives; this pin kills that mutation.
+        """
+        graph = _collision_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["headline"]},
+            declared_output_fields=frozenset({"headline"}),
+            passes_through_input=False,
+            forwards_input_fields=True,
+        )
+
+        with pytest.raises(GraphValidationError, match="headline"):
+            schema_validation.validate_transform_output_field_collisions(graph)
 
     def test_non_colliding_output_field_builds(self) -> None:
         """Negative control: a fresh output field must remain buildable."""
@@ -687,6 +735,7 @@ class TestTransformOutputFieldCollisions:
             plugin_name="llm",
             config={"schema": {"mode": "observed"}},
             declared_output_fields=frozenset({"headline"}),
+            passes_through_input=True,
         )
         graph.add_edge("src", "passthru", label="continue", mode=RoutingMode.MOVE)
         graph.add_edge("passthru", "rewriter", label="continue", mode=RoutingMode.MOVE)
@@ -746,6 +795,7 @@ class TestTransformOutputFieldCollisions:
             plugin_name="llm",
             config={"schema": {"mode": "observed"}},
             declared_output_fields=frozenset({"headline"}),
+            passes_through_input=True,
         )
         graph.add_edge("src", "t1", label="on_error", mode=RoutingMode.DIVERT)
         graph.add_edge("src", "t1", label="continue", mode=RoutingMode.MOVE)

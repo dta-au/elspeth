@@ -379,11 +379,21 @@ class TransformExecutor:
             )
 
         # --- FIELD COLLISION ENFORCEMENT (pre-execution) ---
-        # Centralized check: if this transform declares output fields,
-        # verify none collide with input fields BEFORE running the transform.
-        # This prevents wasted API calls AND makes collision detection mandatory
-        # (not opt-in per plugin).
-        if transform.declared_output_fields:
+        # Centralized check: if this transform declares output fields AND its
+        # write path preserves the input row, verify none collide with input
+        # fields BEFORE running the transform. This prevents wasted API calls
+        # AND makes collision detection mandatory (not opt-in per plugin).
+        # The capability key is load-bearing: declared_output_fields is a
+        # guarantee claim, and a transform that builds its output from a fresh
+        # dict (select_only field_mapper) consumes-and-replaces rather than
+        # overwrites — arming on the declaration alone was a 100% row-loss
+        # false positive (elspeth-6ea3619737). See can_overwrite_input_fields.
+        from elspeth.contracts.field_collision import can_overwrite_input_fields
+
+        if transform.declared_output_fields and can_overwrite_input_fields(
+            passes_through_input=transform.passes_through_input,
+            forwards_input_fields=transform.forwards_input_fields,
+        ):
             from elspeth.contracts.field_collision import detect_field_collisions
 
             collisions = detect_field_collisions(

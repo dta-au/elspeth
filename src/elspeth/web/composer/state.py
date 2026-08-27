@@ -4255,8 +4255,21 @@ def _check_schema_contracts(
             )
         return " ".join(clauses)
 
-    def _probe_transform_declared_output_fields(plugin: str, options: Mapping[str, Any]) -> frozenset[str]:
-        """Read ``plugin``'s ``declared_output_fields``, closing the probe instance.
+    class _CollisionProbe(NamedTuple):
+        declared_output_fields: frozenset[str]
+        can_overwrite_input: bool
+
+    def _probe_transform_collision_surface(plugin: str, options: Mapping[str, Any]) -> _CollisionProbe:
+        """Read ``plugin``'s collision surface in ONE probe, closing the instance.
+
+        Two facts, both only on a constructed instance: ``declared_output_fields``
+        (the set the executor's collision preflight actually tests) and the
+        ``can_overwrite_input_fields`` capability (whether the write path
+        preserves the input row — ``passes_through_input`` /
+        ``forwards_input_fields`` are instance-level on field_mapper and the
+        explode transforms, so the class alone cannot answer). One construction
+        for both, because the lifecycle tests pin exactly one probe instance
+        per site.
 
         Deliberately NOT served from ``_probe_transform_output_schema``:
         ``_output_schema_config.guaranteed_fields`` is a documented SUPERSET of
@@ -4267,10 +4280,11 @@ def _check_schema_contracts(
         directly — substituting guarantees would reject rename sources and
         pass-through fields the runtime never flags (elspeth-cfcd333f83).
 
-        A construction failure abstains with the empty set: a draft node whose
-        options do not yet build is owned by the existing config-validation
+        A construction failure abstains (empty set, gate disarmed): a draft node
+        whose options do not yet build is owned by the existing config-validation
         paths, and Rule D must not turn an incomplete draft into a hard error.
         """
+        from elspeth.contracts.field_collision import can_overwrite_input_fields
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
         try:
@@ -4281,9 +4295,15 @@ def _check_schema_contracts(
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
-            return frozenset()
+            return _CollisionProbe(frozenset(), False)
         try:
-            return transform.declared_output_fields
+            return _CollisionProbe(
+                transform.declared_output_fields,
+                can_overwrite_input_fields(
+                    passes_through_input=transform.passes_through_input,
+                    forwards_input_fields=transform.forwards_input_fields,
+                ),
+            )
         finally:
             transform.close()
 
@@ -4300,7 +4320,7 @@ def _check_schema_contracts(
         read both — the lifecycle tests pin exactly one probe instance per
         site.
 
-        Input-side twin of ``_probe_transform_declared_output_fields``. Six
+        Input-side twin of ``_probe_transform_collision_surface``. Six
         transform configs compute this as a property over their own options
         (web_scrape's ``url_field``, blob_fetch's ``url_field``,
         blob_csv_expand's ``blob_ref_field`` — which DEFAULTS to ``blob_ref``,
@@ -6300,8 +6320,15 @@ def _check_schema_contracts(
             continue
         if node.id in parse_failed_producers:
             continue
-        declared_output = _probe_transform_declared_output_fields(node.plugin, node.options)
+        declared_output, node_can_overwrite = _probe_transform_collision_surface(node.plugin, node.options)
         if not declared_output:
+            continue
+        # Capability key, in lockstep with TransformExecutor._run_preflight and
+        # the build-time twin: a declared output only overwrites when the write
+        # path preserves the input row. A select_only field_mapper builds its
+        # output from a fresh dict — flagging it here was the
+        # elspeth-6ea3619737 false positive.
+        if not node_can_overwrite:
             continue
         # Seeded empty, NOT with ``{node.input}``: Rule A seeds its own input
         # because it resolves the producer first and unions from the producer's

@@ -360,6 +360,7 @@ def _make_transform(
     on_error: str | None = None,
     declared_output_fields: frozenset[str] | None = None,
     passes_through_input: bool = False,
+    forwards_input_fields: bool = False,
     can_drop_rows: bool = False,
     declared_input_fields: frozenset[str] | None = None,
     is_batch_aware: bool = False,
@@ -378,6 +379,7 @@ def _make_transform(
             "_on_start_called",
             "process",
             "passes_through_input",
+            "forwards_input_fields",
             "can_drop_rows",
             "is_batch_aware",
             "_output_schema_config",
@@ -393,6 +395,7 @@ def _make_transform(
     t.output_schema = _PermissiveSchema  # Accepts any row — validation is a no-op
     t._on_start_called = True
     t.passes_through_input = passes_through_input
+    t.forwards_input_fields = forwards_input_fields
     t.can_drop_rows = can_drop_rows
     t.is_batch_aware = is_batch_aware
     t._output_schema_config = None
@@ -1386,8 +1389,13 @@ class TestTransformExecutor:
         """
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        # passes_through_input=True models the enricher class truthfully (the
+        # real llm transform passes input through): the collision gate is
+        # capability-keyed — it arms only for a transform whose write path
+        # preserves the input row (elspeth-6ea3619737).
         transform = _make_transform(
             declared_output_fields=frozenset({"llm_response", "llm_response_model"}),
+            passes_through_input=True,
         )
         # Input row already has "llm_response" — collision!
         token = _make_token(data={"value": "test", "llm_response": "pre-existing"}, token_id="tok_collision")
@@ -1398,6 +1406,186 @@ class TestTransformExecutor:
 
         transform.process.assert_not_called()
         factory.data_flow.record_token_outcome.assert_not_called()
+
+    def test_fresh_row_transform_with_colliding_declaration_is_not_collision_checked(self) -> None:
+        """A transform that does not preserve input fields cannot overwrite one.
+
+        ``declared_output_fields`` is a GUARANTEE claim ("this field is on
+        every successful output row"), not a write-path claim. A transform with
+        ``passes_through_input=False`` and ``forwards_input_fields=False``
+        builds its output from a fresh dict, so a declared name that is also on
+        the input row is consumed-and-replaced, never overwritten — arming the
+        gate there was the elspeth-6ea3619737 false positive (100% row loss on
+        a select_only field_mapper).
+        """
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("value", python_type=str, original_name="value", required=False, source="inferred"),
+                make_field("llm_response", python_type=str, original_name="llm_response", required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        transform = _make_transform(
+            declared_output_fields=frozenset({"llm_response"}),
+            passes_through_input=False,
+            forwards_input_fields=False,
+        )
+        transform.process.return_value = TransformResult.success(
+            make_row({"llm_response": "fresh"}, contract=contract),
+            success_reason={"action": "test"},
+        )
+        token = _make_token(data={"value": "test", "llm_response": "pre-existing"}, token_id="tok_fresh_row", contract=contract)
+        ctx = make_context()
+
+        result, _updated_token, error_sink = executor.execute_transform(transform, token, ctx)
+
+        assert result.status == "success"
+        assert error_sink is None
+        transform.process.assert_called_once()
+
+    def test_forwarding_transform_collision_still_raises(self) -> None:
+        """``forwards_input_fields`` alone arms the gate — the second limb.
+
+        The open-branch field_mapper (and both explode transforms) declare
+        ``passes_through_input=False`` but ``forwards_input_fields=True``: the
+        input row survives onto the output, so a declared output name the row
+        already carries IS a real overwrite. A capability key of
+        ``passes_through_input`` alone would disarm those true positives; this
+        pin kills that mutation.
+        """
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform(
+            declared_output_fields=frozenset({"item"}),
+            passes_through_input=False,
+            forwards_input_fields=True,
+        )
+        token = _make_token(data={"item": "pre-existing", "items": "[1]"}, token_id="tok_forwarding")
+        ctx = make_context()
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            executor.execute_transform(transform, token, ctx)
+
+        transform.process.assert_not_called()
+
+    def test_select_only_field_mapper_rename_onto_occupied_name_survives_preflight(self) -> None:
+        """End-to-end FP cure (elspeth-6ea3619737 family 1): strict + select_only.
+
+        ``select_only`` builds its output from a fresh ``{}`` — it CANNOT
+        overwrite an input field; a rename onto a name the input also carries
+        DROPS that input, which is what select_only means. Under ``strict:
+        true`` the target is declared (an honest guarantee), and before the
+        capability key this armed the collision gate: 0/5 rows survived a real
+        run, quarantined with "would overwrite existing input fields" — false
+        by construction.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "tgt"},
+                "select_only": True,
+                "strict": True,
+                "schema": {"mode": "observed"},
+            }
+        )
+        transform.node_id = "fm_select_only"
+        transform.on_error = "discard"
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("a", python_type=str, original_name="a", required=False, source="inferred"),
+                make_field("tgt", python_type=str, original_name="tgt", required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        token = _make_token(data={"a": "1", "tgt": "occupied"}, token_id="tok_select_only", contract=contract)
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        result, updated_token, error_sink = executor.execute_transform(transform, token, ctx)
+
+        assert result.status == "success"
+        assert error_sink is None
+        assert updated_token.row_data.to_dict() == {"tgt": "1"}
+
+    def test_open_branch_field_mapper_fixed_schema_rename_onto_required_field_collides(self) -> None:
+        """End-to-end FN cure (elspeth-0d1da6dc44): declaration-channel stability.
+
+        Under ``select_only: false`` the mapper deep-copies the input row and
+        then writes the target — a rename onto a field the schema guarantees
+        DESTROYS that field's value on every row. Declaring the guarantee as
+        ``mode: fixed`` required fields used to leave ``declared_output_fields``
+        empty (abstain collapsed into explicit-zero), so all three collision
+        gates slept while ``guaranteed_fields: [a, c]`` — the same promise in
+        the other channel — was rejected. Same runtime behavior, opposite
+        verdicts, keyed on spelling.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "c"},
+                "schema": {"mode": "fixed", "fields": ["a: str", "c: str"]},
+            }
+        )
+        transform.node_id = "fm_open_fixed"
+        transform.on_error = "discard"
+        contract = SchemaContract(
+            mode="FIXED",
+            fields=(
+                make_field("a", python_type=str, original_name="a", required=True, source="declared"),
+                make_field("c", python_type=str, original_name="c", required=True, source="declared"),
+            ),
+            locked=True,
+        )
+        token = _make_token(data={"a": "1", "c": "2"}, token_id="tok_open_fixed", contract=contract)
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            executor.execute_transform(transform, token, ctx)
+
+    def test_open_branch_field_mapper_guaranteed_rename_still_collides(self) -> None:
+        """Control: the explicit-``guaranteed_fields`` channel keeps its true positive.
+
+        This is the shape that was ALREADY rejected before the capability key —
+        the fix must equalize the two declaration channels by arming the fixed
+        schema one, not by disarming this one.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "c"},
+                "schema": {"mode": "observed", "guaranteed_fields": ["a", "c"]},
+            }
+        )
+        transform.node_id = "fm_open_guaranteed"
+        transform.on_error = "discard"
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("a", python_type=str, original_name="a", required=False, source="inferred"),
+                make_field("c", python_type=str, original_name="c", required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        token = _make_token(data={"a": "1", "c": "2"}, token_id="tok_open_guaranteed", contract=contract)
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            executor.execute_transform(transform, token, ctx)
 
     def test_empty_declared_output_fields_skips_collision_check(self) -> None:
         """Transform with empty declared_output_fields passes through without collision check.
@@ -1431,6 +1619,7 @@ class TestTransformExecutor:
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
         transform = _make_transform(
             declared_output_fields=frozenset({"value"}),
+            passes_through_input=True,
         )
         token = _make_token(data={"value": "test"})
         ctx = make_context()

@@ -8826,6 +8826,81 @@ class TestSchemaContractValidation:
 
         assert result.is_valid, result.errors
 
+    def test_rule_d_skips_a_select_only_field_mapper_that_cannot_overwrite(self) -> None:
+        """Rule D is capability-keyed: a fresh-dict writer cannot overwrite (elspeth-6ea3619737).
+
+        A ``select_only`` + ``strict`` field_mapper declares its rename target
+        (an honest guarantee — strict promises the source), and the target name
+        definitely arrives on its input. But ``process`` builds its output from
+        a fresh ``{}``: the arriving field is dropped, never overwritten —
+        which is what select_only MEANS. Before the capability key this shape
+        was rejected here and lost 100% of rows at the runtime twin.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["a", "b"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": True,
+                    "strict": True,
+                    "schema": {"mode": "observed"},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_rule_d_fires_on_an_open_branch_fixed_schema_rename_onto_a_guaranteed_field(self) -> None:
+        """Declaration-channel stability (elspeth-0d1da6dc44): fixed schema arms Rule D too.
+
+        Under ``select_only: false`` the mapper deep-copies the row and writes
+        the target — a real overwrite of the arriving ``c``. Spelling the input
+        promise as ``mode: fixed`` required fields used to leave
+        ``declared_output_fields`` empty and every collision gate asleep, while
+        ``guaranteed_fields: [a, c]`` — the same promise — was rejected. Both
+        spellings must reach the same verdict.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["a", "c"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "c"},
+                    "schema": {"mode": "fixed", "fields": ["a: str", "c: str"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert not result.is_valid, "The fixed-schema spelling must not disarm the collision gate."
+        rule_d_errors = [e for e in result.errors if e.component == "node:rename" and e.error_code == "transform_contract_violation"]
+        assert rule_d_errors, f"Expected a Rule D rejection naming c, got: {[e.message for e in result.errors]}"
+        assert "[c] already arrive(s) on its input row" in rule_d_errors[0].message
+
     def test_rule_d_fires_when_only_one_row_union_arm_delivers_the_field(self) -> None:
         """Rule D rejects a collision carried by a SINGLE fan-in arm.
 

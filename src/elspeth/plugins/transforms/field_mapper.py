@@ -282,7 +282,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e44845bae4843de6"
+    source_file_hash: str | None = "sha256:61f28142d0c70fa6"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -484,46 +484,39 @@ class FieldMapper(BaseTransform):
 
     @classmethod
     def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:
-        """Derive targets safe for executor-level declared-output checks.
+        """Derive the rename targets this node GUARANTEES on every successful row.
 
-        Deliberately reads the RAW ``guaranteed_fields``, not
-        ``_admitted_input_fields``. The two call sites ask different questions
-        and one widened answer is wrong for this one (elspeth-892161b2d5).
+        ``declared_output_fields`` is an honest guarantee claim, nothing more:
+        the collision consumers (``TransformExecutor._run_preflight``, the
+        build-time twin in ``core/dag/schema_validation.py``, composer Rule D)
+        are capability-keyed on ``can_overwrite_input_fields`` — they arm only
+        when the write path preserves the input row — so this declaration no
+        longer needs to be narrowed to keep ``select_only`` alive
+        (elspeth-6ea3619737; the narrowing-vs-arming history is
+        elspeth-892161b2d5).
 
-        ``_build_field_mapper_output_schema_config`` describes what this node
-        EMITS, and widening it there is the fix for the composer's Rule C false
-        reject. ``declared_output_fields`` is different: it is the trigger for
-        ``TransformExecutor._run_preflight``'s field-collision check, which
-        raises a per-row ``PluginContractViolation`` when a declared output
-        name is already present on the INPUT row.
+        The input promise is ``get_effective_guaranteed_fields()``, NOT the raw
+        ``guaranteed_fields`` tuple: a ``mode: fixed`` config with required
+        declared fields guarantees them even when ``guaranteed_fields`` is
+        ``None`` — an ABSTAIN, not an explicit zero. The raw read collapsed the
+        two, so on the ``select_only: false`` branch a fixed-schema declaration
+        disarmed every collision gate while the identical promise spelled
+        ``guaranteed_fields: [...]`` armed them — the same real overwrite,
+        opposite verdicts by declaration channel (elspeth-0d1da6dc44).
 
-        Under ``select_only`` that check is a false positive by its own premise.
-        ``process`` starts from ``output: dict[str, Any] = {}`` — a fresh dict —
-        so it cannot overwrite an input field; a mapping that renames onto a
-        name the input also carries DROPS that input, which is precisely what
-        ``select_only`` means. ``field_collision`` scopes itself to transforms
-        that "enrich rows with new fields" and its message says "would overwrite
-        existing input fields"; neither is true here. Widening this set armed
-        that sleeping check on configs whose every valid row then failed —
-        100% row loss at RUNTIME on pipelines that ran fine before.
-
-        The raw read is not a workaround: ``guaranteed_fields`` is the author's
-        EXPLICIT promise, and a name promised on input while also being written
-        on output is the only shape where a collision claim is defensible. The
-        implicit type-system guarantees the wider predicate adds are exactly the
-        ones ``select_only`` consumes rather than collides with.
+        NOT ``_admitted_input_fields``: that helper answers the EMIT-set
+        question for ``_build_field_mapper_output_schema_config`` and stays
+        gated on ``_emit_set_is_closed`` (elspeth-c84fa33f75 — an emit-set
+        claim on the open branch is a category error). This method asks only
+        whether each TARGET is written on every valid row, which is sound on
+        both branches: a valid row necessarily carries every effectively
+        guaranteed source, so its target is written whichever branch emits it.
         """
-        # NOT ``_admitted_input_fields`` — see this method's docstring. The two
-        # sites deliberately hold DIFFERENT sets, so they carry different names
-        # (elspeth-c84fa33f75's naming finding: one local name over two
-        # semantics is what invited the raw-tuple read in the first place).
-        # This one is the AUTHOR'S EXPLICIT promise; the emit-description site
-        # binds ``admitted_on_input``, which is wider.
-        explicitly_promised_on_input = set(cfg.schema_config.guaranteed_fields or ())
+        promised_on_input = set(cfg.schema_config.get_effective_guaranteed_fields())
         return frozenset(
             target
             for source, target in cfg.mapping.items()
-            if source != target and cls._mapping_target_is_guaranteed(cfg, source, explicitly_promised_on_input)
+            if source != target and cls._mapping_target_is_guaranteed(cfg, source, promised_on_input)
         )
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
@@ -649,8 +642,13 @@ class FieldMapper(BaseTransform):
                 passthrough_fields = admitted_on_input - removed_sources
             output_fields = passthrough_fields | guaranteed_targets
 
-        # Always include declared_output_fields (targets that aren't also sources)
-        output_fields |= self.declared_output_fields
+        # Deliberately NOT unioned with ``declared_output_fields``: that set is
+        # derived from ``get_effective_guaranteed_fields`` on BOTH branches
+        # (elspeth-0d1da6dc44), while this emit description must keep abstaining
+        # on the open branch (elspeth-c84fa33f75 — an emit-set claim there is a
+        # category error). On the closed branch ``admitted_on_input`` is the
+        # same effective predicate, so ``guaranteed_targets`` already covers
+        # every declared target and the union would be a no-op.
 
         # Preserve None-vs-empty-tuple semantics: None = abstain, () = explicitly empty.
         # If upstream declared guarantees or we computed non-empty output, declare explicitly.

@@ -8,6 +8,37 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-27 — the field-collision gates are CAPABILITY-KEYED: they arm only
+  when `can_overwrite_input_fields(passes_through_input=, forwards_input_fields=)`
+  (contracts/field_collision.py) is True — and `declared_output_fields` is now
+  an HONEST guarantee claim, never narrowed to keep a gate asleep**
+  (elspeth-6ea3619737 / elspeth-0d1da6dc44). The three consumers move in
+  lockstep: `TransformExecutor._run_preflight`, build-time
+  `validate_transform_output_field_collisions` (core/dag/schema_validation.py),
+  composer Rule D (`_probe_transform_collision_surface` in
+  web/composer/state.py — ONE probe construction returns fields + capability;
+  do not add a second probe). Traps:
+  - A hand-built transform fake or `add_node` call that declares colliding
+    output fields MUST also model the presence flags truthfully
+    (`passes_through_input=True` for the llm/enricher class) or the gate
+    silently disarms and the test goes green for the wrong reason. The
+    executor mock spec in `tests/unit/engine/test_executors.py` now carries
+    `forwards_input_fields`.
+  - The capability is INSTANCE-level on field_mapper and both explode
+    transforms (`forwards_input_fields` is computed in `__init__`); the class
+    attribute answers False and is not evidence.
+  - Do NOT key the exclusion on executor path: the reductive batch aggregators
+    are unreachable only via AggregationExecutor routing, and arming path-wise
+    breaks 12 plugins whose `group_by` field sits in both the required-input
+    and declared-output sets.
+  - field_mapper's `_derive_declared_output_fields` reads
+    `get_effective_guaranteed_fields()` on BOTH branches (fixed-schema required
+    fields now declare rename targets — the elspeth-0d1da6dc44 FN cure), while
+    `_build_field_mapper_output_schema_config` deliberately does NOT union
+    `declared_output_fields` back in: the open branch's emit description still
+    abstains (elspeth-c84fa33f75 — an emit-set claim there is a category
+    error). `test_an_open_emit_set_is_a_strict_no_op` pins the emit half only.
+
 - **2026-08-27 — `source_data_contract` is the SIXTH InterpretationKind, its
   demand set is a DELTA-RUN of Stage-1's own edge-contract ledger, and the
   /validate remedy for the uploaded-source missing-field shape is now the

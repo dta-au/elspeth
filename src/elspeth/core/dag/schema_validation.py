@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from elspeth.contracts import PluginSchema, RoutingMode, check_compatibility
 from elspeth.contracts.data import CompatibilityResult, resolved_guarantee_type_mismatch
 from elspeth.contracts.enums import NodeType
+from elspeth.contracts.field_collision import can_overwrite_input_fields
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID
 from elspeth.core.dag.guarantees import (
@@ -1418,6 +1419,17 @@ def validate_transform_output_field_collisions(graph: ExecutionGraph) -> None:
 
         declared_output = info.declared_output_fields
         if not declared_output:
+            continue
+
+        # Capability key, in lockstep with TransformExecutor._run_preflight and
+        # composer Rule D: a declared output is only an overwrite when the
+        # transform's write path preserves the input row. A fresh-dict writer
+        # (select_only field_mapper) consumes and replaces — rejecting it here
+        # was the elspeth-6ea3619737 false positive.
+        if not can_overwrite_input_fields(
+            passes_through_input=info.passes_through_input,
+            forwards_input_fields=info.forwards_input_fields,
+        ):
             continue
 
         for predecessor_id in _live_predecessors(graph, node_id):
