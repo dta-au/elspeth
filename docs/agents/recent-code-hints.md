@@ -51,12 +51,43 @@ is a working document under the normal delivery posture.
     re-opens the card via `_pending_source_data_contract_sites`, which is
     DERIVED per read (no mutation-time staging), so demand arising after
     bind blocks and re-asks with no staging hook.
-  - Known gap: `_backend_surface_args_for_site` (composer/service.py) has no
-    source_data_contract arm yet, so the kind-general settlement surfacer
-    (freeform + guided wire-confirm) skips the site — the event minting path
-    is the planner's `request_interpretation_review`; guided sessions that
-    reach the blocked state have no card until that arm lands (follow-up on
-    elspeth-da68332faf).
+  - Known gap CLOSED (083ec4b95): `_backend_surface_args_for_site`
+    (composer/service.py) now carries the source_data_contract arm, so the
+    kind-general settlement surfacer (freeform + guided wire-confirm) mints
+    the card with the server-computed draft; the planner's
+    `request_interpretation_review` is no longer the only minting path.
+  - MULTI-SOURCE FAN-IN IS ATTRIBUTED, not under-demanded (ruling on
+    elspeth-da68332faf): queue/row_union fan-in is an AND over N INDEPENDENT
+    per-source promises — every released row comes from exactly one arm, so
+    a consumer requirement must be promised by EVERY feeding source, each
+    for its own rows (Stage-1 already intersects arm votes).
+    `backtraced_source_demand` runs a sufficiency∩necessity delta: H_all =
+    every card-eligible source stamped with the baseline-missing fields,
+    H_not_S = the same minus this source; a field is demanded iff the miss
+    clears under H_all and not under H_not_S. Single eligible source reduces
+    EXACTLY to the old solo delta (H_not_S is the baseline; no third
+    validate() run). Consequences worth knowing before you "fix" one:
+    (a) an INELIGIBLE source on the intersection (declared `schema.fields`,
+    non-observed mode, or the composer-authored `source_authoring` marker)
+    is never stamped, so the miss never clears and NO card demands the field
+    — the shape fails closed with ordinary edge-contract advice, and that
+    emptiness is deliberate; (b) BARE-observed arms make Stage-1 itself skip
+    the fan-in edge (arm vote abstains → "Contract check skipped" warning,
+    zero edge_contracts), so there is no ledger miss to attribute and no
+    card — the demand derives from Stage-1's own ledger, and runtime per-row
+    enforcement owns that shape; the fan-in card fires when arms participate
+    (each guarantees SOMETHING) but the intersection misses the requirement;
+    (c) a resolved source's disregard-strip recompute re-derives its OWN
+    demand even while a sibling is pending (necessity holds for its rows),
+    which is what keeps its site closed — no re-ask loop. Pins:
+    `TestFanInDemandAttribution` (test_source_demand.py),
+    `TestFanInSiteLifecycle` (test_interpretation_state_source_data_contract.py).
+  - `SOURCE_AUTHORING_KEY`'s canonical definition moved to
+    `web/composer/state.py` (beside `SourceSpec`, whose options carry it);
+    `interpretation_state` re-exports it unchanged for its importers.
+    `source_demand` reads it from state — do not re-import
+    `interpretation_state` into `source_demand` (import cycle) and do not
+    re-literal the string.
 
 - **2026-08-27 — server-owned option metadata is a THREE-surface parity set:
   planner projection, echo-tolerant write gates, and disclosure provenance**

@@ -28,7 +28,13 @@ from elspeth.web.composer.source_demand import (
     parse_source_data_contract_accepted_fields,
     source_data_contract_artifact_hash,
 )
-from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
+from elspeth.web.composer.state import (
+    SOURCE_AUTHORING_KEY,
+    CompositionState,
+    NodeSpec,
+    SourceSpec,
+    _coalesce_branch_connections,
+)
 from elspeth.web.plugin_policy.coverage import (
     OutputStreamGraph as _OutputStreamGraph,
 )
@@ -40,7 +46,6 @@ from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 INTERPRETATION_REQUIREMENTS_KEY = "interpretation_requirements"
 PROMPT_TEMPLATE_PARTS_KEY = "prompt_template_parts"
-SOURCE_AUTHORING_KEY = "source_authoring"
 SOURCE_COMPONENT_ID = "source"
 INTERPRETATION_REVIEW_PENDING_CODE = "interpretation_review_pending"
 PENDING_INTERPRETATION_AUTHORING_TEXT = "pending interpretation"

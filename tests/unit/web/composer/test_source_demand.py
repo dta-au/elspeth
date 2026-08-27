@@ -21,7 +21,7 @@ from elspeth.web.composer.source_demand import (
     source_data_contract_artifact_hash,
     stamp_source_options_with_guarantees,
 )
-from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 
 
 def _llm_node(
@@ -137,6 +137,174 @@ class TestBacktracedSourceDemand:
         state = _state(options, (_llm_node(required=["colour"]),))
         assert backtraced_source_demand(state, "source") == ()
         assert backtraced_source_demand(state, "source", disregard_fields=frozenset({"colour"})) == ("colour",)
+
+
+def _queue_node(node_id: str = "q") -> NodeSpec:
+    return NodeSpec(
+        id=node_id,
+        node_type="queue",
+        plugin=None,
+        input=node_id,
+        on_success=None,
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+def _csv_source(options: dict[str, Any], *, on_success: str = "q") -> SourceSpec:
+    return SourceSpec(plugin="csv", on_success=on_success, options=options, on_validation_failure="discard")
+
+
+def _observed(*guaranteed: str) -> dict[str, Any]:
+    return {"path": "/tmp/upload.csv", "schema": {"mode": "observed", "guaranteed_fields": list(guaranteed)}}
+
+
+def _fan_in_state(
+    sources: dict[str, SourceSpec],
+    nodes: tuple[NodeSpec, ...] = (),
+) -> CompositionState:
+    return CompositionState(
+        source=None,
+        sources=sources,
+        nodes=(_queue_node(), _llm_node(input_name="q", required=["colour"]), *nodes),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+class TestFanInDemandAttribution:
+    """Queue fan-in is an AND over N independent per-source promises.
+
+    Ruling on elspeth-da68332faf: every released row comes from exactly one
+    arm, so a consumer requirement must be promised by EVERY feeding source,
+    each for its own rows (Stage-1 already intersects arm votes). The demand
+    walk attributes a field to a source iff the miss clears when every
+    card-eligible source is stamped (sufficiency) and does NOT clear when
+    only the others are (necessity). The row_union vote is the same
+    intersection arm of ``_producer_entry_propagation_vote``; the queue is
+    the sanctioned multi-source fan-in point and carries these pins.
+    """
+
+    def test_fan_in_requirement_is_demanded_of_every_feeding_source(self) -> None:
+        state = _fan_in_state({"src_a": _csv_source(_observed("id")), "src_b": _csv_source(_observed("id"))})
+        assert backtraced_source_demand(state, "src_a") == ("colour",)
+        assert backtraced_source_demand(state, "src_b") == ("colour",)
+
+    def test_stamping_every_source_clears_validation_but_one_alone_does_not(self) -> None:
+        # The demand is honest: acknowledging BOTH cards satisfies the edge,
+        # acknowledging one alone leaves the intersection short — the AND the
+        # attribution promises the user is the AND validation enforces.
+        state = _fan_in_state({"src_a": _csv_source(_observed("id")), "src_b": _csv_source(_observed("id"))})
+
+        def _stamped(state: CompositionState, names: tuple[str, ...]) -> CompositionState:
+            sources = dict(state.sources)
+            for name in names:
+                stamped_options = stamp_source_options_with_guarantees(sources[name].options, ["colour"])
+                assert stamped_options is not None
+                sources[name] = SourceSpec(
+                    plugin=sources[name].plugin,
+                    on_success=sources[name].on_success,
+                    options=stamped_options,
+                    on_validation_failure=sources[name].on_validation_failure,
+                )
+            return CompositionState(
+                source=None,
+                sources=sources,
+                nodes=state.nodes,
+                edges=state.edges,
+                outputs=state.outputs,
+                metadata=state.metadata,
+                version=state.version,
+            )
+
+        def _unsatisfied(state: CompositionState) -> list[tuple[str, str, tuple[str, ...]]]:
+            return [(c.from_id, c.to_id, c.missing_fields) for c in state.validate().edge_contracts if not c.satisfied]
+
+        assert _unsatisfied(state) == [("q", "rate", ("colour",))]
+        assert _unsatisfied(_stamped(state, ("src_a",))) == [("q", "rate", ("colour",))]
+        assert _unsatisfied(_stamped(state, ("src_a", "src_b"))) == []
+
+    def test_source_not_feeding_the_edge_is_never_asked(self) -> None:
+        # Necessity: src_c is card-eligible but feeds its own edge; the fan-in
+        # miss clears without its promise, so nothing lands on its card.
+        side_consumer = _llm_node(
+            node_id="side_note",
+            input_name="side",
+            on_success="noted",
+            required=[],
+            extra_options={"prompt_template": "Summarise this."},
+        )
+        state = _fan_in_state(
+            {
+                "src_a": _csv_source(_observed("id")),
+                "src_b": _csv_source(_observed("id")),
+                "src_c": _csv_source(_observed("id"), on_success="side"),
+            },
+            nodes=(side_consumer,),
+        )
+        assert backtraced_source_demand(state, "src_a") == ("colour",)
+        assert backtraced_source_demand(state, "src_c") == ()
+
+    def test_ineligible_source_in_the_intersection_fails_closed_for_the_sibling_too(self) -> None:
+        # src_b's declared schema.fields is the author's complete claim — it
+        # cannot be stamped, so the fan-in miss can never clear and NO card
+        # demands the field: the shape stays fail-closed at validation with
+        # the ordinary edge-contract advice instead of staging a card whose
+        # acknowledgement could not resolve the miss.
+        declared = {"path": "/tmp/upload.csv", "schema": {"mode": "fixed", "fields": ["id: str"]}}
+        state = _fan_in_state({"src_a": _csv_source(_observed("id")), "src_b": _csv_source(declared)})
+        assert [c.missing_fields for c in state.validate().edge_contracts if not c.satisfied] == [("colour",)]
+        assert backtraced_source_demand(state, "src_a") == ()
+        assert backtraced_source_demand(state, "src_b") == ()
+
+    def test_resolved_source_recomputes_its_own_demand_while_a_sibling_is_pending(self) -> None:
+        # After src_a's card resolves (stamp in place), the disregard-strip
+        # recompute must return src_a's OWN demand again — necessity holds
+        # because src_a's rows still need the promise even though src_b is
+        # unstamped — so the accepted artifact hash keeps matching and the
+        # site enumerator keeps src_a's card closed while src_b's stays open.
+        state = _fan_in_state({"src_a": _csv_source(_observed("colour", "id")), "src_b": _csv_source(_observed("id"))})
+        assert backtraced_source_demand(state, "src_a", disregard_fields=frozenset({"colour"})) == ("colour",)
+        assert backtraced_source_demand(state, "src_b") == ("colour",)
+
+    def test_composer_authored_sibling_is_never_stamped_even_when_stampable(self) -> None:
+        # src_b carries the composer-authored content marker: its guarantee
+        # is content-derived (invented_source flow), never a card promise, so
+        # the hypothesis must not stamp it — src_b gets no demand, and the
+        # AND over the fan-in cannot clear without it, so src_a fails closed
+        # exactly like the unstampable-sibling shape.
+        authored = _observed("id")
+        authored[SOURCE_AUTHORING_KEY] = {
+            "modality": "llm_generated",
+            "content_hash": "0" * 64,
+            "review_event_id": None,
+            "resolved_kind": None,
+        }
+        state = _fan_in_state({"src_a": _csv_source(_observed("id")), "src_b": _csv_source(authored)})
+        assert backtraced_source_demand(state, "src_b") == ()
+        assert backtraced_source_demand(state, "src_a") == ()
+
+    def test_bare_observed_arms_leave_no_ledger_miss_and_no_demand(self) -> None:
+        # When every arm abstains (no effective guarantees) Stage-1 skips the
+        # edge with the honest "not yet checked" warning and records NO miss,
+        # so there is no existence-precondition to attribute: the demand walk
+        # derives from the ledger and stays empty. Runtime per-row
+        # enforcement owns the shape — this pins the derivation's scope, not
+        # a gap in it.
+        state = _fan_in_state({"src_a": _csv_source({"path": "/tmp/a.csv"}), "src_b": _csv_source({"path": "/tmp/b.csv"})})
+        result = state.validate()
+        assert result.edge_contracts == ()
+        assert any("Contract check skipped" in warning.message for warning in result.warnings)
+        assert backtraced_source_demand(state, "src_a") == ()
+        assert backtraced_source_demand(state, "src_b") == ()
 
 
 class TestStampSourceOptions:

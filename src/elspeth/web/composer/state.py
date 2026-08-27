@@ -73,6 +73,14 @@ CoalesceBranches = tuple[str, ...] | Mapping[str, str]
 
 COMPOSER_NODE_TYPES: frozenset[str] = frozenset(("aggregation", "coalesce", "collector", "gate", "queue", "row_union", "transform"))
 
+# Structural marker the bind tools stamp into a composer/LLM-authored source's
+# options (content-hash-bound authoring metadata; ``tools/sources.py`` writes
+# it, ``interpretation_state._source_authoring_metadata`` parses it). Canonical
+# definition — ``elspeth.web.interpretation_state`` re-exports it beside the
+# other authoring-metadata option keys, and ``source_demand`` reads it here to
+# stay free of the requirement-vocabulary import cycle.
+SOURCE_AUTHORING_KEY: Final[str] = "source_authoring"
+
 _DECLARED_INPUT_FIELDS_OPTION = "required_input_fields"
 _MISSING_DECLARED_INPUT_FIELDS = object()
 _DISCARD_ROUTE_TARGET = "discard"

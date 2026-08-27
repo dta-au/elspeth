@@ -9,6 +9,7 @@ invented_source (materialize_state_for_execution returns the pending site).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -143,6 +144,97 @@ class TestSiteStaging:
         # card — the standing stamp remains the user's own recorded promise.
         state = _state(_resolved_contract_options(["colour"]), required=None)
         assert _contract_sites(state) == []
+
+
+def _queue_node() -> NodeSpec:
+    return NodeSpec(
+        id="q",
+        node_type="queue",
+        plugin=None,
+        input="q",
+        on_success=None,
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+def _fan_in_state(sources: dict[str, SourceSpec]) -> CompositionState:
+    node = _llm_node(required=["colour"])
+    return CompositionState(
+        source=None,
+        sources=sources,
+        nodes=(_queue_node(), replace(node, input="q")),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _fan_in_source(options: dict[str, Any]) -> SourceSpec:
+    return SourceSpec(plugin="csv", on_success="q", options=options, on_validation_failure="discard")
+
+
+class TestFanInSiteLifecycle:
+    """AND-attributed fan-in demand: one card per feeding source, no re-ask loop.
+
+    Ruling on elspeth-da68332faf: a queue fan-in requirement is an AND over N
+    independent per-source promises, so each eligible feeding source gets its
+    own card for the same field. Resolving one card must keep that source's
+    site CLOSED while a sibling's card is still pending — the disregard-strip
+    recompute returns the resolved source's own demand again (necessity holds
+    for its rows regardless of the sibling), so the accepted artifact hash
+    keeps matching and the enumerator never re-opens a settled card.
+    """
+
+    def test_each_pending_feeding_source_gets_its_own_site(self) -> None:
+        state = _fan_in_state(
+            {
+                "src_a": _fan_in_source({"path": "/tmp/a.csv", "schema": {"mode": "observed", "guaranteed_fields": ["id"]}}),
+                "src_b": _fan_in_source({"path": "/tmp/b.csv", "schema": {"mode": "observed", "guaranteed_fields": ["id"]}}),
+            }
+        )
+        sites = _contract_sites(state)
+        assert sorted(site.component_id for site in sites) == ["source:src_a", "source:src_b"]
+
+    def test_resolved_source_stays_closed_while_a_sibling_is_pending(self) -> None:
+        draft = build_source_data_contract_draft(["colour"], None)
+        resolved_options: dict[str, Any] = {
+            "path": "/tmp/a.csv",
+            "schema": {"mode": "observed", "guaranteed_fields": ["colour", "id"]},
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "id": "source-data-contract-src_a",
+                    "kind": InterpretationKind.SOURCE_DATA_CONTRACT.value,
+                    "user_term": SOURCE_DATA_CONTRACT_USER_TERM,
+                    "status": "resolved",
+                    "draft": draft,
+                    "event_id": "11111111-1111-1111-1111-111111111111",
+                    "accepted_value": draft,
+                    "accepted_artifact_hash": source_data_contract_artifact_hash(["colour"]),
+                    "resolved_prompt_template_hash": None,
+                }
+            ],
+        }
+        state = _fan_in_state(
+            {
+                "src_a": _fan_in_source(resolved_options),
+                "src_b": _fan_in_source({"path": "/tmp/b.csv", "schema": {"mode": "observed", "guaranteed_fields": ["id"]}}),
+            }
+        )
+        # The disregard-strip recompute re-derives src_a's own demand even
+        # though src_b's arm is unstamped — that identity with the accepted
+        # hash is exactly what keeps src_a's site closed.
+        assert current_source_data_contract_demand(state, "src_a") == ("colour",)
+        sites = _contract_sites(state)
+        assert [site.component_id for site in sites] == ["source:src_b"]
+        assert current_source_data_contract_demand(state, "src_b") == ("colour",)
 
 
 class TestReadinessBlocking:

@@ -41,7 +41,7 @@ from typing import Any, Final
 
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.web.composer.state import CompositionState, SourceSpec
+from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, SourceSpec
 
 # Stable user-facing label for the data-contract review row. The card's
 # user-visible title ("Data contract") lives in the frontend renderer.
@@ -173,24 +173,41 @@ def backtraced_source_demand(
 ) -> tuple[str, ...]:
     """Minimal field set the pipeline genuinely requires from ``source_name``.
 
-    Delta derivation (see module docstring): baseline = the state with
-    ``disregard_fields`` stripped from the source's guarantee; hypothesis =
-    the same state with every currently-missing field stamped into the
-    source's guarantee. A field is demanded exactly when some edge misses it
-    at baseline and stops missing it under the hypothesis — i.e. this
-    source's promise, alone, is what satisfies that requirement through the
-    transparent-node walk. Fields the pipeline does not require never enter
-    the baseline misses; fields an intermediate node guarantees are not
-    missing; fields whose path is not transparent to this source stay
-    missing under the hypothesis and drop out.
+    Delta derivation (see module docstring), generalized for fan-in (ruling
+    on elspeth-da68332faf: queue/row_union fan-in is an AND over N
+    INDEPENDENT per-source promises — every row comes from exactly one arm,
+    so a requirement must be promised by EVERY feeding source, each for its
+    own rows; the engine already intersects arms in
+    ``walk_effective_guarantee_vote``):
 
-    Returns ``()`` when there is no demand or when the source cannot carry a
-    guarantee stamp at all (explicit ``schema.fields``, non-observed mode,
-    malformed schema block) — a card that acknowledgement could not resolve
-    must never be staged.
+    * baseline = the state with ``disregard_fields`` stripped from THIS
+      source's guarantee (other sources keep their current guarantees);
+    * H_all = every card-eligible source stamped with every baseline-missing
+      field;
+    * H_not_S = the same, except this source keeps its baseline options.
+
+    A field is demanded of this source exactly when some edge misses it at
+    baseline, the miss CLEARS under H_all (sufficiency: the eligible
+    sources' promises, together, are what satisfies it through the
+    transparent walk), and does NOT clear on that edge under H_not_S
+    (necessity: this source's own promise is required — a source that does
+    not feed the edge contributes nothing and is never asked). With a single
+    eligible source this reduces exactly to the original solo-stamp delta:
+    H_all is the solo stamp and H_not_S is the baseline.
+
+    Fields the pipeline does not require never enter the baseline misses;
+    fields an intermediate node guarantees are not missing; an INELIGIBLE
+    source on an intersection path (explicit ``schema.fields``,
+    non-observed mode, composer-authored content) is never stamped, so a
+    miss behind it never clears and no card demands it — the shape stays
+    fail-closed at validation with the ordinary edge-contract advice.
+
+    Returns ``()`` when there is no demand or when this source cannot carry
+    a guarantee stamp at all — a card that acknowledgement could not
+    resolve must never be staged.
     """
     source = state.sources[source_name] if source_name in state.sources else None
-    if source is None:
+    if source is None or SOURCE_AUTHORING_KEY in source.options:
         return ()
     baseline_options = _source_options_without_guaranteed_fields(source.options, disregard_fields)
     if stamp_source_options_with_guarantees(baseline_options, ()) is None:
@@ -200,15 +217,47 @@ def backtraced_source_demand(
     if not baseline_misses:
         return ()
     all_missing = frozenset().union(*baseline_misses.values())
-    stamped_options = stamp_source_options_with_guarantees(baseline_options, sorted(all_missing))
-    if stamped_options is None:
+
+    # Card-eligible sources, judged on the BASELINE state (so this source's
+    # eligibility reflects its stripped options).
+    stamped_by_name: dict[str, Mapping[str, Any]] = {}
+    for name, candidate in baseline_state.sources.items():
+        if SOURCE_AUTHORING_KEY in candidate.options:
+            continue
+        stamped = stamp_source_options_with_guarantees(candidate.options, sorted(all_missing))
+        if stamped is None:
+            continue
+        stamped_by_name[name] = stamped
+    if source_name not in stamped_by_name:
         return ()
-    stamped_state = _state_with_source_options(state, source_name, source, stamped_options)
-    stamped_misses = _unsatisfied_edge_misses(stamped_state)
+
+    h_all_misses = _unsatisfied_edge_misses(_state_with_stamped_sources(baseline_state, stamped_by_name))
+    if len(stamped_by_name) == 1:
+        # Single eligible source: H_not_S IS the baseline — skip the third
+        # validation run and keep the original solo-delta cost.
+        h_not_s_misses = baseline_misses
+    else:
+        without_s = {name: options for name, options in stamped_by_name.items() if name != source_name}
+        h_not_s_misses = _unsatisfied_edge_misses(_state_with_stamped_sources(baseline_state, without_s))
+
     demand: set[str] = set()
     for edge, missing in baseline_misses.items():
-        demand |= missing - (stamped_misses[edge] if edge in stamped_misses else frozenset())
+        cleared_by_all = missing - (h_all_misses[edge] if edge in h_all_misses else frozenset())
+        still_missing_without_s = h_not_s_misses[edge] if edge in h_not_s_misses else frozenset()
+        demand |= cleared_by_all & still_missing_without_s
     return tuple(sorted(demand))
+
+
+def _state_with_stamped_sources(
+    state: CompositionState,
+    stamped_by_name: Mapping[str, Mapping[str, Any]],
+) -> CompositionState:
+    if not stamped_by_name:
+        return state
+    sources = dict(state.sources)
+    for name, options in stamped_by_name.items():
+        sources[name] = replace(sources[name], options=options)
+    return replace(state, sources=sources)
 
 
 def _state_with_source_options(
