@@ -129,7 +129,7 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:36ea627f752063aa"
+    source_file_hash: str | None = "sha256:e55a79ce73d7c917"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -164,6 +164,12 @@ class BatchReplicate(BaseTransform):
     # pass-through contract applies to emitted rows and batch verification uses
     # the fields shared by every buffered input (ADR-009 Clause 2).
     passes_through_input = True
+
+    # Sound because process() deep-copies each input row and only ADDS
+    # copy_index — a row already carrying copy_index raises
+    # PluginContractViolation rather than being overwritten, so no forwarded
+    # value is ever rewritten (elspeth-48aeea6ad9).
+    preserves_input_values = True
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

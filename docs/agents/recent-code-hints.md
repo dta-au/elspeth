@@ -499,9 +499,16 @@ is a working document under the normal delivery posture.
   FIELD survives and say nothing about its value — a transform can pass a
   field through and still rewrite it, which is exactly why
   `resolve_guaranteed_field_type` used to abstain at every observed
-  pass-through. Threading is deliberate and narrow: `builder.py` reads them at
-  the transform and source `add_node` sites ONLY; aggregation and collector
-  sites are deliberately NOT threaded. Two consequences bite whole-tree.
+  pass-through. Threading covers every plugin-bearing kind (updated
+  2026-08-27, elspeth-48aeea6ad9): `builder.py` reads `preserves_input_values`
+  at the TRANSFORM, AGGREGATION, and COLLECTOR `add_node` sites (and
+  `observed_value_type` at the source site) — the walk's abstention guard now
+  gates AGGREGATION/COLLECTOR pass-throughs on the same promise, WITHOUT the
+  TRANSFORM arm's `config.fields` declaration-discipline escape hatch
+  (aggregation output is dynamic by design, so a declaring config proves
+  nothing there — do not flatten the asymmetry). A hand-rolled fake reaching
+  the aggregation/collector builder loops needs the attribute exactly like the
+  row loop always did. Two consequences bite whole-tree.
   (1) `builder.py` reads both attributes DIRECTLY, so every protocol-modeling
   fake in `tests/` needs them — omitting one is an `AttributeError` at
   build, not a skip, and it took ~14 test files to model the contract; add

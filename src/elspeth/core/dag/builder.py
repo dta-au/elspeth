@@ -476,6 +476,7 @@ def build_execution_graph(
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
             removed_input_fields=transform.removed_input_fields,
+            preserves_input_values=transform.preserves_input_values,
         )
 
     graph.set_aggregation_id_map(aggregation_ids)
@@ -738,6 +739,7 @@ def build_execution_graph(
                 passes_through_input=transform.passes_through_input,
                 forwards_input_fields=transform.forwards_input_fields,
                 removed_input_fields=transform.removed_input_fields,
+                preserves_input_values=transform.preserves_input_values,
             )
     graph.set_collector_id_map(collector_ids)
     graph.set_collector_transform_map(collector_transforms)

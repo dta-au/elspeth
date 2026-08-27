@@ -224,12 +224,13 @@ class ExecutionGraph:
                 that the `schema:` block never carries.
             removed_input_fields: The names forwards_input_fields subtracts.
                 Meaningless without that flag; NodeInfo guards the pairing.
-            preserves_input_values: For TRANSFORM nodes only — True iff
-                process() never changes the VALUE of a field present on the
-                input row (adding new fields is fine). Lets
-                resolve_guaranteed_field_type recurse through an undeclaring
-                pass-through instead of abstaining (elspeth-e6e552ce34).
-                NodeInfo guards against misuse.
+            preserves_input_values: For the plugin-bearing kinds — TRANSFORM,
+                AGGREGATION, COLLECTOR — True iff process() never changes the
+                VALUE of a field present on the input row (adding new fields
+                is fine). Lets resolve_guaranteed_field_type recurse through
+                an undeclaring pass-through instead of abstaining
+                (elspeth-e6e552ce34; scope widened from TRANSFORM-only by
+                elspeth-48aeea6ad9). NodeInfo guards against misuse.
             observed_value_type: For SOURCE nodes only — the structural
                 SchemaConfig base type of every cell the source emits under an
                 OBSERVED schema (csv: "str"), or None when no such structural

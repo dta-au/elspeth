@@ -279,15 +279,16 @@ class NodeInfo:
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = field(default_factory=frozenset)
 
-    # Value-preservation declaration (elspeth-e6e552ce34). Populated only for
-    # TRANSFORM nodes by the builder from
-    # TransformProtocol.preserves_input_values. True means process() never
+    # Value-preservation declaration (elspeth-e6e552ce34). Populated for the
+    # plugin-bearing kinds — TRANSFORM, AGGREGATION, COLLECTOR — by the builder
+    # from TransformProtocol.preserves_input_values. True means process() never
     # changes the VALUE of a field present on the input row (adding NEW fields
     # is fine) — the promise that lets resolve_guaranteed_field_type recurse
-    # through an undeclaring pass-through instead of abstaining. Deliberately
-    # NOT threaded for AGGREGATION/COLLECTOR nodes: the type-resolution walk's
-    # pass-through arm is TRANSFORM-scoped, so the fact would have no reader
-    # there (same scope argument as declared_output_fields).
+    # through an undeclaring pass-through instead of abstaining. Scoped like
+    # passes_through_input rather than like declared_output_fields: the walk's
+    # abstention guard reads it at every pass-through-capable kind
+    # (elspeth-48aeea6ad9 widened it from TRANSFORM-only, where an
+    # AGGREGATION/COLLECTOR pass-through recursed unguarded).
     preserves_input_values: bool = False
 
     # Structural observed-cell type (elspeth-e6e552ce34). Populated only for
@@ -405,14 +406,15 @@ class NodeInfo:
                 component_type=component_type,
             )
         # Offensive programming: preserves_input_values mirrors the
-        # declared_output_fields guard above and is TRANSFORM-only for the
-        # same reason — its only consumer, resolve_guaranteed_field_type's
-        # pass-through recursion arm, is scoped to TRANSFORM nodes
-        # (elspeth-e6e552ce34).
-        if self.preserves_input_values and self.node_type != NodeType.TRANSFORM:
+        # passes_through_input guard above — it is a promise about plugin
+        # process() behaviour, so it is meaningful exactly on the kinds that
+        # execute a TransformProtocol plugin: TRANSFORM, AGGREGATION,
+        # COLLECTOR. resolve_guaranteed_field_type's abstention guard reads it
+        # at all three (elspeth-e6e552ce34; widened by elspeth-48aeea6ad9).
+        if self.preserves_input_values and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION, NodeType.COLLECTOR):
             raise GraphValidationError(
-                f"NodeInfo.preserves_input_values is only meaningful for TRANSFORM nodes; "
-                f"node {self.node_id!r} has type {self.node_type.name}.",
+                f"NodeInfo.preserves_input_values is only meaningful for TRANSFORM, "
+                f"AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )

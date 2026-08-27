@@ -13,8 +13,10 @@ Three coordinated pieces under test here:
 1. Two new plugin contract facts threaded onto ``NodeInfo`` by the builder:
    ``observed_value_type`` (SOURCE-only — the structural type of every cell an
    observed-mode source emits; csv declares ``"str"``) and
-   ``preserves_input_values`` (TRANSFORM-only — process() never changes the
-   VALUE of a field present on the input row; adding fields is fine).
+   ``preserves_input_values`` (TRANSFORM/AGGREGATION/COLLECTOR — the
+   plugin-bearing kinds; process() never changes the VALUE of a field present
+   on the input row; adding fields is fine — elspeth-48aeea6ad9 widened the
+   scope from TRANSFORM-only).
 2. Two new arms in ``resolve_guaranteed_field_type``: recursion through an
    undeclaring pass-through that promises value preservation, and a structural
    answer at an observed source for fields in its own guaranteed set.
@@ -25,13 +27,17 @@ Three coordinated pieces under test here:
 
 from __future__ import annotations
 
+from typing import Any, ClassVar
+
 import pytest
 
+from elspeth.contracts import PluginSchema
 from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
 from elspeth.core.dag.models import GraphValidationError
+from elspeth.core.dag.schema_validation import validate_observed_producer_declared_types
 
 _OBSERVED_GUARANTEES_ID = SchemaConfig(mode="observed", guaranteed_fields=("id",))
 _OBSERVED_BARE = SchemaConfig(mode="observed")
@@ -109,9 +115,31 @@ class TestNodeInfoContractFacts:
                 observed_value_type="str",
             )
 
-    def test_preserves_input_values_is_transform_only(self) -> None:
-        """A source/sink carrying the transform fact is a wiring bug."""
+    def test_preserves_input_values_scope_is_the_plugin_bearing_kinds(self) -> None:
+        """The fact is legal on every node kind that executes a
+        TransformProtocol plugin — TRANSFORM, AGGREGATION, COLLECTOR
+        (elspeth-48aeea6ad9) — and a wiring bug anywhere else."""
         graph = ExecutionGraph()
+        graph.add_node(
+            "t",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="passthrough",
+            preserves_input_values=True,
+        )
+        graph.add_node(
+            "agg",
+            node_type=NodeType.AGGREGATION,
+            plugin_name="batch_replicate",
+            preserves_input_values=True,
+        )
+        graph.add_node(
+            "col",
+            node_type=NodeType.COLLECTOR,
+            plugin_name="stitch",
+            preserves_input_values=True,
+        )
+        for node in ("t", "agg", "col"):
+            assert graph.get_node_info(node).preserves_input_values is True
         with pytest.raises(GraphValidationError, match="preserves_input_values"):
             graph.add_node(
                 "src",
@@ -268,6 +296,258 @@ class TestValuePreservingPassThroughResolution:
         assert resolve_guaranteed_field_type(graph, "keep", "id") is None
 
 
+def _append_plugin_bearing_node(
+    graph: ExecutionGraph,
+    node_id: str,
+    upstream: str,
+    *,
+    node_type: NodeType,
+    preserves_input_values: bool,
+    config: SchemaConfig | None = _OBSERVED_BARE,
+) -> None:
+    """An AGGREGATION/COLLECTOR pass-through node, same shape as the transform helper."""
+    graph.add_node(
+        node_id,
+        node_type=node_type,
+        plugin_name="batchish",
+        output_schema_config=config,
+        passes_through_input=True,
+        preserves_input_values=preserves_input_values,
+    )
+    graph.add_edge(upstream, node_id, label="continue")
+
+
+class TestAggregationCollectorPassThroughResolution:
+    """The abstention guard covers every plugin-bearing kind (elspeth-48aeea6ad9).
+
+    An AGGREGATION or COLLECTOR pass-through runs plugin code exactly like a
+    TRANSFORM pass-through does — recursing past one without the
+    value-preservation promise resolves an ancestor type as though the promise
+    had been made, with no declaration to rest on.
+    """
+
+    @pytest.mark.parametrize("kind", [NodeType.AGGREGATION, NodeType.COLLECTOR])
+    def test_passthrough_without_promise_abstains(self, kind: NodeType) -> None:
+        graph = _observed_source_graph()
+        _append_plugin_bearing_node(graph, "batch", "src", node_type=kind, preserves_input_values=False)
+        assert resolve_guaranteed_field_type(graph, "batch", "id") is None
+
+    @pytest.mark.parametrize("kind", [NodeType.AGGREGATION, NodeType.COLLECTOR])
+    def test_passthrough_with_promise_recurses_to_source(self, kind: NodeType) -> None:
+        graph = _observed_source_graph()
+        _append_plugin_bearing_node(graph, "batch", "src", node_type=kind, preserves_input_values=True)
+        resolved = resolve_guaranteed_field_type(graph, "batch", "id")
+        assert resolved is not None
+        assert resolved.field_type == "str"
+        assert resolved.declared_by == frozenset({"src"})
+
+    @pytest.mark.parametrize("kind", [NodeType.AGGREGATION, NodeType.COLLECTOR])
+    def test_declaring_config_is_not_an_escape_hatch(self, kind: NodeType) -> None:
+        """The TRANSFORM arm's declaration-discipline escape hatch does NOT
+        extend to aggregations/collectors: their output is dynamic by design
+        (BatchStats produces count/sum/mean, not the input fields), so a
+        declaring config is not evidence of the rewrite-declaration
+        discipline. Abstention keys purely on the missing promise."""
+        from elspeth.contracts.schema import FieldDefinition
+
+        graph = _observed_source_graph()
+        _append_plugin_bearing_node(
+            graph,
+            "batch",
+            "src",
+            node_type=kind,
+            preserves_input_values=False,
+            config=SchemaConfig(mode="flexible", fields=(FieldDefinition("other", "int"),)),
+        )
+        assert resolve_guaranteed_field_type(graph, "batch", "id") is None
+
+    def test_transform_declaring_config_escape_hatch_survives(self) -> None:
+        """Control for the asymmetry: a TRANSFORM pass-through with a
+        declaring config keeps recursing without the promise — the
+        declaration discipline (rewriters declare their targets) is what
+        makes that sound, and it must not be flattened into the new arms."""
+        from elspeth.contracts.schema import FieldDefinition
+
+        graph = _observed_source_graph()
+        _append_passthrough(
+            graph,
+            "declares_other",
+            "src",
+            preserves_input_values=False,
+            config=SchemaConfig(mode="flexible", fields=(FieldDefinition("other", "int"),)),
+        )
+        resolved = resolve_guaranteed_field_type(graph, "declares_other", "id")
+        assert resolved is not None
+        assert resolved.field_type == "str"
+
+
+class _IdIntConsumer(PluginSchema):
+    id: int
+
+
+class TestValidatePassOverAggregationCollector:
+    """validate_observed_producer_declared_types honours the widened guard."""
+
+    def _graph(self, *, kind: NodeType, preserves_input_values: bool) -> ExecutionGraph:
+        graph = _observed_source_graph()
+        _append_plugin_bearing_node(graph, "batch", "src", node_type=kind, preserves_input_values=preserves_input_values)
+        graph.add_node(
+            "consumer",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="truncate",
+            output_schema_config=_OBSERVED_BARE,
+            input_schema=_IdIntConsumer,
+        )
+        graph.add_edge("batch", "consumer", label="continue")
+        return graph
+
+    @pytest.mark.parametrize("kind", [NodeType.AGGREGATION, NodeType.COLLECTOR])
+    def test_without_promise_the_pass_stays_silent(self, kind: NodeType) -> None:
+        """Mechanism pin: no promise → the walk abstains → no EdgeContractError
+        even though the consumer's ``id: int`` would mismatch the source's
+        structural str. The per-row preflight keeps the verdict."""
+        graph = self._graph(kind=kind, preserves_input_values=False)
+        validate_observed_producer_declared_types(graph)
+
+    @pytest.mark.parametrize("kind", [NodeType.AGGREGATION, NodeType.COLLECTOR])
+    def test_with_promise_the_mismatch_fires(self, kind: NodeType) -> None:
+        from elspeth.core.dag.models import EdgeContractError
+
+        graph = self._graph(kind=kind, preserves_input_values=True)
+        with pytest.raises(EdgeContractError) as exc_info:
+            validate_observed_producer_declared_types(graph)
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.type_mismatches == (("id", "int", "str"),)
+
+
+class _ThreadingFakeSource:
+    name = "mock_source"
+    output_schema = None
+    _output_schema_config: SchemaConfig | None = None
+    observed_value_type: str | None = None
+    config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
+    _on_validation_failure = "discard"
+    on_success = "rows"
+
+
+class _ThreadingFakeSink:
+    name = "mock_sink"
+    input_schema = None
+    config: ClassVar[dict[str, Any]] = {}
+    _on_write_failure = "discard"
+    declared_required_fields: ClassVar[frozenset[str]] = frozenset()
+
+    def _reset_diversion_log(self) -> None:
+        pass
+
+
+class _ThreadingFakeBatchTransform:
+    """Batch-aware pass-through fake declaring the value-preservation promise."""
+
+    input_schema = None
+    output_schema = None
+    creates_tokens = False
+    is_batch_aware = True
+    on_success: str | None = "output"
+    on_error: str | None = None
+    declared_output_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_input_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
+    passes_through_input = True
+    forwards_input_fields = False
+    removed_input_fields: frozenset[str] = frozenset()
+
+    def __init__(self, *, name: str, preserves_input_values: bool) -> None:
+        self.name = name
+        self.preserves_input_values = preserves_input_values
+        self.config: dict[str, Any] = {"schema": {"mode": "observed"}}
+        self._output_schema_config: SchemaConfig | None = None
+
+
+class _ThreadingFakeOpenerTransform:
+    """Multi-row opener fake for the collector build (scope opener)."""
+
+    input_schema = None
+    output_schema = None
+    creates_tokens = True
+    is_batch_aware = False
+    on_success: str | None = "pages"
+    on_error: str | None = "discard"
+    declared_output_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_input_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
+    passes_through_input = False
+    preserves_input_values = False
+    forwards_input_fields = False
+    removed_input_fields: frozenset[str] = frozenset()
+
+    def __init__(self) -> None:
+        self.name = "json_explode"
+        self.config: dict[str, Any] = {"schema": {"mode": "observed"}}
+        self._output_schema_config = None
+
+
+class TestBuilderThreadsAggregationAndCollector:
+    """The builder threads preserves_input_values at BOTH plugin-bearing loops."""
+
+    @pytest.mark.parametrize("declared", [True, False])
+    def test_aggregation_loop_threads_the_promise(self, declared: bool) -> None:
+        from elspeth.core.config import AggregationSettings, SourceSettings, TriggerConfig
+
+        transform = _ThreadingFakeBatchTransform(name="batchy", preserves_input_values=declared)
+        agg_settings = AggregationSettings(
+            name="agg",
+            plugin="batchy",
+            input="rows",
+            on_success="output",
+            on_error="discard",
+            trigger=TriggerConfig(count=2),
+            output_mode="transform",
+            options={"schema": {"mode": "observed"}},
+        )
+        graph = ExecutionGraph.from_plugin_instances(
+            sources={"primary": _ThreadingFakeSource()},  # type: ignore[dict-item]
+            source_settings_map={"primary": SourceSettings(plugin="mock_source", on_success="rows", options={})},
+            transforms=[],
+            sinks={"output": _ThreadingFakeSink()},  # type: ignore[dict-item]
+            aggregations={"agg": (transform, agg_settings)},  # type: ignore[dict-item]
+            gates=[],
+        )
+        agg_nodes = [n for n in graph.get_nodes() if n.node_type is NodeType.AGGREGATION]
+        assert len(agg_nodes) == 1
+        assert agg_nodes[0].preserves_input_values is declared
+
+    @pytest.mark.parametrize("declared", [True, False])
+    def test_collector_site_threads_the_promise(self, declared: bool) -> None:
+        from elspeth.core.config import CollectorSettings, ScopeSettings, SourceSettings, TransformSettings
+        from elspeth.core.dag.wiring import WiredTransform
+
+        collector_plugin = _ThreadingFakeBatchTransform(name="stitch", preserves_input_values=declared)
+        collector_plugin.on_success = None
+        graph = ExecutionGraph.from_plugin_instances(
+            sources={"primary": _ThreadingFakeSource()},  # type: ignore[dict-item]
+            source_settings_map={"primary": SourceSettings(plugin="mock_source", on_success="rows", options={})},
+            transforms=[
+                WiredTransform(
+                    plugin=_ThreadingFakeOpenerTransform(),  # type: ignore[arg-type]
+                    settings=TransformSettings(name="explode", plugin="json_explode", input="rows", on_success="pages", on_error="discard"),
+                )
+            ],
+            sinks={"out": _ThreadingFakeSink()},  # type: ignore[dict-item]
+            collectors={
+                "page_stitcher": (
+                    collector_plugin,
+                    CollectorSettings(name="page_stitcher", plugin="stitch", input="pages", on_success="out"),
+                )
+            },  # type: ignore[dict-item]
+            scope_settings=[ScopeSettings(name="document_pages", opener="explode", closer="page_stitcher", policy="require_all")],
+        )
+        collector_nodes = [n for n in graph.get_nodes() if n.node_type is NodeType.COLLECTOR]
+        assert len(collector_nodes) == 1
+        assert collector_nodes[0].preserves_input_values is declared
+
+
 class TestPluginDeclarations:
     """The real plugins carry the facts, and the builder threads them."""
 
@@ -335,6 +615,14 @@ sinks:
         from elspeth.plugins.transforms.llm.transform import LLMTransform
 
         assert LLMTransform.preserves_input_values is True
+
+    def test_batch_replicate_declares_value_preservation(self) -> None:
+        """batch_replicate deep-copies each input row and only ADDS copy_index
+        (colliding inputs raise PluginContractViolation rather than being
+        overwritten) — the aggregation-placed declarer (elspeth-48aeea6ad9)."""
+        from elspeth.plugins.transforms.batch_replicate import BatchReplicate
+
+        assert BatchReplicate.preserves_input_values is True
 
     def test_rewriting_declarers_stay_false(self) -> None:
         """type_coerce, value_transform, and truncate rewrite forwarded
@@ -570,6 +858,93 @@ sinks:
         assert result is not None
         assert result.type_mismatches == (("id", "int", "str"),)
 
+    _AGGREGATION_PIPELINE = """sources:
+  primary:
+    plugin: csv
+    on_success: raw
+    options:
+      path: examples/fork_coalesce/input.csv
+      schema:
+        mode: observed
+        guaranteed_fields: [id, description]
+      on_validation_failure: discard
+
+aggregations:
+- name: replicate
+  plugin: batch_replicate
+  input: raw
+  on_success: replicated
+  on_error: discard
+  trigger:
+    count: 2
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+
+transforms:
+- name: tidy_columns
+  plugin: truncate
+  input: replicated
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 10
+    suffix: "..."
+    schema:
+      mode: flexible
+      fields:
+      - 'id: {consumer_id_type}'
+      - 'description: str'
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: out.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+"""
+
+    def _build_aggregation_pipeline(self, *, consumer_id_type: str) -> ExecutionGraph:
+        from elspeth.cli_helpers import instantiate_plugins_from_config
+        from elspeth.core.config import load_settings_from_yaml_string
+
+        settings = load_settings_from_yaml_string(self._AGGREGATION_PIPELINE.format(consumer_id_type=consumer_id_type))
+        plugins = instantiate_plugins_from_config(settings)
+        return ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=settings.gates,
+            coalesce_settings=settings.coalesce,
+        )
+
+    def test_aggregation_placed_preserving_plugin_is_rejected_end_to_end(self) -> None:
+        """observed csv → aggregation batch_replicate (declares the promise) →
+        consumer declaring id: int. The honest basis for the outcome the
+        unguarded recursion used to reach by luck (elspeth-48aeea6ad9): the
+        walk now recurses on batch_replicate's DECLARED promise, threaded by
+        the builder's aggregation loop. Without the declaration or the
+        threading this shape would abstain and build green — that is the
+        mutation this pin kills."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            self._build_aggregation_pipeline(consumer_id_type="int")
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.type_mismatches == (("id", "int", "str"),)
+        assert "source_primary" in str(exc_info.value)
+
+    def test_aggregation_placed_preserving_plugin_matching_type_builds(self) -> None:
+        self._build_aggregation_pipeline(consumer_id_type="str")
+
     def test_missing_field_error_keeps_precedence(self) -> None:
         """A graph tripping BOTH the phase-1 missing-fields contract and this
         pass keeps reporting the pre-existing missing-fields error."""
@@ -580,8 +955,8 @@ sinks:
             branch_plugin="passthrough",
             branch_a_options=_PASSTHROUGH_OBSERVED_OPTIONS,
         ).replace(
-            "    fields:\n      description: 10\n    suffix: \"...\"\n",
-            "    fields:\n      description: 10\n    suffix: \"...\"\n    required_input_fields:\n    - not_a_column\n",
+            '    fields:\n      description: 10\n    suffix: "..."\n',
+            '    fields:\n      description: 10\n    suffix: "..."\n    required_input_fields:\n    - not_a_column\n',
         )
         from elspeth.cli_helpers import instantiate_plugins_from_config
         from elspeth.core.config import load_settings_from_yaml_string

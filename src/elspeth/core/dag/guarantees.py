@@ -716,6 +716,23 @@ def _resolve_guaranteed_field_type_uncached(
         and not node_info.preserves_input_values
     ):
         return None
+    # AGGREGATION/COLLECTOR pass-throughs (the other two plugin-bearing kinds)
+    # run plugin code exactly like a transform pass-through does, so recursing
+    # past one is sound only under the same value-preservation promise
+    # (elspeth-48aeea6ad9 — previously they recursed UNGUARDED, benign only
+    # because batch_replicate, the sole shipped batch-aware pass-through,
+    # happens to preserve values). Deliberately NO ``config.fields`` escape
+    # hatch here, unlike the TRANSFORM arm above: aggregations have dynamic
+    # output by design (BatchStats produces count/sum/mean, not the input
+    # fields — see the builder's aggregation-loop comment), so a declaring
+    # config is not the rewrite-declaration discipline that makes the
+    # TRANSFORM hatch sound. Abstain purely on the missing promise.
+    if (
+        node_info.node_type in (NodeType.AGGREGATION, NodeType.COLLECTOR)
+        and node_info.passes_through_input
+        and not node_info.preserves_input_values
+    ):
+        return None
 
     in_edges = list(graph._graph.in_edges(node_id, data=True))
     if any(edge_data["mode"] == RoutingMode.DIVERT for _from_id, _to_id, edge_data in in_edges):
