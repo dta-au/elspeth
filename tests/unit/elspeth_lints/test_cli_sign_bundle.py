@@ -1704,6 +1704,114 @@ def test_sign_bundle_continue_on_block_all_blocked_signs_nothing(tmp_path: Path,
     assert _RECOVERY_GUIDANCE not in captured.err
 
 
+def test_sign_bundle_continue_on_block_all_blocked_publishes_nothing_under_enforce_layout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """All-blocked signs nothing even though the BLOCK itself moved candidate bytes.
+
+    Sibling of ``..._all_blocked_signs_nothing`` on the CANONICAL layout. In an
+    ``enforce_*`` directory each judged BLOCK appends its
+    ``blocked_without_override`` decision event to the candidate's
+    ``.judge-metrics`` log, so the candidate snapshot diverges from the base with
+    zero actions completed. A publish gate that reads "did the bytes move?"
+    instead of "did an action complete?" therefore publishes an audit-only
+    candidate, refreshes the counter snapshot, and reports the partial-publish
+    exit 3 for a run that signed nothing. The neutral-name sibling cannot catch
+    that: ``append_judge_decision_event`` no-ops outside ``enforce_*``, so the
+    candidate there really is byte-identical.
+
+    The blocked decision event still owes its record — it stays in the preserved
+    private transaction, exactly as it does for a BLOCK without
+    ``--continue-on-block``.
+    """
+    from elspeth_lints.core.override_rate import judge_decision_events_path
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    alpha = _live_finding(root, "alpha/mod.py")
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, (_new_judgment_action(alpha, "alpha/mod.py"),)))
+
+    with _patch_judge(_block_all):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert _tree_bytes(allowlist_dir) == before  # no audit-only publish, no counter refresh
+    assert "no action was signed" in captured.err
+    assert _RECOVERY_GUIDANCE not in captured.err
+
+    transaction = _recovery_path(captured.err)
+    events_path = judge_decision_events_path(next(path for path in transaction.rglob("enforce_tier_model") if path.is_dir()))
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [event["write_disposition"] for event in events] == ["blocked_without_override"]
+
+    # Second entry path, same gate: a resume loads the journalled BLOCK, still
+    # completes nothing, and must not publish the candidate it inherits either.
+    with _patch_judge(_block_all):
+        resumed = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--continue-on-block", "--resume", str(transaction)),
+            )
+        )
+
+    assert resumed == 1
+    assert _tree_bytes(allowlist_dir) == before
+
+
+def test_sign_bundle_continue_on_block_publishes_the_blocked_decision_event_with_survivors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A partial publish carries the blocked action's decision event into the active dir.
+
+    The asymmetry is the invariant: when NOTHING completed the block's event stays
+    private to the transaction, but when a survivor publishes, the whole coherent
+    candidate publishes — including the ``blocked_without_override`` event the
+    override-rate gate counts. A publish gate keyed on "did a judge event appear?"
+    rather than "did an action complete?" satisfies the all-blocked sibling and
+    breaks here.
+    """
+    from elspeth_lints.core.override_rate import judge_decision_events_path
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    alpha = _live_finding(root, "alpha/mod.py")
+    beta = _live_finding(root, "beta/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (_new_judgment_action(alpha, "alpha/mod.py"), _new_judgment_action(beta, "beta/mod.py")),
+        ),
+    )
+
+    def _verdict(file_path: str) -> JudgeVerdict:
+        return JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED
+
+    with _patch_judge(_verdict):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 3
+    assert (allowlist_dir / "alpha.yaml").is_file()
+    assert not (allowlist_dir / "beta.yaml").exists()
+    capsys.readouterr()
+
+    events = [
+        json.loads(line) for line in judge_decision_events_path(allowlist_dir).read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    assert {(event["entry_key"], event["write_disposition"]) for event in events} == {
+        (_canonical_key(alpha), "written"),
+        (_canonical_key(beta), "blocked_without_override"),
+    }
+
+
 def test_sign_bundle_published_with_blocks_offers_no_resume_recovery(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Exit 3 is a COMPLETED publish, so the generic recovery path must not fire.
 

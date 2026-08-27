@@ -987,16 +987,27 @@ def run_sign_bundle_transaction(
     # append idempotently. A kill in that narrow post-commit window resumes from
     # disposition="published" and finalizes the exact staged delta.
     assert_rotation_log_unchanged(tx_path, manifest)
-    if manifest["candidate_snapshot"] == manifest["base_snapshot"]:
-        if blocked and not completed:
+    if not completed:
+        # The action journal — not the candidate bytes — decides whether a
+        # publish is owed. A judged BLOCK moves the candidate too: inside the
+        # canonical ``enforce_*`` layout it appends its
+        # ``blocked_without_override`` decision event to the candidate's
+        # ``.judge-metrics`` log. Byte inequality is therefore not evidence that
+        # anything was signed, and gating on it published an audit-only
+        # candidate for a run that completed zero actions.
+        if blocked:
             # Every attempted action was a judged BLOCK: nothing was signed,
             # nothing needs publishing, and the active allowlist is untouched.
+            # The block's decision event stays in the preserved private
+            # transaction, exactly as it does without ``--continue-on-block``.
             return SignBundleRunResult(
                 1,
                 0,
                 blocked_count=len(blocked),
                 blocked_keys=tuple(bundle.actions[index].key for index in sorted(blocked)),
             )
+        raise SignBundleTransactionError("refusing coherent publish without a completed action")
+    if manifest["candidate_snapshot"] == manifest["base_snapshot"]:
         raise SignBundleTransactionError("refusing coherent publish without an authenticated candidate mutation")
     from datetime import UTC, datetime
 
