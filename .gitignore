@@ -428,3 +428,4 @@ findings.jsonl
 output/playwright/
 test-results/.last-run.json
 .claude/settings.json
+config/cicd/.sign-bundle-transactions/
