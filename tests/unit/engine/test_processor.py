@@ -32,6 +32,7 @@ from elspeth.contracts import NodeType, RouteDestination, RowResult, SourceRow, 
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.data import PluginSchema as _PermissiveSchema
 from elspeth.contracts.declaration_contracts import _attach_contract_name_from_dispatcher
+from elspeth.contracts.engine import CommittedAggregationOutputReceipt
 from elspeth.contracts.enums import (
     BatchStatus,
     FrameKind,
@@ -9086,6 +9087,99 @@ class TestNotifyCoalesceOfLostBranch:
                 )
             ).one()
         assert (status, node_id) == ("ready", "coalesce::merge")
+
+
+# =============================================================================
+# Committed-aggregation-output routing authority (elspeth-8783933d99)
+# =============================================================================
+
+
+class TestCommittedAggregationRoutingAuthority:
+    """Nominal GateSettings rejection at the committed-output recovery seam.
+
+    The bare ``cast(TransformProtocol, ...)`` this replaces let a gate at the
+    receipt's aggregation node flow onward as a transform. The rejection is
+    nominal (GateSettings), never protocol conformance — the closed
+    node_to_plugin container makes "not a gate" mean "is a transform".
+    """
+
+    @staticmethod
+    def _receipt(*, output_mode: str) -> CommittedAggregationOutputReceipt:
+        return CommittedAggregationOutputReceipt(
+            batch_id="batch-recov-1",
+            aggregation_node_id="agg-1",
+            aggregation_state_id="state-1",
+            output_mode=output_mode,
+            output_shape="single",
+            output_hash="deadbeef",
+            output_refs=(),
+            member_token_ids=(),
+            members=(),
+            expansion_parent_token_id=None,
+        )
+
+    @staticmethod
+    def _agg_settings() -> AggregationSettings:
+        return AggregationSettings(
+            name="recov-agg",
+            plugin="test-plugin",
+            input="agg_in",
+            on_error="discard",
+            trigger={"count": 3},
+        )
+
+    def test_gate_routing_authority_raises_audit_integrity(self) -> None:
+        """A GateSettings at the receipt's aggregation node is refused by name.
+
+        Mechanism pin: reverting the rejection to the bare cast lets the gate
+        flow past this seam (it survives the mode check, since a gate has no
+        say in output_mode) — this test then fails on the downstream wreckage
+        instead of the honest AuditIntegrityError.
+        """
+        _db, factory = _make_factory()
+        agg_node = NodeID("agg-1")
+        gate = GateSettings(name="not-a-transform", input="default", condition="True", routes={"true": "default", "false": "default"})
+        settings = self._agg_settings()
+        processor = _make_processor(
+            factory,
+            node_to_plugin={agg_node: gate},
+            aggregation_settings={agg_node: settings},
+        )
+
+        with pytest.raises(AuditIntegrityError, match="resolves to gate"):
+            processor._build_committed_aggregation_output_context(
+                self._receipt(output_mode=settings.output_mode.value),
+                [],
+                [],
+            )
+
+    def test_non_conforming_transform_flows_past_gate_rejection(self) -> None:
+        """Control: a transform missing a protocol member is NOT gate-rejected.
+
+        The fake reaches the NEXT integrity check (output-mode disagreement),
+        proving the rejection keys nominally on GateSettings rather than on
+        TransformProtocol conformance.
+        """
+        from tests.fixtures.nonconforming_transform import NonConformingTransform
+
+        _db, factory = _make_factory()
+        agg_node = NodeID("agg-1")
+        transform = NonConformingTransform(node_id="agg-1", is_batch_aware=True)
+        assert not isinstance(transform, TransformProtocol)  # precondition, not the pin
+        settings = self._agg_settings()
+        assert settings.output_mode.value != "passthrough"
+        processor = _make_processor(
+            factory,
+            node_to_plugin={agg_node: transform},
+            aggregation_settings={agg_node: settings},
+        )
+
+        with pytest.raises(AuditIntegrityError, match="disagrees with current graph mode"):
+            processor._build_committed_aggregation_output_context(
+                self._receipt(output_mode="passthrough"),
+                [],
+                [],
+            )
 
 
 class TestRoutingInvariantFailures:

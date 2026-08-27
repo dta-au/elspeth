@@ -75,3 +75,25 @@ class TestBuildAggTransformLookup:
         config = _make_config(transforms=[transform], aggregation_settings={})
 
         assert build_agg_transform_lookup(config) == {}
+
+
+class TestInitializeRunContextDerivesLookup:
+    def test_call_site_derives_from_helper_without_isinstance(self) -> None:
+        """initialize_run_context must DERIVE its lookup via build_agg_transform_lookup.
+
+        Re-inlining a filtered loop at the call site would evade every
+        behavior pin on the helper above; this pins the derivation. The
+        isinstance assertion keeps a structural re-classification from being
+        reintroduced anywhere in the method (elspeth-8783933d99).
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from elspeth.engine.orchestrator.run_context_factory import RunContextFactory
+
+        source = textwrap.dedent(inspect.getsource(RunContextFactory.initialize_run_context))
+        tree = ast.parse(source)
+        called_names = {node.func.id for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        assert "build_agg_transform_lookup" in called_names, "the lookup must be derived from the helper, never re-inlined"
+        assert "isinstance" not in called_names, "no structural classification at the call site"
