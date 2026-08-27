@@ -23,7 +23,8 @@ only to be rejected pre-token at /execute.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
@@ -250,13 +251,26 @@ def _identity_state_for_compiled_ids(authored_state: CompositionState) -> Compos
     return strict_state
 
 
+@dataclass(frozen=True, slots=True)
+class _CompiledIdentityDocument:
+    """Audit-safe authored pipeline document that feeds compiled node identity.
+
+    Owned nominal wrapper (ADR-032: type what ELSPETH owns): the loaded YAML
+    mapping exists solely to be handed to ``_audit_safe_plugin_configs`` as its
+    ``audit_safe_settings``; naming that contract here keeps the identity
+    document from travelling as an anonymous ``dict[str, Any]``.
+    """
+
+    config: Mapping[str, Any]
+
+
 def _compiled_identity_settings(
     authored_state: CompositionState,
     *,
     yaml_generator: YamlGenerator,
     data_dir: Path,
     session_id: str | None,
-) -> dict[str, Any]:
+) -> _CompiledIdentityDocument:
     """Mirror the execution service's audit-safe settings for node identity.
 
     ``build_validated_runtime_graph`` mints compiled node ids for profiled
@@ -281,7 +295,7 @@ def _compiled_identity_settings(
     loaded = load_bounded_pipeline_yaml(identity_yaml)
     if type(loaded) is not dict:
         raise TypeError(f"generate_yaml() produced non-dict YAML (got {type(loaded).__name__}) — this is a bug in the YAML generator")
-    return cast(dict[str, Any], loaded)
+    return _CompiledIdentityDocument(config=cast(dict[str, Any], loaded))
 
 
 @observation_boundary(
@@ -561,7 +575,7 @@ def _validate_pipeline_impl(
         def _build_graph_under_authored_identity(settings: ElspethSettings, bundle: PluginBundle) -> ExecutionGraph:
             with _audit_safe_plugin_configs(
                 bundle,
-                audit_safe_settings=identity_settings,
+                audit_safe_settings=identity_settings.config,
                 plugin_snapshot=plugin_snapshot,
             ):
                 return dependencies.build_graph(settings, bundle)
