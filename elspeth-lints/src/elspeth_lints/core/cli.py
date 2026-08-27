@@ -4368,6 +4368,14 @@ def _execute_sign_bundle(
         )
         if result.blocked_count:
             _emit_sign_bundle_blocked_worklist(result)
+            if not args.continue_on_block:
+                # The recorded verdict is terminal for this transaction — a
+                # resume re-judges nothing. Name the only other move so the
+                # operator does not reach for one that would shop the verdict.
+                sys.stderr.write(
+                    "sign-bundle: judged BLOCK(s) are journalled and will NOT be re-judged on resume; "
+                    "resume with --continue-on-block to skip them and publish the survivors.\n"
+                )
         return result.exit_code
     _maybe_regen_fingerprint_baseline(args)
     _refresh_override_rate_counter_snapshot_after_allowlist_write(args.allowlist_dir / "_defaults.yaml")

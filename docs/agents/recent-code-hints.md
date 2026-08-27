@@ -8,6 +8,27 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-28 — in `sign-bundle`, a judged BLOCK is DURABLE STATE, not a
+  return value: never use one as a generic "stop the run" mechanism**
+  (elspeth-88d8b186f3). `run_sign_bundle_transaction` journals the BLOCK into
+  the manifest's `blocked_actions` the moment the executor returns exit 1 from a
+  judge-gated kind — in every mode, before it decides whether to keep firing —
+  and recovery converts an interrupted verdict back from the authenticated
+  `blocked_without_override` decision event. The action is then never judged
+  again in that transaction; without the `--continue-on-block` opt-in, the
+  journalled BLOCK is terminal and a resume stops on it. Traps:
+  - A test that needs the first run to stop mid-way must fail an action with
+    **exit 2** (patch `cli._execute_new_judgment_action`), NOT with a BLOCK
+    verdict — a BLOCK now sticks, so the resume will not re-judge it and the
+    old "block it, then resume with an accept-all judge" shape asserts a
+    verdict-shopping outcome the engine deliberately refuses.
+  - Exit 1 means judged BLOCK only for `_JUDGE_GATED_KINDS` (`justify`,
+    `drift_repair`); the deterministic executors return 0 or 2 only. Keep any
+    new exit-code branch on that set rather than on the bare code.
+  - The `blocked_without_override` decision event only exists inside the
+    shipped `enforce_*` allowlist layout, so a neutral-named fixture dir cannot
+    exercise the interrupted-verdict recovery at all.
+
 - **2026-08-27 — the field-collision gates are CAPABILITY-KEYED: they arm only
   when `can_overwrite_input_fields(passes_through_input=, forwards_input_fields=)`
   (contracts/field_collision.py) is True — and `declared_output_fields` is now

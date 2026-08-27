@@ -657,6 +657,11 @@ _ACTION_PRIORITY = {
     "justify": 3,
 }
 
+# The kinds that call the real judge. Only these can produce a judged BLOCK
+# (exit 1) and a ``blocked_without_override`` decision event; the deterministic
+# kinds report success or an infrastructure failure (exit 2) and nothing else.
+_JUDGE_GATED_KINDS = frozenset({"justify", "drift_repair"})
+
 
 def run_sign_bundle_transaction(
     *,
@@ -672,15 +677,23 @@ def run_sign_bundle_transaction(
 ) -> SignBundleRunResult:
     """Reconcile/fire journaled actions and publish one verified candidate.
 
-    ``continue_on_block`` applies ONLY to exit-1 action failures — the judged
-    BLOCKED verdict, whose executor has already restored the candidate to its
-    pre-action bytes (asserted by the scoped-changes check). Such actions are
-    journalled as ``blocked_actions`` and skipped for the rest of this
-    transaction (including resume — re-judging a recorded BLOCK would be
-    verdict shopping); everything that succeeded still publishes coherently.
-    Exit-2 failures (verification/infrastructure) always stop the transaction.
-    The flag is deliberately NOT part of the signing policy: it changes which
-    actions are attempted, never what any minted signature attests.
+    A judged BLOCK — exit 1 from a judge-gated action, whose executor has
+    already restored the candidate to its pre-action bytes (asserted by the
+    scoped-changes check) — is journalled as ``blocked_actions`` the moment it
+    is authoritative, in EVERY mode, and is never judged again in this
+    transaction: a second opinion obtained by stopping, killing, or resuming is
+    verdict shopping, and the entry stays fail-closed (stale or absent). A
+    verdict interrupted between the judge's durable decision event and that
+    journal write is recovered from the event and journalled below, before the
+    action loop can retry it. Exit-2 failures (verification/infrastructure)
+    always stop the transaction.
+
+    ``continue_on_block`` governs only what happens NEXT: with the flag, blocked
+    actions are skipped and everything that succeeded still publishes coherently;
+    without it, a recorded BLOCK is terminal — including on a resume, which stops
+    on the journalled verdict rather than inheriting a partial publish. The flag
+    is deliberately NOT part of the signing policy: it changes which actions are
+    attempted, never what any minted signature attests.
     """
     repair_keys_by_stale_key = {
         item.key: item.repair_key or item.key for item in verification.diagnosis.items if item.key in specs_by_stale_key
@@ -795,7 +808,7 @@ def run_sign_bundle_transaction(
             )
             completed.add(running_index)
         else:
-            _assert_judge_event_transition(
+            interrupted_event = _assert_judge_event_transition(
                 running_action,
                 tx_path=tx_path,
                 candidate_dir=Path(manifest["candidate_dir"]),
@@ -811,6 +824,18 @@ def run_sign_bundle_transaction(
                 success=False,
             )
             restore_action_checkpoint(tx_path, manifest)
+            if interrupted_event is not None and interrupted_event.get("write_disposition") == "blocked_without_override":
+                # The judge ruled BLOCK and the ruling reached durable evidence
+                # before the interruption. Convert that authenticated failed
+                # event into journalled blocked state HERE, before the action
+                # loop below can reach it: re-running the judge on a verdict the
+                # transaction already holds is verdict shopping across the crash
+                # boundary, and a second-opinion ACCEPT would then be signed.
+                # Outside the ``enforce_*`` aggregation layout no decision event
+                # is written at all, so an interrupted judge action leaves no
+                # durable verdict and re-judging is the only honest recovery.
+                blocked.add(running_index)
+                manifest["blocked_actions"] = sorted(blocked)
         manifest["running_action"] = None
         manifest["completed_actions"] = sorted(completed)
         commit_action_state(tx_path, manifest)
@@ -830,6 +855,24 @@ def run_sign_bundle_transaction(
         verification=verification,
         tx_path=tx_path,
     )
+
+    if blocked and not continue_on_block:
+        # ``blocked_actions`` records the past; ``--continue-on-block`` governs
+        # the future. A journalled BLOCK is never re-judged, so a resume that
+        # did not opt into publishing survivors stops on it exactly as the run
+        # that recorded it did — rather than silently inheriting a partial
+        # (exit 3) publish the operator never asked for. Resuming WITH the flag
+        # keeps the completed actions and fires the rest.
+        first_blocked = min(blocked)
+        return SignBundleRunResult(
+            1,
+            len(completed),
+            failed_index=first_blocked,
+            failed_kind=bundle.actions[first_blocked].kind,
+            failed_key=bundle.actions[first_blocked].key,
+            blocked_count=len(blocked),
+            blocked_keys=tuple(bundle.actions[i].key for i in sorted(blocked)),
+        )
 
     ordered_actions = sorted(
         enumerate(bundle.actions),
@@ -876,17 +919,20 @@ def run_sign_bundle_transaction(
             verify_semantics=code == 0,
         )
         if code != 0:
-            if code == 1 and continue_on_block:
-                # Judged BLOCK: the executor restored the candidate (asserted
-                # above with verify_semantics=False). Journal it and move on;
-                # the entry stays fail-closed and is reported for remediation.
+            # Judged BLOCK: the executor restored the candidate (asserted above
+            # with verify_semantics=False). Journal the verdict the moment it is
+            # authoritative — BEFORE deciding whether to keep firing — so that a
+            # stop or a kill can never leave it as un-attempted work a resume
+            # would re-judge. The entry stays fail-closed and is reported for
+            # remediation either way.
+            judged_block = code == 1 and action.kind in _JUDGE_GATED_KINDS
+            if judged_block:
                 blocked.add(index)
                 manifest["blocked_actions"] = sorted(blocked)
-                manifest["running_action"] = None
-                commit_action_state(tx_path, manifest)
-                continue
             manifest["running_action"] = None
             commit_action_state(tx_path, manifest)
+            if judged_block and continue_on_block:
+                continue
             return SignBundleRunResult(
                 code,
                 len(completed),
@@ -1088,7 +1134,13 @@ def _assert_judge_event_transition(
     source_file: str | None,
     expected_key: str,
     success: bool | None,
-) -> None:
+) -> dict[str, Any] | None:
+    """Validate the decision-event delta and return it (``None`` when there is none).
+
+    The returned record is the transaction's only authenticated evidence of what
+    the judge actually ruled for this action, so recovery reads the verdict from
+    here rather than parsing the same bytes a second way.
+    """
     checkpoint = tx_path / "checkpoint"
     metadata = strict_json_loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
     saved = checkpoint / "judge-decision-events.jsonl"
@@ -1097,17 +1149,17 @@ def _assert_judge_event_transition(
     before = saved.read_bytes() if metadata.get("judge_events_existed") is True else b""
     event_path = candidate_dir / ".judge-metrics" / "judge-decision-events.jsonl"
     after = event_path.read_bytes() if event_path.is_file() else b""
-    if action.kind not in {"justify", "drift_repair"}:
+    if action.kind not in _JUDGE_GATED_KINDS:
         if after != before:
             raise SignBundleTransactionError(f"{action.kind} {action.key!r} changed the judge decision-event log")
-        return
+        return None
     if not after.startswith(before):
         raise SignBundleTransactionError(f"{action.kind} {action.key!r} rewrote prior judge decision events")
     delta = after[len(before) :]
     if not delta:
         if success is True and candidate_dir.name.startswith("enforce_"):
             raise SignBundleTransactionError(f"{action.kind} {action.key!r} did not append its required decision event")
-        return
+        return None
     if before and not before.endswith(b"\n"):
         raise SignBundleTransactionError("judge decision-event before-image lacks a JSONL boundary")
     if not delta.endswith(b"\n"):
@@ -1173,6 +1225,7 @@ def _assert_judge_event_transition(
         )
         if record != expected_record:
             raise SignBundleTransactionError(f"{action.kind} {action.key!r} decision event contradicts its authoritative signed entry")
+    return record
 
 
 def _assert_rotation_staged_transition(
