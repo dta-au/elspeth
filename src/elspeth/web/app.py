@@ -44,6 +44,7 @@ from elspeth.contracts.secrets import (
     FingerprintKeyMissingError,
     SecretDecryptionError,
 )
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.logging import configure_logging
@@ -107,6 +108,7 @@ from elspeth.web.preferences.service import CorruptPreferencesError, Preferences
 from elspeth.web.readiness import (
     ReadinessCache,
     ReadinessProbeRunner,
+    ReadinessReport,
     overall_timeout_report,
     readiness_report,
 )
@@ -842,13 +844,16 @@ class _BrowserDocumentHeadersMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: StarletteRequest, call_next):  # type: ignore[no-untyped-def]
         response = await call_next(request)
-        content_type = response.headers.get("content-type", "")
+        content_type = response.headers["content-type"] if "content-type" in response.headers else ""
         if not content_type.lower().startswith("text/html"):
             return response
 
         connect_origin: str | None = None
-        token_endpoint = request.app.state.oidc_token_endpoint
-        if isinstance(token_endpoint, str):
+        # ``app.state.oidc_token_endpoint`` is assigned unconditionally in
+        # ``create_app`` (settings value, ``str | None``) and only ever
+        # overwritten with a validated endpoint in ``_service_lifespan``.
+        token_endpoint: str | None = request.app.state.oidc_token_endpoint
+        if token_endpoint is not None:
             token_origin = oidc_browser_endpoint_origin(token_endpoint)
             request_port = request.url.port
             default_port = 443 if request.url.scheme == "https" else 80
@@ -865,6 +870,27 @@ class _BrowserDocumentHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
         return response
+
+
+@trust_boundary(
+    tier=3,
+    source="HTTPException.detail raised by route handlers (Starlette narrows it to str; FastAPI's subclass widens it to Any)",
+    source_param="detail",
+    suppresses=("R5",),
+    invariant="returns the dict envelope unchanged, or None for any non-dict detail; never raises on detail shape",
+    non_raising=True,
+)
+def _structured_error_envelope(detail: object) -> dict[str, object] | None:
+    """Discriminate a structured HTTP error envelope from a plain-string detail.
+
+    Every structured envelope in this app is a dict raised through FastAPI's
+    ``HTTPException`` subclass; a bare ``detail="..."`` string is a plain-
+    language message, not an envelope, and must fall through to FastAPI's
+    default renderer unchanged.
+    """
+    if isinstance(detail, dict):
+        return detail
+    return None
 
 
 def _frontend_build_identity(dist_dir: Path) -> str | None:
@@ -1422,8 +1448,10 @@ def _create_app(
     # different deployment tools advertise workers in different ways.
     multi_worker_reason: str | None = None
 
-    # 1. WEB_CONCURRENCY env var (Heroku, Railway, render.com)
-    web_concurrency_str = os.environ.get("WEB_CONCURRENCY", "1")
+    # 1. WEB_CONCURRENCY env var (Heroku, Railway, render.com).
+    # Absence is the documented single-worker default; a present value is
+    # validated immediately below and malformed input crashes startup.
+    web_concurrency_str = os.environ["WEB_CONCURRENCY"] if "WEB_CONCURRENCY" in os.environ else "1"
     if _parse_worker_count(web_concurrency_str, signal_name="WEB_CONCURRENCY") > 1:
         multi_worker_reason = f"WEB_CONCURRENCY={web_concurrency_str}"
 
@@ -1723,12 +1751,8 @@ def _create_app(
     # contract of every string raise site in the app.
     @app.exception_handler(StarletteHTTPException)
     async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
-        # Starlette narrows ``detail`` to ``str``; FastAPI's subclass widens it
-        # to ``Any`` and every structured envelope in this app is a dict raised
-        # through that subclass. Read it as ``object`` so the discrimination
-        # below is a real runtime check rather than statically dead code.
-        detail: object = exc.detail
-        if not isinstance(detail, dict):
+        envelope = _structured_error_envelope(exc.detail)
+        if envelope is None:
             return await fastapi_http_exception_handler(request, exc)
         request_id = _request_id(request)
         # One bounded lookup event for every structured HTTP error envelope.
@@ -1741,7 +1765,7 @@ def _create_app(
         )
         correlated = HTTPException(
             status_code=exc.status_code,
-            detail={**detail, "request_id": request_id},
+            detail={**envelope, "request_id": request_id},
             headers=exc.headers,
         )
         return await fastapi_http_exception_handler(request, correlated)
@@ -1749,6 +1773,12 @@ def _create_app(
     @app.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    def _readiness_response(report: ReadinessReport) -> JSONResponse:
+        return JSONResponse(
+            status_code=200 if report.ready else 503,
+            content={"ready": report.ready, "checks": [asdict(check) for check in report.checks]},
+        )
 
     @app.get("/api/ready")
     async def ready(request: Request) -> JSONResponse:
@@ -1762,13 +1792,12 @@ def _create_app(
 
         try:
             async with asyncio.timeout(_READINESS_ROUTE_COMPUTE_TIMEOUT_SECONDS):
-                report = await request.app.state.readiness_cache.get(compute)
+                report = await request.app.state.readiness_cache.get_or_compute(compute)
         except TimeoutError:
-            report = overall_timeout_report()
-        return JSONResponse(
-            status_code=200 if report.ready else 503,
-            content={"ready": report.ready, "checks": [asdict(check) for check in report.checks]},
-        )
+            # Explicit error outcome: the timeout is reified as a failed
+            # (503) readiness report rather than swallowed.
+            return _readiness_response(overall_timeout_report())
+        return _readiness_response(report)
 
     # Deploy-cache coherence beacon: resolved once at startup from the same
     # dist the SPA mount below serves; None disarms the client feature.
@@ -1829,7 +1858,7 @@ def _create_app(
                 headers=_METRICS_NO_STORE_HEADERS,
             )
 
-        authorization = request.headers.get("Authorization", "")
+        authorization = request.headers["Authorization"] if "Authorization" in request.headers else ""
         scheme, separator, candidate = authorization.partition(" ")
         expected = configured_token.get_secret_value()
         if separator != " " or scheme.casefold() != "bearer" or not candidate.isascii() or not hmac.compare_digest(candidate, expected):

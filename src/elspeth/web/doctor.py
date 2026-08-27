@@ -20,6 +20,7 @@ from sqlalchemy import Connection, Engine, create_engine, text
 from sqlalchemy.engine import make_url
 
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.web import aws_rds_trust
 from elspeth.web.config import WebSettings
@@ -97,9 +98,7 @@ def probe_directory_writable(label: str, path: Path | None) -> ContractCheck:
                 cleanup_error = exc
         if probe_name is not None and not unlinked:
             try:
-                os.unlink(probe_name)
-            except FileNotFoundError:
-                pass
+                Path(probe_name).unlink(missing_ok=True)
             except Exception as exc:
                 cleanup_error = cleanup_error or exc
 
@@ -194,7 +193,9 @@ def _aws_operator_telemetry_check(settings: WebSettings | None) -> ContractCheck
         ok = (
             settings.deployment_target == "aws-ecs"
             and settings.operator_telemetry == "aws-otlp"
-            and all(isinstance(value, str) and 0 < len(value) <= 128 for value in identity_values)
+            # ``WebSettings`` types every identity field ``str | None``; the
+            # doctor re-checks the length policy so this report stands alone.
+            and all(value is not None and 0 < len(value) <= 128 for value in identity_values)
             and effective.enabled is True
             and effective.granularity in ("lifecycle", "rows")
             and effective.granularity == settings.operator_pipeline_telemetry_granularity
@@ -343,6 +344,14 @@ def _build_engine(label: str, raw_url: str) -> Engine:
     raise ValueError("unknown doctor schema label")
 
 
+@trust_boundary(
+    tier=3,
+    source="live PostgreSQL server's pg_stat_ssl row for the doctor's own backend connection",
+    source_param="connection",
+    suppresses=("R5",),
+    invariant="returns a failed ContractCheck when TLS evidence is absent, malformed, or below policy; never raises on row content",
+    non_raising=True,
+)
 def postgres_tls_check(label: str, connection: Connection) -> ContractCheck:
     """Prove the live PostgreSQL backend connection is authenticated over TLS."""
     name = "session_tls" if label == "session_schema" else "landscape_tls"
@@ -360,24 +369,21 @@ def postgres_tls_check(label: str, connection: Connection) -> ContractCheck:
     )
 
 
-def _inspect_database(
+def _inspect_via_engine(
     label: str,
-    raw_url: str,
+    engine: Engine,
     probe_fn: Callable[[Engine | Connection], SchemaState],
     *,
     require_authenticated_tls: bool,
 ) -> tuple[SchemaState | None, ContractCheck, ContractCheck | None]:
-    """Inspect connectivity, TLS transport, and schema state through one one-shot engine."""
-    engine: Engine | None = None
+    """Connect and probe one schema; every outcome is an explicit return."""
     tls_result: ContractCheck | None = None
-    result: tuple[SchemaState | None, ContractCheck, ContractCheck | None]
     try:
-        engine = _build_engine(label, raw_url)
         with engine.connect() as connection:
             if require_authenticated_tls:
                 tls_result = postgres_tls_check(label, connection)
                 if not tls_result.ok:
-                    result = (
+                    return (
                         None,
                         ContractCheck(
                             label,
@@ -386,15 +392,13 @@ def _inspect_database(
                         ),
                         tls_result,
                     )
-                else:
-                    state = probe_fn(connection)
-                    result = (state, schema_check(label, state), tls_result)
-            else:
-                connection.execute(text("SELECT 1"))
                 state = probe_fn(connection)
-                result = (state, schema_check(label, state), None)
+                return (state, schema_check(label, state), tls_result)
+            connection.execute(text("SELECT 1"))
+            state = probe_fn(connection)
+            return (state, schema_check(label, state), None)
     except (SessionSchemaError, SchemaCompatibilityError):
-        result = (SchemaState.STALE, schema_check(label, SchemaState.STALE), tls_result)
+        return (SchemaState.STALE, schema_check(label, SchemaState.STALE), tls_result)
     except Exception as exc:
         if require_authenticated_tls and tls_result is None:
             # The exception precedes TLS capture (a connection-establishment
@@ -405,26 +409,105 @@ def _inspect_database(
                 False,
                 "authenticated PostgreSQL TLS is not active",
             )
-        result = (
+        return (
             None,
             ContractCheck(label, False, sanitize_error(f"{_human_schema_label(label)} inspection failed", exc)),
             tls_result,
         )
+
+
+def _inspect_database(
+    label: str,
+    raw_url: str,
+    probe_fn: Callable[[Engine | Connection], SchemaState],
+    *,
+    require_authenticated_tls: bool,
+) -> tuple[SchemaState | None, ContractCheck, ContractCheck | None]:
+    """Inspect connectivity, TLS transport, and schema state through one one-shot engine."""
+    try:
+        engine = _build_engine(label, raw_url)
+    except Exception as exc:
+        # No engine was ever constructed, so no connection or TLS evidence
+        # exists; report static failed checks.
+        tls_result = (
+            ContractCheck(
+                "session_tls" if label == "session_schema" else "landscape_tls",
+                False,
+                "authenticated PostgreSQL TLS is not active",
+            )
+            if require_authenticated_tls
+            else None
+        )
+        return (
+            None,
+            ContractCheck(label, False, sanitize_error(f"{_human_schema_label(label)} inspection failed", exc)),
+            tls_result,
+        )
+    result: tuple[SchemaState | None, ContractCheck, ContractCheck | None] | None = None
+    try:
+        result = _inspect_via_engine(label, engine, probe_fn, require_authenticated_tls=require_authenticated_tls)
     finally:
-        if engine is not None:
-            try:
-                engine.dispose()
-            except Exception as exc:
-                result = (
-                    None,
-                    ContractCheck(
-                        label,
-                        False,
-                        sanitize_error(f"{_human_schema_label(label)} engine disposal failed", exc),
-                    ),
-                    tls_result,
-                )
+        try:
+            engine.dispose()
+        except Exception as exc:
+            # Engine disposal failure downgrades the inspection result while
+            # preserving whatever TLS evidence was already collected.
+            result = (
+                None,
+                ContractCheck(
+                    label,
+                    False,
+                    sanitize_error(f"{_human_schema_label(label)} engine disposal failed", exc),
+                ),
+                result[2] if result is not None else None,
+            )
+    assert result is not None  # a BaseException would have propagated out of the finally
     return result
+
+
+def _initialize_via_engine(
+    label: str,
+    engine: Engine,
+    probe_fn: Callable[[Engine | Connection], SchemaState],
+    init_fn: Callable[[Engine], None],
+) -> ContractCheck:
+    """Initialize one schema and verify it; every outcome is an explicit return."""
+    try:
+        init_fn(engine)
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+            final_state = probe_fn(connection)
+        if final_state is SchemaState.CURRENT:
+            return ContractCheck(
+                label,
+                True,
+                "current; initialization completed or was already completed",
+            )
+        return ContractCheck(
+            label,
+            False,
+            f"{_human_schema_label(label)} final verification did not report current",
+        )
+    except SchemaInitBusyError:
+        return ContractCheck(
+            label,
+            False,
+            "another schema initialization is in progress; wait for it to finish and rerun",
+        )
+    except SchemaLockCleanupError:
+        return ContractCheck(
+            label,
+            False,
+            "initialization may have completed but lock cleanup was not verified; investigate the database connection and rerun",
+        )
+    except (SessionSchemaError, SchemaCompatibilityError):
+        return schema_check(label, SchemaState.STALE)
+    except Exception as exc:
+        return ContractCheck(
+            label,
+            False,
+            sanitize_error(f"{_human_schema_label(label)} initialization failed", exc),
+        )
 
 
 def _initialize_database(
@@ -434,56 +517,27 @@ def _initialize_database(
     init_fn: Callable[[Engine], None],
 ) -> ContractCheck:
     """Initialize one eligible schema and independently verify it afterward."""
-    engine: Engine | None = None
-    result: ContractCheck
     try:
         engine = _build_engine(label, raw_url)
-        init_fn(engine)
-        with engine.connect() as connection:
-            connection.execute(text("SELECT 1"))
-            final_state = probe_fn(connection)
-        if final_state is SchemaState.CURRENT:
-            result = ContractCheck(
-                label,
-                True,
-                "current; initialization completed or was already completed",
-            )
-        else:
-            result = ContractCheck(
-                label,
-                False,
-                f"{_human_schema_label(label)} final verification did not report current",
-            )
-    except SchemaInitBusyError:
-        result = ContractCheck(
-            label,
-            False,
-            "another schema initialization is in progress; wait for it to finish and rerun",
-        )
-    except SchemaLockCleanupError:
-        result = ContractCheck(
-            label,
-            False,
-            "initialization may have completed but lock cleanup was not verified; investigate the database connection and rerun",
-        )
-    except (SessionSchemaError, SchemaCompatibilityError):
-        result = schema_check(label, SchemaState.STALE)
     except Exception as exc:
-        result = ContractCheck(
+        return ContractCheck(
             label,
             False,
             sanitize_error(f"{_human_schema_label(label)} initialization failed", exc),
         )
+    result: ContractCheck | None = None
+    try:
+        result = _initialize_via_engine(label, engine, probe_fn, init_fn)
     finally:
-        if engine is not None:
-            try:
-                engine.dispose()
-            except Exception as exc:
-                result = ContractCheck(
-                    label,
-                    False,
-                    sanitize_error(f"{_human_schema_label(label)} engine disposal failed", exc),
-                )
+        try:
+            engine.dispose()
+        except Exception as exc:
+            result = ContractCheck(
+                label,
+                False,
+                sanitize_error(f"{_human_schema_label(label)} engine disposal failed", exc),
+            )
+    assert result is not None  # a BaseException would have propagated out of the finally
     return result
 
 

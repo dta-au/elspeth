@@ -116,8 +116,10 @@ def resolve_deployment_state_mode(settings: WebSettings) -> ResolvedDeploymentSt
 
 
 def _has_approved_aws_ecs_tls_query(parsed: URL) -> bool:
-    sslmode = parsed.query.get("sslmode")
-    sslrootcert = parsed.query.get("sslrootcert")
+    # Operator-supplied URL query string: an absent parameter is a policy
+    # failure (not-approved), reported through the ``False`` return below.
+    sslmode = parsed.query["sslmode"] if "sslmode" in parsed.query else None
+    sslrootcert = parsed.query["sslrootcert"] if "sslrootcert" in parsed.query else None
     return (
         type(sslmode) is str
         and sslmode == "verify-full"

@@ -366,11 +366,11 @@ class TestReadinessCache:
             calls += 1
             return self._report(str(calls))
 
-        assert (await cache.get(compute)).checks[0].detail == "1"
+        assert (await cache.get_or_compute(compute)).checks[0].detail == "1"
         now = 101.999
-        assert (await cache.get(compute)).checks[0].detail == "1"
+        assert (await cache.get_or_compute(compute)).checks[0].detail == "1"
         now = 102.001
-        assert (await cache.get(compute)).checks[0].detail == "2"
+        assert (await cache.get_or_compute(compute)).checks[0].detail == "2"
         assert calls == 2
 
     @pytest.mark.asyncio
@@ -385,7 +385,7 @@ class TestReadinessCache:
             await release.wait()
             return self._report()
 
-        tasks = [asyncio.create_task(cache.get(compute)) for _ in range(50)]
+        tasks = [asyncio.create_task(cache.get_or_compute(compute)) for _ in range(50)]
         await asyncio.sleep(0)
         release.set()
         results = await asyncio.gather(*tasks)
@@ -404,13 +404,13 @@ class TestReadinessCache:
             await release.wait()
             return self._report()
 
-        leader = asyncio.create_task(cache.get(compute))
+        leader = asyncio.create_task(cache.get_or_compute(compute))
         await asyncio.sleep(0)
         leader.cancel()
         with pytest.raises(asyncio.CancelledError):
             await leader
 
-        follower = asyncio.create_task(cache.get(compute))
+        follower = asyncio.create_task(cache.get_or_compute(compute))
         await asyncio.sleep(0)
         assert calls == 1
         release.set()
@@ -430,14 +430,14 @@ class TestReadinessCache:
             await release.wait()
             return self._report()
 
-        leader = asyncio.create_task(cache.get(compute))
+        leader = asyncio.create_task(cache.get_or_compute(compute))
         await started.wait()
         leader.cancel()
         await asyncio.gather(leader, return_exceptions=True)
         release.set()
         await asyncio.sleep(0.01)
 
-        assert await cache.get(compute) == self._report()
+        assert await cache.get_or_compute(compute) == self._report()
         assert calls == 1
 
     @pytest.mark.asyncio
@@ -449,19 +449,19 @@ class TestReadinessCache:
         async def good() -> ReadinessReport:
             return self._report("prior")
 
-        assert await cache.get(good) == self._report("prior")
+        assert await cache.get_or_compute(good) == self._report("prior")
         now = 4.0
 
         async def fail() -> ReadinessReport:
             raise RuntimeError("credential=secret")
 
         with pytest.raises(RuntimeError):
-            await cache.get(fail)
+            await cache.get_or_compute(fail)
 
         async def recovered() -> ReadinessReport:
             return self._report("recovered")
 
-        assert await cache.get(recovered) == self._report("recovered")
+        assert await cache.get_or_compute(recovered) == self._report("recovered")
 
     @pytest.mark.asyncio
     async def test_follower_does_not_wait_for_two_sequential_computations(self) -> None:
@@ -475,8 +475,8 @@ class TestReadinessCache:
             await release.wait()
             raise RuntimeError("failed")
 
-        leader = asyncio.create_task(cache.get(fail))
-        follower = asyncio.create_task(cache.get(fail))
+        leader = asyncio.create_task(cache.get_or_compute(fail))
+        follower = asyncio.create_task(cache.get_or_compute(fail))
         await asyncio.sleep(0)
         release.set()
         results = await asyncio.gather(leader, follower, return_exceptions=True)

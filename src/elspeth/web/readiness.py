@@ -508,7 +508,7 @@ class ReadinessCache:
             self._task_completed_at = None
         return report
 
-    async def get(self, compute: Callable[[], Awaitable[ReadinessReport]]) -> ReadinessReport:
+    async def get_or_compute(self, compute: Callable[[], Awaitable[ReadinessReport]]) -> ReadinessReport:
         async with self._lock:
             if self._task is not None and self._task.done():
                 self._harvest_locked(self._task)
