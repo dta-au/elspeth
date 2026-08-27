@@ -83,6 +83,7 @@ class InterpretationKind(StrEnum):
     LLM_PROMPT_TEMPLATE = "llm_prompt_template"
     PIPELINE_DECISION = "pipeline_decision"
     LLM_MODEL_CHOICE = "llm_model_choice"
+    SOURCE_DATA_CONTRACT = "source_data_contract"
 
 
 _INTERPRETATION_SURFACE_FIELDS: tuple[str, ...] = (

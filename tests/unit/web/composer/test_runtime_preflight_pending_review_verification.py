@@ -639,6 +639,118 @@ class TestPendingHandoffOutstandingFindings:
         assert any(blocker.code == INTERPRETATION_REVIEW_PENDING_CODE for blocker in strict.readiness.blockers)
         assert all(blocker.code != INTERPRETATION_REVIEW_PENDING_CODE for blocker in tolerant.readiness.blockers)
 
+    @pytest.mark.anyio
+    async def test_preview_and_completion_tolerant_passes_share_one_engine_run(self, service, monkeypatch) -> None:
+        """elspeth-229e9e8195: the preview-path tolerant entry (tool_batch wires
+        it with the compose loop's shared cache and snapshot) must satisfy the
+        completion path's ``_pending_handoff_outstanding_findings`` lookup —
+        one engine run per state, not one per surface."""
+        fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_structural_failure_result())
+        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        state = _empty_state()
+        cache = service._new_runtime_preflight_cache()
+        snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
+        # Preview path (tool_batch): strict, then — handoff-shaped — tolerant.
+        await service._cached_runtime_preflight(
+            state,
+            user_id="user-1",
+            session_id=None,
+            cache=cache,
+            initial_version=1,
+            session_scope="session:test",
+            plugin_snapshot=snapshot,
+        )
+        preview_tolerant = await service._cached_runtime_preflight(
+            state,
+            user_id="user-1",
+            session_id=None,
+            cache=cache,
+            initial_version=1,
+            session_scope="session:test",
+            plugin_snapshot=snapshot,
+            interpretation_tolerant=True,
+        )
+        assert fake.calls == [False, True]
+        # Completion path: same cache, same snapshot — no third engine run.
+        findings = await service._pending_handoff_outstanding_findings(
+            state,
+            user_id="user-1",
+            session_id=None,
+            cache=cache,
+            initial_version=1,
+            session_scope="session:test",
+            plugin_snapshot=snapshot,
+        )
+        assert fake.calls == [False, True]
+        assert findings is preview_tolerant
+
+
+class TestPlannerPreviewPreflightStructuralCallback:
+    """``_planner_preview_preflight`` wires the tolerant callback only for a
+    handoff-shaped strict verdict (elspeth-229e9e8195)."""
+
+    def _nonempty_state(self) -> CompositionState:
+        return _empty_state().with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="main",
+                options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        )
+
+    async def _callbacks(self, service: ComposerServiceImpl, fake: _RecordingValidatePipeline, monkeypatch):
+        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        return await service._planner_preview_preflight(
+            self._nonempty_state(),
+            user_id="user-1",
+            session_id="session-1",
+            plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot),
+        )
+
+    @pytest.mark.anyio
+    async def test_handoff_strict_wires_both_callbacks(self, service, monkeypatch) -> None:
+        fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_structural_failure_result())
+        callbacks = await self._callbacks(service, fake, monkeypatch)
+        assert fake.calls == [False, True]
+        assert callbacks.runtime is not None
+        assert callbacks.structural is not None
+        state = self._nonempty_state()
+        assert callbacks.runtime(state).readiness.completion_ready is True
+        assert callbacks.structural(state).errors[0].error_code == "graph_structure"
+
+    @pytest.mark.anyio
+    async def test_non_handoff_strict_leaves_structural_unwired(self, service, monkeypatch) -> None:
+        fake = _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
+        callbacks = await self._callbacks(service, fake, monkeypatch)
+        assert fake.calls == [False]
+        assert callbacks.runtime is not None
+        assert callbacks.structural is None
+
+    @pytest.mark.anyio
+    async def test_tolerant_failure_degrades_to_strict_only(self, service, monkeypatch) -> None:
+        """A tolerant-pass crash must not kill the planner request: the strict
+        callback survives and the structural one is simply absent."""
+        fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_structural_failure_result())
+        original_call = fake.__call__
+
+        def crash_on_tolerant(*args: Any, **kwargs: Any) -> ValidationResult:
+            if kwargs.get("allow_pending_interpretation_placeholders"):
+                fake.calls.append(True)
+                raise RuntimeError("synthetic tolerant preflight bug")
+            return original_call(*args, **kwargs)
+
+        monkeypatch.setattr(service_module, "validate_pipeline", crash_on_tolerant)
+        callbacks = await service._planner_preview_preflight(
+            self._nonempty_state(),
+            user_id="user-1",
+            session_id="session-1",
+            plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot),
+        )
+        assert fake.calls == [False, True]
+        assert callbacks.runtime is not None
+        assert callbacks.structural is None
+
 
 class TestOutstandingFindingsDetail:
     """The objection-or-fallback rule must gate on truthiness, not ``is not None``.

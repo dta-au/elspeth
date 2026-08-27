@@ -22,6 +22,12 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web.composer.source_demand import (
+    SOURCE_DATA_CONTRACT_USER_TERM,
+    backtraced_source_demand,
+    parse_source_data_contract_accepted_fields,
+    source_data_contract_artifact_hash,
+)
 from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
 from elspeth.web.plugin_policy.coverage import (
     OutputStreamGraph as _OutputStreamGraph,
@@ -845,6 +851,7 @@ def interpretation_sites(
     sites: list[InterpretationReviewSite] = []
     for source_name, source in state.sources.items():
         sites.extend(_pending_source_sites(source, component_id=source_component_id(source_name)))
+    sites.extend(_pending_source_data_contract_sites(state))
     web_scrape_raw_fields = _web_scrape_raw_fields(state.nodes)
     for node in state.nodes:
         node_sites = [*_pending_node_sites(node), *_legacy_placeholder_sites(node)]
@@ -1057,6 +1064,83 @@ def _pending_source_sites(source: SourceSpec, *, component_id: str) -> tuple[Int
     )
 
 
+def _source_data_contract_requirement(options: Mapping[str, Any]) -> InterpretationRequirement | None:
+    return _requirement_for_kind(_requirements(options), InterpretationKind.SOURCE_DATA_CONTRACT)
+
+
+def current_source_data_contract_demand(state: CompositionState, source_name: str) -> tuple[str, ...]:
+    """Requirement-aware demand backtrace for one source.
+
+    The single derivation shared by the pending-site enumerator, the
+    event-writer boundary, and the resolve arm (``sessions/service.py``), so
+    the card, its dedup identity, and the resolution stamp cannot diverge on
+    what the pipeline demands. Strips a previously ACKNOWLEDGED field set
+    (parsed from the resolved requirement's ``accepted_value``) before
+    recomputing, so a demand-set change after acknowledgement is measured
+    against the graph rather than against the stamp the previous answer
+    produced. Returns ``()`` for ineligible sources: an LLM-authored bound
+    blob (``source_authoring`` present — its content IS the run's data and
+    the invented_source/auto-declare flow owns it), a missing source, or a
+    source that cannot carry a guarantee stamp.
+    """
+    source = state.sources[source_name] if source_name in state.sources else None
+    if source is None or SOURCE_AUTHORING_KEY in source.options:
+        return ()
+    requirement = _source_data_contract_requirement(source.options)
+    disregard: frozenset[str] = frozenset()
+    if requirement is not None and requirement["status"] == "resolved":
+        # _coerce_requirement guarantees a resolved row's accepted_value is a
+        # str (owned TypedDict — nominal handling, no structural re-check).
+        accepted = requirement["accepted_value"]
+        acknowledged = parse_source_data_contract_accepted_fields(accepted) if accepted is not None else None
+        # An unparseable acknowledgement abstains to "strip nothing": the
+        # artifact-hash comparison at the enumerator then re-opens the card,
+        # which is the fail-closed direction.
+        if acknowledged is not None:
+            disregard = frozenset(acknowledged)
+    return backtraced_source_demand(state, source_name, disregard_fields=disregard)
+
+
+def _pending_source_data_contract_sites(state: CompositionState) -> tuple[InterpretationReviewSite, ...]:
+    """Enumerate unacknowledged (or drifted) data-contract sites per source.
+
+    Derived, not staged (elspeth-da68332faf work item 2): the site exists
+    exactly while the graph demands fields from a not-preflight-checkable
+    source that no current acknowledgement covers — whether the demand
+    existed at bind time or arose later from a node mutation. Mirrors the
+    ``_pending_source_sites`` drift posture for invented_source: a resolved
+    requirement is clean ONLY while its accepted artifact (here the
+    acknowledged FIELD SET, bound by ``source_data_contract_artifact_hash``)
+    still matches the current demand; a demand-set change falls through to a
+    pending site, re-opening the card. A demand that shrinks to EMPTY closes
+    the site without re-asking: there is nothing left to acknowledge, and
+    the standing stamp remains the user's own recorded promise.
+    """
+    sites: list[InterpretationReviewSite] = []
+    for source_name, source in state.sources.items():
+        if SOURCE_AUTHORING_KEY in source.options:
+            continue
+        requirement = _source_data_contract_requirement(source.options)
+        demand = current_source_data_contract_demand(state, source_name)
+        if not demand:
+            continue
+        if (
+            requirement is not None
+            and requirement["status"] == "resolved"
+            and requirement["accepted_artifact_hash"] == source_data_contract_artifact_hash(demand)
+        ):
+            continue
+        sites.append(
+            InterpretationReviewSite(
+                component_id=source_component_id(source_name),
+                component_type="source",
+                user_term=(requirement["user_term"].strip() if requirement is not None else SOURCE_DATA_CONTRACT_USER_TERM),
+                kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+            )
+        )
+    return tuple(sites)
+
+
 def _pending_node_sites(node: NodeSpec) -> tuple[InterpretationReviewSite, ...]:
     requirements = _requirements(node.options)
     if requirements is None:
@@ -1067,6 +1151,11 @@ def _pending_node_sites(node: NodeSpec) -> tuple[InterpretationReviewSite, ...]:
         if status == "pending":
             kind = InterpretationKind(requirement["kind"])
             if node.plugin != "llm" and kind is not InterpretationKind.PIPELINE_DECISION:
+                continue
+            if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+                # Source-only kind: its sites derive from the graph demand in
+                # _pending_source_data_contract_sites. A rogue node-staged row
+                # must not mint a transform site no resolver arm can settle.
                 continue
             sites.append(
                 InterpretationReviewSite(
@@ -2038,7 +2127,7 @@ def _node_review_artifact(
 
 
 def _resolved_review_hash(requirement: InterpretationRequirement, kind: InterpretationKind) -> str:
-    if kind in (InterpretationKind.PIPELINE_DECISION, InterpretationKind.INVENTED_SOURCE):
+    if kind in (InterpretationKind.PIPELINE_DECISION, InterpretationKind.INVENTED_SOURCE, InterpretationKind.SOURCE_DATA_CONTRACT):
         field = "accepted_artifact_hash"
         value = requirement["accepted_artifact_hash"]
     else:
@@ -2172,6 +2261,20 @@ def _reconcile_source_options(
         requirement_id, kind, _user_term = identity
         shell = _pending_authoring_shell(proposed_requirement)
         previous_requirement = previous_index[identity] if identity in previous_index else None
+        if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+            # The acknowledged artifact binds the demand FIELD SET, which is a
+            # fact about the whole graph rather than about this source's own
+            # options, so this per-source reconciliation cannot judge drift.
+            # Carry the coherent resolved row forward verbatim; the pending-site
+            # enumerator (_pending_source_data_contract_sites) recomputes the
+            # live demand on every read and re-opens the card on any mismatch.
+            if previous is None or previous_requirement is None or previous_requirement["status"] != "resolved":
+                reconciled.append(shell)
+                continue
+            _require_resolved_review_coherence(previous_requirement)
+            _resolved_review_hash(previous_requirement, kind)
+            reconciled.append(dict(previous_requirement))
+            continue
         if kind is not InterpretationKind.INVENTED_SOURCE:
             if previous_requirement is not None and previous_requirement["status"] == "resolved":
                 raise ValueError(f"review kind {kind.value!r} cannot target source {component_id!r}")

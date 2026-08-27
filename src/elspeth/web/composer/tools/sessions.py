@@ -28,6 +28,10 @@ from elspeth.web.composer.redaction import (
     SetPipelineArgumentsModel,
     redact_source_storage_path,
 )
+from elspeth.web.composer.source_demand import (
+    build_source_data_contract_draft,
+    sample_header_for_source,
+)
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
@@ -122,6 +126,7 @@ from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX,
     SOURCE_AUTHORING_KEY,
     composition_review_contract_error,
+    current_source_data_contract_demand,
     interpretation_sites,
     parse_interpretation_requirements,
     reconcile_authoritative_reviews,
@@ -2127,6 +2132,44 @@ def _assert_affected_component(
                 actual_type="invented_source event draft does not match the source review requirement draft",
             )
         return draft if draft is not None else llm_draft
+
+    if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+        source_name = source_name_from_component_id(affected_node_id)
+        if source_name is None:
+            raise ToolArgumentError(
+                argument="affected_node_id",
+                expected="'source' for source_data_contract or 'source:<name>' for a named source",
+                actual_type="node id",
+            )
+        source = state.sources.get(source_name)
+        if source is None:
+            raise ToolArgumentError(
+                argument="affected_node_id",
+                expected=f"an existing source component ({affected_node_id!r})",
+                actual_type="missing source",
+            )
+        matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term)
+        if not matched_terms:
+            raise ToolArgumentError(
+                argument="affected_node_id",
+                expected=(
+                    "a source with an outstanding data-contract demand — the pipeline must require fields "
+                    "from this source that no current acknowledgement covers"
+                ),
+                actual_type=f"missing pending {kind.value} review site",
+            )
+        # The draft is SERVER-COMPUTED from the graph's demand backtrace and
+        # the source's illustrative sample header — never planner-supplied
+        # (the planner may REQUEST the review; the field set is the server's).
+        demand = current_source_data_contract_demand(state, source_name)
+        computed_draft = build_source_data_contract_draft(demand, sample_header_for_source(source))
+        if llm_draft is not None and llm_draft != computed_draft:
+            raise ToolArgumentError(
+                argument="llm_draft",
+                expected="omitted — the server computes the data-contract card from the graph's demand backtrace",
+                actual_type="caller-supplied draft that does not match the server-computed data contract",
+            )
+        return computed_draft
 
     if kind is InterpretationKind.PIPELINE_DECISION:
         node = _find_node_or_raise(state, affected_node_id)

@@ -6333,6 +6333,34 @@ class TestComposerRuntimePreflightFinalGate:
         assert "Do not answer by repeating the runtime preflight complaint" in repair
         assert "Do not inline a literal credential" in repair
 
+    def test_preflight_repair_budget_note_names_read_only_turns_generally(self) -> None:
+        """elspeth-71617f1d21 (b): the budget note must warn against ANY
+        read-only turn, get_pipeline_state included, not only a bare
+        preview_pipeline re-run — while keeping the pinned header and
+        turn-counter wording intact."""
+        invalid_preflight = ValidationResultModel(
+            is_valid=False,
+            checks=[],
+            errors=[
+                ValidationError(
+                    component_id="mapper",
+                    component_type="transform",
+                    message="consumer requires ['colour'], producer guarantees (none)",
+                    suggestion=None,
+                    error_code=None,
+                )
+            ],
+            readiness=_not_authoring_ready("graph_structure"),
+        )
+
+        repair = _compose_preflight_repair_message(invalid_preflight, next_turn=1)
+
+        assert "Pre-finalisation runtime preflight" in repair
+        assert "forced repair turn 1 of 2" in repair
+        assert "get_pipeline_state" in repair
+        assert "preview_pipeline" in repair
+        assert "read-only" in repair
+
     @pytest.mark.asyncio
     async def test_changed_state_completion_is_replaced_when_runtime_preflight_fails(self) -> None:
         catalog = _mock_catalog()

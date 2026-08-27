@@ -2794,6 +2794,38 @@
   line-height: 1.45;
 }
 
+/* Data-contract card body (source_data_contract): the demanded columns the
+   pipeline counts on from this source, with per-field sample warnings and
+   the quarantine-consequence note. */
+.ack-card-data-contract {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+
+.ack-card-data-contract-fields {
+  margin: var(--space-2xs) 0 0;
+  padding-left: var(--space-md);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-normal);
+  color: var(--color-text);
+}
+
+.ack-card-data-contract-fields code {
+  font-weight: 600;
+}
+
+.ack-card-data-contract-warning {
+  color: var(--color-error);
+  font-size: var(--font-size-xs);
+}
+
+.ack-card-data-contract-note {
+  margin: var(--space-2xs) 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: 1.45;
+}
+
 /* Secondary disclosure for the frozen staging-time template, shown only
    when it differs from the resolved render. */
 .ack-card-original-template {

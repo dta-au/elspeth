@@ -379,6 +379,22 @@ that kind. You still: (a) author the prompt as `prompt_template_parts` with an
 surface `vague_term`, `invented_source`, `pipeline_decision`, and
 `llm_model_choice` reviews yourself. Only the prompt-template card is automatic.
 
+**`source_data_contract` — the data-contract acknowledgement for sources whose
+data cannot be checked up front** (uploaded files, path-bound, external fetch,
+continuous feeds — any bound source WITHOUT composer-authored content). When
+the pipeline requires fields from such a source (validation reports the
+edge-contract gap), the fix is the user's forward-looking promise, not your
+guess: call `request_interpretation_review(kind="source_data_contract",
+affected_node_id="source"` or `"source:<name>",
+user_term="source_data_contract")` and OMIT `llm_draft` — the server computes
+the demanded field set from the graph (never supply a field list; a supplied
+draft that disagrees is rejected). On acknowledgement the server stamps exactly
+those fields into the source's `schema.guaranteed_fields` and the runtime
+enforces them per-row (rows missing a promised column quarantine; the run
+continues). Do not call it for composer-authored bound blobs (the
+`invented_source` flow and bind-time auto-declare own those) or when
+validation reports no missing source fields.
+
 Before any mutation that creates or updates an LLM prompt you wrote, inspect the
 prompt text you are about to put in `prompt_template`. If it asks the model to
 score, rate, rank, classify, accept/reject, or choose based on a criterion and

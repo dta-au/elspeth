@@ -1,0 +1,325 @@
+"""Demand backtrace for the source data-contract ask flow (elspeth-da68332faf).
+
+Layer: L3 web application.
+
+A graph requires certain fields from a source to exist at all. For a source
+whose data cannot be preflight-checked (uploaded file, path-bound, external
+fetch, continuous feed — anything without a ``source_authoring``-bound blob)
+the guarantee cannot come from content: it is a forward-looking PROMISE the
+user makes, surfaced as the ``source_data_contract`` interpretation card and
+enforced per-row at runtime by ADR-016's ``SourceGuaranteedFieldsContract``.
+
+This module computes the card's field set — the MINIMAL set of fields the
+pipeline genuinely requires from one source — by DELTA-RUNNING the Stage-1
+validator's own edge-contract accounting (``CompositionState.validate()``,
+whose per-edge ``EdgeContract`` rows are produced by the composer twin of the
+``core/dag/guarantees.py`` propagation walk). The demand is DERIVED, never
+restated: a field is demanded exactly when it is missing on some edge today
+AND stamping it into this source's ``schema.guaranteed_fields`` makes that
+edge's miss go away through the transparent-node walk. By construction the
+set can never contain a field no downstream consumer requires, and never
+contains a field an intermediate node already guarantees or that this
+source's guarantee cannot reach.
+
+The helpers here are pure state math. The requirement-row-aware wrapper that
+strips a previously acknowledged field set before recomputing lives in
+``elspeth.web.interpretation_state`` (which owns the requirement-row
+vocabulary); keeping this module free of requirement parsing avoids an
+import cycle.
+"""
+
+from __future__ import annotations
+
+import codecs
+import csv
+import io
+import json
+from collections.abc import Iterable, Mapping
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Final
+
+from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.web.composer.state import CompositionState, SourceSpec
+
+# Stable user-facing label for the data-contract review row. The card's
+# user-visible title ("Data contract") lives in the frontend renderer.
+SOURCE_DATA_CONTRACT_USER_TERM: Final[str] = "source_data_contract"
+
+# Wire/audit shape version for the canonical card draft JSON.
+SOURCE_DATA_CONTRACT_DRAFT_VERSION: Final[int] = 1
+
+# Bounded read for the ILLUSTRATIVE sample header: the sample is evidence
+# shown on the card, never the thing being ratified, so the read is
+# best-effort and abstains (None) on any anomaly.
+_SAMPLE_HEADER_READ_BYTES: Final[int] = 65536
+_SAMPLE_HEADER_MAX_COLUMNS: Final[int] = 512
+_SAMPLE_HEADER_MAX_CELL_CHARS: Final[int] = 512
+
+
+def source_data_contract_artifact_hash(fields: Iterable[str]) -> str:
+    """Canonical artifact hash binding an acknowledged demand FIELD SET.
+
+    Mirrors ``accepted_artifact_hash`` binding content for invented_source:
+    the acknowledgement attests exactly this set of field names, so a
+    demand-set change after acknowledgement re-opens the card. The sample
+    header is deliberately NOT part of the domain — it is illustrative
+    evidence, and a re-uploaded sample must not drift an accepted promise
+    whose demanded fields are unchanged.
+    """
+    return stable_hash({"review_kind": SOURCE_DATA_CONTRACT_USER_TERM, "demanded_fields": sorted(fields)})
+
+
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored source options mapping (Tier-3) whose schema block shape is unproven",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns a stamped copy or None to abstain; every malformed-shape branch abstains, never raises",
+)
+def stamp_source_options_with_guarantees(
+    options: Mapping[str, Any],
+    guaranteed_fields: Iterable[str],
+) -> Mapping[str, Any] | None:
+    """Merge ``guaranteed_fields`` into the options' schema block, or abstain.
+
+    ``None`` means the source cannot honestly carry the stamp: an explicit
+    ``schema.fields`` declaration or a non-observed mode is the author's own
+    complete claim and this flow never rewrites it; a malformed schema block
+    belongs to validation, not to this stamp. Unlike the bind-time
+    auto-declare (``tools/sources.py``), an EXISTING ``guaranteed_fields``
+    list is unioned rather than abstained over — the ask flow's stamp is an
+    explicit user answer widening the source's promise, and re-acknowledging
+    a re-opened card must be able to extend a previous acknowledgement.
+    """
+    schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else "schema")
+    raw_schema = options[schema_key] if schema_key in options else None
+    if raw_schema is None:
+        schema: dict[str, Any] = {"mode": "observed"}
+    elif isinstance(raw_schema, Mapping):
+        schema = dict(raw_schema)
+    else:
+        return None
+    if "fields" in schema and schema["fields"]:
+        return None
+    if "mode" not in schema:
+        schema["mode"] = "observed"
+    if schema["mode"] != "observed":
+        return None
+    existing = schema["guaranteed_fields"] if "guaranteed_fields" in schema else ()
+    if existing is None:
+        existing = ()
+    if not isinstance(existing, (list, tuple)) or not all(isinstance(field, str) for field in existing):
+        return None
+    merged = sorted({*existing, *guaranteed_fields})
+    schema["guaranteed_fields"] = merged
+    return {**options, schema_key: schema}
+
+
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored source options mapping (Tier-3) whose schema block shape is unproven",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns a stripped copy, or the input unchanged for any malformed shape — the demand walk "
+    "abstains on malformed schema blocks, so passing them through never widens a claim",
+)
+def _source_options_without_guaranteed_fields(
+    options: Mapping[str, Any],
+    fields: frozenset[str],
+) -> Mapping[str, Any]:
+    """Return options with ``fields`` removed from ``schema.guaranteed_fields``.
+
+    Used to recompute demand as if a previous acknowledgement had not been
+    stamped, so a demand-set change is measured against the graph, not
+    against the stamp the previous answer produced. Malformed shapes are
+    returned unchanged — the demand walk abstains on them anyway.
+    """
+    if not fields:
+        return options
+    schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else None)
+    if schema_key is None:
+        return options
+    raw_schema = options[schema_key]
+    if not isinstance(raw_schema, Mapping) or "guaranteed_fields" not in raw_schema:
+        return options
+    existing = raw_schema["guaranteed_fields"]
+    if not isinstance(existing, (list, tuple)):
+        return options
+    remaining = [field for field in existing if not (isinstance(field, str) and field in fields)]
+    schema = dict(raw_schema)
+    if remaining:
+        schema["guaranteed_fields"] = remaining
+    else:
+        del schema["guaranteed_fields"]
+    return {**options, schema_key: schema}
+
+
+def _unsatisfied_edge_misses(state: CompositionState) -> dict[tuple[str, str], frozenset[str]]:
+    """Per-edge missing required fields from Stage-1 validation's own ledger."""
+    return {
+        (contract.from_id, contract.to_id): frozenset(contract.missing_fields)
+        for contract in state.validate().edge_contracts
+        if not contract.satisfied
+    }
+
+
+def backtraced_source_demand(
+    state: CompositionState,
+    source_name: str,
+    *,
+    disregard_fields: frozenset[str] = frozenset(),
+) -> tuple[str, ...]:
+    """Minimal field set the pipeline genuinely requires from ``source_name``.
+
+    Delta derivation (see module docstring): baseline = the state with
+    ``disregard_fields`` stripped from the source's guarantee; hypothesis =
+    the same state with every currently-missing field stamped into the
+    source's guarantee. A field is demanded exactly when some edge misses it
+    at baseline and stops missing it under the hypothesis — i.e. this
+    source's promise, alone, is what satisfies that requirement through the
+    transparent-node walk. Fields the pipeline does not require never enter
+    the baseline misses; fields an intermediate node guarantees are not
+    missing; fields whose path is not transparent to this source stay
+    missing under the hypothesis and drop out.
+
+    Returns ``()`` when there is no demand or when the source cannot carry a
+    guarantee stamp at all (explicit ``schema.fields``, non-observed mode,
+    malformed schema block) — a card that acknowledgement could not resolve
+    must never be staged.
+    """
+    source = state.sources[source_name] if source_name in state.sources else None
+    if source is None:
+        return ()
+    baseline_options = _source_options_without_guaranteed_fields(source.options, disregard_fields)
+    if stamp_source_options_with_guarantees(baseline_options, ()) is None:
+        return ()
+    baseline_state = _state_with_source_options(state, source_name, source, baseline_options)
+    baseline_misses = _unsatisfied_edge_misses(baseline_state)
+    if not baseline_misses:
+        return ()
+    all_missing = frozenset().union(*baseline_misses.values())
+    stamped_options = stamp_source_options_with_guarantees(baseline_options, sorted(all_missing))
+    if stamped_options is None:
+        return ()
+    stamped_state = _state_with_source_options(state, source_name, source, stamped_options)
+    stamped_misses = _unsatisfied_edge_misses(stamped_state)
+    demand: set[str] = set()
+    for edge, missing in baseline_misses.items():
+        demand |= missing - (stamped_misses[edge] if edge in stamped_misses else frozenset())
+    return tuple(sorted(demand))
+
+
+def _state_with_source_options(
+    state: CompositionState,
+    source_name: str,
+    source: SourceSpec,
+    options: Mapping[str, Any],
+) -> CompositionState:
+    if options is source.options:
+        return state
+    sources = dict(state.sources)
+    sources[source_name] = replace(source, options=options)
+    return replace(state, sources=sources)
+
+
+@observation_boundary(
+    tier=3,
+    source="source options ('path'/'file', 'delimiter', 'encoding') persisted on composer state, and the "
+    "bytes of the operator-uploaded file those options point at",
+    source_param="source",
+    suppresses=("R1", "R5"),
+    invariant="returns a bounded header tuple or None to abstain; every unreadable/undecodable/over-limit "
+    "branch abstains, never raises — the sample is illustrative card evidence, not a guarantee input",
+)
+def sample_header_for_source(source: SourceSpec) -> tuple[str, ...] | None:
+    """Best-effort ILLUSTRATIVE sample header for a bound csv source.
+
+    The card shows the sample beside the demanded fields and warns on any
+    demanded field the sample does not show ("your data doesn't appear to
+    have this — fix the data or change the pipeline"). The sample is never
+    ratified and never feeds the guarantee stamp, so this read abstains on
+    any anomaly rather than raising: a non-csv plugin, an unreadable or
+    undecodable file, an over-limit row.
+    """
+    if source.plugin != "csv":
+        return None
+    options = source.options
+    path_value = options.get("path") if "path" in options else options.get("file") if "file" in options else None
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    delimiter_value = options.get("delimiter")
+    delimiter = delimiter_value if isinstance(delimiter_value, str) and len(delimiter_value) == 1 else ","
+    encoding_value = options.get("encoding")
+    encoding = encoding_value if isinstance(encoding_value, str) and encoding_value else "utf-8"
+    try:
+        with Path(path_value).open("rb") as handle:
+            raw = handle.read(_SAMPLE_HEADER_READ_BYTES + 1)
+    except OSError:
+        return None
+    truncated = len(raw) > _SAMPLE_HEADER_READ_BYTES
+    try:
+        decoder = codecs.getincrementaldecoder(encoding)()
+        text = decoder.decode(raw[:_SAMPLE_HEADER_READ_BYTES], final=not truncated)
+    except (LookupError, UnicodeDecodeError, ValueError):
+        return None
+    try:
+        for row in csv.reader(io.StringIO(text), delimiter=delimiter, strict=True):
+            if not row or all(not cell.strip() for cell in row):
+                continue
+            if len(row) > _SAMPLE_HEADER_MAX_COLUMNS or any(len(cell) > _SAMPLE_HEADER_MAX_CELL_CHARS for cell in row):
+                return None
+            return tuple(cell.strip() for cell in row)
+    except csv.Error:
+        return None
+    return None
+
+
+def build_source_data_contract_draft(
+    demanded_fields: Iterable[str],
+    sample_header: tuple[str, ...] | None,
+) -> str:
+    """Render the canonical, server-computed card draft.
+
+    Deterministic compact JSON (sorted keys) so draft equality checks at the
+    tool boundary and the writer boundary compare the same bytes. The
+    commitment wording — "whatever I feed this pipeline will carry these
+    columns" — and the honest consequence — "rows missing these columns will
+    be set aside (quarantined), the run continues" — are frontend card copy,
+    not draft payload: the draft carries the FACTS (demanded fields, sample
+    evidence, per-field sample misses), the renderer carries the prose.
+    """
+    demanded = sorted(demanded_fields)
+    missing_from_sample = sorted(set(demanded) - set(sample_header)) if sample_header is not None else []
+    payload = {
+        "contract_version": SOURCE_DATA_CONTRACT_DRAFT_VERSION,
+        "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+        "demanded_fields": demanded,
+        "sample_header": list(sample_header) if sample_header is not None else None,
+        "missing_from_sample": missing_from_sample,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+@observation_boundary(
+    tier=3,
+    source="a persisted interpretation requirement's accepted_value / a persisted interpretation event's "
+    "accepted draft text, round-tripped through sessions.db storage",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="returns the parsed demanded-field tuple or None to abstain; every malformed branch abstains "
+    "— callers treat None as drift and re-open the card, so abstention fails closed",
+)
+def parse_source_data_contract_accepted_fields(value: str) -> tuple[str, ...] | None:
+    """Parse the acknowledged demand set back out of a stored draft/accepted value."""
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    demanded = payload["demanded_fields"] if "demanded_fields" in payload else None
+    if not isinstance(demanded, list) or not all(isinstance(field, str) for field in demanded):
+        return None
+    return tuple(demanded)

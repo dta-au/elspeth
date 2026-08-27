@@ -200,6 +200,101 @@ describe("AcknowledgementCard — per-kind copy", () => {
 
 // ── Value rendering ──────────────────────────────────────────────────────────
 
+describe("AcknowledgementCard — source data contract", () => {
+  function makeDataContractEvent(
+    draft: Record<string, unknown>,
+  ): InterpretationEvent {
+    return makeEvent({
+      kind: "source_data_contract",
+      affected_node_id: "source",
+      user_term: "source_data_contract",
+      llm_draft: JSON.stringify(draft),
+    });
+  }
+
+  it("renders the demanded fields, the commitment framing, and the quarantine consequence", () => {
+    renderCard(
+      makeDataContractEvent({
+        contract_version: 1,
+        kind: "source_data_contract",
+        demanded_fields: ["colour", "size"],
+        sample_header: ["colour", "extra"],
+        missing_from_sample: ["size"],
+      }),
+      { showAmend: false },
+    );
+    expect(screen.getByText("Data contract")).toBeTruthy();
+    expect(screen.getByText("colour")).toBeTruthy();
+    expect(screen.getByText("size")).toBeTruthy();
+    // Commitment wording: a promise about future rows, not the sample file.
+    expect(
+      screen.getByText(/whatever you feed this pipeline/i),
+    ).toBeTruthy();
+    // Honest consequence: quarantine, the run continues.
+    expect(screen.getByText(/set aside\s*\(quarantined\)/i)).toBeTruthy();
+    expect(screen.getByText(/the run continues/i)).toBeTruthy();
+    expect(
+      screen.getByRole("button", {
+        name: /acknowledge the source data contract/i,
+      }),
+    ).toBeTruthy();
+  });
+
+  it("warns per demanded field the sample does not show", () => {
+    renderCard(
+      makeDataContractEvent({
+        contract_version: 1,
+        kind: "source_data_contract",
+        demanded_fields: ["colour", "size"],
+        sample_header: ["colour", "extra"],
+        missing_from_sample: ["size"],
+      }),
+      { showAmend: false },
+    );
+    const warnings = screen.getAllByRole("alert");
+    expect(
+      warnings.some((el) =>
+        /your data doesn't appear to have this/i.test(el.textContent ?? ""),
+      ),
+    ).toBe(true);
+    // The satisfied field carries no warning: exactly one alert for 'size'.
+    expect(
+      warnings.filter((el) =>
+        /your data doesn't appear to have this/i.test(el.textContent ?? ""),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("notes when no sample was available", () => {
+    renderCard(
+      makeDataContractEvent({
+        contract_version: 1,
+        kind: "source_data_contract",
+        demanded_fields: ["colour"],
+        sample_header: null,
+        missing_from_sample: [],
+      }),
+      { showAmend: false },
+    );
+    expect(screen.getByText(/no sample of this source's data/i)).toBeTruthy();
+  });
+
+  it("falls back to the raw payload when the draft cannot be parsed", () => {
+    renderCard(
+      makeEvent({
+        kind: "source_data_contract",
+        affected_node_id: "source",
+        user_term: "source_data_contract",
+        llm_draft: "not json at all",
+      }),
+      { showAmend: false },
+    );
+    expect(
+      screen.getByText(/could not be parsed/i),
+    ).toBeTruthy();
+  });
+});
+
 describe("AcknowledgementCard — invented-source value", () => {
   it("pretty-prints a short JSON source value inline", () => {
     const { container } = renderCard(

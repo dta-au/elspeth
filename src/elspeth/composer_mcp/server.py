@@ -645,6 +645,15 @@ def create_server(
             omitted preflight degrades preview_pipeline into publishing
             is_valid on authoring checks alone, so every caller must take a
             visible position rather than inherit one.
+
+            Deliberately STRICT-ONLY (elspeth-229e9e8195): the MCP surface
+            wires no interpretation-tolerant ``structural_preflight``, so
+            preview_pipeline here never emits ``data["structural_preview"]``.
+            ``McpRuntimePreflight`` carries no tolerance parameter by design —
+            the MCP operator channel has no compose-loop repair budget for the
+            block to steer, and a handoff-shaped verdict already names the
+            pending review. Extending tolerance to MCP is a deliberate
+            decision, not an omission to "fix" in passing.
         runtime_preflight_settings_hash: Hash of settings relevant to runtime
             validation. Required when runtime_preflight is configured.
         runtime_preflight_timeout_seconds: Per-call timeout for runtime preflight.

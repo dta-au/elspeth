@@ -242,8 +242,20 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["vague_term", "invented_source", "llm_prompt_template", "pipeline_decision", "llm_model_choice"],
-                    "description": "Class of assumption being surfaced for review.",
+                    "enum": [
+                        "vague_term",
+                        "invented_source",
+                        "llm_prompt_template",
+                        "pipeline_decision",
+                        "llm_model_choice",
+                        "source_data_contract",
+                    ],
+                    "description": (
+                        "Class of assumption being surfaced for review. source_data_contract asks the user to "
+                        "acknowledge the data contract for an uploaded/path-bound source the pipeline requires "
+                        "fields from: target 'source' or 'source:<name>', set user_term='source_data_contract', "
+                        "and OMIT llm_draft — the server computes the demanded field set from the graph."
+                    ),
                 },
                 "user_term": {
                     "type": "string",
@@ -583,6 +595,7 @@ def execute_tool(
     baseline: CompositionState | None = None,
     prior_validation: ValidationSummary | None = None,
     runtime_preflight: RuntimePreflight | None = None,
+    structural_preflight: RuntimePreflight | None = None,
     max_blob_storage_per_session_bytes: int | None = None,
     user_message_id: str | None = None,
     user_message_content: str | None = None,
@@ -640,6 +653,11 @@ def execute_tool(
             Only applied to preview_pipeline. Pre-computed in the async
             compose loop and injected here as a cheap synchronous callback
             so execute_tool() stays synchronous.
+        structural_preflight: Optional callback for the interpretation-
+            tolerant preflight, applied only to preview_pipeline. Wired by
+            callers whose strict Stage-2 result is handoff-shaped so the
+            preview can additionally surface structural findings the strict
+            ledger skipped behind the pending review (elspeth-229e9e8195).
         max_blob_storage_per_session_bytes: Configured per-session blob
             storage quota for assistant-created session artifacts. Defaults
             to ``None`` so the blob plane can fall back to its historical
@@ -722,6 +740,7 @@ def execute_tool(
         baseline=baseline,
         current_validation=current_validation,
         runtime_preflight=runtime_preflight,
+        structural_preflight=structural_preflight,
         max_blob_storage_per_session_bytes=max_blob_storage_per_session_bytes,
         user_message_id=user_message_id,
         user_message_content=user_message_content,

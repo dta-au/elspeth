@@ -213,6 +213,8 @@ function describePendingInterpretation(event: InterpretationEvent): string {
       return `Resolve the pipeline decision for ${nodeLabel} before running.`;
     case "llm_model_choice":
       return `Set the LLM model choice for ${nodeLabel} before running.`;
+    case "source_data_contract":
+      return `Acknowledge the data contract for ${nodeLabel} before running.`;
     case "vague_term":
     case null:
       return `Resolve the pending interpretation for ${nodeLabel} before running.`;

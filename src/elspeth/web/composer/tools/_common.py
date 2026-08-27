@@ -3043,6 +3043,15 @@ class ToolContext:
             preflight, applied only to ``preview_pipeline``. Pre-computed in
             the async compose loop and injected here as a cheap synchronous
             callback so ``execute_tool`` stays synchronous.
+        structural_preflight: Optional callback for the interpretation-
+            tolerant (authoring-masked) preflight, applied only to
+            ``preview_pipeline`` and only wired by callers whose strict
+            Stage-2 result is handoff-shaped (invalid with the
+            ``interpretation_review_pending`` blocker). Same precompute-
+            then-close-over shape as ``runtime_preflight``. The handler
+            surfaces it as the additive ``data["structural_preview"]``
+            block (elspeth-229e9e8195); it never participates in
+            ``is_valid``.
         max_blob_storage_per_session_bytes: Configured per-session blob
             storage quota for assistant-created session artifacts. Defaults
             to ``None`` (no override) so the blob plane can fall back to its
@@ -3089,6 +3098,7 @@ class ToolContext:
     baseline: CompositionState | None = None
     current_validation: ValidationSummary | None = None
     runtime_preflight: RuntimePreflight | None = None
+    structural_preflight: RuntimePreflight | None = None
     max_blob_storage_per_session_bytes: int | None = None
     user_message_id: str | None = None
     user_message_content: str | None = None

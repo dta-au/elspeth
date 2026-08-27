@@ -82,9 +82,11 @@ from elspeth.web.composer.tools.declarations import (
 from elspeth.web.composer.tools.sessions import (
     _authoring_validation_payload,
 )
+from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationResult
 from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_REVIEW_DRAFT,
     RAW_HTML_CLEANUP_USER_TERM,
+    materialize_state_for_authoring,
 )
 from elspeth.web.plugin_policy.models import PluginUnavailableReason
 
@@ -3398,6 +3400,89 @@ def _runtime_preflight_not_run_error() -> ValidationEntryDict:
     )
 
 
+class _StructuralPreviewCheckDict(TypedDict):
+    """One failing tolerant-preflight check projected into the preview block."""
+
+    name: str
+    detail: str
+    outcome_code: str | None
+    affected_nodes: list[str]
+
+
+class _StructuralPreviewBlockDict(TypedDict):
+    """The additive ``data["structural_preview"]`` payload (elspeth-229e9e8195)."""
+
+    is_valid: bool
+    confidence: Literal["equivalent", "provisional"]
+    masking_applied: bool
+    failing_checks: list[_StructuralPreviewCheckDict]
+    errors: list[dict[str, Any]]
+    note: str
+
+
+def _structural_preview_block(state: CompositionState, tolerant_result: ValidationResult) -> _StructuralPreviewBlockDict:
+    """Project the interpretation-tolerant preflight into an advisory block.
+
+    While an interpretation review is pending, the strict Stage-2 ledger
+    fails at ``review_interpretations`` and stamps every later stage —
+    graph structure included — ``SKIPPED_AFTER_FAILURE``, so a mid-loop
+    preview shows authoring-green plus a review-pending note while an
+    edge-contract violation stays invisible until completion
+    (elspeth-229e9e8195). This block surfaces the tolerant re-validation's
+    findings during authoring, while the defect is still cheap to fix.
+
+    A bounded PROJECTION, never a second full ``ValidationResult`` dump:
+    the preview result rides the append-only planner conversation against
+    the hard request-bytes cap, so only the failing checks and errors are
+    carried. ``SKIPPED_AFTER_FAILURE`` stamps are derived noise (the stage
+    that failed is already in the projection) and are dropped.
+
+    ``masking_applied`` is the soundness discriminator: tolerant masking
+    substitutes placeholder text for pending interpretation sites, which
+    can produce findings in BOTH directions (a false red at plugin
+    instantiation, a false green past it). ``materialize_state_for_authoring``
+    returns the IDENTICAL state object when substitution was a no-op, and
+    in that case the findings were computed against the exact authored
+    bytes — as reliable as a strict run.
+    """
+    masking_applied = materialize_state_for_authoring(state) is not state
+    failing_checks = [
+        _StructuralPreviewCheckDict(
+            name=check.name,
+            detail=check.detail,
+            outcome_code=check.outcome_code,
+            affected_nodes=list(check.affected_nodes),
+        )
+        for check in tolerant_result.checks
+        if not check.passed and check.outcome_code != CHECK_OUTCOME_SKIPPED_AFTER_FAILURE
+    ]
+    errors = [error.model_dump() for error in tolerant_result.errors]
+    confidence: Literal["equivalent", "provisional"]
+    if masking_applied:
+        confidence = "provisional"
+        note = (
+            "These findings were computed with pending interpretation reviews masked by "
+            "placeholder-substituted text, so a finding may be an artifact of the placeholder "
+            "rather than of the authored pipeline. Report these findings instead of blindly "
+            "repairing against them; re-check after the pending reviews resolve."
+        )
+    else:
+        confidence = "equivalent"
+        note = (
+            "The pending interpretation review required no placeholder substitution, so these "
+            "findings were computed against the exact authored pipeline and are as reliable as "
+            "a strict preflight. Repair any finding below before completing."
+        )
+    return _StructuralPreviewBlockDict(
+        is_valid=tolerant_result.is_valid,
+        confidence=confidence,
+        masking_applied=masking_applied,
+        failing_checks=failing_checks,
+        errors=errors,
+        note=note,
+    )
+
+
 def _execute_preview_pipeline(
     args: dict[str, Any],
     state: CompositionState,
@@ -3422,6 +3507,13 @@ def _execute_preview_pipeline(
     )
     authoring_payload = _authoring_validation_payload(state, validation)
     runtime_result = context.runtime_preflight(state) if context.runtime_preflight is not None else None
+    # Wired only when the caller's strict Stage-2 verdict is handoff-shaped
+    # (elspeth-229e9e8195). Additive advisory block: it never joins the
+    # ``is_valid`` conjunct below — folding tolerant findings into the strict
+    # verdict would misreport a review-pending state as a validator objection.
+    structural_preview = (
+        _structural_preview_block(state, context.structural_preflight(state)) if context.structural_preflight is not None else None
+    )
 
     proof_diagnostics = compute_proof_diagnostics(
         state,
@@ -3479,6 +3571,8 @@ def _execute_preview_pipeline(
         "nodes": [{"id": n.id, "node_type": n.node_type, "plugin": n.plugin} for n in state.nodes],
         "outputs": [{"name": o.name, "plugin": o.plugin} for o in state.outputs],
     }
+    if structural_preview is not None:
+        summary["structural_preview"] = structural_preview
 
     return ToolResult(
         success=True,
