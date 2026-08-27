@@ -234,6 +234,26 @@ identical guard (`_exporter_delivery_metrics`) before anyone looked.
 - ADR-023: Custom Python Static Analyzer (`elspeth-lints`) — the
   analyzer whose judge policy this ADR amends.
 
+## Addendum (2026-08-27): not a dispatch control either
+
+Ticket `elspeth-8783933d99`. A `runtime_checkable` Protocol `isinstance()`
+is not only unfit as a security control — it is unfit as a **dispatch
+control**. Protocol membership is a *measurement* of the object's current
+attribute surface, not a declaration: widening the protocol (commit
+`ef5e6e593` added `preserves_input_values`) silently reclassified every
+implementation lacking the new member, tree-wide, with no import-time
+signal, and the engine raised `TypeError: Unknown transform type`
+mid-traversal.
+
+The engine now dispatches **nominally on `GateSettings` in negative form**
+over containers that are closed by construction: `node_to_plugin` is built
+from `config.transforms` ∪ `config.gates` with an exhaustiveness raise
+(`graph_wiring.py`), so "not a `GateSettings`" *is* "is a transform".
+Homogeneous containers (`config.transforms: Sequence[RowPlugin]`) need no
+type test at all. Widening `TransformProtocol` can no longer reclassify
+engine dispatch; conformance remains measured where measuring is the point
+(`tests/unit/plugins/test_protocols.py`).
+
 ## References
 
 - `elspeth-9ea866438b` — the P0: composer tool-call admission rejected

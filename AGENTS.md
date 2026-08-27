@@ -62,7 +62,9 @@ elspeth run --settings examples/<name>/settings.yaml --execute
   nominally type what ELSPETH owns (`isinstance` against a concrete class we
   define), parse what it does not (sentinel `getattr` + value assertions +
   construct an owned type). Never use a `runtime_checkable` Protocol as a
-  security control — it is structural typing, so an impostor passes, and since
+  security control or a dispatch control — it is structural typing, so an
+  impostor passes, widening the protocol silently reclassifies every
+  implementation tree-wide (elspeth-8783933d99), and since
   Python 3.12 it silently rejects dynamic-attribute objects such as pydantic
   `extra="allow"` models.
 - Worktrees live under `.claude/worktrees/<name>` and symlink `.venv` to the

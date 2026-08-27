@@ -400,6 +400,10 @@ is a working document under the normal delivery posture.
     such a Protocol as a SECURITY control; this is the same mechanism as a
     DISPATCH control. Dispatch on an owned base class or explicit
     registration so a missing declaration fails at build, not mid-traversal.
+    The hardening LANDED (elspeth-8783933d99, ADR-032 addendum 2026-08-27):
+    engine dispatch now keys nominally on GateSettings in negative form over
+    the closed node_to_plugin / config.transforms containers, so widening
+    TransformProtocol no longer reclassifies engine dispatch.
 
   - **A REBUILD-AND-COMPARE CHECK PASSES HARDEST WHEN IT DID NOTHING.** The
     stage-then-`cmp` procedure (rebuild a file from HEAD, re-apply your hunks,
@@ -518,8 +522,9 @@ is a working document under the normal delivery posture.
   reaches an `isinstance` site fails STRUCTURAL CONFORMANCE instead of
   raising `AttributeError`, and the message names neither the protocol nor
   the missing attribute — `test_protocols.py` reports only "Must conform to
-  TransformProtocol", and `token_traversal.py:1091` reports "Unknown
-  transform type: <FakeName>. Expected TransformProtocol or GateSettings."
+  TransformProtocol". (token_traversal's "Unknown transform type" variant of
+  this trap is GONE — engine dispatch is nominal on GateSettings since
+  elspeth-8783933d99 and no longer measures conformance.)
   Both of those cost a debugging cycle after the AttributeError sweep looked
   complete. When you add a protocol attribute, grep for fakes that assign the
   sibling flags in `__init__` (`self.passes_through_input = ...`) as well as

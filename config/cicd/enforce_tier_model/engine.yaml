@@ -23,22 +23,6 @@ per_file_rules:
   reason: BatchTransformMixin type narrowing for mypy
   expires: null
   max_hits: 2
-- pattern: engine/orchestrator/aggregation.py
-  rules:
-  - R5
-  reason: TransformProtocol dispatch on config.transforms
-  expires: null
-  max_hits: 1
-- pattern: engine/orchestrator/run_context_factory.py
-  rules:
-  - R5
-  reason: 'TransformProtocol dispatch for batch-aware aggregation lookup: isinstance(t,
-    TransformProtocol) on first-party @runtime_checkable plugin contract values from
-    config.transforms (RunContextFactory.initialize_run_context). Repointed from
-    engine/orchestrator/run_core.py after the lifecycle-boundary split
-    (elspeth-b53a093321) moved initialize_run_context here; run_core.py is deleted.'
-  expires: null
-  max_hits: 1
 - pattern: engine/processor.py
   rules:
   - R5
@@ -53,8 +37,14 @@ per_file_rules:
     TokenTraversalEngine extraction (elspeth-c49f33d6e4 component 4) moved the
     per-token traversal loop's plugin dispatch (TransformProtocol vs GateSettings)
     and _Transform*/_Gate* outcome-union narrowing to engine/token_traversal.py.
+    Budget 6->7 under elspeth-8783933d99 — the negative-nominal-dispatch
+    hardening replaced the bare cast at the committed-aggregation-output
+    routing-authority check with a nominal isinstance(plugin, GateSettings)
+    rejection; the same change removed the structural isinstance(t,
+    TransformProtocol) sites in engine/orchestrator/aggregation.py and
+    run_context_factory.py, whose per-file rules are deleted.
   expires: null
-  max_hits: 6
+  max_hits: 7
 - pattern: engine/token_traversal.py
   rules:
   - R5
