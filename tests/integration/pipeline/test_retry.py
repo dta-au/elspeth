@@ -235,6 +235,10 @@ class CollidingOutputTransform(BaseTransform):
 
     The executor's preflight rejects the collision before ``process()`` runs,
     raising a bare (Tier-2) ``PluginContractViolation``.
+
+    ``passes_through_input=True`` models the enricher class truthfully: the
+    collision gate is capability-keyed (elspeth-6ea3619737) and only arms for
+    a transform whose write path preserves the input row.
     """
 
     name = "colliding_output_transform"
@@ -242,6 +246,7 @@ class CollidingOutputTransform(BaseTransform):
     input_schema = PluginSchema
     output_schema = PluginSchema
     plugin_version = "1.0.0"
+    passes_through_input = True
 
     def __init__(self, config: dict[str, Any]) -> None:
         from elspeth.contracts.schema import SchemaConfig

@@ -425,12 +425,15 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
         assert lost == {}, f"configured input columns silently demoted: {lost}"
 
     def test_field_mapper_target_is_optional_on_input_without_strict(self) -> None:
-        """'Fields I may create' is wider than 'fields I guarantee'.
+        """A declared rename target must still be optional on input.
 
-        Non-strict field_mapper only GUARANTEES a target when its source is
-        itself guaranteed, so declared_output_fields is empty here — but the
-        transform still creates the target whenever the source arrives, so
-        requiring it on input is the same trap.
+        Non-strict field_mapper guarantees a target when its source is
+        promised on every input row — here the flexible-mode required
+        ``source_id`` is exactly that promise (elspeth-0d1da6dc44), so
+        ``target_id`` is honestly declared. Declaring it must not demand it on
+        input: the transform CREATES it, so requiring it is the
+        elspeth-d6eeb3a71d trap — the same shape the batch_stats sibling
+        below pins.
         """
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
@@ -442,7 +445,7 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
             }
         )
 
-        assert transform.declared_output_fields == frozenset()
+        assert transform.declared_output_fields == frozenset({"target_id"})
         assert "target_id" not in _required_input_fields(transform)
         transform.input_schema.model_validate({"source_id": "abc"}, strict=True)
 
