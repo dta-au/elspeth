@@ -7,6 +7,7 @@ Tests the complete SSRF-safe pipeline:
 """
 
 import socket
+import urllib.parse
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import Any
@@ -602,3 +603,117 @@ class TestRedirectAllowedRangesBehavior:
 
         assert result.status == "error"
         assert "SSRFBlockedError" in result.reason.get("error_type", "")
+
+
+class TestErrorPathURLRedaction:
+    """Error paths must never embed the raw request URL (elspeth-600360c72e).
+
+    Secret-bearing query values (sensitive-named params), userinfo, and
+    fragments must be fingerprinted/stripped eagerly at construction — the
+    executor-level scrubber passes unknown-shaped URLs verbatim, so these
+    strings persist to transform_errors / node_states / payload-store blobs
+    as built here. Mirrors blob_fetch's eager safe_url = fingerprint_url()
+    pattern and its redaction tests.
+    """
+
+    SECRET_URL = "https://example.com/hop?sig=ERRPATH_SIG_SECRET&view=full#ERRFRAG_SECRET"
+
+    @pytest.fixture(autouse=True)
+    def _fingerprint_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "web-scrape-test-key")
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+
+    def _make_transform(self, mock_ctx, *, max_body_bytes: int | None = None) -> WebScrapeTransform:
+        http_config: dict[str, Any] = {
+            "abuse_contact": "test@example.com",
+            "scraping_reason": "Security testing",
+        }
+        if max_body_bytes is not None:
+            http_config["max_body_bytes"] = max_body_bytes
+        t = WebScrapeTransform(
+            {
+                "schema": {"mode": "observed"},
+                "url_field": "url",
+                "content_field": "page_content",
+                "fingerprint_field": "page_fingerprint",
+                "http": http_config,
+            }
+        )
+        t.on_start(mock_ctx)
+        return t
+
+    def _assert_no_secrets(self, text: str) -> None:
+        assert "ERRPATH_SIG_SECRET" not in text
+        assert "ERRFRAG_SECRET" not in text
+
+    @staticmethod
+    def _assert_fingerprinted(text: str) -> None:
+        # urlencode percent-encodes the <fingerprint:...> marker inside URLs
+        assert "<fingerprint:" in urllib.parse.unquote(text)
+
+    @respx.mock
+    def test_http_status_error_reason_redacts_url_secrets(self, mock_ctx):
+        respx.route(host="104.18.27.120").mock(return_value=httpx.Response(404))
+        transform = self._make_transform(mock_ctx)
+
+        with patch("socket.getaddrinfo", _mock_getaddrinfo("104.18.27.120")):
+            result = transform.process(make_pipeline_row({"url": self.SECRET_URL}), mock_ctx)
+
+        assert result.status == "error"
+        assert result.reason["error_type"] == "NotFoundError"
+        self._assert_no_secrets(repr(result.reason))
+        self._assert_fingerprinted(result.reason["error"])
+
+    @respx.mock
+    def test_retryable_error_message_redacts_url_secrets(self, mock_ctx):
+        from elspeth.plugins.transforms.web_scrape_errors import ServerError
+
+        respx.route(host="104.18.27.120").mock(return_value=httpx.Response(500))
+        transform = self._make_transform(mock_ctx)
+
+        with patch("socket.getaddrinfo", _mock_getaddrinfo("104.18.27.120")), pytest.raises(ServerError) as exc_info:
+            transform.process(make_pipeline_row({"url": self.SECRET_URL}), mock_ctx)
+
+        self._assert_no_secrets(str(exc_info.value))
+        self._assert_fingerprinted(str(exc_info.value))
+
+    @respx.mock
+    def test_network_error_message_redacts_url_secrets(self, mock_ctx):
+        from elspeth.plugins.transforms.web_scrape_errors import NetworkError
+
+        respx.route(host="104.18.27.120").mock(side_effect=httpx.ConnectError(f"connect fail for {self.SECRET_URL}"))
+        transform = self._make_transform(mock_ctx)
+
+        with patch("socket.getaddrinfo", _mock_getaddrinfo("104.18.27.120")), pytest.raises(NetworkError) as exc_info:
+            transform.process(make_pipeline_row({"url": self.SECRET_URL}), mock_ctx)
+
+        self._assert_no_secrets(str(exc_info.value))
+
+    @respx.mock
+    def test_body_cap_error_reason_redacts_hop_url(self, mock_ctx):
+        """The streaming-cap error's message embeds the raw hop URL (http.py) —
+        the transform must rebuild the message rather than persist str(e).
+        This is the path the adversarial review reproduced end-to-end."""
+        respx.route(host="104.18.27.120").mock(return_value=httpx.Response(200, text="x" * 64, headers={"content-type": "text/html"}))
+        transform = self._make_transform(mock_ctx, max_body_bytes=16)
+
+        with patch("socket.getaddrinfo", _mock_getaddrinfo("104.18.27.120")):
+            result = transform.process(make_pipeline_row({"url": self.SECRET_URL}), mock_ctx)
+
+        assert result.status == "error"
+        assert result.reason["reason"] == "body_too_large"
+        self._assert_no_secrets(repr(result.reason))
+        self._assert_fingerprinted(str(result.reason["url"]))
+
+    @respx.mock
+    def test_non_text_content_type_reason_redacts_url_secrets(self, mock_ctx):
+        respx.route(host="104.18.27.120").mock(return_value=httpx.Response(200, content=b"\x89PNG", headers={"content-type": "image/png"}))
+        transform = self._make_transform(mock_ctx)
+
+        with patch("socket.getaddrinfo", _mock_getaddrinfo("104.18.27.120")):
+            result = transform.process(make_pipeline_row({"url": self.SECRET_URL}), mock_ctx)
+
+        assert result.status == "error"
+        assert result.reason["reason"] == "non_text_content_type"
+        self._assert_no_secrets(repr(result.reason))
+        self._assert_fingerprinted(str(result.reason["url"]))
