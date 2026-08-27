@@ -1948,6 +1948,42 @@ class TestOpenBranchDeclarationChannelStability:
 
         assert via_fixed.declared_output_fields == via_guaranteed.declared_output_fields == frozenset({"c"})
 
+    def test_required_fields_is_the_third_spelling_of_the_same_promise(self) -> None:
+        """``schema.required_fields`` declares like the other two channels.
+
+        Found by the adversarial review of a7c783423: the first cure equalized
+        ``guaranteed_fields`` and fixed-mode required fields but left
+        ``required_fields`` disarmed. It is the same per-row promise —
+        ``get_raw_node_required_fields`` feeds the build-time edge contract,
+        which rejects EVERY graph whose upstream does not guarantee the field
+        (measured: an abstaining bare-observed upstream is rejected, no
+        abstention skip), so on any runnable graph every row carries it and
+        the rename target is written on every row.
+        """
+        via_required = self._mapper({"mode": "observed", "required_fields": ["a", "c"]})
+        via_guaranteed = self._mapper({"mode": "observed", "guaranteed_fields": ["a", "c"]})
+
+        assert via_required.declared_output_fields == via_guaranteed.declared_output_fields == frozenset({"c"})
+
+    def test_select_only_emit_guarantees_cover_every_declared_target(self) -> None:
+        """Closed-branch subset invariant: declared ⊆ emit guarantees, all channels.
+
+        The emit builder deliberately does not union ``declared_output_fields``
+        back in; that is only sound while ``_admitted_input_fields`` speaks the
+        same predicate as the derivation. A required-but-not-guaranteed source
+        is the shape that would split them.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        for schema in (
+            {"mode": "observed", "required_fields": ["a"]},
+            {"mode": "observed", "guaranteed_fields": ["a"]},
+            {"mode": "fixed", "fields": ["a: str", "b: str"]},
+        ):
+            transform = FieldMapper({"mapping": {"a": "b"}, "select_only": True, "schema": schema})
+            emitted = frozenset(transform._output_schema_config.get_effective_guaranteed_fields())
+            assert transform.declared_output_fields <= emitted, (schema, sorted(transform.declared_output_fields), sorted(emitted))
+
     def test_open_branch_keeps_the_forwarding_promise_that_arms_the_gate(self) -> None:
         """The consumer half of the FN cure: the open branch answers True.
 

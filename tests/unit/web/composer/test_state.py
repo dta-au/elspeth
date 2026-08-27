@@ -8901,6 +8901,41 @@ class TestSchemaContractValidation:
         assert rule_d_errors, f"Expected a Rule D rejection naming c, got: {[e.message for e in result.errors]}"
         assert "[c] already arrive(s) on its input row" in rule_d_errors[0].message
 
+    def test_rule_d_fires_on_a_required_fields_rename_onto_a_guaranteed_field(self) -> None:
+        """Third declaration channel (adversarial review of a7c783423): required_fields.
+
+        ``schema.required_fields`` is build-time fail-closed against every
+        non-guaranteeing upstream, so it is the same per-row promise as
+        ``guaranteed_fields`` — the same rename must get the same verdict.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["email", "username"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"email": "username"},
+                    "schema": {"mode": "observed", "required_fields": ["email", "username"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert not result.is_valid, "The required_fields spelling must not disarm the collision gate."
+        rule_d_errors = [e for e in result.errors if e.component == "node:rename" and e.error_code == "transform_contract_violation"]
+        assert rule_d_errors, f"Expected a Rule D rejection naming username, got: {[e.message for e in result.errors]}"
+        assert "[username] already arrive(s) on its input row" in rule_d_errors[0].message
+
     def test_rule_d_fires_when_only_one_row_union_arm_delivers_the_field(self) -> None:
         """Rule D rejects a collision carried by a SINGLE fan-in arm.
 

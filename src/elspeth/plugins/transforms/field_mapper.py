@@ -282,7 +282,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:61f28142d0c70fa6"
+    source_file_hash: str | None = "sha256:81d619809f29ad7b"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -479,8 +479,33 @@ class FieldMapper(BaseTransform):
         differently would feed one predicate two answers about one config.
         """
         if cls._emit_set_is_closed(cfg):
-            return set(cfg.schema_config.get_effective_guaranteed_fields())
+            return cls._promised_on_every_input_row(cfg)
         return set(cfg.schema_config.guaranteed_fields or ())
+
+    @classmethod
+    def _promised_on_every_input_row(cls, cfg: FieldMapperConfig) -> set[str]:
+        """Every field the config promises is present on each row reaching ``process``.
+
+        THREE spellings make that promise, and all three must produce one
+        verdict (elspeth-0d1da6dc44; the third found by adversarial review of
+        a7c783423): explicit ``guaranteed_fields``, fixed/flexible-mode
+        required declared ``fields`` (both via
+        ``get_effective_guaranteed_fields``), and ``required_fields`` (via
+        ``get_effective_required_fields``). ``required_fields`` qualifies
+        because ``get_raw_node_required_fields`` feeds the build-time edge
+        contract, which fail-closes against EVERY upstream that does not
+        guarantee the field — measured: an abstaining bare-observed upstream is
+        rejected outright, no abstention skip — so no runnable graph delivers a
+        row lacking one. If that Phase-1 strictness is ever relaxed to skip
+        abstaining upstreams, this limb becomes unsound and must be revisited.
+
+        Shared by the declaration derivation AND the closed-branch emit
+        predicate so the two cannot drift: the emit builder relies on
+        ``declared_output_fields ⊆ guaranteed_targets`` to omit the union
+        (see ``_build_field_mapper_output_schema_config``), which holds only
+        while both sites read the same promise set.
+        """
+        return set(cfg.schema_config.get_effective_guaranteed_fields()) | set(cfg.schema_config.get_effective_required_fields())
 
     @classmethod
     def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:
@@ -495,24 +520,25 @@ class FieldMapper(BaseTransform):
         (elspeth-6ea3619737; the narrowing-vs-arming history is
         elspeth-892161b2d5).
 
-        The input promise is ``get_effective_guaranteed_fields()``, NOT the raw
-        ``guaranteed_fields`` tuple: a ``mode: fixed`` config with required
-        declared fields guarantees them even when ``guaranteed_fields`` is
-        ``None`` — an ABSTAIN, not an explicit zero. The raw read collapsed the
-        two, so on the ``select_only: false`` branch a fixed-schema declaration
-        disarmed every collision gate while the identical promise spelled
-        ``guaranteed_fields: [...]`` armed them — the same real overwrite,
-        opposite verdicts by declaration channel (elspeth-0d1da6dc44).
+        The input promise is ``_promised_on_every_input_row`` — every
+        declaration channel that puts the source on each arriving row, NOT the
+        raw ``guaranteed_fields`` tuple. The raw read collapsed the
+        fixed-schema ABSTAIN into explicit-zero, so on the ``select_only:
+        false`` branch a fixed-schema declaration disarmed every collision gate
+        while the identical promise spelled ``guaranteed_fields: [...]`` armed
+        them — the same real overwrite, opposite verdicts by declaration
+        channel (elspeth-0d1da6dc44); ``required_fields`` was the third such
+        channel.
 
         NOT ``_admitted_input_fields``: that helper answers the EMIT-set
         question for ``_build_field_mapper_output_schema_config`` and stays
         gated on ``_emit_set_is_closed`` (elspeth-c84fa33f75 — an emit-set
         claim on the open branch is a category error). This method asks only
         whether each TARGET is written on every valid row, which is sound on
-        both branches: a valid row necessarily carries every effectively
-        guaranteed source, so its target is written whichever branch emits it.
+        both branches: a valid row necessarily carries every promised source,
+        so its target is written whichever branch emits it.
         """
-        promised_on_input = set(cfg.schema_config.get_effective_guaranteed_fields())
+        promised_on_input = cls._promised_on_every_input_row(cfg)
         return frozenset(
             target
             for source, target in cfg.mapping.items()

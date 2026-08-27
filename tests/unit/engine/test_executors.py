@@ -1553,6 +1553,42 @@ class TestTransformExecutor:
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
             executor.execute_transform(transform, token, ctx)
 
+    def test_open_branch_field_mapper_required_fields_rename_also_collides(self) -> None:
+        """Third declaration channel (adversarial review of a7c783423): required_fields.
+
+        ``schema.required_fields`` feeds the build-time edge contract, which
+        fail-closes against every upstream that does not guarantee the field —
+        so on any runnable graph the field is on every row, the same promise
+        as ``guaranteed_fields``, and the same rename must get the same
+        verdict.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"email": "username"},
+                "schema": {"mode": "observed", "required_fields": ["email", "username"]},
+            }
+        )
+        transform.node_id = "fm_open_required"
+        transform.on_error = "discard"
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("email", python_type=str, original_name="email", required=True, source="declared"),
+                make_field("username", python_type=str, original_name="username", required=True, source="declared"),
+            ),
+            locked=True,
+        )
+        token = _make_token(data={"email": "a@b", "username": "u"}, token_id="tok_open_required", contract=contract)
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            executor.execute_transform(transform, token, ctx)
+
     def test_open_branch_field_mapper_guaranteed_rename_still_collides(self) -> None:
         """Control: the explicit-``guaranteed_fields`` channel keeps its true positive.
 

@@ -32,8 +32,13 @@ is a working document under the normal delivery posture.
     breaks 12 plugins whose `group_by` field sits in both the required-input
     and declared-output sets.
   - field_mapper's `_derive_declared_output_fields` reads
-    `get_effective_guaranteed_fields()` on BOTH branches (fixed-schema required
-    fields now declare rename targets — the elspeth-0d1da6dc44 FN cure), while
+    `_promised_on_every_input_row` — `get_effective_guaranteed_fields() ∪
+    get_effective_required_fields()` — on BOTH branches (fixed-schema required
+    fields AND `required_fields` now declare rename targets — the
+    elspeth-0d1da6dc44 FN cure; the `required_fields` limb is sound ONLY
+    because the build-time edge contract fail-closes against abstaining
+    upstreams — relax that Phase-1 strictness and the limb must be revisited),
+    while
     `_build_field_mapper_output_schema_config` deliberately does NOT union
     `declared_output_fields` back in: the open branch's emit description still
     abstains (elspeth-c84fa33f75 — an emit-set claim there is a category
