@@ -176,6 +176,10 @@ from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
+from elspeth.web.composer.source_demand import (
+    build_source_data_contract_draft,
+    sample_header_for_source,
+)
 from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary
 from elspeth.web.composer.tools import (
     _SESSION_AWARE_TOOL_HANDLERS,
@@ -218,6 +222,7 @@ from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_USER_TERM,
     SOURCE_AUTHORING_KEY,
     InterpretationReviewSite,
+    current_source_data_contract_demand,
     interpretation_sites,
     source_name_from_component_id,
     vague_term_wiring_count,
@@ -1730,6 +1735,27 @@ def _backend_surface_args_for_site(
         draft = ComposerServiceImpl._matching_requirement_draft(options, kind=site.kind, user_term=site.user_term)
         if draft is None:
             return None
+        return (site.component_id, site.user_term, draft)
+
+    if site.kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+        # The data-contract card carries no staged requirement draft — the
+        # draft is SERVER-COMPUTED from the graph's demand backtrace plus the
+        # source's illustrative sample header, exactly as the
+        # request_interpretation_review arm computes it
+        # (tools/sessions.py::_assert_affected_component). The writer boundary
+        # recomputes the same facts from the persisted head under the session
+        # lock and rejects any divergence, so this surfacer can never persist
+        # a stale or forged field list (elspeth-da68332faf work item 2).
+        source_name = source_name_from_component_id(site.component_id)
+        if source_name is None:
+            return None
+        source = state.sources[source_name] if source_name in state.sources else None
+        if source is None or SOURCE_AUTHORING_KEY in source.options:
+            return None
+        demand = current_source_data_contract_demand(state, source_name)
+        if not demand:
+            return None
+        draft = build_source_data_contract_draft(demand, sample_header_for_source(source))
         return (site.component_id, site.user_term, draft)
 
     node = next((candidate for candidate in state.nodes if candidate.id == site.component_id), None)

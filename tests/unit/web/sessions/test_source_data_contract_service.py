@@ -305,6 +305,76 @@ async def test_demand_drift_between_surface_and_resolve_is_refused(service, tmp_
 
 
 @pytest.mark.asyncio
+async def test_settlement_surfacer_mints_the_card_for_a_blocked_uploaded_source(service, tmp_path: Path) -> None:
+    """The kind-general settlement surfacer — the SAME pass the freeform
+    settlement and the guided wire-confirm settlement run
+    (surface_pending_interpretation_reviews_for_state) — mints the
+    data-contract event with the server-computed draft, so a guided session
+    reaching the blocked shape gets its card without a planner tool call."""
+    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+    from elspeth.web.interpretation_state import BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX
+
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+    sid = uuid4()
+    state = await _seed_state(service, session_id=sid, csv_path=str(csv_path), required=["colour"])
+
+    await surface_pending_interpretation_reviews_for_state(
+        state_from_record(state),
+        sessions_service=service,
+        session_id=str(sid),
+        current_state_id=str(state.id),
+        model_identifier="anthropic/test-model",
+        model_version="1",
+        provider="anthropic",
+        composer_skill_hash="0" * 64,
+    )
+
+    events = await service.list_interpretation_events(sid, status="all")
+    contract_events = [event for event in events if event.kind is InterpretationKind.SOURCE_DATA_CONTRACT]
+    assert len(contract_events) == 1
+    event = contract_events[0]
+    assert event.choice is InterpretationChoice.PENDING
+    assert event.affected_node_id == "source"
+    assert (event.tool_call_id or "").startswith(BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX)
+    assert event.llm_draft == _server_draft(("colour", "extra"), ["colour"])
+
+
+@pytest.mark.asyncio
+async def test_settlement_surfacer_skips_card_ineligible_sources(service, tmp_path: Path) -> None:
+    """Composer-authored bound content never gets a data-contract card from
+    the surfacer (the invented_source flow owns it), and neither does a
+    source the pipeline demands nothing from."""
+    from elspeth.web.composer.service import _backend_surface_args_for_site
+    from elspeth.web.interpretation_state import InterpretationReviewSite
+
+    csv_path = tmp_path / "generated.csv"
+    csv_path.write_text("colour\nred\n", encoding="utf-8")
+    state_dict = _uploaded_state_dict(str(csv_path), required=["colour"])
+    source_options = dict(state_dict["sources"]["source"]["options"])
+    source_options["source_authoring"] = {
+        "modality": "llm_generated",
+        "content_hash": "0" * 64,
+        "review_event_id": None,
+        "resolved_kind": None,
+    }
+    state_dict["sources"]["source"]["options"] = source_options
+    from elspeth.web.composer.state import CompositionState
+
+    authored_state = CompositionState.from_dict(state_dict)
+    site = InterpretationReviewSite(
+        component_id="source",
+        component_type="source",
+        user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+        kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+    )
+    assert _backend_surface_args_for_site(authored_state, site) is None
+
+    no_demand_state = CompositionState.from_dict(_uploaded_state_dict(str(csv_path), required=[]))
+    assert _backend_surface_args_for_site(no_demand_state, site) is None
+
+
+@pytest.mark.asyncio
 async def test_amended_resolution_is_refused(service, tmp_path: Path) -> None:
     csv_path = tmp_path / "upload.csv"
     csv_path.write_text("colour\nred\n", encoding="utf-8")
