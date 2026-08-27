@@ -142,6 +142,23 @@ def _unexpected_edge_target(
     raise AssertionError("edge target resolver must not be called")
 
 
+def _identity_edge_target(
+    dag_node_id: str,
+    *,
+    state: CompositionState | None,
+    graph: ExecutionGraph | None,
+    component_type: str | None,
+) -> _EdgePatchTarget:
+    """Resolver double for arms where translation applies but no map exists."""
+    del state, graph
+    return _EdgePatchTarget(
+        component_id=dag_node_id,
+        component_type=component_type,
+        display_name=f"{component_type or 'node'} '{dag_node_id}'",
+        schema_patch_tool_call="patch_node_options()",
+    )
+
+
 def _unexpected_edge_formatter(
     exc: EdgeContractError,
     *,
@@ -169,7 +186,13 @@ def _snapshot() -> PluginAvailabilitySnapshot:
     )
 
 
-def _warning(warning: GraphValidationWarning) -> ValidationWarning:
+def _warning(
+    warning: GraphValidationWarning,
+    *,
+    state: CompositionState | None = None,
+    graph: ExecutionGraph | None = None,
+) -> ValidationWarning:
+    del state, graph
     return ValidationWarning(
         component_id=warning.node_ids[0] if warning.node_ids else None,
         component_type="graph",
@@ -399,7 +422,10 @@ def test_graph_phase_converts_graph_errors_and_propagates_unexpected_errors() ->
         _instantiated(),
         build_graph=_autospec_callable(build_runtime_graph, side_effect=graph_error),
         warning_to_validation_warning=_warning,
-        edge_patch_target_for_node_id=_unexpected_edge_target,
+        # The plain graph-error arm now routes its component id through the
+        # resolver (elspeth-9f21f3c57d); on the build path there is no graph,
+        # so translation is the identity.
+        edge_patch_target_for_node_id=_identity_edge_target,
         format_edge_contract_failure=_unexpected_edge_formatter,
     )
     assert isinstance(failure, PhaseFailure)
@@ -592,12 +618,15 @@ def test_schema_phase_plain_error_and_success_preserve_exact_graph() -> None:
     )
     failure = validate_schema_compatibility(
         _graphed(failing_graph),
-        edge_patch_target_for_node_id=_unexpected_edge_target,
+        # The plain graph-error arm routes its component id through the
+        # resolver now (elspeth-9f21f3c57d); this double keeps it identity.
+        edge_patch_target_for_node_id=_identity_edge_target,
         format_edge_contract_failure=_unexpected_edge_formatter,
     )
     assert isinstance(failure, PhaseFailure)
     assert failure.errors[0].message == "schema mismatch"
     assert failure.errors[0].suggestion is None
+    assert failure.errors[0].component_id == "sink"
 
     graph = _graph()
     graphed = _graphed(graph)

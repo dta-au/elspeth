@@ -21,6 +21,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.plugins.sources.blob_rows import _ROW_FIELDS as _BLOB_ROWS_ROW_FIELDS
 from elspeth.plugins.sources.field_normalization import declarable_field_name
 from elspeth.web.blobs.protocol import BlobIntegrityError
@@ -356,6 +357,13 @@ def _options_with_source_blob_review(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored source options mapping (Tier-3) whose schema block shape is unproven",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns a stamped copy or None to abstain; every malformed-shape branch abstains, never raises",
+)
 def _schema_options_with_guarantees(
     options: Mapping[str, Any],
     guaranteed_fields: Sequence[str],
@@ -381,7 +389,7 @@ def _schema_options_with_guarantees(
     if "columns" in options or "field_mapping" in options:
         return None
     schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else "schema")
-    raw_schema = options.get(schema_key)
+    raw_schema = options[schema_key] if schema_key in options else None
     if raw_schema is None:
         schema: dict[str, Any] = {"mode": "observed"}
     elif isinstance(raw_schema, Mapping):
@@ -390,41 +398,12 @@ def _schema_options_with_guarantees(
         return None
     if "guaranteed_fields" in schema or "fields" in schema:
         return None
-    if schema.get("mode", "observed") != "observed":
+    if "mode" not in schema:
+        schema["mode"] = "observed"
+    if schema["mode"] != "observed":
         return None
-    schema.setdefault("mode", "observed")
     schema["guaranteed_fields"] = list(guaranteed_fields)
     return {**options, schema_key: schema}
-
-
-def _read_blob_content_for_guarantees(
-    session_engine: Engine,
-    session_id: str,
-    blob: BlobToolRecord,
-    *,
-    pending_content: bytes | None,
-) -> str | None:
-    """Best-effort one-version content read for guarantee derivation ONLY.
-
-    Returns ``None`` to abstain on ANY read, integrity, or decode problem so
-    the non-authored bind path stays byte-for-byte as bindable as before the
-    derivation existed (elspeth-da68332faf). The LLM-authored path must NOT
-    use this — its review stamp requires the strict fail-recoverably read in
-    :func:`_resolve_source_blob`.
-    """
-    try:
-        if pending_content is not None:
-            fresh_blob: BlobToolRecord | None = blob
-            data: bytes | None = pending_content
-        else:
-            fresh_blob, data = _locked_read_ready_blob(session_engine, session_id, blob["id"])
-        if fresh_blob is None or fresh_blob["status"] != "ready" or data is None:
-            return None
-        if fresh_blob["content_hash"] != blob["content_hash"]:
-            return None
-        return data.decode("utf-8")
-    except (AuditIntegrityError, BlobIntegrityError, OSError, UnicodeDecodeError):
-        return None
 
 
 def _derived_csv_guarantee_fields(content: str, *, delimiter: str) -> tuple[str, ...] | None:
@@ -433,12 +412,10 @@ def _derived_csv_guarantee_fields(content: str, *, delimiter: str) -> tuple[str,
     All-or-nothing: a partial ``guaranteed_fields`` is a complete-claim
     violation (SchemaConfig docstring, contracts/schema.py) — the documented
     worst option. So one undeclarable header, or two headers collapsing onto
-    one canonical row key (ambiguous evidence), abstains entirely.
+    one canonical row key (ambiguous evidence), abstains entirely. CSV
+    parse/boundary failures propagate — the caller owns the abstention.
     """
-    try:
-        header = _first_nonempty_csv_row(content, delimiter=delimiter)
-    except _CsvContentBoundaryError:
-        return None
+    header = _first_nonempty_csv_row(content, delimiter=delimiter)
     if header is None:
         return None
     fields: list[str] = []
@@ -452,6 +429,13 @@ def _derived_csv_guarantee_fields(content: str, *, delimiter: str) -> tuple[str,
     return tuple(fields)
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored source options (Tier-3) and decoded blob content bytes",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns the stamped options or the caller's options unchanged; every malformed-shape branch abstains, never raises",
+)
 def _options_with_derived_guarantees(
     options: Mapping[str, Any],
     *,
@@ -468,23 +452,66 @@ def _options_with_derived_guarantees(
     evidence and ADR-016 asserts guaranteed fields per row at runtime.
 
     Evidence must be read the way the runtime will read it: a non-comma
-    ``delimiter`` is honoured, and a non-UTF-8 ``encoding`` option abstains
+    ``delimiter`` is honoured, a non-UTF-8 ``encoding`` option abstains
     (bind-time content was decoded as UTF-8, so the runtime's view could
-    differ).
+    differ), and unparseable CSV content abstains via the explicit
+    ``return options`` — the unchanged options ARE the abstention outcome.
     """
     if plugin != "csv" or mime_type != "text/csv":
         return options
-    encoding = options.get("encoding")
+    encoding = options["encoding"] if "encoding" in options else None
     if encoding is not None and (not isinstance(encoding, str) or encoding.lower().replace("-", "").replace("_", "") != "utf8"):
         return options
-    delimiter = options.get("delimiter", ",")
+    delimiter = options["delimiter"] if "delimiter" in options else ","
     if not isinstance(delimiter, str) or len(delimiter) != 1:
         return options
-    fields = _derived_csv_guarantee_fields(content, delimiter=delimiter)
+    try:
+        fields = _derived_csv_guarantee_fields(content, delimiter=delimiter)
+    except _CsvContentBoundaryError:
+        return options
     if fields is None:
         return options
     stamped = _schema_options_with_guarantees(options, fields)
     return options if stamped is None else stamped
+
+
+def _options_with_best_effort_guarantees(
+    options: Mapping[str, Any],
+    *,
+    session_engine: Engine,
+    session_id: str,
+    blob: BlobToolRecord,
+    plugin: str,
+    pending_content: bytes | None,
+) -> Mapping[str, Any]:
+    """Derive guarantees from a best-effort one-version content read.
+
+    For the NON-authored bind path only: any read, integrity, or decode
+    problem returns the caller's options unchanged, so that path stays
+    byte-for-byte as bindable as before the derivation existed
+    (elspeth-da68332faf). The LLM-authored path must NOT use this — its
+    review stamp requires the strict fail-recoverably read in
+    :func:`_resolve_source_blob`.
+    """
+    try:
+        if pending_content is not None:
+            fresh_blob: BlobToolRecord | None = blob
+            data: bytes | None = pending_content
+        else:
+            fresh_blob, data = _locked_read_ready_blob(session_engine, session_id, blob["id"])
+        if fresh_blob is None or fresh_blob["status"] != "ready" or data is None:
+            return options
+        if fresh_blob["content_hash"] != blob["content_hash"]:
+            return options
+        content = data.decode("utf-8")
+    except (AuditIntegrityError, BlobIntegrityError, OSError, UnicodeDecodeError):
+        return options
+    return _options_with_derived_guarantees(
+        options,
+        plugin=plugin,
+        mime_type=blob["mime_type"],
+        content=content,
+    )
 
 
 def _manual_source_authoring_error(*, tool_name: str) -> str:
@@ -694,19 +721,14 @@ def _resolve_source_blob(
         # problem abstains from the stamp and leaves the bind exactly as it
         # was before this derivation existed — run admission remains the
         # custody gate for those failures.
-        guarantee_content = _read_blob_content_for_guarantees(
-            session_engine,
-            session_id,
-            blob,
+        merged_options = _options_with_best_effort_guarantees(
+            merged_options,
+            session_engine=session_engine,
+            session_id=session_id,
+            blob=blob,
+            plugin=plugin,
             pending_content=pending_content,
         )
-        if guarantee_content is not None:
-            merged_options = _options_with_derived_guarantees(
-                merged_options,
-                plugin=plugin,
-                mime_type=blob["mime_type"],
-                content=guarantee_content,
-            )
     canonical_error = _canonical_interpretation_requirement_error(
         merged_options,
         tool_name=tool_name,

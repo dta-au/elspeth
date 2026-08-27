@@ -88,10 +88,13 @@ def test_step1_prefill_survives_guided_get_rebuild(composer_test_client: TestCli
     assert rebuilt_prefill["fields"] == ["name: str", "age: int"]
 
 
-def test_step1_prefill_stays_observed_for_env_var_header(composer_test_client: TestClient) -> None:
+def test_step1_prefill_guarantees_canonical_keys_for_env_var_header(composer_test_client: TestClient) -> None:
     # A Tier-3 uploaded CSV whose header is a ${VAR} placeholder must not be
     # promoted into explicit schema.fields specs: those strings later flow through
     # the runtime YAML loader, where ${VAR} would resolve host env on the CLI path.
+    # The observed+guaranteed_fields fallback (elspeth-da68332faf) carries only
+    # the CANONICAL row key — a validated identifier with no metacharacters —
+    # which is exactly the key runtime header normalization produces per row.
     sess = _create_session(composer_test_client, "step1-prefill-env-header")
     resp = composer_test_client.post(
         f"/api/sessions/{sess}/blobs/inline",
@@ -110,4 +113,4 @@ def test_step1_prefill_stays_observed_for_env_var_header(composer_test_client: T
 
     assert selected["next_turn"]["type"] == "schema_form"
     schema_prefill = selected["next_turn"]["payload"]["prefilled"]["schema"]
-    assert schema_prefill == {"mode": "observed"}
+    assert schema_prefill == {"mode": "observed", "guaranteed_fields": ["aws_secret_access_key", "ok"]}

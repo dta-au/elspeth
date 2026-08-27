@@ -1018,6 +1018,11 @@ class _FakeRuntimeBundle:
     transforms: tuple[Any, ...] = ()
     sinks: dict[str, Any] = field(default_factory=lambda: {"primary": _FakeSinkPlugin()})
     aggregations: dict[str, Any] = field(default_factory=dict)
+    # _audit_safe_plugin_configs (the compiled-id identity swap,
+    # elspeth-ba01834a57) walks every bundle component family, so the fake
+    # must model the full PluginBundle contract or a profiled snapshot fails
+    # the build with AttributeError instead of exercising the swap.
+    collectors: dict[str, Any] = field(default_factory=dict)
 
 
 def _fake_settings() -> _FakeSettings:
@@ -1189,12 +1194,23 @@ def test_canonical_web_validation_lowers_profiled_s3_source_before_runtime_const
 
     assert result.is_valid is True
     assert all(check.passed for check in result.checks)
-    assert len(yaml_generator.rendered_states) == 1
+    # Two renders since elspeth-ba01834a57: the runtime YAML from the LOWERED
+    # state (private bucket binding), then the compiled-id identity YAML from
+    # the AUTHORED state (profile alias only — the private binding must never
+    # feed node identity, matching the run path's audit-safe swap).
+    assert len(yaml_generator.rendered_states) == 2
     rendered_options = yaml_generator.rendered_states[0].sources["source"].options
     assert rendered_options == {
         "bucket": "operator-private-bucket-marker",
         "key": "incoming/records/input.csv",
         "region_name": "ap-southeast-1",
+        "format": "csv",
+        "schema": {"mode": "observed"},
+    }
+    identity_options = yaml_generator.rendered_states[1].sources["source"].options
+    assert dict(identity_options) == {
+        "profile": "demo-input",
+        "key": "records/input.csv",
         "format": "csv",
         "schema": {"mode": "observed"},
     }
@@ -1320,6 +1336,7 @@ class _EdgeSuggestionGraph:
         node_configs: dict[str, dict[str, Any]],
         transform_id_map: dict[int, str],
         sink_id_map: dict[str, str],
+        transform_name_id_map: dict[str, str] | None = None,
         config_gate_id_map: dict[str, str] | None = None,
         aggregation_id_map: dict[str, str] | None = None,
         coalesce_id_map: dict[str, str] | None = None,
@@ -1328,6 +1345,11 @@ class _EdgeSuggestionGraph:
         self._sources = sources
         self._node_configs = node_configs
         self._transform_id_map = transform_id_map
+        # The name-keyed sibling map is the one diagnostics consume
+        # (elspeth-9f21f3c57d); derive it from the positional map's DAG ids
+        # when the test does not spell it out, mirroring the builder invariant
+        # that ``transform_<name>_<hash>`` embeds the settings name.
+        self._transform_name_id_map = transform_name_id_map if transform_name_id_map is not None else {}
         self._sink_id_map = sink_id_map
         self._config_gate_id_map = config_gate_id_map or {}
         self._aggregation_id_map = aggregation_id_map or {}
@@ -1343,6 +1365,9 @@ class _EdgeSuggestionGraph:
 
     def get_transform_id_map(self) -> dict[int, str]:
         return self._transform_id_map
+
+    def get_transform_name_id_map(self) -> dict[str, str]:
+        return self._transform_name_id_map
 
     def get_config_gate_id_map(self) -> dict[str, str]:
         return self._config_gate_id_map
@@ -5602,6 +5627,7 @@ class TestEdgeContractFailureFormatting:
             sources=("source_csv_a1b2c3",),
             node_configs={"source_csv_a1b2c3": {"source_name": "source"}},
             transform_id_map={0: "transform_split_lines_d4e5f6"},
+            transform_name_id_map={"split_lines": "transform_split_lines_d4e5f6"},
             sink_id_map={"results": "sink_results_f7g8h9"},
         )
 
@@ -5656,6 +5682,7 @@ class TestEdgeContractFailureFormatting:
                 "source_csv_refunds_a1b2c3": {"source_name": "refunds"},
             },
             transform_id_map={0: "transform_normalize_d4e5f6"},
+            transform_name_id_map={"normalize": "transform_normalize_d4e5f6"},
             sink_id_map={"results": "sink_results_f7g8h9"},
         )
 
@@ -5663,8 +5690,14 @@ class TestEdgeContractFailureFormatting:
 
         graph.get_source.assert_not_called()
         assert "source 'refunds' (csv)" in suggestion
-        assert "patch_source_options(source_name='refunds', patch={'schema': {...}})" in suggestion
-        assert "patch_source_options(patch={'schema': {...}})" not in suggestion
+        # A missing-fields failure with a SOURCE producer leads with the
+        # concrete guarantee declaration (elspeth-d39ec0c4d9), seeded from the
+        # sorted missing fields and carrying the completeness warning.
+        assert (
+            "patch_source_options(source_name='refunds', patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['refund_id', ...]}})"
+            in suggestion
+        )
+        assert "COMPLETE claim" in suggestion
         assert "patch_node_options(node_id='source_csv_refunds_a1b2c3'" not in suggestion
 
     def test_suggestion_maps_dag_sink_ids_to_output_patch_tool(self) -> None:
@@ -5698,6 +5731,7 @@ class TestEdgeContractFailureFormatting:
             sources=("source_csv_z9y8x7",),
             node_configs={"source_csv_z9y8x7": {"source_name": "source"}},
             transform_id_map={0: "transform_clean_text_a1b2c3"},
+            transform_name_id_map={"clean_text": "transform_clean_text_a1b2c3"},
             sink_id_map={"results": "sink_results_d4e5f6"},
         )
 
@@ -5752,6 +5786,7 @@ class TestEdgeContractFailureFormatting:
             sources=("source_csv_z9y8x7",),
             node_configs={"source_csv_z9y8x7": {"source_name": "source"}},
             transform_id_map={0: "transform_consume_d4e5f6"},
+            transform_name_id_map={"consume": "transform_consume_d4e5f6"},
             sink_id_map={"results": "sink_results_f7g8h9"},
             row_union_id_map={"variant_union": "row_union_variant_union_a1b2c3"},
         )
@@ -5808,6 +5843,7 @@ class TestEdgeContractFailureFormatting:
             sources=("source_csv_z9y8x7",),
             node_configs={"source_csv_z9y8x7": {"source_name": "source"}},
             transform_id_map={0: "transform_control_path_a1b2c3"},
+            transform_name_id_map={"control_path": "transform_control_path_a1b2c3"},
             sink_id_map={"unioned_rows": "sink_results_f7g8h9"},
             row_union_id_map={"variant_union": "row_union_variant_union_d4e5f6"},
         )
@@ -6398,3 +6434,219 @@ class TestValidatePipelineStateShapeMaterialization:
         assert "on_error" in message
         assert "test_node" in _check(result, "blob_inline_refs").detail
         assert result.errors[0].suggestion
+
+
+class TestEdgeContractSourceAndStructuralProducerRemedies:
+    """elspeth-d39ec0c4d9 + elspeth-9f21f3c57d: source producers get the
+    concrete guaranteed_fields repair, plugin-free gate/coalesce producers get
+    the originates-upstream arm, and diagnostics speak composer ids."""
+
+    @staticmethod
+    def _edge_error(
+        *,
+        from_node_id: str,
+        to_node_id: str,
+        missing_fields: tuple[str, ...],
+        from_component_type: str | None,
+        component_type: str = "transform",
+    ) -> EdgeContractError:
+        return EdgeContractError(
+            f"Edge from '{from_node_id}' to '{to_node_id}' invalid",
+            from_node_id=from_node_id,
+            to_node_id=to_node_id,
+            producer_schema_name="(dynamic)",
+            consumer_schema_name="(dynamic)",
+            compatibility_result=CompatibilityResult(compatible=False, missing_fields=missing_fields),
+            component_type=component_type,
+            from_component_type=from_component_type,
+        )
+
+    def test_source_producer_leads_with_concrete_guarantee_repair_on_build_path(self) -> None:
+        """graph=None (the BUILD path — where this family actually fires):
+        the remedy must key on from_component_type, never on graph resolution."""
+        exc = self._edge_error(
+            from_node_id="source_csv_a1b2c3",
+            to_node_id="transform_classify_d4e5f6",
+            missing_fields=("colour",),
+            from_component_type="source",
+        )
+        state = _make_state(
+            source_options={"schema": {"mode": "observed"}},
+            nodes=(),
+            outputs=(_make_output(name="results"),),
+        )
+
+        suggestion = _build_edge_contract_suggestion(exc, state=state, graph=None)
+
+        assert "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['colour', ...]}})" in suggestion
+        assert "COMPLETE claim" in suggestion
+        # Consumer relaxation stays available as the alternative.
+        assert "relax the consumer" in suggestion.lower()
+        # The old generic menu (patch the producer's plugin schema) is gone —
+        # an observed source has no plugin output contract to mis-declare.
+        assert "plugin output schemas are largely baked-in" not in suggestion
+
+    def test_plugin_free_gate_producer_points_at_the_upstream_source(self) -> None:
+        """Session 2e0c8ea3's shape: producer is a plugin-free config gate and
+        both generic options were wrong (comment 8071 on elspeth-71617f1d21)."""
+        exc = self._edge_error(
+            from_node_id="config_gate_fan_out_5176d9a61403",
+            to_node_id="transform_classify_d4e5f6",
+            missing_fields=("colour",),
+            from_component_type="gate",
+        )
+        state = _make_state(
+            source_options={"schema": {"mode": "observed"}},
+            nodes=(),
+            outputs=(_make_output(name="results"),),
+        )
+
+        suggestion = _build_edge_contract_suggestion(exc, state=state, graph=None)
+
+        assert "structural gate" in suggestion
+        assert "no plugin" in suggestion
+        assert "originates at the true producer" in suggestion
+        assert "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['colour', ...]}})" in suggestion
+        assert "COMPLETE claim" in suggestion
+
+    def test_plugin_free_coalesce_producer_gets_the_same_arm(self) -> None:
+        exc = self._edge_error(
+            from_node_id="coalesce_merge_branches_a1b2c3",
+            to_node_id="transform_classify_d4e5f6",
+            missing_fields=("colour",),
+            from_component_type="coalesce",
+        )
+        state = _make_state(
+            source_options={"schema": {"mode": "observed"}},
+            nodes=(),
+            outputs=(_make_output(name="results"),),
+        )
+
+        suggestion = _build_edge_contract_suggestion(exc, state=state, graph=None)
+
+        assert "structural coalesce" in suggestion
+        assert "patch_source_options(" in suggestion
+
+    def test_message_prints_composer_ids_and_aliases_compiled_ids(self) -> None:
+        """With a graph, the headline speaks composer ids; the compiled DAG
+        ids move to a detail line — ALIASED, never truncated."""
+        exc = self._edge_error(
+            from_node_id="source_csv_a1b2c3",
+            to_node_id="transform_classify_d4e5f6",
+            missing_fields=("colour",),
+            from_component_type="source",
+        )
+        state = _make_state(
+            source_options={"schema": {"mode": "observed"}},
+            nodes=(
+                NodeSpec(
+                    id="classify",
+                    node_type="transform",
+                    plugin="llm",
+                    input="classify",
+                    on_success="results",
+                    on_error="discard",
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            outputs=(_make_output(name="results"),),
+        )
+        graph = _EdgeSuggestionGraph(
+            sources=("source_csv_a1b2c3",),
+            node_configs={"source_csv_a1b2c3": {"source_name": "source"}},
+            transform_id_map={0: "transform_classify_d4e5f6"},
+            transform_name_id_map={"classify": "transform_classify_d4e5f6"},
+            sink_id_map={"results": "sink_results_f7g8h9"},
+        )
+
+        message, _suggestion = _format_edge_contract_failure(exc, state=state, graph=graph)
+
+        assert "producer node 'source'" in message
+        assert "consumer node 'classify'" in message
+        assert "Compiled DAG node ids: producer 'source_csv_a1b2c3', consumer 'transform_classify_d4e5f6'." in message
+
+    def test_message_keeps_compiled_ids_verbatim_on_the_build_path(self) -> None:
+        """No graph, no map: the headline keeps the compiled ids IN PLACE and
+        no compiled-detail line is fabricated."""
+        exc = self._edge_error(
+            from_node_id="source_csv_a1b2c3",
+            to_node_id="transform_classify_d4e5f6",
+            missing_fields=("colour",),
+            from_component_type="source",
+        )
+
+        message, _suggestion = _format_edge_contract_failure(exc)
+
+        assert "producer node 'source_csv_a1b2c3'" in message
+        assert "consumer node 'transform_classify_d4e5f6'" in message
+        assert "Compiled DAG node ids" not in message
+
+    def test_transform_attribution_is_name_keyed_not_positional(self) -> None:
+        """Two transforms whose STATE order disagrees with the graph's
+        sequence order: attribution must follow the name map (the positional
+        zip mis-attributed silently)."""
+        first = NodeSpec(
+            id="alpha",
+            node_type="transform",
+            plugin="field_mapper",
+            input="alpha",
+            on_success="beta",
+            on_error="discard",
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        second = NodeSpec(
+            id="beta",
+            node_type="transform",
+            plugin="field_mapper",
+            input="beta",
+            on_success="results",
+            on_error="discard",
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        # State lists beta FIRST — a positional zip would hand beta's id to
+        # the sequence-0 DAG node, which is alpha's.
+        state = _make_state(
+            source_options={"schema": {"mode": "observed"}},
+            nodes=(second, first),
+            outputs=(_make_output(name="results"),),
+        )
+        graph = _EdgeSuggestionGraph(
+            sources=("source_csv_z9y8x7",),
+            node_configs={"source_csv_z9y8x7": {"source_name": "source"}},
+            transform_id_map={0: "transform_alpha_a1b2c3", 1: "transform_beta_d4e5f6"},
+            transform_name_id_map={
+                "alpha": "transform_alpha_a1b2c3",
+                "beta": "transform_beta_d4e5f6",
+            },
+            sink_id_map={"results": "sink_results_f7g8h9"},
+        )
+        exc = self._edge_error(
+            from_node_id="transform_alpha_a1b2c3",
+            to_node_id="transform_beta_d4e5f6",
+            missing_fields=("colour",),
+            from_component_type="transform",
+        )
+
+        suggestion = _build_edge_contract_suggestion(exc, state=state, graph=graph)
+
+        assert "patch_node_options(node_id='beta'" in suggestion
+        assert "patch_node_options(node_id='alpha'" in suggestion
+        assert "patch_node_options(node_id='transform_" not in suggestion

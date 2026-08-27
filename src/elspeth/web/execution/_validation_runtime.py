@@ -78,6 +78,16 @@ class _GraphBuilder(Protocol):
     def __call__(self, settings: ElspethSettings, bundle: PluginBundle) -> ExecutionGraph: ...
 
 
+class _WarningConverter(Protocol):
+    def __call__(
+        self,
+        warning: GraphValidationWarning,
+        *,
+        state: CompositionState | None = None,
+        graph: ExecutionGraph | None = None,
+    ) -> ValidationWarning: ...
+
+
 class _RouteValidator(Protocol):
     def __call__(
         self,
@@ -352,7 +362,7 @@ def validate_graph_structure(
     instantiated: InstantiatedRuntime,
     *,
     build_graph: _GraphBuilder,
-    warning_to_validation_warning: Callable[[GraphValidationWarning], ValidationWarning],
+    warning_to_validation_warning: _WarningConverter,
     edge_patch_target_for_node_id: _EdgePatchTargetResolver,
     format_edge_contract_failure: _EdgeFormatter,
 ) -> PhaseReport[GraphedRuntime] | PhaseFailure:
@@ -361,22 +371,28 @@ def validate_graph_structure(
     Edge compatibility is checked inside the graph BUILD, so a type-mismatch
     edge failure raises here — phase 3's dedicated handler requires a built
     graph and can never see it. This phase owns the same rich edge-contract
-    diagnostics; the graph does not exist when the build raises, so
-    patch-target resolution degrades to the DAG node id by design.
+    diagnostics; the graph does not exist when the BUILD raises, so
+    patch-target resolution degrades to the DAG node id by design — but a
+    failure from ``graph.validate()`` fires AFTER a successful build, and the
+    real graph is then threaded through so diagnostics resolve composer ids
+    (elspeth-9f21f3c57d).
     """
+    policy_state = instantiated.loaded.materialized.authored.policy.state
+    graph: ExecutionGraph | None = None
     try:
         graph = build_graph(instantiated.loaded.settings, instantiated.bundle)
         graph.validate()
-        graph_warnings = tuple(warning_to_validation_warning(warning) for warning in graph.validation_warnings)
+        graph_warnings = tuple(
+            warning_to_validation_warning(warning, state=policy_state, graph=graph) for warning in graph.validation_warnings
+        )
     except EdgeContractError as exc:
-        policy_state = instantiated.loaded.materialized.authored.policy.state
         consumer_target = edge_patch_target_for_node_id(
             exc.to_node_id,
             state=policy_state,
-            graph=None,
+            graph=graph,
             component_type=exc.component_type,
         )
-        message, suggestion = format_edge_contract_failure(exc, state=policy_state, graph=None)
+        message, suggestion = format_edge_contract_failure(exc, state=policy_state, graph=graph)
         error = ValidationError(
             component_id=consumer_target.component_id,
             component_type=consumer_target.component_type,
@@ -397,13 +413,24 @@ def validate_graph_structure(
             semantic_contracts=_semantic_contracts(instantiated.loaded.materialized),
         )
     except GraphValidationError as exc:
+        component_id = exc.component_id
+        component_type = exc.component_type
+        if component_id is not None:
+            target = edge_patch_target_for_node_id(
+                component_id,
+                state=policy_state,
+                graph=graph,
+                component_type=component_type,
+            )
+            component_id = target.component_id
+            component_type = target.component_type
         return PhaseFailure(
             passed_checks=(),
             failed_check=_check(RUNTIME_CHECK_GRAPH_STRUCTURE, passed=False, detail=str(exc)),
             errors=(
                 ValidationError(
-                    component_id=exc.component_id,
-                    component_type=exc.component_type,
+                    component_id=component_id,
+                    component_type=component_type,
                     message=str(exc),
                     suggestion=None,
                     error_code=None,
@@ -412,8 +439,8 @@ def validate_graph_structure(
             readiness=_blocked_readiness(
                 code="graph_structure",
                 detail="Graph validation failed.",
-                component_id=exc.component_id,
-                component_type=exc.component_type,
+                component_id=component_id,
+                component_type=component_type,
             ),
             semantic_contracts=_semantic_contracts(instantiated.loaded.materialized),
         )
@@ -487,10 +514,10 @@ def validate_schema_compatibility(
     format_edge_contract_failure: _EdgeFormatter,
 ) -> PhaseReport[GraphedRuntime] | PhaseFailure:
     """Validate edge schemas using authored policy state for diagnostics."""
+    policy_state = graphed.instantiated.loaded.materialized.authored.policy.state
     try:
         graphed.graph.validate_edge_compatibility()
     except EdgeContractError as exc:
-        policy_state = graphed.instantiated.loaded.materialized.authored.policy.state
         consumer_target = edge_patch_target_for_node_id(
             exc.to_node_id,
             state=policy_state,
@@ -518,9 +545,20 @@ def validate_schema_compatibility(
             semantic_contracts=_semantic_contracts(graphed.instantiated.loaded.materialized),
         )
     except GraphValidationError as exc:
+        component_id = exc.component_id
+        component_type = exc.component_type
+        if component_id is not None:
+            target = edge_patch_target_for_node_id(
+                component_id,
+                state=policy_state,
+                graph=graphed.graph,
+                component_type=component_type,
+            )
+            component_id = target.component_id
+            component_type = target.component_type
         error = ValidationError(
-            component_id=exc.component_id,
-            component_type=exc.component_type,
+            component_id=component_id,
+            component_type=component_type,
             message=str(exc),
             suggestion=None,
             error_code=None,

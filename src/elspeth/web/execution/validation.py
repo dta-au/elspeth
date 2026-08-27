@@ -24,16 +24,18 @@ only to be rejected pre-token at /execute.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
+from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.composer.state import (
     CompositionState,
 )
@@ -79,6 +81,7 @@ from elspeth.web.execution._validation_materialization import (
 from elspeth.web.execution._validation_model import PhaseFailure, PhaseReport, _blocked_readiness
 from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
 from elspeth.web.execution._validation_runtime import (
+    _GraphBuilder,
     build_gate_fan_out_advisory_checks,
     build_identity_advisory_checks,
     build_static_llm_prompt_advisory_checks,
@@ -94,8 +97,11 @@ from elspeth.web.execution.preflight import (
     RUNTIME_CHECK_PLUGIN_INSTANTIATION,
     RUNTIME_CHECK_SCHEMA_COMPATIBILITY,
     RUNTIME_GRAPH_VALIDATION_CHECKS,
+    _audit_safe_plugin_configs,
+    _profiled_plugin_ids,
     build_runtime_graph,
     instantiate_runtime_plugins,
+    resolve_runtime_yaml_paths,
 )
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
@@ -107,6 +113,11 @@ from elspeth.web.execution.schemas import (
     ValidationError,
     ValidationReadiness,
     ValidationResult,
+)
+from elspeth.web.interpretation_state import (
+    InterpretationReviewPending,
+    materialize_state_for_authoring,
+    materialize_state_for_execution,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -185,7 +196,10 @@ def _format_edge_contract_failure(
     tool calls and lead with the consumer-side repair before the narrower
     producer-side alternative.
     """
-    return _format_edge_contract_message(exc), _build_edge_contract_suggestion(exc, state=state, graph=graph)
+    return (
+        _format_edge_contract_message(exc, state=state, graph=graph),
+        _build_edge_contract_suggestion(exc, state=state, graph=graph),
+    )
 
 
 def _skipped_checks(from_check: str, *, already_emitted: frozenset[str] = frozenset()) -> list[ValidationCheck]:
@@ -207,6 +221,67 @@ def _skipped_checks(from_check: str, *, already_emitted: frozenset[str] = frozen
                 )
             )
     return result
+
+
+def _identity_state_for_compiled_ids(authored_state: CompositionState) -> CompositionState:
+    """Select the state whose bytes feed compiled node identity.
+
+    Strict-first regardless of the caller's tolerant/strict lane: the run path
+    hashes the strictly materialized authored options, and hashing those same
+    bytes from both preflight lanes is what keeps ids stable across the
+    tolerant/strict seam (elspeth-ba01834a57 seam B — the tolerant materializer
+    masks placeholders and omits ``resolved_prompt_template_hash``, so
+    lane-local materialization would mint a different id per lane). Only when
+    strict materialization is impossible on the tolerant lane does identity
+    fall back to the authoring-masked state: such a state cannot execute yet,
+    so there is no run id to match, and the fallback keeps tolerant recompiles
+    stable with each other.
+    """
+    try:
+        strict_state = materialize_state_for_execution(authored_state)
+    except ValueError:
+        # Resolved-but-drifted review evidence the strict materializer refuses;
+        # the tolerant lane must keep validating the draft rather than 500.
+        return materialize_state_for_authoring(authored_state)
+    # Nominal discrimination of an ELSPETH-owned closed result union
+    # (the same shape review_interpretations discriminates).
+    if isinstance(strict_state, InterpretationReviewPending):
+        return materialize_state_for_authoring(authored_state)
+    return strict_state
+
+
+def _compiled_identity_settings(
+    authored_state: CompositionState,
+    *,
+    yaml_generator: YamlGenerator,
+    data_dir: Path,
+    session_id: str | None,
+) -> dict[str, Any]:
+    """Mirror the execution service's audit-safe settings for node identity.
+
+    ``build_validated_runtime_graph`` mints compiled node ids for profiled
+    plugins from the AUTHORED options — ``_audit_safe_plugin_configs`` swaps
+    ``plugin.config`` back for the duration of the build — while this module's
+    dry-run used to hash the profile-lowered, secret-resolved config, so
+    preflight and run minted different ids for the same node on every compile
+    (elspeth-ba01834a57, seam A). This helper reproduces the service's exact
+    audit-safe construction (strict materialize -> generate_yaml -> resolve
+    runtime paths -> bounded load) so the preflight build can run under the
+    same swap and mint run-identical ids.
+
+    ``generate_yaml`` is deliberately unguarded, mirroring the execution
+    service's call on this same authored state: every ``PipelineLoweringError``
+    site is a spec-shape defect independent of option payloads, and the
+    caller only reaches this helper after ``materialize_validation_yaml``
+    generated the same spec shapes successfully — a raise here is a
+    yaml-generator bug that must surface (W18), not a state to tolerate.
+    """
+    identity_yaml = yaml_generator.generate_yaml(_identity_state_for_compiled_ids(authored_state))
+    identity_yaml = resolve_runtime_yaml_paths(identity_yaml, str(data_dir), session_id=session_id)
+    loaded = load_bounded_pipeline_yaml(identity_yaml)
+    if type(loaded) is not dict:
+        raise TypeError(f"generate_yaml() produced non-dict YAML (got {type(loaded).__name__}) — this is a bug in the YAML generator")
+    return cast(dict[str, Any], loaded)
 
 
 @observation_boundary(
@@ -463,11 +538,40 @@ def _validate_pipeline_impl(
         ),
     )
     value_source_validated = _apply_phase(ledger, validate_value_source_compliance(instantiated))
+    # Compiled node identity must match what the run path will mint
+    # (elspeth-ba01834a57): the execution service builds its graph under
+    # _audit_safe_plugin_configs, which hashes AUTHORED options for every
+    # operator-profiled plugin, while this dry-run built bare and hashed the
+    # lowered, secret-resolved config — a different id for the same node on
+    # every compile. Reproduce the service's swap here so preflight-minted ids
+    # join against persisted run/diagnostic ids. The validation itself still
+    # runs against the lowered/materialized runtime config — only the identity
+    # input changes. Trained-operator execution never builds with audit-safe
+    # settings (service.py leaves audit_safe_config None in that mode), so its
+    # preflight stays unwrapped to keep matching its own run path.
+    build_graph: _GraphBuilder = dependencies.build_graph
+    if not plugin_snapshot.is_trained_operator and _profiled_plugin_ids(plugin_snapshot):
+        identity_settings = _compiled_identity_settings(
+            value_source_validated.loaded.materialized.authored.policy.authored_state,
+            yaml_generator=yaml_generator,
+            data_dir=settings.data_dir,
+            session_id=session_id,
+        )
+
+        def _build_graph_under_authored_identity(settings: ElspethSettings, bundle: PluginBundle) -> ExecutionGraph:
+            with _audit_safe_plugin_configs(
+                bundle,
+                audit_safe_settings=identity_settings,
+                plugin_snapshot=plugin_snapshot,
+            ):
+                return dependencies.build_graph(settings, bundle)
+
+        build_graph = _build_graph_under_authored_identity
     graphed = _apply_phase(
         ledger,
         validate_graph_structure(
             value_source_validated,
-            build_graph=dependencies.build_graph,
+            build_graph=build_graph,
             warning_to_validation_warning=_graph_warning_to_validation_warning,
             edge_patch_target_for_node_id=_edge_patch_target_for_node_id,
             format_edge_contract_failure=_format_edge_contract_failure,
