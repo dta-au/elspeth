@@ -172,6 +172,7 @@ function App() {
   const applyRecoveredState = useSessionStore((s) => s.applyRecoveredState);
   const discardRecovery = useSessionStore((s) => s.discardRecovery);
   const pendingFanoutGuard = useExecutionStore((s) => s.pendingFanoutGuard);
+  const pendingSecretGuard = useExecutionStore((s) => s.pendingSecretGuard);
   const bootstrapPrefs = usePreferencesStore((s) => s.bootstrap);
   const preferencesLoaded = usePreferencesStore((s) => s.loaded);
   const tutorialCompleted = usePreferencesStore(selectTutorialCompleted);
@@ -290,6 +291,22 @@ function App() {
   }, []);
   const dismissFanoutGuard = useCallback(() => {
     useExecutionStore.getState().dismissFanoutGuard();
+  }, []);
+  const confirmSecretExecution = useCallback(async () => {
+    const runId = await useExecutionStore.getState().confirmSecretExecution();
+    // Same Run-artifact switch as the fanout confirm above: keyed on a real
+    // run_id — a follow-on fanout 428, stale-readiness settle, or re-keyed
+    // secret guard all return null and must not switch tabs.
+    if (typeof runId === "string") {
+      dispatchArtifactViewIntent({
+        tab: "run",
+        focusMode: false,
+        sessionId: useSessionStore.getState().activeSessionId,
+      });
+    }
+  }, []);
+  const dismissSecretGuard = useCallback(() => {
+    useExecutionStore.getState().dismissSecretGuard();
   }, []);
 
   // Check backend health. healthChecking/lastHealthCheckAt exist because a
@@ -842,6 +859,30 @@ function App() {
           onApply={applyRecoveredState}
           onDiscard={discardRecovery}
         />
+        {pendingSecretGuard && (
+          <ConfirmDialog
+            title="Approve secret use"
+            message={pendingSecretGuard.summary}
+            confirmLabel="Approve and execute"
+            cancelLabel="Cancel"
+            variant="danger"
+            onConfirm={confirmSecretExecution}
+            onCancel={dismissSecretGuard}
+          >
+            <ul className="run-disclosure-summary">
+              {pendingSecretGuard.wirings.map((wiring) => (
+                <li
+                  key={`${wiring.component_id}:${wiring.option_key}:${wiring.secret_name}`}
+                >
+                  {`${wiring.secret_name} → ${wiring.component_id} (${wiring.plugin}) ${wiring.option_key}`}
+                </li>
+              ))}
+            </ul>
+            <p className="confirm-dialog-message">
+              Approving allows this exact pipeline to use the named secrets.
+            </p>
+          </ConfirmDialog>
+        )}
         {pendingFanoutGuard && (
           <ConfirmDialog
             title="Review LLM provider calls"

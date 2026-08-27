@@ -1089,6 +1089,27 @@ export interface ExecutionFanoutAck {
   accepted: true;
 }
 
+// ── Execution Secret Guard ─────────────────────────────────────────────────
+
+export interface ExecutionSecretWiring {
+  secret_name: string;
+  component_id: string;
+  component_type: "source" | "transform" | "sink";
+  plugin: string;
+  option_key: string;
+}
+
+export interface ExecutionSecretGuard {
+  ack_token: string;
+  summary: string;
+  wirings: ExecutionSecretWiring[];
+}
+
+export interface ExecutionSecretAck {
+  token: string;
+  accepted: true;
+}
+
 // ── API Error Envelope ──────────────────────────────────────────────────────
 
 /**
@@ -1150,6 +1171,7 @@ export interface ApiError {
   partial_state_save_failed?: boolean;
   partial_state_save_error?: string | null;
   fanout_guard?: ExecutionFanoutGuard;
+  secret_guard?: ExecutionSecretGuard;
   provider_detail?: string;
   provider_status_code?: number;
   validation_errors?: ValidationError[];

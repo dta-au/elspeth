@@ -932,7 +932,11 @@ class TestStep3SecretTierMigration:
     def test_wire_secret_ref(self) -> None:
         assert self._get("wire_secret_ref") == {
             "name": "wire_secret_ref",
-            "description": "Place a secret reference marker in the pipeline config. The secret will be resolved at execution time.",
+            "description": (
+                "Place a secret reference marker in the pipeline config. The secret will be resolved at execution time. "
+                "Wiring is deny-by-default: the deployment's server-authored secret wiring allowlist must authorize the "
+                "exact secret/component/option destination, and a denial cannot be repaired by retrying."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

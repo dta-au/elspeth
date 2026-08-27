@@ -207,6 +207,7 @@ payload_store:
         get_landscape_url=lambda: settings.landscape.url,
         get_payload_store_path=lambda: settings.payload_store.base_path,
         get_session_db_url=lambda: f"sqlite:///{tmp_path / 'sessions.db'}",
+        secret_wiring_allowlist=(),
     )
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)

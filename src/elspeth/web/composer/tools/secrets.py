@@ -27,6 +27,7 @@ from elspeth.web.composer.tools.declarations import (
     ToolKind,
 )
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
+from elspeth.web.secrets.wiring_policy import secret_wiring_authorization_error
 
 
 # Tier-3 argument-shape models.  Secret tools are POLICY-driven in the
@@ -222,6 +223,15 @@ def _execute_wire_secret_ref(
         source = state.sources[source_name] if source_name in state.sources else None
         if source is None:
             return _failure_result(state, f"Source '{source_name}' not found.")
+        authorization_error = secret_wiring_authorization_error(
+            context.secret_wiring_policy,
+            secret_name=name,
+            component_type="source",
+            plugin=source.plugin,
+            option_key=option_key,
+        )
+        if authorization_error is not None:
+            return _failure_result(state, authorization_error)
         patched_options = dict(deep_thaw(source.options))
         patched_options[option_key] = marker
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(source.plugin, patched_options)
@@ -246,6 +256,17 @@ def _execute_wire_secret_ref(
                 state,
                 "Secret references can only be wired into source, transform, aggregation, or output plugin options.",
             )
+        # ``"transform"`` covers aggregation nodes too — the same vocabulary
+        # ``_secret_ref_placement_error`` uses for this arm below.
+        authorization_error = secret_wiring_authorization_error(
+            context.secret_wiring_policy,
+            secret_name=name,
+            component_type="transform",
+            plugin=node.plugin,
+            option_key=option_key,
+        )
+        if authorization_error is not None:
+            return _failure_result(state, authorization_error)
         patched_options = dict(deep_thaw(node.options))
         patched_options[option_key] = marker
         placement_error = _secret_ref_placement_error("transform", node.plugin, patched_options)
@@ -264,6 +285,15 @@ def _execute_wire_secret_ref(
         output = next((o for o in state.outputs if o.name == target_id), None)
         if output is None:
             return _failure_result(state, f"Output '{target_id}' not found.")
+        authorization_error = secret_wiring_authorization_error(
+            context.secret_wiring_policy,
+            secret_name=name,
+            component_type="sink",
+            plugin=output.plugin,
+            option_key=option_key,
+        )
+        if authorization_error is not None:
+            return _failure_result(state, authorization_error)
         patched_options = dict(deep_thaw(output.options))
         patched_options[option_key] = marker
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(output.plugin, patched_options)
@@ -281,7 +311,11 @@ _WIRE_SECRET_REF_DECLARATION = ToolDeclaration(
     name="wire_secret_ref",
     handler=_execute_wire_secret_ref,
     kind=ToolKind.SECRET_MUTATION,
-    description="Place a secret reference marker in the pipeline config. The secret will be resolved at execution time.",
+    description=(
+        "Place a secret reference marker in the pipeline config. The secret will be resolved at execution time. "
+        "Wiring is deny-by-default: the deployment's server-authored secret wiring allowlist must authorize the "
+        "exact secret/component/option destination, and a denial cannot be repaired by retrying."
+    ),
     json_schema={
         "type": "object",
         "properties": {

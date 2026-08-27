@@ -34,6 +34,20 @@ from elspeth.web.execution.schemas import SemanticEdgeContractResponse, Validati
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.service import ScopedSecretResolver
+from elspeth.web.secrets.wiring_policy import SecretWiringComponentType, SecretWiringPolicy, SecretWiringRule
+
+
+def _authorizing_policy(secret: str, component_type: str, plugin: str, option_key: str) -> SecretWiringPolicy:
+    return SecretWiringPolicy(
+        rules=(
+            SecretWiringRule(
+                secret=secret,
+                component_type=cast(SecretWiringComponentType, component_type),
+                plugin=plugin,
+                option_key=option_key,
+            ),
+        )
+    )
 
 
 def _source(options: dict[str, object] | None = None, *, plugin: str = "csv", on_success: str = "node_in") -> SourceSpec:
@@ -198,6 +212,7 @@ def test_scoped_secret_marker_accepts_owned_nominal_resolver() -> None:
         _policy(state),
         secret_service=_OwnedScopedSecretService(frozenset({"API_KEY"})),
         user_id="alice",
+        secret_wiring_policy=_authorizing_policy("API_KEY", "source", "csv", "api_key"),
     )
 
     assert isinstance(result, PhaseReport)
@@ -402,6 +417,7 @@ def test_secret_phase_returns_typed_evidence() -> None:
         _policy(state),
         secret_service=_SecretService(frozenset({"API_KEY"})),
         user_id="alice",
+        secret_wiring_policy=_authorizing_policy("API_KEY", "source", "csv", "api_key"),
     )
 
     assert isinstance(result, PhaseReport)
@@ -409,6 +425,70 @@ def test_secret_phase_returns_typed_evidence() -> None:
     assert result.artifact.all_secret_refs == (("API_KEY", None),)
     assert result.artifact.env_ref_names == frozenset({"API_KEY"})
     assert result.checks[0].name == "secret_refs"
+    assert result.checks[0].outcome_code == "secret_refs.resolved"
+
+
+def test_secret_phase_denies_unauthorized_wiring_by_default() -> None:
+    """A wired secret with no allowlist rule fails closed — however the
+    marker entered the composition (elspeth-f3c1aafd25)."""
+    state = _state(source=_source({"api_key": {"secret_ref": "API_KEY"}}))
+
+    result = validate_secret_evidence(
+        _policy(state),
+        secret_service=_SecretService(frozenset({"API_KEY"})),
+        user_id="alice",
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "secret_refs"
+    assert [error.error_code for error in result.errors] == ["unauthorized_secret_ref"]
+    assert "API_KEY" in result.errors[0].message
+    assert "secret_wiring_allowlist" in result.errors[0].message
+
+
+def test_secret_phase_denies_near_miss_rule_on_node_and_output() -> None:
+    """The rule must match the exact component/plugin/option — near-miss denies."""
+    state = _state(
+        source=_source({"path": "/data/in.csv"}),
+        nodes=(_node(options={"api_key": {"secret_ref": "API_KEY"}}),),
+        outputs=(_output({"token": {"secret_ref": "SINK_TOKEN"}}),),
+    )
+
+    result = validate_secret_evidence(
+        _policy(state),
+        secret_service=_SecretService(frozenset({"API_KEY", "SINK_TOKEN"})),
+        user_id="alice",
+        # Authorizes the node wiring only — the sink wiring stays denied.
+        secret_wiring_policy=_authorizing_policy("API_KEY", "transform", "value_transform", "api_key"),
+    )
+
+    assert isinstance(result, PhaseFailure)
+    unauthorized = [error for error in result.errors if error.error_code == "unauthorized_secret_ref"]
+    assert [error.component_id for error in unauthorized] == ["primary"]
+    assert "SINK_TOKEN" in unauthorized[0].message
+
+
+def test_secret_phase_authorizes_exact_rules_across_all_components() -> None:
+    state = _state(
+        source=_source({"api_key": {"secret_ref": "SRC_KEY"}}),
+        nodes=(_node(options={"api_key": {"secret_ref": "NODE_KEY"}}),),
+        outputs=(_output({"token": {"secret_ref": "SINK_TOKEN"}}),),
+    )
+
+    result = validate_secret_evidence(
+        _policy(state),
+        secret_service=_SecretService(frozenset({"SRC_KEY", "NODE_KEY", "SINK_TOKEN"})),
+        user_id="alice",
+        secret_wiring_policy=SecretWiringPolicy(
+            rules=(
+                SecretWiringRule(secret="SRC_KEY", component_type="source", plugin="csv", option_key="api_key"),
+                SecretWiringRule(secret="NODE_KEY", component_type="transform", plugin="value_transform", option_key="api_key"),
+                SecretWiringRule(secret="SINK_TOKEN", component_type="sink", plugin="csv", option_key="token"),
+            )
+        ),
+    )
+
+    assert isinstance(result, PhaseReport)
     assert result.checks[0].outcome_code == "secret_refs.resolved"
 
 

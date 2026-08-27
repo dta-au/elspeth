@@ -587,6 +587,7 @@ describe("executionStore fanout guard", () => {
     expect(executePipeline).toHaveBeenCalledWith(
       "session-1",
       undefined,
+      undefined,
       "state-1",
     );
     expect(state.pendingFanoutGuard).toEqual(guard);
@@ -618,6 +619,7 @@ describe("executionStore fanout guard", () => {
         accepted: true,
         token: "ack-line-explode",
       },
+      undefined,
       "state-1",
     );
     expect(state.pendingFanoutGuard).toBeNull();
@@ -778,6 +780,232 @@ describe("executionStore fanout guard", () => {
     // re-arms the dialog for a new explicit confirmation.
     expect(state.pendingFanoutGuard).toEqual(freshGuard);
     expect(state.pendingFanoutSessionId).toBe("session-1");
+  });
+});
+
+describe("executionStore secret guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useExecutionStore.getState().reset();
+    resetInterpretationStore();
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: { id: "state-1", version: 1, sources: {}, nodes: [], edges: [], outputs: [] },
+    } as never);
+  });
+
+  const secretGuard = {
+    ack_token: "secret-ack-1",
+    summary: "This run uses 1 stored secret.",
+    wirings: [
+      {
+        secret_name: "OPENROUTER_API_KEY",
+        component_id: "classify_line",
+        component_type: "transform" as const,
+        plugin: "llm_transform",
+        option_key: "api_key",
+      },
+    ],
+  };
+
+  const fanoutGuard = {
+    ack_token: "fanout-ack-1",
+    risk_level: "high" as const,
+    summary: "LLM transform 'classify_line' may make an unknown number of OpenRouter calls.",
+    risks: [],
+  };
+
+  it("holds a 428 secret guard for explicit user approval", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValue({
+      status: 428,
+      detail: secretGuard.summary,
+      error_type: "execution_secret_approval_required",
+      secret_guard: secretGuard,
+    });
+
+    const runId = await useExecutionStore.getState().execute("session-1");
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(executePipeline).toHaveBeenCalledWith(
+      "session-1",
+      undefined,
+      undefined,
+      "state-1",
+    );
+    expect(state.pendingSecretGuard).toEqual(secretGuard);
+    expect(state.pendingSecretSessionId).toBe("session-1");
+    expect(state.isExecuting).toBe(false);
+    expect(state.error).toBeNull();
+  });
+
+  it("retries execution with the approved secret guard token", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: secretGuard.summary,
+        error_type: "execution_secret_approval_required",
+        secret_guard: secretGuard,
+      })
+      .mockResolvedValueOnce({ run_id: "run-1" });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    const runId = await useExecutionStore.getState().confirmSecretExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBe("run-1");
+    expect(executePipeline).toHaveBeenLastCalledWith(
+      "session-1",
+      undefined,
+      {
+        accepted: true,
+        token: "secret-ack-1",
+      },
+      "state-1",
+    );
+    expect(state.pendingSecretGuard).toBeNull();
+    expect(state.pendingSecretSessionId).toBeNull();
+    expect(state.activeRunId).toBe("run-1");
+  });
+
+  it("carries both tokens when the fanout guard fires after the secret approval", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: secretGuard.summary,
+        error_type: "execution_secret_approval_required",
+        secret_guard: secretGuard,
+      })
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: fanoutGuard.summary,
+        error_type: "execution_fanout_ack_required",
+        fanout_guard: fanoutGuard,
+      })
+      .mockResolvedValueOnce({ run_id: "run-1" });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    const secretRunId = await useExecutionStore
+      .getState()
+      .confirmSecretExecution();
+
+    // The approved secret dispatch hit the fanout guard: no run yet, the
+    // fanout dialog arms, and the approved secret token is held for the
+    // acknowledged re-send.
+    expect(secretRunId).toBeNull();
+    const armed = useExecutionStore.getState();
+    expect(armed.pendingSecretGuard).toBeNull();
+    expect(armed.pendingFanoutGuard).toEqual(fanoutGuard);
+    expect(armed.pendingFanoutSessionId).toBe("session-1");
+
+    const runId = await useExecutionStore.getState().confirmFanoutExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBe("run-1");
+    expect(executePipeline).toHaveBeenLastCalledWith(
+      "session-1",
+      {
+        accepted: true,
+        token: "fanout-ack-1",
+      },
+      {
+        accepted: true,
+        token: "secret-ack-1",
+      },
+      "state-1",
+    );
+    expect(state.pendingFanoutGuard).toBeNull();
+    expect(state.pendingFanoutSessionId).toBeNull();
+    expect(state.activeRunId).toBe("run-1");
+  });
+
+  it("settles a stale secret guard without executing when live readiness is false", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 428,
+      detail: secretGuard.summary,
+      error_type: "execution_secret_approval_required",
+      secret_guard: secretGuard,
+    });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    useExecutionStore.getState().setValidationResult(
+      makeValidationResult({
+        readiness: EXECUTION_BLOCKED_VALIDATION_READINESS,
+      }),
+    );
+
+    const runId = await useExecutionStore.getState().confirmSecretExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(executePipeline).toHaveBeenCalledTimes(1);
+    expect(state.pendingSecretGuard).toBeNull();
+    expect(state.pendingSecretSessionId).toBeNull();
+    expect(state.isExecuting).toBe(false);
+    expect(state.error).toBe(
+      "This pipeline is no longer ready to run. Validate it again before executing.",
+    );
+  });
+
+  it("restores the guard when the approved dispatch itself returns a fresh 428", async () => {
+    const { executePipeline } = await import("@/api/client");
+    const freshGuard = { ...secretGuard, ack_token: "secret-ack-rotated" };
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: secretGuard.summary,
+        error_type: "execution_secret_approval_required",
+        secret_guard: secretGuard,
+      })
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: freshGuard.summary,
+        error_type: "execution_secret_approval_required",
+        secret_guard: freshGuard,
+      });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    const runId = await useExecutionStore.getState().confirmSecretExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    // Atomic settle must not dead-end a re-keyed token: the fresh guard
+    // re-arms the dialog for a new explicit approval.
+    expect(state.pendingSecretGuard).toEqual(freshGuard);
+    expect(state.pendingSecretSessionId).toBe("session-1");
+  });
+
+  it("drops a late secret guard after the active session changes", async () => {
+    const { executePipeline } = await import("@/api/client");
+    const pendingExecute = deferred<never>();
+    (executePipeline as ReturnType<typeof vi.fn>).mockReturnValue(
+      pendingExecute.promise,
+    );
+
+    const executePromise = useExecutionStore.getState().execute("session-1");
+    useSessionStore.setState({ activeSessionId: "session-2" } as never);
+    pendingExecute.reject({
+      status: 428,
+      detail: secretGuard.summary,
+      error_type: "execution_secret_approval_required",
+      secret_guard: secretGuard,
+    });
+    const runId = await executePromise;
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(state.pendingSecretGuard).toBeNull();
+    expect(state.pendingSecretSessionId).toBeNull();
+    expect(state.error).toBeNull();
+    expect(state.isExecuting).toBe(false);
   });
 });
 

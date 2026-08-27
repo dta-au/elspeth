@@ -193,6 +193,25 @@ class SecretRefPlacementViolation:
     secret_name: str
 
 
+@dataclass(frozen=True, slots=True)
+class SecretRefMarkerSite:
+    """One wired deferred-secret use: which secret, at which option path.
+
+    Names and paths only — never values. Produced by
+    ``collect_secret_ref_marker_sites``, the single marker-walk authority:
+    the secret-wiring authorization gate (elspeth-f3c1aafd25) consumes every
+    site regardless of which entry path (wire tool, patch tool,
+    set_pipeline, YAML paste) introduced it, and the placement check derives
+    its violations from the same walk. ``field_name`` is the immediate
+    containing key (exact, not parsed back out of ``field_path`` — keys may
+    contain dots); empty for a root-level marker.
+    """
+
+    field_path: str
+    field_name: str
+    secret_name: str
+
+
 @runtime_checkable
 class WebSecretResolver(Protocol):
     """Protocol for web-facing secret resolution and inventory."""

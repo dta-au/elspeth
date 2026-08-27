@@ -203,10 +203,25 @@ vi.mock("./components/common/ShortcutsHelp", () => ({
 }));
 
 vi.mock("./components/common/ConfirmDialog", () => ({
-  // Exposes onConfirm so the fanout-guard confirm path (the only App-level
-  // ConfirmDialog) can be exercised without the real dialog chrome.
-  ConfirmDialog: ({ onConfirm }: { onConfirm?: () => void }) => (
+  // Exposes onConfirm so the App-level guard confirm paths (fanout and
+  // secret-approval ConfirmDialogs — never mounted simultaneously) can be
+  // exercised without the real dialog chrome; renders title, message, and
+  // children so the secret guard's wirings disclosure is assertable.
+  ConfirmDialog: ({
+    title,
+    message,
+    onConfirm,
+    children,
+  }: {
+    title?: string;
+    message?: string;
+    onConfirm?: () => void;
+    children?: React.ReactNode;
+  }) => (
     <div data-testid="confirm-dialog-stub">
+      <div>{title}</div>
+      <div>{message}</div>
+      {children}
       <button type="button" onClick={() => onConfirm?.()}>
         Stub confirm
       </button>
@@ -1101,6 +1116,131 @@ describe("App banner roles", () => {
 
     await act(async () => Promise.resolve());
     expect(confirmFanoutExecution).toHaveBeenCalledTimes(1);
+    expect(artifactRequests).toEqual([]);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+
+  it("renders the secret guard's summary and disclosed wirings", async () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    act(() => {
+      useExecutionStore.setState({
+        pendingSecretGuard: {
+          ack_token: "secret-ack-1",
+          summary: "This run uses 2 stored secrets.",
+          wirings: [
+            {
+              secret_name: "OPENROUTER_API_KEY",
+              component_id: "classify_line",
+              component_type: "transform",
+              plugin: "llm_transform",
+              option_key: "api_key",
+            },
+            {
+              secret_name: "PG_PASSWORD",
+              component_id: "load_rows",
+              component_type: "source",
+              plugin: "postgres",
+              option_key: "password",
+            },
+          ],
+        },
+        pendingSecretSessionId: "session-1",
+      } as never);
+    });
+
+    expect(screen.getByText("Approve secret use")).toBeInTheDocument();
+    expect(
+      screen.getByText("This run uses 2 stored secrets."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("OPENROUTER_API_KEY → classify_line (llm_transform) api_key"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("PG_PASSWORD → load_rows (postgres) password"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Approving allows this exact pipeline to use the named secrets.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("switches to the Run artifact after a confirmed secret approval", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    const confirmSecretExecution = vi.fn().mockResolvedValue("run-77");
+    act(() => {
+      useExecutionStore.setState({
+        pendingSecretGuard: {
+          ack_token: "secret-ack-1",
+          summary: "This run uses 1 stored secret.",
+          wirings: [],
+        },
+        pendingSecretSessionId: "session-1",
+        confirmSecretExecution,
+      } as never);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub confirm" }));
+
+    await waitFor(() =>
+      expect(artifactRequests).toEqual([
+        { tab: "run", focusMode: false, sessionId: "session-1" },
+      ]),
+    );
+    expect(confirmSecretExecution).toHaveBeenCalledTimes(1);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+
+  it("does not switch artifacts when the confirmed secret dispatch fails", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    // Follow-on fanout 428, stale readiness, and re-keyed secret guards all
+    // resolve null from the store.
+    const confirmSecretExecution = vi.fn().mockResolvedValue(null);
+    act(() => {
+      useExecutionStore.setState({
+        pendingSecretGuard: {
+          ack_token: "secret-ack-1",
+          summary: "This run uses 1 stored secret.",
+          wirings: [],
+        },
+        pendingSecretSessionId: "session-1",
+        confirmSecretExecution,
+      } as never);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub confirm" }));
+
+    await act(async () => Promise.resolve());
+    expect(confirmSecretExecution).toHaveBeenCalledTimes(1);
     expect(artifactRequests).toEqual([]);
     window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
   });

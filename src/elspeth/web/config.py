@@ -35,6 +35,7 @@ from elspeth.web.auth.urls import (
 )
 from elspeth.web.composer.reasoning import ReasoningEffort
 from elspeth.web.plugin_policy.profiles import AWSS3SourceProfileSettings, AWSTextractProfileSettings
+from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 from elspeth.web.validation import (
     SERVER_SECRET_RESERVED_PREFIX,
     is_reserved_server_secret_name,
@@ -437,6 +438,13 @@ class WebSettings(BaseModel):
         "ANTHROPIC_API_KEY",
         "AZURE_API_KEY",
     )
+    # Server-authored secret→destination allowlist (elspeth-f3c1aafd25).
+    # Secret WIRING is deny-by-default: with no rules, wire_secret_ref and
+    # every other marker entry path is refused at validation. Each rule
+    # authorizes one exact (secret, component_type, plugin, option_key)
+    # destination. This is deliberately distinct from server_secret_allowlist,
+    # which only exposes a server secret's NAME to users.
+    secret_wiring_allowlist: tuple[SecretWiringRuleSettings, ...] = ()
     # Universal web plugin policy.  These user-facing Pydantic values are
     # converted immediately to RuntimeWebPluginConfig before consumption.
     plugin_allowlist: tuple[str, ...] = ()
@@ -1210,6 +1218,7 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
         "bedrock_guardrail_profiles",
         "aws_s3_source_profiles",
         "aws_textract_profiles",
+        "secret_wiring_allowlist",
     }
 )
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(

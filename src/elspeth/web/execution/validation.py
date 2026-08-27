@@ -122,6 +122,7 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 
 _CHECK_SETTINGS = CHECK_SETTINGS
 _CHECK_PLUGINS = RUNTIME_CHECK_PLUGIN_INSTANTIATION
@@ -317,6 +318,7 @@ def validate_pipeline(
     profile_registry: OperatorProfileRegistry | None,
     catalog: CatalogService,
     secret_service: WebSecretResolver | None = None,
+    secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
     allow_pending_interpretation_placeholders: bool = False,
@@ -339,6 +341,7 @@ def validate_pipeline(
         profile_registry=profile_registry,
         catalog=catalog,
         secret_service=secret_service,
+        secret_wiring_policy=secret_wiring_policy,
         user_id=user_id,
         blob_get_metadata=blob_get_metadata,
         allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
@@ -355,6 +358,7 @@ def _validate_pipeline_impl(
     profile_registry: OperatorProfileRegistry | None,
     catalog: CatalogService,
     secret_service: WebSecretResolver | None = None,
+    secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
     allow_pending_interpretation_placeholders: bool = False,
@@ -473,6 +477,7 @@ def _validate_pipeline_impl(
             resource_validated,
             secret_service=secret_service,
             user_id=user_id,
+            secret_wiring_policy=secret_wiring_policy,
         ),
     )
     semantic_validated = _apply_phase(

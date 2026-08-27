@@ -37,6 +37,7 @@ from elspeth.contracts.composer_progress import ComposerProgressReason, Composer
 from elspeth.contracts.errors import FailedTurnMetadata
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationResult
+from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # Route-owned provenance marker carried only inside Composer's in-process chat
@@ -1216,6 +1217,9 @@ class ComposerSettings(Protocol):
 
     @property
     def max_blob_storage_per_session_bytes(self) -> int: ...
+
+    @property
+    def secret_wiring_allowlist(self) -> tuple[SecretWiringRuleSettings, ...]: ...
 
     @property
     def data_dir(self) -> Any: ...

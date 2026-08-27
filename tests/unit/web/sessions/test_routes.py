@@ -11060,10 +11060,11 @@ async def test_state_data_adjudicated_clean_save_still_clears_prior_gate() -> No
 @pytest.mark.asyncio
 async def test_runtime_preflight_for_state_threads_session_id_to_validate_pipeline(monkeypatch) -> None:
     """The runtime wrapper must preserve the session-scoped sink allowlist."""
+    from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
     from elspeth.web.sessions.routes import _helpers as routes
 
     state = _make_authoring_valid_partial("runtime-wrapper-session")
-    settings = SimpleNamespace(composer_runtime_preflight_timeout_seconds=1)
+    settings = SimpleNamespace(composer_runtime_preflight_timeout_seconds=1, secret_wiring_allowlist=())
     plugin_snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
     profile_registry = MagicMock(spec=OperatorProfileRegistry)
     catalog = create_catalog_service()
@@ -11091,6 +11092,9 @@ async def test_runtime_preflight_for_state_threads_session_id_to_validate_pipeli
     assert seen_kwargs == [
         {
             "secret_service": None,
+            # Derived inside the helper from settings.secret_wiring_allowlist
+            # (elspeth-f3c1aafd25); empty allowlist = deny-by-default policy.
+            "secret_wiring_policy": SecretWiringPolicy(rules=()),
             "user_id": "alice",
             "session_id": "session-123",
             "plugin_snapshot": plugin_snapshot,

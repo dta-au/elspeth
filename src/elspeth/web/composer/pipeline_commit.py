@@ -54,6 +54,7 @@ from elspeth.web.composer.tools._common import RuntimePreflight, ToolContext, To
 from elspeth.web.composer.tools._dispatch import execute_tool
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.sessions.protocol import AuthoritativePipelineProposal
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -274,6 +275,9 @@ class PipelineCommitConfig:
     max_blob_storage_per_session_bytes: int
     runtime_preflight: RuntimePreflight | None
     timeout_seconds: float
+    # Server-authored secret→destination allowlist (elspeth-f3c1aafd25).
+    # ``None`` is the deny-by-default posture at the wire gate, never an allow.
+    secret_wiring_policy: SecretWiringPolicy | None = None
 
     def __post_init__(self) -> None:
         if type(self.data_dir) is not str or not self.data_dir.strip():
@@ -450,6 +454,7 @@ async def prepare_pipeline_proposal_commit(
         session_engine=config.session_engine,
         session_id=str(authority.row.session_id),
         secret_service=config.secret_service,
+        secret_wiring_policy=config.secret_wiring_policy,
         user_id=config.user_id,
         baseline=current_state,
         current_validation=prior_validation,
@@ -514,6 +519,7 @@ async def prepare_pipeline_proposal_commit(
                 session_engine=config.session_engine,
                 session_id=str(authority.row.session_id),
                 secret_service=config.secret_service,
+                secret_wiring_policy=config.secret_wiring_policy,
                 user_id=config.user_id,
                 baseline=current_state,
                 prior_validation=prior_validation,

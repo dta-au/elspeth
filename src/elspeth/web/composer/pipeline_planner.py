@@ -135,6 +135,7 @@ from elspeth.web.composer.tools.generation import (
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 
 _PLANNER_DISCOVERY_TOOL_NAME_SET: Final[frozenset[str]] = frozenset(PLANNER_DISCOVERY_TOOL_NAMES)
 _TERMINAL_TOOL_NAME: Final[str] = PLANNER_TERMINAL_TOOL_NAME
@@ -965,6 +966,9 @@ class PlannerCustodyConfig:
     max_storage_per_session: int
     secret_service: WebSecretResolver | None
     runtime_preflight: RuntimePreflight | None
+    # Server-authored secret→destination allowlist (elspeth-f3c1aafd25).
+    # ``None`` is the deny-by-default posture at the wire gate, never an allow.
+    secret_wiring_policy: SecretWiringPolicy | None = None
     # Interpretation-tolerant Stage-2 callback, wired only when the strict
     # verdict is handoff-shaped so preview_pipeline can surface the
     # structural findings the strict ledger skipped (elspeth-229e9e8195).
@@ -3572,6 +3576,7 @@ async def _plan_pipeline_inner(
         session_engine=custody_config.session_engine,
         session_id=originating_message.session_id,
         secret_service=custody_config.secret_service,
+        secret_wiring_policy=custody_config.secret_wiring_policy,
         user_id=originating_message.user_id,
         baseline=current_state,
         current_validation=current_validation.validation,

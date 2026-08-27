@@ -19,6 +19,7 @@ from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.secrets import (
     collect_credential_field_violations,
     collect_disallowed_secret_ref_markers,
+    collect_secret_ref_marker_sites,
     parse_secret_ref_marker,
     secret_env_ref_name,
 )
@@ -78,6 +79,7 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields, allowed_secret_ref_fields_text
 from elspeth.web.secrets.service import ScopedSecretResolver
+from elspeth.web.secrets.wiring_policy import SecretWiringPolicy, secret_wiring_authorization_error
 
 _PLUGIN_POLICY_CHECKS: tuple[tuple[PolicyValidationStage, ValidationCheckName], ...] = (
     ("plugin_enablement", CHECK_PLUGIN_ENABLEMENT),
@@ -678,13 +680,51 @@ def validate_secret_evidence(
     *,
     secret_service: WebSecretResolver | None,
     user_id: str | None,
+    secret_wiring_policy: SecretWiringPolicy | None = None,
 ) -> PhaseReport[SecretValidatedState] | PhaseFailure:
-    """Validate secret markers and retain the evidence needed for loading."""
+    """Validate secret markers and retain the evidence needed for loading.
+
+    Beyond existence / fabrication / placement, every wired secret use is
+    authorization-checked against the server-authored destination allowlist
+    (``secret_wiring_policy``, elspeth-f3c1aafd25) — deny-by-default, so a
+    marker introduced past ``wire_secret_ref`` (patch tools, ``set_pipeline``,
+    YAML paste) is still refused here before any resolution. The
+    authorization walk runs over ``policy.authored_state``, NOT the lowered
+    state: operator-profile lowering injects credential markers server-side
+    from the deployment's own ``llm_profiles`` settings, and those are
+    server-authored end-to-end — only markers the composer/user authored
+    need destination authorization.
+    """
     state = policy.state
     all_refs: list[tuple[str, SecretScope | None]] = []
     env_ref_names: set[str] = set()
     fabricated_components: list[tuple[str | None, str | None, list[str]]] = []
     disallowed_components: list[tuple[str | None, str, str, list[SecretRefPlacementViolation]]] = []
+    unauthorized_components: list[tuple[str | None, str, str, list[tuple[str, str, str]]]] = []
+
+    def _collect_unauthorized(
+        component_id: str | None,
+        component_type: str,
+        plugin_name: str,
+        options: Mapping[str, object],
+    ) -> None:
+        unauthorized_sites = [
+            (site.secret_name, site.field_path, error)
+            for site in collect_secret_ref_marker_sites(options, env_ref_names)
+            if (
+                error := secret_wiring_authorization_error(
+                    secret_wiring_policy,
+                    secret_name=site.secret_name,
+                    component_type=component_type,
+                    plugin=plugin_name,
+                    option_key=site.field_path,
+                )
+            )
+            is not None
+        ]
+        if unauthorized_sites:
+            unauthorized_components.append((component_id, component_type, plugin_name, unauthorized_sites))
+
     if secret_service is not None and user_id is not None:
         env_ref_names = {item.name for item in secret_service.list_refs(user_id)}
         for source_name, source in state.sources.items():
@@ -726,8 +766,19 @@ def validate_secret_evidence(
             if disallowed:
                 disallowed_components.append((output.name, "sink", output.plugin, disallowed))
 
+        # Authorization walks the AUTHORED state only — see the docstring:
+        # profile-lowered credential markers are server-authored and exempt.
+        authored = policy.authored_state
+        for source_name, source in authored.sources.items():
+            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            _collect_unauthorized(source_component, "source", source.plugin, source.options)
+        for node in authored.nodes:
+            _collect_unauthorized(node.id, "transform", node.plugin or "<unset>", node.options)
+        for output in authored.outputs:
+            _collect_unauthorized(output.name, "sink", output.plugin, output.options)
+
         missing_refs = [ref[0] for ref in all_refs if not _secret_ref_exists(secret_service, user_id, ref)]
-        if missing_refs or fabricated_components or disallowed_components:
+        if missing_refs or fabricated_components or disallowed_components or unauthorized_components:
             detail_parts: list[str] = []
             errors: list[ValidationError] = []
             if missing_refs:
@@ -782,6 +833,23 @@ def validate_secret_evidence(
                         error_code="disallowed_secret_ref",
                     )
                     for violation in violations
+                )
+            for component_id, component_type, plugin_name, unauthorized_sites in unauthorized_components:
+                site_text = ", ".join(f"{field_path} -> {secret_name}" for secret_name, field_path, _error in unauthorized_sites)
+                detail_parts.append(f"Unauthorized secret wiring for {plugin_name} {component_id}: {site_text}")
+                errors.extend(
+                    ValidationError(
+                        component_id=component_id,
+                        component_type=component_type,
+                        message=denial,
+                        suggestion=(
+                            "Secret wiring is deny-by-default. Ask the deployment operator to add "
+                            "this exact secret/plugin/option destination to the server-authored "
+                            "secret_wiring_allowlist, or remove the wired secret reference."
+                        ),
+                        error_code="unauthorized_secret_ref",
+                    )
+                    for _secret_name, _field_path, denial in unauthorized_sites
                 )
             return PhaseFailure(
                 passed_checks=(),
