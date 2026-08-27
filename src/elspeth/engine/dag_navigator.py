@@ -230,10 +230,9 @@ class DAGNavigator:
         a processing connection (builder-enforced), so it can never be the
         terminal node of a walk (elspeth-b6a0a85a15's sibling-arm analysis).
         """
-        closer = self._closer_by_node_id.get(node_id)
-        if closer is None:
+        if node_id not in self._closer_by_node_id:
             return None
-        kind, name = closer
+        kind, name = self._closer_by_node_id[node_id]
         if kind is CloserKind.COALESCE:
             return self.resolve_coalesce_sink(CoalesceName(name), context=context)
         if kind is CloserKind.COLLECTOR:

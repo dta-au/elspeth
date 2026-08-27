@@ -123,8 +123,7 @@ class TestBranchLossReasonDerivation:
 
 class TestSettingsField:
     def test_default_and_bounds(self) -> None:
-        assert ElspethSettings.model_fields["max_expand_group_width"].default == 100_000
-        meta = ElspethSettings.model_fields["max_expand_group_width"].metadata
-        bounds = {type(m).__name__: getattr(m, "ge", getattr(m, "le", None)) for m in meta}
-        assert bounds.get("Ge") == 1
-        assert bounds.get("Le") == 10_000_000
+        schema = ElspethSettings.model_json_schema()["properties"]["max_expand_group_width"]
+        assert schema["default"] == 100_000
+        assert schema["minimum"] == 1
+        assert schema["maximum"] == 10_000_000
