@@ -39,6 +39,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -385,6 +386,12 @@ _RECOVERY_GUIDANCE = "re-verify and resume with"
 
 
 def _recovery_path(stderr: str) -> Path:
+    """Extract a transaction directory from any ``--resume`` mention in stderr.
+
+    NOT evidence that recovery guidance was offered: this also matches the
+    creation-time "if interrupted, resume with --resume <dir>" line, which is
+    printed on the SUCCESS path too. Assert ``_RECOVERY_GUIDANCE`` for that.
+    """
     match = re.search(r"--resume\s+('([^']+)'|(\S+))", stderr)
     if match is None:
         raise AssertionError(f"no recovery command in stderr:\n{stderr}")
@@ -572,6 +579,47 @@ def test_sign_bundle_drift_repair_rejudges(tmp_path: Path) -> None:
         repaired_key,
         _TRAILING_SPARE_PRE_JUDGE_KEY,
     ]
+
+
+def test_sign_bundle_stale_drift_repair_claim_offers_no_resume_recovery(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A drift_repair the fresh diagnosis can no longer sign is re-staged, not resumed.
+
+    The abort happens before any write, and a resume re-derives the same fresh
+    diagnosis and stops in the same place, so the paste-ready ``--resume``
+    command would contradict the "re-run stage_scan" line it follows. The
+    unrepairable set is the guard's own input, so it is supplied at that seam --
+    reaching this branch through the tree would require a diagnosis that flipped
+    to unsignable while still satisfying the whole-bundle re-verification.
+    """
+    import elspeth_lints.core.cli as cli_module
+
+    root, allowlist_dir, key = _drift_repair_ast_path_fixture(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root, allowlist_dir, (BundleAction(lane="resign", kind="drift_repair", key=key, diagnosis_status="AST_PATH_BINDING_DRIFT"),)
+        ),
+    )
+    real_specs = cli_module._signing_specs_from_diagnosis
+
+    def _unsignable(report: Any) -> Any:
+        specs, stale_keys, unrepairable = real_specs(report)
+        stale = SimpleNamespace(key=key)
+        return specs, stale_keys, (*unrepairable, stale)
+
+    with (
+        _patch_judge(_accept_all) as calls,
+        patch.object(cli_module, "_signing_specs_from_diagnosis", side_effect=_unsignable),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    assert calls == []  # aborted before any paid judge call
+    assert _tree_bytes(allowlist_dir) == before
+    err = capsys.readouterr().err
+    assert "no longer signable" in err
+    assert _RECOVERY_GUIDANCE not in err
 
 
 def test_sign_bundle_drift_repair_block_not_laundered(tmp_path: Path) -> None:
