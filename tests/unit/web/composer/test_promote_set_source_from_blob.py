@@ -13,6 +13,7 @@ discipline regardless of which binding tool it invoked.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSummary
@@ -943,3 +945,158 @@ class TestSetSourceFromBlobDerivedGuarantees:
         )
         schema = self._schema(bind_result)
         assert "guaranteed_fields" not in schema
+
+
+class TestEchoedServerOwnedMetadata:
+    """Echo-tolerant reserved-key gates on the singular source tools
+    (elspeth-c67fbbbd83, option ii): an exact echo of stored server-owned
+    metadata is reduced/dropped with an advisory note; any non-matching value
+    keeps the elspeth-4496f61e30 rejection."""
+
+    def _bound_source(self, tmp_path: Path) -> tuple[_ToolContext, CompositionState, dict[str, Any]]:
+        user_message_content = "Create generated CSV content for the source."
+        engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
+        ctx = ToolContext(
+            catalog=_mock_catalog(),
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=user_message_id,
+            user_message_content=user_message_content,
+            composer_model_identifier="openai/gpt-5-mini",
+            composer_model_version="gpt-5-mini-2026-05-01",
+            composer_provider="openai",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash="b" * 64,
+        )
+        create = _execute_create_blob(
+            {"filename": "generated.csv", "mime_type": "text/csv", "content": "name,score\nada,42\n"},
+            _empty_state(),
+            ctx,
+        )
+        assert create.success is True
+        bind = _execute_set_source_from_blob(
+            {
+                "blob_id": create.data["blob_id"],
+                "on_success": "rows",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            _empty_state(),
+            ctx,
+        )
+        assert bind.success is True, bind.data
+        options = dict(deep_thaw(bind.updated_state.sources["source"].options))
+        return ctx, bind.updated_state, options
+
+    @staticmethod
+    def _resolved_state(state: CompositionState, options: dict[str, Any]) -> tuple[CompositionState, dict[str, Any]]:
+        """Project the bound source's pending review into its resolved form,
+        the state the review resolver persists (elspeth session 2e0c8ea3's
+        v3: authoring block review-bound, requirement resolved)."""
+        authoring = {
+            **options[SOURCE_AUTHORING_KEY],
+            "review_event_id": "event-1",
+            "resolved_kind": "invented_source",
+        }
+        resolved_row = {
+            **options[INTERPRETATION_REQUIREMENTS_KEY][0],
+            "status": "resolved",
+            "event_id": "event-1",
+            "accepted_value": "approved",
+            "accepted_artifact_hash": authoring["content_hash"],
+        }
+        resolved_options = {
+            **options,
+            SOURCE_AUTHORING_KEY: authoring,
+            INTERPRETATION_REQUIREMENTS_KEY: [resolved_row],
+        }
+        source = state.sources["source"]
+        return state.with_named_source("source", replace(source, options=resolved_options)), resolved_options
+
+    def test_patch_echoing_stored_pending_rows_is_accepted_and_preserved(self, tmp_path: Path) -> None:
+        ctx, state, options = self._bound_source(tmp_path)
+
+        result = _execute_patch_source_options(
+            {"patch": {INTERPRETATION_REQUIREMENTS_KEY: options[INTERPRETATION_REQUIREMENTS_KEY]}},
+            state,
+            ctx,
+        )
+
+        assert result.success is True, result.data
+        assert "interpretation_requirements" in result.data["server_owned_metadata_note"]
+        requirements = deep_thaw(result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY])
+        assert requirements == options[INTERPRETATION_REQUIREMENTS_KEY]
+
+    def test_patch_echoing_reduced_resolved_row_keeps_the_review_resolved(self, tmp_path: Path) -> None:
+        """The planner-context projection of a resolved row round-trips: the
+        echo reduces to a shell and reconciliation restores the resolved
+        server row — no downgrade to pending."""
+        ctx, state, options = self._bound_source(tmp_path)
+        state, resolved_options = self._resolved_state(state, options)
+        stored_row = resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]
+        context_projection = {field: stored_row[field] for field in ("id", "kind", "user_term", "draft", "status")}
+
+        result = _execute_patch_source_options(
+            {"patch": {INTERPRETATION_REQUIREMENTS_KEY: [context_projection]}},
+            state,
+            ctx,
+        )
+
+        assert result.success is True, result.data
+        carried = deep_thaw(result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY])[0]
+        assert carried == stored_row
+        authoring = deep_thaw(result.updated_state.sources["source"].options[SOURCE_AUTHORING_KEY])
+        assert authoring == resolved_options[SOURCE_AUTHORING_KEY]
+
+    def test_patch_with_tampered_resolved_row_still_rejects(self, tmp_path: Path) -> None:
+        ctx, state, options = self._bound_source(tmp_path)
+        state, resolved_options = self._resolved_state(state, options)
+        stored_row = resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]
+        tampered = {field: stored_row[field] for field in ("id", "kind", "user_term", "draft", "status")}
+        tampered["draft"] = "tampered draft"
+
+        result = _execute_patch_source_options(
+            {"patch": {INTERPRETATION_REQUIREMENTS_KEY: [tampered]}},
+            state,
+            ctx,
+        )
+
+        assert result.success is False
+        assert "resolved" in result.data["error"]
+
+    def test_rebind_echoing_stored_source_authoring_is_accepted_with_note(self, tmp_path: Path) -> None:
+        ctx, state, options = self._bound_source(tmp_path)
+
+        result = _execute_set_source_from_blob(
+            {
+                "blob_id": options["blob_ref"],
+                "on_success": "rows",
+                "options": {
+                    "schema": options["schema"],
+                    SOURCE_AUTHORING_KEY: options[SOURCE_AUTHORING_KEY],
+                },
+            },
+            state,
+            ctx,
+        )
+
+        assert result.success is True, result.data
+        assert "source_authoring" in result.data["server_owned_metadata_note"]
+        assert deep_thaw(result.updated_state.sources["source"].options[SOURCE_AUTHORING_KEY]) == options[SOURCE_AUTHORING_KEY]
+
+    def test_rebind_with_tampered_source_authoring_still_rejects(self, tmp_path: Path) -> None:
+        ctx, state, options = self._bound_source(tmp_path)
+        tampered = {**options[SOURCE_AUTHORING_KEY], "review_event_id": "forged-event"}
+
+        result = _execute_set_source_from_blob(
+            {
+                "blob_id": options["blob_ref"],
+                "on_success": "rows",
+                "options": {"schema": options["schema"], SOURCE_AUTHORING_KEY: tampered},
+            },
+            state,
+            ctx,
+        )
+
+        assert result.success is False
+        assert SOURCE_AUTHORING_KEY in result.data["error"]

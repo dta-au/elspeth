@@ -88,6 +88,7 @@ from elspeth.web.interpretation_state import (
     ServerStagedRequiredControlUserTerm,
     composer_pipeline_decision_user_term_error,
     parse_interpretation_requirements,
+    project_planner_context_interpretation_requirement,
     serialize_authoring_review_options,
     source_name_from_component_id,
     strip_authoring_options,
@@ -2044,6 +2045,99 @@ def _mask_pending_interpretation_placeholders_for_authoring_validation(
     )
 
 
+# Advisories served through the ``_mutation_result`` data channel (under the
+# ``server_owned_metadata_note`` key) when echoed server-owned metadata was
+# accepted and re-derived rather than rejected (elspeth-c67fbbbd83).
+_ECHOED_REVIEW_METADATA_NOTE: Final[str] = (
+    "interpretation_requirements rows matching the server's stored review state "
+    "were accepted as an echo; resolver-owned review metadata is re-derived "
+    "server-side and does not need to be sent back. Omit those rows (or send "
+    "only pending {kind, user_term, draft} shells) on future writes."
+)
+_ECHOED_SOURCE_AUTHORING_NOTE: Final[str] = (
+    "source_authoring matched the server's stored provenance block exactly and "
+    "was ignored: it is server-stamped and does not need to be sent back. Omit "
+    "source_authoring from future writes."
+)
+
+
+def _echoed_metadata_note(*, requirement_echo: bool, authoring_echo: bool = False) -> str | None:
+    """Compose the advisory for echoed server-owned metadata, or ``None``."""
+    notes: list[str] = []
+    if authoring_echo:
+        notes.append(_ECHOED_SOURCE_AUTHORING_NOTE)
+    if requirement_echo:
+        notes.append(_ECHOED_REVIEW_METADATA_NOTE)
+    return " ".join(notes) if notes else None
+
+
+def _normalize_echoed_interpretation_requirements(
+    options: Mapping[str, Any],
+    *,
+    stored_options: Mapping[str, Any] | None,
+) -> tuple[Mapping[str, Any], bool]:
+    """Reduce echoed server-owned requirement rows back to author shells.
+
+    A planner doing read-modify-write over a serialized state echoes the
+    stored ``interpretation_requirements`` rows — the canonical persisted rows
+    or the reduced planner-context projection
+    (:func:`project_planner_context_interpretation_requirement`). Those rows
+    carry resolver-owned fields, so
+    :func:`_resolver_owned_interpretation_requirement_error` would reject the
+    whole call even though the write asserts nothing new
+    (elspeth-c67fbbbd83). An echoed row that EXACTLY matches a stored row
+    (``stable_hash``-equal to the deep-thawed canonical row or to its
+    planner-context projection) is therefore reduced to its author-owned
+    pending shell ``{kind, user_term, draft}``: the shell passes admission,
+    canonicalization re-keys it to the stored id, and
+    ``reconcile_authoritative_reviews`` restores the resolved server row —
+    the same round trip a well-behaved planner performs by hand. Any row that
+    does NOT match — a single differing field included — is left verbatim for
+    the gate to reject, so the elspeth-4496f61e30 forgery guard is untouched
+    for non-matching values, and a forged "resolved" row on a component with
+    no stored counterpart never matches anything. The server-staged
+    required-control disclosure row is never normalized: only the
+    required-control finalizer may stage its user_term.
+
+    Returns the (possibly rewritten) options and whether any row was reduced.
+    """
+    if stored_options is None or INTERPRETATION_REQUIREMENTS_KEY not in options:
+        return options, False
+    supplied_rows = options[INTERPRETATION_REQUIREMENTS_KEY]
+    stored_rows = stored_options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in stored_options else None
+    if type(supplied_rows) is not list or not isinstance(stored_rows, (list, tuple)):
+        return options, False
+    shells_by_echo_hash: dict[str, dict[str, Any]] = {}
+    for stored in stored_rows:
+        if not isinstance(stored, Mapping):
+            continue
+        kind = stored["kind"] if "kind" in stored else None
+        user_term = stored["user_term"] if "user_term" in stored else None
+        draft = stored["draft"] if "draft" in stored else None
+        if type(kind) is not str or type(user_term) is not str or type(draft) is not str:
+            continue
+        if user_term == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM:
+            continue
+        shell = {"kind": kind, "user_term": user_term, "draft": draft}
+        shells_by_echo_hash[stable_hash(deep_thaw(stored))] = shell
+        shells_by_echo_hash[stable_hash(project_planner_context_interpretation_requirement(stored))] = shell
+    if not shells_by_echo_hash:
+        return options, False
+    normalized_rows: list[Any] = []
+    normalized_any = False
+    for supplied in supplied_rows:
+        if isinstance(supplied, Mapping):
+            matched_shell = shells_by_echo_hash.get(stable_hash(deep_thaw(supplied)))
+            if matched_shell is not None:
+                normalized_rows.append(dict(matched_shell))
+                normalized_any = True
+                continue
+        normalized_rows.append(supplied)
+    if not normalized_any:
+        return options, False
+    return {**options, INTERPRETATION_REQUIREMENTS_KEY: normalized_rows}, True
+
+
 def _resolver_owned_interpretation_requirement_error(
     options: Mapping[str, Any],
     *,
@@ -3279,7 +3373,7 @@ def _serialize_set_pipeline_arguments(state: CompositionState) -> tuple[dict[str
 
 # Ceiling on one applied-component echo, canonically encoded. Sized against
 # the provider-payload budget family in ``planner_authoring_aids`` (8 KiB
-# expression grammar, 24 KiB discovery digest, 48 KiB plugin contract) rather
+# expression grammar, 28 KiB discovery digest, 48 KiB plugin contract) rather
 # than the blob-reading caps: this is a provider response surface, not a file
 # read. The echo replaces a ``get_pipeline_state`` call whose payload is the
 # WHOLE state in the wider diagnostic serialization, so the cap bounds a

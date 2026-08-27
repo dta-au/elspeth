@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 from unittest.mock import MagicMock, call, patch
 from uuid import uuid4
 
@@ -18984,3 +18984,85 @@ class TestStepDescriptionAuthoring:
         )
         assert patched.success is True
         assert patched.updated_state.nodes[0].description == "Pass rows through unchanged."
+
+
+class TestNormalizeEchoedInterpretationRequirements:
+    """Direct guard-mechanics pins for the echo normalizer (elspeth-c67fbbbd83).
+
+    The end-to-end echo behaviour is pinned in test_promote_set_pipeline /
+    test_promote_set_source_from_blob; these kill the mutations the e2e
+    surface cannot see (the auto-wired disclosure row's exemption, and the
+    exact-match hash arms in isolation).
+    """
+
+    _STORED_ROW: ClassVar[dict[str, Any]] = {
+        "id": "source_review:inline_source_data",
+        "kind": "invented_source",
+        "user_term": "inline_source_data",
+        "status": "pending",
+        "draft": "a,b\n1,2\n",
+        "event_id": None,
+        "accepted_value": None,
+        "accepted_artifact_hash": None,
+        "resolved_prompt_template_hash": None,
+    }
+
+    def test_full_row_echo_reduces_to_the_author_shell(self) -> None:
+        from elspeth.web.composer.tools._common import _normalize_echoed_interpretation_requirements
+
+        options, normalized = _normalize_echoed_interpretation_requirements(
+            {"interpretation_requirements": [dict(self._STORED_ROW)]},
+            stored_options={"interpretation_requirements": [dict(self._STORED_ROW)]},
+        )
+        assert normalized is True
+        assert options["interpretation_requirements"] == [
+            {"kind": "invented_source", "user_term": "inline_source_data", "draft": "a,b\n1,2\n"}
+        ]
+
+    def test_context_projection_echo_reduces_to_the_author_shell(self) -> None:
+        from elspeth.web.composer.tools._common import _normalize_echoed_interpretation_requirements
+
+        projection = {field: self._STORED_ROW[field] for field in ("id", "kind", "user_term", "draft", "status")}
+        options, normalized = _normalize_echoed_interpretation_requirements(
+            {"interpretation_requirements": [projection]},
+            stored_options={"interpretation_requirements": [dict(self._STORED_ROW)]},
+        )
+        assert normalized is True
+        assert options["interpretation_requirements"] == [
+            {"kind": "invented_source", "user_term": "inline_source_data", "draft": "a,b\n1,2\n"}
+        ]
+
+    @pytest.mark.parametrize("field, value", [("status", "resolved"), ("draft", "tampered"), ("id", "other:id")])
+    def test_any_single_field_difference_is_left_for_the_gate(self, field: str, value: str) -> None:
+        from elspeth.web.composer.tools._common import _normalize_echoed_interpretation_requirements
+
+        tampered = {**self._STORED_ROW, field: value}
+        options, normalized = _normalize_echoed_interpretation_requirements(
+            {"interpretation_requirements": [tampered]},
+            stored_options={"interpretation_requirements": [dict(self._STORED_ROW)]},
+        )
+        assert normalized is False
+        assert options["interpretation_requirements"] == [tampered]
+
+    def test_without_stored_options_nothing_matches(self) -> None:
+        from elspeth.web.composer.tools._common import _normalize_echoed_interpretation_requirements
+
+        _options, normalized = _normalize_echoed_interpretation_requirements(
+            {"interpretation_requirements": [dict(self._STORED_ROW)]},
+            stored_options=None,
+        )
+        assert normalized is False
+
+    def test_auto_wired_disclosure_row_is_never_normalized(self) -> None:
+        """Only the required-control finalizer may stage that user_term; the
+        echo path must not synthesize an author shell for it."""
+        from elspeth.web.composer.tools._common import _normalize_echoed_interpretation_requirements
+        from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+
+        stored = {**self._STORED_ROW, "user_term": REQUIRED_CONTROL_AUTO_WIRED_USER_TERM, "id": "auto:control"}
+        options, normalized = _normalize_echoed_interpretation_requirements(
+            {"interpretation_requirements": [dict(stored)]},
+            stored_options={"interpretation_requirements": [dict(stored)]},
+        )
+        assert normalized is False
+        assert options["interpretation_requirements"] == [stored]

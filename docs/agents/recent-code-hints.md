@@ -8,7 +8,38 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
-- **2026-08-27 — Stage-1 constructor probes CANNOT construct an operator-profiled
+- **2026-08-27 — server-owned option metadata is a THREE-surface parity set:
+  planner projection, echo-tolerant write gates, and disclosure provenance**
+  (elspeth-c67fbbbd83). The keys are `source_authoring`,
+  `interpretation_requirements`, `prompt_template_parts`,
+  `resolved_prompt_template_hash` — always derived from
+  `AUTHORING_METADATA_OPTION_KEYS` / `_PROFILE_LOWERING_METADATA_OPTION_KEYS`,
+  never restated. (a) The per-turn "Current pipeline state" context block and
+  BOTH `plan_pipeline` `provider_current_state` call sites run
+  `prompts.project_server_owned_option_metadata` between `to_dict()` and the
+  storage-path redactor: three keys dropped, `interpretation_requirements`
+  rows REDUCED to `PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS`
+  (id/kind/user_term/draft/status — resolved-vs-pending stays legible). NEVER
+  strip inside `to_dict()` itself: it feeds `composition_content_hash` and
+  pinned literals in `test_state_serialisation_contract.py`. (b) The
+  reserved-key write gates are echo-tolerant:
+  `_normalize_echoed_interpretation_requirements` (`tools/_common.py`) reduces
+  a supplied row that `stable_hash`-matches a stored row — full row OR its
+  context projection — to its `{kind, user_term, draft}` shell before the
+  resolver-owned admission gate, and `_drop_echoed_source_authoring`
+  (`tools/sources.py`) drops an exactly-matching `source_authoring` block
+  before `_reject_manual_source_authoring`; both surface a
+  `server_owned_metadata_note` advisory through `_mutation_result` data. Any
+  non-matching value — one field off — still rejects (the elspeth-4496f61e30
+  forgery guard), and the auto-wired required-control disclosure row is never
+  normalized. The shells round-trip through `reconcile_authoritative_reviews`,
+  which is why `patch_source_options` now runs that reconciliation like
+  `patch_node_options` always did — dropping the shell instead of reconciling
+  silently downgrades a resolved review to pending. (c)
+  `implicit_decisions._provenance_for_path` attributes TOP-LEVEL-rooted
+  server-owned option paths as `server_stamped`. A NEW server-owned option key
+  must join all three surfaces in one change; a lane that adds one and skips
+  (b) recreates the one-turn planner trap this entry exists to close.
   plugin from authored options, and for a pass-through plugin that failure votes
   "participates with ZERO guarantees" — a permanent false reject, not a draft
   error.** A composer llm node never carries `provider`/`endpoint`/`api_key`

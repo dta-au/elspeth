@@ -25,7 +25,12 @@ from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY, Co
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.skills import load_deployment_skill, load_skill_with_hash
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    project_planner_context_interpretation_requirement,
+)
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.validation import _PROFILE_LOWERING_METADATA_OPTION_KEYS
 
 if TYPE_CHECKING:
     from elspeth.web.composer.guided.state_machine import TerminalState
@@ -251,6 +256,74 @@ def build_catalog_context_string(
     return f"{CATALOG_CONTEXT_PREFIX}\n{json.dumps(context, separators=_COMPACT_JSON_SEPARATORS)}"
 
 
+# Server-owned option keys the planner must never be asked to round-trip:
+# every write gate rejects them (``_reject_manual_source_authoring``, the
+# resolver-owned requirement admission, ``_RUNTIME_OWNED_LLM_OPTION_KEYS``),
+# so echoing them in a planner-visible state projection hands the model a
+# payload its own tools refuse (elspeth-c67fbbbd83, session 2e0c8ea3 seq 19).
+# ``interpretation_requirements`` is excluded here because it is REDUCED, not
+# dropped — resolved/pending review state must stay legible to the planner.
+_SERVER_OWNED_DROPPED_OPTION_KEYS: Final[frozenset[str]] = _PROFILE_LOWERING_METADATA_OPTION_KEYS - {INTERPRETATION_REQUIREMENTS_KEY}
+
+
+def _project_component_options(options: Any) -> Any:
+    """Project one serialized component's options for planner consumption."""
+    if not isinstance(options, Mapping):
+        return options
+    projected: dict[str, Any] = {}
+    for key, value in options.items():
+        if key in _SERVER_OWNED_DROPPED_OPTION_KEYS:
+            continue
+        if key == INTERPRETATION_REQUIREMENTS_KEY and isinstance(value, list):
+            projected[key] = [project_planner_context_interpretation_requirement(row) if isinstance(row, Mapping) else row for row in value]
+            continue
+        projected[key] = value
+    return projected
+
+
+def project_server_owned_option_metadata(serialized: dict[str, Any]) -> dict[str, Any]:
+    """Project server-owned option metadata out of a serialized state dict.
+
+    Applied between ``CompositionState.to_dict()`` and any planner-facing
+    surface (the per-turn state context message here; ``plan_pipeline``'s
+    ``provider_current_state`` in ``service.py``) so a read-modify-write over
+    what the planner sees is round-trippable into ``set_pipeline``. Drops
+    ``source_authoring``, ``prompt_template_parts`` and
+    ``resolved_prompt_template_hash`` from every source/node/output options
+    block, and reduces each ``interpretation_requirements`` row to the
+    planner-context projection (id/kind/user_term/draft/status) — resolved
+    vs pending stays legible without echoing resolver-owned linkage. Never
+    strip inside ``to_dict()`` itself: that serialization feeds
+    ``composition_content_hash`` (pinned literals in
+    ``test_state_serialisation_contract.py``).
+
+    Returns a copied dict; the input is not mutated.
+    """
+    projected = dict(serialized)
+    sources = serialized["sources"] if "sources" in serialized else None
+    if isinstance(sources, Mapping):
+        projected["sources"] = {
+            name: (
+                {**source, "options": _project_component_options(source["options"])}
+                if isinstance(source, Mapping) and "options" in source
+                else source
+            )
+            for name, source in sources.items()
+        }
+    for component_key in ("nodes", "outputs"):
+        components = serialized[component_key] if component_key in serialized else None
+        if isinstance(components, list):
+            projected[component_key] = [
+                (
+                    {**component, "options": _project_component_options(component["options"])}
+                    if isinstance(component, Mapping) and "options" in component
+                    else component
+                )
+                for component in components
+            ]
+    return projected
+
+
 def build_context_string(
     state: CompositionState,
     catalog: PolicyCatalogView,
@@ -301,6 +374,11 @@ def build_context_string(
         (the payload embeds user-authored strings).
     """
     serialized = state.to_dict()
+    # Round-trippability (elspeth-c67fbbbd83): drop/reduce server-owned option
+    # metadata BEFORE the storage-path redaction so what the planner reads can
+    # be written back through set_pipeline without tripping the reserved-key
+    # gates.
+    serialized = project_server_owned_option_metadata(serialized)
     serialized = redact_source_storage_path(serialized)  # B4: hide blob storage paths
     validation = catalog.validate_composition_state(state).validation
     serialized["validation"] = {

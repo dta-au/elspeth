@@ -964,6 +964,11 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/_common.py:diff_states:return"
   - "src/elspeth/web/composer/redaction.py:redact_source_storage_path:state_dict"
   - "src/elspeth/web/composer/redaction.py:redact_source_storage_path:return"
+  # Planner-visible projection of a serialized CompositionState (elspeth-c67fbbbd83):
+  # same serialized-state dict shape as redact_source_storage_path above.
+  - "src/elspeth/web/composer/prompts.py:project_server_owned_option_metadata:serialized"
+  - "src/elspeth/web/composer/prompts.py:project_server_owned_option_metadata:return"
+  - "src/elspeth/web/interpretation_state.py:project_planner_context_interpretation_requirement:return"
   - "src/elspeth/web/composer/tools/blobs.py:_execute_create_blob:arguments"
   - "src/elspeth/web/composer/tools/blobs.py:_execute_update_blob:arguments"
   - "src/elspeth/web/composer/tools/blobs.py:_execute_delete_blob:arguments"

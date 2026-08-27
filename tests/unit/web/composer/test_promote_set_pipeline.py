@@ -42,6 +42,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSummary
@@ -1758,3 +1759,152 @@ class TestSetPipelineRowUnion:
 
         assert state.version == 1
         assert state.nodes == ()
+
+
+class TestEchoedServerOwnedMetadata:
+    """Echo-tolerant reserved-key gates (elspeth-c67fbbbd83, option ii).
+
+    Session 2e0c8ea3 seq 19: a read-modify-write ``set_pipeline`` echoing the
+    server-stamped ``source_authoring`` block was rejected as reserved and cost
+    a full planner turn. An EXACT echo of the stored block is now dropped with
+    an advisory note; any non-matching value — a single field included — still
+    rejects, so the provenance-forgery guard is intact.
+    """
+
+    def _bound_blob_state(self, tmp_path: Path) -> tuple[Any, CompositionState, dict[str, Any]]:
+        """Bind an LLM-authored inline CSV, returning (ctx, state, source options)."""
+        user_message_content = "Create a tiny generated CSV for the pipeline."
+        engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
+        ctx = ToolContext(
+            catalog=_mock_catalog(),
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=user_message_id,
+            user_message_content=user_message_content,
+            composer_model_identifier="openai/gpt-5-mini",
+            composer_model_version="gpt-5-mini-2026-05-01",
+            composer_provider="openai",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash="b" * 64,
+        )
+        bind = _execute_set_pipeline(
+            {
+                "source": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {"schema": {"mode": "observed"}},
+                    "inline_blob": {
+                        "filename": "generated.csv",
+                        "mime_type": "text/csv",
+                        "content": "name,score\nada,42\n",
+                    },
+                    "on_validation_failure": "discard",
+                },
+                "nodes": [],
+                "edges": [],
+                "outputs": [],
+            },
+            _empty_state(),
+            ctx,
+        )
+        assert bind.success is True, bind.data
+        options = dict(deep_thaw(bind.updated_state.sources["source"].options))
+        return ctx, bind.updated_state, options
+
+    def _echo_args(self, stored_options: dict[str, Any], **option_overrides: Any) -> dict[str, Any]:
+        """set_pipeline args echoing the stored source through source.blob_id."""
+        echoed = {
+            "schema": stored_options["schema"],
+            SOURCE_AUTHORING_KEY: stored_options[SOURCE_AUTHORING_KEY],
+            INTERPRETATION_REQUIREMENTS_KEY: stored_options[INTERPRETATION_REQUIREMENTS_KEY],
+        }
+        echoed.update(option_overrides)
+        return {
+            "source": {
+                "plugin": "csv",
+                "blob_id": stored_options["blob_ref"],
+                "on_success": "rows",
+                "options": echoed,
+                "on_validation_failure": "discard",
+            },
+            "nodes": [],
+            "edges": [],
+            "outputs": [],
+        }
+
+    def test_exact_echo_is_accepted_with_an_advisory_note(self, tmp_path: Path) -> None:
+        ctx, state, stored_options = self._bound_blob_state(tmp_path)
+
+        result = _execute_set_pipeline(self._echo_args(stored_options), state, ctx)
+
+        assert result.success is True, result.data
+        note = result.data["server_owned_metadata_note"]
+        assert "source_authoring" in note
+        assert "interpretation_requirements" in note
+        # The server values survive untouched — the echo neither altered nor
+        # duplicated them.
+        options = result.updated_state.sources["source"].options
+        assert deep_thaw(options[SOURCE_AUTHORING_KEY]) == stored_options[SOURCE_AUTHORING_KEY]
+        requirements = deep_thaw(options[INTERPRETATION_REQUIREMENTS_KEY])
+        assert len(requirements) == 1
+        assert requirements[0]["id"] == "source_review:inline_source_data"
+        assert requirements[0]["status"] == "pending"
+
+    @pytest.mark.parametrize(
+        "tampered_field, tampered_value",
+        [
+            ("review_event_id", "forged-event"),
+            ("modality", CreationModality.VERBATIM.value),
+            ("content_hash", "0" * 64),
+            ("resolved_kind", "forged-kind"),
+        ],
+    )
+    def test_echo_differing_in_any_single_field_still_rejects(self, tmp_path: Path, tampered_field: str, tampered_value: str) -> None:
+        ctx, state, stored_options = self._bound_blob_state(tmp_path)
+        tampered = {**stored_options[SOURCE_AUTHORING_KEY], tampered_field: tampered_value}
+
+        result = _execute_set_pipeline(
+            self._echo_args(stored_options, **{SOURCE_AUTHORING_KEY: tampered}),
+            state,
+            ctx,
+        )
+
+        assert result.success is False
+        assert SOURCE_AUTHORING_KEY in result.data["error"]
+
+    def test_tampered_requirement_row_still_rejects(self, tmp_path: Path) -> None:
+        """A row claiming resolver-owned resolution the server never wrote
+        matches nothing in stored state and keeps the elspeth-4496f61e30
+        rejection."""
+        ctx, state, stored_options = self._bound_blob_state(tmp_path)
+        forged_resolved = {**stored_options[INTERPRETATION_REQUIREMENTS_KEY][0], "status": "resolved"}
+
+        result = _execute_set_pipeline(
+            self._echo_args(
+                stored_options,
+                **{
+                    SOURCE_AUTHORING_KEY: stored_options[SOURCE_AUTHORING_KEY],
+                    INTERPRETATION_REQUIREMENTS_KEY: [forged_resolved],
+                },
+            ),
+            state,
+            ctx,
+        )
+
+        assert result.success is False
+        assert "resolved" in result.data["error"]
+
+    def test_forged_block_without_a_stored_counterpart_still_rejects(self, tmp_path: Path) -> None:
+        """No stored source at all: nothing can match, so the reserved-key
+        rejection is unchanged (the manual-authoring guard's original case)."""
+        ctx, _state, stored_options = self._bound_blob_state(tmp_path)
+
+        result = _execute_set_pipeline(
+            self._echo_args(stored_options),
+            _empty_state(),
+            ctx,
+        )
+
+        assert result.success is False
+        assert SOURCE_AUTHORING_KEY in result.data["error"]

@@ -18,7 +18,7 @@ from typing import Any, Final, Literal, NotRequired, TypedDict
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality
-from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -198,6 +198,25 @@ AUTHORING_METADATA_OPTION_KEYS: frozenset[str] = frozenset(
         SOURCE_AUTHORING_KEY,
     }
 )
+
+# The requirement fields the per-turn planner context keeps when it reduces a
+# canonical row (elspeth-c67fbbbd83): enough to keep resolved/pending review
+# state legible without echoing resolver-owned linkage (event ids, accepted
+# values, artifact hashes) back to the provider. The echo-tolerant write gates
+# match a supplied row against this projection as well as against the full
+# stored row, so the two surfaces must share one field list.
+PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS: Final[tuple[str, ...]] = (
+    "id",
+    "kind",
+    "user_term",
+    "draft",
+    "status",
+)
+
+
+def project_planner_context_interpretation_requirement(requirement: Mapping[str, Any]) -> dict[str, Any]:
+    """Reduce one requirement row to its planner-context projection."""
+    return {field: deep_thaw(requirement[field]) for field in PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS if field in requirement}
 
 
 def source_component_id(source_name: str) -> str:

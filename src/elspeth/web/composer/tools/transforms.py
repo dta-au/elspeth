@@ -43,8 +43,10 @@ from elspeth.web.composer.tools._common import (
     _composition_canonical_interpretation_requirement_error,
     _credential_wiring_contract_failure,
     _discovery_result,
+    _echoed_metadata_note,
     _failure_result,
     _mutation_result,
+    _normalize_echoed_interpretation_requirements,
     _options_with_default_llm_reviews,
     _plugin_policy_failure,
     _post_mutation_invariant_error,
@@ -586,6 +588,13 @@ def _execute_upsert_node(
     plugin = validated.plugin
     node_options: Mapping[str, Any] = validated.options
     existing_node = next((node for node in state.nodes if node.id == node_id), None)
+    # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
+    # from the stored node reduce to author shells; the reconciliation pass
+    # below restores the server rows. Non-matching values still reject.
+    node_options, requirement_echo = _normalize_echoed_interpretation_requirements(
+        node_options,
+        stored_options=existing_node.options if existing_node is not None else None,
+    )
     runtime_owned_error = _runtime_owned_llm_option_error(
         plugin,
         node_options,
@@ -751,7 +760,12 @@ def _execute_upsert_node(
             affected.add(edge.from_node)
             affected.add(edge.to_node)
 
-    return _mutation_result(new_state, tuple(sorted(affected)))
+    echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
+    return _mutation_result(
+        new_state,
+        tuple(sorted(affected)),
+        data=None if echo_note is None else {"server_owned_metadata_note": echo_note},
+    )
 
 
 def _splice_connection_name(node_id: str, state: CompositionState) -> str | None:
@@ -1454,6 +1468,13 @@ def _execute_patch_node_options(
     routing_patch_error = _node_routing_option_patch_error(patch, node_type=current.node_type)
     if routing_patch_error is not None:
         return _failure_result(state, routing_patch_error)
+    # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
+    # from the stored node reduce to author shells; the reconciliation pass
+    # below restores the server rows. Non-matching values still reject.
+    patch, requirement_echo = _normalize_echoed_interpretation_requirements(
+        patch,
+        stored_options=current.options,
+    )
     runtime_owned_error = _runtime_owned_llm_option_error(
         current.plugin,
         patch,
@@ -1542,7 +1563,12 @@ def _execute_patch_node_options(
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _failure_result(state, review_contract_error)
-    return _mutation_result(new_state, (node_id,))
+    echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
+    return _mutation_result(
+        new_state,
+        (node_id,),
+        data=None if echo_note is None else {"server_owned_metadata_note": echo_note},
+    )
 
 
 def _handle_patch_node_options(

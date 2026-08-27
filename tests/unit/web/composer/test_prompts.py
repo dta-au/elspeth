@@ -12,12 +12,14 @@ Verifies:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlMode, PluginCapability
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -44,9 +46,18 @@ from elspeth.web.composer.prompts import (
     build_messages as _build_messages,
 )
 from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY
-from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.tools import ToolContext
+from elspeth.web.composer.tools.sessions import _execute_set_pipeline
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
+    SOURCE_AUTHORING_KEY,
+    WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+    pipeline_decision_artifact_hash,
+)
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
@@ -1197,3 +1208,254 @@ class TestBuildContextStringRedaction:
         # Should complete without error.
         context = build_context_string(state, catalog)
         assert "blobid" in context
+
+
+class TestServerOwnedMetadataProjection:
+    """The per-turn state context is round-trippable (elspeth-c67fbbbd83).
+
+    Session 2e0c8ea3 seq 19: the planner built a ``set_pipeline`` payload from
+    the "Current pipeline state" context block, whose ``to_dict()`` carried the
+    server-stamped ``source_authoring`` block — rejected as reserved, costing a
+    full planner turn. The context block must therefore drop the server-owned
+    option keys and reduce requirement rows to the planner-context projection,
+    while ``to_dict()`` itself stays untouched (it feeds
+    ``composition_content_hash``).
+    """
+
+    @staticmethod
+    def _review_bound_state() -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                options=deep_freeze(
+                    {
+                        "path": "/internal/blobs/sess123/blobid_data.csv",
+                        "blob_ref": "9f2b3c1d-4e5a-4b6c-8d7e-0f1a2b3c4d5e",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                        SOURCE_AUTHORING_KEY: {
+                            "modality": "llm_generated",
+                            "content_hash": "a" * 64,
+                            "review_event_id": "event-1",
+                            "resolved_kind": "invented_source",
+                        },
+                        INTERPRETATION_REQUIREMENTS_KEY: [
+                            {
+                                "id": "source_review:inline_source_data",
+                                "kind": "invented_source",
+                                "user_term": "inline_source_data",
+                                "status": "resolved",
+                                "draft": "a,b\n1,2\n",
+                                "event_id": "event-1",
+                                "accepted_value": "approved",
+                                "accepted_artifact_hash": "a" * 64,
+                                "resolved_prompt_template_hash": None,
+                            }
+                        ],
+                    }
+                ),
+                on_success="rows",
+                on_validation_failure="discard",
+            ),
+            nodes=(
+                NodeSpec(
+                    id="model",
+                    node_type="transform",
+                    plugin="llm",
+                    input="rows",
+                    on_success="out",
+                    on_error="discard",
+                    options=deep_freeze(
+                        {
+                            "prompt_template": "Tone: warm",
+                            "resolved_prompt_template_hash": "b" * 64,
+                            PROMPT_TEMPLATE_PARTS_KEY: [{"kind": "text", "text": "Tone: warm"}],
+                            INTERPRETATION_REQUIREMENTS_KEY: [
+                                {
+                                    "id": "vague:tone",
+                                    "kind": "vague_term",
+                                    "user_term": "friendly",
+                                    "status": "resolved",
+                                    "draft": "friendly",
+                                    "event_id": "event-2",
+                                    "accepted_value": "warm",
+                                    "accepted_artifact_hash": None,
+                                    "resolved_prompt_template_hash": "c" * 64,
+                                }
+                            ],
+                            "schema": {"mode": "observed"},
+                        }
+                    ),
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(name="review-bound"),
+            version=4,
+        )
+
+    def test_context_state_drops_server_owned_keys_and_reduces_requirement_rows(self) -> None:
+        state = self._review_bound_state()
+        context = build_context_string(state, _stub_catalog())
+        current = json.loads(context.split("\n", 1)[1])["current_state"]
+
+        source_options = current["sources"]["source"]["options"]
+        assert SOURCE_AUTHORING_KEY not in source_options
+        assert "resolved_prompt_template_hash" not in source_options
+        assert PROMPT_TEMPLATE_PARTS_KEY not in source_options
+        # Reduced, not dropped: resolved-vs-pending must stay legible.
+        assert source_options[INTERPRETATION_REQUIREMENTS_KEY] == [
+            {
+                "id": "source_review:inline_source_data",
+                "kind": "invented_source",
+                "user_term": "inline_source_data",
+                "draft": "a,b\n1,2\n",
+                "status": "resolved",
+            }
+        ]
+        # The blob binding facts survive (path is redacted separately by B4).
+        assert source_options["blob_ref"] == "9f2b3c1d-4e5a-4b6c-8d7e-0f1a2b3c4d5e"
+
+        node_options = current["nodes"][0]["options"]
+        assert "resolved_prompt_template_hash" not in node_options
+        assert PROMPT_TEMPLATE_PARTS_KEY not in node_options
+        assert node_options[INTERPRETATION_REQUIREMENTS_KEY][0] == {
+            "id": "vague:tone",
+            "kind": "vague_term",
+            "user_term": "friendly",
+            "draft": "friendly",
+            "status": "resolved",
+        }
+        assert node_options["prompt_template"] == "Tone: warm"
+
+    def test_to_dict_itself_keeps_the_server_owned_keys(self) -> None:
+        """The projection is a read-side view; ``to_dict()`` bytes feed
+        ``composition_content_hash`` and must not move."""
+        state = self._review_bound_state()
+        serialized = state.to_dict()
+        assert SOURCE_AUTHORING_KEY in serialized["sources"]["source"]["options"]
+        assert "resolved_prompt_template_hash" in serialized["nodes"][0]["options"]
+        assert PROMPT_TEMPLATE_PARTS_KEY in serialized["nodes"][0]["options"]
+        row = serialized["sources"]["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
+        assert row["event_id"] == "event-1"
+
+    def test_context_state_round_trips_through_set_pipeline(self) -> None:
+        """Feeding the context block's current_state back through
+        ``set_pipeline`` succeeds: the reduced resolved requirement rows are
+        accepted as an echo and the server rows are restored by
+        reconciliation."""
+        options = {
+            "url_field": "url",
+            "content_field": "page_text",
+            "fingerprint_field": "page_fingerprint",
+            "format": "text",
+            "http": {
+                "abuse_contact": "review@foundryside.dev",
+                "scraping_reason": "context round-trip test",
+            },
+            "schema": {"mode": "observed"},
+        }
+        node = NodeSpec(
+            id="scrape",
+            node_type="transform",
+            plugin="web_scrape",
+            input="in",
+            on_success="out",
+            on_error="discard",
+            options=options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        resolved = {
+            "id": "http-identity:scrape",
+            "kind": InterpretationKind.PIPELINE_DECISION.value,
+            "user_term": WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+            "status": "resolved",
+            "draft": "review this",
+            "event_id": "event-1",
+            "accepted_value": "approved",
+            "accepted_artifact_hash": pipeline_decision_artifact_hash(
+                node,
+                (node,),
+                user_term=WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+            ),
+            "resolved_prompt_template_hash": None,
+        }
+        previous = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                options={"path": "rows.csv", "schema": {"mode": "observed"}},
+                on_success="in",
+                on_validation_failure="discard",
+            ),
+            nodes=(replace(node, options={**options, INTERPRETATION_REQUIREMENTS_KEY: [resolved]}),),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="out",
+                    plugin="json",
+                    options={
+                        "path": "out.jsonl",
+                        "schema": {"mode": "observed"},
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(name="reviewed"),
+            version=3,
+        )
+
+        real_catalog = create_catalog_service()
+        context = build_context_string(previous, real_catalog)
+        current = json.loads(context.split("\n", 1)[1])["current_state"]
+        # The context block carries only the reduced projection.
+        echoed_row = current["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
+        assert set(echoed_row) == {"id", "kind", "user_term", "draft", "status"}
+        assert echoed_row["status"] == "resolved"
+
+        source = current["sources"]["source"]
+        args = {
+            "source": {
+                "plugin": source["plugin"],
+                "on_success": source["on_success"],
+                "options": source["options"],
+                "on_validation_failure": source["on_validation_failure"],
+            },
+            "nodes": current["nodes"],
+            "edges": current["edges"],
+            "outputs": [
+                {
+                    "sink_name": output["name"],
+                    "plugin": output["plugin"],
+                    "options": output["options"],
+                    "on_write_failure": output["on_write_failure"],
+                }
+                for output in current["outputs"]
+            ],
+        }
+
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(real_catalog)
+        context_obj = ToolContext(
+            catalog=PolicyCatalogView.for_trained_operator(real_catalog, snapshot),
+            plugin_snapshot=snapshot,
+        )
+        result = _execute_set_pipeline(args, previous, context_obj)
+
+        assert result.success, result.data
+        carried = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+        assert carried["status"] == "resolved"
+        assert carried["event_id"] == "event-1"
+        note = result.data["server_owned_metadata_note"]
+        assert "interpretation_requirements" in note

@@ -146,7 +146,12 @@ from elspeth.web.composer.progress import (
     emit_progress,
     model_call_progress_event,
 )
-from elspeth.web.composer.prompts import build_messages, build_run_diagnostics_messages, render_system_prompt
+from elspeth.web.composer.prompts import (
+    build_messages,
+    build_run_diagnostics_messages,
+    project_server_owned_option_metadata,
+    render_system_prompt,
+)
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
@@ -3453,7 +3458,11 @@ class ComposerServiceImpl:
         guided_full_planner_call = plan_pipeline(
             intent=intent,
             current_state=current_state,
-            provider_current_state=current_state.to_dict(),
+            # Round-trippable planner projection (elspeth-c67fbbbd83): the
+            # provider both reads this as current_state and serves it back
+            # through its own get_pipeline_state palette tool, so server-owned
+            # option metadata must not reach it un-projected.
+            provider_current_state=project_server_owned_option_metadata(current_state.to_dict()),
             # No reviewed guided source or output exists on the guided-FULL
             # surface (reviewed_facts is empty by construction), so there is no
             # declared output contract a gap could be computed against.
@@ -4243,7 +4252,9 @@ class ComposerServiceImpl:
                 intent=message,
                 conversation_context=_freeform_planner_conversation_context(message, messages),
                 current_state=state,
-                provider_current_state=state.to_dict(),
+                # Round-trippable planner projection (elspeth-c67fbbbd83); see
+                # the guided-full call site above.
+                provider_current_state=project_server_owned_option_metadata(state.to_dict()),
                 reviewed_facts={},
                 reviewed_planner_context={},
                 # Freeform has no reviewed guided output, so no operator

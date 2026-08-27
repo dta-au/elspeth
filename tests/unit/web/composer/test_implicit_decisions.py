@@ -24,7 +24,7 @@ import pytest
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
-from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 
 _BLOB_REF = "9f2b3c1d-4e5a-4b6c-8d7e-0f1a2b3c4d5e"
 _STORAGE_PATH = "/var/lib/elspeth/blobs/9f2b3c1d-4e5a-4b6c-8d7e-0f1a2b3c4d5e/input.csv"
@@ -326,3 +326,94 @@ def test_non_blob_source_guaranteed_fields_keep_ordinary_provenance() -> None:
     entry = by_path["source.schema.guaranteed_fields"]
     assert entry["provenance"] == "composer_selected"
     assert "note" not in entry
+
+
+def test_server_stamped_source_metadata_attributes_to_the_server() -> None:
+    """``source_authoring.*`` and ``interpretation_requirements`` are written
+    by ELSPETH's provenance and review machinery, never chosen by the planner
+    (elspeth-c67fbbbd83: v11 showed them recorded as ``composer_selected``)."""
+    by_path = _entries_by_path(
+        _state_with_source_options(
+            {
+                "blob_ref": _BLOB_REF,
+                "path": _STORAGE_PATH,
+                "delimiter": ";",
+                "source_authoring": {
+                    "modality": "llm_generated",
+                    "content_hash": "a" * 64,
+                    "review_event_id": None,
+                    "resolved_kind": None,
+                },
+                "interpretation_requirements": [
+                    {
+                        "id": "source_review:inline_source_data",
+                        "kind": "invented_source",
+                        "user_term": "inline_source_data",
+                        "status": "pending",
+                        "draft": "a,b\n1,2\n",
+                        "event_id": None,
+                        "accepted_value": None,
+                        "accepted_artifact_hash": None,
+                        "resolved_prompt_template_hash": None,
+                    }
+                ],
+                "schema": {"mode": "observed"},
+            }
+        )
+    )
+
+    assert by_path["source.source_authoring.modality"]["provenance"] == "server_stamped"
+    assert by_path["source.source_authoring.content_hash"]["provenance"] == "server_stamped"
+    assert by_path["source.interpretation_requirements"]["provenance"] == "server_stamped"
+    # The path/file sentinel entries keep being emitted verbatim —
+    # ``redact_guided_snapshot_storage_paths`` keys on those exact paths.
+    assert by_path["source.path"]["value"] == f"blob:{_BLOB_REF}"
+    # Sibling ordinary options are untouched.
+    assert by_path["source.delimiter"]["provenance"] == "composer_selected"
+
+
+def test_server_stamped_node_metadata_attributes_to_the_server() -> None:
+    """The node-side server-owned keys (``resolved_prompt_template_hash``,
+    ``prompt_template_parts``) attribute honestly too, and only when rooted at
+    the TOP-LEVEL options segment."""
+    state = CompositionState(
+        source=None,
+        nodes=(
+            NodeSpec(
+                id="model",
+                node_type="transform",
+                plugin="llm",
+                input="rows",
+                on_success="out",
+                on_error="discard",
+                options=deep_freeze(
+                    {
+                        "prompt_template": "Tone: warm",
+                        "resolved_prompt_template_hash": "b" * 64,
+                        "prompt_template_parts": [{"kind": "text", "text": "Tone: warm"}],
+                        "nested": {"resolved_prompt_template_hash": "not-server-owned"},
+                        "schema": {"mode": "observed"},
+                    }
+                ),
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(name="node metadata"),
+        version=2,
+    )
+    report = build_implicit_decisions_report(state)
+    by_path = {str(entry["path"]): dict(entry) for entry in report["entries"]}
+
+    assert by_path["node.model.options.resolved_prompt_template_hash"]["provenance"] == "server_stamped"
+    assert by_path["node.model.options.prompt_template_parts"]["provenance"] == "server_stamped"
+    # A NESTED key that merely reuses a server-owned name is an ordinary
+    # plugin option — the stamp applies to the top-level options segment only.
+    assert by_path["node.model.options.nested.resolved_prompt_template_hash"]["provenance"] == "composer_selected"
+    assert by_path["node.model.options.prompt_template"]["provenance"] == "composer_selected"

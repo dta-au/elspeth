@@ -44,6 +44,8 @@ from elspeth.web.composer.state import (
     queue_node_contract_error,
 )
 from elspeth.web.composer.tools._common import (
+    _ECHOED_REVIEW_METADATA_NOTE,
+    _ECHOED_SOURCE_AUTHORING_NOTE,
     _FULL_STATE_COMPONENT_ALIAS_SET,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
@@ -60,6 +62,7 @@ from elspeth.web.composer.tools._common import (
     _merged_component_rejection_result,
     _missing_output_options_repair_error,
     _mutation_result,
+    _normalize_echoed_interpretation_requirements,
     _normalize_trusted_legacy_interpretation_requirements,
     _options_with_default_llm_reviews,
     _plugin_policy_failure,
@@ -101,6 +104,7 @@ from elspeth.web.composer.tools.declarations import (
 from elspeth.web.composer.tools.sources import (
     _MIME_TO_SOURCE,
     _delimiter_extra_for_csv_blob,
+    _drop_echoed_source_authoring,
     _header_only_inline_csv_conflict,
     _options_with_derived_guarantees,
     _options_with_source_blob_review,
@@ -560,6 +564,10 @@ def build_set_pipeline_candidate(
 
     component_rejections: list[ToolResult] = []
     components_withheld = 0
+    # Echoed server-owned metadata that was reduced/dropped rather than
+    # rejected (elspeth-c67fbbbd83); surfaced once through the success
+    # envelope's data channel.
+    echoed_metadata_notes: list[str] = []
 
     def _record_component_rejection(rejection: SetPipelineCandidate) -> None:
         """Collect one component's rejection instead of returning it.
@@ -707,6 +715,24 @@ def build_set_pipeline_candidate(
         )
         if manual_blob_ref_error is not None:
             return _failure_result(state, manual_blob_ref_error)
+        # Echo tolerance (elspeth-c67fbbbd83): server-owned metadata that
+        # exactly matches the stored source is an echo from a read-modify-write
+        # over the planner-visible state, not a forgery attempt — reduce/drop
+        # it before the reserved-key gates. Non-matching values still reject.
+        stored_legacy_options = state.sources["source"].options if "source" in state.sources else None
+        if not interpretation_requirements_are_internal:
+            legacy_src_options, requirement_echo = _normalize_echoed_interpretation_requirements(
+                legacy_src_options,
+                stored_options=stored_legacy_options,
+            )
+            if requirement_echo:
+                echoed_metadata_notes.append(_ECHOED_REVIEW_METADATA_NOTE)
+        legacy_src_options, authoring_echo = _drop_echoed_source_authoring(
+            legacy_src_options,
+            stored_options=stored_legacy_options,
+        )
+        if authoring_echo:
+            echoed_metadata_notes.append(_ECHOED_SOURCE_AUTHORING_NOTE)
         manual_authoring_error = _reject_manual_source_authoring(legacy_src_options, tool_name="set_pipeline")
         if manual_authoring_error is not None:
             return _failure_result(state, manual_authoring_error)
@@ -933,6 +959,26 @@ def build_set_pipeline_candidate(
                     option_value = src_options[option_name] if option_name in src_options else None
                     if type(option_value) is str and option_value.startswith("blob:"):
                         src_options[option_name] = authority.verified_blob_paths[option_value]
+            # Echo tolerance (elspeth-c67fbbbd83), unreviewed sources only: a
+            # reviewed binding is hash-matched verbatim above and must not be
+            # rewritten. Non-matching values still reject at the gates below.
+            stored_source_options = state.sources[source_name].options if source_name in state.sources else None
+            if not reviewed_source:
+                if not interpretation_requirements_are_internal:
+                    src_options_normalized, requirement_echo = _normalize_echoed_interpretation_requirements(
+                        src_options,
+                        stored_options=stored_source_options,
+                    )
+                    src_options = dict(src_options_normalized)
+                    if requirement_echo:
+                        echoed_metadata_notes.append(_ECHOED_REVIEW_METADATA_NOTE)
+                src_options_dropped, authoring_echo = _drop_echoed_source_authoring(
+                    src_options,
+                    stored_options=stored_source_options,
+                )
+                src_options = dict(src_options_dropped)
+                if authoring_echo:
+                    echoed_metadata_notes.append(_ECHOED_SOURCE_AUTHORING_NOTE)
             review_metadata_error = (
                 None
                 if reviewed_source or interpretation_requirements_are_internal
@@ -1053,6 +1099,16 @@ def build_set_pipeline_candidate(
         node_type = node.node_type
         node_plugin = node.plugin
         node_options: Mapping[str, Any] = node.options
+        # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed
+        # verbatim from the stored node reduce to author shells; the
+        # reconciliation pass below restores the server rows.
+        if not interpretation_requirements_are_internal:
+            node_options, node_requirement_echo = _normalize_echoed_interpretation_requirements(
+                node_options,
+                stored_options=current_nodes[node_id].options if node_id in current_nodes else None,
+            )
+            if node_requirement_echo:
+                echoed_metadata_notes.append(_ECHOED_REVIEW_METADATA_NOTE)
         runtime_owned_error = _runtime_owned_llm_option_error(
             node_plugin,
             node_options,
@@ -1497,6 +1553,11 @@ def build_set_pipeline_candidate(
     if resolved_source_blob is not None:
         source_blob_payload = {"source_blob": resolved_source_blob.payload}
         data = source_blob_payload if data is None else {**data, **source_blob_payload}
+    if echoed_metadata_notes:
+        # De-duplicated in first-seen order: one advisory per note kind, no
+        # matter how many components echoed.
+        note_payload = {"server_owned_metadata_note": " ".join(dict.fromkeys(echoed_metadata_notes))}
+        data = note_payload if data is None else {**data, **note_payload}
     return _candidate(
         _mutation_result(
             new_state,

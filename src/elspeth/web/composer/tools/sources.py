@@ -20,7 +20,8 @@ from elspeth.contracts.blobs import STORAGE_MIME_TYPES
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.plugins.sources.blob_rows import _ROW_FIELDS as _BLOB_ROWS_ROW_FIELDS
 from elspeth.plugins.sources.field_normalization import declarable_field_name
@@ -54,8 +55,10 @@ from elspeth.web.composer.tools._common import (
     _canonicalize_authored_interpretation_requirements,
     _credential_wiring_contract_failure,
     _discovery_result,
+    _echoed_metadata_note,
     _failure_result,
     _mutation_result,
+    _normalize_echoed_interpretation_requirements,
     _options_with_pending_requirement,
     _pending_interpretation_requirement,
     _plugin_policy_failure,
@@ -81,7 +84,12 @@ from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
-from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY, SourceAuthoringMetadata, source_component_id
+from elspeth.web.interpretation_state import (
+    SOURCE_AUTHORING_KEY,
+    SourceAuthoringMetadata,
+    reconcile_authoritative_reviews,
+    source_component_id,
+)
 from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
 )
@@ -540,6 +548,38 @@ def _reject_manual_source_authoring(
     return _manual_source_authoring_error(tool_name=tool_name)
 
 
+def _drop_echoed_source_authoring(
+    options: Mapping[str, Any],
+    *,
+    stored_options: Mapping[str, Any] | None,
+) -> tuple[Mapping[str, Any], bool]:
+    """Drop a supplied source_authoring block that exactly echoes stored state.
+
+    A planner doing read-modify-write over a serialized state echoes the
+    server-stamped ``source_authoring`` block, which
+    :func:`_reject_manual_source_authoring` would reject even though the
+    write asserts nothing new (elspeth-c67fbbbd83, session 2e0c8ea3 seq 19).
+    When the supplied block ``stable_hash``-matches the STORED block
+    (deep-thawed, the ``_reviewed_source_options`` precedent), the key is
+    DROPPED from the caller's options — never passed through, because a
+    forged block on a source with no stored counterpart would otherwise
+    survive ``reconcile_authoritative_reviews``, which only restores over
+    resolved, hash-matched requirements. Any difference from the stored
+    block — ``review_event_id`` alone included — is left for the reject
+    gate, so the provenance-forgery guard is untouched for non-matching
+    values.
+
+    Returns the (possibly rewritten) options and whether the key was dropped.
+    """
+    if SOURCE_AUTHORING_KEY not in options or stored_options is None or SOURCE_AUTHORING_KEY not in stored_options:
+        return options, False
+    supplied_hash = stable_hash(deep_thaw(options[SOURCE_AUTHORING_KEY]))
+    stored_hash = stable_hash(deep_thaw(stored_options[SOURCE_AUTHORING_KEY]))
+    if supplied_hash != stored_hash:
+        return options, False
+    return {key: value for key, value in options.items() if key != SOURCE_AUTHORING_KEY}, True
+
+
 def _reject_manual_source_blobs(
     options: Mapping[str, Any],
     *,
@@ -810,6 +850,19 @@ def _execute_set_source(
     source_name = validated.source_name
     _validate_source_name_argument(source_name)
 
+    # Echo tolerance (elspeth-c67fbbbd83): server-owned metadata that exactly
+    # matches the stored source is an echo from a read-modify-write, not a
+    # forgery attempt — reduce/drop it before the reserved-key gates below.
+    stored_source_options = state.sources[source_name].options if source_name in state.sources else None
+    options, requirement_echo = _normalize_echoed_interpretation_requirements(
+        options,
+        stored_options=stored_source_options,
+    )
+    options, authoring_echo = _drop_echoed_source_authoring(
+        options,
+        stored_options=stored_source_options,
+    )
+
     # Stage A validates the untrusted compact shell before any plugin work.
     review_metadata_error = _resolver_owned_interpretation_requirement_error(
         options,
@@ -827,7 +880,7 @@ def _execute_set_source(
         options,
         component_id=_source_component_id(source_name),
         source=True,
-        existing_options=state.sources[source_name].options if source_name in state.sources else None,
+        existing_options=stored_source_options,
     )
     canonical_error = _canonical_interpretation_requirement_error(
         options,
@@ -909,7 +962,11 @@ def _execute_set_source(
     )
     new_state = state.with_named_source(source_name, source)
     affected = (_source_component_id(source_name),)
-    return _mutation_result(new_state, affected, data=_vf_destination_note(new_state, on_vf))
+    data = _vf_destination_note(new_state, on_vf)
+    echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
+    if echo_note is not None:
+        data = {"server_owned_metadata_note": echo_note} if data is None else {**data, "server_owned_metadata_note": echo_note}
+    return _mutation_result(new_state, affected, data=data)
 
 
 def _execute_set_source_from_blob(
@@ -957,12 +1014,27 @@ def _execute_set_source_from_blob(
     source_name = validated.source_name
     _validate_source_name_argument(source_name)
 
+    # Echo tolerance (elspeth-c67fbbbd83): server-owned metadata that exactly
+    # matches the stored source is an echo from a read-modify-write, not a
+    # forgery attempt — reduce/drop it before the reserved-key gates. The
+    # resolver re-stamps source_authoring from the authoritative blob record
+    # regardless, so the drop loses nothing.
+    stored_source_options = state.sources[source_name].options if source_name in state.sources else None
+    caller_options, requirement_echo = _normalize_echoed_interpretation_requirements(
+        validated.options,
+        stored_options=stored_source_options,
+    )
+    caller_options, authoring_echo = _drop_echoed_source_authoring(
+        caller_options,
+        stored_options=stored_source_options,
+    )
+
     # Caller options merge into the bound source's options, so a forged
     # "resolved" INVENTED_SOURCE requirement here would bypass human review even
     # though the blob path also re-stamps a pending requirement — guard at the
     # boundary rather than relying on that downstream overwrite.
     review_metadata_error = _resolver_owned_interpretation_requirement_error(
-        validated.options,
+        caller_options,
         tool_name="set_source_from_blob",
         component_id=_source_component_id(source_name),
         source=True,
@@ -974,10 +1046,10 @@ def _execute_set_source_from_blob(
             error_code="interpretation_requirements_invalid",
         )
     caller_options = _canonicalize_authored_interpretation_requirements(
-        validated.options,
+        caller_options,
         component_id=_source_component_id(source_name),
         source=True,
-        existing_options=state.sources[source_name].options if source_name in state.sources else None,
+        existing_options=stored_source_options,
     )
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(validated.plugin, caller_options)
     if endpoint_policy_error is not None:
@@ -1018,6 +1090,9 @@ def _execute_set_source_from_blob(
     )
     new_state = state.with_named_source(source_name, source)
     data = _vf_destination_note(new_state, on_vf) or {}
+    echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
+    if echo_note is not None:
+        data["server_owned_metadata_note"] = echo_note
     return _mutation_result(new_state, (_source_component_id(source_name),), data={**data, "source_blob": resolved.payload})
 
 
@@ -1164,8 +1239,20 @@ def _execute_set_source_from_blobs(
     source_name = validated.source_name
     _validate_source_name_argument(source_name)
 
-    review_metadata_error = _resolver_owned_interpretation_requirement_error(
+    # Echo tolerance (elspeth-c67fbbbd83): reduce/drop server-owned metadata
+    # that exactly matches the stored source before the reserved-key gates.
+    stored_source_options = state.sources[source_name].options if source_name in state.sources else None
+    caller_options, requirement_echo = _normalize_echoed_interpretation_requirements(
         validated.options,
+        stored_options=stored_source_options,
+    )
+    caller_options, authoring_echo = _drop_echoed_source_authoring(
+        caller_options,
+        stored_options=stored_source_options,
+    )
+
+    review_metadata_error = _resolver_owned_interpretation_requirement_error(
+        caller_options,
         tool_name="set_source_from_blobs",
         component_id=_source_component_id(source_name),
         source=True,
@@ -1173,10 +1260,10 @@ def _execute_set_source_from_blobs(
     if review_metadata_error is not None:
         return _failure_result(state, review_metadata_error, error_code="interpretation_requirements_invalid")
     caller_options = _canonicalize_authored_interpretation_requirements(
-        validated.options,
+        caller_options,
         component_id=_source_component_id(source_name),
         source=True,
-        existing_options=state.sources[source_name].options if source_name in state.sources else None,
+        existing_options=stored_source_options,
     )
     on_vf = canonicalize_source_validation_failure(validated.on_validation_failure)
     resolved = _resolve_source_blobs(
@@ -1205,6 +1292,9 @@ def _execute_set_source_from_blobs(
     )
     new_state = state.with_named_source(source_name, source)
     data = _vf_destination_note(new_state, on_vf) or {}
+    echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
+    if echo_note is not None:
+        data["server_owned_metadata_note"] = echo_note
     return _mutation_result(
         new_state,
         (_source_component_id(source_name),),
@@ -1581,6 +1671,19 @@ def _execute_patch_source_options(
     current_source = state.sources[source_name]
     patch: Mapping[str, Any] = validated.patch
 
+    # Echo tolerance (elspeth-c67fbbbd83): a patch echoing the stored
+    # server-owned metadata verbatim asserts nothing new — reduce/drop it
+    # before the reserved-key gates. The merge-patch then leaves the stored
+    # values untouched.
+    patch, requirement_echo = _normalize_echoed_interpretation_requirements(
+        patch,
+        stored_options=current_source.options,
+    )
+    patch, authoring_echo = _drop_echoed_source_authoring(
+        patch,
+        stored_options=current_source.options,
+    )
+
     manual_authoring_error = _reject_manual_source_authoring(patch, tool_name="patch_source_options")
     if manual_authoring_error is not None:
         return _failure_result(state, manual_authoring_error)
@@ -1681,8 +1784,24 @@ def _execute_patch_source_options(
         return _failure_result(state, prevalidation_error)
 
     new_source = replace(current_source, options=new_options)
-    new_state = state.with_named_source(source_name, new_source)
-    return _mutation_result(new_state, (_source_component_id(source_name),))
+    proposed_state = state.with_named_source(source_name, new_source)
+    # Rehydrate server-owned review evidence over the merged options — the
+    # same post-build step patch_node_options runs. Without it, an echoed
+    # requirement row reduced to its pending shell above would persist as
+    # PENDING and silently downgrade an already-resolved review.
+    try:
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError):
+        return _failure_result(
+            state,
+            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            error_code="review_reconciliation_failed",
+        )
+    data = None
+    echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
+    if echo_note is not None:
+        data = {"server_owned_metadata_note": echo_note}
+    return _mutation_result(new_state, (_source_component_id(source_name),), data=data)
 
 
 def _handle_patch_source_options(

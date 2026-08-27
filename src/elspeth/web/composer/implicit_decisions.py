@@ -23,6 +23,7 @@ from elspeth.web.interpretation_state import (
     SOURCE_AUTHORING_KEY,
     parse_interpretation_requirements,
 )
+from elspeth.web.plugin_policy.validation import _PROFILE_LOWERING_METADATA_OPTION_KEYS
 
 DecisionCategory = Literal[
     "error_routing",
@@ -40,6 +41,7 @@ DecisionProvenance = Literal[
     "explicit_source_required",
     "picked",
     "policy_required",
+    "server_stamped",
 ]
 
 
@@ -378,7 +380,34 @@ def _note_for_source_option(source: SourceSpec, field_path: str) -> str | None:
     return None
 
 
+def _is_server_stamped_option_path(path: str) -> bool:
+    """Detect a disclosure path rooted at a server-owned options key.
+
+    The key inventory derives from the same constants the write gates and the
+    planner projection use (``AUTHORING_METADATA_OPTION_KEYS`` plus the
+    profile-lowering superset carrying ``resolved_prompt_template_hash``) —
+    never a hand-rolled list. Only the TOP-LEVEL options segment counts:
+    source paths are ``source.<key>...``; node/output paths are
+    ``<prefix>.options.<key>...``.
+    """
+    if path.startswith("source."):
+        remainder = path.removeprefix("source.")
+    else:
+        _prefix, sep, remainder = path.partition(".options.")
+        if not sep:
+            return False
+    root = remainder.split(".", 1)[0]
+    return root in _PROFILE_LOWERING_METADATA_OPTION_KEYS
+
+
 def _provenance_for_path(path: str, value: object) -> DecisionProvenance:
+    if _is_server_stamped_option_path(path):
+        # source_authoring.* / interpretation_requirements /
+        # prompt_template_parts / resolved_prompt_template_hash are written by
+        # ELSPETH's provenance and review machinery, never chosen by the
+        # planner — attributing them to the composer misinforms the auditor
+        # (elspeth-c67fbbbd83).
+        return "server_stamped"
     if path.endswith(".http.abuse_contact") or path.endswith(".http.scraping_reason"):
         return "explicit_source_required"
     if path.endswith(".allowed_hosts") and value == "public_only":
