@@ -304,7 +304,7 @@ def test_build_raised_source_producer_failure_discloses_guarantee_repair(tmp_pat
     error = result.errors[0]
     assert "colour" in error.message
     assert error.suggestion is not None
-    assert "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['colour', ...]}})" in error.suggestion
+    assert "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['colour']}})" in error.suggestion
     assert "COMPLETE claim" in error.suggestion
     assert "relax the consumer" in error.suggestion.lower()
     # Phase ownership: still the build path.

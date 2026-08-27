@@ -5694,7 +5694,7 @@ class TestEdgeContractFailureFormatting:
         # concrete guarantee declaration (elspeth-d39ec0c4d9), seeded from the
         # sorted missing fields and carrying the completeness warning.
         assert (
-            "patch_source_options(source_name='refunds', patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['refund_id', ...]}})"
+            "patch_source_options(source_name='refunds', patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['refund_id']}})"
             in suggestion
         )
         assert "COMPLETE claim" in suggestion
@@ -6478,7 +6478,7 @@ class TestEdgeContractSourceAndStructuralProducerRemedies:
 
         suggestion = _build_edge_contract_suggestion(exc, state=state, graph=None)
 
-        assert "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['colour', ...]}})" in suggestion
+        assert "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['colour']}})" in suggestion
         assert "COMPLETE claim" in suggestion
         # Consumer relaxation stays available as the alternative.
         assert "relax the consumer" in suggestion.lower()
@@ -6506,7 +6506,7 @@ class TestEdgeContractSourceAndStructuralProducerRemedies:
         assert "structural gate" in suggestion
         assert "no plugin" in suggestion
         assert "originates at the true producer" in suggestion
-        assert "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['colour', ...]}})" in suggestion
+        assert "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': ['colour']}})" in suggestion
         assert "COMPLETE claim" in suggestion
 
     def test_plugin_free_coalesce_producer_gets_the_same_arm(self) -> None:
@@ -6650,3 +6650,38 @@ class TestEdgeContractSourceAndStructuralProducerRemedies:
         assert "patch_node_options(node_id='beta'" in suggestion
         assert "patch_node_options(node_id='alpha'" in suggestion
         assert "patch_node_options(node_id='transform_" not in suggestion
+
+    def test_plugin_free_gate_arm_with_multiple_sources_instructs_the_lookup(self) -> None:
+        """Multi-source ambiguity: an UNNAMED patch_source_options call is
+        ambiguous (or rejected) on a multi-source pipeline, so the arm must
+        instruct identifying the feeding source instead of rendering one."""
+        exc = self._edge_error(
+            from_node_id="config_gate_fan_out_5176d9a61403",
+            to_node_id="transform_classify_d4e5f6",
+            missing_fields=("colour",),
+            from_component_type="gate",
+        )
+        orders = _make_source({"schema": {"mode": "observed"}})
+        refunds = SourceSpec(
+            plugin="csv",
+            on_success="classify",
+            options={"schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        )
+        state = CompositionState(
+            sources={"orders": orders, "refunds": refunds},
+            nodes=(),
+            edges=(),
+            outputs=(_make_output(name="results"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        suggestion = _build_edge_contract_suggestion(exc, state=state, graph=None)
+
+        assert "more than one source" in suggestion
+        assert "get_pipeline_state(component='all')" in suggestion
+        assert "patch_source_options(source_name=<the source feeding this path>" in suggestion
+        # No unnamed executable call is offered.
+        assert "patch_source_options(patch=" not in suggestion
+        assert "COMPLETE claim" in suggestion

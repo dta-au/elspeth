@@ -830,9 +830,13 @@ def build_set_pipeline_candidate(
                 prepared_inline_blob,
                 existing_options=state.sources["source"].options if "source" in state.sources else None,
             )
-            # An inline blob IS the run's data: its CSV header is per-row
-            # evidence, so the bound source guarantees the fields it knows
-            # (elspeth-da68332faf; same stamp as _resolve_source_blob).
+            # An LLM-AUTHORED inline blob IS the run's data: its CSV content
+            # is per-row evidence, so the bound source guarantees the fields
+            # it knows (elspeth-da68332faf; same stamp as _resolve_source_blob).
+            # The helper gates on SOURCE_AUTHORING_KEY itself, so a VERBATIM
+            # (user-supplied) inline blob never stamps — an uploaded header is
+            # a sample and feeds the ask-the-user flow instead (John's ruling,
+            # 2026-08-27).
             legacy_src_options = _options_with_derived_guarantees(
                 legacy_src_options,
                 plugin=src_plugin,

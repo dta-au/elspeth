@@ -7039,8 +7039,12 @@ class TestCsvBindGuaranteeRuntimeAgreement:
                     updated_at=now,
                 )
             )
+        # The content stays OUT of the user message so provenance classifies
+        # the blob LLM_GENERATED — auto-declare is scoped to that evidence
+        # class (John's ruling 2026-08-27): an uploaded/verbatim header is a
+        # sample and never silently stamps guarantees.
         content = "colour\nred\nblue\n"
-        user_message_content = f"Use this exact CSV:\n{content}"
+        user_message_content = "Generate a small colour CSV for the pipeline."
         user_message_id = str(uuid4())
         with engine.begin() as conn:
             conn.execute(
@@ -7073,6 +7077,11 @@ class TestCsvBindGuaranteeRuntimeAgreement:
             session_id=_AGREEMENT_SESSION_ID,
             user_message_id=user_message_id,
             user_message_content=user_message_content,
+            composer_model_identifier="openai/gpt-5-mini",
+            composer_model_version="gpt-5-mini-2026-05-01",
+            composer_provider="openai",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash="b" * 64,
         )
         empty = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
         create_result = _execute_create_blob(

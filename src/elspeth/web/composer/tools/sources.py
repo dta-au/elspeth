@@ -24,7 +24,6 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.plugins.sources.blob_rows import _ROW_FIELDS as _BLOB_ROWS_ROW_FIELDS
 from elspeth.plugins.sources.field_normalization import declarable_field_name
-from elspeth.web.blobs.protocol import BlobIntegrityError
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchSourceOptionsArgumentsModel,
@@ -407,16 +406,50 @@ def _schema_options_with_guarantees(
 
 
 def _derived_csv_guarantee_fields(content: str, *, delimiter: str) -> tuple[str, ...] | None:
-    """Derive the complete guaranteed-field set from a CSV header, or abstain.
+    """Derive the per-row-verified guaranteed-field set from CSV content, or abstain.
 
-    All-or-nothing: a partial ``guaranteed_fields`` is a complete-claim
-    violation (SchemaConfig docstring, contracts/schema.py) — the documented
-    worst option. So one undeclarable header, or two headers collapsing onto
-    one canonical row key (ambiguous evidence), abstains entirely. CSV
-    parse/boundary failures propagate — the caller owns the abstention.
+    Two filters, both all-or-nothing:
+
+    1. NAME: every header must have a declarable canonical row key
+       (``declarable_field_name``), with no two headers collapsing onto one
+       key — a partial ``guaranteed_fields`` is a complete-claim violation
+       (SchemaConfig docstring, contracts/schema.py), the documented worst
+       option.
+    2. PER-ROW PRESENCE, derived from the runtime authority rather than
+       restated: ``verify_source_guaranteed_fields``
+       (engine/executors/source_guaranteed_fields.py, ADR-016) checks KEY
+       PRESENCE on each VALID emitted row (``row_data.keys()`` — an
+       empty-string value is data, not absence), and the csv source
+       materializes a valid row as ``dict(zip(headers, values))`` ONLY when
+       the record's cell count equals the header count — a ragged record is
+       QUARANTINED by column-count validation (csv_source.py, "expected N
+       fields, got M") and never reaches the guarantee check. So every row
+       this content will ever emit as valid carries every header key; the
+       content evidence per-row verification needs is that at least one
+       record WOULD emit as a valid row. Zero such records (header-only or
+       all-ragged content) is no evidence — abstain rather than guarantee a
+       source that emits nothing. The premise "valid rows carry all header
+       keys" is pinned against the real csv plugin by
+       ``test_ragged_row_premise_quarantine_not_padding`` — if the source
+       ever starts padding short rows instead, that pin fails and this
+       derivation must become an intersection over emitted-row key sets.
+
+    Row iteration mirrors the source's ``next_nonblank_record``: only an
+    EMPTY record (a blank physical line, ``[]``) is skipped — a ``,,,`` record
+    is a real row of empty values, and it can be the header row exactly as it
+    would be at runtime.
     """
-    header = _first_nonempty_csv_row(content, delimiter=delimiter)
-    if header is None:
+    header: tuple[str, ...] | None = None
+    saw_valid_data_row = False
+    for record in _bounded_csv_rows(content, delimiter=delimiter):
+        if not record:
+            continue
+        if header is None:
+            header = tuple(record)
+            continue
+        if len(record) == len(header):
+            saw_valid_data_row = True
+    if header is None or not saw_valid_data_row:
         return None
     fields: list[str] = []
     seen: set[str] = set()
@@ -443,24 +476,36 @@ def _options_with_derived_guarantees(
     mime_type: str,
     content: str,
 ) -> Mapping[str, Any]:
-    """Auto-declare ``schema.guaranteed_fields`` from bound CSV content.
+    """Auto-declare ``schema.guaranteed_fields`` from LLM-authored bound CSV content.
 
-    A source guarantees what it knows (elspeth-da68332faf): a blob bound at
-    authoring time IS the run's data, so every header column genuinely present
-    is guaranteeable from content alone. Scope is deliberately CSV-only —
-    JSON/JSONL/text ABSTAIN, because a sampled key-union is not per-row
-    evidence and ADR-016 asserts guaranteed fields per row at runtime.
+    A source guarantees what it knows (elspeth-da68332faf) — and evidence
+    class decides what it knows (John's ruling, 2026-08-27): ONLY a
+    composer/LLM-authored blob (``SOURCE_AUTHORING_KEY`` present) qualifies,
+    because its exact bytes are content-hash-bound to the run and content
+    drift reopens review. An UPLOADED or rebindable source's header is a
+    SAMPLE — it feeds the ask-the-user interpretation flow (elspeth-da68332faf
+    work item 2), never a silent stamp, so this helper abstains for it.
+
+    Scope is deliberately CSV-only — JSON/JSONL/text ABSTAIN, because a
+    sampled key-union is not per-row evidence and ADR-016 asserts guaranteed
+    fields per row at runtime.
 
     Evidence must be read the way the runtime will read it: a non-comma
-    ``delimiter`` is honoured, a non-UTF-8 ``encoding`` option abstains
+    ``delimiter`` is honoured; a non-UTF-8 ``encoding`` option abstains
     (bind-time content was decoded as UTF-8, so the runtime's view could
-    differ), and unparseable CSV content abstains via the explicit
-    ``return options`` — the unchanged options ARE the abstention outcome.
+    differ); a configured ``skip_rows`` abstains (the runtime header would be
+    a different record than the one read here); unparseable CSV content
+    abstains via the explicit ``return options`` — the unchanged options ARE
+    the abstention outcome.
     """
+    if SOURCE_AUTHORING_KEY not in options:
+        return options
     if plugin != "csv" or mime_type != "text/csv":
         return options
     encoding = options["encoding"] if "encoding" in options else None
     if encoding is not None and (not isinstance(encoding, str) or encoding.lower().replace("-", "").replace("_", "") != "utf8"):
+        return options
+    if "skip_rows" in options and options["skip_rows"]:
         return options
     delimiter = options["delimiter"] if "delimiter" in options else ","
     if not isinstance(delimiter, str) or len(delimiter) != 1:
@@ -473,45 +518,6 @@ def _options_with_derived_guarantees(
         return options
     stamped = _schema_options_with_guarantees(options, fields)
     return options if stamped is None else stamped
-
-
-def _options_with_best_effort_guarantees(
-    options: Mapping[str, Any],
-    *,
-    session_engine: Engine,
-    session_id: str,
-    blob: BlobToolRecord,
-    plugin: str,
-    pending_content: bytes | None,
-) -> Mapping[str, Any]:
-    """Derive guarantees from a best-effort one-version content read.
-
-    For the NON-authored bind path only: any read, integrity, or decode
-    problem returns the caller's options unchanged, so that path stays
-    byte-for-byte as bindable as before the derivation existed
-    (elspeth-da68332faf). The LLM-authored path must NOT use this — its
-    review stamp requires the strict fail-recoverably read in
-    :func:`_resolve_source_blob`.
-    """
-    try:
-        if pending_content is not None:
-            fresh_blob: BlobToolRecord | None = blob
-            data: bytes | None = pending_content
-        else:
-            fresh_blob, data = _locked_read_ready_blob(session_engine, session_id, blob["id"])
-        if fresh_blob is None or fresh_blob["status"] != "ready" or data is None:
-            return options
-        if fresh_blob["content_hash"] != blob["content_hash"]:
-            return options
-        content = data.decode("utf-8")
-    except (AuditIntegrityError, BlobIntegrityError, OSError, UnicodeDecodeError):
-        return options
-    return _options_with_derived_guarantees(
-        options,
-        plugin=plugin,
-        mime_type=blob["mime_type"],
-        content=content,
-    )
 
 
 def _manual_source_authoring_error(*, tool_name: str) -> str:
@@ -712,22 +718,6 @@ def _resolve_source_blob(
             plugin=plugin,
             mime_type=blob["mime_type"],
             content=content,
-        )
-    elif plugin == "csv" and blob["mime_type"] == "text/csv":
-        # A user-uploaded/verbatim CSV blob is ALSO the run's data, so its
-        # header is per-row evidence for guaranteed_fields
-        # (elspeth-da68332faf). Unlike the LLM-authored review path above,
-        # this read is strictly ADDITIVE: any read, integrity, or decode
-        # problem abstains from the stamp and leaves the bind exactly as it
-        # was before this derivation existed — run admission remains the
-        # custody gate for those failures.
-        merged_options = _options_with_best_effort_guarantees(
-            merged_options,
-            session_engine=session_engine,
-            session_id=session_id,
-            blob=blob,
-            plugin=plugin,
-            pending_content=pending_content,
         )
     canonical_error = _canonical_interpretation_requirement_error(
         merged_options,
@@ -1117,12 +1107,15 @@ def _resolve_source_blobs(
         payloads.append(_source_blob_payload(blob))
 
     merged_options: dict[str, Any] = {**caller_options, "blobs": entries}
-    # A source guarantees what it knows (elspeth-da68332faf): blob_rows rows
-    # carry EXACTLY the plugin's five fixed custody fields — the guarantee is
-    # structural, from the plugin contract, not from content evidence (the
-    # blobs are opaque documents; their bytes are never read here). The claim
-    # is complete by construction, which is what SchemaConfig's participation
-    # vote requires.
+    # A source guarantees what it knows: blob_rows fabricates EVERY row as a
+    # literal dict of exactly the plugin's five fixed custody fields
+    # (blob_rows.py load(), the row construction at :226-232 over _ROW_FIELDS)
+    # — the guarantee is PLUGIN-CONTRACT truth, complete by construction, not
+    # a sample-header inference, so it sits outside John's uploaded-source
+    # exclusion (adjudicated 2026-08-27; the sample rule governs content
+    # evidence, and no blob content is read here). The declaration lives at
+    # this bind seam rather than inside the plugin file to avoid
+    # source_file_hash/corpus churn — possible future cleanup.
     stamped = _schema_options_with_guarantees(merged_options, _BLOB_ROWS_ROW_FIELDS)
     if stamped is not None:
         merged_options = dict(stamped)

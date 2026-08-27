@@ -8271,10 +8271,9 @@ class TestComposeLoopForcedRepair:
         assert result.repair_turns_used == 1
         assert result.state.sources["source"] is not None
         assert result.state.sources["source"].options["blob_ref"] == self.blob_id
-        # Bind-time content evidence adds guaranteed_fields to the observed
-        # schema (elspeth-da68332faf); this test pins the repair-loop shape,
-        # not the guarantee derivation, so assert the mode only.
-        assert result.state.sources["source"].options["schema"]["mode"] == "observed"
+        # Uploaded blob: no auto-declared guaranteed_fields (John's ruling
+        # 2026-08-27, elspeth-da68332faf) — the schema stays bare observed.
+        assert dict(result.state.sources["source"].options["schema"]) == {"mode": "observed"}
         assert result.state.outputs[0].name == "out"
         assert result.runtime_preflight is not None and result.runtime_preflight.is_valid is True
 

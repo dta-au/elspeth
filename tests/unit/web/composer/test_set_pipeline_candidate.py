@@ -2304,9 +2304,10 @@ async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_pa
         "plugin": "csv",
         "on_success": "rows",
         "options": {
-            # Bind-time content evidence stamps the header's canonical row
-            # keys as the complete guarantee (elspeth-da68332faf).
-            "schema": {"mode": "observed", "guaranteed_fields": ["name", "score"]},
+            # VERBATIM inline content (echoed in the user message) never
+            # auto-declares guaranteed_fields — the stamp is scoped to
+            # LLM-authored blobs (John's ruling 2026-08-27, elspeth-da68332faf).
+            "schema": {"mode": "observed"},
             "path": rows[0]["storage_path"],
             "blob_ref": rows[0]["id"],
         },

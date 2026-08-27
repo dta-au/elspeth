@@ -805,9 +805,10 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "The rejection's contract facts name the producer, the sink, and the missing field names.",
         "Call preview_pipeline to inspect edge_contracts, then either relax the sink schema with patch_output_options or "
         "update the upstream schema with patch_source_options or patch_node_options and re-preview until the edge shows "
-        "satisfied=true. When the true producer is an observed-mode source whose rows genuinely carry the fields, declare "
-        "them: patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': [...]}}) — guaranteed_fields "
-        "is a COMPLETE claim, so list every field the rows carry, not only the missing ones.",
+        "satisfied=true. Declare a source guarantee ONLY for fields VERIFIED from the source's actual content (its bound "
+        "blob or inspect_source) or confirmed by the user — never the planner's intent alone: "
+        "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': [...]}}) — guaranteed_fields "
+        "is a COMPLETE claim, so list every such field, not only the missing ones.",
     ),
     (
         r"schema_contract_violation|Schema contract violation:",
@@ -815,10 +816,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "guaranteed_fields guarantees NOTHING, and a plugin-free gate/coalesce producer only passes through what its own "
         "upstream guarantees. The rejection's contract facts name the producer, the consumer, and the missing field names.",
         "Call preview_pipeline to inspect edge_contracts, then update the upstream schema with patch_source_options or "
-        "patch_node_options and re-preview until the edge shows satisfied=true. When the true producer is an observed-mode "
-        "source whose rows genuinely carry the fields, declare them: "
+        "patch_node_options and re-preview until the edge shows satisfied=true. Declare a source guarantee ONLY for fields "
+        "VERIFIED from the source's actual content (its bound blob or inspect_source) or confirmed by the user — never "
+        "the planner's intent alone: "
         "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': [...]}}) — guaranteed_fields is a "
-        "COMPLETE claim, so list every field the rows carry, not only the missing ones.",
+        "COMPLETE claim, so list every such field, not only the missing ones.",
     ),
     # ── Closed structural node-shape codes ──────────────────────────────────
     # The planner repair feedback strips validation messages; these codes are

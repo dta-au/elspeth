@@ -179,11 +179,12 @@ def _merge_inspection_into_prefill(
         if fields is not None:
             prefilled["schema"] = {"mode": "flexible", "fields": fields}
         else:
-            guaranteed = _guaranteed_fields_from_inspection_headers(plugin, facts)
-            if guaranteed is not None:
-                prefilled["schema"] = {"mode": "observed", "guaranteed_fields": guaranteed}
-            else:
-                prefilled["schema"] = {"mode": "observed"}
+            # Deliberately NO observed+guaranteed_fields fallback here (John's
+            # ruling, 2026-08-27): guided inspection works from a USER-PROVIDED
+            # (uploaded/path-bound) source, so its header is a SAMPLE — it may
+            # feed the ask-the-user interpretation flow (elspeth-da68332faf
+            # work item 2), never a silent guarantee prefill.
+            prefilled["schema"] = {"mode": "observed"}
     elif facts.observed_headers:
         prefilled["schema"] = {"mode": "observed"}
     # Delimiter and encoding are deliberately not prefilled here: the live
@@ -225,39 +226,6 @@ def _schema_field_specs_from_inspection_headers(facts: SourceInspectionFacts) ->
         field_type = "any" if inferred == "null" else inferred
         fields.append(f"{header}: {field_type}")
     return fields
-
-
-def _guaranteed_fields_from_inspection_headers(
-    plugin: str,
-    facts: SourceInspectionFacts,
-) -> list[str] | None:
-    """Return observed-mode ``guaranteed_fields`` from a CSV header, or None.
-
-    The fallback for headers that are real but not safe explicit-schema
-    identifiers (``_schema_field_specs_from_inspection_headers`` returned
-    None): the runtime normalizes each header to a canonical row key, and that
-    key is what the source can guarantee per row (elspeth-da68332faf —
-    observed + guaranteed_fields is the sanctioned participate-but-open
-    shape). CSV only: a JSON/JSONL sampled key-union is not per-row evidence.
-
-    All-or-nothing, like the explicit-schema prefill above it: one header with
-    no declarable form, or two headers collapsing onto one canonical key,
-    abstains entirely — a partial guaranteed_fields is a complete-claim
-    violation (SchemaConfig docstring).
-    """
-    if plugin != "csv" or facts.source_kind != "csv":
-        return None
-    from elspeth.plugins.sources.field_normalization import declarable_field_name
-
-    fields: list[str] = []
-    seen: set[str] = set()
-    for header in facts.observed_headers or ():
-        name = declarable_field_name(header)
-        if name is None or name in seen:
-            return None
-        seen.add(name)
-        fields.append(name)
-    return fields or None
 
 
 def _is_safe_schema_field_name(header: str) -> bool:

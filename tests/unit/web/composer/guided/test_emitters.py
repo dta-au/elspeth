@@ -399,14 +399,14 @@ class TestBuildSchemaFormTurns:
         schema_prefill = turn["payload"]["prefilled"]["schema"]
         assert schema_prefill == {"mode": "flexible", "fields": ["name: str", "age: int"]}
 
-    def test_step_1_schema_form_guarantees_canonical_keys_for_unsafe_inspected_header(self) -> None:
+    def test_step_1_schema_form_keeps_observed_mode_for_unsafe_inspected_header(self) -> None:
         # A Tier-3 uploaded CSV whose header is an env-var placeholder must not be
         # emitted as an explicit schema.fields spec: those strings later flow through
         # the runtime YAML loader, and a raw ``${VAR}`` header would become a
         # config-to-output host-secret exfiltration gadget on the CLI loader path.
-        # The observed+guaranteed_fields fallback (elspeth-da68332faf) carries only
-        # the CANONICAL row key — a validated identifier, no metacharacters — which
-        # is exactly the key runtime header normalization produces per row.
+        # Deliberately NO observed+guaranteed_fields fallback either (John's ruling,
+        # 2026-08-27): the inspected source is user-provided, so its header is a
+        # SAMPLE — guarantee ratification belongs to the ask-the-user flow.
         facts = SourceInspectionFacts(
             source_kind="csv",
             redacted_identity={"filename": "input.csv"},
@@ -421,12 +421,13 @@ class TestBuildSchemaFormTurns:
         turn = build_step_1_schema_form_turn("csv", _Catalog(), inspection_facts=facts)
 
         schema_prefill = turn["payload"]["prefilled"]["schema"]
-        assert schema_prefill == {"mode": "observed", "guaranteed_fields": ["aws_secret_access_key", "ok"]}
+        assert schema_prefill == {"mode": "observed"}
 
-    def test_step_1_schema_form_guarantees_canonical_keys_for_keyword_header(self) -> None:
+    def test_step_1_schema_form_keeps_observed_mode_for_keyword_header(self) -> None:
         # A header that is a Python keyword ("class") is not a safe explicit field
-        # name either — runtime header normalization renames it to "class_", and
-        # that canonical key is what the source can guarantee per row.
+        # name either — runtime header normalization would rename it, so declaring
+        # it as an explicit spec would diverge from actual runtime behaviour. No
+        # guarantee fallback here either (sample-header rule, see the test above).
         facts = SourceInspectionFacts(
             source_kind="csv",
             redacted_identity={"filename": "input.csv"},
@@ -434,45 +435,6 @@ class TestBuildSchemaFormTurns:
             sample_row_count=1,
             observed_headers=("class", "ok"),
             inferred_types={"class": "str", "ok": "int"},
-            url_candidates=(),
-            warnings=(),
-        )
-
-        turn = build_step_1_schema_form_turn("csv", _Catalog(), inspection_facts=facts)
-
-        schema_prefill = turn["payload"]["prefilled"]["schema"]
-        assert schema_prefill == {"mode": "observed", "guaranteed_fields": ["class_", "ok"]}
-
-    def test_step_1_schema_form_stays_bare_observed_for_undeclarable_header(self) -> None:
-        # All-or-nothing (elspeth-da68332faf): one header with NO declarable form
-        # ("!!!" normalizes to nothing, so it names no row key) abstains entirely —
-        # a partial guaranteed_fields is a complete-claim violation.
-        facts = SourceInspectionFacts(
-            source_kind="csv",
-            redacted_identity={"filename": "input.csv"},
-            byte_range_inspected=(0, 64),
-            sample_row_count=1,
-            observed_headers=("!!!", "ok"),
-            inferred_types={"!!!": "str", "ok": "int"},
-            url_candidates=(),
-            warnings=(),
-        )
-
-        turn = build_step_1_schema_form_turn("csv", _Catalog(), inspection_facts=facts)
-
-        schema_prefill = turn["payload"]["prefilled"]["schema"]
-        assert schema_prefill == {"mode": "observed"}
-
-    def test_step_1_schema_form_stays_bare_observed_for_colliding_canonical_headers(self) -> None:
-        # Two headers collapsing onto one canonical row key ("A B" and "a_b") are
-        # ambiguous evidence — abstain rather than guess.
-        facts = SourceInspectionFacts(
-            source_kind="csv",
-            redacted_identity={"filename": "input.csv"},
-            byte_range_inspected=(0, 64),
-            sample_row_count=1,
-            observed_headers=("A B", "a_b"),
-            inferred_types={"A B": "str", "a_b": "int"},
             url_candidates=(),
             warnings=(),
         )

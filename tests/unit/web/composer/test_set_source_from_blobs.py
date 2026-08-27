@@ -128,9 +128,12 @@ class TestSetSourceFromBlobs:
             "mime_type": "image/jpeg",
             "size_bytes": len(_JPEG),
         }
-        # A source guarantees what it knows (elspeth-da68332faf): blob_rows
-        # rows carry exactly the plugin's five fixed custody fields, so the
-        # bind stamps the complete structural guarantee.
+        # A source guarantees what it knows (elspeth-da68332faf, adjudicated
+        # 2026-08-27): blob_rows fabricates every row as exactly the plugin's
+        # five fixed custody fields (blob_rows.py load() row construction), so
+        # the bind stamps the complete PLUGIN-CONTRACT guarantee — this is not
+        # a sample-header inference and sits outside the uploaded-source
+        # exclusion.
         schema = source.options["schema"]
         assert set(schema) == {"mode", "guaranteed_fields"}
         assert schema["mode"] == "observed"
