@@ -20,6 +20,7 @@ from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
 from elspeth.web.interpretation_state import (
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+    SOURCE_AUTHORING_KEY,
     parse_interpretation_requirements,
 )
 
@@ -329,19 +330,26 @@ def _category_for_source_option(source: SourceSpec, field_path: str) -> Decision
 def _is_content_derived_guarantee(source: SourceSpec, field_path: str) -> bool:
     """Detect the bind-time content-derived ``schema.guaranteed_fields`` stamp.
 
-    The stamp exists only on blob-bound sources (``blob_ref`` is the structural
-    marker the bind tools write alongside it), where the bound content IS the
-    run's data (elspeth-da68332faf). The final state alone cannot distinguish
-    a planner-authored guarantee on a blob-bound source from the derived one,
-    so this attribution is conservative in the report's documented sense: for
-    blob-bound sources the guarantee is evidenced by the file's content either
-    way — the bind path refuses to stamp anything the header does not carry.
+    The stamp exists only on LLM-AUTHORED blob-bound sources —
+    ``SOURCE_AUTHORING_KEY`` is the structural marker the bind tools write for
+    exactly that evidence class (John's ruling, 2026-08-27: an uploaded
+    source's header is a sample and never auto-declares). The final state
+    alone cannot distinguish a planner-authored guarantee on such a source
+    from the derived one, so this attribution is conservative in the report's
+    documented sense: for an authored bound blob the guarantee is evidenced by
+    the file's content either way — the bind path refuses to stamp anything
+    the content does not carry per row.
     """
-    return field_path in ("schema.guaranteed_fields", "schema_config.guaranteed_fields") and "blob_ref" in source.options
+    return field_path in ("schema.guaranteed_fields", "schema_config.guaranteed_fields") and SOURCE_AUTHORING_KEY in source.options
 
 
 def _is_structural_blob_rows_guarantee(source: SourceSpec, field_path: str) -> bool:
-    """Detect the blob_rows fixed-row-field guarantee stamped at bind time."""
+    """Detect the blob_rows fixed-row-field guarantee stamped at bind time.
+
+    blob_rows fabricates every row as exactly the plugin's five fixed custody
+    fields (blob_rows.py ``load()`` row construction), so the stamped claim is
+    plugin-contract truth — server-derived, never the planner's assertion.
+    """
     return (
         field_path in ("schema.guaranteed_fields", "schema_config.guaranteed_fields")
         and source.plugin == "blob_rows"
@@ -358,7 +366,7 @@ def _source_provenance(source: SourceSpec, field_path: str, value: object) -> De
 def _note_for_source_option(source: SourceSpec, field_path: str) -> str | None:
     if _is_content_derived_guarantee(source, field_path):
         return (
-            "Guaranteed fields derived from the bound file's own header at bind "
+            "Guaranteed fields derived from the bound file's own content at bind "
             "time — the content, not the planner, is the evidence for this claim."
         )
     if _is_structural_blob_rows_guarantee(source, field_path):

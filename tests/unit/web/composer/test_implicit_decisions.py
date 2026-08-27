@@ -238,14 +238,21 @@ def test_llm_source_non_model_options_and_routing_keep_source_contract() -> None
     }
 
 
-def test_blob_bound_guaranteed_fields_attribute_to_content_not_planner() -> None:
-    """The bind-time guarantee stamp is evidenced by the file's own header
-    (elspeth-da68332faf), so the report must say ``derived_from_content``."""
+def test_authored_blob_guaranteed_fields_attribute_to_content_not_planner() -> None:
+    """The bind-time guarantee stamp exists only on LLM-authored bound blobs
+    (SOURCE_AUTHORING_KEY marks the evidence class — John's ruling 2026-08-27),
+    and the report must attribute it as ``derived_from_content``."""
     by_path = _entries_by_path(
         _state_with_source_options(
             {
                 "blob_ref": _BLOB_REF,
                 "path": _STORAGE_PATH,
+                "source_authoring": {
+                    "modality": "llm_generated",
+                    "content_hash": "a" * 64,
+                    "review_event_id": None,
+                    "resolved_kind": None,
+                },
                 "schema": {"mode": "observed", "guaranteed_fields": ["colour"]},
             }
         )
@@ -258,12 +265,14 @@ def test_blob_bound_guaranteed_fields_attribute_to_content_not_planner() -> None
     assert by_path["source.schema.mode"]["provenance"] == "composer_selected"
 
 
-def test_non_blob_source_guaranteed_fields_keep_ordinary_provenance() -> None:
-    """Without the blob binding there is no content evidence to attribute."""
+def test_uploaded_blob_guaranteed_fields_keep_ordinary_provenance() -> None:
+    """A verbatim/uploaded bound blob never auto-declares, so a guarantee on
+    one is the author's own claim — never attributed to content."""
     by_path = _entries_by_path(
         _state_with_source_options(
             {
-                "path": "/data/input.csv",
+                "blob_ref": _BLOB_REF,
+                "path": _STORAGE_PATH,
                 "schema": {"mode": "observed", "guaranteed_fields": ["colour"]},
             }
         )
@@ -275,7 +284,8 @@ def test_non_blob_source_guaranteed_fields_keep_ordinary_provenance() -> None:
 
 
 def test_blob_rows_guarantee_attributes_to_plugin_contract() -> None:
-    """The blob_rows fixed-row-field stamp is server-derived, not the planner's."""
+    """The blob_rows fixed-row-field stamp is server-derived plugin-contract
+    truth (adjudicated 2026-08-27), not the planner's assertion."""
     by_path = _entries_by_path(
         _state_with_source_options(
             {
@@ -300,3 +310,19 @@ def test_blob_rows_guarantee_attributes_to_plugin_contract() -> None:
     entry = by_path["source.schema.guaranteed_fields"]
     assert entry["provenance"] == "derived_from_content"
     assert "plugin" in str(entry["note"])
+
+
+def test_non_blob_source_guaranteed_fields_keep_ordinary_provenance() -> None:
+    """Without a blob binding there is no content evidence to attribute."""
+    by_path = _entries_by_path(
+        _state_with_source_options(
+            {
+                "path": "/data/input.csv",
+                "schema": {"mode": "observed", "guaranteed_fields": ["colour"]},
+            }
+        )
+    )
+
+    entry = by_path["source.schema.guaranteed_fields"]
+    assert entry["provenance"] == "composer_selected"
+    assert "note" not in entry

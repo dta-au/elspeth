@@ -8,25 +8,42 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
-- **2026-08-27 — a blob-bound CSV source now carries
+- **2026-08-27 — an LLM-AUTHORED blob-bound CSV source now carries
   `schema.guaranteed_fields` STAMPED AT BIND TIME, and a graph fake needs the
   NAME-keyed transform map** (elspeth-da68332faf / elspeth-d39ec0c4d9). Two
   test-fixture traps from landing it, both of which redden green-looking
   suites elsewhere:
-  - Any test that binds a CSV blob (`set_source_from_blob`,
-    `set_source_from_blobs`, `set_pipeline` blob_id/inline_blob) and pins the
-    source options EXACTLY now sees `schema: {mode: observed,
-    guaranteed_fields: [<canonical header keys>]}` instead of the bare
-    observed block — three pins moved in one landing
-    (`test_set_source_from_blobs.py`, `test_set_pipeline_candidate.py`,
-    `test_service.py`). Pin the guarantee where the test is ABOUT the stamp;
-    assert `schema["mode"]` alone where it is not. blob_rows binds stamp the
-    plugin's five fixed custody row fields. The stamp is all-or-nothing
-    (partial guaranteed_fields is a complete-claim violation) and abstains on
-    `columns`/`field_mapping`, author-written `guaranteed_fields`/`fields`,
-    non-observed mode, non-UTF-8 `encoding`, undeclarable or colliding
-    headers, and — on the non-authored path — ANY content-read problem
-    (strictly additive; do not "harden" that abstention into a bind failure).
+  - EVIDENCE CLASS decides the stamp (John's ruling, 2026-08-27): auto-declare
+    fires ONLY when `SOURCE_AUTHORING_KEY` is in the bound options —
+    composer/LLM-authored blobs (invented_source flow), whose bytes are
+    content-hash-bound to the run. An UPLOADED/verbatim/rebindable source's
+    header is a SAMPLE and NEVER auto-declares (it will feed the ask-the-user
+    interpretation card, elspeth-da68332faf work item 2); the guided
+    inspection prefill deliberately has no guarantee fallback for the same
+    reason. blob_rows binds are the one non-authored stamp: the plugin
+    fabricates every row as exactly its five fixed custody fields
+    (blob_rows.py load() row construction), so that claim is PLUGIN-CONTRACT
+    truth, not sample inference (adjudicated). Do not "extend" the content
+    stamp to uploaded/guided surfaces. A test
+    that binds an LLM-AUTHORED CSV blob and pins the source options exactly
+    sees `schema: {mode: observed, guaranteed_fields: [<canonical header
+    keys>]}`; verbatim binds keep the bare observed block. The stamp is
+    all-or-nothing on NAMES (partial guaranteed_fields is a complete-claim
+    violation) and PER-ROW VERIFIED against the actual content, with the
+    predicate DERIVED from the runtime authority
+    (`verify_source_guaranteed_fields`, ADR-016: KEY presence on each VALID
+    row; the csv source QUARANTINES ragged records — "expected N fields, got
+    M" — so they never emit and cannot shrink the stamp; a `,,` record is a
+    row of empty VALUES, which is data). Zero valid data rows = abstain
+    entirely — never stamp an empty list, `()` participates and guarantees
+    nothing. Also abstains on `columns`/`field_mapping`, `skip_rows`,
+    author-written `guaranteed_fields`/`fields`, non-observed mode,
+    non-UTF-8 `encoding`, undeclarable or colliding headers. The
+    quarantine-not-padding premise is pinned by
+    `test_ragged_row_premise_quarantine_not_padding`
+    (`test_promote_set_source_from_blob.py`) — if the csv source ever starts
+    padding short rows, fix the DERIVATION to intersect emitted-row key sets,
+    never the pin.
   - `_edge_patch_targets_by_dag_id`'s transform arm reads
     `graph.get_transform_name_id_map()` (builder keys it on
     `wired.settings.name`, the composer node id) instead of zipping the

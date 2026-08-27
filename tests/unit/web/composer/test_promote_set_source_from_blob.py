@@ -572,9 +572,12 @@ class TestSetSourceFromBlobTsvDelimiter:
 
 
 class TestSetSourceFromBlobDerivedGuarantees:
-    """A bound blob IS the run's data, so a CSV bind auto-declares
-    ``schema.guaranteed_fields`` from the header it can read — all-or-nothing,
-    never partial, and never over an author-written declaration."""
+    """An LLM-AUTHORED bound blob IS the run's data, so its bind auto-declares
+    ``schema.guaranteed_fields`` — verified per row against the actual content,
+    all-or-nothing, never partial, and never over an author-written
+    declaration. An UPLOADED/verbatim blob's header is a SAMPLE (John's ruling
+    2026-08-27) and never auto-declares: it feeds the ask-the-user flow
+    (elspeth-da68332faf work item 2)."""
 
     def _bind_blob(
         self,
@@ -584,8 +587,16 @@ class TestSetSourceFromBlobDerivedGuarantees:
         mime_type: str,
         tmp_path: Path,
         options: dict[str, Any] | None = None,
+        authored: bool = True,
     ) -> Any:
-        user_message_content = f"Bind this blob as the source:\n{content}"
+        # ``authored=True`` keeps the blob content OUT of the user message so
+        # provenance classifies it LLM_GENERATED and the bind stamps
+        # SOURCE_AUTHORING_KEY — the evidence class auto-declare is scoped to.
+        # ``authored=False`` embeds the content verbatim (user-supplied).
+        if authored:
+            user_message_content = "Generate the source data yourself."
+        else:
+            user_message_content = f"Bind this blob as the source:\n{content}"
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
         catalog = _mock_catalog()
         ctx = ToolContext(
@@ -595,6 +606,11 @@ class TestSetSourceFromBlobDerivedGuarantees:
             session_id=session_id,
             user_message_id=user_message_id,
             user_message_content=user_message_content,
+            composer_model_identifier="openai/gpt-5-mini",
+            composer_model_version="gpt-5-mini-2026-05-01",
+            composer_provider="openai",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash="b" * 64,
         )
         create_result = _execute_create_blob(
             {"filename": filename, "mime_type": mime_type, "content": content},
@@ -617,7 +633,7 @@ class TestSetSourceFromBlobDerivedGuarantees:
         assert bind_result.success is True, bind_result.data
         return dict(bind_result.updated_state.sources["source"].options["schema"])
 
-    def test_csv_bind_stamps_complete_header_guarantee(self, tmp_path: Path) -> None:
+    def test_authored_csv_bind_stamps_complete_header_guarantee(self, tmp_path: Path) -> None:
         schema = self._schema(
             self._bind_blob(
                 filename="data.csv",
@@ -630,7 +646,22 @@ class TestSetSourceFromBlobDerivedGuarantees:
         assert schema["mode"] == "observed"
         assert list(schema["guaranteed_fields"]) == ["id", "score_value", "colour"]
 
-    def test_csv_bind_without_schema_block_creates_observed_guarantee(self, tmp_path: Path) -> None:
+    def test_uploaded_csv_bind_never_auto_declares(self, tmp_path: Path) -> None:
+        """The negative the ruling requires: a user-verbatim CSV blob binds
+        successfully and gains NO guaranteed_fields — its header is a sample."""
+        bind_result = self._bind_blob(
+            filename="data.csv",
+            content="id,colour\n1,red\n",
+            mime_type="text/csv",
+            tmp_path=tmp_path,
+            authored=False,
+        )
+        schema = self._schema(bind_result)
+        assert schema == {"mode": "observed"}
+        # And the bind really was the verbatim class, not a mis-classified one.
+        assert SOURCE_AUTHORING_KEY not in bind_result.updated_state.sources["source"].options
+
+    def test_authored_csv_bind_without_schema_block_creates_observed_guarantee(self, tmp_path: Path) -> None:
         schema = self._schema(
             self._bind_blob(
                 filename="data.csv",
@@ -640,11 +671,10 @@ class TestSetSourceFromBlobDerivedGuarantees:
                 options={},
             )
         )
-        assert schema == {"mode": "observed", "guaranteed_fields": ["a", "b"]} or (
-            schema["mode"] == "observed" and list(schema["guaranteed_fields"]) == ["a", "b"]
-        )
+        assert schema["mode"] == "observed"
+        assert list(schema["guaranteed_fields"]) == ["a", "b"]
 
-    def test_tsv_bind_reads_header_with_derived_tab_delimiter(self, tmp_path: Path) -> None:
+    def test_authored_tsv_bind_reads_header_with_derived_tab_delimiter(self, tmp_path: Path) -> None:
         schema = self._schema(
             self._bind_blob(
                 filename="data.tsv",
@@ -654,6 +684,126 @@ class TestSetSourceFromBlobDerivedGuarantees:
             )
         )
         assert list(schema["guaranteed_fields"]) == ["alpha", "beta"]
+
+    def test_ragged_row_stamps_full_header_because_the_source_quarantines_it(self, tmp_path: Path) -> None:
+        """Per-row presence derives from the csv source's own materialization:
+        a record with the wrong cell count is QUARANTINED by column-count
+        validation ("expected N fields, got M") and never emits as a valid
+        row, so it cannot shrink the guarantee — every VALID row is
+        ``dict(zip(headers, values))`` and carries every header key, which is
+        exactly the key-presence predicate ``verify_source_guaranteed_fields``
+        (ADR-016) enforces. The premise is pinned against the real plugin by
+        ``test_ragged_row_premise_quarantine_not_padding`` below."""
+        schema = self._schema(
+            self._bind_blob(
+                filename="data.csv",
+                content="a,b\n1\n2,3\n",
+                mime_type="text/csv",
+                tmp_path=tmp_path,
+            )
+        )
+        assert list(schema["guaranteed_fields"]) == ["a", "b"]
+
+    def test_ragged_row_premise_quarantine_not_padding(self, tmp_path: Path) -> None:
+        """Predicate-parity pin tying the stamp to the runtime authority: feed
+        the REAL csv source the ragged content and assert the ragged record is
+        quarantined (never padded into a valid row) and every valid row
+        carries every header key. If the csv source ever starts padding short
+        rows, this fails first — and the bind-time derivation must become an
+        intersection over emitted-row key sets."""
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        csv_path = tmp_path / "ragged.csv"
+        csv_path.write_text("a,b\n1\n2,3\n", encoding="utf-8")
+        source = CSVSource(
+            {
+                "path": str(csv_path),
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "quarantine_sink",
+            }
+        )
+
+        class _Ctx:
+            def record_validation_error(self, **kwargs: Any) -> None:
+                del kwargs
+
+        rows = list(source.load(_Ctx()))
+        valid = [row for row in rows if not row.is_quarantined]
+        quarantined = [row for row in rows if row.is_quarantined]
+        assert len(valid) == 1, rows
+        assert set(valid[0].row.keys()) >= {"a", "b"}
+        assert len(quarantined) == 1
+        assert quarantined[0].quarantine_error is not None
+        assert "expected 2 fields, got 1" in quarantined[0].quarantine_error
+
+    def test_runtime_predicate_is_key_presence_not_value_nonemptiness(self) -> None:
+        """The other half of predicate parity: the stamp treats an empty VALUE
+        as data because ``verify_source_guaranteed_fields`` (ADR-016) checks
+        ``row_data.keys()`` — KEY presence. Exercise the runtime authority
+        directly on that exact discriminating pair: if its definition ever
+        tightens to value non-emptiness, the empty-value arm here fails before
+        any stamped pipeline over-claims."""
+        from elspeth.contracts.errors import SourceGuaranteedFieldsViolation
+        from elspeth.engine.executors.source_guaranteed_fields import (
+            _build_contract,
+            verify_source_guaranteed_fields,
+        )
+
+        common: dict[str, Any] = {
+            "declared_guaranteed_fields": frozenset({"a", "b"}),
+            "row_contract": _build_contract(("a", "b")),
+            "plugin_name": "csv",
+            "node_id": "source",
+            "run_id": "run",
+            "row_id": "row-1",
+            "token_id": "token-1",
+        }
+        # Empty-string values: every key present — the guarantee holds.
+        verify_source_guaranteed_fields(row_data={"a": "", "b": ""}, **common)
+        # Absent key: the guarantee is violated regardless of sibling values.
+        with pytest.raises(SourceGuaranteedFieldsViolation) as excinfo:
+            verify_source_guaranteed_fields(row_data={"a": ""}, **common)
+        assert list(excinfo.value.payload["missing"]) == ["b"]
+
+    def test_all_empty_values_row_is_data_not_absence(self, tmp_path: Path) -> None:
+        """A row spelled ``,,`` carries every field as an EMPTY VALUE — key
+        presence is what the runtime contract checks, so it must not exclude
+        any field from the stamp."""
+        schema = self._schema(
+            self._bind_blob(
+                filename="data.csv",
+                content="a,b,c\n,,\n",
+                mime_type="text/csv",
+                tmp_path=tmp_path,
+            )
+        )
+        assert list(schema["guaranteed_fields"]) == ["a", "b", "c"]
+
+    def test_header_only_content_stamps_nothing(self, tmp_path: Path) -> None:
+        """Zero valid data rows is zero per-row evidence — abstain entirely
+        (never stamp an empty list: () participates and guarantees nothing)."""
+        schema = self._schema(
+            self._bind_blob(
+                filename="data.csv",
+                content="a,b\n",
+                mime_type="text/csv",
+                tmp_path=tmp_path,
+            )
+        )
+        assert "guaranteed_fields" not in schema
+
+    def test_all_ragged_content_stamps_nothing(self, tmp_path: Path) -> None:
+        """Every data record would quarantine, so no valid row ever emits —
+        no per-row evidence, abstain."""
+        schema = self._schema(
+            self._bind_blob(
+                filename="data.csv",
+                content="a,b\n1\n",
+                mime_type="text/csv",
+                tmp_path=tmp_path,
+            )
+        )
+        assert "guaranteed_fields" not in schema
 
     def test_undeclarable_header_stamps_nothing_all_or_nothing(self, tmp_path: Path) -> None:
         """One header with no declarable form abstains ENTIRELY — a partial
@@ -719,6 +869,19 @@ class TestSetSourceFromBlobDerivedGuarantees:
         schema = self._schema(bind_result)
         assert "guaranteed_fields" not in schema
 
+    def test_skip_rows_configured_csv_stamps_nothing(self, tmp_path: Path) -> None:
+        """With skip_rows the runtime header is a different record than the
+        first one read here — abstain rather than guarantee the wrong row."""
+        bind_result = self._bind_blob(
+            filename="data.csv",
+            content="preamble line\na,b\n1,2\n",
+            mime_type="text/csv",
+            tmp_path=tmp_path,
+            options={"skip_rows": 1, "schema": {"mode": "observed"}},
+        )
+        schema = self._schema(bind_result)
+        assert "guaranteed_fields" not in schema
+
     def test_author_written_guarantee_is_never_widened(self, tmp_path: Path) -> None:
         bind_result = self._bind_blob(
             filename="data.csv",
@@ -731,8 +894,8 @@ class TestSetSourceFromBlobDerivedGuarantees:
         assert list(schema["guaranteed_fields"]) == ["a"]
 
     def test_non_utf8_csv_blob_still_binds_and_abstains(self, tmp_path: Path) -> None:
-        """Widening the bind-time content read must not make a latin-1 CSV
-        unbindable: the guarantee derivation abstains, the bind stays green."""
+        """An uploaded latin-1 CSV stays bindable and unstamped: it is
+        user-verbatim (no source_authoring), so auto-declare never engages."""
         import asyncio
         from uuid import UUID
 
@@ -768,7 +931,7 @@ class TestSetSourceFromBlobDerivedGuarantees:
         schema = self._schema(bind_result)
         assert "guaranteed_fields" not in schema
 
-    def test_non_utf8_encoding_option_abstains_even_for_utf8_bytes(self, tmp_path: Path) -> None:
+    def test_non_utf8_encoding_option_abstains_even_for_authored_utf8_bytes(self, tmp_path: Path) -> None:
         """The runtime will read the file with the configured encoding; when
         that is not UTF-8 the bind-time evidence may not match, so abstain."""
         bind_result = self._bind_blob(

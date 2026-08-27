@@ -331,35 +331,43 @@ def _format_edge_contract_message(
 
 
 _GUARANTEE_COMPLETENESS_WARNING = (
-    "      IMPORTANT: guaranteed_fields is a COMPLETE claim, not a partial hint. List EVERY field the "
-    "source's rows carry — not only the missing ones above — or build-time validation will start "
-    "rejecting the fields you left out."
+    "      IMPORTANT: guaranteed_fields is a COMPLETE claim, not a partial hint. The call above lists "
+    "only the currently-missing fields — extend it to EVERY field the source is VERIFIED to carry "
+    "(from its actual content: the bound blob or inspect_source, or confirmed by the user — never from "
+    "intent alone), or build-time validation will start rejecting the fields you left out."
 )
 
 
-def _concrete_source_guarantee_patch_call(
+def _resolved_source_name(
     producer: _EdgePatchTarget,
     state: CompositionState | None,
+) -> str | None:
+    """The source name to patch, or None when it is genuinely ambiguous."""
+    if producer.component_id == "source":
+        return "source"
+    if producer.component_id.startswith("source:"):
+        return producer.component_id[len("source:") :]
+    if state is not None and len(state.sources) == 1:
+        # Build-path degradation left the DAG id in place; a single-source
+        # state still identifies the producer unambiguously.
+        return next(iter(state.sources))
+    return None
+
+
+def _concrete_source_guarantee_patch_call(
+    source_name: str,
     missing_fields: tuple[str, ...],
 ) -> str:
     """Render the exact patch_source_options call that declares the guarantee.
 
-    The fields literal seeds from the sorted missing fields with a trailing
-    ellipsis — the completeness warning beside it tells the planner to extend
-    the list to the source's full row shape.
+    The rendered call must be EXECUTABLE VERBATIM — planners comply with
+    remedy text literally (session 2e0c8ea3), so no placeholder tokens: the
+    list holds exactly the sorted missing fields, and the completeness
+    warning beside it demands extension to the source's full verified shape.
     """
-    source_name: str | None = None
-    if producer.component_id == "source":
-        source_name = "source"
-    elif producer.component_id.startswith("source:"):
-        source_name = producer.component_id[len("source:") :]
-    elif state is not None and len(state.sources) == 1:
-        # Build-path degradation left the DAG id in place; a single-source
-        # state still identifies the producer unambiguously.
-        source_name = next(iter(state.sources))
     fields_literal = ", ".join(repr(field) for field in sorted(missing_fields))
-    patch = f"patch={{'schema': {{'mode': 'observed', 'guaranteed_fields': [{fields_literal}, ...]}}}}"
-    if source_name in (None, "source"):
+    patch = f"patch={{'schema': {{'mode': 'observed', 'guaranteed_fields': [{fields_literal}]}}}}"
+    if source_name == "source":
         return f"patch_source_options({patch})"
     return f"patch_source_options(source_name={source_name!r}, {patch})"
 
@@ -373,13 +381,32 @@ def _source_guarantee_repair_lines(
     preamble: str,
 ) -> str:
     """Source-remedy-first advice: declare the guarantee where the rows live."""
+    source_name = _resolved_source_name(producer, state)
+    if source_name is not None:
+        declare_lines = (
+            "  (a) Declare the source's guaranteed fields — ONLY fields VERIFIED from the source's actual "
+            "content (its bound blob or inspect_source) or confirmed by the user; never from intent:",
+            f"      Tool: {_concrete_source_guarantee_patch_call(source_name, missing_fields)}",
+            _GUARANTEE_COMPLETENESS_WARNING,
+        )
+    else:
+        # Multiple sources and no resolved producer name: an unnamed
+        # patch_source_options call is ambiguous (or rejected outright), so
+        # instruct the lookup instead of rendering a call that wastes a turn.
+        declare_lines = (
+            "  (a) Declare the guarantee on the source that feeds this path — this pipeline has more than "
+            "one source, so first identify WHICH source produces these rows (get_pipeline_state(component='all')), "
+            "then declare ONLY fields VERIFIED from that source's actual content (its bound blob or "
+            "inspect_source) or confirmed by the user:",
+            "      Tool: patch_source_options(source_name=<the source feeding this path>, "
+            f"patch={{'schema': {{'mode': 'observed', 'guaranteed_fields': [{', '.join(repr(field) for field in sorted(missing_fields))}]}}}})",
+            _GUARANTEE_COMPLETENESS_WARNING,
+        )
     return "\n".join(
         (
             preamble,
             "",
-            "  (a) Declare the source's guaranteed fields — the complete set of fields its rows actually carry:",
-            f"      Tool: {_concrete_source_guarantee_patch_call(producer, state, missing_fields)}",
-            _GUARANTEE_COMPLETENESS_WARNING,
+            *declare_lines,
             "",
             f"  (b) Or relax the consumer {consumer.display_name}: drop the missing required fields from wherever it "
             "declares them — its schema.required_fields or its required_input_fields option — if it doesn't actually "
