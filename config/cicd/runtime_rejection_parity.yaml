@@ -3270,16 +3270,19 @@ sites:
   counterpart:
   - transform_missing_plugin
   - aggregation_missing_plugin
-- key: 0d826b613dd13ebc
+- key: 159fcc0aa88cc01b
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
   exception: GraphValidationError
-  message: NodeInfo.preserves_input_values is only meaningful for TRANSFORM nodes; node {} has type {}.
+  message: NodeInfo.preserves_input_values is only meaningful for TRANSFORM, AGGREGATION, or COLLECTOR
+    nodes; node {} has type {}.
   ordinal: 0
   disposition: structural
-  note: preserves_input_values is written only at builder.py's TRANSFORM add_node site (from TransformProtocol.preserves_input_values);
-    its only consumer — resolve_guaranteed_field_type's pass-through recursion arm — is TRANSFORM-scoped,
-    so any other node type carrying it is a framework wiring bug, unreachable from authored config (elspeth-e6e552ce34).
+  note: preserves_input_values is written only at builder.py's TRANSFORM, AGGREGATION, and COLLECTOR add_node
+    sites (from the plugin contract's preserves_input_values); its only consumer — resolve_guaranteed_field_type's
+    pass-through recursion arm — is scoped to those same node kinds (elspeth-48aeea6ad9 widened the e6e552ce34
+    threading), so any other node type carrying it is a framework wiring bug, unreachable from authored
+    config.
 - key: 57c9f229abe3f2b8
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
