@@ -1756,6 +1756,113 @@ def test_sign_bundle_resume_skips_recorded_blocked_actions(tmp_path: Path, capsy
     assert _canonical_key(alpha) in out
 
 
+def test_sign_bundle_lanes_resign_only_never_judges_and_publishes_deterministic_work(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--lanes resign fires the deterministic lane and never touches the judge.
+
+    The unselected new_judgment action is not attempted: no judge call, no
+    entry written, and the run publishes coherently over the selected lane.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    widget_finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=widget_finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),
+            ),
+        ),
+    )
+
+    with _patch_judge(_accept_all) as judge_calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--lanes", "resign")))
+
+    assert rc == 0
+    assert judge_calls == []
+    assert orphan_key not in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert not (allowlist_dir / "alpha.yaml").exists()
+    out = capsys.readouterr().out
+    assert "1 action(s) outside the selected lane(s)" in out
+
+
+def test_sign_bundle_lanes_rejects_unknown_lane(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),)),
+    )
+
+    with pytest.raises(SystemExit):
+        main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--lanes", "drift_repair")))
+
+    assert "valid lanes" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_keeps_and_inherits_the_journalled_lane_scope(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Resume inherits the transaction's lane scope; an explicit mismatch refuses.
+
+    First run: --lanes resign with the stale_delete forced to exit 2 → stop.
+    Resuming with --lanes new_judgment is refused; resuming with no --lanes
+    inherits resign, completes the delete, and still never judges the
+    unselected justify action.
+    """
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    widget_finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=widget_finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),
+            ),
+        ),
+    )
+
+    with patch.object(cli_module, "_execute_stale_delete_action", return_value=2):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--lanes", "resign")))
+    assert rc == 2
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--lanes", "new_judgment", "--resume", str(transaction)),
+        )
+    )
+    assert rc == 2
+    assert "--lanes mismatch" in capsys.readouterr().err
+
+    with _patch_judge(_accept_all) as judge_calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 0
+    assert judge_calls == []
+    assert orphan_key not in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert not (allowlist_dir / "alpha.yaml").exists()
+
+
 def test_sign_bundle_resume_reuses_accepted_judgment_and_publishes_coherently(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)

@@ -875,6 +875,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip the interactive confirmation prompt before creating/resuming the private transaction.",
     )
     sign_bundle.add_argument(
+        "--lanes",
+        type=_sign_bundle_lanes,
+        default=None,
+        metavar="LANE[,LANE]",
+        help=(
+            "Scope the transaction to a comma-separated subset of bundle lanes: "
+            "'resign' (drift_repair + rotation + stale_delete — no new rationale "
+            "needed) and/or 'new_judgment' (justify — judges the staged "
+            "rationale). Unselected actions are never attempted, never judged, "
+            "and stay exactly as they are in the allowlist (fail-closed); the "
+            "coherent publish covers the selected lanes only. The selection is "
+            "journalled in the transaction and a resume must use the same "
+            "--lanes value (omitting the flag on resume inherits it). Default: "
+            "all lanes."
+        ),
+    )
+    sign_bundle.add_argument(
         "--continue-on-block",
         action="store_true",
         help=(
@@ -4051,6 +4068,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
                 rotation_log=args.rotation_log,
                 signing_policy=signing_policy,
             )
+            _assert_resume_lanes(resume_manifest, args)
             resume_disposition = publication_disposition(resume_manifest)
             if resume_disposition.startswith("published"):
                 # After the atomic swap the transaction's candidate path holds
@@ -4110,6 +4128,13 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
 
     # --- Pre-write summary (pure read) ---------------------------------------
     _emit_sign_bundle_summary(bundle, verification=verification, args=args)
+    if args.lanes is not None:
+        lane_set = set(args.lanes)
+        excluded = sum(1 for action in bundle.actions if action.lane not in lane_set)
+        sys.stdout.write(
+            f"sign-bundle: --lanes {','.join(args.lanes)} — {excluded} action(s) outside the selected lane(s) "
+            "will not be attempted and stay fail-closed.\n"
+        )
 
     if args.dry_run:
         sys.stdout.write("sign-bundle: dry-run; nothing written (re-run without --dry-run to fire).\n")
@@ -4132,6 +4157,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
                     allowlist_dir=args.allowlist_dir,
                     rotation_log=args.rotation_log,
                     signing_policy=signing_policy,
+                    selected_lanes=args.lanes,
                 )
                 sys.stderr.write(f"sign-bundle: private transaction created at {tx_path}; if interrupted, resume with --resume {tx_path}\n")
             else:
@@ -4145,6 +4171,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
                     rotation_log=args.rotation_log,
                     signing_policy=signing_policy,
                 )
+                _assert_resume_lanes(manifest, args)
             disposition = publication_disposition(manifest)
             if disposition == "not_published":
                 assert_active_unchanged(manifest)
@@ -4180,6 +4207,40 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
     if code != 0 and tx_path is not None:
         _emit_sign_bundle_recovery(args, tx_path, reason="action did not succeed")
     return code
+
+
+_SIGN_BUNDLE_LANES = ("new_judgment", "resign")
+
+
+def _sign_bundle_lanes(raw: str) -> tuple[str, ...]:
+    """Parse a comma-separated lane subset; reject unknown or empty selections."""
+    lanes = tuple(sorted({part.strip() for part in raw.split(",") if part.strip()}))
+    if not lanes:
+        raise argparse.ArgumentTypeError("--lanes requires at least one lane name")
+    unknown = [lane for lane in lanes if lane not in _SIGN_BUNDLE_LANES]
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown lane(s) {', '.join(unknown)}; valid lanes: {', '.join(_SIGN_BUNDLE_LANES)}")
+    return lanes
+
+
+def _assert_resume_lanes(manifest: dict[str, Any], args: argparse.Namespace) -> None:
+    """A resumed transaction keeps its journalled lane scope.
+
+    Omitting --lanes on resume inherits the manifest's selection (written back
+    onto ``args`` so every downstream consumer sees the effective scope); an
+    explicit mismatch is refused rather than silently re-scoped.
+    """
+    from elspeth_lints.core.sign_bundle_transaction import SignBundleTransactionError
+
+    manifest_lanes = manifest.get("selected_lanes")
+    if args.lanes is None:
+        args.lanes = None if manifest_lanes is None else tuple(manifest_lanes)
+        return
+    if manifest_lanes is None or tuple(sorted(manifest_lanes)) != tuple(sorted(args.lanes)):
+        recorded = "all lanes" if manifest_lanes is None else ",".join(sorted(manifest_lanes))
+        raise SignBundleTransactionError(
+            f"resume --lanes mismatch: transaction was created for {recorded}, command selected {','.join(sorted(args.lanes))}"
+        )
 
 
 def _sign_bundle_signing_policy(args: argparse.Namespace) -> dict[str, Any]:
@@ -4259,7 +4320,12 @@ def _execute_sign_bundle(
 
     # A drift_repair action that is no longer signable (now in `unrepairable`)
     # is a stale claim -- abort before any write, mirroring sign-judge-signatures.
-    blocked = {a.key for a in bundle.actions if a.kind == "drift_repair"} & unrepairable_keys
+    # Actions outside the selected lanes are never attempted, so their claims
+    # cannot gate the transaction.
+    selected_lanes = None if args.lanes is None else set(args.lanes)
+    blocked = {
+        a.key for a in bundle.actions if a.kind == "drift_repair" and (selected_lanes is None or a.lane in selected_lanes)
+    } & unrepairable_keys
     if blocked:
         sys.stderr.write("sign-bundle: drift_repair action(s) are no longer signable in the fresh diagnosis; re-run stage_scan:\n")
         for key in sorted(blocked):
@@ -4392,6 +4458,8 @@ def _emit_sign_bundle_recovery(args: argparse.Namespace, tx_path: Path, *, reaso
         command.extend(("--format", args.justify_format))
     if args.continue_on_block:
         command.append("--continue-on-block")
+    if args.lanes is not None:
+        command.extend(("--lanes", ",".join(args.lanes)))
     sys.stderr.write(
         f"sign-bundle: {reason}; private decisions preserved at {tx_path}.\n"
         f"sign-bundle: re-verify and resume with:\n  {shlex.join(command)}\n"

@@ -143,6 +143,7 @@ def create_transaction(
     allowlist_dir: Path,
     rotation_log: Path,
     signing_policy: dict[str, Any],
+    selected_lanes: tuple[str, ...] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Copy the active allowlist and initialize a secret-free durable journal."""
     active = allowlist_dir.resolve()
@@ -197,6 +198,10 @@ def create_transaction(
         "source_validation_state": _SOURCE_VALIDATION_NOT_STARTED,
         "completed_actions": [],
         "running_action": None,
+        # None = every lane (legacy journals lack the key entirely). A lane
+        # subset scopes the transaction: unselected actions are never attempted
+        # and the publish invariant covers the selected set only.
+        "selected_lanes": None if selected_lanes is None else sorted(selected_lanes),
     }
     _fsync_tree(candidate)
     _fsync_directory(candidate_parent)
@@ -305,6 +310,11 @@ def load_manifest(tx_path: Path) -> dict[str, Any]:
         raise SignBundleTransactionError("transaction manifest completed_actions must be a list")
     if raw.get("blocked_actions") is not None and not isinstance(raw.get("blocked_actions"), list):
         raise SignBundleTransactionError("transaction manifest blocked_actions must be a list or absent")
+    selected_lanes = raw.get("selected_lanes")
+    if selected_lanes is not None and (
+        not isinstance(selected_lanes, list) or not all(isinstance(lane, str) and lane for lane in selected_lanes)
+    ):
+        raise SignBundleTransactionError("transaction manifest selected_lanes must be a list of lane names or null")
     if not isinstance(raw.get("rotation_base_sha256"), str) or not isinstance(raw.get("rotation_staged_sha256"), str):
         raise SignBundleTransactionError("transaction manifest rotation hashes must be strings")
     if raw.get("checkpoint_snapshot") is not None and not isinstance(raw.get("checkpoint_snapshot"), dict):
@@ -684,6 +694,14 @@ def run_sign_bundle_transaction(
         raise SignBundleTransactionError("transaction journal records an action as both completed and blocked")
     if any(index < 0 or index >= len(bundle.actions) for index in blocked):
         raise SignBundleTransactionError("transaction blocked_actions index is out of range")
+    manifest_lanes = manifest.get("selected_lanes")
+    if manifest_lanes is None:
+        selected = set(range(len(bundle.actions)))
+    else:
+        lane_set = set(manifest_lanes)
+        selected = {index for index, action in enumerate(bundle.actions) if action.lane in lane_set}
+    if (completed | blocked) - selected:
+        raise SignBundleTransactionError("transaction journal records actions outside its selected lanes")
     running = manifest.get("running_action")
     recorded_rotation_hash = cast("str", manifest["rotation_staged_sha256"])
     if running is None:
@@ -695,8 +713,8 @@ def run_sign_bundle_transaction(
             raise SignBundleTransactionError("transaction running-action rotation checkpoint authentication failed")
 
     if disposition.startswith("published"):
-        if completed | blocked != set(range(len(bundle.actions))):
-            raise SignBundleTransactionError("published transaction journal does not contain every bundle action")
+        if completed | blocked != selected:
+            raise SignBundleTransactionError("published transaction journal does not contain every selected bundle action")
         _validate_pending_source_publish(
             bundle=bundle,
             args=args,
@@ -818,7 +836,7 @@ def run_sign_bundle_transaction(
         key=lambda indexed: (_ACTION_PRIORITY[indexed[1].kind], indexed[0]),
     )
     for index, action in ordered_actions:
-        if index in completed or index in blocked:
+        if index not in selected or index in completed or index in blocked:
             continue
         source_file = _action_source_file(
             action,
