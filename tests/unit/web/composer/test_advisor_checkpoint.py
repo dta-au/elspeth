@@ -135,17 +135,19 @@ def _mock_catalog() -> MagicMock:
     return catalog
 
 
-def _make_settings() -> WebSettings:
-    return WebSettings(
-        data_dir=Path("/data"),
-        composer_max_composition_turns=15,
-        composer_max_discovery_turns=10,
-        composer_timeout_seconds=85.0,
-        composer_rate_limit_per_minute=10,
-        composer_advisor_max_calls_per_compose=4,
-        composer_advisor_timeout_seconds=60.0,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
+def _make_settings(**overrides: object) -> WebSettings:
+    values: dict[str, object] = {
+        "data_dir": Path("/data"),
+        "composer_max_composition_turns": 15,
+        "composer_max_discovery_turns": 10,
+        "composer_timeout_seconds": 85.0,
+        "composer_rate_limit_per_minute": 10,
+        "composer_advisor_max_calls_per_compose": 4,
+        "composer_advisor_timeout_seconds": 60.0,
+        "shareable_link_signing_key": b"\x00" * 32,
+    }
+    values.update(overrides)
+    return WebSettings(**values)
 
 
 def make_recorder() -> BufferingRecorder:
@@ -4136,3 +4138,207 @@ def test_advisor_rubric_makes_the_withheld_schema_entry_case_satisfiable(make_se
     # name-only "values withheld" key list, or the obligation is unsatisfiable.
     assert "additional_fields_withheld" in prompt
     assert "values withheld" in prompt
+
+
+# ---------------------------------------------------------------------------
+# elspeth-71617f1d21 — repair-continue mutation expectation + stalled-repair
+# terminal hardening.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_end_gate_repair_message_carries_mutation_expectation(make_service, clean_runnable_state):
+    """The repair-continue injection must state that MUTATIONS are expected.
+
+    Session 2e0c8ea3: both advisor repair turns were spent entirely on
+    get_pipeline_state lookups — nothing in the injected message said a
+    read-only turn is a wasted pass.
+    """
+    from elspeth.web.composer.service import _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating")
+    )
+    llm_messages: list[dict[str, object]] = []
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0, llm_messages=llm_messages)
+    assert outcome.action == "continue"
+    repair_message = next(m["content"] for m in llm_messages if m["role"] == "user")
+    assert _ADVISOR_MUTATION_EXPECTATION_CLAUSE in repair_message
+    assert "MUTATIONS" in repair_message
+    assert "get_pipeline_state" in repair_message
+
+
+@pytest.mark.asyncio
+async def test_early_checkpoint_does_not_carry_mutation_expectation(make_service, empty_state, nonempty_state):
+    """EARLY advisory injection keeps its continue-if-inapplicable framing —
+    the mutation-expectation clause is END-gate only by design."""
+    from elspeth.web.composer.service import _ADVISOR_MUTATION_EXPECTATION_CLAUSE
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="Consider a field_mapper before the sink")
+    )
+    llm_messages: list[dict[str, object]] = []
+    await service._maybe_run_early_checkpoint(
+        state=nonempty_state,
+        prev_state=empty_state,
+        session_id="s1",
+        llm_messages=llm_messages,
+        recorder=make_recorder(),
+    )
+    injected = next(m["content"] for m in llm_messages if m["role"] == "user")
+    assert _ADVISOR_MUTATION_EXPECTATION_CLAUSE not in injected
+
+
+def _advisor_evidence_hash(state: CompositionState) -> str:
+    from elspeth.web.composer.service import _summarize_pipeline_for_advisor
+
+    return stable_hash({"advisor_evidence": _summarize_pipeline_for_advisor(state)})
+
+
+def _make_stalled_gate_service():
+    """A service with a 3-pass budget so a stalled pass 2 has a continue to deny."""
+    return ComposerServiceImpl.for_trained_operator(
+        catalog=_mock_catalog(),
+        settings=_make_settings(composer_advisor_checkpoint_max_passes=3),
+    )
+
+
+async def _drive_gate_with_review_state(service, state, review_state):
+    from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
+
+    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: still unresolved")
+    )
+    runtime_preflight = ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+    return await service._evaluate_terminal_no_tool_advisor_gate(
+        state=state,
+        session_id=None,
+        current_state_id=None,
+        assistant_message=_AssistantMessage(),
+        llm_messages=[],
+        recorder=make_recorder(),
+        progress=None,
+        advisor_checkpoint_passes_used=1,
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_tool_call_turn=False,
+        allow_repair_continue=True,
+        runtime_preflight=runtime_preflight,
+        user_message="build the thing",
+        user_id="alice",
+        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        initial_version=1,
+        session_scope="s1",
+        plugin_snapshot=None,
+        advisor_review_state=review_state,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stalled_repair_reflag_terminal_blocks_instead_of_another_continue(clean_runnable_state):
+    """elspeth-71617f1d21 (c): prior FLAG + zero mutations + identical evidence
+    → a re-FLAG takes the terminal-block branch even with budget left."""
+    from elspeth.web.composer._compose_loop_carriers import _AdvisorReviewState
+
+    service = _make_stalled_gate_service()
+    review_state = _AdvisorReviewState(
+        completed_passes=1,
+        previous_findings=("FLAGGED: still unresolved",),
+        previous_evidence_hash=_advisor_evidence_hash(clean_runnable_state),
+        successful_mutating_actions=(),
+    )
+    outcome = await _drive_gate_with_review_state(service, clean_runnable_state, review_state)
+    assert outcome.action == "return"
+    assert outcome.result is not None
+
+
+@pytest.mark.asyncio
+async def test_stalled_repair_check_spares_a_pass_that_mutated(clean_runnable_state):
+    """Control: a successful mutation after the prior FLAG keeps the repair-continue."""
+    from elspeth.web.composer._compose_loop_carriers import _AdvisorReviewState
+
+    service = _make_stalled_gate_service()
+    review_state = _AdvisorReviewState(
+        completed_passes=1,
+        previous_findings=("FLAGGED: still unresolved",),
+        previous_evidence_hash=_advisor_evidence_hash(clean_runnable_state),
+        successful_mutating_actions=("patch_node_options",),
+    )
+    outcome = await _drive_gate_with_review_state(service, clean_runnable_state, review_state)
+    assert outcome.action == "continue"
+
+
+@pytest.mark.asyncio
+async def test_stalled_repair_check_spares_changed_evidence(clean_runnable_state):
+    """Control: changed evidence identity keeps the repair-continue even with
+    zero recorded mutations (the state moved by some other path)."""
+    from elspeth.web.composer._compose_loop_carriers import _AdvisorReviewState
+
+    service = _make_stalled_gate_service()
+    review_state = _AdvisorReviewState(
+        completed_passes=1,
+        previous_findings=("FLAGGED: still unresolved",),
+        previous_evidence_hash="a-different-evidence-identity",
+        successful_mutating_actions=(),
+    )
+    outcome = await _drive_gate_with_review_state(service, clean_runnable_state, review_state)
+    assert outcome.action == "continue"
+
+
+@pytest.mark.asyncio
+async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_runnable_state):
+    """The hardening never skips pass 2: a CLEAN verdict over identical
+    evidence stays the advisor's self-correction path (test_service.py:1934
+    pins the compose-loop half of this behaviour)."""
+    from elspeth.web.composer._compose_loop_carriers import _AdvisorReviewState
+    from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
+
+    service = _make_stalled_gate_service()
+    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._run_advisor_checkpoint = _AsyncRecorder(return_value=AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
+    review_state = _AdvisorReviewState(
+        completed_passes=1,
+        previous_findings=("FLAGGED: still unresolved",),
+        previous_evidence_hash=_advisor_evidence_hash(clean_runnable_state),
+        successful_mutating_actions=(),
+    )
+    runtime_preflight = ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+    outcome = await service._evaluate_terminal_no_tool_advisor_gate(
+        state=clean_runnable_state,
+        session_id=None,
+        current_state_id=None,
+        assistant_message=_AssistantMessage(),
+        llm_messages=[],
+        recorder=make_recorder(),
+        progress=None,
+        advisor_checkpoint_passes_used=1,
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_tool_call_turn=False,
+        allow_repair_continue=True,
+        runtime_preflight=runtime_preflight,
+        user_message="build the thing",
+        user_id="alice",
+        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        initial_version=1,
+        session_scope="s1",
+        plugin_snapshot=None,
+        advisor_review_state=review_state,
+    )
+    assert service._run_advisor_checkpoint.await_count == 1
+    assert outcome.action == "fall_through"
