@@ -1218,6 +1218,7 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
         "bedrock_guardrail_profiles",
         "aws_s3_source_profiles",
         "aws_textract_profiles",
+        "secret_wiring_allowlist",
     }
 )
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
