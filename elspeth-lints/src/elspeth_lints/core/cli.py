@@ -4175,7 +4175,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
             disposition = publication_disposition(manifest)
             if disposition == "not_published":
                 assert_active_unchanged(manifest)
-            code = _execute_sign_bundle(
+            outcome = _execute_sign_bundle(
                 bundle,
                 verification=verification,
                 args=args,
@@ -4204,12 +4204,35 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
             _emit_sign_bundle_recovery(args, tx_path, reason="unexpected failure")
         return 2
 
-    if code != 0 and tx_path is not None:
+    if outcome.resumable and tx_path is not None:
         _emit_sign_bundle_recovery(args, tx_path, reason="action did not succeed")
-    return code
+    return outcome.exit_code
 
 
 _SIGN_BUNDLE_LANES = ("new_judgment", "resign")
+
+# Published, but some judged BLOCKs were skipped under --continue-on-block: the
+# signed subset is live and the blocked entries stay fail-closed. Distinct from
+# 0 so a partial run never reads as clean, and from 1/2 so it is not mistaken
+# for an unfinished transaction (see ``_SignBundleOutcome``).
+_SIGN_BUNDLE_EXIT_PUBLISHED_WITH_BLOCKS = 3
+
+
+@dataclass(frozen=True, slots=True)
+class _SignBundleOutcome:
+    """A finished ``sign-bundle`` transaction and whether resuming it can progress.
+
+    The exit code alone cannot answer the second question, which is why this
+    carries both. Exit 3 is reached only *after* the coherent publish, and exit 1
+    covers both a stopped-on-BLOCK transaction (resumable with
+    ``--continue-on-block``) and an all-blocked one that signed nothing (no work
+    left to advance). Offering the paste-ready ``--resume`` command on a terminal
+    outcome sends the operator into a loop: the command reproduces the same code
+    and the same guidance forever.
+    """
+
+    exit_code: int
+    resumable: bool
 
 
 def _sign_bundle_lanes(raw: str) -> tuple[str, ...]:
@@ -4306,7 +4329,7 @@ def _execute_sign_bundle(
     tx_path: Path,
     manifest: dict[str, Any],
     disposition: str,
-) -> int:
+) -> _SignBundleOutcome:
     """Resume/fire actions privately, then atomically publish one coherent tree."""
     diagnosis = verification.diagnosis
     specs, _stale_keys, unrepairable = _signing_specs_from_diagnosis(diagnosis)
@@ -4330,7 +4353,9 @@ def _execute_sign_bundle(
         sys.stderr.write("sign-bundle: drift_repair action(s) are no longer signable in the fresh diagnosis; re-run stage_scan:\n")
         for key in sorted(blocked):
             sys.stderr.write(f"  {key}\n")
-        return 2
+        # A stale claim is re-staged, not resumed: nothing was written, and a
+        # resume re-derives the same fresh diagnosis and stops here again.
+        return _SignBundleOutcome(2, resumable=False)
 
     from elspeth_lints.core.sign_bundle_transaction import run_sign_bundle_transaction
 
@@ -4360,7 +4385,11 @@ def _execute_sign_bundle(
                 f"sign-bundle: no action was signed; {result.blocked_count} judged-BLOCK action(s) recorded. Remediate and re-stage.\n"
             )
             _emit_sign_bundle_blocked_worklist(result)
-            return result.exit_code
+            # Every selected action is journalled BLOCKED and a journalled BLOCK
+            # is never re-judged, so there is nothing left for a resume to fire
+            # and nothing to publish. Re-staging is the only move; naming a
+            # resume command here would contradict the line above.
+            return _SignBundleOutcome(result.exit_code, resumable=False)
         sys.stderr.write(
             f"sign-bundle: transaction stopped after {result.completed_count} completed action(s); "
             f"[{(result.failed_index or 0) + 1}/{len(bundle.actions)}] "
@@ -4376,7 +4405,7 @@ def _execute_sign_bundle(
                     "sign-bundle: judged BLOCK(s) are journalled and will NOT be re-judged on resume; "
                     "resume with --continue-on-block to skip them and publish the survivors.\n"
                 )
-        return result.exit_code
+        return _SignBundleOutcome(result.exit_code, resumable=True)
     _maybe_regen_fingerprint_baseline(args)
     _refresh_override_rate_counter_snapshot_after_allowlist_write(args.allowlist_dir / "_defaults.yaml")
     _emit_sign_bundle_post_state(args)
@@ -4391,8 +4420,9 @@ def _execute_sign_bundle(
             "and remain UNSIGNED (fail-closed).\n"
         )
         _emit_sign_bundle_blocked_worklist(result)
-        return 3
-    return 0
+        # The transaction is published and complete; only remediation is owed.
+        return _SignBundleOutcome(_SIGN_BUNDLE_EXIT_PUBLISHED_WITH_BLOCKS, resumable=False)
+    return _SignBundleOutcome(0, resumable=False)
 
 
 def _emit_sign_bundle_blocked_worklist(result: Any) -> None:

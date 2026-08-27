@@ -133,7 +133,11 @@ elspeth-lints rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NE
   `--resume <transaction-dir>`. Resume authenticates the journal, exact bundle,
   source/bindings, directory identities, candidate/checkpoint/audit evidence,
   prior signatures, and the original non-secret signing policy. It skips
-  completed authoritative decisions and retries only unfinished actions.
+  completed authoritative decisions and retries only unfinished actions. That
+  command is printed only when a resume can still progress: exit 3
+  (published-with-blocks), an all-blocked run that signed nothing, and a stale
+  `drift_repair` claim are terminal and are re-staged instead — if no `--resume`
+  command was offered, do not construct one.
 - `rekey` is a scheme-preserving, **signature-only** swap (only the
   `judge_metadata_signature` line changes). Idempotent/re-runnable; an entry
   verifying under neither old nor new key aborts the whole run (no laundering). Key

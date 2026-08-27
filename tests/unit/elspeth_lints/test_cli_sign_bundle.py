@@ -378,6 +378,12 @@ def _tree_bytes(root: Path) -> dict[str, bytes]:
     return {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
 
 
+# The distinctive line ``_emit_sign_bundle_recovery`` prints. Asserting on
+# ``--resume`` alone cannot discriminate: ``_run_sign_bundle`` also names the
+# flag when it announces a freshly created transaction, and that line is correct.
+_RECOVERY_GUIDANCE = "re-verify and resume with"
+
+
 def _recovery_path(stderr: str) -> Path:
     match = re.search(r"--resume\s+('([^']+)'|(\S+))", stderr)
     if match is None:
@@ -1644,6 +1650,64 @@ def test_sign_bundle_continue_on_block_all_blocked_signs_nothing(tmp_path: Path,
     captured = capsys.readouterr()
     assert "no action was signed" in captured.err
     assert "BLOCKED" in captured.out
+    # Nothing was signed and every selected action is journalled BLOCKED, so the
+    # transaction has no work a resume could advance: "Remediate and re-stage"
+    # must not be contradicted by a paste-ready resume command two lines later.
+    assert _RECOVERY_GUIDANCE not in captured.err
+
+
+def test_sign_bundle_published_with_blocks_offers_no_resume_recovery(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Exit 3 is a COMPLETED publish, so the generic recovery path must not fire.
+
+    ``_run_sign_bundle`` treated every nonzero code as an unsuccessful action and
+    printed a paste-ready ``--resume`` command. Exit 3 is reached only *after* the
+    coherent publish, so following that command re-enters at the published
+    disposition, returns 3 again, and re-emits the same guidance indefinitely.
+    Proven terminal here rather than merely muted: the resume is executed and must
+    stay silent too. The creation-time ``if interrupted, resume with`` line is a
+    different statement about a then-unfinished transaction and survives.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+
+    def _verdict(file_path: str) -> JudgeVerdict:
+        return JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED
+
+    with _patch_judge(_verdict):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert "private transaction created at" in err
+    assert _RECOVERY_GUIDANCE not in err
+    assert "private decisions preserved at" not in err
+
+    transaction = _recovery_path(err)
+    with _patch_judge(_verdict):
+        resumed = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--continue-on-block", "--resume", str(transaction)),
+            )
+        )
+
+    assert resumed == 3
+    assert _RECOVERY_GUIDANCE not in capsys.readouterr().err
 
 
 def test_sign_bundle_continue_on_block_still_stops_on_infrastructure_failure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1687,6 +1751,10 @@ def test_sign_bundle_continue_on_block_still_stops_on_infrastructure_failure(tmp
     assert _tree_bytes(allowlist_dir) == before
     err = capsys.readouterr().err
     assert "transaction stopped" in err
+    # Control for the two "no recovery guidance" assertions above: an
+    # infrastructure failure leaves genuinely resumable work, so suppressing the
+    # guidance outright (rather than on the terminal outcomes) must fail here.
+    assert _RECOVERY_GUIDANCE in err
     assert _recovery_path(err).is_dir()
 
 

@@ -28,6 +28,24 @@ is a working document under the normal delivery posture.
   - The `blocked_without_override` decision event only exists inside the
     shipped `enforce_*` allowlist layout, so a neutral-named fixture dir cannot
     exercise the interrupted-verdict recovery at all.
+  - **A `sign-bundle` exit code does NOT say whether the transaction is
+    resumable, and `code != 0` as a proxy for it printed an infinite recovery
+    loop.** `_execute_sign_bundle` returns `_SignBundleOutcome(exit_code,
+    resumable)` for exactly this reason: exit 3 is reached only *after* the
+    coherent publish, and exit 1 covers both a stopped-on-BLOCK transaction
+    (resumable with `--continue-on-block`) and an all-blocked run that signed
+    nothing (terminal). A terminal outcome offered the paste-ready `--resume`
+    command, which reproduced the same code and the same guidance forever. Any
+    new return site must answer `resumable` honestly rather than defaulting it,
+    and the docs state the same rule (`docs/judge-signature-handoff.md`, the
+    `judge-signature-workflow` skill) — update both with the code.
+  - Testing that guidance: `--resume` appears in stderr on the SUCCESS path too
+    (`_run_sign_bundle` announces the freshly created transaction with "if
+    interrupted, resume with"), so asserting on the flag name cannot
+    discriminate and `_recovery_path()` matches that line as well. Assert on
+    `_emit_sign_bundle_recovery`'s own text ("re-verify and resume with"), and
+    pair any "no guidance" assertion with a control on an exit-2 infrastructure
+    failure — otherwise deleting the emit call outright passes.
 
 - **2026-08-27 — the field-collision gates are CAPABILITY-KEYED: they arm only
   when `can_overwrite_input_fields(passes_through_input=, forwards_input_fields=)`

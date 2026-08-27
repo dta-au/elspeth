@@ -173,9 +173,16 @@ window: if publication commits before the audit append, resume detects the
 published bytes and finishes that append without repeating judge work.
 
 A real-judge BLOCK, ordinary action failure, unexpected exception, or
-interruption exits non-zero (interrupts return 130), preserves the private
-transaction, and prints a paste-ready command containing
-`--resume <transaction-dir>`. Resume does not trust the scratch copy: it
+interruption exits non-zero (interrupts return 130) and preserves the private
+transaction. A paste-ready command containing `--resume <transaction-dir>` is
+printed only when resuming can still make progress — never on an outcome that is
+already terminal, because following it there reproduces the same exit code and
+the same guidance indefinitely. The three terminal outcomes are exit 3
+(`--continue-on-block` published the survivors and the transaction is complete;
+the skipped BLOCKs owe remediation, not a resume), an all-blocked run that signed
+nothing, and a stale `drift_repair` claim; the first two are re-staged after
+remediation, the third after re-running `stage_scan`. Resume does not trust the
+scratch copy: it
 authenticates the journal, then re-checks the exact bundle bytes,
 source/bindings, active/candidate state, action evidence, and previously
 produced HMAC signatures before skipping completed judge work. The manifest
