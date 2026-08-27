@@ -20,7 +20,7 @@ from sqlalchemy import Connection, Engine, create_engine, text
 from sqlalchemy.engine import make_url
 
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.web import aws_rds_trust
 from elspeth.web.config import WebSettings
@@ -344,13 +344,12 @@ def _build_engine(label: str, raw_url: str) -> Engine:
     raise ValueError("unknown doctor schema label")
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="live PostgreSQL server's pg_stat_ssl row for the doctor's own backend connection",
     source_param="connection",
     suppresses=("R5",),
     invariant="returns a failed ContractCheck when TLS evidence is absent, malformed, or below policy; never raises on row content",
-    non_raising=True,
 )
 def postgres_tls_check(label: str, connection: Connection) -> ContractCheck:
     """Prove the live PostgreSQL backend connection is authenticated over TLS."""
