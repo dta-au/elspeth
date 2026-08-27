@@ -135,6 +135,7 @@ class ExecutionService(Protocol):
         user_id: str | None = None,
         auth_provider_type: str | None = None,
         fanout_ack_token: str | None = None,
+        secret_ack_token: str | None = None,
     ) -> UUID:
         """Start a background pipeline run.
 
@@ -148,6 +149,8 @@ class ExecutionService(Protocol):
             auth_provider_type: Auth provider namespace for Landscape run attribution.
             fanout_ack_token: Optional launch acknowledgement for high-fanout
                 LLM/provider-call risk.
+            secret_ack_token: Optional out-of-band approval of the run's wired
+                secret→destination set (elspeth-f3c1aafd25).
 
         Note: async because it calls SessionService (async) for active-run
         check and run creation. The actual pipeline runs in a background

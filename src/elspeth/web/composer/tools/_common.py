@@ -108,6 +108,7 @@ from elspeth.web.secrets.ref_policy import (
     allowed_secret_ref_fields,
     allowed_secret_ref_fields_text,
 )
+from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.validation import (
     INTERPRETATION_PLACEHOLDER_RE,
 )
@@ -3029,6 +3030,10 @@ class ToolContext:
             composer plane never has to know about it.  Required for
             secret tools (``list_secret_refs`` / ``validate_secret_ref``
             / ``wire_secret_ref``); ``None`` for non-secret-aware callers.
+        secret_wiring_policy: Server-authored secret→destination allowlist
+            (elspeth-f3c1aafd25). ``wire_secret_ref`` denies every wiring
+            not covered by an exact rule; ``None`` is the deny-by-default
+            posture, never an allow.
         user_id: Current user ID. Required for secret tools.
         baseline: Baseline state for ``diff_pipeline`` comparisons.
         current_validation: Pre-computed validation of the live state, used
@@ -3079,6 +3084,7 @@ class ToolContext:
     session_engine: Engine | None = None
     session_id: str | None = None
     secret_service: WebSecretResolver | None = None
+    secret_wiring_policy: SecretWiringPolicy | None = None
     user_id: str | None = None
     baseline: CompositionState | None = None
     current_validation: ValidationSummary | None = None

@@ -8,6 +8,34 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-27 — secret WIRING is deny-by-default behind a server-authored
+  destination allowlist, with a THIRD execute-time 428 ack** (elspeth-f3c1aafd25).
+  The authority is `web/secrets/wiring_policy.py::secret_wiring_authorization_error`
+  (exact `(secret, component_type, plugin, option_key)` match;
+  `component_type` vocab is `source|transform|sink` — same as
+  `_secret_ref_placement_error`, aggregation nodes are `transform`); the
+  operator surface is `WebSettings.secret_wiring_allowlist` (default `()` =
+  deny everything). Enforced at THREE derived seams: (a) `wire_secret_ref`
+  (all three arms, before the marker write; `ToolContext.secret_wiring_policy`,
+  `None` = deny — a test whose wiring must SUCCEED, or that tests a LATER gate
+  like placement/endpoint policy, must pass an authorizing policy or it now
+  fails at authorization first); (b) `validate_secret_evidence` emits
+  `unauthorized_secret_ref` under the `secret_refs` blocker for markers from
+  ANY entry path — but the authorization walk runs over
+  `policy.authored_state`, NOT the lowered state: operator-profile lowering
+  injects credential markers server-side and those are exempt by design — do
+  not "fix" it to walk `policy.state`; (c) `/execute` raises
+  `ExecutionSecretApprovalRequired` → 428
+  `execution_secret_approval_required` + `secret_guard` payload
+  (`web/execution/secret_guard.py`, mirrors the fanout guard; evaluated over
+  the authored `composition_state` for the same exemption; fires BEFORE the
+  fanout guard, so a wired-secret + fanout test must acquire the secret ack
+  first and send BOTH tokens on the final execute). The composer repair loop
+  has a dedicated non-retryable notice for `unauthorized_secret_ref` — the
+  planner cannot repair operator policy; do not add advice telling it to
+  retry wiring. `_WebSettingsStub`-style settings fakes need
+  `secret_wiring_allowlist: tuple = ()` or service construction breaks.
+
 - **2026-08-27 — server-owned option metadata is a THREE-surface parity set:
   planner projection, echo-tolerant write gates, and disclosure provenance**
   (elspeth-c67fbbbd83). The keys are `source_authoring`,

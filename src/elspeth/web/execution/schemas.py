@@ -286,6 +286,7 @@ class ExecuteRequest(_StrictResponse):
     """Optional execution-launch acknowledgement payload."""
 
     fanout_ack_token: str | None = Field(default=None, min_length=1)
+    secret_ack_token: str | None = Field(default=None, min_length=1)
 
 
 class WebSocketTicketResponse(_StrictResponse):

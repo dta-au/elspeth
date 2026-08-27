@@ -741,6 +741,58 @@ class TestExecuteEndpoint:
         assert detail["fanout_guard"]["risks"][0]["estimated_provider_calls"] is None
 
     @pytest.mark.asyncio
+    async def test_execute_forwards_secret_ack_token_to_service(self) -> None:
+        expected_run_id = uuid4()
+        svc = _execution_service()
+        svc.execute = AsyncMock(spec=ExecutionService.execute, return_value=expected_run_id)
+        app = _create_test_app(execution_service=svc)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/api/sessions/{uuid4()}/execute",
+                json={"secret_ack_token": "secret-ack-test-token"},
+            )
+
+        assert resp.status_code == 202
+        assert svc.execute.await_args.kwargs["secret_ack_token"] == "secret-ack-test-token"
+
+    @pytest.mark.asyncio
+    async def test_execute_returns_428_with_structured_secret_guard(self) -> None:
+        from elspeth.web.execution.secret_guard import (
+            ExecutionSecretApprovalGuard,
+            ExecutionSecretApprovalRequired,
+            ExecutionSecretWiring,
+        )
+
+        guard = ExecutionSecretApprovalGuard(
+            ack_token="secret-ack-token",
+            summary="Approve secret use before execution: secret 'OPENROUTER_API_KEY' is wired into transform 'classify' (llm) option 'api_key'.",
+            wirings=(
+                ExecutionSecretWiring(
+                    secret_name="OPENROUTER_API_KEY",
+                    component_id="classify",
+                    component_type="transform",
+                    plugin="llm",
+                    option_key="api_key",
+                ),
+            ),
+        )
+        svc = _execution_service()
+        svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=ExecutionSecretApprovalRequired(guard))
+        app = _create_test_app(execution_service=svc)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+
+        assert resp.status_code == 428
+        detail = resp.json()["detail"]
+        assert detail["error_type"] == "execution_secret_approval_required"
+        assert detail["secret_guard"]["ack_token"] == "secret-ack-token"
+        assert detail["secret_guard"]["wirings"][0]["secret_name"] == "OPENROUTER_API_KEY"
+        assert detail["secret_guard"]["wirings"][0]["plugin"] == "llm"
+        assert detail["secret_guard"]["wirings"][0]["option_key"] == "api_key"
+
+    @pytest.mark.asyncio
     async def test_execute_returns_422_with_structured_semantic_payload(self) -> None:
         """Semantic contract violations surface as 422 with structured payload.
 

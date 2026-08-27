@@ -142,6 +142,7 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limi
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_authored_composition_state
+from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions._auto_title import maybe_auto_title_session
 from elspeth.web.sessions._guided_step_chat import (
     _COMMIT_REJECTED_MESSAGE,
@@ -1470,6 +1471,7 @@ async def _runtime_preflight_for_state(
             settings,
             yaml_generator,
             secret_service=secret_service,
+            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),
             user_id=user_id,
             session_id=str(session_id),
             plugin_snapshot=plugin_snapshot,

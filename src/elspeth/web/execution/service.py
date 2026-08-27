@@ -135,12 +135,18 @@ from elspeth.web.execution.schemas import (
     ValidationReadinessBlocker,
     ValidationResult,
 )
+from elspeth.web.execution.secret_guard import (
+    ExecutionSecretApprovalRequired,
+    annotate_pipeline_yaml_with_secret_guard,
+    evaluate_execution_secret_guard,
+)
 from elspeth.web.interpretation_state import InterpretationReviewPending, materialize_state_for_execution
 from elspeth.web.landscape_access import open_landscape_db
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPluginPolicy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
 from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error, web_rag_provider_config_policy_error
+from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import (
     SESSION_TERMINAL_RUN_STATUS_VALUES,
@@ -805,6 +811,9 @@ class ExecutionServiceImpl:
         self._telemetry = telemetry
         self._blob_service = blob_service
         self._secret_service = secret_service
+        # Server-authored secret→destination allowlist (elspeth-f3c1aafd25);
+        # derived once from settings — deny-by-default when no rules exist.
+        self._secret_wiring_policy = runtime_secret_wiring_policy(settings.secret_wiring_allowlist)
         self._plugin_snapshot_factory = plugin_snapshot_factory
         self._operator_profile_registry = operator_profile_registry
         self._web_plugin_policy = web_plugin_policy
@@ -1009,6 +1018,7 @@ class ExecutionServiceImpl:
             self._settings,
             self._yaml_generator,
             secret_service=self._secret_service,
+            secret_wiring_policy=self._secret_wiring_policy,
             user_id=user_id,
             blob_get_metadata=_blob_get_metadata,
             session_id=str(session_id) if session_id is not None else None,
@@ -1156,6 +1166,7 @@ class ExecutionServiceImpl:
         user_id: str | None = None,
         auth_provider_type: str | None = None,
         fanout_ack_token: str | None = None,
+        secret_ack_token: str | None = None,
     ) -> UUID:
         """Start a background pipeline run.
 
@@ -1171,6 +1182,8 @@ class ExecutionServiceImpl:
             auth_provider_type: Auth provider namespace for Landscape run attribution.
             fanout_ack_token: Optional launch acknowledgement for high-fanout
                 LLM/provider-call risk.
+            secret_ack_token: Optional out-of-band approval of the run's
+                wired secret→destination set (elspeth-f3c1aafd25).
 
         Note: async because SessionService methods are async. The pipeline
         itself runs in a background thread — only setup is async.
@@ -1187,6 +1200,7 @@ class ExecutionServiceImpl:
                 user_id=user_id,
                 auth_provider_type=auth_provider_type,
                 fanout_ack_token=fanout_ack_token,
+                secret_ack_token=secret_ack_token,
             )
 
     async def _execute_locked(
@@ -1197,6 +1211,7 @@ class ExecutionServiceImpl:
         user_id: str | None = None,
         auth_provider_type: str | None = None,
         fanout_ack_token: str | None = None,
+        secret_ack_token: str | None = None,
     ) -> UUID:
         """Inner execute — runs under the per-session asyncio.Lock."""
         # B6: One active run per session (AC #17: via SessionService)
@@ -1576,6 +1591,29 @@ class ExecutionServiceImpl:
                         blob_id=str(parsed_blob_id),
                         session_id=str(session_id),
                     )
+
+        # Out-of-band secret approval (elspeth-f3c1aafd25) runs BEFORE the
+        # fanout guard: approving what credentials a run may use is a
+        # privilege decision, spend acknowledgement comes after. The token is
+        # derived from the composition snapshot + disclosure set, so it can
+        # only be produced by a caller who was shown this exact wiring set —
+        # never by LLM tool arguments (no composer/MCP tool reaches execute).
+        # Evaluated over the AUTHORED state (pre profile-lowering):
+        # operator-profile lowering injects its own credential markers from
+        # deployment settings, which are server-authored and need no
+        # per-run user approval — and must never appear in this disclosure.
+        secret_guard_env_ref_names: frozenset[str] = frozenset()
+        if self._secret_service is not None and user_id is not None:
+            secret_guard_env_ref_names = frozenset(item.name for item in self._secret_service.list_refs(user_id))
+        secret_guard = evaluate_execution_secret_guard(
+            composition_state,
+            env_ref_names=secret_guard_env_ref_names,
+        )
+        if secret_guard is not None:
+            if secret_ack_token != secret_guard.ack_token:
+                raise ExecutionSecretApprovalRequired(secret_guard)
+            pipeline_yaml = annotate_pipeline_yaml_with_secret_guard(pipeline_yaml, secret_guard)
+            executable_pipeline_yaml = annotate_pipeline_yaml_with_secret_guard(executable_pipeline_yaml, secret_guard)
 
         fanout_guard = evaluate_execution_fanout_guard(
             policy_result.executable_state,

@@ -86,6 +86,7 @@ from elspeth.web.execution.schemas import (
     WebSocketTicketResponse,
     revalidated_with_discard_summary,
 )
+from elspeth.web.execution.secret_guard import SECRET_GUARD_ERROR_TYPE, ExecutionSecretApprovalRequired
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
 from elspeth.web.middleware.rate_limit import get_rate_limiter
 from elspeth.web.paths import allowed_sink_directories
@@ -928,6 +929,7 @@ def create_execution_router() -> APIRouter:
         await verify_session_ownership(session_id, user, request)
         settings: WebSettings = request.app.state.settings
         fanout_ack_token = execute_request.fanout_ack_token if execute_request is not None else None
+        secret_ack_token = execute_request.secret_ack_token if execute_request is not None else None
         try:
             run_id = await service.execute(
                 session_id,
@@ -935,6 +937,7 @@ def create_execution_router() -> APIRouter:
                 user_id=user.user_id,
                 auth_provider_type=settings.auth_provider,
                 fanout_ack_token=fanout_ack_token,
+                secret_ack_token=secret_ack_token,
             )
         except StateAccessError:
             # IDOR contract: the "state does not exist" and
@@ -1010,6 +1013,15 @@ def create_execution_router() -> APIRouter:
                     "detail": public_detail,
                     "kind": "completion_gate_integrity_failure",
                     "message": public_detail,
+                },
+            ) from exc
+        except ExecutionSecretApprovalRequired as exc:
+            raise HTTPException(
+                status_code=428,
+                detail={
+                    "error_type": SECRET_GUARD_ERROR_TYPE,
+                    "detail": str(exc),
+                    "secret_guard": exc.guard.to_dict(),
                 },
             ) from exc
         except ExecutionFanoutGuardRequired as exc:

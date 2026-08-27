@@ -64,6 +64,22 @@ from elspeth.web.plugin_policy.models import (
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
+from elspeth.web.secrets.wiring_policy import SecretWiringComponentType, SecretWiringPolicy, SecretWiringRule
+
+
+def _wiring_rules(*rules: tuple[str, str, str, str]) -> SecretWiringPolicy:
+    """Server-authored allowlist for tests exercising authorized wirings."""
+    return SecretWiringPolicy(
+        rules=tuple(
+            SecretWiringRule(
+                secret=secret,
+                component_type=cast(SecretWiringComponentType, component_type),
+                plugin=plugin,
+                option_key=option_key,
+            )
+            for secret, component_type, plugin, option_key in rules
+        )
+    )
 
 
 def validate_pipeline_for_trained_operator(
@@ -1056,7 +1072,8 @@ def test_validate_pipeline_public_signature_is_stable_through_boundary_decorator
     expected = (
         "(state: 'CompositionState', settings: 'ValidationSettings', yaml_generator: 'YamlGenerator', *, "
         "plugin_snapshot: 'PluginAvailabilitySnapshot', profile_registry: 'OperatorProfileRegistry | None', "
-        "catalog: 'CatalogService', secret_service: 'WebSecretResolver | None' = None, user_id: 'str | None' = None, "
+        "catalog: 'CatalogService', secret_service: 'WebSecretResolver | None' = None, "
+        "secret_wiring_policy: 'SecretWiringPolicy | None' = None, user_id: 'str | None' = None, "
         "blob_get_metadata: 'Callable[[UUID], BlobRecord | None] | None' = None, "
         "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None) -> 'ValidationResult'"
     )
@@ -4336,6 +4353,7 @@ class TestValidatePipelineSecretRefs:
                 mock_yaml_gen,
                 secret_service=secret_svc,
                 user_id="user-1",
+                secret_wiring_policy=_wiring_rules(("MY_KEY", "source", "csv", "api_key")),
             )
 
         secret_check = next(c for c in result.checks if c.name == "secret_refs")
@@ -4443,6 +4461,10 @@ class TestValidatePipelineSecretRefs:
             mock_yaml_gen,
             secret_service=secret_svc,
             user_id="user-1",
+            secret_wiring_policy=_wiring_rules(
+                ("REF_A", "source", "csv", "api_key"),
+                ("REF_B", "source", "csv", "token"),
+            ),
         )
 
         assert result.is_valid is False
@@ -4690,6 +4712,7 @@ class TestValidatePipelineFabricatedCredentials:
                 mock_yaml_gen,
                 secret_service=secret_svc,
                 user_id="user-1",
+                secret_wiring_policy=_wiring_rules(("REAL_KEY", "source", "csv", "api_key")),
             )
 
         assert _check(result, "secret_refs").passed is True
@@ -4774,6 +4797,9 @@ class TestValidatePipelineFabricatedCredentials:
                 mock_yaml_gen,
                 secret_service=secret_svc,
                 user_id="user-1",
+                secret_wiring_policy=_wiring_rules(
+                    *((name, "transform", "aws_textract_document_analysis", field) for field, name in refs.items())
+                ),
             )
 
         assert _check(result, "secret_refs").passed is True
@@ -4851,6 +4877,7 @@ class TestValidatePipelineFabricatedCredentials:
                 mock_yaml_gen,
                 secret_service=secret_svc,
                 user_id="user-1",
+                secret_wiring_policy=_wiring_rules(("DATABASE_URL", "sink", "database", "url")),
             )
 
         assert _check(result, "secret_refs").passed is True
@@ -4876,6 +4903,7 @@ class TestValidatePipelineFabricatedCredentials:
                 mock_yaml_gen,
                 secret_service=secret_svc,
                 user_id="user-1",
+                secret_wiring_policy=_wiring_rules(("OPENROUTER_API_KEY", "source", "csv", "api_key")),
             )
 
         assert _check(result, "secret_refs").passed is True
@@ -5097,6 +5125,7 @@ class TestSecretRefResolutionBeforeSettingsLoad:
             mock_yaml_gen,
             secret_service=secret_svc,
             user_id="user-1",
+            secret_wiring_policy=_wiring_rules(("MY_KEY", "source", "csv", "api_key")),
         )
 
         # In-memory dict loader was used after secret resolution; resolved
@@ -5142,6 +5171,7 @@ class TestSecretRefResolutionBeforeSettingsLoad:
             mock_yaml_gen,
             secret_service=secret_svc,
             user_id="user-1",
+            secret_wiring_policy=_wiring_rules(("OPENROUTER_API_KEY", "source", "csv", "api_key")),
         )
 
         mock_load_config.assert_called_once()

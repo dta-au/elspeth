@@ -90,6 +90,7 @@ from elspeth.web.execution.schemas import (
     ValidationReadinessBlocker,
     ValidationResult,
 )
+from elspeth.web.execution.secret_guard import ExecutionSecretApprovalRequired
 from elspeth.web.execution.service import _MAX_FRAME_PATH_PARTS, ExecutionServiceImpl
 from elspeth.web.execution.validation import validate_pipeline as _real_validate_pipeline
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
@@ -126,6 +127,9 @@ class _WebSettingsStub:
         self.payload_store_path = Path("/tmp/test_payloads")
         self.landscape_passphrase = None
         self.data_dir: str | Path = "/tmp/data"
+        # Secret wiring is deny-by-default (elspeth-f3c1aafd25); tests that
+        # exercise wired secrets construct their own authorizing policy.
+        self.secret_wiring_allowlist: tuple[Any, ...] = ()
 
     def get_session_db_url(self) -> str:
         return f"sqlite:///{Path(self.data_dir) / 'sessions.db'}"
@@ -2750,9 +2754,17 @@ class TestExecutionFanoutGuard:
         with (
             patch.object(service, "_run_pipeline"),
             patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
-            pytest.raises(ExecutionFanoutGuardRequired) as raised,
         ):
-            await service.execute(session_id=session_id)
+            # The wired OPENROUTER_API_KEY trips the secret-approval guard
+            # first (elspeth-f3c1aafd25); acknowledge it to reach the fanout
+            # guard under test.
+            with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
+                await service.execute(session_id=session_id)
+            with pytest.raises(ExecutionFanoutGuardRequired) as raised:
+                await service.execute(
+                    session_id=session_id,
+                    secret_ack_token=secret_raised.value.guard.ack_token,
+                )
 
         guard = raised.value.guard
         assert guard.ack_token
@@ -2816,9 +2828,15 @@ class TestExecutionFanoutGuard:
         with (
             patch.object(service, "_run_pipeline"),
             patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
-            pytest.raises(ExecutionFanoutGuardRequired) as raised,
         ):
-            await service.execute(session_id=session_id)
+            # Secret approval (elspeth-f3c1aafd25) gates first, then fanout.
+            with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
+                await service.execute(session_id=session_id)
+            with pytest.raises(ExecutionFanoutGuardRequired) as raised:
+                await service.execute(
+                    session_id=session_id,
+                    secret_ack_token=secret_raised.value.guard.ack_token,
+                )
 
         run_id = uuid4()
         mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
@@ -2830,14 +2848,18 @@ class TestExecutionFanoutGuard:
             await service.execute(
                 session_id=session_id,
                 fanout_ack_token=raised.value.guard.ack_token,
+                secret_ack_token=secret_raised.value.guard.ack_token,
             )
 
         create_call = mock_session_service.create_run.await_args_list[-1]
         persisted_yaml = create_call.kwargs["pipeline_yaml"]
         assert "elspeth_execution_fanout_guard" in persisted_yaml
+        assert "elspeth_execution_secret_approval" in persisted_yaml
         assert '"accepted":true' in persisted_yaml
         assert raised.value.guard.ack_token in persisted_yaml
+        assert secret_raised.value.guard.ack_token in persisted_yaml
         assert '"node_id":"classify_line"' in persisted_yaml
+        assert '"secret_name":"OPENROUTER_API_KEY"' in persisted_yaml
 
     @pytest.mark.asyncio
     async def test_direct_small_text_source_to_llm_executes_without_ack(
@@ -2882,11 +2904,19 @@ class TestExecutionFanoutGuard:
             patch.object(service, "_run_pipeline"),
             patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
         ):
-            run_id = await service.execute(session_id=session_id)
+            # The wired secret still requires its own out-of-band approval
+            # (elspeth-f3c1aafd25); low cardinality only removes the FANOUT ack.
+            with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
+                await service.execute(session_id=session_id)
+            run_id = await service.execute(
+                session_id=session_id,
+                secret_ack_token=secret_raised.value.guard.ack_token,
+            )
 
         assert isinstance(run_id, UUID)
         persisted_yaml = mock_session_service.create_run.await_args.kwargs["pipeline_yaml"]
         assert "elspeth_execution_fanout_guard" not in persisted_yaml
+        assert "elspeth_execution_secret_approval" in persisted_yaml
 
     @pytest.mark.asyncio
     async def test_non_first_named_source_to_llm_uses_its_own_cardinality(
@@ -2948,9 +2978,15 @@ class TestExecutionFanoutGuard:
         with (
             patch.object(service, "_run_pipeline"),
             patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
-            pytest.raises(ExecutionFanoutGuardRequired) as raised,
         ):
-            await service.execute(session_id=session_id)
+            # Acknowledge the wired-secret approval first (elspeth-f3c1aafd25).
+            with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
+                await service.execute(session_id=session_id)
+            with pytest.raises(ExecutionFanoutGuardRequired) as raised:
+                await service.execute(
+                    session_id=session_id,
+                    secret_ack_token=secret_raised.value.guard.ack_token,
+                )
 
         risk = raised.value.guard.risks[0]
         assert risk.estimated_provider_calls == 101

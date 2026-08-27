@@ -20,6 +20,8 @@ import type {
   ComposerProgressSnapshot,
   ExecutionFanoutAck,
   ExecutionFanoutGuard,
+  ExecutionSecretAck,
+  ExecutionSecretGuard,
   CancelRunResponse,
   InlineSourceProvenance,
   PluginSchemaInfo,
@@ -239,6 +241,7 @@ export async function parseResponse<T>(
     let providerDetail: string | undefined;
     let providerStatusCode: number | undefined;
     let fanoutGuard: ExecutionFanoutGuard | undefined;
+    let secretGuard: ExecutionSecretGuard | undefined;
     let validationErrors: ApiError["validation_errors"];
     let errors: ApiError["errors"];
     let reason: string | undefined;
@@ -329,6 +332,9 @@ export async function parseResponse<T>(
       fanoutGuard =
         body.fanout_guard ?? nestedDetail?.fanout_guard;
 
+      secretGuard =
+        body.secret_guard ?? nestedDetail?.secret_guard;
+
       validationErrors =
         body.validation_errors ?? nestedDetail?.validation_errors;
 
@@ -410,6 +416,7 @@ export async function parseResponse<T>(
       partial_state_save_failed: partialStateSaveFailed,
       partial_state_save_error: partialStateSaveError,
       fanout_guard: fanoutGuard,
+      secret_guard: secretGuard,
       provider_detail: providerDetail,
       provider_status_code: providerStatusCode,
       validation_errors: validationErrors,
@@ -1297,6 +1304,7 @@ export async function validatePipeline(
 export async function executePipeline(
   sessionId: string,
   fanoutAck?: ExecutionFanoutAck,
+  secretAck?: ExecutionSecretAck,
   stateId?: string,
 ): Promise<{ run_id: string }> {
   const params = new URLSearchParams();
@@ -1308,8 +1316,17 @@ export async function executePipeline(
     method: "POST",
     headers: authHeaders("application/json"),
   };
-  if (fanoutAck) {
-    init.body = JSON.stringify({ fanout_ack_token: fanoutAck.token });
+  if (fanoutAck || secretAck) {
+    // Both guards can fire on one run; an acknowledged re-send must carry
+    // every token acquired so far, never just the most recent one.
+    const body: Record<string, string> = {};
+    if (fanoutAck) {
+      body.fanout_ack_token = fanoutAck.token;
+    }
+    if (secretAck) {
+      body.secret_ack_token = secretAck.token;
+    }
+    init.body = JSON.stringify(body);
   }
   const response = await fetch(`/api/sessions/${sessionId}/execute${query}`, init);
   return parseResponse<{ run_id: string }>(response);

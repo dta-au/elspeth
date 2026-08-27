@@ -27,6 +27,8 @@ import type {
   ApiError,
   ExecutionFanoutAck,
   ExecutionFanoutGuard,
+  ExecutionSecretAck,
+  ExecutionSecretGuard,
 } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { isTerminalRunStatus } from "@/types/index";
@@ -88,6 +90,22 @@ interface ExecutionState {
   validationResult: ValidationResult | null;
   pendingFanoutGuard: ExecutionFanoutGuard | null;
   pendingFanoutSessionId: string | null;
+  /**
+   * Secret ack already acquired for this launch attempt, held alongside
+   * pendingFanoutGuard so the acknowledged fanout re-send carries BOTH
+   * tokens — the secret guard fires first, so its approved token must
+   * survive a subsequent fanout 428.
+   */
+  pendingFanoutSecretAck: ExecutionSecretAck | null;
+  pendingSecretGuard: ExecutionSecretGuard | null;
+  pendingSecretSessionId: string | null;
+  /**
+   * Fanout ack already acquired for this launch attempt, held alongside
+   * pendingSecretGuard so the acknowledged secret re-send carries BOTH
+   * tokens (a rotated secret token re-arms this guard after the fanout
+   * guard was already approved).
+   */
+  pendingSecretFanoutAck: ExecutionFanoutAck | null;
   isValidating: boolean;
   validationError: string | null;
   isExecuting: boolean;
@@ -117,9 +135,15 @@ interface ExecutionState {
 
   validate: (sessionId: string, options?: ValidateOptions) => Promise<boolean>;
   setValidationResult: (result: ValidationResult | null) => void;
-  execute: (sessionId: string, fanoutAck?: ExecutionFanoutAck) => Promise<string | null>;
+  execute: (
+    sessionId: string,
+    fanoutAck?: ExecutionFanoutAck,
+    secretAck?: ExecutionSecretAck,
+  ) => Promise<string | null>;
   confirmFanoutExecution: () => Promise<string | null>;
   dismissFanoutGuard: () => void;
+  confirmSecretExecution: () => Promise<string | null>;
+  dismissSecretGuard: () => void;
   acknowledgeRunDisclosure: (sessionId: string) => void;
   clearRunDisclosureAcks: () => void;
   acknowledgeRunOutcome: () => void;
@@ -402,6 +426,10 @@ const initialExecutionState = {
   validationResult: null as ValidationResult | null,
   pendingFanoutGuard: null as ExecutionFanoutGuard | null,
   pendingFanoutSessionId: null as string | null,
+  pendingFanoutSecretAck: null as ExecutionSecretAck | null,
+  pendingSecretGuard: null as ExecutionSecretGuard | null,
+  pendingSecretSessionId: null as string | null,
+  pendingSecretFanoutAck: null as ExecutionFanoutAck | null,
   isValidating: false,
   validationError: null as string | null,
   isExecuting: false,
@@ -466,7 +494,11 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     set({ validationResult: result, validationError: null });
   },
 
-  async execute(sessionId: string, fanoutAck?: ExecutionFanoutAck) {
+  async execute(
+    sessionId: string,
+    fanoutAck?: ExecutionFanoutAck,
+    secretAck?: ExecutionSecretAck,
+  ) {
     const blockedByInterpretation = getRunBlockError(sessionId);
     if (blockedByInterpretation !== null) {
       set({ isExecuting: false, error: blockedByInterpretation });
@@ -477,9 +509,9 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     set({ isExecuting: true, error: null });
     try {
       const { run_id } =
-        fanoutAck === undefined && stateId === undefined
+        fanoutAck === undefined && secretAck === undefined && stateId === undefined
           ? await api.executePipeline(sessionId)
-          : await api.executePipeline(sessionId, fanoutAck, stateId);
+          : await api.executePipeline(sessionId, fanoutAck, secretAck, stateId);
       if (!shouldApplyExecutionResult(sessionId, requestSeq)) {
         if (requestSeq === executionRequestSeq) {
           set({ isExecuting: false });
@@ -495,6 +527,10 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         isExecuting: false,
         pendingFanoutGuard: null,
         pendingFanoutSessionId: null,
+        pendingFanoutSecretAck: null,
+        pendingSecretGuard: null,
+        pendingSecretSessionId: null,
+        pendingSecretFanoutAck: null,
         // A fresh launch supersedes any unacknowledged prior outcome: the
         // Run-tab badge switches to the live pulse and the toast retires.
         lastRunOutcome: null,
@@ -528,6 +564,22 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       const apiErr = err as ApiError;
       if (
         apiErr.status === 428 &&
+        apiErr.error_type === "execution_secret_approval_required" &&
+        apiErr.secret_guard
+      ) {
+        set({
+          isExecuting: false,
+          pendingSecretGuard: apiErr.secret_guard,
+          pendingSecretSessionId: sessionId,
+          // A fanout token already acquired on this attempt rides along so
+          // the approved re-send carries both tokens.
+          pendingSecretFanoutAck: fanoutAck ?? null,
+          error: null,
+        });
+        return null;
+      }
+      if (
+        apiErr.status === 428 &&
         apiErr.error_type === "execution_fanout_ack_required" &&
         apiErr.fanout_guard
       ) {
@@ -535,6 +587,9 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
           isExecuting: false,
           pendingFanoutGuard: apiErr.fanout_guard,
           pendingFanoutSessionId: sessionId,
+          // The secret guard fires first, so a secret token approved on
+          // this attempt must survive into the fanout confirm re-send.
+          pendingFanoutSecretAck: secretAck ?? null,
           error: null,
         });
         return null;
@@ -563,10 +618,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         isExecuting: false,
         pendingFanoutGuard: null,
         pendingFanoutSessionId: null,
+        pendingFanoutSecretAck: null,
         error: STALE_FANOUT_READINESS_ERROR,
       });
       return null;
     }
+    const heldSecretAck = get().pendingFanoutSecretAck;
     // Settle the confirmation SYNCHRONOUSLY, before dispatch
     // (elspeth-8363555f05). The ConfirmDialog is mounted solely off
     // pendingFanoutGuard, so clearing it here closes the dialog atomically
@@ -578,11 +635,19 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     // round-trip. If the acknowledged dispatch itself returns a fresh 428
     // (rotated token), execute()'s catch re-arms the guard for a new
     // explicit confirmation, so atomic settlement cannot dead-end a run.
-    set({ pendingFanoutGuard: null, pendingFanoutSessionId: null });
-    return get().execute(pendingSessionId, {
-      accepted: true,
-      token: pendingGuard.ack_token,
+    set({
+      pendingFanoutGuard: null,
+      pendingFanoutSessionId: null,
+      pendingFanoutSecretAck: null,
     });
+    return get().execute(
+      pendingSessionId,
+      {
+        accepted: true,
+        token: pendingGuard.ack_token,
+      },
+      heldSecretAck ?? undefined,
+    );
   },
 
   dismissFanoutGuard() {
@@ -590,6 +655,47 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       isExecuting: false,
       pendingFanoutGuard: null,
       pendingFanoutSessionId: null,
+      pendingFanoutSecretAck: null,
+    });
+  },
+
+  async confirmSecretExecution() {
+    const pendingGuard = get().pendingSecretGuard;
+    const pendingSessionId = get().pendingSecretSessionId;
+    if (!pendingGuard || !pendingSessionId) {
+      return null;
+    }
+    if (get().validationResult?.readiness?.execution_ready !== true) {
+      set({
+        isExecuting: false,
+        pendingSecretGuard: null,
+        pendingSecretSessionId: null,
+        pendingSecretFanoutAck: null,
+        error: STALE_FANOUT_READINESS_ERROR,
+      });
+      return null;
+    }
+    const heldFanoutAck = get().pendingSecretFanoutAck;
+    // Settle synchronously before dispatch, for the same reasons as
+    // confirmFanoutExecution above (elspeth-8363555f05): the dialog closes
+    // atomically with the decision, and a re-keyed 428 re-arms the guard.
+    set({
+      pendingSecretGuard: null,
+      pendingSecretSessionId: null,
+      pendingSecretFanoutAck: null,
+    });
+    return get().execute(pendingSessionId, heldFanoutAck ?? undefined, {
+      accepted: true,
+      token: pendingGuard.ack_token,
+    });
+  },
+
+  dismissSecretGuard() {
+    set({
+      isExecuting: false,
+      pendingSecretGuard: null,
+      pendingSecretSessionId: null,
+      pendingSecretFanoutAck: null,
     });
   },
 

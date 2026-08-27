@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, cast
 from unittest.mock import MagicMock, call, patch
 from uuid import uuid4
 
@@ -70,6 +70,11 @@ from elspeth.web.plugin_policy.models import (
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
+from elspeth.web.secrets.wiring_policy import (
+    SecretWiringComponentType,
+    SecretWiringPolicy,
+    SecretWiringRule,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -324,6 +329,25 @@ def _mock_catalog() -> MagicMock:
         knob_schema={"fields": []},
     )
     return catalog
+
+
+def _wiring_policy(
+    secret: str,
+    component_type: str,
+    plugin: str,
+    option_key: str,
+) -> SecretWiringPolicy:
+    """Server-authored allowlist authorizing exactly one wiring (elspeth-f3c1aafd25)."""
+    return SecretWiringPolicy(
+        rules=(
+            SecretWiringRule(
+                secret=secret,
+                component_type=cast("SecretWiringComponentType", component_type),
+                plugin=plugin,
+                option_key=option_key,
+            ),
+        )
+    )
 
 
 def execute_tool(
@@ -1113,6 +1137,14 @@ class TestAwsS3EndpointUrlComposerPolicy:
             _mock_catalog(),
             secret_service=secret_service,
             user_id="test-user",
+            # Authorize the wiring so the endpoint_url policy is the gate
+            # under test, not the secret-wiring allowlist (elspeth-f3c1aafd25).
+            secret_wiring_policy=_wiring_policy(
+                secret_name,
+                "source" if target == "source" else "sink",
+                "aws_s3",
+                "endpoint_url",
+            ),
         )
 
         _assert_aws_s3_endpoint_url_rejected(result, state, forbidden_value=secret_name)
@@ -7164,6 +7196,7 @@ class TestSecretTools:
             catalog,
             secret_service=svc,
             user_id="test-user",
+            secret_wiring_policy=_wiring_policy("OPENROUTER_API_KEY", "source", "csv", "api_key"),
         )
         assert r2.success is True
         assert _default_source(r2.updated_state) is not None
@@ -7202,6 +7235,8 @@ class TestSecretTools:
             catalog,
             secret_service=svc,
             user_id="test-user",
+            # Authorize the wiring so the placement policy is the gate under test.
+            secret_wiring_policy=_wiring_policy("OPENROUTER_API_KEY", "source", "csv", "path"),
         )
 
         assert result.success is False
@@ -7244,6 +7279,8 @@ class TestSecretTools:
             catalog,
             secret_service=svc,
             user_id="test-user",
+            # Authorize the wiring so the placement policy is the gate under test.
+            secret_wiring_policy=_wiring_policy("OPENROUTER_API_KEY", "transform", "llm", "template"),
         )
 
         assert result.success is False
@@ -7283,6 +7320,8 @@ class TestSecretTools:
             catalog,
             secret_service=svc,
             user_id="test-user",
+            # Authorize the wiring so the placement policy is the gate under test.
+            secret_wiring_policy=_wiring_policy("OPENROUTER_API_KEY", "sink", "csv", "path"),
         )
 
         assert result.success is False
@@ -7366,6 +7405,7 @@ class TestSecretTools:
             catalog,
             secret_service=svc,
             user_id="test-user",
+            secret_wiring_policy=_wiring_policy("OPENROUTER_API_KEY", "source", "csv", "api_key"),
         )
         assert r2.success is True
         assert r2.prior_validation is not None
@@ -7410,6 +7450,7 @@ class TestSecretTools:
             secret_service=svc,
             user_id="test-user",
             prior_validation=threaded,
+            secret_wiring_policy=_wiring_policy("OPENROUTER_API_KEY", "source", "csv", "api_key"),
         )
         assert result.success is True
         assert result.prior_validation is threaded
@@ -7424,6 +7465,7 @@ class TestSecretTools:
             "target": "source",
             "option_key": "api_key",
         }
+        wiring_policy = _wiring_policy("OPENROUTER_API_KEY", "source", "csv", "api_key")
         # Fresh (no threading)
         result_fresh = execute_tool(
             "wire_secret_ref",
@@ -7432,6 +7474,7 @@ class TestSecretTools:
             catalog,
             secret_service=svc,
             user_id="test-user",
+            secret_wiring_policy=wiring_policy,
         )
         # Threaded
         threaded = state.validate()
@@ -7443,10 +7486,184 @@ class TestSecretTools:
             secret_service=svc,
             user_id="test-user",
             prior_validation=threaded,
+            secret_wiring_policy=wiring_policy,
         )
         delta_fresh = result_fresh.to_dict()["validation_delta"]
         delta_threaded = result_threaded.to_dict()["validation_delta"]
         assert delta_fresh == delta_threaded
+
+
+class TestSecretWiringAuthorization:
+    """wire_secret_ref is deny-by-default (elspeth-f3c1aafd25).
+
+    Adjudicated policy: deny every wiring unless a server-authored
+    destination allowlist authorizes the exact
+    (secret, component_type, plugin, option_key) tuple. LLM tool arguments
+    are never approval; an absent policy is a denial, not an allow.
+    """
+
+    def _svc(self) -> _SecretServiceDouble:
+        svc = _SecretServiceDouble()
+        svc.has_ref.return_value = True
+        return svc
+
+    def _state_with_source(self, catalog: Any) -> CompositionState:
+        r = execute_tool(
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "t1",
+                "options": {"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "quarantine",
+            },
+            _empty_state(),
+            catalog,
+        )
+        assert r.success is True
+        return r.updated_state
+
+    def test_wire_without_policy_denies_and_leaves_state_unchanged(self) -> None:
+        """No secret_wiring_policy in context = deny-by-default, never an allow."""
+        catalog = _mock_catalog()
+        state = self._state_with_source(catalog)
+        result = execute_tool(
+            "wire_secret_ref",
+            {"name": "OPENROUTER_API_KEY", "target": "source", "option_key": "api_key"},
+            state,
+            catalog,
+            secret_service=self._svc(),
+            user_id="test-user",
+        )
+        assert result.success is False
+        assert result.updated_state is state
+        assert "OPENROUTER_API_KEY" in result.data["error"]
+        assert "secret_wiring_allowlist" in result.data["error"]
+        opts = deep_thaw(_default_source(result.updated_state).options)
+        assert "api_key" not in opts
+
+    def test_wire_with_empty_policy_denies(self) -> None:
+        catalog = _mock_catalog()
+        state = self._state_with_source(catalog)
+        result = execute_tool(
+            "wire_secret_ref",
+            {"name": "OPENROUTER_API_KEY", "target": "source", "option_key": "api_key"},
+            state,
+            catalog,
+            secret_service=self._svc(),
+            user_id="test-user",
+            secret_wiring_policy=SecretWiringPolicy(rules=()),
+        )
+        assert result.success is False
+        assert result.updated_state is state
+
+    @pytest.mark.parametrize(
+        ("rule_secret", "rule_component", "rule_plugin", "rule_option"),
+        [
+            # Each axis off by one from the requested (OPENROUTER_API_KEY,
+            # source, csv, api_key) wiring — every near-miss denies.
+            ("OPENAI_API_KEY", "source", "csv", "api_key"),
+            ("OPENROUTER_API_KEY", "sink", "csv", "api_key"),
+            ("OPENROUTER_API_KEY", "source", "json", "api_key"),
+            ("OPENROUTER_API_KEY", "source", "csv", "token"),
+        ],
+    )
+    def test_wire_with_near_miss_rule_denies(
+        self,
+        rule_secret: str,
+        rule_component: str,
+        rule_plugin: str,
+        rule_option: str,
+    ) -> None:
+        catalog = _mock_catalog()
+        state = self._state_with_source(catalog)
+        result = execute_tool(
+            "wire_secret_ref",
+            {"name": "OPENROUTER_API_KEY", "target": "source", "option_key": "api_key"},
+            state,
+            catalog,
+            secret_service=self._svc(),
+            user_id="test-user",
+            secret_wiring_policy=_wiring_policy(rule_secret, rule_component, rule_plugin, rule_option),
+        )
+        assert result.success is False
+        assert result.updated_state is state
+
+    def test_wire_node_target_authorized_by_transform_rule(self) -> None:
+        """Node targets (transform AND aggregation) authorize under 'transform'."""
+        catalog = _mock_catalog()
+        state = self._state_with_source(catalog)
+        r1 = execute_tool(
+            "upsert_node",
+            {
+                "id": "classify",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "t1",
+                "on_success": "main",
+                "on_error": "discard",
+                "options": _llm_options_with_api_key({"secret_ref": "OPENROUTER_API_KEY"}),
+            },
+            state,
+            catalog,
+        )
+        assert r1.success is True
+        result = execute_tool(
+            "wire_secret_ref",
+            {"name": "AZURE_API_KEY", "target": "node", "target_id": "classify", "option_key": "api_key"},
+            r1.updated_state,
+            catalog,
+            secret_service=self._svc(),
+            user_id="test-user",
+            secret_wiring_policy=_wiring_policy("AZURE_API_KEY", "transform", "llm", "api_key"),
+        )
+        assert result.success is True
+        node = next(n for n in result.updated_state.nodes if n.id == "classify")
+        assert deep_thaw(node.options)["api_key"] == {"secret_ref": "AZURE_API_KEY"}
+
+    def test_wire_output_target_authorized_by_sink_rule(self) -> None:
+        catalog = _mock_catalog()
+        r1 = execute_tool(
+            "set_output",
+            {
+                "sink_name": "main",
+                "plugin": "csv",
+                "options": {"path": "/data/out.csv", "schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
+            },
+            _empty_state(),
+            catalog,
+        )
+        assert r1.success is True
+        result = execute_tool(
+            "wire_secret_ref",
+            {"name": "SINK_API_KEY", "target": "output", "target_id": "main", "option_key": "api_key"},
+            r1.updated_state,
+            catalog,
+            secret_service=self._svc(),
+            user_id="test-user",
+            secret_wiring_policy=_wiring_policy("SINK_API_KEY", "sink", "csv", "api_key"),
+        )
+        assert result.success is True
+        output = next(o for o in result.updated_state.outputs if o.name == "main")
+        assert deep_thaw(output.options)["api_key"] == {"secret_ref": "SINK_API_KEY"}
+
+    def test_authorization_runs_before_marker_write_not_after(self) -> None:
+        """A denied wiring never reaches placement/endpoint policy — the
+        authorization boundary is outermost after existence."""
+        catalog = _mock_catalog()
+        state = self._state_with_source(catalog)
+        result = execute_tool(
+            "wire_secret_ref",
+            {"name": "OPENROUTER_API_KEY", "target": "source", "option_key": "path"},
+            state,
+            catalog,
+            secret_service=self._svc(),
+            user_id="test-user",
+        )
+        assert result.success is False
+        # The denial is the authorization denial, not the placement denial.
+        assert "secret_wiring_allowlist" in result.data["error"]
+        assert "only credential-bearing fields" not in result.data["error"]
 
 
 class TestSecretToolsArgumentValidation:

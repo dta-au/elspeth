@@ -224,6 +224,7 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
 from elspeth.web.sessions.models import sessions_table
 from elspeth.web.validation import _redact_sensitive_content
@@ -1556,7 +1557,18 @@ def _compose_preflight_repair_message(runtime_result: ValidationResult, *, next_
     )
 
     credential_note = ""
-    if any(
+    if any(error.error_code == "unauthorized_secret_ref" for error in runtime_result.errors):
+        credential_note = (
+            "\n\nSecret-wiring authorization notice:\n"
+            "- One or more wired secrets are not authorized for their destination by this "
+            "deployment's server-authored secret_wiring_allowlist. This is operator policy, "
+            "not a configuration mistake you can repair: no composer tool call can authorize "
+            "the wiring, and re-trying wire_secret_ref or re-validating will not change the outcome.\n"
+            "- Either remove the wired secret reference from the named component, or tell the "
+            "user the deployment operator must allowlist this exact secret/plugin/option "
+            "destination before this pipeline can run."
+        )
+    elif any(
         error.error_code in {"fabricated_secret", "missing_secret_ref"}
         or "Credential field(s)" in error.message
         or "secret reference" in error.message
@@ -1931,6 +1943,9 @@ class ComposerServiceImpl:
         self._data_dir: str = str(settings.data_dir)
         self._session_engine = session_engine
         self._secret_service = secret_service
+        # Server-authored secret→destination allowlist (elspeth-f3c1aafd25);
+        # deny-by-default when the deployment configures no rules.
+        self._secret_wiring_policy = runtime_secret_wiring_policy(settings.secret_wiring_allowlist)
         self._plugin_snapshot_factory = plugin_snapshot_factory
         self._operator_profile_registry = operator_profile_registry
         self._trained_operator_mode = trained_operator_mode
@@ -2273,6 +2288,7 @@ class ComposerServiceImpl:
             self._settings,
             yaml_generator,
             secret_service=self._secret_service,
+            secret_wiring_policy=self._secret_wiring_policy,
             user_id=user_id,
             session_id=session_id,
             allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
@@ -3514,6 +3530,7 @@ class ComposerServiceImpl:
                 session_engine=self._session_engine,
                 max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
                 secret_service=self._secret_service,
+                secret_wiring_policy=self._secret_wiring_policy,
                 runtime_preflight=await self._planner_preview_preflight(
                     current_state,
                     user_id=originating_message.user_id,
@@ -3673,6 +3690,7 @@ class ComposerServiceImpl:
             session_engine=self._session_engine,
             max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
             secret_service=self._secret_service,
+            secret_wiring_policy=self._secret_wiring_policy,
             runtime_preflight=await self._planner_preview_preflight(
                 current_state,
                 user_id=user_id,
@@ -4231,6 +4249,7 @@ class ComposerServiceImpl:
             session_engine=self._session_engine,
             max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
             secret_service=self._secret_service,
+            secret_wiring_policy=self._secret_wiring_policy,
             # Resolves to ``None`` today — this surface plans an EMPTY topology
             # by construction, and the helper's structurally-empty guard is the
             # single source of that rule. Routed through it anyway so the

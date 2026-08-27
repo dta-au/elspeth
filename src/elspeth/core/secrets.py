@@ -13,6 +13,7 @@ from typing import Any
 from elspeth.contracts.secrets import (
     ResolvedSecret,
     ScopedSecretResolverContract,
+    SecretRefMarkerSite,
     SecretRefPlacementViolation,
     SecretScope,
     WebSecretResolver,
@@ -280,61 +281,62 @@ def collect_disallowed_secret_ref_markers(
     such as the database sink's whole-DSN ``url`` field.
     """
     allowed_exact = frozenset(field.lower() for field in additional_allowed_fields)
-    violations: list[SecretRefPlacementViolation] = []
-    _collect_disallowed_secret_ref_markers(
-        options,
-        env_ref_names,
-        allowed_exact,
-        path=(),
-        violations=violations,
-    )
-    return violations
+    # DERIVED from the single marker-walk authority; the placement decision
+    # is a filter over its sites, never a second traversal.
+    return [
+        SecretRefPlacementViolation(field_path=site.field_path, secret_name=site.secret_name)
+        for site in collect_secret_ref_marker_sites(options, env_ref_names)
+        if not _field_allows_secret_ref(site.field_name, allowed_exact)
+    ]
 
 
 def _field_allows_secret_ref(field_name: str, additional_allowed_fields: Collection[str]) -> bool:
     return is_secret_field(field_name) or field_name.lower() in additional_allowed_fields
 
 
-def _collect_disallowed_secret_ref_markers(
+def collect_secret_ref_marker_sites(
+    options: Any,
+    env_ref_names: Collection[str] = frozenset(),
+) -> list[SecretRefMarkerSite]:
+    """Return every wired deferred-secret use with its dotted option path.
+
+    Unlike ``collect_disallowed_secret_ref_markers`` this collects ALL
+    marker and exact-``${NAME}`` env-ref sites, not just misplaced ones —
+    it feeds the secret-wiring authorization gate (elspeth-f3c1aafd25),
+    which must adjudicate every secret→destination pairing however the
+    marker entered the composition. Names and paths only, never values.
+    """
+    sites: list[SecretRefMarkerSite] = []
+    _collect_secret_ref_marker_sites(options, env_ref_names, path=(), sites=sites)
+    return sites
+
+
+def _collect_secret_ref_marker_sites(
     obj: Any,
     env_ref_names: Collection[str],
-    additional_allowed_fields: Collection[str],
     *,
     path: tuple[str, ...],
-    violations: list[SecretRefPlacementViolation],
+    sites: list[SecretRefMarkerSite],
 ) -> None:
     marker = parse_secret_ref_marker(obj)
     ref_name = marker[0] if marker is not None else _is_secret_env_ref(obj, env_ref_names)
     if ref_name is not None:
-        field_name = path[-1] if path else ""
-        if not _field_allows_secret_ref(field_name, additional_allowed_fields):
-            violations.append(
-                SecretRefPlacementViolation(
-                    field_path=".".join(path) if path else "<root>",
-                    secret_name=ref_name,
-                )
+        sites.append(
+            SecretRefMarkerSite(
+                field_path=".".join(path) if path else "<root>",
+                field_name=path[-1] if path else "",
+                secret_name=ref_name,
             )
+        )
         return
 
     if isinstance(obj, Mapping):
         for key, value in obj.items():
             next_path = (*path, key) if isinstance(key, str) else (*path, f"<{type(key).__name__}>")
-            _collect_disallowed_secret_ref_markers(
-                value,
-                env_ref_names,
-                additional_allowed_fields,
-                path=next_path,
-                violations=violations,
-            )
+            _collect_secret_ref_marker_sites(value, env_ref_names, path=next_path, sites=sites)
     elif isinstance(obj, (list, tuple)):
         for index, item in enumerate(obj):
-            _collect_disallowed_secret_ref_markers(
-                item,
-                env_ref_names,
-                additional_allowed_fields,
-                path=(*path, f"[{index}]"),
-                violations=violations,
-            )
+            _collect_secret_ref_marker_sites(item, env_ref_names, path=(*path, f"[{index}]"), sites=sites)
 
 
 def _walk(

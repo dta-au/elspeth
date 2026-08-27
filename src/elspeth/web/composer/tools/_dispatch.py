@@ -65,6 +65,7 @@ from elspeth.web.composer.tools.sessions import (
     ADVISOR_TRIGGER_VALUES,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 
 __all__ = [
     "_inject_prior_validation",
@@ -577,6 +578,7 @@ def execute_tool(
     session_engine: Engine | None = None,
     session_id: str | None = None,
     secret_service: WebSecretResolver | None = None,
+    secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
     baseline: CompositionState | None = None,
     prior_validation: ValidationSummary | None = None,
@@ -624,6 +626,9 @@ def execute_tool(
         secret_service: ``WebSecretResolver`` — auth-scoped secret-reference
             resolver. Required for secret tools. Production wiring passes a
             ``ScopedSecretResolver`` (``elspeth.web.secrets.service``).
+        secret_wiring_policy: Server-authored secret→destination allowlist
+            consulted by ``wire_secret_ref`` (elspeth-f3c1aafd25). ``None``
+            denies every wiring — deny-by-default, never an allow.
         user_id: Current user ID. Required for secret tools.
         baseline: Baseline state for diff_pipeline comparisons.
         prior_validation: Pre-computed validation for the current state.
@@ -712,6 +717,7 @@ def execute_tool(
         session_engine=session_engine,
         session_id=session_id,
         secret_service=secret_service,
+        secret_wiring_policy=secret_wiring_policy,
         user_id=user_id,
         baseline=baseline,
         current_validation=current_validation,

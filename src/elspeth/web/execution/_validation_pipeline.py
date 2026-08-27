@@ -24,6 +24,7 @@ from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 
 
 class _ValidationRunImpl(Protocol):
@@ -39,6 +40,7 @@ class _ValidationRunImpl(Protocol):
         profile_registry: OperatorProfileRegistry | None,
         catalog: CatalogService,
         secret_service: WebSecretResolver | None = None,
+        secret_wiring_policy: SecretWiringPolicy | None = None,
         user_id: str | None = None,
         blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
         allow_pending_interpretation_placeholders: bool = False,
@@ -81,6 +83,7 @@ class ValidationPipeline:
         profile_registry: OperatorProfileRegistry | None,
         catalog: CatalogService,
         secret_service: WebSecretResolver | None = None,
+        secret_wiring_policy: SecretWiringPolicy | None = None,
         user_id: str | None = None,
         blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
         allow_pending_interpretation_placeholders: bool = False,
@@ -105,6 +108,7 @@ class ValidationPipeline:
                 profile_registry=profile_registry,
                 catalog=catalog,
                 secret_service=secret_service,
+                secret_wiring_policy=secret_wiring_policy,
                 user_id=user_id,
                 blob_get_metadata=blob_get_metadata,
                 allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
