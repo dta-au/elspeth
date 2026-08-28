@@ -424,7 +424,10 @@ def _json_value_chars(value: Any, *, seen: set[int]) -> int:
         if not math.isfinite(value):
             raise S3RecordSerializationError
         return len(json.dumps(value, allow_nan=False))
-    if type(value) is dict:
+    # The container arms mirror json.JSONEncoder's own dispatch (dict subclasses
+    # and list/tuple) so this estimate accepts exactly what the write path will
+    # encode; a frozen mapping or frozenset is a static failure in both places.
+    if isinstance(value, dict):
         identity = id(value)
         if identity in seen:
             raise S3RecordSerializationError
@@ -440,7 +443,7 @@ def _json_value_chars(value: Any, *, seen: set[int]) -> int:
             return total
         finally:
             seen.remove(identity)
-    if type(value) is list:
+    if isinstance(value, (list, tuple)):
         identity = id(value)
         if identity in seen:
             raise S3RecordSerializationError
@@ -729,7 +732,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f4bcdedf9a58c880"
+    source_file_hash: str | None = "sha256:a63d01a80d52bc5c"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP

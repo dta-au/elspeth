@@ -404,6 +404,33 @@ class TestSerialization:
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None
 
+    @pytest.mark.parametrize("format", ["json", "jsonl"])
+    def test_json_size_estimate_accepts_exactly_what_the_encoder_accepts(self, format: str) -> None:
+        """The record-size estimator must not quarantine a row json.dumps would write.
+
+        Tuples and dict subclasses are encoder-serializable; a deep-frozen row that
+        skipped deep_thaw (mappingproxy values) is rejected by the encoder and must
+        be the same static failure here rather than a silent size mismatch.
+        """
+        from collections import OrderedDict
+        from types import MappingProxyType
+
+        from elspeth.plugins.sinks.aws_s3_sink import S3RecordSerializationError
+
+        serialized = _serialize(
+            [{"id": 1, "name": "Ada", "tags": ("a", "b"), "nested": OrderedDict(k=[1, (2, 3)])}],
+            format=format,
+            max_record_chars=100,
+        )
+        payload = serialized.body.read()
+        serialized.close()
+        assert b'"tags":["a","b"]' in payload
+        assert b'"nested":{"k":[1,[2,3]]}' in payload
+
+        with pytest.raises(S3RecordSerializationError) as captured:
+            _serialize([{"id": 1, "name": "Ada", "nested": MappingProxyType({"k": 1})}], format=format)
+        assert captured.value.__context__ is None
+
     @pytest.mark.parametrize("format", ["csv", "json", "jsonl"])
     def test_huge_integer_conversion_is_a_static_serialization_failure(self, format: str) -> None:
         from elspeth.plugins.sinks.aws_s3_sink import S3RecordSerializationError
