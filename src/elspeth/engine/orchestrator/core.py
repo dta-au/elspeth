@@ -146,6 +146,7 @@ class Orchestrator:
         self._sink_flush = SinkFlushCoordinator(
             span_factory=self._span_factory,
             checkpoints=self._checkpoints,
+            clock=self._clock,
         )
         self._resume_coordinator = ResumeCoordinator(
             db=self._db,

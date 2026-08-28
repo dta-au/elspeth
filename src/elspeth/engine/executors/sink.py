@@ -55,12 +55,14 @@ from elspeth.contracts.sink_effects import (
     SinkEffectRole,
 )
 from elspeth.core.canonical import canonical_json as pipeline_canonical_json
+from elspeth.core.clock import Clock
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import decode_sink_effect_returned_result
 from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_identity, resolve_sink_effect_members
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine._error_hash import compute_error_hash
+from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.declaration_dispatch import run_boundary_checks
 from elspeth.engine.executors.sink_effects import (
     SinkEffectCoordinator,
@@ -156,6 +158,7 @@ class SinkExecutor:
         *,
         factory: RecorderFactory | None = None,
         worker_id: str | None = None,
+        clock: Clock = DEFAULT_CLOCK,
         sink_effect_fault_hook: Callable[[SinkEffectExecutionSeam], None] | None = None,
         shutdown_event: threading.Event | None = None,
         check_coordination_latch: Callable[[], None] | None = None,
@@ -179,6 +182,9 @@ class SinkExecutor:
         # orchestration threads its registered coordination worker id; direct
         # executor callers still receive a process-unique owner.
         self._worker_id = worker_id or f"sink-effects:{run_id}:{uuid.uuid4().hex}"
+        # Sink-effect lease waits measure and sleep on this clock (the
+        # orchestrator's), so a controlled clock never blocks a real thread.
+        self._clock = clock
         self._sink_effect_fault_hook = sink_effect_fault_hook
         self._shutdown_event = shutdown_event
         self._check_coordination_latch = check_coordination_latch
@@ -767,6 +773,7 @@ class SinkExecutor:
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
+            clock=self._clock,
             fault_hook=self._sink_effect_fault_hook,
             shutdown_event=self._shutdown_event,
             check_coordination_latch=self._check_coordination_latch,
@@ -1100,6 +1107,7 @@ class SinkExecutor:
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
+            clock=self._clock,
             fault_hook=self._sink_effect_fault_hook,
             shutdown_event=self._shutdown_event,
             check_coordination_latch=self._check_coordination_latch,

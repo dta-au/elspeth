@@ -26,7 +26,9 @@ from elspeth.contracts.types import (
     NodeID,
     SinkName,
 )
+from elspeth.core.clock import Clock
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.sink import DiversionCounts
 from elspeth.engine.orchestrator.outcomes import (
     reconcile_sink_write_diversions,
@@ -117,9 +119,11 @@ class SinkFlushCoordinator:
         *,
         span_factory: SpanFactory,
         checkpoints: CheckpointCoordinator,
+        clock: Clock = DEFAULT_CLOCK,
     ) -> None:
         self._span_factory = span_factory
         self._checkpoints = checkpoints
+        self._clock = clock
 
     def write_pending_to_sinks(
         self,
@@ -187,6 +191,7 @@ class SinkFlushCoordinator:
             run_id,
             factory=factory,
             worker_id=worker_id,
+            clock=self._clock,
             shutdown_event=ctx.shutdown_event,
             check_coordination_latch=check_coordination_latch,
             make_shutdown_error=_shutdown_during_sink_effect_wait,

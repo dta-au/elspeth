@@ -8,6 +8,18 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — a component that polls a `Clock` must also SLEEP through
+  it.** `elspeth.core.clock.Clock` now carries `sleep(seconds)`: `SystemClock`
+  blocks, `MockClock` advances. `SinkEffectCoordinator` defaults its sleep to
+  `clock.sleep` and takes the wall-clock `shutdown_event.wait` path only on a
+  `SystemClock`; `Orchestrator._clock` threads through `SinkFlushCoordinator`
+  → `SinkExecutor` → both coordinators. Before this, a resume whose crashed
+  predecessor still held a sink-effect lease slept the full five-minute TTL
+  in real time inside a unit test (`test_resume_does_not_rewrite_sequence_zero`,
+  ~300s, 14s CPU). When you add a new poll-until-deadline loop, measure the
+  deadline and wait on the SAME injected clock — never `time.sleep` beside
+  `clock.monotonic()` — and any test fake typed as `Clock` needs `sleep`.
+
 - **2026-08-28 — `.pre-commit-config.yaml` lint hooks are pinned by
   `tests/unit/elspeth_lints/test_pre_commit_triggers.py`** (elspeth-7e8bf1c28b).
   Three whole-config contracts: (1) a `--files` hook may select ONLY

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import queue
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -79,6 +80,11 @@ class _SharedFileClock:
 
     def monotonic(self) -> float:
         return self.now_utc().timestamp()
+
+    def sleep(self, seconds: float) -> None:
+        # The parent test owns this clock's progress; a child wait blocks
+        # in real time until the parent moves the file.
+        time.sleep(seconds)
 
 
 class _LeaseStallTransform(BaseTransform):

@@ -23,4 +23,14 @@ class UtcClock(Protocol):
 
 
 class Clock(MonotonicClock, UtcClock, Protocol):
-    """Combined clock contract for components that need both time domains."""
+    """Combined clock contract for components that need both time domains.
+
+    ``sleep`` is the clock's own notion of waiting: a production clock blocks
+    the calling thread, a controlled clock advances itself. Components that
+    poll against ``monotonic()``/``now_utc()`` must wait through the same
+    clock, or a controlled clock never reaches their deadline.
+    """
+
+    def sleep(self, seconds: float) -> None:
+        """Wait ``seconds`` on this clock's time scale."""
+        ...

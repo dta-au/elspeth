@@ -60,7 +60,7 @@ from elspeth.core.landscape.execution.sink_effect_attempt_results import (
 )
 from elspeth.core.landscape.execution.sink_effects import SinkEffectRepository
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.engine.clock import DEFAULT_CLOCK
+from elspeth.engine.clock import DEFAULT_CLOCK, SystemClock
 
 logger = logging.getLogger(__name__)
 
@@ -284,7 +284,13 @@ class SinkEffectCoordinator:
         self._lease_ttl = lease_ttl
         self._fault_hook = fault_hook
         self._clock = clock
-        self._sleep = sleep if sleep is not None else time.sleep
+        # Waiting goes through the clock the deadline is measured on, so a
+        # controlled clock advances instead of blocking the worker. The
+        # shutdown-event wait below is a wall-clock primitive and is used
+        # only when the clock is the real one; a controlled clock still sees
+        # the event at the next poll via _check_wait_interruptions.
+        self._sleep = sleep if sleep is not None else clock.sleep
+        self._wait_on_shutdown_event = sleep is None and isinstance(clock, SystemClock)
         self._poll_interval = float(poll_interval)
         self._shutdown_event = shutdown_event
         self._check_coordination_latch = check_coordination_latch
@@ -409,7 +415,7 @@ class SinkEffectCoordinator:
             sleep_seconds = min(self._poll_interval, deadline - monotonic_now)
             if sleep_seconds <= 0.0:  # pragma: no cover - guarded by deadline check
                 raise LandscapeRecordError("sink-effect predecessor wait produced a non-positive poll interval")
-            if self._shutdown_event is not None and self._sleep is time.sleep:
+            if self._shutdown_event is not None and self._wait_on_shutdown_event:
                 self._shutdown_event.wait(timeout=sleep_seconds)
             else:
                 self._sleep(sleep_seconds)
@@ -450,7 +456,7 @@ class SinkEffectCoordinator:
             sleep_seconds = min(self._poll_interval, deadline - monotonic_now)
             if sleep_seconds <= 0.0:  # pragma: no cover - guarded by deadline check
                 raise LandscapeRecordError("sink-effect lease wait produced a non-positive poll interval")
-            if self._shutdown_event is not None and self._sleep is time.sleep:
+            if self._shutdown_event is not None and self._wait_on_shutdown_event:
                 self._shutdown_event.wait(timeout=sleep_seconds)
             else:
                 self._sleep(sleep_seconds)
