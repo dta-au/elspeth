@@ -42,6 +42,23 @@ is a working document under the normal delivery posture.
   be derivable from `source_param` through the tier_model dataflow walk, and
   R4/R6 are properties of a handler rather than of a derived value.
 
+- **2026-08-29 — SDK providers read `raw_response` through ONE declared
+  boundary: `plugins/transforms/llm/provider.finish_reason_from_raw_response`.**
+  Azure and Bedrock used to each walk `response.raw_response.get("choices")[0]
+  .get("finish_reason")` inline; both copies are now the non-raising
+  `@trust_boundary` in `provider.py`. `LLMResponse` deep-freezes the envelope,
+  so inside it lists are `tuple` and dicts are `MappingProxyType` — the
+  boundary discriminates with `isinstance(..., Sequence)`/`Mapping`, and
+  `type(x) is list`/`dict` there would silently return `None` for every real
+  response. A new SDK-shaped provider (anything routed through
+  `AuditedLLMClient`) calls this helper rather than growing a third copy; the
+  HTTP providers (openrouter/gateway) keep their own raising body validators
+  because they parse bytes, not an SDK envelope. Also from B21: an R6 on a
+  handler that only stores the error and raises AFTER the `try` (the
+  `terminal_error`/`redacted_error` record-then-raise and bounded-egress
+  seams) is rationalised, not restructured — moving the raise into the handler
+  either skips the audit write or re-attaches provider text via `__context__`.
+
 - **2026-08-29 — `validate_credential_safe_https_url` now lives at
   `elspeth.core.url_validation`, NOT `elspeth.plugins.infrastructure.*`.**
   The module is stdlib-only (`re` + `urllib.parse`) and was already consumed

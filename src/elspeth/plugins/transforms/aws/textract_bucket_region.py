@@ -101,6 +101,15 @@ def build_s3_head_bucket_sdk_client(
     return cast("S3HeadBucketSDKClient", boto3.client("s3", **kwargs))
 
 
+@trust_boundary(
+    tier=3,
+    source="AWS S3 HeadBucket success response envelope (externally derived)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises BucketRegionUnverifiedError(code=malformed_response) unless value is a Mapping whose every key is a str; never coerces or defaults",
+    test_ref="tests/unit/plugins/transforms/aws/test_textract_bucket_region.py::test_strict_mapping_boundary_rejects_non_mapping_and_non_string_keys",
+    test_fingerprint="d3e4bcf0ca70e18f6deb702c941b04f09e8824bb4e993569b9ae4a94dcd78273",
+)
 def _strict_mapping(value: object) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or not all(type(key) is str for key in value):
         raise BucketRegionUnverifiedError(code="malformed_response", retryable=False)
@@ -111,15 +120,34 @@ def _strict_region(value: object) -> str | None:
     return value if type(value) is str and is_supported_textract_region(value) else None
 
 
+@trust_boundary(
+    tier=3,
+    source="AWS S3 HeadBucket ResponseMetadata member, from a success response or a ClientError envelope (externally derived)",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns (http_status, headers, attempts); a member or HTTPHeaders that is not a str-keyed mapping yields "
+        "(None, {}, 1) and an out-of-range status or retry count yields None / a single attempt; never raises"
+    ),
+    non_raising=True,
+)
 def _metadata(value: object) -> tuple[int | None, Mapping[str, Any], int]:
-    metadata = _strict_mapping(value)
-    raw_status = metadata.get("HTTPStatusCode")
+    """Read status, headers and attempt count from a ResponseMetadata member.
+
+    Non-raising so that both the success path (which then rejects any status
+    other than 200) and the ClientError path (which degrades to an unknown
+    status) share one parse of the same vendor shape.
+    """
+    if not isinstance(value, Mapping) or not all(type(key) is str for key in value):
+        return None, {}, 1
+    raw_headers = value.get("HTTPHeaders", {})
+    if not isinstance(raw_headers, Mapping) or not all(type(key) is str for key in raw_headers):
+        return None, {}, 1
+    raw_status = value.get("HTTPStatusCode")
     status = raw_status if type(raw_status) is int and 100 <= raw_status <= 599 else None
-    raw_headers = metadata.get("HTTPHeaders", {})
-    headers = _strict_mapping(raw_headers)
-    raw_retries = metadata.get("RetryAttempts", 0)
+    raw_retries = value.get("RetryAttempts", 0)
     attempts = raw_retries + 1 if type(raw_retries) is int and 0 <= raw_retries <= 10 else 1
-    return status, headers, attempts
+    return status, raw_headers, attempts
 
 
 @trust_boundary(
@@ -163,7 +191,24 @@ def _safe_provider_code(value: object) -> str:
     return "unknown"
 
 
+@trust_boundary(
+    tier=3,
+    source="botocore exception raised by an S3 HeadBucket call (externally derived)",
+    source_param="error",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns (proof, failure, attempts) for every botocore exception: a region proof only when a 301/403 envelope "
+        "carries a supported x-amz-bucket-region header, otherwise a sanitized BucketRegionUnverifiedError; an "
+        "unrecognised exception class or a malformed envelope classifies as a non-retryable unknown code and never raises"
+    ),
+    non_raising=True,
+)
 def _provider_outcome(error: Exception) -> tuple[BucketRegionProof | None, BucketRegionUnverifiedError, int]:
+    """Classify one botocore exception into a proof-or-failure outcome.
+
+    The exception's ``response`` envelope is vendor data: every member is read
+    once, bounded, and re-asserted before it becomes part of the audit record.
+    """
     from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 
     if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
@@ -177,10 +222,7 @@ def _provider_outcome(error: Exception) -> tuple[BucketRegionProof | None, Bucke
     raw_error = response.get("Error")
     raw_code = raw_error.get("Code") if isinstance(raw_error, Mapping) else None
     code = _safe_provider_code(raw_code)
-    try:
-        status, headers, attempts = _metadata(response.get("ResponseMetadata", {}))
-    except BucketRegionUnverifiedError:
-        status, headers, attempts = None, {}, 1
+    status, headers, attempts = _metadata(response.get("ResponseMetadata", {}))
     if status in {301, 403}:
         region = _strict_region(headers.get("x-amz-bucket-region"))
         if region is not None:
@@ -372,14 +414,15 @@ class BucketRegionCoordinator:
 
     def verify(self, bucket: str, live_verify: Callable[[], BucketRegionProof]) -> BucketRegionVerification:
         with self._lock:
-            cached = self._cache.get(bucket)
-            if cached is not None:
+            if bucket in self._cache:
+                cached = self._cache[bucket]
                 return BucketRegionVerification(cached.region, cached.source, cached.http_status, "cached", cached.provider_code)
-            flight = self._in_flight.get(bucket)
-            leader = flight is None
-            if flight is None:
+            leader = bucket not in self._in_flight
+            if leader:
                 flight = _InFlight(completed=threading.Event())
                 self._in_flight[bucket] = flight
+            else:
+                flight = self._in_flight[bucket]
 
         if leader:
             try:
@@ -387,13 +430,15 @@ class BucketRegionCoordinator:
             except BaseException as error:
                 with self._lock:
                     flight.error = error
-                    self._in_flight.pop(bucket, None)
+                    # Only the leader inserts and removes its own flight, so
+                    # an absent entry here is an invariant break, not a race.
+                    del self._in_flight[bucket]
                     flight.completed.set()
                 raise
             with self._lock:
                 self._cache[bucket] = proof
                 flight.proof = proof
-                self._in_flight.pop(bucket, None)
+                del self._in_flight[bucket]
                 flight.completed.set()
             return BucketRegionVerification(proof.region, proof.source, proof.http_status, "live", proof.provider_code)
 

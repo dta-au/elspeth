@@ -167,9 +167,9 @@ def parse_tracing_config(config: dict[str, Any] | None) -> TracingConfig | None:
     if config is None:
         return None
 
-    # "provider" absence is a valid shorthand for "no tracing" — the only
-    # key where a .get() default is justified (it's a discriminator, not data).
-    provider = config.get("provider", "none")
+    # "provider" absence is a valid shorthand for "no tracing": it is the
+    # discriminator, not data, so its absence is read by membership.
+    provider = config["provider"] if "provider" in config else "none"
 
     # Pass remaining config fields through to the dataclass, which owns all
     # defaults and required-field validation via __post_init__.  This avoids

@@ -15,6 +15,7 @@ from elspeth.plugins.transforms.aws.guardrails_client import (
     BedrockGuardrailsClient,
     GuardrailPartialCoverageError,
     GuardrailResponseError,
+    _mapping,
     parse_guardrail_response,
 )
 
@@ -565,3 +566,11 @@ def test_sdk_retry_configuration_has_one_owner() -> None:
     assert config.retries["total_max_attempts"] == 3
     assert config.connect_timeout == 5
     assert config.read_timeout == 15
+
+
+@pytest.mark.parametrize("value", [None, [], "assessments", {1: "not a str key"}])
+def test_mapping_boundary_rejects_non_mapping_and_non_string_keys(value: object) -> None:
+    # ``@trust_boundary`` honesty proof for ``_mapping``'s ``value`` parameter:
+    # every SDK response passes through it before any member is read.
+    with pytest.raises(GuardrailResponseError):
+        _mapping(value)

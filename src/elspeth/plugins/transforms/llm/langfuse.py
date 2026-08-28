@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 import structlog
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
@@ -163,6 +164,10 @@ class ActiveLangfuseTracer:
                 ) as generation,
             ):
                 generation.update(**update_kwargs)
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except (TypeError, AttributeError, KeyError, NameError):
+            raise
         except Exception as e:
             _handle_trace_failure("langfuse_trace_failed", self.transform_name, e)
 
@@ -214,6 +219,10 @@ class ActiveLangfuseTracer:
                 ) as generation,
             ):
                 generation.update(**update_kwargs)
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except (TypeError, AttributeError, KeyError, NameError):
+            raise
         except Exception as e:
             _handle_trace_failure("langfuse_error_trace_failed", self.transform_name, e)
 
@@ -221,6 +230,10 @@ class ActiveLangfuseTracer:
         """Flush pending tracing data."""
         try:
             self.client.flush()
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except (TypeError, AttributeError, KeyError, NameError):
+            raise
         except Exception as e:
             _handle_trace_failure("langfuse_flush_failed", self.transform_name, e)
 
@@ -233,12 +246,16 @@ def _handle_trace_failure(
     """Handle trace recording failure — No Silent Failures via structlog.
 
     Langfuse is itself an optional telemetry path. If it fails, structlog is
-    the independent last-resort channel and the pipeline result remains primary.
+    the independent last-resort channel and the pipeline result remains
+    primary. Tier-1 and programming errors never reach here: the callers
+    re-raise them ahead of the broad clause, so only SDK/transport failures
+    are recorded and swallowed.
     """
     logger.warning(
         event_name,
         plugin=transform_name,
         error_type=type(error).__name__,
+        exc_info=True,
     )
 
 

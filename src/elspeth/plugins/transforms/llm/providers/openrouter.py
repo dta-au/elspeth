@@ -30,6 +30,7 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
@@ -100,68 +101,81 @@ def _summarize_http_error_body(error: httpx.HTTPStatusError) -> str:
     return f" | provider error body redacted (body_present=true; chars={len(body)})"
 
 
-def _validate_chat_completion_response(response: httpx.Response) -> tuple[dict[str, Any], str, TokenUsage, ParsedFinishReason, str]:
-    """Parse and validate an OpenRouter chat-completion response body."""
-    try:
-        data = json.loads(response.content, parse_constant=reject_nonfinite_constant)
-    except (ValueError, TypeError) as e:
-        raise LLMClientError(
-            f"Response is not valid JSON: {e}",
-            retryable=False,
-        ) from e
+def _decode_openrouter_json(response: httpx.Response) -> Any:
+    """Decode an OpenRouter body as JSON, rejecting non-finite constants.
 
+    Transport-level only: ``_validate_chat_completion_response`` owns every
+    shape check on the decoded value. Only the exception type name reaches the
+    failure message; the decoded content is never interpolated.
+    """
+    try:
+        return json.loads(response.content, parse_constant=reject_nonfinite_constant)
+    except (ValueError, TypeError) as e:
+        raise LLMClientError(f"Response is not valid JSON: {type(e).__name__}", retryable=False) from e
+
+
+@trust_boundary(
+    tier=3,
+    source="OpenRouter chat-completion success body (externally derived)",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises LLMClientError (or a typed subclass of it) unless the body is a JSON object whose first choice carries "
+        "non-empty str content, whose usage values are finite, and whose model is a non-empty str; never echoes body "
+        "content into an exception message"
+    ),
+    test_ref="tests/unit/plugins/llm/test_provider_openrouter.py::test_validate_chat_completion_response_rejects_malformed_bodies",
+    test_fingerprint="848eb27c7567682ffdaa9fd292309b8629b1d76799e5e8507e7ec1cdc1f33fef",
+)
+def _validate_chat_completion_response(response: httpx.Response) -> tuple[dict[str, Any], str, TokenUsage, ParsedFinishReason, str]:
+    """Parse and validate an OpenRouter chat-completion response body.
+
+    Structural diagnostics such as type and member names are safe to surface;
+    response *content* (keys, values, finish_reason text) is never echoed into
+    an exception message.
+    """
+    data = _decode_openrouter_json(response)
     if not isinstance(data, dict):
-        raise LLMClientError(
-            f"Empty or missing choices in response: {type(data).__name__}",
-            retryable=False,
-        )
+        raise LLMClientError(f"Response is not a JSON object: {type(data).__name__}", retryable=False)
 
     choices = data.get("choices")
     if not choices:
-        raise LLMClientError(
-            f"Empty or missing choices in response: {list(data.keys())}",
-            retryable=False,
-        )
+        # Fixed text only — the top-level JSON keys are provider-controlled
+        # data and must never be interpolated into an exception message.
+        raise LLMClientError("Empty or missing choices in response", retryable=False)
 
-    try:
-        content = choices[0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise LLMClientError(
-            f"Malformed response structure: {type(e).__name__}: {e}",
-            retryable=False,
-        ) from e
+    # Shape is asserted member by member (never by catching KeyError/
+    # TypeError): only the member NAME reaches the message, never a value.
+    first_choice = choices[0] if isinstance(choices, list) else None
+    if not isinstance(first_choice, dict):
+        raise LLMClientError("Malformed response structure: choices[0]", retryable=False)
+    message = first_choice.get("message")
+    if not isinstance(message, dict) or "content" not in message:
+        raise LLMClientError("Malformed response structure: message.content", retryable=False)
+    content = message["content"]
+    raw_finish_reason = first_choice.get("finish_reason")
 
     if content is None:
         raise ContentPolicyError("LLM returned null content (likely content-filtered by provider)")
 
     if not isinstance(content, str):
-        raise LLMClientError(
-            f"Expected string content, got {type(content).__name__}",
-            retryable=False,
-        )
+        raise LLMClientError(f"Expected string content, got {type(content).__name__}", retryable=False)
 
     if not content.strip():
-        raw_fr = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
-        if raw_fr == "tool_calls":
-            raise LLMClientError(
-                "LLM returned tool_calls response (not supported by ELSPETH)",
-                retryable=False,
-            )
-        raise ContentPolicyError(
-            f"LLM returned empty content (finish_reason={raw_fr})",
-        )
+        if raw_finish_reason == "tool_calls":
+            raise LLMClientError("LLM returned tool_calls response (not supported by ELSPETH)", retryable=False)
+        # finish_reason is provider-controlled data — never interpolated.
+        raise ContentPolicyError("LLM returned empty content")
 
     raw_usage = data.get("usage")
     if isinstance(raw_usage, dict):
-        for usage_key, usage_val in raw_usage.items():
+        for usage_val in raw_usage.values():
             if isinstance(usage_val, float) and not math.isfinite(usage_val):
-                raise LLMClientError(
-                    f"Non-finite value in usage.{usage_key}: {usage_val}",
-                    retryable=False,
-                )
+                # The usage key name is provider-controlled data — never
+                # interpolated, even though it's "just a key name".
+                raise LLMClientError("Non-finite value in usage", retryable=False)
     usage = TokenUsage.from_dict(raw_usage)
 
-    raw_finish_reason = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
     finish_reason = parse_finish_reason(str(raw_finish_reason)) if raw_finish_reason is not None else None
 
     # The provider MUST report which model served the request. Substituting the
@@ -601,8 +615,11 @@ class OpenRouterLLMProvider:
             count = self._http_client_refs[cache_key] - 1
             self._http_client_refs[cache_key] = count
             if count <= 0:
-                client_to_close = self._http_clients.pop(cache_key, None)
-                self._http_client_refs.pop(cache_key, None)
+                # Both maps are written together in _get_http_client and the
+                # refcount presence was asserted above, so a missing entry
+                # here is a real invariant break, not an idempotent release.
+                client_to_close = self._http_clients.pop(cache_key)
+                del self._http_client_refs[cache_key]
         if client_to_close is not None:
             try:
                 client_to_close.close()

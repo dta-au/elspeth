@@ -32,7 +32,7 @@ from elspeth.plugins.transforms.llm.provider import (
     LLMQueryResult,
     UnrecognizedFinishReason,
 )
-from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
+from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider, _validate_chat_completion_response
 
 if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
@@ -1129,3 +1129,28 @@ class TestRuntimePreflight:
             message = str(exc_info.value)
             assert "HTTP 400" in message
             _assert_provider_body_redacted(message, "sk-or-v1-url-secret", "openrouter.ai", "chat/completions")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[]",
+        '{"choices": []}',
+        '{"choices": "not a list", "model": "m"}',
+        '{"choices": [7], "model": "m"}',
+        '{"choices": [{"message": "not an object"}], "model": "m"}',
+        '{"choices": [{"message": {}}], "model": "m"}',
+        '{"choices": [{"message": {"content": 7}}], "model": "m"}',
+        '{"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 1e999}, "model": "m"}',
+        '{"choices": [{"message": {"content": "ok"}}], "model": ""}',
+        '{"choices": [{"message": {"content": "ok"}}]}',
+    ],
+)
+def test_validate_chat_completion_response_rejects_malformed_bodies(body: str) -> None:
+    # ``@trust_boundary`` honesty proof for ``_validate_chat_completion_response``'s
+    # ``response`` parameter: every malformed success body is refused with a
+    # typed error, and the message never echoes body content.
+    with pytest.raises(LLMClientError) as exc_info:
+        _validate_chat_completion_response(_make_error_response(200, body=body))
+    assert "not a list" not in str(exc_info.value)
+    assert "not an object" not in str(exc_info.value)

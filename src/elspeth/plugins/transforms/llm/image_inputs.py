@@ -51,7 +51,7 @@ def _resolve_format(spec: ImageInputConfig, row: PipelineRow) -> ImageFormat | T
         missing_reason: TransformErrorReason = {"reason": "missing_field", "field": format_field}
         return TransformResult.error(missing_reason, retryable=False)
     mime = row[format_field]
-    mapped = BINARY_DOCUMENT_FORMAT_BY_MIME.get(mime) if type(mime) is str else None
+    mapped = BINARY_DOCUMENT_FORMAT_BY_MIME[mime] if type(mime) is str and mime in BINARY_DOCUMENT_FORMAT_BY_MIME else None
     if mapped is None or mapped not in IMAGE_FORMATS:
         unmapped_reason: TransformErrorReason = {
             "reason": "invalid_input",
