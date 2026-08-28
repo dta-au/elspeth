@@ -52,9 +52,17 @@ def managed_blob_directory(data_dir: str) -> Path:
 
 
 def _is_uuid_path_segment(value: str) -> bool:
+    """Report whether one path segment parses as a UUID.
+
+    ``ValueError`` is the negative answer, not a swallowed fault: it is how
+    :class:`~uuid.UUID` reports "this string is not a UUID". The sole caller
+    passes an element of ``Path.parts``, which is ``tuple[str, ...]``, so a
+    non-string can never reach here and ``AttributeError`` is not caught —
+    a wrong-typed caller must crash rather than be reported as "not a UUID".
+    """
     try:
         UUID(value)
-    except (ValueError, AttributeError):
+    except ValueError:
         return False
     return True
 
