@@ -822,26 +822,26 @@ def _candidate_component_blocks(candidate: Mapping[str, Any]) -> dict[str, Mappi
     entry-scoped withholding.
     """
     blocks: dict[str, Mapping[str, Any]] = {}
-    raw_source = candidate.get("source")
+    raw_source = candidate["source"] if "source" in candidate else None
     if isinstance(raw_source, Mapping):
         blocks["source"] = raw_source
-    raw_sources = candidate.get("sources")
+    raw_sources = candidate["sources"] if "sources" in candidate else None
     if isinstance(raw_sources, Mapping):
         for name, block in raw_sources.items():
             if type(name) is str and name and isinstance(block, Mapping):
                 blocks["source" if name == "source" else f"source:{name}"] = block
-    raw_nodes = candidate.get("nodes")
+    raw_nodes = candidate["nodes"] if "nodes" in candidate else None
     if type(raw_nodes) is list:
         for node in raw_nodes:
             if isinstance(node, Mapping):
-                node_id = node.get("id")
+                node_id = node["id"] if "id" in node else None
                 if type(node_id) is str and node_id:
                     blocks[f"node:{node_id}"] = node
-    raw_outputs = candidate.get("outputs")
+    raw_outputs = candidate["outputs"] if "outputs" in candidate else None
     if type(raw_outputs) is list:
         for output in raw_outputs:
             if isinstance(output, Mapping):
-                sink_name = output.get("sink_name")
+                sink_name = output["sink_name"] if "sink_name" in output else None
                 if type(sink_name) is str and sink_name:
                     blocks[f"output:{sink_name}"] = output
     return blocks
@@ -875,12 +875,13 @@ def _derive_finalizer_owned_refs(
     config_owned: set[str] = set()
     routing_owned: set[str] = set()
     for ref, block in _candidate_component_blocks(finalized).items():
-        original = authored.get(ref)
-        if original is None:
+        if ref not in authored:
             config_owned.add(ref)
-        elif original is block:
             continue
-        elif _component_config_identity(original) != _component_config_identity(block):
+        original = authored[ref]
+        if original is block:
+            continue
+        if _component_config_identity(original) != _component_config_identity(block):
             config_owned.add(ref)
         elif canonical_json(original) != canonical_json(block):
             routing_owned.add(ref)
@@ -1089,7 +1090,7 @@ def _value_free_shape(value: object) -> object:
 
 def _candidate_shape_hash(candidate: Mapping[str, Any]) -> str:
     """Hash only the structural shape of a model-authored candidate."""
-    raw_nodes = candidate.get("nodes")
+    raw_nodes = candidate["nodes"] if "nodes" in candidate else None
     node_types: list[str] = []
     if type(raw_nodes) is list:
         for raw_node in raw_nodes:
@@ -1426,9 +1427,8 @@ class _ClaimedDeferredIntentSchema(TypedDict):
 
 
 def _claimed_deferred_intent_schema() -> _ClaimedDeferredIntentSchema:
-    schema = dict(_PlannerTerminalPayload.model_json_schema()["properties"]["claimed_deferred_intent_ids"])
-    schema.pop("default", None)
-    schema.pop("title", None)
+    generated = _PlannerTerminalPayload.model_json_schema()["properties"]["claimed_deferred_intent_ids"]
+    schema = {key: value for key, value in generated.items() if key not in {"default", "title"}}
     return cast(_ClaimedDeferredIntentSchema, schema)
 
 
@@ -1905,7 +1905,9 @@ def _threshold_homeless_gate_id(pipeline: Mapping[str, Any]) -> str | None:
     """
     gates = [node for node in cast(list[Mapping[str, Any]], pipeline["nodes"]) if node["node_type"] == "gate"]
     constant_gate_ids = [
-        str(gate["id"]) for gate in gates if isinstance(gate.get("condition"), str) and gate_condition_is_constant(gate["condition"])
+        str(gate["id"])
+        for gate in gates
+        if "condition" in gate and type(gate["condition"]) is str and gate_condition_is_constant(gate["condition"])
     ]
     if not constant_gate_ids or len(constant_gate_ids) != len(gates):
         return None
@@ -2793,7 +2795,7 @@ def _log_schema_precheck_rejection(trail: _PlannerAttemptTrail, errors: Sequence
     validator keyword is a JSON Schema keyword, so neither can carry an
     authored value.
     """
-    if os.environ.get("ELSPETH_PLANNER_REJECTION_DETAIL_LOG") != "1":
+    if "ELSPETH_PLANNER_REJECTION_DETAIL_LOG" not in os.environ or os.environ["ELSPETH_PLANNER_REJECTION_DETAIL_LOG"] != "1":
         return
     slog.warning(
         "composer.planner_rejection_detail",
@@ -3077,17 +3079,22 @@ def _serialize_provider_discovery_result(
         return _serialize_closed_provider_discovery_payload(payload)
 
     authoritative_data = result.data
-    component = call.arguments.get("component")
+    component = call.arguments["component"] if "component" in call.arguments else None
     if component == "set_pipeline_arguments":
         fail_closed()
     elif isinstance(authoritative_data, Mapping) and set(authoritative_data) == {"sources"}:
-        payload["data"] = {"sources": deep_thaw(provider_current_state.get("sources", []))}
+        projected_sources = provider_current_state["sources"] if "sources" in provider_current_state else []
+        payload["data"] = {"sources": deep_thaw(projected_sources)}
     elif isinstance(authoritative_data, Mapping) and set(authoritative_data) == {"node"}:
         selected = authoritative_data["node"]
-        nodes = provider_current_state.get("nodes", [])
-        selected_id = selected.get("id") if isinstance(selected, Mapping) else None
+        nodes = provider_current_state["nodes"] if "nodes" in provider_current_state else []
+        selected_id = selected["id"] if isinstance(selected, Mapping) and "id" in selected else None
         node = next(
-            (candidate for candidate in nodes if isinstance(candidate, Mapping) and candidate.get("id") == selected_id),
+            (
+                candidate
+                for candidate in nodes
+                if isinstance(candidate, Mapping) and (candidate["id"] if "id" in candidate else None) == selected_id
+            ),
             None,
         )
         if node is not None:
@@ -3096,10 +3103,14 @@ def _serialize_provider_discovery_result(
             fail_closed()
     elif isinstance(authoritative_data, Mapping) and set(authoritative_data) == {"output"}:
         selected = authoritative_data["output"]
-        outputs = provider_current_state.get("outputs", [])
-        selected_name = selected.get("sink_name") if isinstance(selected, Mapping) else None
+        outputs = provider_current_state["outputs"] if "outputs" in provider_current_state else []
+        selected_name = selected["sink_name"] if isinstance(selected, Mapping) and "sink_name" in selected else None
         output = next(
-            (candidate for candidate in outputs if isinstance(candidate, Mapping) and candidate.get("name") == selected_name),
+            (
+                candidate
+                for candidate in outputs
+                if isinstance(candidate, Mapping) and (candidate["name"] if "name" in candidate else None) == selected_name
+            ),
             None,
         )
         if output is not None:
@@ -4270,7 +4281,9 @@ async def _plan_pipeline_inner(
             finalizer_owned_refs: _FinalizerOwnedRefs = _FINALIZER_OWNS_NOTHING
             if terminal_feedback is None:
                 assert pipeline is not None
-                if pipeline.get("source") is None and pipeline.get("sources") is None:
+                authored_source = pipeline["source"] if "source" in pipeline else None
+                authored_sources = pipeline["sources"] if "sources" in pipeline else None
+                if authored_source is None and authored_sources is None:
                     # Fingerprinted like every other candidate rejection: a
                     # sourceless candidate re-emitted unchanged must still draw
                     # the repeat notice rather than silently burning budget.
@@ -4586,7 +4599,7 @@ async def _plan_pipeline_inner(
                     components_withheld=_withheld_component_count(exc.result),
                     plugin_contract_resolver=_violated_plugin_contract,
                 )
-                if os.environ.get("ELSPETH_PLANNER_REJECTION_DETAIL_LOG") == "1":
+                if "ELSPETH_PLANNER_REJECTION_DETAIL_LOG" in os.environ and os.environ["ELSPETH_PLANNER_REJECTION_DETAIL_LOG"] == "1":
                     # Operator-opted diagnostic seam. Validator messages are never
                     # logged: even an opt-in diagnostic must not persist authored
                     # option values, row content, paths, or secret material. Closed
