@@ -459,6 +459,7 @@ The TelemetryManager exposes health metrics:
 | `events_emitted` | Successfully delivered events | N/A |
 | `events_dropped` | Failed to deliver to any exporter | > 0 |
 | `queue_drops` | Enqueue/backpressure losses (excludes exporter delivery failures) | > 0 |
+| `observer_failures` | Event-observer callbacks that raised (contained, never breaks a row) | > 0 |
 | `exporter_failures` | Per-exporter failure counts | Trend increasing |
 | `consecutive_total_failures` | Current streak of all-exporter failures | > 5 |
 

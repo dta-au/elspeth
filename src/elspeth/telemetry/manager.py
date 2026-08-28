@@ -18,8 +18,8 @@ Thread Safety:
     TelemetryManager uses a background export thread for async export.
     - handle_event() is called from the pipeline thread (non-blocking)
     - _export_loop() runs in the background export thread
-    - _events_dropped and _queue_drops are protected by _dropped_lock
-      (accessed from both threads)
+    - _events_dropped, _queue_drops and _observer_failures are protected by
+      _dropped_lock (accessed from both threads)
     - All other metrics are only modified by the export thread
     - health_metrics reads are approximately consistent
 """
@@ -91,6 +91,7 @@ class HealthMetrics(TypedDict):
     events_emitted: int
     events_dropped: int
     queue_drops: int
+    observer_failures: int
     exporter_failures: dict[str, int]
     consecutive_total_failures: int
     queue_depth: int
@@ -179,6 +180,7 @@ class TelemetryManager:
         self._pending_deferred_events = 0
         self._events_dropped = 0
         self._queue_drops = 0
+        self._observer_failures = 0
         self._exporter_failures: defaultdict[str, int] = defaultdict(int)
         self._last_logged_drop_count: int = 0
 
@@ -423,6 +425,16 @@ class TelemetryManager:
             try:
                 observer(export_event)
             except Exception as exc:
+                # Isolation, not silence: an operator-supplied observer must
+                # never break the row, so the failure is contained here — but
+                # it is COUNTED into health_metrics["observer_failures"] as
+                # well as logged, so a permanently broken observer is visible
+                # on the operational surface rather than only in the log
+                # stream. Exporter failures are already counted this way; a
+                # swallowed observer failure that nothing counted would be the
+                # only unrecorded loss in this class.
+                with self._dropped_lock:
+                    self._observer_failures += 1
                 logger.error(
                     "Telemetry event observer failed",
                     observer_type=type(observer).__name__,
@@ -580,6 +592,8 @@ class TelemetryManager:
         - events_emitted: Successfully delivered to at least one exporter
         - events_dropped: Failed to deliver (queue full or all exporters failed)
         - queue_drops: Enqueue/backpressure losses only; excludes exporter failures
+        - observer_failures: Event-observer callbacks that raised; the raise is
+          contained so it cannot break a row, and counted here so it is not silent
         - exporter_failures: Per-exporter failure counts
         - consecutive_total_failures: Current streak of total failures
         - queue_depth: Current number of events in queue
@@ -598,6 +612,7 @@ class TelemetryManager:
         with self._dropped_lock:
             events_dropped = self._events_dropped
             queue_drops = self._queue_drops
+            observer_failures = self._observer_failures
         return {
             "events_attempted": self._events_attempted,
             "events_delivered": self._events_delivered,
@@ -605,6 +620,7 @@ class TelemetryManager:
             "events_emitted": self._events_emitted,
             "events_dropped": events_dropped,
             "queue_drops": queue_drops,
+            "observer_failures": observer_failures,
             "exporter_failures": dict(self._exporter_failures),
             "consecutive_total_failures": self._consecutive_total_failures,
             "queue_depth": self._queue.qsize(),
