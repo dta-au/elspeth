@@ -202,8 +202,6 @@ def validate_sink_effect_capability(
         raise SinkEffectCapabilityError(f"Sink {sink_name!r} supported_effect_modes must be an exact frozenset declaration")
     if not supported_modes or any(not isinstance(declared, str) or not declared.strip() for declared in supported_modes):
         raise SinkEffectCapabilityError(f"Sink {sink_name!r} must declare at least one non-empty supported effect mode")
-    if not isinstance(mode, str) or not mode.strip():
-        raise SinkEffectCapabilityError(f"Sink {sink_name!r} requires a non-empty configured effect mode")
     if mode not in supported_modes:
         guidance = _effect_mode_guidance(sink_type)
         raise SinkEffectCapabilityError(
@@ -283,8 +281,6 @@ def validate_sink_effect_type_capability(
         raise SinkEffectCapabilityError(f"Sink {sink_name!r} supported_effect_modes must be an exact frozenset declaration")
     if not supported_modes or any(not isinstance(declared, str) or not declared.strip() for declared in supported_modes):
         raise SinkEffectCapabilityError(f"Sink {sink_name!r} must declare at least one non-empty supported effect mode")
-    if not isinstance(mode, str) or not mode.strip():
-        raise SinkEffectCapabilityError(f"Sink {sink_name!r} requires a non-empty configured effect mode")
     if mode not in supported_modes:
         guidance = _effect_mode_guidance(sink_type)
         raise SinkEffectCapabilityError(
