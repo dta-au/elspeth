@@ -22,6 +22,7 @@ sequence continues.
 
 from __future__ import annotations
 
+import builtins
 from collections.abc import Iterator
 from typing import Any
 
@@ -493,3 +494,65 @@ def test_operator_override_of_litellm_cost_map_is_preserved() -> None:
     env["LITELLM_LOCAL_MODEL_COST_MAP"] = "False"
     result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# litellm import failures: an absent extra is not a broken install
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _uncached_litellm_read() -> Iterator[None]:
+    """Clear the reader's ``lru_cache`` around a test that patches the import.
+
+    ``read_litellm_model_list`` caches the real litellm answer for the
+    process, so a test that substitutes the import must start from an empty
+    cache and must not leave its substituted answer behind for the next one.
+    """
+    model_catalog.read_litellm_model_list.cache_clear()
+    yield
+    model_catalog.read_litellm_model_list.cache_clear()
+
+
+def _patch_litellm_import(monkeypatch: pytest.MonkeyPatch, failure: ModuleNotFoundError) -> None:
+    """Make ``import litellm`` raise ``failure``, leaving other imports alone."""
+    real_import = builtins.__import__
+
+    def _fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "litellm":
+            raise failure
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+
+@pytest.mark.usefixtures("_uncached_litellm_read")
+def test_absent_litellm_reads_as_an_empty_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """litellm genuinely missing is the documented empty-catalog path.
+
+    The LLM extra is optional, so the reader tolerates the module being
+    absent and returns an empty tuple; the walker turns that into the
+    structured "install ``elspeth[llm]``" remediation hint.
+    """
+    _patch_litellm_import(monkeypatch, ModuleNotFoundError("No module named 'litellm'", name="litellm"))
+
+    assert model_catalog.read_litellm_model_list() == ()
+
+
+@pytest.mark.usefixtures("_uncached_litellm_read")
+def test_broken_litellm_install_propagates_rather_than_reading_as_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A litellm that fails its own import must not be reported as absent.
+
+    ``import litellm`` also raises ``ModuleNotFoundError`` when litellm IS
+    installed but one of its transitive dependencies is not. Swallowing
+    that hands the operator the wrong remediation — the empty-catalog hint
+    says "install ``elspeth[llm]``" for a package already on disk — and
+    silently empties the validate-time model catalog. Only the absence of
+    ``litellm`` itself is tolerated; anything else propagates.
+    """
+    _patch_litellm_import(monkeypatch, ModuleNotFoundError("No module named 'tokenizers'", name="tokenizers"))
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        model_catalog.read_litellm_model_list()
+
+    assert excinfo.value.name == "tokenizers"

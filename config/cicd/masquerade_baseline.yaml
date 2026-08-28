@@ -292,15 +292,6 @@ entries:
   classification: external-parse
   justification: Parses optional token counters from vendor LLM usage objects, then
     constructs the owned TokenUsage value; mapping responses use their mapping API.
-- path: src/elspeth/plugins/llm/model_catalog.py
-  qualname: read_litellm_model_list
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 3dd5d6b1058f531cfb97b22f20c5c6920a3c7137e74e2238ec9a5e45e5179d41
-  classification: external-parse
-  justification: Reads an optional LiteLLM module capability, validates the returned
-    value as a list, and retains only string model identifiers.
 - path: src/elspeth/plugins/transforms/aws/textract_client.py
   qualname: _observed_send_attempts
   kind: getattr

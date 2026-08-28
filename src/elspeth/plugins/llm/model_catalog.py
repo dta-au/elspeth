@@ -58,12 +58,14 @@ import hashlib
 import os
 import threading
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
 import httpx
 import structlog
 
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import register_catalog_reader
 
 # LiteLLM fetches its model-cost map from raw.githubusercontent.com at
@@ -117,15 +119,25 @@ def read_litellm_model_list() -> tuple[str, ...]:
     composer ``list_models`` tool and the openrouter catalog reader use
     this — they cannot drift on what counts as "what litellm knows."
 
-    Returns an empty tuple on ``ImportError`` (litellm not installed) or
-    when ``model_list`` is absent / not a list. The result is sorted so
-    callers can rely on a stable order.
+    Returns an empty tuple when litellm itself is not installed (the LLM
+    extra was not selected) or when ``model_list`` is not a list. The
+    result is sorted so callers can rely on a stable order.
+
+    A litellm that IS installed but fails its own import — a missing
+    transitive dependency, a broken wheel — is not "litellm absent" and
+    must not be reported as such: the walker's remediation hint for an
+    empty catalog is "install ``elspeth[llm]``", which is the wrong
+    instruction for a broken install. Only the absence of the ``litellm``
+    module itself is tolerated here; every other import failure
+    propagates.
     """
     try:
         import litellm
-    except ImportError:
+    except ModuleNotFoundError as exc:
+        if exc.name != "litellm":
+            raise
         return ()
-    raw = getattr(litellm, "model_list", None)
+    raw: Any = litellm.model_list
     if not isinstance(raw, list):
         return ()
     return tuple(sorted(str(m) for m in raw if isinstance(m, str)))
@@ -257,6 +269,83 @@ def _read_openrouter_catalog() -> frozenset[str]:
     return _bundled_openrouter_slice()
 
 
+@dataclass(frozen=True, slots=True)
+class _OpenRouterCatalogPayload:
+    """What OpenRouter's ``/models`` body actually carried — an owned record.
+
+    Constructed by :func:`_parse_openrouter_models_payload` so the prime
+    branches on ELSPETH-owned fields instead of re-probing external data at
+    every decision point, and so the two distinct fallback log events can be
+    populated from a single parse.
+
+    ``shape_ok`` is ``False`` for a body that is not ``{"data": [...]}``;
+    ``ids`` is then empty and the counters are zero. ``entries_received``
+    counts what OpenRouter sent, ``entries_skipped`` counts what per-entry
+    coercion dropped, and ``ids`` holds the surviving model identifiers.
+    """
+
+    shape_ok: bool
+    top_level_type: str
+    ids: frozenset[str]
+    entries_received: int
+    entries_skipped: int
+
+
+@trust_boundary(
+    tier=3,
+    source="OpenRouter GET https://openrouter.ai/api/v1/models response body, JSON-decoded",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "Returns an owned _OpenRouterCatalogPayload for any input. shape_ok=False when the body is not "
+        "a mapping carrying a list under 'data'; per-entry coercion drops entries that are not mappings "
+        "carrying a non-empty string 'id' and counts them in entries_skipped. Never raises on external data."
+    ),
+    non_raising=True,
+)
+def _parse_openrouter_models_payload(payload: Any) -> _OpenRouterCatalogPayload:
+    """Parse OpenRouter's ``/models`` body into an owned catalog record.
+
+    Tier-3 admission boundary (ADR-032): the body is external data, so it is
+    parsed — shape-checked at the top level and per entry — and the result is
+    an ELSPETH-owned frozen record. Malformed entries are skipped rather than
+    aborting the parse; OpenRouter occasionally ships entries with
+    non-standard fields and the prime tolerates that. Whether an empty or
+    malformed result is fatal is the caller's decision, not this function's:
+    it reports, it does not act.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return _OpenRouterCatalogPayload(
+            shape_ok=False,
+            top_level_type=type(payload).__name__,
+            ids=frozenset(),
+            entries_received=0,
+            entries_skipped=0,
+        )
+
+    entries: list[Any] = payload["data"]
+    ids: set[str] = set()
+    skipped = 0
+    for entry in entries:
+        # Per-entry Tier-3 row coercion: ``id`` must be a non-empty string.
+        if not isinstance(entry, dict):
+            skipped += 1
+            continue
+        candidate = entry.get("id")
+        if not isinstance(candidate, str) or not candidate:
+            skipped += 1
+            continue
+        ids.add(candidate)
+
+    return _OpenRouterCatalogPayload(
+        shape_ok=True,
+        top_level_type=type(payload).__name__,
+        ids=frozenset(ids),
+        entries_received=len(entries),
+        entries_skipped=skipped,
+    )
+
+
 async def prime_openrouter_catalog_from_live(
     *,
     http_get: Callable[[str], Awaitable[httpx.Response]],
@@ -275,13 +364,16 @@ async def prime_openrouter_catalog_from_live(
     atomically at the end.
 
     Tier-3 trust boundary discipline (CLAUDE.md "Data Manifesto"):
-    OpenRouter's response is external. We validate the top-level shape
-    (``{"data": [...]}``) and per-entry shape (each entry is a dict with
-    a string ``id``). On malformed shape or transport error, we log a
-    structured warning and return ``False`` — the boot must continue,
-    with the bundled fallback in effect. Per-entry validation skips
-    malformed entries without aborting the prime; OpenRouter occasionally
-    ships entries with non-standard fields and we tolerate that.
+    OpenRouter's response is external. The body is admitted through
+    :func:`_parse_openrouter_models_payload`, which shape-checks the top
+    level (``{"data": [...]}``) and each entry (a dict with a non-empty
+    string ``id``) and returns the owned
+    :class:`_OpenRouterCatalogPayload` record this function branches on.
+    On malformed shape or transport error, we log a structured warning
+    and return ``False`` — the boot must continue, with the bundled
+    fallback in effect. Per-entry coercion skips malformed entries
+    without aborting the prime; OpenRouter occasionally ships entries
+    with non-standard fields and we tolerate that.
 
     Returns ``True`` on successful prime, ``False`` on any failure mode.
     Never raises — the caller is the boot lifespan and a raise here
@@ -323,46 +415,32 @@ async def prime_openrouter_catalog_from_live(
         _clear_live_openrouter_catalog()
         return False
 
-    # Tier-3 top-level shape validation. Missing ``data`` key or wrong
-    # type is a contract violation, not row-level garbage — log and
-    # fall back.
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+    parsed = _parse_openrouter_models_payload(payload)
+
+    # A body that is not ``{"data": [...]}`` is a contract violation, not
+    # row-level garbage — log and fall back.
+    if not parsed.shape_ok:
         _slog.warning(
             "openrouter_catalog_prime_malformed_response",
             url=OPENROUTER_MODELS_URL,
-            top_level_type=type(payload).__name__,
+            top_level_type=parsed.top_level_type,
             action="falling back to bundled litellm catalog",
         )
         _clear_live_openrouter_catalog()
         return False
 
-    entries: list[Any] = payload["data"]
-    ids: set[str] = set()
-    skipped = 0
-    for entry in entries:
-        # Per-entry Tier-3 row coercion: skip malformed entries rather
-        # than aborting the prime. ``id`` must be a non-empty string.
-        if not isinstance(entry, dict):
-            skipped += 1
-            continue
-        candidate = entry.get("id")
-        if not isinstance(candidate, str) or not candidate:
-            skipped += 1
-            continue
-        ids.add(candidate)
-
-    if not ids:
+    if not parsed.ids:
         _slog.warning(
             "openrouter_catalog_prime_empty_data",
             url=OPENROUTER_MODELS_URL,
-            entries_received=len(entries),
-            entries_skipped=skipped,
+            entries_received=parsed.entries_received,
+            entries_skipped=parsed.entries_skipped,
             action="falling back to bundled litellm catalog",
         )
         _clear_live_openrouter_catalog()
         return False
 
-    snapshot = frozenset(ids)
+    snapshot = parsed.ids
     snapshot_sha = _canonical_catalog_sha256(snapshot)
     with _LIVE_CATALOG_LOCK:
         _LIVE_CATALOG = snapshot
@@ -372,7 +450,7 @@ async def prime_openrouter_catalog_from_live(
         "openrouter_catalog_primed",
         url=OPENROUTER_MODELS_URL,
         count=len(snapshot),
-        entries_skipped=skipped,
+        entries_skipped=parsed.entries_skipped,
     )
     return True
 
