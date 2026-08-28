@@ -79,8 +79,14 @@ class PolicyCatalogView:
         exist, and ``lower_operator_profile_options`` refuses every alias.
         A profiled plugin whose principal has no usable alias is recorded
         present-with-``()`` *and* declined ``PROFILE_UNAVAILABLE`` by the same
-        producer, so it never enters ``snapshot.available`` and never reaches
-        these callers at all.
+        producer, so it does not enter ``snapshot.available``. That is not a
+        reachability precondition, though: the guided schema-form path
+        (``_schema8_schema_authority`` in
+        ``web/sessions/routes/composer/guided.py``) lowers whenever the
+        authored options carry a ``profile`` key, so a present-but-``()``
+        plugin can still reach ``lower_operator_profile_options`` - where
+        ``alias not in ()`` fails for every alias and the answer is the same
+        fail-closed ``ValueError("profile_unavailable")``.
 
         Never widen the absent branch to anything but ``()``: crediting a
         plugin with aliases the snapshot did not grant it would hand an
