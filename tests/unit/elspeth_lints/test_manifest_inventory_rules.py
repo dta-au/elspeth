@@ -164,6 +164,31 @@ def test_test_to_source_mapping_ignores_migrated_assertions_and_unrelated_string
         pytest.param("DELETE FROM {table} WHERE outcome IS NULL", id="delete-from"),
         pytest.param("SELECT count(*) FROM main.{table} WHERE outcome = 'completed'", id="schema-qualified"),
         pytest.param("SELECT is_terminal, path FROM {table}", id="is-terminal-survives-path-axis"),
+        pytest.param("CREATE TABLE {table} (outcome TEXT)", id="create-table"),
+        pytest.param("ALTER TABLE {table} ADD COLUMN outcome TEXT", id="alter-table"),
+        pytest.param("REPLACE INTO {table} (outcome) VALUES ('completed')", id="replace-into"),
+        pytest.param("EXPLAIN SELECT outcome FROM {table}", id="explain-select"),
+        pytest.param("WITH recent AS (SELECT outcome FROM {table}) SELECT * FROM recent", id="with-select"),
+        pytest.param("WITH recent(outcome) AS (SELECT outcome FROM {table}) SELECT * FROM recent", id="with-columns"),
+        pytest.param('WITH "recent" AS (SELECT outcome FROM {table}) SELECT * FROM recent', id="with-quoted-name"),
+        pytest.param("EXPLAIN WITH recent AS (SELECT outcome FROM {table}) SELECT * FROM recent", id="explain-with"),
+        pytest.param("-- compatibility query\nSELECT outcome FROM {table}", id="line-comment-prefix"),
+        pytest.param("/* compatibility query */ SELECT outcome FROM {table}", id="block-comment-prefix"),
+        pytest.param('SELECT outcome FROM "{table}"', id="double-quoted-table"),
+        pytest.param("SELECT outcome FROM `{table}`", id="backtick-quoted-table"),
+        pytest.param("SELECT outcome FROM [{table}]", id="bracket-quoted-table"),
+        pytest.param('SELECT outcome FROM "main"."{table}"', id="quoted-schema-table"),
+        pytest.param("SELECT outcome FROM {table}, tokens", id="comma-join"),
+        pytest.param("INSERT OR REPLACE INTO {table} (outcome) VALUES ('completed')", id="sqlite-insert-or-replace"),
+        pytest.param("WITH one(x) AS (VALUES (1)) SELECT outcome FROM {table}", id="values-cte-outer-select"),
+        pytest.param(
+            "WITH one(x) AS (VALUES (1)), two(y) AS (VALUES (2)) SELECT outcome FROM {table}",
+            id="multiple-values-ctes-outer-select",
+        ),
+        pytest.param(
+            "WITH one(x) AS (VALUES (1)), two AS (SELECT outcome FROM {table}) SELECT * FROM two",
+            id="target-in-second-cte",
+        ),
     ],
 )
 def test_raw_token_outcomes_sql_still_fires_on_genuine_statements(tmp_path: Path, statement: str) -> None:
@@ -205,7 +230,9 @@ def test_prose_naming_the_outcomes_table_is_not_raw_sql(tmp_path: Path) -> None:
 
 
         def test_prose():
-            return None
+            """The outcome discriminator is retired from {token_table}; the roster moved elsewhere."""
+            message = "The outcome discriminator is retired from {token_table}; the roster moved elsewhere"
+            return message
         ''',
     )
 
@@ -233,6 +260,27 @@ def test_data_blob_of_test_names_is_not_raw_sql(tmp_path: Path) -> None:
         def test_blob():
             return REVIEWED
         ''',
+    )
+
+    assert scan_test_file(source, tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Update {table} outcome migration guidance in this document.",
+        "UPDATE {table} SET outcome expectations for this test.",
+        "Select outcome from {table} when explaining the retired schema.",
+        "WITH note AS (SELECT ') SELECT outcome FROM {table}; migration prose' AS note) SELECT 1",
+        "WITH one AS (SELECT 1 /* ) SELECT outcome FROM {table}; migration prose */) SELECT 1",
+    ],
+)
+def test_sql_like_imperative_prose_is_not_raw_sql(tmp_path: Path, message: str) -> None:
+    """Leading SQL-like verbs are insufficient without statement grammar."""
+    token_table = "token_" + "outcomes"
+    source = _write(
+        tmp_path / "tests/unit/test_imperative_prose.py",
+        f"MESSAGE = {message.format(table=token_table)!r}\n",
     )
 
     assert scan_test_file(source, tmp_path) == []

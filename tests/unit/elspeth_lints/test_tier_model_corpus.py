@@ -386,6 +386,11 @@ def test_source_snapshot_uses_the_tier_scanner_file_predicate(tmp_path: Path) ->
     (pycache / "widget.cpython-313.pyc").write_bytes(b"not Python source")
     assert source_snapshot_sha256(source_root=source_root, allowlist_dir=allowlist_dir) == initial
 
+    sibling_worktree_source = source_root / ".claude" / "worktrees" / "x" / "src" / "elspeth" / "foo.py"
+    sibling_worktree_source.parent.mkdir(parents=True)
+    sibling_worktree_source.write_text("foreign_branch = True\n", encoding="utf-8")
+    assert source_snapshot_sha256(source_root=source_root, allowlist_dir=allowlist_dir) == initial
+
     added = source_root / "added.py"
     added.write_text("added = 1\n", encoding="utf-8")
     after_add = source_snapshot_sha256(source_root=source_root, allowlist_dir=allowlist_dir)

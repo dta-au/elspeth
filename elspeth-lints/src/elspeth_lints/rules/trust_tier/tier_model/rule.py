@@ -45,7 +45,7 @@ from elspeth_lints.core.allowlist import (
     verify_entry_binding_against_finding,
 )
 from elspeth_lints.core.allowlist import PerFileRule as PerFileRule
-from elspeth_lints.core.ast_walker import iter_own_scope
+from elspeth_lints.core.ast_walker import iter_own_scope, iter_python_files
 from elspeth_lints.core.boundary_aliases import (
     argument_names,
     evaluate_alias_flow,
@@ -2041,10 +2041,8 @@ def iter_scannable_python_files(
     """Yield exactly the Python paths consumed by the directory scanners."""
     if exclude_patterns is None:
         exclude_patterns = []
-    for py_file in root.rglob("*.py"):
+    for py_file in iter_python_files(root):
         relative = py_file.relative_to(root)
-        if any(part in _ALWAYS_EXCLUDED_DIRS for part in relative.parts):
-            continue
         if any(relative.match(pattern) or str(relative).startswith(pattern.rstrip("*/")) for pattern in exclude_patterns):
             continue
         yield py_file
@@ -2202,24 +2200,10 @@ def scan_layer_imports_directory(
     exclude_patterns: list[str] | None = None,
 ) -> tuple[list[Finding], list[Finding]]:
     """Scan all Python files for upward layer imports."""
-    exclude_patterns = exclude_patterns or []
     all_violations: list[Finding] = []
     all_tc_findings: list[Finding] = []
 
-    for py_file in root.rglob("*.py"):
-        relative = py_file.relative_to(root)
-        # Skip vendored/third-party directories
-        if any(part in _ALWAYS_EXCLUDED_DIRS for part in relative.parts):
-            continue
-        # Check user-specified exclusions
-        skip = False
-        for pattern in exclude_patterns:
-            if relative.match(pattern) or str(relative).startswith(pattern.rstrip("*/")):
-                skip = True
-                break
-        if skip:
-            continue
-
+    for py_file in iter_scannable_python_files(root, exclude_patterns):
         violations, tc_findings = scan_layer_imports_file(py_file, root)
         all_violations.extend(violations)
         all_tc_findings.extend(tc_findings)
@@ -2394,25 +2378,13 @@ def scan_dump_edges(
 
     Returns (nodes, edges, sccs).  All collections are sorted deterministically.
     """
-    exclude_patterns = exclude_patterns or []
-
     file_count: dict[str, int] = {}
     file_loc: dict[str, int] = {}
     node_layer: dict[str, int] = {}
     raw_edges: list[tuple[str, str, _ImportSite]] = []
 
-    for py_file in sorted(root.rglob("*.py")):
+    for py_file in iter_scannable_python_files(root, exclude_patterns):
         relative = py_file.relative_to(root)
-        if any(part in _ALWAYS_EXCLUDED_DIRS for part in relative.parts):
-            continue
-        skip = False
-        for pattern in exclude_patterns:
-            if relative.match(pattern) or str(relative).startswith(pattern.rstrip("*/")):
-                skip = True
-                break
-        if skip:
-            continue
-
         rel_str = str(relative)
         try:
             source = py_file.read_text(encoding="utf-8")
@@ -2773,10 +2745,6 @@ _ALLOWLIST_PATTERN_TAGS = frozenset(
         "union-dispatch",
     }
 )
-
-# Directories that are always excluded from scanning — vendored/third-party code
-# that happens to contain .py files but is not part of the ELSPETH codebase.
-_ALWAYS_EXCLUDED_DIRS = ("node_modules",)
 
 
 def _validate_allowlist_governance(allowlist: Allowlist) -> None:

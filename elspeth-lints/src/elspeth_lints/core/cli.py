@@ -350,13 +350,26 @@ def _build_parser() -> argparse.ArgumentParser:
             "When unset, each rule resolves its own per-rule default directory."
         ),
     )
+    check.add_argument(
+        "--fail-on-inert",
+        action="store_true",
+        help=(
+            "Fail when a selected incremental rule matches no non-fixture Python files. "
+            "Use for full-corpus gates; partial --files selections may legitimately reach only a subset of selected rules."
+        ),
+    )
     check.add_argument("--files", nargs="*", type=Path)
 
     rotate = subparsers.add_parser(
         "rotate",
         help="Rotate stale fingerprints in tier_model allowlist entries (mechanical, no judge)",
     )
-    rotate.add_argument("--root", type=Path, required=True, help="Source tree to scan (e.g. src/elspeth)")
+    rotate.add_argument(
+        "--root",
+        type=Path,
+        default=Path("src/elspeth"),
+        help="Source tree to scan. Default: src/elspeth.",
+    )
     rotate.add_argument(
         "--allowlist-dir",
         type=Path,
@@ -1398,11 +1411,14 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
                         f"({', '.join(rule.id for rule in incremental_rules)})\n"
                     )
                 return 2
+        matched_incremental_rule_ids: set[str] = set()
         for item, applicable_rules in _walk_applicable_python_files(
             args.root,
             explicit_files or None,
             rules=incremental_rules,
         ):
+            if not _is_lint_rule_fixture_path(item.path):
+                matched_incremental_rule_ids.update(rule.id for rule in applicable_rules)
             if isinstance(item, PythonSyntaxError):
                 if item.path not in diagnostic_paths:
                     findings.append(_syntax_error_finding(item))
@@ -1421,6 +1437,17 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
                     findings.append(_read_error_finding(item))
                 continue
             findings.extend(_run_rules(item, applicable_rules, context=context))
+        if args.fail_on_inert:
+            # An INCREMENTAL rule with zero matches never reaches analyze(), so
+            # silence is a false clean. WHOLE_REPO rules are deliberately not
+            # checked here: their path_filter gates only the shared parse/read
+            # diagnostic walk, while analyze(empty_tree, root, context) runs
+            # independently above even when that filter matches nothing.
+            findings.extend(
+                _inert_incremental_rule_finding(rule, root=args.root)
+                for rule in incremental_rules
+                if rule.id not in matched_incremental_rule_ids
+            )
 
     return _emit_findings(findings, output_format=args.format, rules=selected_rules)
 
@@ -1537,6 +1564,30 @@ def _rules_for_path(file_path: Path, *, root: Path, rules: list[Rule]) -> list[R
 
 def _path_matches_rule(file_path: Path, *, root: Path, rule: Rule) -> bool:
     return re.search(rule.metadata.path_filter, _display_path(_candidate_path(root, file_path), root)) is not None
+
+
+def _is_lint_rule_fixture_path(file_path: Path) -> bool:
+    """Return whether ``file_path`` is one of elspeth-lints' synthetic rule fixtures."""
+    parts = file_path.parts
+    fixture_owner = ("src", "elspeth_lints", "rules")
+    for index in range(len(parts) - len(fixture_owner) + 1):
+        if parts[index : index + len(fixture_owner)] == fixture_owner:
+            return "fixtures" in parts[index + len(fixture_owner) :]
+    return False
+
+
+def _inert_incremental_rule_finding(rule: Rule, *, root: Path) -> Finding:
+    path_filter = rule.metadata.path_filter
+    return Finding(
+        rule_id=rule.id,
+        file_path=root.as_posix(),
+        line=0,
+        column=0,
+        message=(f"inert-rule: selected incremental rule matched zero non-fixture Python files (path_filter={path_filter})"),
+        fingerprint=f"inert-rule:{hashlib.sha256(path_filter.encode('utf-8')).hexdigest()[:16]}",
+        severity=Severity.ERROR,
+        suggestion=("Correct the rule path_filter or scanned root. Omit --fail-on-inert only for an intentionally partial --files scan."),
+    )
 
 
 def _candidate_path(root: Path, file_path: Path) -> Path:

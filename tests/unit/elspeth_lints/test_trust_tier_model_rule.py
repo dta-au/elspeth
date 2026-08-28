@@ -39,6 +39,7 @@ from elspeth_lints.rules.trust_tier.tier_model.rule import (
     report_json,
     run_check,
     scan_file,
+    scan_layer_imports_directory,
     scan_layer_imports_file,
 )
 from elspeth_lints.rules.trust_tier.tier_model.rule import (
@@ -3362,6 +3363,35 @@ class TestLayerImportScanner:
         assert [f.rule_id for f in violations] == ["L1"]
         assert violations[0].file_fingerprint == self._file_fingerprint(source)
         assert tc == []
+
+    def test_directory_scan_excludes_nested_agent_worktrees(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sibling branch must not contribute layer-import findings."""
+        import elspeth_lints.rules.trust_tier.tier_model.rule as tier_rule
+
+        live = tmp_path / "core" / "live.py"
+        explicitly_excluded = tmp_path / "ignored" / "excluded.py"
+        foreign = tmp_path / ".claude" / "worktrees" / "sibling" / "core" / "foreign.py"
+        for source in (live, explicitly_excluded, foreign):
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("value = 1\n", encoding="utf-8")
+        scanned: list[Path] = []
+
+        def record_scan(file_path: Path, root: Path) -> tuple[list[Finding], list[Finding]]:
+            assert root == tmp_path
+            scanned.append(file_path)
+            return [], []
+
+        monkeypatch.setattr(tier_rule, "scan_layer_imports_file", record_scan)
+
+        violations, tc = scan_layer_imports_directory(tmp_path, exclude_patterns=["ignored/"])
+
+        assert violations == []
+        assert tc == []
+        assert scanned == [live]
 
     def test_flags_relative_upward_import(self, tmp_path: Path) -> None:
         # elspeth-b8b600e213: `from ..plugins import x` in a core file resolves to

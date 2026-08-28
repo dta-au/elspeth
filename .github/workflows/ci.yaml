@@ -196,21 +196,24 @@ jobs:
         run: |
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
             --rules 'composer/*' \
-            --root src/elspeth
+            --root src/elspeth \
+            --fail-on-inert
 
       - name: Run contract-invariants elspeth-lints rules
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
             --rules 'contract_invariants/*' \
-            --root src/elspeth
+            --root src/elspeth \
+            --fail-on-inert
 
       - name: Run session-engine-factory elspeth-lints rule
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
             --rules contract_invariants.session_engine_factory \
-            --root .
+            --root . \
+            --fail-on-inert
 
       - name: Run contract-manifest elspeth-lints rule
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
@@ -324,6 +327,7 @@ jobs:
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
             --rules 'composer/*' \
             --root src/elspeth \
+            --fail-on-inert \
             --format sarif > elspeth-lints-composer.sarif
           status=$?
           if [ "$status" -gt 1 ]; then
@@ -338,6 +342,7 @@ jobs:
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
             --rules 'contract_invariants/*' \
             --root src/elspeth \
+            --fail-on-inert \
             --format sarif > elspeth-lints-contract-invariants.sarif
           status=$?
           if [ "$status" -gt 1 ]; then
@@ -352,6 +357,7 @@ jobs:
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
             --rules contract_invariants.session_engine_factory \
             --root . \
+            --fail-on-inert \
             --format sarif > elspeth-lints-session-engine-factory.sarif
           status=$?
           if [ "$status" -gt 1 ]; then

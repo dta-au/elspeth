@@ -47,17 +47,41 @@ ROW_OUTCOME_VALUES = frozenset(
     }
 )
 
-# A SQL clause keyword must GOVERN the table name, not merely share a string
-# with it. ``from``/``where``/``update``/``create`` are ordinary English words,
-# so bare co-presence made every prose docstring or data blob that also
-# mentioned ``token_outcomes`` a finding. Requiring adjacency (optionally
-# through a schema qualifier or quoting) keeps every hand-written statement
-# shape — FROM/JOIN/INSERT INTO/UPDATE/DELETE FROM/CREATE TABLE/ALTER TABLE —
-# while English prose no longer matches anything.
-TOKEN_OUTCOMES_STATEMENT_RE = re.compile(
-    r"\b(?:from|join|into|update|table)\s+"
-    r"""(?:["'`\[]?[A-Za-z_][A-Za-z0-9_$]*["'`\]]?\s*\.\s*)?"""
-    r"""["'`\[]?token_outcomes\b""",
+# A SQL statement verb must lead the string, and a clause keyword must GOVERN
+# the table name rather than merely share a string with it. ``from``/``update``
+# are ordinary English words: clause adjacency alone made prose such as
+# "outcome is retired from token_outcomes" look like SQL. The two-stage shape
+# keeps hand-written SELECT/JOIN/INSERT/UPDATE/DELETE/DDL statements while
+# rejecting docstrings and message text that happen to use a preposition next
+# to the table name. WITH is deliberately structural rather than a bare leading
+# word because natural English commonly starts with "With".
+_SQL_IDENTIFIER = r"""(?:[A-Za-z_][A-Za-z0-9_$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])"""
+_TOKEN_OUTCOMES_TABLE = rf"(?:{_SQL_IDENTIFIER}\s*\.\s*)?[\"`\[]?token_outcomes\b[\"`\]]?"
+_SELECT_TABLE_SUFFIX = (
+    rf"(?:\s+(?:as\s+)?{_SQL_IDENTIFIER})?\s*"
+    r"(?=\Z|[;,)]|\b(?:where|join|on|order|group|having|limit|offset|union|except|intersect|returning)\b)"
+)
+TOKEN_OUTCOMES_SQL_DIRECT_RES = (
+    re.compile(rf"\Aselect\b[\s\S]*?\b(?:from|join)\s+{_TOKEN_OUTCOMES_TABLE}{_SELECT_TABLE_SUFFIX}", re.IGNORECASE),
+    re.compile(
+        rf"\Ainsert(?:\s+or\s+(?:replace|abort|fail|ignore|rollback))?\s+into\s+{_TOKEN_OUTCOMES_TABLE}\s*"
+        r"(?=\(|\b(?:default|values|select|overriding)\b)",
+        re.IGNORECASE,
+    ),
+    re.compile(rf"\Aupdate\s+{_TOKEN_OUTCOMES_TABLE}\s+set\s+{_SQL_IDENTIFIER}\s*=", re.IGNORECASE),
+    re.compile(rf"\Adelete\s+from\s+{_TOKEN_OUTCOMES_TABLE}\s*(?=\Z|;|\b(?:where|returning)\b)", re.IGNORECASE),
+    re.compile(rf"\Acreate\s+table(?:\s+if\s+not\s+exists)?\s+{_TOKEN_OUTCOMES_TABLE}\s*(?=\(|\b(?:as|like)\b)", re.IGNORECASE),
+    re.compile(rf"\Aalter\s+table\s+{_TOKEN_OUTCOMES_TABLE}\s+(?:add|drop|rename|alter|set)\b", re.IGNORECASE),
+    re.compile(rf"\Areplace\s+into\s+{_TOKEN_OUTCOMES_TABLE}\s*(?=\(|\b(?:values|select|set)\b)", re.IGNORECASE),
+)
+SQL_LEADING_TRIVIA_RE = re.compile(r"\A(?:\s|--[^\r\n]*(?:\r?\n|\Z)|/\*[\s\S]*?\*/)*")
+SQL_EXPLAIN_PREFIX_RE = re.compile(r"\Aexplain(?:\s+query\s+plan)?\s+", re.IGNORECASE)
+SQL_CTE_START_RE = re.compile(
+    rf"\Awith(?:\s+recursive)?\s+{_SQL_IDENTIFIER}\s*(?:\([^)]*\))?\s+as\s*\(",
+    re.IGNORECASE,
+)
+SQL_CTE_ENTRY_RE = re.compile(
+    rf"\A{_SQL_IDENTIFIER}\s*(?:\([^)]*\))?\s+as\s*\(",
     re.IGNORECASE,
 )
 TOKEN_OUTCOME_COLUMN_RE = re.compile(r"\boutcome\b", re.IGNORECASE)
@@ -400,6 +424,119 @@ def _token_outcomes_column(node: ast.AST) -> str | None:
     return node.attr
 
 
+def _matching_sql_parenthesis(value: str, open_index: int) -> int | None:
+    """Return the balanced SQL close, ignoring quoted and commented parentheses."""
+    depth = 1
+    index = open_index + 1
+    while index < len(value):
+        char = value[index]
+        following = value[index + 1] if index + 1 < len(value) else ""
+        if char == "-" and following == "-":
+            newline = value.find("\n", index + 2)
+            index = len(value) if newline < 0 else newline + 1
+            continue
+        if char == "/" and following == "*":
+            comment_end = value.find("*/", index + 2)
+            if comment_end < 0:
+                return None
+            index = comment_end + 2
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            while index < len(value):
+                if value[index] == "\\":
+                    index += 2
+                    continue
+                if value[index] == quote:
+                    if index + 1 < len(value) and value[index + 1] == quote:
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            else:
+                return None
+            continue
+        if char == "[":
+            index += 1
+            while index < len(value):
+                if value[index] == "]":
+                    if index + 1 < len(value) and value[index + 1] == "]":
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            else:
+                return None
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _sql_code_without_literals_or_comments(value: str) -> str:
+    """Mask SQL string literals and comments while preserving code offsets."""
+    masked = list(value)
+    index = 0
+    while index < len(value):
+        following = value[index + 1] if index + 1 < len(value) else ""
+        if value[index] == "-" and following == "-":
+            end = value.find("\n", index + 2)
+            end = len(value) if end < 0 else end
+        elif value[index] == "/" and following == "*":
+            comment_end = value.find("*/", index + 2)
+            end = len(value) if comment_end < 0 else comment_end + 2
+        elif value[index] == "'":
+            end = index + 1
+            while end < len(value):
+                if value[end] == "\\":
+                    end += 2
+                    continue
+                if value[end] == "'":
+                    if end + 1 < len(value) and value[end + 1] == "'":
+                        end += 2
+                        continue
+                    end += 1
+                    break
+                end += 1
+        else:
+            index += 1
+            continue
+        masked[index:end] = " " * (end - index)
+        index = end
+    return "".join(masked)
+
+
+def _sql_statement_candidates(value: str) -> tuple[str, ...]:
+    """Return direct statements from a plain statement or a balanced CTE chain."""
+    cte_entry = SQL_CTE_START_RE.match(value)
+    if cte_entry is None:
+        return (value,)
+
+    candidates: list[str] = []
+    remaining = value
+    while cte_entry is not None:
+        cte_close = _matching_sql_parenthesis(remaining, cte_entry.end() - 1)
+        if cte_close is None:
+            return ()
+        candidates.append(remaining[cte_entry.end() : cte_close])
+        tail = remaining[cte_close + 1 :].lstrip()
+        if not tail.startswith(","):
+            candidates.append(tail)
+            return tuple(candidates)
+        remaining = tail[1:].lstrip()
+        cte_entry = SQL_CTE_ENTRY_RE.match(remaining)
+
+    return ()
+
+
 def _is_raw_token_outcomes_sql(value: str) -> bool:
     """Return whether a string constant hand-writes SQL against ``token_outcomes``.
 
@@ -407,11 +544,17 @@ def _is_raw_token_outcomes_sql(value: str) -> bool:
     table itself; the ADR-019 two-axis check (outcome without path) then
     decides whether that statement is the stale outcome-only shape.
     """
-    if TOKEN_OUTCOMES_STATEMENT_RE.search(value) is None:
+    sql_code = _sql_code_without_literals_or_comments(value)
+    candidate = SQL_LEADING_TRIVIA_RE.sub("", sql_code, count=1)
+    explain_prefix = SQL_EXPLAIN_PREFIX_RE.match(candidate)
+    if explain_prefix is not None:
+        candidate = candidate[explain_prefix.end() :]
+    statement_candidates = _sql_statement_candidates(candidate)
+    if not any(pattern.search(statement) is not None for statement in statement_candidates for pattern in TOKEN_OUTCOMES_SQL_DIRECT_RES):
         return False
-    if TOKEN_OUTCOME_IS_TERMINAL_RE.search(value) is not None:
+    if TOKEN_OUTCOME_IS_TERMINAL_RE.search(sql_code) is not None:
         return True
-    return TOKEN_OUTCOME_COLUMN_RE.search(value) is not None and TOKEN_OUTCOME_PATH_RE.search(value) is None
+    return TOKEN_OUTCOME_COLUMN_RE.search(sql_code) is not None and TOKEN_OUTCOME_PATH_RE.search(sql_code) is None
 
 
 def _iter_python_files(root: Path) -> Iterable[Path]:

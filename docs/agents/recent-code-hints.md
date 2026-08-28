@@ -8,6 +8,23 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-28 — incremental lint policy gates pass `--fail-on-inert`, but
+  changed-file hooks MUST NOT.** A selected incremental rule whose
+  `path_filter` matches zero non-fixture Python files never reaches
+  `analyze()`, so without the flag it is byte-for-byte indistinguishable from
+  a clean run. The full-root Composer and contract-invariant gates opt in and
+  emit an ERROR finding naming the rule and exact filter. The `--files` hooks
+  deliberately do not: a changed web file may legitimately reach
+  `composer.catch_order` but not `composer.exception_channel`, and requiring
+  every selected rule to match that partial input would reject ordinary
+  commits. Lint-rule examples under
+  `elspeth-lints/src/elspeth_lints/rules/**/fixtures/` never satisfy the count;
+  real `tests/fixtures/` code still does. WHOLE_REPO rules are also exempt
+  because their filter gates only the shared parse/read diagnostic walk while
+  `analyze(empty_tree, root, context)` runs independently. The flag detects a
+  wholly dead filter, not a dead alternate inside an otherwise-live regex;
+  do not parse opaque regex text into a pretend directory inventory.
+
 - **2026-08-28 — the no-stash pre-commit dispatcher needs a truthy,
   guaranteed-nonexistent `--files` sentinel for deletion-only indexes**
   (elspeth-c1e85e08c9). A deletion-only index is non-empty even though the
@@ -38,6 +55,14 @@ is a working document under the normal delivery posture.
   Keep directory-enumeration errors skippable, matching `Path.rglob`'s legacy
   behavior; an unreadable or concurrently removed subtree must not abort the
   whole CLI with a traceback. Per-file read errors remain structured findings.
+  Tier-model discovery is not an exception: its source-snapshot seal,
+  directory scan, layer-import scan, and `dump-edges` graph all route through
+  `tier_model.iter_scannable_python_files`, which delegates traversal to the
+  core walker and applies only caller-supplied `exclude_patterns` afterward.
+  Do not reintroduce a local `rglob` or exclusion tuple there. Authority-bearing
+  operator verbs default `--root` to `src/elspeth`; widening that root must be
+  an explicit operator choice, never something the CLI forces through a
+  missing default.
   In the CLI, enumerate → apply every selected rule's `path_filter` → parse;
   reverting that order makes a narrow rule parse the entire repository. Do
   not turn `_path_matches_rule` from `re.search` into `fullmatch` as part of a

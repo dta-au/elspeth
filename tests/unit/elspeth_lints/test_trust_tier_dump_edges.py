@@ -450,6 +450,22 @@ def test_case10_empty_input(temp_root: Path) -> None:
     assert payload["strongly_connected_components"] == []
 
 
+def test_dump_edges_excludes_nested_agent_worktrees(temp_root: Path) -> None:
+    """The advisory import graph must use the same source-tree boundary as scans."""
+    foreign = temp_root / ".claude" / "worktrees" / "sibling" / "web" / "composer" / "foreign.py"
+    _write(foreign, "from elspeth.plugins.transforms import llm\n")
+
+    nodes, edges, sccs = scan_dump_edges(
+        root=temp_root,
+        include_layers=frozenset({3}),
+        collapse_to_subsystem=False,
+    )
+
+    assert nodes == []
+    assert edges == []
+    assert sccs == []
+
+
 # =============================================================================
 # Bonus — output formatters round-trip / rendering smoke
 # =============================================================================
