@@ -57,6 +57,14 @@ landed 3 unrelated `docs(plans)` commits on the branch (`2ab533425`, `ed1592ee1`
    John's go.**
 
 ## John's rulings this wave (BINDING for Wave 3 briefs)
+- **Counting rule for burn-down reporting:** the metric is RETIRED RISK, measured as the
+  raw-corpus finding delta (allowlist disabled, identical command at each anchor). A
+  boundary conversion (finding → `R_TB_SUPPRESSED` with a `test_ref`) counts as a removal the
+  same as restructuring — "adding tests retires the risk in the same way that removing the
+  code does." Rationalised sidecar sites are NOT removals (still findings in a raw scan;
+  documented risk awaiting the operator). Measured W1+W2: 3,898 → 2,932 = **966 removed**
+  (345 + 621; ~324 via boundary+test, ~642 restructured), ~552 rationalised carried.
+  Saved corpora: scratchpad `raw_tier.txt` / `raw_tier_w2.txt` / `raw_tier_tip_postB43c.txt`.
 - **"An honest fix is always preferred to minimising churn; signing effort is the lowest priority
   compared to clean and honest code."** (4th statement; memory
   `feedback_never_shape_code_around_signature_churn` updated.) Lanes may fix signed sites when the
