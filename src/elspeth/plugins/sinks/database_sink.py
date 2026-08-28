@@ -132,9 +132,8 @@ def database_effect_ledger_table(metadata: MetaData, table_name: str) -> Table:
     """Build the version-1 operator provisioning table; runtime never calls create_all()."""
     if _DATABASE_EFFECT_TABLE_NAME.fullmatch(table_name) is None:
         raise ValueError("effect ledger table must be a namespaced identifier beginning with '_elspeth_'")
-    existing = metadata.tables.get(table_name)
-    if existing is not None:
-        return existing
+    if table_name in metadata.tables:
+        return metadata.tables[table_name]
     return Table(
         table_name,
         metadata,
@@ -215,7 +214,7 @@ class DatabaseSink(BaseSink):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:46a66b450425cba4"
+    source_file_hash: str | None = "sha256:ba79f4b3d1e89249"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL
@@ -390,8 +389,7 @@ class DatabaseSink(BaseSink):
             raise DatabaseEffectLedgerError(
                 f"Database target-side effect ledger {ledger_config.table!r} does not match schema version {ledger_config.schema_version}"
             )
-        primary_key = inspector.get_pk_constraint(ledger_config.table).get("constrained_columns")
-        if primary_key != ["effect_id"]:
+        if inspector.get_pk_constraint(ledger_config.table)["constrained_columns"] != ["effect_id"]:
             raise DatabaseEffectLedgerError("Database target-side effect ledger must use effect_id as its sole primary key")
         required_not_null = _DATABASE_EFFECT_LEDGER_COLUMNS - {
             "accepted_ordinals_json",
@@ -528,7 +526,7 @@ class DatabaseSink(BaseSink):
         ):
             raise DatabaseEffectLedgerError("Database sink effect inspection is divergent from configured target authority")
         target_columns_value = inspection.evidence["target_columns"]
-        if not isinstance(target_columns_value, tuple) or any(not isinstance(value, str) for value in target_columns_value):
+        if type(target_columns_value) is not tuple or any(type(value) is not str for value in target_columns_value):
             raise DatabaseEffectLedgerError("Database sink effect inspection lacks exact target columns")
         target_columns = set(target_columns_value)
 
@@ -582,7 +580,7 @@ class DatabaseSink(BaseSink):
 
     @staticmethod
     def _require_canonical_json(value: object, *, field_name: str) -> object:
-        if not isinstance(value, str):
+        if type(value) is not str:
             raise DatabaseEffectMarkerDivergence(f"Database effect marker {field_name} must be text")
         try:
             decoded = json.loads(value)
@@ -641,9 +639,9 @@ class DatabaseSink(BaseSink):
             row = raw_member["row"]
             if type(ordinal) is not int or ordinal != expected_ordinal:
                 raise DatabaseEffectLedgerError("Database effect plan member ordinals must be dense and ordered")
-            if not isinstance(payload_hash, str) or re.fullmatch(r"[0-9a-f]{64}", payload_hash) is None:
+            if type(payload_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", payload_hash) is None:
                 raise DatabaseEffectLedgerError("Database effect plan member payload hash is invalid")
-            if type(row) is not dict or any(not isinstance(key, str) for key in row):
+            if type(row) is not dict or any(type(key) is not str for key in row):
                 raise DatabaseEffectLedgerError("Database effect plan member row must be a canonical object")
             detached_row = dict(row)
             members.append((ordinal, detached_row))
@@ -780,9 +778,9 @@ class DatabaseSink(BaseSink):
                 type(item) is not dict
                 or set(item) != {"error_hash", "ordinal", "reason_hash"}
                 or item["ordinal"] != ordinal
-                or not isinstance(item["reason_hash"], str)
+                or type(item["reason_hash"]) is not str
                 or re.fullmatch(r"[0-9a-f]{64}", item["reason_hash"]) is None
-                or not isinstance(item["error_hash"], str)
+                or type(item["error_hash"]) is not str
                 or re.fullmatch(r"[0-9a-f]{16}", item["error_hash"]) is None
             ):
                 raise DatabaseEffectMarkerDivergence("Database effect marker diversion hashes are invalid")
@@ -991,7 +989,7 @@ class DatabaseSink(BaseSink):
             for field in fields_to_check:
                 if field in new_row:
                     value = new_row[field]
-                    if isinstance(value, (dict, list)):
+                    if type(value) is dict or type(value) is list:
                         new_row[field] = json.dumps(value)
             result.append(new_row)
         return result

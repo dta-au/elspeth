@@ -8,6 +8,20 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — `raise X from None` inside an `except` is NOT context-free;
+  only a raise AFTER the handler is.** `from None` clears `__cause__` and sets
+  `__suppress_context__`, but the interpreter still attaches the in-flight
+  exception as `__context__`. The S3 sink's serialization failures must carry
+  neither (a `UnicodeEncodeError` / json `TypeError` message quotes the row's
+  characters and would ride into the audit trail), and
+  `tests/unit/plugins/sinks/test_aws_s3_sink.py::TestSerialization` pins
+  `__context__ is None`. That is why `_EncodedTextWriter._encode`,
+  `_check_json_record`, `_csv_scalar_text`, and the json loop in
+  `_serialize_rows_to_spool` record a flag in the handler and raise after it —
+  the tier-model R6 rule cannot see that the flag is consumed, so those sites
+  are rationalised, not restructured. Do not "fix" them by moving the raise
+  into the handler; the scoped tests catch it.
+
 - **2026-08-29 — a component that polls a `Clock` must also SLEEP through
   it.** `elspeth.core.clock.Clock` now carries `sleep(seconds)`: `SystemClock`
   blocks, `MockClock` advances. `SinkEffectCoordinator` defaults its sleep to
