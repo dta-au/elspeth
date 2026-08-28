@@ -43,6 +43,34 @@ is a working document under the normal delivery posture.
   which would abort a whole run's diagnostics read; normalising the field to
   `str | None` inside the owned envelope makes the membership test total.
 
+- **2026-08-29 — an exact key-set assertion (`if set(item) != expected: raise`)
+  makes every later `.get()` on that mapping an unreachable-`None` read, and a
+  SIGNED rationale can therefore be actively wrong rather than merely stale.**
+  `_parse_step_2_sink_tool_arguments` (guided/chat_solver.py, B37) proves
+  `set(item) == {"name","plugin","options","required_fields","schema_mode",
+  "on_write_failure"}` and then read four of those six with `item.get(...)`
+  while reading the other two as `item["name"]` / `item["on_write_failure"]`
+  two lines apart — the `.get()`s were leftovers, not a contract. Their four
+  `fp=`-keyed entries in `config/cicd/enforce_tier_model/web.yaml` each argue
+  that "a missing/malformed key becomes None and is rejected at the boundary";
+  the missing half of that has been impossible since the key-set assertion
+  landed, and all four fingerprints had already gone stale. Generalises the
+  existing "`d.get(k, DEFAULT)` right after `if k in d`" entry: the guard does
+  not have to name the key — a whole-set equality upstream is the same proof,
+  and converging on the subscript the neighbouring lines already use is a
+  removal, not a dodge. Corollary when auditing: read a stale signed rationale
+  for CORRECTNESS before re-justifying the site, because re-signing prose that
+  describes an unreachable branch launders a defect into the audit trail.
+  Same lane, two measurement notes: (a) adding a `@trust_boundary` /
+  `@observation_boundary` does NOT shift module-level `body[N]` indices the way
+  a docstring or a new statement does — decorators live in `decorator_list`, so
+  a decorate-only commit leaves every other signed `ast_path` in the file
+  intact (verified by diffing `scan_file` keys before/after: removals only, no
+  re-indexed survivors); (b) a per-file `pattern:` entry with `max_hits:` is a
+  RATCHET that reports its own overage (`matched 36/11`), so suppressing sites
+  under a boundary lowers the count without clearing the finding — only the
+  operator can lower the cap, and the residual is not a lane defect.
+
 - **2026-08-29 — the `trust_boundary.tests` gate reads exception names out of
   `invariant` PROSE with a `*Error|*Exception|*Warning` suffix regex, so a
   boundary whose raise type has no such suffix must not mention an
