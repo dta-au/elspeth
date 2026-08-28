@@ -8,6 +8,49 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — a `@trust_boundary`-suppressed site DOES stop counting toward a
+  `per_file_rules` `max_hits:` ceiling, and driving a pattern to ZERO turns the
+  gate line into `Unused tier-model per-file rule`.** This narrows the B37 note
+  above ("suppressing sites under a boundary lowers the count without clearing
+  the finding"): the count really does go all the way down, so on a file whose
+  only allowlist coverage is a per-file ceiling, declaring honest boundaries is
+  a complete fix for the overage and not just a partial one. Measured in B40 on
+  `web/composer/tools/_common.py`, whose two ceilings (R1 `max_hits: 10`, R5
+  `max_hits: 13`) both reported overage at HEAD (`matched 16/10`, `matched
+  24/13`). One `@observation_boundary` on
+  `_options_with_ascii_safe_scrape_headers` moved them to 14/10 and 22/13 —
+  exactly the four sites it suppressed — and the finished lane (41 → 8
+  allowlist-disabled findings) cleared both ERROR lines. But note the endgame:
+  R1 reached zero, and the R1 `pattern:` entry then reported
+  `Unused tier-model per-file rule` instead. That is a NEW gate line the lane
+  cannot clear, because `config/cicd/enforce_tier_model/*.yaml` is
+  operator-owned — hand the dead entry to the operator rather than trying to
+  land at exactly one residual finding to keep the rule alive. Two corollaries
+  for planning such a lane: (a) a per-file `pattern:` entry carries no
+  `scope_fingerprint`/`ast_path`/`judge_metadata_signature`, so a SIDECAR
+  RATIONALE for a site it covers buys nothing at all — only code removals move
+  the `matched N` — and no signed ast_path runs through the file, so
+  restructuring is free; (b) run the experiment (one decorator, re-scan under
+  the REAL allowlist, read the `matched N/cap` line) before investing in a
+  sweep, and keep the two measurements separate: removals show up in the
+  allowlist-DISABLED diff, cap progress only in the real-allowlist `matched`
+  line.
+- **2026-08-29 — swapping `isinstance(x, (list, tuple))` for the house
+  `type(x) not in (list, tuple)` breaks mypy narrowing when `x` is `T | None`,
+  and the fix is to delete the Optional, not to add a `cast`.** In
+  `_normalize_echoed_interpretation_requirements` (B40) the guarded local was
+  `stored_rows = stored_options[KEY] if KEY in stored_options else None`;
+  `isinstance` narrowed away the `None` arm for the `for stored in stored_rows`
+  below it, and `type(...) not in (...)` does not, so mypy failed with
+  `Item "None" of "Any | None" has no attribute "__iter__"`. Hoisting the
+  membership test into its own early-return (`if KEY not in stored_options:
+  return options, False`) and then reading `stored_options[KEY]`
+  unconditionally removes the sentinel entirely — the local is no longer
+  Optional, mypy is satisfied, and the abstain branch is more legible than the
+  sentinel it replaces. Generalises the existing `type(x) is C` narrowing
+  entries: check the local's declared type, not just the else-branch, before
+  the swap, and run mypy on the file rather than trusting the scoped tests.
+
 - **2026-08-29 — a platform-conditional stdlib constant probed with
   `getattr(os, "O_NOFOLLOW", None)` is BOTH a tier_model R2 and a masquerade
   baseline entry; the honest form is a direct read under
