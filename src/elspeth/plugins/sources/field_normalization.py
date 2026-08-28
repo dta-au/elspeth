@@ -67,29 +67,13 @@ def _replace_non_identifier_chars(value: str) -> str:
     return "".join(char if _is_identifier_continue(char) else "_" for char in value)
 
 
-def normalize_field_name(raw: str) -> str:
-    """Normalize messy header to valid Python identifier.
+def _normalize_field_name_or_empty(raw: str) -> str:
+    """Steps 1-8 of :func:`normalize_field_name`; empty means no header produces a name.
 
-    Rules applied in order:
-    1. Unicode NFC normalization (canonical composition)
-    2. Strip leading/trailing whitespace
-    3. Lowercase
-    4. Replace non-identifier chars with underscore
-    5. Collapse consecutive underscores
-    6. Strip leading/trailing underscores
-    7. Prefix with underscore if starts with digit
-    8. Append underscore if result is Python keyword
-    9. Raise error if result is empty
-
-    Args:
-        raw: Original messy header name
-
-    Returns:
-        Valid Python identifier
-
-    Raises:
-        ExternalHeaderError: If header normalizes to empty string.
-        ValueError: If the normalization algorithm produces an invalid identifier.
+    Callers that need "does anything normalize to this?" as data — the
+    declared-field reachability check and the declarable-form lookup — read
+    the empty result here instead of catching the ``ExternalHeaderError`` the
+    public entry point raises for it.
     """
     # Step 1: Unicode NFC normalization
     normalized = unicodedata.normalize("NFC", raw)
@@ -118,16 +102,45 @@ def normalize_field_name(raw: str) -> str:
     if keyword.iskeyword(normalized):
         normalized = f"{normalized}_"
 
+    # Defense-in-depth: verify a non-empty result is a valid identifier
+    if normalized and not normalized.isidentifier():
+        raise ValueError(
+            f"Header '{raw}' normalized to '{normalized}' which is not a valid identifier. This is a bug in the normalization algorithm."
+        )
+
+    return normalized
+
+
+def normalize_field_name(raw: str) -> str:
+    """Normalize messy header to valid Python identifier.
+
+    Rules applied in order:
+    1. Unicode NFC normalization (canonical composition)
+    2. Strip leading/trailing whitespace
+    3. Lowercase
+    4. Replace non-identifier chars with underscore
+    5. Collapse consecutive underscores
+    6. Strip leading/trailing underscores
+    7. Prefix with underscore if starts with digit
+    8. Append underscore if result is Python keyword
+    9. Raise error if result is empty
+
+    Args:
+        raw: Original messy header name
+
+    Returns:
+        Valid Python identifier
+
+    Raises:
+        ExternalHeaderError: If header normalizes to empty string.
+        ValueError: If the normalization algorithm produces an invalid identifier.
+    """
+    normalized = _normalize_field_name_or_empty(raw)
+
     # Step 9: Validate non-empty result
     # Tier 3: an external header that normalizes away to nothing is bad source data.
     if not normalized:
         raise ExternalHeaderError(f"Header '{raw}' normalizes to empty string")
-
-    # Defense-in-depth: verify result is valid identifier
-    if not normalized.isidentifier():
-        raise ValueError(
-            f"Header '{raw}' normalized to '{normalized}' which is not a valid identifier. This is a bug in the normalization algorithm."
-        )
 
     return normalized
 
@@ -488,9 +501,8 @@ def check_declared_fields_reachable(
                     f"Declare '{field_mapping[name]}', or remove the field_mapping entry."
                 )
                 continue
-            try:
-                normalized = normalize_field_name(name)
-            except ExternalHeaderError:
+            normalized = _normalize_field_name_or_empty(name)
+            if not normalized:
                 # e.g. '_' — normalization strips it to nothing, so no external
                 # header can produce it and it is not a mapping value.
                 problems.append(
@@ -513,8 +525,9 @@ def check_declared_fields_reachable(
 def declarable_field_name(name: str) -> str | None:
     """The ``required_input_fields`` entry that covers a template row field.
 
-    ``validate_field_name`` restricts a declaration entry to a non-keyword
-    Python identifier, while a bracket read returns its literal verbatim — so
+    ``is_valid_field_name`` (the acceptance set ``validate_field_name`` applies
+    to a declaration entry) admits only a non-keyword Python identifier, while
+    a bracket read returns its literal verbatim — so
     ``{{ row["Original Header"] }}`` reads a name no declaration can carry.
     Returns the name itself when it is already declarable, else the canonical
     row key it resolves to at render, else None when it has no declarable form
@@ -524,22 +537,14 @@ def declarable_field_name(name: str) -> str | None:
     are the repair and the check for one contract, and they disagreed once
     already (elspeth-a9ba80cb0b).
     """
-    from elspeth.contracts.identifiers import validate_field_name
+    from elspeth.contracts.identifiers import is_valid_field_name
 
-    def declarable(candidate: str) -> bool:
-        try:
-            validate_field_name(candidate, "required_input_fields entry", strip=True)
-        except ValueError:
-            return False
-        return True
-
-    if declarable(name):
+    if is_valid_field_name(name.strip()):
         return name.strip()
-    try:
-        canonical = normalize_field_name(name)
-    except ExternalHeaderError:
+    canonical = _normalize_field_name_or_empty(name)
+    if not canonical or not is_valid_field_name(canonical):
         return None
-    return canonical if declarable(canonical) else None
+    return canonical
 
 
 def undeclared_row_fields(row_fields: Iterable[str], declared_fields: Iterable[str]) -> tuple[str, ...]:

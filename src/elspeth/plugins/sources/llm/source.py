@@ -123,7 +123,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3b5107005cfe195a"
+    source_file_hash: str | None = "sha256:262d121a2fbbfcaf"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -153,7 +153,7 @@ class LLMSource(BaseSource):
 
     @classmethod
     def get_config_model(cls, config: dict[str, Any] | None = None) -> type[LLMSourceConfig]:
-        provider = config.get("provider") if config is not None else None
+        provider = config["provider"] if config is not None and "provider" in config else None
         if provider is None:
             return LLMSourceConfig
         if type(provider) is not str or provider not in SOURCE_PROVIDER_CONFIGS:
@@ -474,26 +474,19 @@ class LLMSource(BaseSource):
         tracer = self._tracer
         if tracer is None:
             return
-        try:
-            tracer.record_success(
-                parent=parent,
-                query_name="source",
-                prompt=prompt,
-                response_content=response_content,
-                model=model,
-                usage=usage,
-                latency_ms=latency_ms,
-                extra_metadata=None,
-                system_prompt=self._system_prompt,
-            )
-        except contract_errors.TIER_1_ERRORS:
-            raise
-        except Exception as trace_error:
-            logger.warning(
-                "llm_trace_emission_failed",
-                plugin=self.name,
-                error_type=type(trace_error).__name__,
-            )
+        # The tracer owns its SDK boundary: ActiveLangfuseTracer catches and
+        # logs transport failures itself, exactly as the LLM transform relies on.
+        tracer.record_success(
+            parent=parent,
+            query_name="source",
+            prompt=prompt,
+            response_content=response_content,
+            model=model,
+            usage=usage,
+            latency_ms=latency_ms,
+            extra_metadata=None,
+            system_prompt=self._system_prompt,
+        )
 
     def _trace_error(
         self,
@@ -507,25 +500,16 @@ class LLMSource(BaseSource):
         tracer = self._tracer
         if tracer is None:
             return
-        try:
-            tracer.record_error(
-                parent=parent,
-                query_name="source",
-                prompt=prompt,
-                error_message=error_message,
-                model=model,
-                latency_ms=latency_ms,
-                extra_metadata=None,
-                system_prompt=self._system_prompt,
-            )
-        except contract_errors.TIER_1_ERRORS:
-            raise
-        except Exception as trace_error:
-            logger.warning(
-                "llm_trace_emission_failed",
-                plugin=self.name,
-                error_type=type(trace_error).__name__,
-            )
+        tracer.record_error(
+            parent=parent,
+            query_name="source",
+            prompt=prompt,
+            error_message=error_message,
+            model=model,
+            latency_ms=latency_ms,
+            extra_metadata=None,
+            system_prompt=self._system_prompt,
+        )
 
     def _create_provider(self, recorder: PluginAuditWriterAdapter) -> LLMProvider:
         if self._run_id is None:
