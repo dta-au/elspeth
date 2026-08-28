@@ -168,7 +168,7 @@ def _disclosure_draft(
     tier=3,
     source="set_pipeline candidate source containers (LLM tool-call arguments or a server-derived pipeline dict, not yet validated)",
     source_param="candidate",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns None on any malformed source-container shape (both 'source' and 'sources' present, "
         "a non-Mapping source block, or a non-string source name); never raises"
@@ -206,7 +206,7 @@ def _candidate_sources(candidate: Mapping[str, Any]) -> tuple[_CandidateSource, 
     tier=3,
     source="one set_pipeline candidate node block (LLM tool-call arguments or a server-derived pipeline dict)",
     source_param="raw",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "raises TypeError on any malformed node field shape (wrong scalar type, unknown node_type, "
         "or a malformed routes/fork_to/branches container); never coerces silently"
@@ -283,7 +283,7 @@ def _parse_node(raw: Mapping[str, Any]) -> NodeSpec:
     tier=3,
     source="a set_pipeline candidate mapping (LLM tool-call arguments or a server-derived pipeline dict, not yet validated)",
     source_param="candidate",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns None on any candidate shape that does not project into a CompositionState (malformed "
         "nodes/outputs list or entries, duplicate node ids); the KeyError/TypeError/ValueError a nested "
@@ -364,7 +364,7 @@ def _parse_candidate_state(candidate: Mapping[str, Any]) -> CompositionState | N
     tier=3,
     source="one set_pipeline candidate source block (LLM tool-call arguments or a server-derived pipeline dict)",
     source_param="block",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "raises TypeError on any malformed source field shape (non-string plugin/on_success/"
         "on_validation_failure, or non-Mapping options); never coerces silently"
@@ -486,6 +486,17 @@ def _control_node_is_creditable(
     return node_has_blocking_control(spec, capability, role, protected_fields=frozenset(protected_fields))
 
 
+@observation_boundary(
+    tier=3,
+    source="the working set_pipeline candidate's node blocks (LLM tool-call arguments or a server-derived pipeline dict) being rewritten in place",
+    source_param="nodes",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns False without touching the node list whenever the target node is absent or carries no "
+        "non-empty string 'input' edge; this runs inside the planner candidate_finalizer seam, which "
+        "treats an unprefixed exception as a terminal failure, so it never raises on candidate content"
+    ),
+)
 def _splice_input_control(
     nodes: list[dict[str, object]],
     *,
@@ -499,7 +510,7 @@ def _splice_input_control(
     reserved: set[str],
 ) -> bool:
     """Interpose the shield on the target's input edge; True when spliced."""
-    index = next((i for i, node in enumerate(nodes) if node.get("id") == target_id), None)
+    index = next((i for i, node in enumerate(nodes) if "id" in node and node["id"] == target_id), None)
     if index is None:
         return False
     target = nodes[index]
@@ -547,6 +558,17 @@ def _splice_input_control(
     return True
 
 
+@observation_boundary(
+    tier=3,
+    source="the working set_pipeline candidate's node blocks (LLM tool-call arguments or a server-derived pipeline dict) being rewritten in place",
+    source_param="nodes",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns False without touching the node list whenever the target node id is absent from the "
+        "candidate's blocks; this runs inside the planner candidate_finalizer seam, which treats an "
+        "unprefixed exception as a terminal failure, so it never raises on candidate content"
+    ),
+)
 def _splice_output_control(
     nodes: list[dict[str, object]],
     *,
@@ -559,11 +581,16 @@ def _splice_output_control(
     reserved: set[str],
 ) -> bool:
     """Interpose content safety on the target's on_success edge; True when spliced."""
-    index = next((i for i, node in enumerate(nodes) if node.get("id") == target.id), None)
+    index = next((i for i, node in enumerate(nodes) if "id" in node and node["id"] == target.id), None)
     if index is None:
         return False
     downstream = target.on_success
-    if not isinstance(downstream, str) or not downstream:
+    # ``target`` is an owned NodeSpec whose ``on_success`` is declared
+    # ``str | None`` and is only ever populated by ``_parse_node``, which
+    # rejects a non-exact-str value outright. A gate carries None here and an
+    # unrouted node carries "": both are the same "no on_success edge to
+    # interpose on" answer, so falsiness is the whole test.
+    if not downstream:
         return False
     protected_fields = _llm_output_fields(target)
     if not protected_fields:
@@ -620,6 +647,17 @@ def _splice_output_control(
     return True
 
 
+@observation_boundary(
+    tier=3,
+    source="the working set_pipeline candidate mapping (LLM tool-call arguments or a server-derived pipeline dict) whose source container is being rewritten",
+    source_param="candidate",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns False without touching the candidate whenever the plural 'sources' container it must "
+        "rewrite is absent or is not a Mapping; this runs inside the planner candidate_finalizer seam, "
+        "which treats an unprefixed exception as a terminal failure, so it never raises on candidate content"
+    ),
+)
 def _splice_source_output_control(
     candidate: dict[str, object],
     nodes: list[dict[str, object]],
@@ -730,7 +768,10 @@ def wire_required_controls(
     modes = dict(snapshot.control_modes)
     selections: dict[PluginCapability, tuple[str, str | None]] = {}
     for capability in _REQUIRED_CONTROL_CAPABILITIES:
-        if modes.get(capability, ControlMode.RECOMMEND) is not ControlMode.REQUIRED:
+        # ``control_modes`` is a sparse policy tuple: a capability the
+        # deployment never names is RECOMMEND, so absence and an explicit
+        # non-REQUIRED mode are the same "do not auto-wire" answer.
+        if capability not in modes or modes[capability] is not ControlMode.REQUIRED:
             continue
         selected = _selected_control_profile(catalog, capability)
         if selected is None:
@@ -814,10 +855,9 @@ def wire_required_controls(
                 if finding.reason not in _AUTO_WIRE_ACTIONABLE_REASONS:
                     continue
                 if finding.component_type == "source":
-                    source_target = sources_by_component.get(finding.component_id)
-                    if source_target is None or finding.role is not ControlRole.OUTPUT:
+                    if finding.component_id not in sources_by_component or finding.role is not ControlRole.OUTPUT:
                         continue
-                    location, source = source_target
+                    location, source = sources_by_component[finding.component_id]
                     progressed = _splice_source_output_control(
                         working_candidate,
                         working_nodes,
@@ -831,9 +871,9 @@ def wire_required_controls(
                         reserved=reserved,
                     )
                 else:
-                    target = nodes_by_id.get(finding.component_id)
-                    if target is None:
+                    if finding.component_id not in nodes_by_id:
                         continue
+                    target = nodes_by_id[finding.component_id]
                     if finding.role is ControlRole.INPUT:
                         progressed = _splice_input_control(
                             working_nodes,
@@ -901,35 +941,43 @@ def wire_required_controls_state(
         raise AuditIntegrityError("Required-control state finalization must return an exact candidate mapping")
 
     restored = dict(finalized)
-    raw_outputs = restored.get("outputs")
-    if type(raw_outputs) is not list:
+    # ``finalized`` is this module's own working candidate, built from an owned
+    # ``CompositionState.to_dict()``: 'outputs' and 'nodes' are present by
+    # construction, so absence here is the same internal integrity failure as a
+    # malformed value and takes the same AuditIntegrityError, never a bare KeyError.
+    if "outputs" not in restored or type(restored["outputs"]) is not list:
         raise AuditIntegrityError("Required-control state finalization produced malformed outputs")
+    raw_outputs = restored["outputs"]
     restored_outputs: list[dict[str, Any]] = []
     for output in raw_outputs:
-        if type(output) is not dict or type(output.get("sink_name")) is not str:
+        if type(output) is not dict or "sink_name" not in output or type(output["sink_name"]) is not str:
             raise AuditIntegrityError("Required-control state finalization produced a malformed output")
         restored_output = {key: value for key, value in output.items() if key != "sink_name"}
         restored_output["name"] = output["sink_name"]
         restored_outputs.append(restored_output)
     restored["outputs"] = restored_outputs
 
-    raw_nodes = restored.get("nodes")
-    if type(raw_nodes) is not list:
+    if "nodes" not in restored or type(restored["nodes"]) is not list:
         raise AuditIntegrityError("Required-control state finalization produced malformed nodes")
+    raw_nodes = restored["nodes"]
     restored_nodes: list[dict[str, Any]] = []
     for node in raw_nodes:
         if type(node) is not dict:
             raise AuditIntegrityError("Required-control state finalization produced a malformed node")
-        options = node.get("options")
-        requirements = options.get(INTERPRETATION_REQUIREMENTS_KEY) if type(options) is dict else None
+        options = node["options"] if "options" in node else None
+        requirements = None
+        if type(options) is dict and INTERPRETATION_REQUIREMENTS_KEY in options:
+            requirements = options[INTERPRETATION_REQUIREMENTS_KEY]
         server_staged = type(requirements) is list and any(
-            type(requirement) is dict and type(requirement.get("user_term")) is ServerStagedRequiredControlUserTerm
+            type(requirement) is dict
+            and "user_term" in requirement
+            and type(requirement["user_term"]) is ServerStagedRequiredControlUserTerm
             for requirement in requirements
         )
         if not server_staged:
             restored_nodes.append(node)
             continue
-        if type(node.get("id")) is not str or type(options) is not dict:
+        if "id" not in node or type(node["id"]) is not str or type(options) is not dict:
             raise AuditIntegrityError("Required-control state finalization produced malformed disclosure ownership")
         canonical_node = dict(node)
         canonical_node["options"] = _canonicalize_authored_interpretation_requirements(
@@ -965,9 +1013,14 @@ def merge_required_control_affected_components(
     for node in after_finalization.nodes:
         if node.id in before_ids:
             continue
-        requirements = node.options.get(INTERPRETATION_REQUIREMENTS_KEY)
+        # A node this pass inserted always carries the requirements key; its
+        # absence is the same "inserted without its server disclosure" integrity
+        # failure the auto_wired test below rejects, so it takes the same path.
+        requirements = node.options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in node.options else None
         auto_wired = isinstance(requirements, (list, tuple)) and any(
-            isinstance(requirement, Mapping) and requirement.get("user_term") == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+            isinstance(requirement, Mapping)
+            and "user_term" in requirement
+            and requirement["user_term"] == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
             for requirement in requirements
         )
         if not auto_wired:
