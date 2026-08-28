@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -20,8 +20,10 @@ from elspeth.web.composer.redaction import (
     REDACTED_BLOB_SOURCE_PATH,
     Sensitive,
     SetSourceArgumentsModel,
+    _coerce_stringified_json_object,
     _redact_via_schema,
     _summarize_set_source_options,
+    normalize_set_pipeline_redacted_arguments,
     redact_guided_snapshot_storage_paths,
     redact_source_storage_path,
     redact_tool_call_arguments,
@@ -956,3 +958,142 @@ def test_redact_via_schema_substitutes_nested_sensitive_path() -> None:
     assert result["payload"]["inner_secret"] == "<fixed-sum>"
     assert result["payload"]["public_field"] == "shown"
     assert "RAW_SECRET" not in str(result)
+
+
+# ---------------------------------------------------------------------------
+# Tier-model burn-down (B36) pins: every guard below was rewritten from a
+# ``.get()`` / ABC ``isinstance`` form to a nominal ``type() is dict`` or
+# membership-form read. These tests hold the redaction behaviour fixed across
+# that rewrite — a value that MUST be redacted still is, and a malformed
+# first-party shape fails closed instead of passing an un-redacted path.
+# ---------------------------------------------------------------------------
+
+
+def test_redact_source_storage_path_rejects_non_dict_source_shape() -> None:
+    """A present, non-dict source is a corrupted Tier-1 serializer output.
+
+    ``_redact_one`` checks ``type(source) is dict`` nominally: every producer
+    feeding this surface (``CompositionState.to_dict``, ``deep_thaw`` in the
+    session routes, the JSON-decoded MCP result) emits plain dicts, so even a
+    read-only ``Mapping`` here is a shape nothing first-party produces.
+    """
+    from types import MappingProxyType
+
+    proxied = MappingProxyType({"options": {"path": "/internal/blob/x.csv", "blob_ref": "abc"}})
+    with pytest.raises(AuditIntegrityError, match="non-Mapping source value"):
+        redact_source_storage_path({"source": proxied})
+    with pytest.raises(AuditIntegrityError, match="non-Mapping source value"):
+        redact_source_storage_path({"source": "not-a-mapping"})
+
+
+def test_redact_source_storage_path_rejects_non_dict_options_carrying_blob_path() -> None:
+    """A non-dict ``options`` value must fail closed, never pass through.
+
+    Before the burn-down a non-``Mapping`` options value returned the source
+    unchanged; a read-only ``Mapping`` was redacted. Both now raise: silently
+    returning a malformed options carrier is exactly the leak this surface
+    exists to prevent, and the private path must not appear in the error.
+    """
+    from types import MappingProxyType
+
+    private_path = "/internal/blob/secret-storage.csv"
+    proxied_options = MappingProxyType({"path": private_path, "blob_ref": "abc"})
+    with pytest.raises(AuditIntegrityError, match=r"non-dict source\.options") as excinfo:
+        redact_source_storage_path({"source": {"options": proxied_options}})
+    assert private_path not in str(excinfo.value)
+    with pytest.raises(AuditIntegrityError, match=r"non-dict source\.options"):
+        redact_source_storage_path({"sources": {"s": {"options": [private_path, "blob_ref"]}}})
+
+
+def test_redact_source_storage_path_none_options_and_missing_blob_ref_pass_through() -> None:
+    """The documented first-party no-op shapes are unchanged by the rewrite."""
+    states: list[dict[str, Any]] = [
+        {"source": {"options": None}},
+        {"source": {}},
+        {"source": None},
+        {"source": {"options": {"path": "/tmp/user.csv"}}},
+    ]
+    for state in states:
+        assert redact_source_storage_path(state) == state
+
+
+def test_coerce_stringified_json_object_never_raises_on_hostile_text() -> None:
+    """``_coerce_stringified_json_object`` is an observation boundary: it never raises.
+
+    Depth is bounded by ``bounded_json_loads`` (``RecursionError`` becomes a
+    ``JsonBoundaryError``, a ``ValueError``), so the previously documented
+    unbounded-recursion exposure is closed and every non-object outcome is
+    returned untouched for pydantic to reject.
+    """
+    deep = "[" * 20_000
+    assert _coerce_stringified_json_object(deep) is deep
+    for untouched in ("not json", "[1, 2]", "null", '"str"', "42", 7, None, ["x"], {"already": "dict"}):
+        assert _coerce_stringified_json_object(untouched) is untouched
+    assert _coerce_stringified_json_object('{"k": 1}') == {"k": 1}
+
+
+def test_normalize_set_pipeline_redacted_arguments_membership_shapes() -> None:
+    """Only ``source.inline_blob is None`` is dropped; every other shape is untouched."""
+    assert normalize_set_pipeline_redacted_arguments("scalar") == "scalar"
+    no_source: dict[str, Any] = {"nodes": []}
+    assert normalize_set_pipeline_redacted_arguments(no_source) is no_source
+    non_dict_source = {"source": ["x"]}
+    assert normalize_set_pipeline_redacted_arguments(non_dict_source) is non_dict_source
+    absent = {"source": {"plugin": "csv"}}
+    assert normalize_set_pipeline_redacted_arguments(absent) is absent
+    present = {"source": {"plugin": "csv", "inline_blob": "<redacted>"}}
+    assert normalize_set_pipeline_redacted_arguments(present) is present
+    null_blob = {"source": {"plugin": "csv", "inline_blob": None}, "nodes": []}
+    normalized = normalize_set_pipeline_redacted_arguments(null_blob)
+    assert normalized == {"source": {"plugin": "csv"}, "nodes": []}
+    assert null_blob["source"] == {"plugin": "csv", "inline_blob": None}
+
+
+def _sentinel_projection_meta(real_path: str, sentinel: str, entries: object) -> dict[str, Any]:
+    return {
+        "guided_session": {
+            "reviewed_sources": {
+                "22222222-2222-4222-8222-222222222222": {
+                    "name": "source",
+                    "options": {"path": sentinel, "schema": {"mode": "observed"}},
+                }
+            },
+            "pending_source_intents": {},
+        },
+        "implicit_decisions": {"schema_version": 1, "entries": entries, "normalization_events": []},
+    }
+
+
+def test_redact_guided_snapshot_implicit_decision_entries_use_membership_reads() -> None:
+    """Entries lacking ``path``/``value``, or with a non-projected value, are untouched.
+
+    The projection lookup is membership-form on the owned
+    ``private_path_projections`` dict; a private path that IS projected must
+    still be replaced by its sentinel, and nothing else in the entry changes.
+    """
+    real_path = "/internal/blobs/session/source.csv"
+    sentinel = "blob:11111111-1111-4111-8111-111111111111"
+    sources = {"source": {"options": {"path": real_path, "schema": {"mode": "observed"}}}}
+    entries = [
+        {"path": "source.path", "value": real_path, "category": "source"},
+        {"path": "source.file", "value": "/tmp/other.csv", "category": "source"},
+        {"path": "source.path", "category": "source"},
+        {"value": real_path, "category": "source"},
+        {"path": "source.path", "value": 3, "category": "source"},
+    ]
+    _sources_out, meta_out = redact_guided_snapshot_storage_paths(sources, _sentinel_projection_meta(real_path, sentinel, entries))
+    assert meta_out is not None
+    projected = meta_out["implicit_decisions"]["entries"]
+    assert projected[0] == {"path": "source.path", "value": sentinel, "category": "source"}
+    assert projected[1:] == entries[1:]
+    assert real_path not in str(projected[0])
+
+
+def test_redact_guided_snapshot_implicit_decision_report_without_entries_fails_closed() -> None:
+    real_path = "/internal/blobs/session/source.csv"
+    sentinel = "blob:11111111-1111-4111-8111-111111111111"
+    sources = {"source": {"options": {"path": real_path, "schema": {"mode": "observed"}}}}
+    meta = _sentinel_projection_meta(real_path, sentinel, [])
+    del meta["implicit_decisions"]["entries"]
+    with pytest.raises(AuditIntegrityError, match="implicit-decision projection is malformed"):
+        redact_guided_snapshot_storage_paths(sources, meta)

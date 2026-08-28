@@ -320,7 +320,7 @@ def _summarize_arg_error_text(value: str | None, *, label: str) -> str | None:
     tier=3,
     source="Raw ARG_ERROR result payload from a failed tool-call argument parse (caller-controlled)",
     source_param="result",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "never raises; result['error'] and result['validation_errors'] are summarized to bounded counts/"
         "sentinels and dropped entirely from the projection when not str / list-or-tuple respectively"
@@ -449,8 +449,7 @@ def _project_validated_response_scalars(
     if isinstance(value, str):
         if value in _STABLE_RESPONSE_SENTINELS:
             return value
-        safe_values = _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD.get(field_name)
-        if safe_values is not None and value in safe_values:
+        if field_name in _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD and value in _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD[field_name]:
             return value
         return _summarize_external_response_value(value)
     return _REDACTED_RESPONSE_VALUE
@@ -1271,6 +1270,15 @@ class ToolRedaction:
 _OPTION_SHAPE_CLASSES = ("mapping", "scalar", "sequence", "set")
 
 
+@observation_boundary(
+    tier=3,
+    source="LLM-authored plugin option value (or one immediate child of it) reaching the shape summarizer",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; classifies the value into the closed _OPTION_SHAPE_CLASSES vocabulary and never returns any part of the value itself"
+    ),
+)
 def _option_shape_class(value: object) -> str:
     if isinstance(value, Mapping):
         return "mapping"
@@ -1281,6 +1289,16 @@ def _option_shape_class(value: object) -> str:
     return "scalar"
 
 
+@observation_boundary(
+    tier=3,
+    source="LLM-authored set_source/node/output 'options' mapping (open plugin-defined surface)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; a non-container collapses to _REDACTED_OPTION_VALUE and a container to its "
+        "shape class, entry count, and closed-vocabulary child-shape counts — no key or value is echoed"
+    ),
+)
 def _summarize_option_shape(value: object) -> object:
     if not isinstance(value, (Mapping, list, tuple, AbstractSet)):
         return _REDACTED_OPTION_VALUE
@@ -1336,14 +1354,17 @@ def _summarize_set_source_options(options: object) -> str:
     )
 
 
-# NOT a declared trust boundary: ``non_raising=True`` would be false here.
-# ``json.loads`` raises ``RecursionError`` (a ``RuntimeError``, so not caught by
-# the ``(json.JSONDecodeError, ValueError)`` handler below) on deeply nested
-# input — reproduced with a ~20KB string of 9999 nested ``[``. The honesty
-# gate's mechanical check cannot see this, because the raise comes from a called
-# stdlib function rather than a ``raise`` statement in this body. Declaring the
-# boundary would permanently shield a live defect from R5. Fix the recursion
-# exposure first, then declare.
+@observation_boundary(
+    tier=3,
+    source="LLM-authored free-form object tool-call argument (options/patch) before pydantic validation",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; only a str that bounded_json_loads decodes to a dict is replaced by that dict — "
+        "a non-str, undecodable text, an over-deep/over-long text (JsonBoundaryError is a ValueError), "
+        "or a non-object decode is returned untouched for the field's own validation to reject"
+    ),
+)
 def _coerce_stringified_json_object(value: Any) -> Any:
     """Tier-3 boundary deserialisation for LLM-supplied object arguments.
 
@@ -1385,7 +1406,7 @@ def _coerce_stringified_json_object(value: Any) -> Any:
         decoded = bounded_json_loads(value, label="stringified tool-argument object")
     except (json.JSONDecodeError, ValueError):
         return value
-    return decoded if isinstance(decoded, dict) else value
+    return decoded if type(decoded) is dict else value
 
 
 # Reusable annotation for every LLM-supplied free-form object argument
@@ -2381,8 +2402,10 @@ def normalize_set_pipeline_redacted_arguments(value: Any) -> Any:
     """
     if type(value) is not dict:
         return value
-    source = value.get("source")
-    if type(source) is not dict or source.get("inline_blob", object()) is not None:
+    if "source" not in value:
+        return value
+    source = value["source"]
+    if type(source) is not dict or "inline_blob" not in source or source["inline_blob"] is not None:
         return value
     normalized_source = dict(source)
     del normalized_source["inline_blob"]
@@ -3987,7 +4010,7 @@ def redact_tool_call_response(
             telemetry=telemetry,
         )
         projected = _project_validated_response_scalars(schema_redacted)
-        assert isinstance(projected, Mapping)
+        assert type(projected) is dict
         return _bounded_projection_result({key: projected[key] for key in response})
 
     # --- Declarative path ---
@@ -4069,7 +4092,7 @@ def redact_source_storage_path(state_dict: dict[str, Any]) -> dict[str, Any]:
         # PLUGIN_CRASH reclassification).
         if source is None:
             return source, False
-        if not isinstance(source, Mapping):
+        if type(source) is not dict:
             raise AuditIntegrityError(
                 "redact_source_storage_path received a non-Mapping source value "
                 f"(type {type(source).__name__!r}); serialized state source entries "
@@ -4079,7 +4102,16 @@ def redact_source_storage_path(state_dict: dict[str, Any]) -> dict[str, Any]:
         if "options" not in source:
             return source, False
         options = source["options"]
-        if options is None or not isinstance(options, Mapping) or "blob_ref" not in options:
+        if options is None:
+            return source, False
+        if type(options) is not dict:
+            raise AuditIntegrityError(
+                "redact_source_storage_path received a non-dict source.options value "
+                f"(type {type(options).__name__!r}); serialized source options must be dicts. "
+                "Refusing to pass through a malformed first-party shape that may carry an "
+                "un-redacted internal storage path."
+            )
+        if "blob_ref" not in options:
             return source, False
         redacted_source = dict(source)
         redacted_options = dict(options)
@@ -4206,7 +4238,7 @@ def redact_guided_snapshot_storage_paths(
             live_reviewed_paths = {
                 value
                 for key in GUIDED_REVIEWED_BLOB_PATH_KEYS
-                if type(value := live_options.get(key)) is str and value in all_reviewed_paths
+                if key in live_options and type(value := live_options[key]) is str and value in all_reviewed_paths
             }
             if not live_reviewed_paths:
                 continue
@@ -4217,7 +4249,7 @@ def redact_guided_snapshot_storage_paths(
                 raise AuditIntegrityError("guided blob source mapping is inconsistent")
             options_redacted = dict(live_options)
             for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
-                if type(value := live_options.get(key)) is str and value in live_reviewed_paths:
+                if key in live_options and type(value := live_options[key]) is str and value in live_reviewed_paths:
                     private_path_projections[value] = REDACTED_BLOB_SOURCE_PATH
                     options_redacted[key] = REDACTED_BLOB_SOURCE_PATH
             source_redacted = dict(live_source)
@@ -4229,8 +4261,8 @@ def redact_guided_snapshot_storage_paths(
         if missing_names:
             raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
         for source_name, binding in sentinel_bindings.items():
-            live_source = rebuilt_sources.get(source_name)
-            if type(live_source) is not dict or type(live_source.get("options")) is not dict:
+            live_source = rebuilt_sources[source_name]
+            if type(live_source) is not dict or "options" not in live_source or type(live_source["options"]) is not dict:
                 raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
             live_options = live_source["options"]
             live_carriers = validate_guided_reviewed_sentinel_source_mapping(
@@ -4242,8 +4274,7 @@ def redact_guided_snapshot_storage_paths(
             redacted_options = dict(live_options)
             for key, private_path in live_carriers:
                 sentinel = sentinels[key]
-                existing_projection = private_path_projections.get(private_path)
-                if existing_projection is not None and existing_projection != sentinel:
+                if private_path in private_path_projections and private_path_projections[private_path] != sentinel:
                     raise AuditIntegrityError("guided blob sentinel path projection is ambiguous")
                 private_path_projections[private_path] = sentinel
                 redacted_options[key] = sentinel
@@ -4285,17 +4316,21 @@ def redact_guided_snapshot_storage_paths(
 
     if private_path_projections and meta_out is not None and "implicit_decisions" in meta_out:
         report = meta_out["implicit_decisions"]
-        if type(report) is not dict or type(report.get("entries")) is not list:
+        if type(report) is not dict or "entries" not in report or type(report["entries"]) is not list:
             raise AuditIntegrityError("guided implicit-decision projection is malformed")
         redacted_entries: list[dict[str, Any]] = []
         for entry in report["entries"]:
             if type(entry) is not dict:
                 raise AuditIntegrityError("guided implicit-decision entry is malformed")
             redacted_entry = dict(entry)
-            if entry.get("path") in {"source.path", "source.file"} and type(entry.get("value")) is str:
-                projected = private_path_projections.get(entry["value"])
-                if projected is not None:
-                    redacted_entry["value"] = projected
+            if (
+                "path" in entry
+                and entry["path"] in {"source.path", "source.file"}
+                and "value" in entry
+                and type(entry["value"]) is str
+                and entry["value"] in private_path_projections
+            ):
+                redacted_entry["value"] = private_path_projections[entry["value"]]
             redacted_entries.append(redacted_entry)
         redacted_report = dict(report)
         redacted_report["entries"] = redacted_entries
