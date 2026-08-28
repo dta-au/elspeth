@@ -19,6 +19,7 @@ from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.factory import (
     DataFlowReadRepository,
     ExecutionReadRepository,
+    PayloadStoreReadRepository,
     RecorderFactory,
     RunLifecycleReadRepository,
 )
@@ -118,6 +119,37 @@ class TestPayloadStore:
     def test_payload_store_defaults_to_none(self, factory: RecorderFactory) -> None:
         assert factory.payload_store is None
 
+    @pytest.mark.parametrize("build", ["read_only", "read_repositories"])
+    def test_read_repositories_expose_only_read_payload_operations(self, build: str) -> None:
+        db = LandscapeDB.in_memory()
+        payload_store = MockPayloadStore()
+        payload_ref = payload_store.store(b"audit evidence")
+
+        if build == "read_only":
+            read_payloads = RecorderFactory.read_only(db, payload_store=payload_store).payload_store
+        else:
+            read_payloads = RecorderFactory(db, payload_store=payload_store).read_repositories().payload_store
+
+        assert isinstance(read_payloads, PayloadStoreReadRepository)
+        assert read_payloads.exists(payload_ref)
+        assert read_payloads.retrieve(payload_ref) == b"audit evidence"
+        assert not hasattr(read_payloads, "store")
+        assert not hasattr(read_payloads, "delete")
+
+    def test_read_repositories_payload_store_none_stays_none(self) -> None:
+        db = LandscapeDB.in_memory()
+        assert RecorderFactory.read_only(db).payload_store is None
+        assert RecorderFactory(db).read_repositories().payload_store is None
+
+    def test_write_repositories_retain_mutable_payload_store(self) -> None:
+        db = LandscapeDB.in_memory()
+        payload_store = MockPayloadStore()
+
+        write_repositories = RecorderFactory(db, payload_store=payload_store).write_repositories()
+
+        assert write_repositories.payload_store is payload_store
+        assert isinstance(write_repositories.read.payload_store, PayloadStoreReadRepository)
+
 
 class TestPluginAuditWriter:
     """Verify plugin_audit_writer() returns the adapter."""
@@ -174,6 +206,7 @@ class TestReadPortDelegation:
             pytest.param(RunLifecycleReadRepository, RunLifecycleRepository, id="run-lifecycle"),
             pytest.param(DataFlowReadRepository, DataFlowRepository, id="data-flow"),
             pytest.param(ExecutionReadRepository, ExecutionRepository, id="execution"),
+            pytest.param(PayloadStoreReadRepository, MockPayloadStore, id="payload-store"),
         ],
     )
     def test_every_public_method_delegates_to_same_named_repo_method(self, facade_cls: type, repo_cls: type) -> None:
