@@ -651,7 +651,7 @@ class GuidedProposalRef:
             "GuidedProposalRef.from_dict",
         )
         base_raw = _require_str_mapping(record["base"], "GuidedProposalRef.base")
-        kind = base_raw.get("kind")
+        kind = base_raw["kind"] if "kind" in base_raw else None
         if kind == "absent":
             _require_exact_dict(base_raw, frozenset({"kind"}), "GuidedProposalRef.base")
             base: ProposalBase = AbsentBase()
