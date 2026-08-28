@@ -375,6 +375,7 @@ telemetry:
     "events_emitted": int,           # Successfully exported
     "events_dropped": int,           # Queue full or all exporters failed
     "queue_drops": int,              # Enqueue/backpressure losses only
+    "observer_failures": int,        # Event-observer callbacks that raised (contained)
     "exporter_failures": {name: count},
     "consecutive_total_failures": int,
     "queue_depth": int,

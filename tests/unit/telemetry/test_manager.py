@@ -202,6 +202,7 @@ class TestInitialization:
             assert metrics["events_emitted"] == 0
             assert metrics["events_dropped"] == 0
             assert metrics["queue_drops"] == 0
+            assert metrics["observer_failures"] == 0
             assert metrics["consecutive_total_failures"] == 0
         finally:
             manager.close()
@@ -308,6 +309,34 @@ class TestHandleEventBasic:
             assert failure_log["log_level"] == "error"
             assert "SENSITIVE_OBSERVER_FAILURE" not in repr(logs)
             assert event.run_id not in repr(logs)
+            # The containment is recorded, not silent: one raising observer
+            # counts once on the operational health surface.
+            assert manager.health_metrics["observer_failures"] == 1
+        finally:
+            manager.close()
+
+    def test_observer_failures_accumulate_on_the_health_surface(self) -> None:
+        config = MockTelemetryConfig()
+        exporter = TelemetryTestExporter()
+
+        def failing_observer(received: object) -> None:
+            raise RuntimeError("SENSITIVE_OBSERVER_FAILURE")
+
+        manager = TelemetryManager(
+            config,
+            exporters=[exporter],
+            event_observers=[failing_observer],
+        )
+        try:
+            assert manager.health_metrics["observer_failures"] == 0
+            for _ in range(3):
+                manager.handle_event(_lifecycle_event())
+            _wait_for_processing(manager)
+
+            assert manager.health_metrics["observer_failures"] == 3
+            # Observer failure is isolated from delivery: the exporter still
+            # received every event.
+            assert len(exporter.events) == 3
         finally:
             manager.close()
 
@@ -1119,6 +1148,7 @@ class TestHealthMetrics:
                 "events_emitted",
                 "events_dropped",
                 "queue_drops",
+                "observer_failures",
                 "exporter_failures",
                 "consecutive_total_failures",
                 "queue_depth",
