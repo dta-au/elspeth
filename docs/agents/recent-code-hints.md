@@ -8,6 +8,23 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-28 — `.pre-commit-config.yaml` lint hooks are pinned by
+  `tests/unit/elspeth_lints/test_pre_commit_triggers.py`** (elspeth-7e8bf1c28b).
+  Three whole-config contracts: (1) a `--files` hook may select ONLY
+  `RuleScope.INCREMENTAL` rules — `--files` is inert for a WHOLE_REPO rule,
+  which rescans `--root` regardless, so such a hook is a whole-repo scan
+  behind a subject-code trigger (run those as policy hooks keyed to
+  `config/cicd/<allowlist>/` + the rule dir, `pass_filenames: false`, and
+  enumerate rule ids instead of `family/*` when the family mixes scopes);
+  (2) every tracked non-fixture file a `--files` hook's rules would judge
+  under its `--root` must also match the hook's `files:` regex — `--root`
+  does not scope an explicit file list, so the trigger is the only scope,
+  and a trigger narrower than the `path_filter` is silent (`Skipped`);
+  (3) every `config/cicd/<dir>/` needs a consumer that re-runs on edit — a
+  hook trigger naming it, a CI workflow, or the commit-msg script. Pre-commit
+  ANDs `files` with `types: [python]`, so a Python-typed hook never fires on
+  a YAML allowlist.
+
 - **2026-08-28 — incremental lint policy gates pass `--fail-on-inert`, but
   changed-file hooks MUST NOT.** A selected incremental rule whose
   `path_filter` matches zero non-fixture Python files never reaches

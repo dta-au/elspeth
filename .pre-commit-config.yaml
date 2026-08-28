@@ -113,12 +113,15 @@ repos:
         files: ^(config/cicd/enforce_freeze_guards/|elspeth-lints/src/elspeth_lints/rules/immutability/freeze_guards/)
         pass_filenames: false
 
-      - id: elspeth-lints-frozen-annotations-incremental
-        name: elspeth-lints frozen annotations (changed files)
-        entry: env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check --rules immutability.frozen_annotations --root src/elspeth --files
+      - id: elspeth-lints-frozen-annotations
+        name: elspeth-lints frozen annotations
+        # WHOLE_REPO rule: ``--files`` is inert for it (the rule rescans
+        # ``--root`` regardless), so it runs as a policy check keyed to its
+        # rule and allowlist, and CI is the per-commit gate of record.
+        entry: env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check --rules immutability.frozen_annotations --root src/elspeth
         language: system
-        types: [python]
-        files: ^src/elspeth/.*\.py$
+        files: ^(config/cicd/enforce_frozen_annotations/|elspeth-lints/src/elspeth_lints/rules/immutability/frozen_annotations/)
+        pass_filenames: false
 
       - id: elspeth-lints-audit-evidence
         name: elspeth-lints audit-evidence
@@ -157,7 +160,10 @@ repos:
 
       - id: elspeth-lints-contract-invariants-incremental
         name: elspeth-lints contract invariants (changed files)
-        entry: env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check --rules 'contract_invariants/*' --root src/elspeth --files
+        # Only the INCREMENTAL rules: ``contract_invariants/*`` would also pull in
+        # the WHOLE_REPO adapter_method_budget, for which ``--files`` is inert.
+        # That rule runs under the policy hook above and in CI.
+        entry: env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check --rules contract_invariants.portable_sqlite_insert,contract_invariants.session_engine_factory,contract_invariants.validation_theatre --root src/elspeth --files
         language: system
         types: [python]
         files: ^src/elspeth/.*\.py$
@@ -167,7 +173,7 @@ repos:
         entry: env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check --rules contract_invariants.session_engine_factory --root . --files
         language: system
         types: [python]
-        files: ^(src/elspeth/web/.*\.py|tests/(unit|integration|property|e2e)/web/.*\.py)$
+        files: ^(src/elspeth/web/.*\.py|tests/(unit|integration|property|e2e|testcontainer)/web/.*\.py)$
 
       - id: elspeth-lints-contract-manifest
         name: elspeth-lints contract manifest
