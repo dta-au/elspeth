@@ -133,8 +133,10 @@ class TestPayloadStore:
         assert isinstance(read_payloads, PayloadStoreReadRepository)
         assert read_payloads.exists(payload_ref)
         assert read_payloads.retrieve(payload_ref) == b"audit evidence"
-        assert not hasattr(read_payloads, "store")
-        assert not hasattr(read_payloads, "delete")
+        with pytest.raises(AttributeError):
+            read_payloads.store  # noqa: B018 — capability must be absent
+        with pytest.raises(AttributeError):
+            read_payloads.delete  # noqa: B018 — capability must be absent
 
     def test_read_repositories_payload_store_none_stays_none(self) -> None:
         db = LandscapeDB.in_memory()
