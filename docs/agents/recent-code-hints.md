@@ -728,6 +728,31 @@ is a working document under the normal delivery posture.
   `plugin_policy.coverage`. General trap: this failure reproduces from an
   UNMODIFIED file, so before "fixing" a mypy hook failure, run mypy on a file
   you did not touch and attribute it before you edit anything.
+- **2026-08-29 — NARROWING a broad `except` does not clear a tier_model R4; it
+  CONVERTS it into an R6 at the same line.** `TierModelVisitor._check_exception_handler`
+  sets `is_broad` only for a Name/Tuple naming `Exception` or `BaseException`;
+  anything else falls through to `_handler_is_silent`, which returns True for
+  any handler whose own scope contains no `raise` and no non-default `return`
+  (`_is_default_return_value` counts `None`/`""`/`0`/`False`/empty containers
+  as silent). So `except BaseException as exc: x = exc` → R4, and
+  `except (TypeError, ValueError) as exc: x = exc` → R6. Measured on
+  `web/composer/tool_batch.py`: zero corpus gain either way. **The only shape
+  that clears both is a handler that RETURNS a non-default value**, which means
+  lifting the guarded region into a helper — the file's own
+  `_try_finalize_proposal_custody` (`except BlobQuotaExceededError: return
+  "quota_exceeded"`) is the template. Two consequences before you reach for
+  that: (1) a handler ending in `break` or `continue` **cannot** be extracted at
+  all — the control flow belongs to the enclosing loop, which rules out every
+  per-tool-call handler in `run_tool_batch`; (2) extracting a 5-line
+  `try`/`except` solely so the rule sees a non-default `return` — especially
+  when the natural return is `None`, forcing an invented sentinel Literal — is
+  helper indirection to move a finding out of sight, which the burn-down brief
+  bans. When neither applies, the honest disposition is a rationale that states
+  this proof, not a contorted extraction. Do not "simplify" a caught tuple
+  either: `(json.JSONDecodeError, JsonBoundaryError, TypeError, ValueError)` in
+  that file is redundant as dispatch (both JSON classes subclass `ValueError`)
+  and is written out to DOCUMENT the audit taxonomy.
+
 - **2026-08-29 — `@trust_boundary` suppression is CALL-LAUNDERED: decorating a
   function does NOTHING for a finding on a value a helper RETURNED.** The
   tier_model walk roots a subject at `source_param` through subscript,

@@ -730,7 +730,12 @@ async def run_tool_batch(
             all_cache_hits = False
             continue
 
-        if not isinstance(decoded_arguments, dict):
+        # Exact-type: bounded_json_loads is called with no object_hook /
+        # object_pairs_hook, so json.loads builds a plain dict, and its own
+        # _validate_decoded_json has already held every node to exactly
+        # dict/list/str/bool/int/float/None. A Mapping that is not a dict
+        # cannot reach this line.
+        if type(decoded_arguments) is not dict:
             if is_discovery_tool(tool_name):
                 turn_has_discovery = True
             else:
@@ -1200,12 +1205,20 @@ async def run_tool_batch(
                         redacted_arguments = None
                     else:
                         if not proposal_acceptable:
-                            if isinstance(finalized_candidate_result.data, Mapping):
-                                feedback_data = dict(finalized_candidate_result.data)
-                            elif finalized_candidate_result.data is None:
+                            # ToolResult.data is typed Any, but every producer on
+                            # the set_pipeline candidate path returns a plain dict
+                            # or None (_failure_result and friends build dict
+                            # literals; _mutation_result declares dict | None).
+                            # The three arms stay so an unexpected shape is carried
+                            # structurally instead of raising dict() inside this
+                            # try's else-clause, which no handler here would catch.
+                            candidate_data = finalized_candidate_result.data
+                            if type(candidate_data) is dict:
+                                feedback_data = dict(candidate_data)
+                            elif candidate_data is None:
                                 feedback_data = {}
                             else:
-                                feedback_data = {"candidate_data": finalized_candidate_result.data}
+                                feedback_data = {"candidate_data": candidate_data}
                             feedback_data.update(
                                 {
                                     "status": "PREVALIDATION_REJECTED",
