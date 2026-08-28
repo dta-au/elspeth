@@ -186,9 +186,10 @@ def _append_email_verification_record(outbox_path: Path, record: Mapping[str, ob
 
 def _open_owner_only_database(path: Path) -> int:
     """Open or atomically create ``path`` without following a final symlink."""
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
-        raise LocalAuthStorageSecurityError("Local auth storage requires no-follow file admission")
+    try:
+        nofollow = os.O_NOFOLLOW
+    except AttributeError as exc:
+        raise LocalAuthStorageSecurityError("Local auth storage requires no-follow file admission") from exc
     flags = os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK | nofollow
     created = False
     try:

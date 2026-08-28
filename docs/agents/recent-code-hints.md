@@ -8,6 +8,29 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — a platform-conditional stdlib constant probed with
+  `getattr(os, "O_NOFOLLOW", None)` is BOTH a tier_model R2 and a masquerade
+  baseline entry; the honest form is a direct read under
+  `except AttributeError`.** `_open_owner_only_database` (web/auth/local.py,
+  B30) probed `os.O_NOFOLLOW` with a `None` default and then raised
+  `LocalAuthStorageSecurityError` on `None`. Python documents `O_NOFOLLOW` as
+  "not present if not defined by the C library", so the check is real, but
+  the getattr-default is not needed to express it:
+  `try: nofollow = os.O_NOFOLLOW / except AttributeError as exc: raise
+  LocalAuthStorageSecurityError(...) from exc` is the same fail-closed
+  outcome with no dynamic-attribute site — it clears R2 and deletes the
+  `module-getattr` row from `config/cicd/masquerade_baseline.yaml` (reseed in
+  the same commit; `seed_baseline --check` exits 0 only after the reseed).
+  Do NOT reach for `hasattr` (R3) or a module-level probe that turns a
+  first-open failure into an import-time one unless the module already fails
+  to import on that platform for the same reason. Companion in the same lane:
+  `_parse_https_url` (web/auth/urls.py) guarded a pydantic-typed `str` with
+  `isinstance(raw_value, str)`, which ADMITS a `str` subclass — an impostor
+  whose `__contains__`/`find` deny the separators it carries would sail past
+  every scan in that function. `type(raw_value) is not str` is the house
+  scalar idiom and rejects it; pinned by
+  tests/unit/web/auth/test_urls.py::test_url_values_must_be_exact_str_not_a_subclass_or_lookalike,
+  which asserts the impostor's methods were never consulted.
 - **2026-08-29 — `web/execution/` has DECLARATION tests that pin the exact
   tier_model finding set, so REMOVING a finding there turns the lane red until
   you update the `Counter`.** `tests/unit/web/execution/test_validation_trust_tier.py`

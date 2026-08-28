@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from elspeth.web.auth.urls import (
@@ -236,3 +238,32 @@ def test_embedding_allowed_url_does_not_authorize_initial_destination(smuggled: 
             issuer=ISSUER,
             allowed_origins=(COGNITO_ORIGIN,),
         )
+
+
+class _LyingStr(str):
+    """A ``str`` subclass whose scanning methods deny every separator it carries."""
+
+    consulted = False
+
+    def __contains__(self, item: object) -> bool:
+        type(self).consulted = True
+        return False
+
+    def find(self, *args: Any, **kwargs: Any) -> int:
+        type(self).consulted = True
+        return -1
+
+
+@pytest.mark.parametrize(
+    "impostor",
+    [
+        pytest.param(_LyingStr("https://allowed.example.com\\@evil.example"), id="str-subclass"),
+        pytest.param(b"https://allowed.example.com", id="bytes"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_url_values_must_be_exact_str_not_a_subclass_or_lookalike(impostor: Any) -> None:
+    _LyingStr.consulted = False
+    with pytest.raises(ValueError, match="OIDC browser allowed origin failed string check"):
+        validate_oidc_browser_origins((impostor,))
+    assert _LyingStr.consulted is False
