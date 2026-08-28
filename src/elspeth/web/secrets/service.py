@@ -80,8 +80,8 @@ def _log_fingerprint_missing_rate_limited() -> None:
         "secret_resolve_fingerprint_key_missing",
         detail=(
             "ELSPETH_FINGERPRINT_KEY is unset or misconfigured; every "
-            "call to WebSecretService.resolve() will return None until "
-            "the deployment environment is fixed."
+            "call to WebSecretService.resolve() / resolve_scoped() will "
+            "return None until the deployment environment is fixed."
         ),
         emit_interval_seconds=_FINGERPRINT_MISSING_LOG_INTERVAL_SECONDS,
         suppressed_since_last_emit=suppressed_since_last_emit,
@@ -114,8 +114,8 @@ def _log_secret_decryption_rate_limited() -> None:
         "secret_resolve_decryption_failed",
         detail=(
             "A stored web secret exists but cannot be decrypted with the current "
-            "server key material; affected calls to WebSecretService.resolve() "
-            "will return None until the secret is re-saved or the deployment "
+            "server key material; affected calls to WebSecretService.resolve() / "
+            "resolve_scoped() will return None until the secret is re-saved or the deployment "
             "key configuration is restored."
         ),
         emit_interval_seconds=_SECRET_DECRYPTION_LOG_INTERVAL_SECONDS,
@@ -224,7 +224,23 @@ class WebSecretService:
         *,
         auth_provider_type: AuthProviderType,
     ) -> ResolvedSecret | None:
-        """Resolve from exactly the operator-selected store without shadowing."""
+        """Resolve from exactly the operator-selected store without shadowing.
+
+        Same miss contract as :meth:`resolve` — every unresolvable condition
+        returns None so ``resolve_secret_refs`` (``core/secrets.py``) can
+        bucket scoped and unscoped misses into one ``SecretResolutionError``
+        — with the same operator-visible split between the conditions:
+        ``FingerprintKeyMissingError`` and ``SecretDecryptionError`` each
+        emit their own rate-limited breadcrumb
+        (:func:`_log_fingerprint_missing_rate_limited`,
+        :func:`_log_secret_decryption_rate_limited`); genuine absence
+        (``SecretNotFoundError``) emits nothing.  Unlike :meth:`resolve`
+        there is no fallback between stores: an undecryptable user row asked
+        for as ``scope="user"`` is None even when a server secret of the same
+        name exists, and a scope with no backing store (``org``) is absent by
+        construction.  Pinned per exception class by
+        ``tests/unit/web/secrets/test_service.py::TestResolveScoped``.
+        """
         try:
             if scope == "user":
                 value, ref = self._user_store.get_secret(name, user_id=user_id, auth_provider_type=auth_provider_type)
