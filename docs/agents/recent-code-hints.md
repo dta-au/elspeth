@@ -22,6 +22,24 @@ is a working document under the normal delivery posture.
   `type() is dict` swap returns names where connections are wanted only in the
   mapped form and is undetectable in the list form.
 
+- **2026-08-29 — a tier-model `fp=` and `scope_fingerprint` are per-ENCLOSING-SCOPE,
+  so editing a sibling method's docstring or a module-level string literal
+  does NOT stale a signed entry in another method.** Measured in B55
+  (`web/secrets/service.py`): expanding `WebSecretService.resolve_scoped`'s
+  docstring and rewording the `detail=` strings inside the module-level
+  `_log_*_rate_limited` helpers left all five signed `resolve` /
+  `check_user_ref_resolvable` fingerprints and scope fingerprints
+  byte-identical (`scan_file` before/after), while `file_fingerprint` moved.
+  Corollary: do not hold back an honest docstring or log-text edit on
+  "signature churn" grounds unless it is INSIDE the signed handler's own
+  function — and never shape the edit around it either way. Verify with the
+  rule's `scan_file` (fields `fingerprint`, `scope_fingerprint`) rather than
+  guessing. Same lane: `resolve_scoped` shares `resolve`'s None-on-miss
+  contract for the `resolve_secret_refs` aggregator, so its three R6 handlers
+  are rationalised (sidecar `B55.rationales.json`) and pinned per exception
+  class by `tests/unit/web/secrets/test_service.py::TestResolveScoped`,
+  which previously did not exist — a new `WebSecretResolver` method is a
+  parity item for that class.
 - **2026-08-29 — a platform-conditional stdlib constant probed with
   `getattr(os, "O_NOFOLLOW", None)` is BOTH a tier_model R2 and a masquerade
   baseline entry; the honest form is a direct read under
