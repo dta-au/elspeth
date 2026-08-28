@@ -8,6 +8,28 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — a tier_model R1 `d.get(k, DEFAULT)` sitting right after
+  `if k in d or <helper>(...)` is usually a DEFECT, not a justify candidate.**
+  Check whether the helper caches the key before it returns True. In
+  `RowUnionExecutor` it does — `_check_landscape_for_completion` calls
+  `_mark_completed(key, reason)` on every truthy return, and `_mark_completed`'s
+  bounded eviction is `OrderedDict.popitem(last=False)`, which pops the OLDEST
+  entry and so can never evict the one just written (plain assignment does not
+  reorder, and a fresh key is newest — true even at `max_completed_keys=1`).
+  That made `self._completed_keys.get(key, _CLOSED_BY_RELEASE)` both unreachable
+  AND wrong if reached: the landscape arm can cache `_CLOSED_BY_BRANCH_LOSS` or
+  `_CLOSED_BY_PRIOR_FAILURE`, which the default would relabel `"released"` on
+  its way into `_fail_pending`'s resume failure outcome. Read it as a member so
+  a broken invariant crashes instead of writing a mislabelled audit reason. The
+  same look applies to R8 `setdefault` on a group accumulator: when the file
+  already spells the accumulator as `if k not in d: d[k] = ...` elsewhere
+  (`RowUnionExecutor.accept`, `CollectorJournalRestorer.restore`), converging on
+  that idiom is a removal, not a dodge. Contrast a genuine justify: a `.get()`
+  whose absent key is a first-class VALUE — `row_union_state_ids.get(token_id)`
+  in `barrier_coordination.restore_from_journal` returns None for exactly the
+  holdless members of a released group, and `reconcile_released_group` reads
+  None as "already completed, do not write twice".
+
 - **2026-08-29 — `validate_credential_safe_https_url` now lives at
   `elspeth.core.url_validation`, NOT `elspeth.plugins.infrastructure.*`.**
   The module is stdlib-only (`re` + `urllib.parse`) and was already consumed
