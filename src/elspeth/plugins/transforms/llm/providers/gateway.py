@@ -51,6 +51,7 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
@@ -200,24 +201,44 @@ def _validate_contract_header(response: httpx.Response, contract_major: int) -> 
     (retrying the same request against the same mismatched contract cannot
     succeed).
     """
-    if response.headers.get(_GATEWAY_CONTRACT_HEADER) != str(contract_major):
+    if _GATEWAY_CONTRACT_HEADER not in response.headers or response.headers[_GATEWAY_CONTRACT_HEADER] != str(contract_major):
         raise LLMClientError(_STATIC_GATEWAY_ERROR, retryable=False)
 
 
-def _extract_gateway_error_code(response: httpx.Response) -> str | None:
-    """Read only ``error.code`` from a gateway error envelope.
+def _decode_gateway_json(response: httpx.Response, *, document: str) -> Any:
+    """Decode a gateway body as JSON, rejecting non-finite constants.
 
-    Never reads ``error.message`` (agency-adjacent free text) or any other
-    field. Any parse/shape failure returns ``None`` — callers fail closed
-    (non-retryable) rather than raise a second, unrelated exception.
+    Transport-level only: the per-document validators own every shape check
+    on the decoded value. ``document`` names the body in the (fixed-text)
+    failure message; the decoded content is never interpolated.
     """
     try:
-        data = json.loads(response.content, parse_constant=reject_nonfinite_constant)
-    except (ValueError, TypeError):
+        return json.loads(response.content, parse_constant=reject_nonfinite_constant)
+    except (ValueError, TypeError) as e:
+        raise LLMClientError(f"Gateway {document} is not valid JSON: {type(e).__name__}", retryable=False) from e
+
+
+@trust_boundary(
+    tier=3,
+    source="ELSPETH LLM Gateway decoded error envelope (externally derived)",
+    source_param="envelope",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns envelope.error.code when it is a str and None on any shape failure; "
+        "never raises on the envelope and never reads error.message"
+    ),
+    non_raising=True,
+)
+def _error_code_from_envelope(envelope: Any) -> str | None:
+    """Read only ``error.code`` from a decoded gateway error envelope.
+
+    Never reads ``error.message`` (agency-adjacent free text) or any other
+    field. Any shape failure returns ``None`` — callers fail closed
+    (non-retryable) rather than raise a second, unrelated exception.
+    """
+    if not isinstance(envelope, dict):
         return None
-    if not isinstance(data, dict):
-        return None
-    error = data.get("error")
+    error = envelope.get("error")
     if not isinstance(error, dict):
         return None
     code = error.get("code")
@@ -277,19 +298,58 @@ def _gateway_error_for_code(code: str | None) -> LLMClientError:
 
 
 def _classify_gateway_http_error(response: httpx.Response) -> LLMClientError:
-    return _gateway_error_for_code(_extract_gateway_error_code(response))
+    try:
+        envelope = _decode_gateway_json(response, document="error envelope")
+    except LLMClientError:
+        # An unparseable error body is itself a contract violation: fail
+        # closed, non-retryable, without raising a second unrelated error.
+        return LLMClientError(_STATIC_GATEWAY_ERROR, retryable=False)
+    return _gateway_error_for_code(_error_code_from_envelope(envelope))
 
 
-def _validate_readyz_adapter_identity(payload: dict[str, Any]) -> dict[str, str | int]:
-    """Validate the readyz ``adapter`` identity block's presence and shape.
+@trust_boundary(
+    tier=3,
+    source="ELSPETH LLM Gateway /readyz document (externally derived)",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises LLMClientError unless the body is a JSON object reporting ready=true with the configured contract_major, "
+        "a well-formed adapter identity block, the configured model alias, and a capabilities list covering every "
+        "required capability; never defaults a missing member"
+    ),
+    test_ref="tests/unit/plugins/llm/test_provider_gateway.py::TestReadyzPayloadBoundary::test_not_ready_document_raises",
+    test_fingerprint="358504b1b4521b75a73e9d01023904cedbdc854a8e5734930266cb1925607b1b",
+)
+def _validate_readyz_payload(
+    response: httpx.Response,
+    *,
+    contract_major: int,
+    model: str,
+    required_capabilities: tuple[str, ...],
+) -> dict[str, str | int]:
+    """Parse and validate a ``/readyz`` document against this configuration.
 
     Per the integration design ("checks gateway readiness, contract major,
     ADAPTER IDENTITY, model alias, and capabilities"), readiness is not just
-    ``ready: true`` — the adapter block must actually be there and shaped
-    right. This checks presence/shape and returns the values as forensic
-    metadata; it does NOT compare against an *expected* identity (that needs
-    a new GatewayConfig field, which is out of scope here — see the report).
+    ``ready: true`` — every declared member must be present and shaped right.
+    The adapter identity block is returned as forensic metadata; it is NOT
+    compared against an *expected* identity (that needs a new GatewayConfig
+    field, which is out of scope here — see the report).
     """
+    payload = _decode_gateway_json(response, document="readiness response")
+    if not isinstance(payload, dict):
+        raise LLMClientError("Gateway readiness response is not a JSON object", retryable=False)
+
+    # A readiness document alone is not health — but an unready document,
+    # or one that disagrees with our configuration, is still a config-level
+    # failure worth surfacing distinctly from "the actual completion failed"
+    # (checked next, in the caller).
+    if response.status_code != 200 or payload.get("ready") is not True:
+        raise LLMClientError("Gateway reports not ready", retryable=False)
+
+    if payload.get("contract_major") != contract_major:
+        raise LLMClientError("Gateway readiness contract_major does not match configuration", retryable=False)
+
     adapter = payload.get("adapter")
     if not isinstance(adapter, dict):
         raise LLMClientError("Gateway readiness adapter identity block is missing or malformed", retryable=False)
@@ -313,6 +373,24 @@ def _validate_readyz_adapter_identity(payload: dict[str, Any]) -> dict[str, str 
     ):
         raise LLMClientError("Gateway readiness adapter identity block is missing or malformed", retryable=False)
 
+    model_aliases = payload.get("model_aliases")
+    if not isinstance(model_aliases, list) or model not in model_aliases:
+        raise LLMClientError("Gateway readiness does not report the configured model alias", retryable=False)
+
+    declared_capabilities = payload.get("capabilities")
+    if not isinstance(declared_capabilities, list):
+        # Missing/malformed capabilities is a malformed document, NOT an
+        # empty declared set — treating it as empty would let a profile with
+        # no required_capabilities silently pass against a readyz body that
+        # never actually reported any.
+        raise LLMClientError("Gateway readiness capabilities field is missing or malformed", retryable=False)
+    missing = set(required_capabilities) - set(declared_capabilities)
+    if missing:
+        raise LLMClientError(
+            f"Gateway readiness does not report {len(missing)} required capabilit(y/ies)",
+            retryable=False,
+        )
+
     return {
         "name": name,
         "version": version,
@@ -321,6 +399,19 @@ def _validate_readyz_adapter_identity(payload: dict[str, Any]) -> dict[str, str 
     }
 
 
+@trust_boundary(
+    tier=3,
+    source="ELSPETH LLM Gateway chat-completion success body (externally derived)",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises LLMClientError (or a typed subclass of it) unless the body is a JSON object whose first choice carries "
+        "non-empty str content, whose usage values are finite, and whose model is a non-empty str; never echoes body "
+        "content into an exception message"
+    ),
+    test_ref="tests/unit/plugins/llm/test_provider_gateway.py::TestSuccessPathLeakGuard::test_sentinel_in_top_level_key_never_leaks",
+    test_fingerprint="88c7bc5e12f698e6b96cd00bf73dcbf3542e453e8f0ea9eebb3af96ba8f79bc6",
+)
 def _validate_gateway_success_response(
     response: httpx.Response,
     *,
@@ -332,11 +423,7 @@ def _validate_gateway_success_response(
     such as type/key names are safe to surface; response *content* is
     never echoed into an exception message).
     """
-    try:
-        data = json.loads(response.content, parse_constant=reject_nonfinite_constant)
-    except (ValueError, TypeError) as e:
-        raise LLMClientError(f"Gateway response is not valid JSON: {type(e).__name__}", retryable=False) from e
-
+    data = _decode_gateway_json(response, document="response")
     if not isinstance(data, dict):
         raise LLMClientError(f"Gateway response is not a JSON object: {type(data).__name__}", retryable=False)
 
@@ -346,12 +433,16 @@ def _validate_gateway_success_response(
         # data and must never be interpolated into an exception message.
         raise LLMClientError("Gateway response is missing 'choices'", retryable=False)
 
-    try:
-        content = choices[0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise LLMClientError(f"Gateway response has a malformed choice structure: {type(e).__name__}", retryable=False) from e
-
-    raw_finish_reason = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
+    # Shape is asserted member by member (never by catching KeyError/
+    # TypeError): only the member NAME reaches the message, never a value.
+    first_choice = choices[0] if isinstance(choices, list) else None
+    if not isinstance(first_choice, dict):
+        raise LLMClientError("Gateway response has a malformed choice structure: choices[0]", retryable=False)
+    message = first_choice.get("message")
+    if not isinstance(message, dict) or "content" not in message:
+        raise LLMClientError("Gateway response has a malformed choice structure: message.content", retryable=False)
+    content = message["content"]
+    raw_finish_reason = first_choice.get("finish_reason")
 
     if content is None:
         raise ContentPolicyError("Gateway returned null content (likely content-filtered upstream)")
@@ -698,43 +789,12 @@ class GatewayLLMProvider:
             # much a wire-contract violation as on /chat/completions.
             _validate_contract_header(response, self._contract_major)
 
-            try:
-                payload = json.loads(response.content, parse_constant=reject_nonfinite_constant)
-            except (ValueError, TypeError) as e:
-                raise LLMClientError("Gateway readiness response is not valid JSON", retryable=False) from e
-            if not isinstance(payload, dict):
-                raise LLMClientError("Gateway readiness response is not a JSON object", retryable=False)
-
-            # A readiness document alone is not health — but an unready
-            # document, or one that disagrees with our configuration, is
-            # still a config-level failure worth surfacing distinctly from
-            # "the actual completion failed" (checked next, in the caller).
-            if response.status_code != 200 or payload.get("ready") is not True:
-                raise LLMClientError("Gateway reports not ready", retryable=False)
-
-            if payload.get("contract_major") != self._contract_major:
-                raise LLMClientError("Gateway readiness contract_major does not match configuration", retryable=False)
-
-            self._last_readyz_adapter_identity = _validate_readyz_adapter_identity(payload)
-
-            model_aliases = payload.get("model_aliases")
-            if not isinstance(model_aliases, list) or model not in model_aliases:
-                raise LLMClientError("Gateway readiness does not report the configured model alias", retryable=False)
-
-            declared_capabilities = payload.get("capabilities")
-            if not isinstance(declared_capabilities, list):
-                # Missing/malformed capabilities is a malformed document, NOT
-                # an empty declared set — treating it as empty would let a
-                # profile with no required_capabilities silently pass
-                # against a readyz body that never actually reported any.
-                raise LLMClientError("Gateway readiness capabilities field is missing or malformed", retryable=False)
-            declared = set(declared_capabilities)
-            missing = set(self._required_capabilities) - declared
-            if missing:
-                raise LLMClientError(
-                    f"Gateway readiness does not report {len(missing)} required capabilit(y/ies)",
-                    retryable=False,
-                )
+            self._last_readyz_adapter_identity = _validate_readyz_payload(
+                response,
+                contract_major=self._contract_major,
+                model=model,
+                required_capabilities=self._required_capabilities,
+            )
         finally:
             http_client.close()
 
@@ -804,8 +864,11 @@ class GatewayLLMProvider:
             count = self._http_client_refs[cache_key] - 1
             self._http_client_refs[cache_key] = count
             if count <= 0:
-                client_to_close = self._http_clients.pop(cache_key, None)
-                self._http_client_refs.pop(cache_key, None)
+                # Both maps are written together in _get_http_client and the
+                # refcount presence was asserted above, so a missing entry
+                # here is a real invariant break, not an idempotent release.
+                client_to_close = self._http_clients.pop(cache_key)
+                del self._http_client_refs[cache_key]
         if client_to_close is not None:
             try:
                 client_to_close.close()

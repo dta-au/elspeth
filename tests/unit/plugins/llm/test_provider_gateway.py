@@ -33,7 +33,11 @@ from elspeth.plugins.infrastructure.clients.llm import (
     ServerError,
 )
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMProvider, LLMQueryResult
-from elspeth.plugins.transforms.llm.providers.gateway import GatewayLLMProvider, _validate_gateway_success_response
+from elspeth.plugins.transforms.llm.providers.gateway import (
+    GatewayLLMProvider,
+    _validate_gateway_success_response,
+    _validate_readyz_payload,
+)
 
 _ENDPOINT = "https://gateway.example.com/v1"
 _READYZ_ROOT = "https://gateway.example.com"
@@ -1089,3 +1093,18 @@ class TestRuntimePreflight:
             "adapter_api_major": 1,
             "fingerprint": "abc123",
         }
+
+
+class TestReadyzPayloadBoundary:
+    """Direct honesty proof for the ``_validate_readyz_payload`` boundary.
+
+    The preflight tests above drive the same checks through ``runtime_preflight``;
+    this one invokes the decorated function on its ``response`` parameter so the
+    ``@trust_boundary`` gate can bind a raising assertion to it.
+    """
+
+    def test_not_ready_document_raises(self) -> None:
+        response = httpx.Response(200, json=_readyz_body(ready=False), headers={_CONTRACT_HEADER: "1"})
+        with pytest.raises(LLMClientError) as exc_info:
+            _validate_readyz_payload(response, contract_major=1, model="standard", required_capabilities=())
+        assert exc_info.value.retryable is False

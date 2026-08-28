@@ -15,6 +15,7 @@ from elspeth.plugins.transforms.aws.textract_client import (
     TextractIdempotencyInvariantError,
     TextractResponseError,
     TextractServiceError,
+    _mapping,
     _record_send_attempt,
     build_textract_sdk_client,
 )
@@ -608,3 +609,11 @@ def test_start_audit_identity_projects_request_payload_without_bucket() -> None:
     assert request_payload["key"] == "scans/invoice.pdf"
     assert "bucket" not in request_payload
     assert "operator-owned-docs" not in repr(recorder.calls[0])
+
+
+@pytest.mark.parametrize("value", [None, [], "JobId", {1: "not a str key"}])
+def test_mapping_boundary_rejects_non_mapping_and_non_string_keys(value: object) -> None:
+    # ``@trust_boundary`` honesty proof for ``_mapping``'s ``value`` parameter:
+    # every SDK response passes through it before any member is read.
+    with pytest.raises(TextractResponseError):
+        _mapping(value)

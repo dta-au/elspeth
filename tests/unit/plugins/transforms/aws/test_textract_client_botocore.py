@@ -159,7 +159,7 @@ def test_start_document_analysis_queries_config_matches_the_service_model() -> N
                 feature_types=("QUERIES",),
                 queries=(
                     {"text": "What is the invoice total?", "alias": "total", "pages": ("1", "2-*")},
-                    {"text": "Who issued the invoice?"},
+                    {"text": "Who issued the invoice?", "alias": None, "pages": ()},
                 ),
                 client_request_token=_TOKEN,
             ).job_id

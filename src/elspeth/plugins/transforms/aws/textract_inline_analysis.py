@@ -420,9 +420,8 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
 
     def _get_row_client(self, state_id: str, *, token_id: str | None) -> TextractInlineClient:
         with self._row_clients_lock:
-            existing = self._row_clients.get(state_id)
-            if existing is not None:
-                return existing
+            if state_id in self._row_clients:
+                return self._row_clients[state_id]
             if self._recorder is None or self._sdk_client is None or not self._run_id:
                 raise FrameworkBugError("Amazon Textract inline transform used before on_start")
             client = TextractInlineClient(
@@ -447,8 +446,11 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         try:
             return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id)
         finally:
+            # The row client is created lazily at the SDK call, so a row that
+            # was rejected before reaching it never registered one.
             with self._row_clients_lock:
-                self._row_clients.pop(ctx.state_id, None)
+                if ctx.state_id in self._row_clients:
+                    del self._row_clients[ctx.state_id]
 
     def _read_document_bytes(self, row: PipelineRow) -> tuple[str, bytes] | TransformResult:
         """Resolve and locally validate the row's document bytes.

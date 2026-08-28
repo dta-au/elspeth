@@ -24,6 +24,7 @@ from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.freeze import deep_freeze, freeze_fields
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
 
@@ -47,12 +48,23 @@ _MAX_JOB_ID_LENGTH = 64
 _MAX_NEXT_TOKEN_LENGTH = 1024
 SDK_TOTAL_MAX_ATTEMPTS = 3
 
-_send_attempts = threading.local()
+
+class _SendAttempts(threading.local):
+    """Per-thread count of started botocore HTTP attempts for the in-flight call.
+
+    The class attribute is the per-thread initial value, so the slot exists on
+    every thread before its first ``before-send`` event fires.
+    """
+
+    count: int = 0
+
+
+_send_attempts = _SendAttempts()
 
 
 def _record_send_attempt(**_: Any) -> None:
     """Count one started HTTP attempt; registered on botocore's before-send event."""
-    _send_attempts.count = getattr(_send_attempts, "count", 0) + 1
+    _send_attempts.count += 1
 
 
 def _reset_send_attempts() -> None:
@@ -60,7 +72,7 @@ def _reset_send_attempts() -> None:
 
 
 def _observed_send_attempts() -> int:
-    return max(1, getattr(_send_attempts, "count", 0))
+    return max(1, _send_attempts.count)
 
 
 class TextractResponseError(ValueError):
@@ -144,6 +156,15 @@ class TextractSyncSDKClient(Protocol):
     def close(self) -> None: ...
 
 
+@trust_boundary(
+    tier=3,
+    source="botocore Amazon Textract response envelope (externally derived)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises TextractResponseError unless value is a Mapping whose every key is a str; never coerces or defaults",
+    test_ref="tests/unit/plugins/transforms/aws/test_textract_client.py::test_mapping_boundary_rejects_non_mapping_and_non_string_keys",
+    test_fingerprint="4ecbd9d50a771b063f92e0cd9bd8a08c899c08c98d51ddcdcba0006cd1380151",
+)
 def _mapping(value: object) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or not all(type(key) is str for key in value):
         raise TextractResponseError
@@ -160,14 +181,21 @@ def _bounded_string(value: object, *, maximum: int) -> str:
     return value
 
 
-def _parse_response_metadata(value: object) -> tuple[bool, int]:
-    if value is None:
+def _parse_response_metadata(response: Mapping[str, Any]) -> tuple[bool, int]:
+    """Return ``(request_id_present, attempts)`` from the response's ``ResponseMetadata``.
+
+    botocore attaches ``ResponseMetadata`` to every real response; a fake that
+    omits it counts as one attempt with no request id. Its two optional members
+    are read by presence — a present-but-malformed member fails closed rather
+    than defaulting.
+    """
+    if "ResponseMetadata" not in response:
         return False, 1
-    metadata = _mapping(value)
-    retry_attempts: object = metadata.get("RetryAttempts", 0)
+    metadata = _mapping(response["ResponseMetadata"])
+    retry_attempts: object = metadata["RetryAttempts"] if "RetryAttempts" in metadata else 0
     if type(retry_attempts) is not int or not 0 <= retry_attempts <= 10:
         raise TextractResponseError
-    request_id = metadata.get("RequestId")
+    request_id = metadata["RequestId"] if "RequestId" in metadata else None
     if request_id is not None and (type(request_id) is not str or not 1 <= len(request_id) <= 256):
         raise TextractResponseError
     return request_id is not None, retry_attempts + 1
@@ -178,17 +206,24 @@ def _fingerprint(value: str) -> str:
 
 
 def _query_request(queries: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Project the plugins' config-derived query mappings onto the SDK request shape.
+
+    ``queries`` is Tier-2: both Textract plugins build every entry from a
+    validated ``TextractQueryConfig`` with all three keys present (``alias``
+    is ``None`` and ``pages`` is empty when unset), so the keys are read
+    directly and only the values are re-asserted before they reach the wire.
+    """
     result: list[Mapping[str, Any]] = []
     for query in queries:
-        text = query.get("text")
-        alias = query.get("alias")
-        pages = query.get("pages", ())
+        text = query["text"]
+        alias = query["alias"]
+        pages = query["pages"]
         if type(text) is not str or not text:
             raise ValueError("Textract query text must be a non-empty string")
         if alias is not None and (type(alias) is not str or not alias):
             raise ValueError("Textract query alias must be a non-empty string when set")
-        if not isinstance(pages, Sequence) or isinstance(pages, (str, bytes, bytearray)):
-            raise ValueError("Textract query pages must be a sequence")
+        if type(pages) not in (list, tuple):
+            raise ValueError("Textract query pages must be a list or tuple")
         if any(type(page) is not str or not page for page in pages):
             raise ValueError("Textract query page selectors must be non-empty strings")
         request: dict[str, Any] = {"Text": text}
@@ -200,7 +235,24 @@ def _query_request(queries: Sequence[Mapping[str, Any]]) -> list[Mapping[str, An
     return result
 
 
+@trust_boundary(
+    tier=3,
+    source="botocore exception raised by an Amazon Textract SDK call (externally derived)",
+    source_param="error",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns a sanitized (code, retryable, attempts, idempotency_mismatch) tuple for every botocore exception; "
+        "an unrecognised exception class or a malformed error envelope classifies as a non-retryable unknown code and "
+        "never raises"
+    ),
+    non_raising=True,
+)
 def _provider_error(error: Exception, *, observed_attempts: int) -> tuple[str, bool, int, bool]:
+    """Classify one botocore exception into ELSPETH's sanitized error taxonomy.
+
+    The exception's ``response`` envelope is vendor data: every member is read
+    once, bounded, and re-asserted before it becomes part of the audit record.
+    """
     from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 
     if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
@@ -458,8 +510,10 @@ class TextractClient(_TextractAuditedClient):
             _reset_send_attempts()
             raw_response = self._sdk_client.start_document_analysis(**sdk_request)
             response = _mapping(raw_response)
-            request_id_present, attempts = _parse_response_metadata(response.get("ResponseMetadata"))
-            job_id = _bounded_string(response.get("JobId"), maximum=_MAX_JOB_ID_LENGTH)
+            request_id_present, attempts = _parse_response_metadata(response)
+            if "JobId" not in response:
+                raise TextractResponseError
+            job_id = _bounded_string(response["JobId"], maximum=_MAX_JOB_ID_LENGTH)
             receipt: StartAnalysisReceipt | None = StartAnalysisReceipt(job_id=job_id)
             response_payload = RawCallPayload(
                 {
@@ -552,9 +606,10 @@ class TextractClient(_TextractAuditedClient):
             _reset_send_attempts()
             raw_response = self._sdk_client.get_document_analysis(**sdk_request)
             response = _mapping(raw_response)
-            request_id_present, attempts = _parse_response_metadata(response.get("ResponseMetadata"))
-            raw_next_token = response.get("NextToken")
-            returned_next_token = None if raw_next_token is None else _bounded_string(raw_next_token, maximum=_MAX_NEXT_TOKEN_LENGTH)
+            request_id_present, attempts = _parse_response_metadata(response)
+            returned_next_token = (
+                _bounded_string(response["NextToken"], maximum=_MAX_NEXT_TOKEN_LENGTH) if "NextToken" in response else None
+            )
             semantic_response, frozen_semantic = self._bounded_semantic_response(
                 response,
                 exclude=frozenset({"ResponseMetadata", "NextToken"}),
@@ -716,7 +771,7 @@ class TextractInlineClient(_TextractAuditedClient):
             _reset_send_attempts()
             raw_response = self._sdk_client.analyze_document(**sdk_request)
             response = _mapping(raw_response)
-            request_id_present, attempts = _parse_response_metadata(response.get("ResponseMetadata"))
+            request_id_present, attempts = _parse_response_metadata(response)
             semantic_response, frozen_semantic = self._bounded_semantic_response(
                 response,
                 exclude=frozenset({"ResponseMetadata"}),
