@@ -490,3 +490,57 @@ class TestReplayedCallNestedMutationRejected:
         assert call.error_data is not None
         with pytest.raises(TypeError):
             call.error_data["detail"]["code"] = 999
+
+
+# ── deep_freeze must leave dataclasses discriminable by ``type(x) is C`` ─────
+
+
+class TestDeepFreezeLeavesDataclassesDiscriminable:
+    """``deep_freeze`` must return dataclass instances unchanged.
+
+    ``_compute_proof_diagnostics_for_source`` (``web/composer/tools/generation.py``)
+    discriminates the closed resolver union
+    ``ResolvedProofBlob | UnresolvedClaimedProofBlob | None`` with the house
+    ``type(x) is C`` idiom, routing a failed custody claim to the blocking
+    ``source_inspection_failed`` diagnostic. That idiom is sound there ONLY
+    while ``deep_freeze`` leaves the marker's exact type alone. The container
+    arm below pins the contrast that makes this load-bearing: for ``dict`` and
+    ``list``, freezing REWRITES the runtime type, so ``type(x) is dict`` on
+    anything below a frozen options bag is silently always-False — which is why
+    ``_value_transform_preserves_field`` must keep its ``isinstance`` guards.
+
+    Contracts does not depend on web, so the consumer type is imported locally.
+    """
+
+    def test_frozen_dataclass_survives_with_identity_and_exact_type(self) -> None:
+        from elspeth.web.composer.tools.generation import UnresolvedClaimedProofBlob
+
+        marker = UnresolvedClaimedProofBlob()
+
+        frozen = deep_freeze(marker)
+
+        assert frozen is marker
+        assert type(frozen) is UnresolvedClaimedProofBlob
+
+    def test_dataclass_nested_in_a_frozen_mapping_keeps_its_exact_type(self) -> None:
+        from elspeth.web.composer.tools.generation import UnresolvedClaimedProofBlob
+
+        marker = UnresolvedClaimedProofBlob()
+
+        frozen = deep_freeze({"resolved": marker})
+
+        assert isinstance(frozen, MappingProxyType)
+        assert frozen["resolved"] is marker
+        assert type(frozen["resolved"]) is UnresolvedClaimedProofBlob
+
+    def test_nested_containers_are_retyped_so_type_is_dict_would_be_always_false(self) -> None:
+        """The contrast: container types DO change, dataclass types do not."""
+        frozen = deep_freeze({"operations": [{"target": "amount"}]})
+
+        operations = frozen["operations"]
+        assert type(operations) is tuple
+        assert not isinstance(operations, list)
+
+        operation = operations[0]
+        assert type(operation) is not dict
+        assert isinstance(operation, Mapping)
