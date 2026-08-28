@@ -300,6 +300,32 @@ def test_unconfigured_profiled_source_is_coherent_across_every_reader() -> None:
     assert view.get_schema("sink", "aws_s3").name == "aws_s3"
 
 
+def test_unprofiled_plugin_is_granted_no_operator_profile_alias(view: PolicyCatalogView) -> None:
+    """A plugin absent from ``usable_profile_aliases`` gets ``()``, never a borrowed alias.
+
+    ``build_plugin_snapshot`` records an entry only for an
+    ``OPERATOR_PROFILED`` plugin, so ``source:csv`` — authored directly — is
+    absent. ``PolicyCatalogView._usable_profile_aliases`` answers that absence
+    with an explicit empty tuple, and every reader of it must stay restrictive:
+    the listing and schema keep the raw catalog projection (no synthetic
+    ``profile`` knob), and lowering refuses ``task-role`` even though that
+    alias is genuinely usable for the *profiled* ``transform:llm``. Widening
+    the absent branch would hand an unprofiled plugin the operator's private
+    binding, which is why the branch is spelled as a membership test with a
+    named empty answer rather than a defaulted read.
+    """
+    csv_id = PluginId("source", "csv")
+    assert csv_id not in dict(view.snapshot.usable_profile_aliases)
+    assert PluginId("transform", "llm") in dict(view.snapshot.usable_profile_aliases)
+
+    csv_summary = next(item for item in view.list_sources() if item.name == "csv")
+    assert "profile" not in {field.name for field in csv_summary.config_fields}
+    assert view.get_schema("source", "csv") == create_catalog_service().get_schema("source", "csv")
+
+    with pytest.raises(ValueError, match="profile_unavailable"):
+        view.lower_operator_profile_options(csv_id, alias="task-role", safe_options={})
+
+
 def test_trained_operator_view_still_offers_raw_s3_source_configuration() -> None:
     """The local MCP projection keeps unrestricted raw S3 configuration."""
     catalog = create_catalog_service()

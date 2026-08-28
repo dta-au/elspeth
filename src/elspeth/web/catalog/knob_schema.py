@@ -349,6 +349,11 @@ def _attach_default(field: KnobField, info: FieldInfo) -> None:
         # plain JSON values (the guided turn validator rejects str subclasses,
         # StrEnum included). Lower the member exactly as _kind_for_scalar
         # lowers the choice set, so ``default`` stays inside ``enum``.
+        # isinstance, not the house type()-is idiom: a member's concrete type
+        # is always the plugin-authored subclass, never Enum itself, so
+        # ``type(default) is Enum`` is unconditionally False and would ship
+        # the member unlowered. _kind_for_scalar asks the same question with
+        # issubclass on the class side.
         default = str(default.value)
     field["default"] = default
 
@@ -371,7 +376,10 @@ def _attach_required_when(field: KnobField, info: FieldInfo) -> None:
     model we author (``KnobSchema`` is Tier 1), so it raises at catalog load
     rather than silently shipping a form that under-gates a knob the composer
     will reject — the exact failure this predicate exists to prevent. The
-    membership-then-index shape mirrors ``_attach_tier`` / ``_is_composer_hidden``.
+    membership-then-index shape mirrors ``_attach_tier`` / ``_is_composer_hidden``,
+    and so does the exact-type test: the predicate is authored as a ``dict``
+    literal inside ``json_schema_extra`` (``config_base.py``) and lowers to the
+    ``VisibilityPredicate`` wire shape, so ``dict`` is the whole permitted set.
     """
     extra = info.json_schema_extra
     if type(extra) is not dict:
@@ -379,9 +387,9 @@ def _attach_required_when(field: KnobField, info: FieldInfo) -> None:
     if "composer_required_when" not in extra:
         return
     predicate = extra["composer_required_when"]
-    if not isinstance(predicate, Mapping) or frozenset(predicate) != _PREDICATE_KEYS:
+    if type(predicate) is not dict or frozenset(predicate) != _PREDICATE_KEYS:
         raise TypeError(
-            f"json_schema_extra['composer_required_when'] must be a mapping with keys {sorted(_PREDICATE_KEYS)}, got {predicate!r}"
+            f"json_schema_extra['composer_required_when'] must be a dict with exactly the keys {sorted(_PREDICATE_KEYS)}, got {predicate!r}"
         )
     target = predicate["field"]
     if type(target) is not str or not target:
