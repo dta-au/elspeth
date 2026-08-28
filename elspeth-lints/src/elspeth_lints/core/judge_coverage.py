@@ -672,9 +672,22 @@ def _load_entries_from_git(
     entries: list[AllowlistEntry] = []
     per_file_rules: list[PerFileRuleCoverageEntry] = []
     for rel_path in file_names:
-        if Path(rel_path).name == "_defaults.yaml":
+        # ``ls-tree -r`` is recursive while the HEAD loader is not. Key by the
+        # path relative to the allowlist dir and REFUSE a nested document
+        # rather than collapsing it to a basename that could shadow the real
+        # file (elspeth-3262174e37). Dot-prefixed subtrees are tool state.
+        source_file = Path(rel_path).relative_to(rel_dir).as_posix()
+        if source_file.startswith("."):
             continue
-        if not rel_path.endswith(".yaml"):
+        if "/" in source_file:
+            if not source_file.endswith((".yaml", ".yml")):
+                continue
+            raise JudgeCoverageError(
+                f"baseline {baseline_ref}:{rel_path}: allowlist YAML must sit directly in {rel_dir}; nested documents are refused"
+            )
+        if source_file == "_defaults.yaml":
+            continue
+        if not source_file.endswith(".yaml"):
             continue
         content = _git_show(
             baseline_ref=baseline_ref,
@@ -697,11 +710,11 @@ def _load_entries_from_git(
             entries.extend(
                 parse_allow_hits(
                     data,
-                    source_file=Path(rel_path).name,
+                    source_file=source_file,
                     allow_historical_missing_safety=True,
                 )
             )
-            per_file_rules.extend(_parse_per_file_rules_for_coverage(data, source_file=Path(rel_path).name))
+            per_file_rules.extend(_parse_per_file_rules_for_coverage(data, source_file=source_file))
         except AllowlistIOError as exc:
             raise JudgeCoverageError(f"baseline {baseline_ref}:{rel_path}: {exc}") from exc
     return entries, per_file_rules

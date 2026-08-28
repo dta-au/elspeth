@@ -116,18 +116,28 @@ def test_capture_source_snapshot_rejects_tracked_scanner_symlink(tmp_path: Path)
         capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
 
 
-def test_capture_source_snapshot_ignores_yaml_not_consumed_by_allowlist_loader(tmp_path: Path) -> None:
+def test_capture_source_snapshot_ignores_yml_not_consumed_by_allowlist_loader(tmp_path: Path) -> None:
     _repo_path, source_root, allowlist_dir = _repo(tmp_path)
     before = capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
-    nested = allowlist_dir / "nested" / "ignored.yaml"
-    nested.parent.mkdir()
-    nested.write_text("allow_hits: []\n", encoding="utf-8")
     yml = allowlist_dir / "ignored.yml"
     yml.write_text("allow_hits: []\n", encoding="utf-8")
 
     after = capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
 
     assert after == before
+
+
+def test_capture_source_snapshot_refuses_nested_yaml_rather_than_ignoring_it(tmp_path: Path) -> None:
+    """A nested allowlist document has no meaning; silently ignoring one is how a decoy hides (elspeth-3262174e37)."""
+    from elspeth_lints.core.allowlist import NestedAllowlistDocumentError
+
+    _repo_path, source_root, allowlist_dir = _repo(tmp_path)
+    nested = allowlist_dir / "nested" / "ignored.yaml"
+    nested.parent.mkdir()
+    nested.write_text("allow_hits: []\n", encoding="utf-8")
+
+    with pytest.raises(NestedAllowlistDocumentError, match=r"nested/ignored\.yaml"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
 
 
 def test_capture_source_snapshot_ignores_ambient_git_index_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

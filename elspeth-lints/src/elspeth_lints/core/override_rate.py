@@ -62,6 +62,7 @@ from typing import Any
 from elspeth_lints.core.allowlist import (
     AllowlistEntry,
     JudgeVerdict,
+    iter_allowlist_root_yaml_paths,
 )
 from elspeth_lints.core.allowlist_io import (
     AllowlistIOError,
@@ -495,10 +496,10 @@ def _collect_counter_records_from_allowlists(allowlist_root: Path) -> list[Judge
 
 def _compute_allowlist_hash(allowlist_root: Path) -> str:
     hasher = hashlib.sha256()
-    candidates = list(allowlist_root.rglob("*.yaml")) + list(allowlist_root.rglob("*.yml"))
-    for path in sorted(candidates, key=lambda p: p.relative_to(allowlist_root).as_posix()):
-        if COUNTER_SNAPSHOT_DIRNAME in path.parts:
-            continue
+    # Shared root walker: skips COUNTER_SNAPSHOT_DIRNAME and every other
+    # dot-prefixed tool-state directory, including the sign-bundle staging
+    # area whose candidate allowlists would otherwise perturb the hash.
+    for path in iter_allowlist_root_yaml_paths(allowlist_root):
         rel = path.relative_to(allowlist_root).as_posix()
         hasher.update(rel.encode("utf-8"))
         hasher.update(b"\0")

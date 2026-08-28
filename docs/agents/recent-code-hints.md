@@ -59,6 +59,22 @@ is a working document under the normal delivery posture.
   unless the operator separately changes the local fast-gate policy in
   `.pre-commit-config.yaml`.
 
+- **2026-08-28 — allowlist YAML enumeration is ONE non-recursive authority
+  that REFUSES nested documents:** `allowlist.iter_allowlist_yaml_paths`
+  (elspeth-3262174e37). `load_allowlist`, the source snapshot, and the
+  judge-coverage HEAD loader (`allowlist_io.iter_yaml_documents`) all share
+  it; a `*.yaml`/`*.yml` below the top level of an `enforce_*` dir raises
+  `NestedAllowlistDocumentError` (surfaced as `AllowlistIOError` /
+  `JudgeCoverageError`). The judge-coverage BASELINE side (`git ls-tree -r`)
+  refuses nested paths the same way and keys `source_file` by the
+  dir-relative path — never collapse a git path to its basename. Root-level
+  aggregators over `config/cicd` (`override_rate` hash,
+  `per_file_blanket_ratchet` HEAD) use `iter_allowlist_root_yaml_paths`,
+  which skips every dot-prefixed subtree: `.sign-bundle-transactions/`
+  materialises basename-colliding candidate allowlists on disk by design and
+  was protected only by being untracked. Do not add a private
+  `glob("*.yaml")`/`rglob` over allowlist dirs.
+
 - **2026-08-28 — there is ONE Python-file walk authority:
   `elspeth_lints.core.ast_walker`** (elspeth-faadf9873e). `iter_python_files`
   / `walk_python_files` prune `EXCLUDED_WALK_DIRS` (`.venv`, `.worktrees`,

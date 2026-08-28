@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from elspeth_lints.core.allowlist import AllowlistEntry, _parse_allow_hits
+from elspeth_lints.core.allowlist import AllowlistEntry, NestedAllowlistDocumentError, _parse_allow_hits, iter_allowlist_yaml_paths
 
 _HISTORICAL_BASELINE_SAFETY = "historical-baseline-unspecified"
 
@@ -55,9 +55,17 @@ def load_yaml_mapping_text(text: str, *, source_label: str) -> dict[str, Any]:
 
 
 def iter_yaml_documents(directory: Path) -> list[AllowlistYamlDocument]:
-    """Return parsed non-default YAML files in ``directory``."""
+    """Return parsed non-default YAML files in ``directory``.
+
+    Enumeration is the shared non-recursive authority, so a nested YAML
+    document is refused here exactly as ``load_allowlist`` refuses it.
+    """
     documents: list[AllowlistYamlDocument] = []
-    for yaml_file in sorted(directory.glob("*.yaml")):
+    try:
+        yaml_files = iter_allowlist_yaml_paths(directory)
+    except NestedAllowlistDocumentError as exc:
+        raise AllowlistIOError(str(exc)) from exc
+    for yaml_file in yaml_files:
         if yaml_file.name == "_defaults.yaml":
             continue
         try:

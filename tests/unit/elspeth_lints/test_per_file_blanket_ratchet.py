@@ -227,3 +227,17 @@ def test_judge_coverage_and_blanket_ratchet_share_duplicate_rule_validation() ->
 
     with pytest.raises(AllowlistIOError, match="duplicate rule ids"):
         _parse_per_file_rules_for_coverage(data, source_file="allowlist.yaml")
+
+
+def test_sign_bundle_staging_candidates_do_not_count_toward_head_blankets(tmp_path: Path) -> None:
+    """Staging copies every allowlist on disk; counting them doubles HEAD against a git baseline."""
+    from elspeth_lints.core.sign_bundle_transaction import TRANSACTION_DIRNAME
+
+    allowlist_root, baseline = _init_repo(tmp_path, _LEGACY_BLANKET)
+    candidate = allowlist_root / TRANSACTION_DIRNAME / "txn" / "candidate" / "enforce_example" / "allowlist.yaml"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text(_LEGACY_BLANKET, encoding="utf-8")
+
+    report = _check(allowlist_root=allowlist_root, baseline_ref=baseline, repo_root=tmp_path)
+
+    assert report.violations == ()

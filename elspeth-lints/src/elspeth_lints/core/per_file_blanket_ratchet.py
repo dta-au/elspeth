@@ -17,6 +17,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from elspeth_lints.core.allowlist import iter_allowlist_root_yaml_paths
 from elspeth_lints.core.allowlist_io import AllowlistIOError, load_yaml_mapping_text, parse_per_file_rules
 
 
@@ -154,8 +155,10 @@ def _cap_is_same_or_tighter(head: int | None, baseline: int | None) -> bool:
 
 def _load_head_blankets(*, allowlist_root: Path, repo_root: Path) -> list[PerFileBlanket]:
     entries: list[PerFileBlanket] = []
-    paths = sorted({*allowlist_root.rglob("*.yaml"), *allowlist_root.rglob("*.yml")})
-    for path in paths:
+    # Shared root walker: the sign-bundle staging area materialises
+    # basename-colliding candidate allowlists on disk; counting them here
+    # would double the HEAD blanket count against a git-enumerated baseline.
+    for path in iter_allowlist_root_yaml_paths(allowlist_root):
         try:
             text = path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -180,6 +183,8 @@ def _load_baseline_blankets(
     entries: list[PerFileBlanket] = []
     for source_file in sorted(listed.stdout.splitlines()):
         if not source_file.endswith((".yaml", ".yml")):
+            continue
+        if any(part.startswith(".") for part in Path(source_file).relative_to(relative_root).parts):
             continue
         shown = _run_git(["show", f"{baseline_ref}:{source_file}"], repo_root=repo_root)
         if shown.returncode != 0:
