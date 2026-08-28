@@ -701,9 +701,9 @@ def execute_tool(
         **_SECRET_DISCOVERY_TOOLS,
         **_SECRET_MUTATION_TOOLS,
     }
-    handler = all_handlers.get(tool_name)
-    if handler is None:
+    if tool_name not in all_handlers:
         return normalize_tool_result_validation(_failure_result(state, f"Unknown tool: {tool_name}"), catalog)
+    handler = all_handlers[tool_name]
     current_validation = prior_validation or catalog.validate_composition_state(state).validation
 
     if validate_arguments or raise_schema_argument_errors:
@@ -790,14 +790,14 @@ def execute_discovery_tool_with_context(
         **_BLOB_DISCOVERY_TOOLS,
         **_SECRET_DISCOVERY_TOOLS,
     }
-    handler = discovery_handlers.get(tool_name)
-    if handler is None:
+    if tool_name not in discovery_handlers:
         raise ToolArgumentError(
             argument="tool_name",
             expected="a declared read-only discovery tool",
             actual_type="mutation_or_unknown",
             code="DISCOVERY_ONLY",
         )
+    handler = discovery_handlers[tool_name]
     argument_error = _validate_tool_arguments(tool_name, arguments, state, raise_on_error=True)
     assert argument_error is None
     if _requires_secret_context(tool_name) and (context.secret_service is None or context.user_id is None):

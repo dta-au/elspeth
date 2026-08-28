@@ -100,6 +100,18 @@ _DECLINED_SECTION_REASONS: dict[str, str] = {
 }
 
 
+@trust_boundary(
+    tier=3,
+    source="operator-supplied runtime pipeline YAML document (untrusted import payload)",
+    source_param="doc",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises RuntimeYamlImportError naming every modelled ElspethSettings section the composer "
+        "cannot import; a section is never dropped silently"
+    ),
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_unimportable_sections_refuses_a_declined_section_by_name",
+    test_fingerprint="83b3cec68a80483e5281976e2b7ff8927fac25e34a07d973899f479f854f4f7b",
+)
 def _reject_unimportable_sections(doc: Mapping[str, object]) -> None:
     """Refuse a document carrying a modelled section the composer cannot hold.
 
@@ -203,6 +215,15 @@ def _optional_str(entry: Mapping[str, Any], key: str) -> str | None:
     raise RuntimeYamlImportError(f"{key} must be a string when provided")
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML entry mapping (untrusted import payload)",
+    source_param="entry",
+    suppresses=("R1", "R5"),
+    invariant="raises RuntimeYamlImportError unless the key holds a string with non-whitespace content; returns it stripped",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_require_nonblank_str_rejects_whitespace_only_value",
+    test_fingerprint="055b2f713425686dd80563642a6275630c63e51298621f99834b134a1a2c9cfd",
+)
 def _require_nonblank_str(entry: Mapping[str, Any], key: str, path: str) -> str:
     value = entry.get(key)
     if isinstance(value, str) and value.strip():
@@ -210,6 +231,17 @@ def _require_nonblank_str(entry: Mapping[str, Any], key: str, path: str) -> str:
     raise RuntimeYamlImportError(f"{path}.{key} must be a non-empty string")
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML node entry mapping (untrusted import payload)",
+    source_param="entry",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises RuntimeYamlImportError unless timeout_seconds is absent or a finite positive non-boolean number; an absent key yields None"
+    ),
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_finite_positive_timeout_rejects_non_numeric_value",
+    test_fingerprint="149c502e31fb45e2a4e74d429862cd6774d49829f670f0207d6e700dfca61a78",
+)
 def _finite_positive_timeout(entry: Mapping[str, Any], path: str) -> float | None:
     value = entry.get("timeout_seconds")
     if value is None:
@@ -253,6 +285,15 @@ def _string_tuple(value: Any, path: str) -> tuple[str, ...]:
     return tuple(items)
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML row_union branches value (untrusted import payload)",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=("raises RuntimeYamlImportError unless the value is a mapping or list carrying at least two unique non-blank branch strings"),
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_row_union_branches_rejects_non_string_branch_entry",
+    test_fingerprint="477860b5416edc3b66c4b071a63e2a1b9e778da629bd02716144f1544f16f3df",
+)
 def _row_union_branches(value: Any, path: str) -> dict[str, str] | tuple[str, ...]:
     if isinstance(value, Mapping):
         result: dict[str, str] = {}
