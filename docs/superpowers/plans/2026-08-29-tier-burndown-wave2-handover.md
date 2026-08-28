@@ -1,5 +1,15 @@
 # Tier burn-down — Wave 2 handover (2026-08-29, hub session "justify-burndown")
 
+> **WAVE 2 CLOSED 2026-08-29 at `feature/unified-lineage@9814aa794`.** Every outstanding item
+> below is DONE: B43c merged (0fa1f5d5c), lens A done + dispositioned (comments 8798/8801),
+> lensA-wording merged + symlink adjudication (2b6e87bc4), full suite green at 2b6e87bc4
+> (43,455 passed; the 2 failures were pre-wave — Codex-plan staging token + unpinned
+> f0e38838d policy-hash rotation — fixed 9814aa794 and re-run green), all 28 bucket issues
+> closed with commit anchor 9814aa794, observations swept (6 dismissed into the ledger).
+> **PAUSED before Wave 3 per John's instruction.** Sections below are preserved for the
+> re-stage seam and Wave-3 briefs.
+
+
 Plan: `docs/superpowers/plans/2026-08-28-tier-model-justify-burndown.md` (+ `.buckets.json`).
 Epic: `elspeth-3ab6107b1f`. Branch: `feature/unified-lineage`. Wave-2 base `2ca7d2227` → tip **`1ef98bcba`**.
 Wave-1 handover (still valid for its content): `2026-08-28-tier-burndown-wave1-handover.md`.
