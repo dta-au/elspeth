@@ -67,7 +67,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, get_args, get_origin
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -145,16 +145,3 @@ def env_placeholders_in(value: object) -> bool:
     if isinstance(value, list | tuple):
         return any(env_placeholders_in(item) for item in value)
     return False
-
-
-def annotation_declares_emitted_output(annotation: object) -> bool:
-    """Is this raw annotation an ``Annotated[..., EmittedToOutput(...)]``?
-
-    For callers holding an annotation rather than a pydantic field — chiefly
-    tests asserting that a declaration survives a refactor. Prefer
-    :func:`emitted_option_fields` when a model is available: pydantic normalises
-    inherited and unioned annotations, and this function does not.
-    """
-    if get_origin(annotation) is None:
-        return False
-    return any(isinstance(entry, EmittedToOutput) for entry in get_args(annotation)[1:])

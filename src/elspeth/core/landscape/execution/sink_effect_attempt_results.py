@@ -142,8 +142,11 @@ def decode_sink_effect_returned_result(
             diverted_ordinals=diverted_ordinals,
         )
     except (KeyError, TypeError, ValueError) as exc:
-        if isinstance(exc, LandscapeRecordError):
-            raise
+        # LandscapeRecordError descends from AuditIntegrityError, which descends
+        # straight from Exception — never from KeyError/TypeError/ValueError — so
+        # the envelope refusals raised inside this block (and by _load_descriptor)
+        # propagate past this handler already carrying their own message. Only a
+        # genuine shape fault from the payload reaches here.
         raise LandscapeRecordError("sink effect returned attempt result is incomplete or divergent") from exc
 
 

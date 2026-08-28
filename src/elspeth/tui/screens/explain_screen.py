@@ -205,13 +205,17 @@ class ExplainScreen:
                 artifacts_by_state_id: dict[str, list[Artifact]] = {}
                 artifacts_by_token_id: dict[str, list[Artifact]] = {}
                 if lineage_result.outcome is not None:
+                    # get_effect_artifact_members keys only those artifacts that join
+                    # a sink_effect with recorded members. A sink-effect artifact whose
+                    # members were never recorded is ABSENT from the mapping, not mapped
+                    # to an empty tuple, and indexes under no token.
                     effect_members = factory.query.get_effect_artifact_members(run_id)
                     for artifact in factory.execution.get_artifacts(run_id):
                         if artifact.producer_kind == "node_state":
                             assert artifact.produced_by_state_id is not None
                             artifacts_by_state_id.setdefault(artifact.produced_by_state_id, []).append(artifact)
-                        else:
-                            for token_id in effect_members.get(artifact.artifact_id, ()):
+                        elif artifact.artifact_id in effect_members:
+                            for token_id in effect_members[artifact.artifact_id]:
                                 artifacts_by_token_id.setdefault(token_id, []).append(artifact)
                 focused_tokens.append(self._token_display_info(lineage_result, artifacts_by_state_id, artifacts_by_token_id))
                 focused_state_by_node_id = {state.node_id: state for state in lineage_result.node_states}
