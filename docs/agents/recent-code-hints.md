@@ -8,6 +8,48 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
+  the negative branch.** Only `isinstance` removes `list` from the non-list
+  arm under mypy; the exact-type form leaves the else-branch type untouched.
+  So `type(x) is C` is the right shape for validating a scalar (it also
+  subsumes the bool-vs-int special case, since `type(True) is int` is False),
+  but it is NOT a drop-in for a union discriminator whose else-branch is
+  used — check the else branch under mypy before converting
+  (`engine/executors/state_guard.py:399`: the mapping arm is only assignable
+  without a cast because `isinstance` narrowed `list` out of it). It is also
+  not a drop-in for a container check whose fall-through is a failure path:
+  `aws_s3_sink._json_value_chars` (B16) must accept exactly what
+  `json.JSONEncoder` accepts, and `json` dispatches on `isinstance`, so an
+  exact-type test there would send every `dict`/`list` SUBCLASS the encoder
+  happily serialises down the "unsupported value" arm and mis-size the
+  estimate. Tree-wide consequence (audit lens B, epic comment 8726): the
+  Wave-1 burn-down converted ~50 `isinstance` checks to `type(x) is C` /
+  `type(x) in {...}` across 17 files (`git diff ff917243a..a4f633728 --
+  src/`), which is an undocumented commitment that these ELSPETH-owned
+  types are CLOSED — a subclass instance will DIVERT or be rejected at
+  those sites, never pass: `SinkEffectPipelineMembersInput`,
+  `SinkEffectPlan`, `SinkEffectMember`, `SinkEffectInspection`,
+  `SinkEffectExecutionPurpose`, `NodeStateStatus`, `DiversionAttribution`,
+  `AuditExportSnapshotChunkInput`, and the composer node models
+  `nodes.Name`, `nodes.Output`, `nodes.TemplateData`; the same sites pin the
+  builtins `str`/`int`/`float`/`bool`/`bytes`/`dict`/`list`/`tuple` and
+  `MappingProxyType` exactly. Do not subclass one of these expecting the
+  parent's checks to admit it — add the subclass to the check (or restore
+  `isinstance` with an explicit rationale) in the same change.
+
+- **2026-08-29 — when a decode helper's return type is a union keyed on an
+  argument, `@overload` on that argument's `Literal` removes the caller-side
+  re-checks.** `_returned_attempt` in `engine/executors/sink_effects.py` is
+  overloaded on `action: Literal[SinkEffectAttemptAction.INSPECT | COMMIT |
+  RECONCILE]`, so each call site gets the concrete result type and the five
+  unreachable "decoded to the wrong result type" raises were deleted rather
+  than rationalised. Trap: overload stubs are class-body statements, so
+  adding them shifts every later `body[N]` index in the class — any signed
+  tier_model allowlist entry whose `ast_path` runs through that class
+  (`config/cicd/enforce_tier_model/*.yaml`) goes stale. Re-derive the ast
+  paths after adding overloads (and place any NEW helper after the last
+  signed site in the class, not before it, when you can).
+
 - **2026-08-29 — a tier_model R1 `d.get(k, DEFAULT)` sitting right after
   `if k in d or <helper>(...)` is usually a DEFECT, not a justify candidate.**
   Check whether the helper caches the key before it returns True. In

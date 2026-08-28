@@ -34,6 +34,7 @@ from elspeth.contracts.sink_effects import (
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.orchestrator.preflight import validate_sink_effect_capability
 from elspeth.plugins.sinks import _remote_object_effects as remote_effects
+from elspeth.plugins.sinks._remote_object_effects import RemoteObjectPreconditionError
 from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink, S3ConditionalWriteRejectedError
 from elspeth.plugins.sinks.azure_blob_sink import AzureBlobSink
 from tests.fixtures.base_classes import inject_write_failure
@@ -508,15 +509,66 @@ def test_azure_fresh_process_successor_and_response_loss_reconcile() -> None:
 
 
 def test_non_azure_exception_named_resource_not_found_is_not_absence() -> None:
+    """Absence is the Azure SDK's ResourceNotFoundError by identity, not by name or message."""
+    store = _AzureStore()
+    sink = _azure(store)
     pretender_type = type("ResourceNotFoundError", (Exception,), {})
-    pretender = pretender_type("not an Azure SDK error")
+    store.control = pretender_type("ResourceNotFoundError: not an Azure SDK error")
 
-    assert AzureBlobSink._is_missing(pretender) is False
+    with pytest.raises(pretender_type):
+        sink.inspect_effect(
+            SinkEffectInspectionRequest(effect_id="d3" * 32, target="{}", predecessor_descriptor=None),
+            _CTX,
+        )
+
+    assert [request["operation"] for request in store.requests] == ["properties"]
 
 
-def test_azure_properties_require_the_declared_sdk_contract() -> None:
-    with pytest.raises(TypeError):
-        AzureBlobSink._observation_from_properties(object())
+def _blob_properties(**overrides: object) -> SimpleNamespace:
+    fields: dict[str, object] = {
+        "size": 3,
+        "etag": '"etag-1"',
+        "metadata": {"elspeth_effect_id": "a" * 64},
+        "content_settings": SimpleNamespace(content_md5=b"\x01" * 16),
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+@pytest.mark.parametrize(
+    "properties",
+    [
+        object(),
+        _blob_properties(size="3"),
+        _blob_properties(size=-1),
+        _blob_properties(etag=""),
+        _blob_properties(etag=b"etag"),
+        _blob_properties(metadata=[("elspeth_effect_id", "a" * 64)]),
+        _blob_properties(metadata={"elspeth_effect_id": 7}),
+        _blob_properties(metadata={"elspeth_effect_id": ""}),
+        _blob_properties(content_settings=None),
+        _blob_properties(content_settings=SimpleNamespace()),
+        _blob_properties(content_settings=SimpleNamespace(content_md5="AQEBAQEBAQEBAQEBAQEBAQ==")),
+        _blob_properties(content_settings=SimpleNamespace(content_md5=b"\x01" * 15)),
+    ],
+)
+def test_azure_malformed_blob_properties_are_rejected(properties: object) -> None:
+    """A missing, None, or malformed SDK field is precondition evidence, never a raw AttributeError."""
+    with pytest.raises(RemoteObjectPreconditionError, match=r"Azure blob"):
+        AzureBlobSink._observation_from_properties(properties)  # type: ignore[arg-type]
+
+
+def test_azure_well_formed_blob_properties_parse_into_an_owned_observation() -> None:
+    observation = AzureBlobSink._observation_from_properties(
+        _blob_properties(content_settings=SimpleNamespace(content_md5=bytearray(b"\x01" * 16)))  # type: ignore[arg-type]
+    )
+
+    assert observation.exists is True
+    assert observation.size_bytes == 3
+    assert observation.etag == '"etag-1"'
+    assert observation.effect_id == "a" * 64
+    assert observation.checksum_algorithm == "md5"
+    assert observation.checksum_b64 == base64.b64encode(b"\x01" * 16).decode("ascii")
 
 
 def test_azure_prepare_missing_owned_inspection_evidence_raises() -> None:
