@@ -45,7 +45,15 @@ def _dotted_name(expr: ast.expr) -> tuple[str, ...] | None:
 
 
 def resolve_boundary_kind(func: ast.expr, import_aliases: Mapping[str, str]) -> BoundaryDecoratorKind | None:
-    """Resolve a marker only when its root has a proven canonical import."""
+    """Resolve a marker only when its root has a proven canonical import.
+
+    Coupling: ``masquerade.inventory._may_carry_boundary_decorator`` skips
+    the alias-tracking visitor for a file on the strength of this function's
+    necessary condition — a ``Call`` decorator whose root name is bound by a
+    proven absolute import targeting ``elspeth`` or ``elspeth.*``. Widening
+    resolution here (relative imports, assignment aliases, bare decorators)
+    without widening that pre-check turns it into a silent false negative.
+    """
     parts = _dotted_name(func)
     if parts is None:
         return None
