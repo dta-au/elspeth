@@ -44,3 +44,27 @@
 - WAVE-END MANDATORY [DONE 2026-08-28 — lens A comment 8798 ran a range-wide sweep over 2ca7d2227..d68447450: B43b tool_batch is the ONLY hit; every other added exact-type site reads pydantic/json.loads/to_dict/deep_thaw output or is frozen-aware]: re-run the frozen-narrowing audit over 92a846c66..tip (merges after the first audit: B41 6cada217b, B50 2ce7446f9, B32 d1f88d7d9, B46 d549399b5, B39b/c, B55 1354c95ee, B29 e3f2e1896, B45 7228f2b39, B43b ce399cd1b, B40 pending) with the polarity-first heuristic and the "check the dataclass that holds the field" rule.
 - OPERATOR (B40 obs elspeth-obs-e2ff0cc748): _common.py per-file rules — R1 rule now 'Unused' (delete), R5 rule ratchet 13→7; both reason prose stale. LINT FACT: boundary-suppressed sites DO stop counting toward max_hits (narrows B37 note).
 - W2 AUDIT lens B (#8797): F1 = known B43b (fix in flight); F2 low (str-subclass tolerance divergence _node_str_option vs _backend_surface_args_for_site, no production path); F3 → bug filed (run_status_projection.py:207). OPEN from lens B: composer-invariant 'server authors pipeline structure' half UNSWEPT — lens A must cover or it stays an explicit gap in the wave sign-off.
+
+## WAVE 3 PREP (2026-08-29, hub; DISPATCH AWAITS JOHN'S GO)
+- Scope per plan doc (authoritative over the handover's compressed line): Wave 3 = B54 (web/plugin_policy)
+  + B56–B61 (web/sessions). B26–28 (_aws_ecs_acceptance, 455 raw lines incl. suppressed) stay Wave 4,
+  pending the module-level @trust_boundary decision John reserved.
+- Live counts at base (corpus @2b6e87bc4, findings only, R_TB_SUPPRESSED excluded): B54=121, B56=161,
+  B57=39, B58=11 (+engine.py), B59=32, B60=53 (+routes/messages.py, routes/composer/{proposals,compose}.py),
+  B61=58 — 475 total. Worklists: scratchpad `worklists3/B*.md` (per-file findings + signed entries binding
+  each file). Brief: scratchpad `LANE_BRIEF_W3.md` (amends `LANE_BRIEF_W2.md`, which applies verbatim).
+- Signed coverage in scope: 44 entries across web/sessions (guided.py 16, _helpers.py 14, state.py 4,
+  schema.py 4, service.py 3, compose.py 2, messages.py 2, _auto_title/engine/proposals 1 each); ZERO in
+  plugin_policy — B54 works its whole corpus with no subtraction. Honest-fix-wins ruling applies.
+- Rounds: R1 = B56 (fable, SOLO — nothing else touches web/sessions while it runs) + B54 (opus) +
+  hygiene lane (opus: the wave-end hygiene list above — provenance pins for _discover_blob_rows_sources
+  + normalize_set_pipeline_redacted_arguments, knob_schema accept-gates fail-closed w/ frozen-input pin,
+  planner_authoring_aids `.get(plugin_id, ())` honest fix, _canonical_state_from_private_pipeline bare
+  TypeError → consider AuditIntegrityError). R2 after B56 merges = B57 B59 B60 B61 B58 (opus). ≤`-n 2`
+  per lane; every brief mandates an explicit `-n` (elspeth-xdist-auto defaults to `-n auto`).
+- Wave-end gates: two-lens control-location audit (wave-1 lens B mandated a repeat "esp. B38/B54"),
+  range-wide frozen-narrowing sweep, full suite in a worktree (`-n 16`, background), close issues, PAUSE
+  before Wave 4. Filigree bucket issues are NOT created yet — create under epic elspeth-3ab6107b1f at
+  dispatch.
+- Still owed before the re-stage (NOT a Wave-3 gate): elspeth-23ee8e3440 (stage_status --lanes /
+  --continue-on-block) and the operator's check-judge-quality re-run for the f0e38838d rotation.
