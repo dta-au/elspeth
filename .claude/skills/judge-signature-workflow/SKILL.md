@@ -84,6 +84,16 @@ bundles must be re-staged.
    preview on it (a verdict for a different rationale is stale evidence).
    Refuses stale bundles, unknown keys, and empty rationales. Args:
    `bundle_id`, `rationales`.
+   **Authoring rule (judge policy, 2026-08-28):** when a rationale locates
+   the real control somewhere other than the flagged site ("the in-
+   transaction check in `X` raises; `test_y` pins it"), name that control
+   and its pinning test by SYMBOL / nodeid — never by line number, which
+   rots while the signature stays valid — and make sure the excerpt does
+   not contradict its reachability on every path the flagged site covers.
+   The judge now checks control-location claims explicitly (decision
+   question 7): an unverifiable one is BLOCK-PENDING, a contradicted one is
+   BLOCKED. The mirror error is worse than a block: a suppression justified
+   by "X already checks this" where X is not reached deletes the only gate.
 4. **`stage_preview`** (needs installed + authenticated Codex CLI and the
    `[mcp]` extra) — run the read-only Codex judge over each `new_judgment`
    action and record a **non-authoritative** preview (`authoritative=False`);

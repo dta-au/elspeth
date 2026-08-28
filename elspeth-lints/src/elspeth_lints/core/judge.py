@@ -186,6 +186,26 @@ disposition you found (RULE MISFIRES / GENUINE VIOLATION / PRESCRIBED
 FORM / BLOCK-PENDING) so the basis of the verdict is captured in the
 audit record.
 
+CONTROL-LOCATION CLAIMS — a rationale that says "the real gate lives
+elsewhere" (another function, a caller, an in-transaction check, a
+pinning test) is making a checkable claim, and it is the single most
+common way a wrong suppression gets signed. Two failure shapes, both
+seen in the 2026-08-28 burn-down audit:
+  (a) a contained/swallowed signal that LOOKS like a lost integrity gate
+      but the real gate is elsewhere — the rationale is right only if it
+      NAMES that gate by symbol and the code you can see is consistent
+      with it being reached on every path the flagged site covers;
+  (b) a removal or narrowing justified by "X already checks this" where
+      X does not exist, is not reached on the flagged path, or checks a
+      different property — the suppression then deletes the only control.
+Hold such a rationale to this bar: the control is named by SYMBOL (not a
+line number — lines rot while the signature stays valid), the visible
+code does not contradict its reachability, and a pinning test is named
+by nodeid where one is claimed. In tool mode, READ the named control and
+its test before crediting them. A control-location claim you cannot
+verify is BLOCK-PENDING, not ACCEPTED; a claim the code contradicts is
+GENUINE VIOLATION.
+
 You do NOT propose a code fix. Your only outputs are a verdict and the
 reasoning behind it. If the suppression is wrong, the agent is
 responsible for remediation — refactor, broaden a per-file rule, move the
@@ -823,6 +843,12 @@ BLOCKED and make that uncertainty visible with lower ``confidence``.
 6. Apply the fabrication-decision test if the rationale proposes to
    fill in an absent field with anything other than ``None``. If the
    answer is "this is fabrication", BLOCK.
+
+7. Does the rationale locate the real control somewhere other than the
+   flagged site? (CONTROL-LOCATION CLAIMS above.) If yes, name the
+   control by symbol in your recorded rationale and state whether you
+   verified it (read it / saw it in the excerpt / could not). Unverified
+   → BLOCK-PENDING; contradicted → BLOCKED.
 
 Also inspect ``allowlist_similarity`` in the request payload. A high
 ``rationale_duplicate_count`` or similar boilerplate entries is evidence
