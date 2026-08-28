@@ -180,24 +180,38 @@ is a working document under the normal delivery posture.
   swap: that deletes the real type check to change a lint shape. Such a site
   is a justify candidate, not a conversion candidate.
 
-- **2026-08-29 — converting an `isinstance` that has a LIVE signed tier-model
-  allowlist entry turns that entry into stale drift; the live run, not the
-  worklist's raw section, tells you which sites those are.** The keyless
-  `--rules all` run reports a signed entry's site as a finding anyway
-  (signature verification is fail-closed without the operator key), so a site
-  can look un-allowlisted while a matching, judge-ACCEPTED, non-expired entry
-  exists. Rewriting it re-rolls the `fp=` key, nothing matches, and the gate
-  gains a `Stale tier-model allowlist entry` line — a net worsening, since
-  `config/cicd/enforce_tier_model/*.yaml` is not agent-editable. Measured in
-  B41 on `sessions.py:R5:_detect_unresolved_interpretation_placeholders_typed`
-  (`fp=d39651187f78a341`, judge_verdict ACCEPTED, expires 2026-10-06): the
+- **2026-08-29 — how to tell which of your findings sit at SIGNED allowlist
+  sites, and what that does (and does NOT) change. CORRECTED by John's ruling
+  — signature churn is never a reason to withhold a fix.** The mechanism
+  first: the keyless `--rules all` run reports a signed entry's site as a
+  finding anyway (signature verification is fail-closed without the operator
+  key), so a site can look un-allowlisted while a matching, judge-ACCEPTED,
+  non-expired entry exists. Rewriting such a site re-rolls its `fp=` key,
+  nothing matches, and the gate gains a `Stale tier-model allowlist entry`
+  line. Measured in B41 on
+  `sessions.py:R5:_detect_unresolved_interpretation_placeholders_typed`
+  (`fp=d39651187f78a341`, judge_verdict ACCEPTED, expires 2026-10-06): an
   `isinstance(prompt_template, str)` → `type(...) is not str` conversion
-  removed one R5 and added one stale entry, and was reverted. The reliable
-  discriminator is the LIVE run (real allowlist) against the file: a site the
-  worklist's allowlist-DISABLED "raw findings" section lists but the live run
-  does NOT report is already covered by a signed entry — leave it alone. Take
-  the baseline AFTER `git merge feature/unified-lineage`, or sibling lanes'
-  merged work shows up as your own whole-tree delta.
+  removed one R5 and added one stale entry.
+  **The ruling: an honest fix is ALWAYS preferred to minimising churn —
+  signing effort is the lowest priority, behind clean honest code.** So if the
+  right code change removes a finding at a signed site (binding or stale),
+  MAKE IT; the entry becomes `stale_delete` and the operator re-signs once.
+  An earlier version of this entry said "leave it alone" — that was wrong, and
+  B41 reverted its conversion for the wrong reason. What the signed/unsigned
+  distinction is actually good for is narrower: (a) do NOT write a rationale
+  that merely restates a still-binding signed ruling for code you did not
+  change — either change the code or leave the site entirely alone; (b) a
+  stale-signed site is UNCOVERED, so fix or rationalise it like any other
+  finding. To identify them, diff the LIVE run (real allowlist) against the
+  worklist's allowlist-DISABLED "raw findings" section: a site listed in the
+  raw section that the live run does NOT report is covered by a binding
+  signed entry. (B41 ultimately left that site as `isinstance` on its own
+  merits — it is the prescribed maximally-informative Tier-3 form, and an
+  exact-type check would newly reject the three `str` subclasses the tree
+  defines — not to protect the signature.) Unrelated but same lane: take the
+  baseline AFTER `git merge feature/unified-lineage`, or sibling lanes' merged
+  work shows up as your own whole-tree delta.
 
 - **2026-08-29 — the `@trust_boundary` suppressor also loses the derived-name
   trail through a `try:` whose handler RETURNS, so the decode-then-read idiom
