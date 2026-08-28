@@ -38,6 +38,9 @@ Two independent lenses over `ff917243a..a4f633728` (comments 8724 lens A, 8726 l
 11. Cap: 8 lanes × `-n 2`; a held lane's slot can host a small extra lane (BS1).
 12. Wave-2 hot spots: B38 `guided/planning.py` (178, 133×R1) and B54 `plugin_policy` (121) = ONE parse boundary per payload type, not 100+ edits; B56 `sessions/service.py` (13.6k LOC) solo in Wave 3; B26–28 acceptance harness = boundary decision first (Wave 4).
 
+## Judge policy change (f0e38838d)
+Control-location claims are now a named fault class in the judge's static policy (`elspeth-lints/src/elspeth_lints/core/judge.py`, decision question 7) + two corpus cases. `JUDGE_POLICY_HASH` changed → **operator must re-run the real-LLM `check-judge-quality` gate** (`config/cicd/judge-quality-corpus/README.md`) before the next `sign-bundle`; agents cannot (needs Codex/key). Annotate briefs: name controls by symbol + test nodeid, never line numbers.
+
 ## Open items (tracker)
 - `elspeth-6a9eb088c6` P1 bug: `sink.py` runtime_checkable Protocol as dispatch control — own lane (edits masquerade test doubles).
 - `elspeth-fdf115047f` P3: six Wave-1 code residuals (lease-owner dup, S3 spool leak, Textract binding parity, json_expand missing text_field routing, `_events_attempted` lock, stale docstring).
