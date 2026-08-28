@@ -28,8 +28,18 @@ from elspeth.web.composer.source_demand import (
     parse_source_data_contract_accepted_fields,
     source_data_contract_artifact_hash,
 )
+
+# ``SOURCE_AUTHORING_KEY`` is re-exported in the explicit ``X as X`` form on
+# purpose. Six composer modules (service, pipeline_proposal,
+# reviewed_source_authority, tools/_common, tools/sources, tools/sessions)
+# source this key from the interpretation-state facade rather than from
+# composer.state; this module declares no ``__all__``, so under mypy's
+# no_implicit_reexport the plain import form makes every one of those imports
+# an attr-defined error (introduced by 3dc67fb1d).
 from elspeth.web.composer.state import (
-    SOURCE_AUTHORING_KEY,
+    SOURCE_AUTHORING_KEY as SOURCE_AUTHORING_KEY,
+)
+from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
     SourceSpec,
