@@ -306,6 +306,11 @@ def prepare_audit_export_snapshot(
     """Reuse or durably materialize one immutable export snapshot winner."""
     if type(config) is not LandscapeExportSettings:
         raise TypeError("config must be exact LandscapeExportSettings")
+    # No isinstance gate on AuditExportContentStore: it is a runtime_checkable
+    # Protocol, so the check admits any object carrying the right attribute names
+    # and rejects honest dynamic-attribute ones (ADR-032 rule 3). The binding
+    # controls are this durability proof and the identifier/namespace assertions
+    # the resolver runs on register() two statements below.
     if not content_store.is_durable():
         raise TypeError("content_store must implement durable AuditExportContentStore")
     resolver = content_store_resolver or AuditExportContentStoreResolver()
