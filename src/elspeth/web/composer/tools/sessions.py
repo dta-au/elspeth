@@ -297,6 +297,66 @@ def _options_with_inline_blob_source_review(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="LLM composer set_pipeline tool-call pipeline payload (planner-authored nodes/source/sources blocks)",
+    source_param="source_block",
+    suppresses=("R5",),
+    invariant="a non-mapping source block or non-mapping options is returned unchanged; never raises on source_block",
+)
+def _canonicalize_authored_source_block(
+    source_block: Any,
+    *,
+    source_name: str,
+    current_state: CompositionState | None,
+) -> Any:
+    """Canonicalise one planner-authored source block's review requirements.
+
+    The source-side half of
+    :func:`canonicalize_authored_node_review_requirements`, lifted to module
+    scope so its Tier-3 shape guards sit on their own boundary parameter
+    rather than on a closure variable the enclosing boundary cannot vouch
+    for. Copy-on-write and idempotent, exactly like the node arm: a block
+    whose options already canonicalise to themselves is returned unchanged.
+    """
+    if not isinstance(source_block, Mapping):
+        return source_block
+    options = source_block["options"] if "options" in source_block else None
+    if not isinstance(options, Mapping):
+        return source_block
+    admission_error = _resolver_owned_interpretation_requirement_error(
+        options,
+        tool_name="set_pipeline",
+        component_id=_source_component_id(source_name),
+        source=True,
+    )
+    if admission_error is not None:
+        # Reviewed source authority may intentionally carry canonical
+        # resolver output. The raw candidate boundary decides whether that
+        # authority is trusted; never rewrite it here.
+        return source_block
+    canonical_options = _canonicalize_authored_interpretation_requirements(
+        options,
+        component_id=_source_component_id(source_name),
+        source=True,
+        existing_options=(
+            current_state.sources[source_name].options if current_state is not None and source_name in current_state.sources else None
+        ),
+    )
+    if canonical_options is options:
+        return source_block
+    canonical_source = dict(source_block)
+    canonical_source["options"] = canonical_options
+    return canonical_source
+
+
+@observation_boundary(
+    tier=3,
+    source="LLM composer set_pipeline tool-call pipeline payload (planner-authored nodes/source/sources blocks)",
+    source_param="pipeline",
+    suppresses=("R5",),
+    invariant="every shape guard on pipeline returns the offending node or block unchanged; never raises on pipeline",
+)
 def canonicalize_authored_node_review_requirements(
     pipeline: Mapping[str, Any],
     *,
@@ -369,45 +429,22 @@ def canonicalize_authored_node_review_requirements(
     if nodes_changed:
         normalized["nodes"] = new_nodes
 
-    def _canonicalize_source_block(source_block: Any, *, source_name: str) -> Any:
-        if not isinstance(source_block, Mapping):
-            return source_block
-        options = source_block["options"] if "options" in source_block else None
-        if not isinstance(options, Mapping):
-            return source_block
-        admission_error = _resolver_owned_interpretation_requirement_error(
-            options,
-            tool_name="set_pipeline",
-            component_id=_source_component_id(source_name),
-            source=True,
-        )
-        if admission_error is not None:
-            # Reviewed source authority may intentionally carry canonical
-            # resolver output. The raw candidate boundary decides whether that
-            # authority is trusted; never rewrite it here.
-            return source_block
-        canonical_options = _canonicalize_authored_interpretation_requirements(
-            options,
-            component_id=_source_component_id(source_name),
-            source=True,
-            existing_options=(
-                current_state.sources[source_name].options if current_state is not None and source_name in current_state.sources else None
-            ),
-        )
-        if canonical_options is options:
-            return source_block
-        canonical_source = dict(source_block)
-        canonical_source["options"] = canonical_options
-        return canonical_source
-
     if "source" in normalized:
-        canonical_source = _canonicalize_source_block(normalized["source"], source_name="source")
+        canonical_source = _canonicalize_authored_source_block(
+            normalized["source"],
+            source_name="source",
+            current_state=current_state,
+        )
         if canonical_source is not normalized["source"]:
             normalized["source"] = canonical_source
     sources = normalized["sources"] if "sources" in normalized else None
     if isinstance(sources, Mapping):
         canonical_sources = {
-            source_name: _canonicalize_source_block(source_block, source_name=str(source_name))
+            source_name: _canonicalize_authored_source_block(
+                source_block,
+                source_name=str(source_name),
+                current_state=current_state,
+            )
             for source_name, source_block in sources.items()
         }
         if any(canonical_sources[name] is not sources[name] for name in sources):
@@ -623,9 +660,14 @@ def build_set_pipeline_candidate(
             or authority.session_id != context.session_id
         ):
             return None
-        matches = [
-            value for value in authority.reviewed_sources.values() if isinstance(value, Mapping) and value.get("name") == source_name
-        ]
+        # Every ``reviewed_sources`` value is already a mapping by
+        # construction: ``ReviewedSourceAuthority.__post_init__`` rejects a
+        # non-mapping value with TypeError, and the type's sole constructor
+        # (``resolve_reviewed_source_authority`` — the only one in the tree)
+        # raises AuditIntegrityError on the same shape before that. The
+        # ``type(authority) is`` check above is what makes those invariants
+        # load-bearing here, so no re-check is needed.
+        matches = [value for value in authority.reviewed_sources.values() if (value["name"] if "name" in value else None) == source_name]
         if len(matches) != 1:
             return None
         reviewed = matches[0]
@@ -666,8 +708,14 @@ def build_set_pipeline_candidate(
             if name in {"path", "file"} and type(value) is str and value.startswith("blob:")
         ):
             return None
-        reviewed_options = reviewed["options"]
-        return reviewed_options if isinstance(reviewed_options, Mapping) else None
+        # ``resolve_reviewed_source_authority`` raises AuditIntegrityError
+        # ("reviewed source authority contains malformed source options")
+        # unless every reviewed record's ``options`` is a mapping, and it is
+        # the only constructor of this type — so the recorded options need no
+        # shape re-check once the exact-type check above has admitted the
+        # authority. The required-key check above already proved presence.
+        reviewed_options: Mapping[str, Any] = reviewed["options"]
+        return reviewed_options
 
     try:
         validated = SetPipelineArgumentsModel.model_validate(args)
@@ -793,6 +841,13 @@ def build_set_pipeline_candidate(
                 source_name="source",
                 existing_options=state.sources["source"].options if "source" in state.sources else None,
             )
+            # Nominal discrimination of the owned closed union
+            # ``_ResolvedSourceBlob | ToolResult`` (ADR-032). Kept as
+            # ``isinstance`` rather than the exact-type idiom because mypy
+            # gives ``type(x) is C`` no negative-branch narrowing on a union,
+            # so the three reads below lose their types; neither class is
+            # subclassed anywhere in the tree, so the two forms are
+            # equivalent at runtime.
             if isinstance(resolved, ToolResult):
                 return _candidate(resolved)
             resolved_source_blob = resolved
@@ -1414,7 +1469,11 @@ def build_set_pipeline_candidate(
     node_specs = []
     for node_index, n in enumerate(validated.nodes):
         fork_to = tuple(n.fork_to) if n.fork_to is not None else None
-        branches = dict(n.branches) if isinstance(n.branches, Mapping) else tuple(n.branches) if n.branches is not None else None
+        # ``_PipelineNodeModel.branches`` is ``list[str] | dict[str, str] |
+        # None``, and Pydantic materialises each arm as exactly that concrete
+        # builtin — so the exact-type discriminator covers the same three
+        # cases the ABC check did.
+        branches = dict(n.branches) if type(n.branches) is dict else tuple(n.branches) if n.branches is not None else None
         nt = n.node_type
         node_spec = NodeSpec(
             id=n.id,
