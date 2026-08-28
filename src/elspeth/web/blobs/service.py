@@ -470,16 +470,23 @@ def _require_failed_fork_cleanup_authorization(
         )
     ).all()
     for row in rows:
+        # Every role="audit" row session_fork writes is a canonical-JSON plan
+        # envelope, so undecodable content is a corrupt audit trail, not a
+        # foreign row: refuse cleanup rather than count past it.
         try:
             content = json.loads(row.content)
-        except (TypeError, json.JSONDecodeError):
-            continue
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise AuditIntegrityError("Fork blob cleanup found an undecodable session_fork audit row") from exc
         if (
             type(content) is dict
-            and content.get("schema") == "session-fork-blob-plan.v1"
-            and content.get("source_session_id") == source_session_id
-            and content.get("child_session_id") == target_session_id
-            and content.get("operation_id") == operation_id
+            and "schema" in content
+            and content["schema"] == "session-fork-blob-plan.v1"
+            and "source_session_id" in content
+            and content["source_session_id"] == source_session_id
+            and "child_session_id" in content
+            and content["child_session_id"] == target_session_id
+            and "operation_id" in content
+            and content["operation_id"] == operation_id
         ):
             matching_plans += 1
     if matching_plans != 1:

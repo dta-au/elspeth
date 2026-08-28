@@ -4014,6 +4014,59 @@ class TestCopyBlobsForFork:
         assert await blob_service.list_blobs(target_session_id, limit=None) == before
 
     @pytest.mark.asyncio
+    async def test_cleanup_rejects_undecodable_session_fork_audit_row_and_preserves_blobs(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+    ) -> None:
+        """A non-JSON role="audit" row by session_fork is a corrupt trail, not a skipped row."""
+        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        before = await blob_service.list_blobs(target_session_id, limit=None)
+        session_service = SessionServiceImpl(
+            blob_service._engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.blob-fork-custody"),
+        )
+        await session_service.add_message(target_session_id, "audit", "{not json", writer_principal="session_fork")
+
+        with pytest.raises(AuditIntegrityError, match="undecodable session_fork audit row"):
+            await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert await blob_service.list_blobs(target_session_id, limit=None) == before
+
+    @pytest.mark.asyncio
+    async def test_cleanup_ignores_foreign_json_session_fork_audit_rows(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+    ) -> None:
+        """Decodable session_fork audit rows that are not THIS plan are skipped, keys present or absent."""
+        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        session_service = SessionServiceImpl(
+            blob_service._engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.blob-fork-custody"),
+        )
+        for foreign in (
+            {"schema": "session-fork-blob-plan.v1"},
+            {"schema": "session-fork-blob-plan.v1", "source_session_id": str(session_id), "operation_id": "other"},
+            ["session-fork-blob-plan.v1"],
+        ):
+            await session_service.add_message(target_session_id, "audit", json.dumps(foreign), writer_principal="session_fork")
+
+        result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert result.errors == ()
+        assert len(result.deleted_ids) == 1
+        assert await blob_service.list_blobs(target_session_id, limit=None) == []
+
+    @pytest.mark.asyncio
     async def test_cleanup_treats_already_missing_snapshot_row_as_success(
         self,
         blob_service: BlobServiceImpl,
@@ -4076,6 +4129,55 @@ class TestCopyBlobsForFork:
             "exc_type": "OSError",
         }
         assert context is None
+
+    @pytest.mark.asyncio
+    async def test_cleanup_records_recovery_failed_when_residual_check_cannot_run(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failed residual-row check after an item failure is an explicit RecoveryFailed error entry."""
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        failing_id = (await blob_service.list_blobs(target_session_id, limit=None))[0].id
+
+        orphan_counter = _FakeCounter()
+        monkeypatch.setattr(blob_service_module, "_BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER", orphan_counter)
+
+        delete_failed = False
+
+        def _fail_delete(conn, *, row, blob_id_str: str):
+            nonlocal delete_failed
+            delete_failed = True
+            raise OSError(5, "cleanup failed")
+
+        original_phase = blob_service_module._blob_phase_transaction
+
+        @contextlib.contextmanager
+        def _fail_residual_phase(engine, held_connection):
+            # The first phase opened after the item failure IS the residual-row check.
+            nonlocal delete_failed
+            if delete_failed:
+                delete_failed = False
+                raise OSError(5, "residual check unavailable")
+            with original_phase(engine, held_connection) as conn:
+                yield conn
+
+        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", _fail_delete)
+        monkeypatch.setattr(blob_service_module, "_blob_phase_transaction", _fail_residual_phase)
+        result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert tuple(result.deleted_ids) == ()
+        assert [(error.blob_id, error.exc_type) for error in result.errors] == [
+            (failing_id, "OSError"),
+            (failing_id, "RecoveryFailed[OSError]"),
+        ]
+        assert "residual check unavailable" in result.errors[1].detail
+        assert orphan_counter.calls == []
+        assert [blob.id for blob in await blob_service.list_blobs(target_session_id, limit=None)] == [failing_id]
 
     @pytest.mark.asyncio
     async def test_mid_copy_failure_retains_partial_rows_for_exact_plan_takeover(
@@ -4172,6 +4274,91 @@ class TestCopyBlobsForFork:
         with pytest.raises(BlobForkFenceLostError):
             await copy_task
         assert await blob_service.list_blobs(target_session_id, limit=None) == []
+
+
+class TestBlobRollbackNotes:
+    """Rollback arms annotate and re-raise the primary failure; they never replace it."""
+
+    def test_atomic_write_rolls_back_blob_published_before_lease_loss(self, tmp_path: Path) -> None:
+        storage = tmp_path / "blob.bin"
+        primary = BlobForkFenceLostError("op", attempt=1)
+        guard_calls = 0
+
+        def _lose_after_publish() -> None:
+            nonlocal guard_calls
+            guard_calls += 1
+            if storage.exists():
+                raise primary
+
+        with pytest.raises(BlobForkFenceLostError) as exc_info:
+            blob_service_module._atomic_write_blob(storage, b"payload", write_guard=_lose_after_publish)
+
+        assert exc_info.value is primary
+        assert not storage.exists()
+        assert vars(primary).get("__notes__", []) == []
+        assert guard_calls > 1
+
+    def test_atomic_write_rollback_failure_annotates_lease_loss_and_reraises_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        storage = tmp_path / "blob.bin"
+        primary = BlobForkFenceLostError("op", attempt=1)
+        original_fsync = blob_service_module._fsync_parent_directory
+        fsync_calls = 0
+
+        def _fail_rollback_fsync(directory: Path) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError(5, "rollback fsync failed")
+            original_fsync(directory)
+
+        def _lose_after_publish() -> None:
+            if storage.exists():
+                raise primary
+
+        monkeypatch.setattr(blob_service_module, "_fsync_parent_directory", _fail_rollback_fsync)
+        with pytest.raises(BlobForkFenceLostError) as exc_info:
+            blob_service_module._atomic_write_blob(storage, b"payload", write_guard=_lose_after_publish)
+
+        assert exc_info.value is primary
+        notes = primary.__notes__
+        assert len(notes) == 1
+        assert "Rollback failed: could not remove fork blob published after lease loss" in notes[0]
+        assert "OSError: [Errno 5] rollback fsync failed" in notes[0]
+
+    def test_restore_staged_deletion_restores_tombstone_without_note(self, tmp_path: Path) -> None:
+        storage = tmp_path / "blob.bin"
+        tombstone = tmp_path / ".blob.bin.delete-abc"
+        tombstone.write_bytes(b"original")
+        primary = RuntimeError("commit failed")
+
+        blob_service_module._restore_staged_blob_deletion(
+            blob_service_module._StagedBlobDeletion(storage=storage, tombstone=tombstone), primary
+        )
+
+        assert storage.read_bytes() == b"original"
+        assert not tombstone.exists()
+        assert vars(primary).get("__notes__", []) == []
+
+    def test_restore_staged_deletion_refuses_to_overwrite_replacement_and_annotates_primary(self, tmp_path: Path) -> None:
+        storage = tmp_path / "blob.bin"
+        tombstone = tmp_path / ".blob.bin.delete-abc"
+        tombstone.write_bytes(b"original")
+        storage.write_bytes(b"replacement")
+        primary = RuntimeError("commit failed")
+
+        blob_service_module._restore_staged_blob_deletion(
+            blob_service_module._StagedBlobDeletion(storage=storage, tombstone=tombstone), primary
+        )
+
+        assert storage.read_bytes() == b"replacement"
+        assert tombstone.read_bytes() == b"original"
+        notes = primary.__notes__
+        assert len(notes) == 1
+        assert "Rollback failed: could not restore deleted blob file" in notes[0]
+        assert "FileExistsError" in notes[0]
+        assert "manual reconciliation required" in notes[0]
 
 
 # ---------------------------------------------------------------------------
