@@ -223,9 +223,14 @@ def redacted_tool_invocation_content_and_envelope(
     if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
         raw_result = _load_canonical_mapping(invocation.result_canonical)
         if raw_result is not None and ("pipeline_content_hash_schema" in raw_result or "pipeline_content_hash" in raw_result):
-            if raw_result.get("pipeline_content_hash_schema") != "composer.pipeline-dispatch-result.v1":
+            if (
+                "pipeline_content_hash_schema" not in raw_result
+                or raw_result["pipeline_content_hash_schema"] != "composer.pipeline-dispatch-result.v1"
+            ):
                 raise AuditIntegrityError("pipeline dispatch executor-content schema is malformed")
-            executor_content_hash = raw_result.get("pipeline_content_hash")
+            if "pipeline_content_hash" not in raw_result:
+                raise AuditIntegrityError("pipeline dispatch content hash is malformed")
+            executor_content_hash = raw_result["pipeline_content_hash"]
             if not is_lower_sha256_hex(executor_content_hash):
                 raise AuditIntegrityError("pipeline dispatch content hash is malformed")
             redacted_result = _load_canonical_mapping(result_canonical)

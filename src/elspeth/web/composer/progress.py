@@ -91,7 +91,9 @@ class ComposerProgressRegistry:
         :meth:`end_request` at request teardown.
         """
         with self._lock:
-            self._inflight[session_id] = self._inflight.get(session_id, 0) + 1
+            if session_id not in self._inflight:
+                self._inflight[session_id] = 0
+            self._inflight[session_id] += 1
 
     def end_request(self, session_id: str) -> None:
         """Release one in-flight compose request for ``session_id``."""
@@ -175,7 +177,7 @@ class ComposerProgressRegistry:
 
         async def _publish(event: ComposerProgressEvent) -> None:
             with self._lock:
-                if self._request_generations.get(session_id) != generation:
+                if session_id not in self._request_generations or self._request_generations[session_id] != generation:
                     return
                 self._publish_locked(
                     session_id=session_id,
@@ -218,7 +220,7 @@ class ComposerProgressRegistry:
         live quiescence state alongside the last narrative phase.
         """
         with self._lock:
-            snapshot = self._snapshots.get(session_id) or _idle_snapshot(session_id)
+            snapshot = self._snapshots[session_id] if session_id in self._snapshots else _idle_snapshot(session_id)
             return self._with_live_inflight(session_id, snapshot)
 
     def _with_live_inflight(self, session_id: str, snapshot: ComposerProgressSnapshot) -> ComposerProgressSnapshot:
@@ -229,7 +231,7 @@ class ComposerProgressRegistry:
         an actively composing session as quiescent. Caller must hold
         ``self._lock``.
         """
-        inflight = self._inflight.get(session_id, 0)
+        inflight = self._inflight[session_id] if session_id in self._inflight else 0
         if snapshot.inflight_requests == inflight:
             return snapshot
         return snapshot.model_copy(update={"inflight_requests": inflight})

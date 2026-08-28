@@ -126,7 +126,8 @@ def resolve_reviewed_source_authority(
                 referenced_ids.add(blob_id)
                 sentinel_blob_ids[option_value] = blob_id
             elif type(option_value) is str:
-                raw_storage_paths[stable_id] = (*raw_storage_paths.get(stable_id, ()), option_value)
+                recorded_paths = raw_storage_paths[stable_id] if stable_id in raw_storage_paths else ()
+                raw_storage_paths[stable_id] = (*recorded_paths, option_value)
         if len(referenced_ids) > 1:
             raise AuditIntegrityError("reviewed source blob custody fields disagree")
         if referenced_ids:
@@ -180,13 +181,13 @@ def resolve_reviewed_source_authority(
             )
 
     for stable_id, paths in raw_storage_paths.items():
-        source_blob_id = source_blob_ids.get(stable_id)
-        if source_blob_id is None:
+        if stable_id not in source_blob_ids:
             # A non-blob path is authorized only by the exact reviewed source
             # binding at the candidate boundary.  Session ownership was still
             # verified above, and the normal credential/plugin/S2 path checks
             # remain mandatory after that binding matches.
             continue
+        source_blob_id = source_blob_ids[stable_id]
         if any(path != verified_storage_by_blob_id[source_blob_id] for path in paths):
             raise AuditIntegrityError("reviewed source raw storage path differs from its owned ready blob")
 

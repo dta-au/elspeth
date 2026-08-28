@@ -80,18 +80,21 @@ class DeferredIntentManagementOption:
 
 
 def _provider_safe_constraint(constraint: DeferredConstraint) -> dict[str, object]:
-    if not isinstance(
-        constraint,
-        (
-            SubjectPresenceConstraint,
-            OptionValueConstraint,
-            ComponentCountConstraint,
-            StatedGateRoutingConstraint,
-            StatedPredicateConstraint,
-            EdgeRouteConstraint,
-            FailureRouteConstraint,
-        ),
-    ):
+    # CLOSED UNION: DeferredConstraint is a seven-member alias over concrete
+    # dataclasses this module owns, and constraint_from_dict is their only
+    # constructor — so exact-type membership is the honest discrimination and
+    # matches the `type(constraint) is OptionValueConstraint` test below. A new
+    # constraint kind must be added here in the same change that declares it;
+    # a SUBCLASS of any member is deliberately not admitted.
+    if type(constraint) not in {
+        SubjectPresenceConstraint,
+        OptionValueConstraint,
+        ComponentCountConstraint,
+        StatedGateRoutingConstraint,
+        StatedPredicateConstraint,
+        EdgeRouteConstraint,
+        FailureRouteConstraint,
+    }:
         raise AuditIntegrityError("deferred intent contains a constraint without a closed projection")
     projected = cast(dict[str, Any], constraint.to_dict())
     if type(constraint) is OptionValueConstraint:
