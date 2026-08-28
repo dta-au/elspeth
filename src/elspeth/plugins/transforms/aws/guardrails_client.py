@@ -17,6 +17,7 @@ import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
 
@@ -131,6 +132,15 @@ class BedrockRuntimeClient(Protocol):
     def close(self) -> None: ...
 
 
+@trust_boundary(
+    tier=3,
+    source="botocore Bedrock Runtime ApplyGuardrail response envelope (externally derived)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises GuardrailResponseError unless value is a Mapping whose every key is a str; never coerces or defaults",
+    test_ref="tests/unit/plugins/transforms/aws/test_guardrails_client.py::test_mapping_boundary_rejects_non_mapping_and_non_string_keys",
+    test_fingerprint="2ae82b3a6c1d85014449420bc9fbe40c2e624cf2775e1c44daa45c6258a8c01b",
+)
 def _mapping(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or not all(type(key) is str for key in value):
         raise GuardrailResponseError
@@ -372,25 +382,48 @@ def parse_guardrail_response(
     )
 
 
-def _is_retryable_sdk_error(error: Exception) -> bool:
+@trust_boundary(
+    tier=3,
+    source="botocore exception raised by a Bedrock Runtime ApplyGuardrail call (externally derived)",
+    source_param="error",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns a (retryable, attempts) pair for every botocore exception; an unrecognised exception class or a "
+        "malformed error envelope classifies as non-retryable with the observed attempt count and never raises"
+    ),
+    non_raising=True,
+)
+def _provider_error(error: Exception) -> tuple[bool, int]:
+    """Classify one botocore exception into (retryable, attempts).
+
+    The exception's ``response`` envelope is vendor data: every member is read
+    once, bounded, and re-asserted before it becomes part of the audit record.
+    """
     from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 
     if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
-        return True
+        return True, 1
     if not isinstance(error, ClientError):
-        return False
-    error_data: object = error.response["Error"]
-    if not isinstance(error_data, Mapping) or "Code" not in error_data:
-        return False
-    code = error_data["Code"]
+        return False, 1
+    attempts = 1
+    response_metadata = error.response.get("ResponseMetadata")
+    if isinstance(response_metadata, Mapping):
+        raw_retries = response_metadata.get("RetryAttempts", 0)
+        if type(raw_retries) is int and 0 <= raw_retries <= 10:
+            attempts = raw_retries + 1
+    error_data = error.response.get("Error")
+    if not isinstance(error_data, Mapping):
+        return False, attempts
+    code = error_data.get("Code")
     if type(code) is not str:
-        return False
-    return code in {
+        return False, attempts
+    retryable = code in {
         "InternalServerException",
         "ServiceUnavailableException",
         "ThrottlingException",
         "TooManyRequestsException",
     }
+    return retryable, attempts
 
 
 class BedrockGuardrailsClient(AuditedClientBase):
@@ -548,18 +581,8 @@ class BedrockGuardrailsClient(AuditedClientBase):
             error_payload = RawCallPayload({"type": "malformed_response", "retryable": False})
             decision = None
         except _bedrock_provider_exception_types() as error:
-            retryable = _is_retryable_sdk_error(error)
+            retryable, attempts = _provider_error(error)
             terminal_error = GuardrailServiceError(retryable=retryable)
-            from botocore.exceptions import ClientError
-
-            if isinstance(error, ClientError) and "ResponseMetadata" in error.response:
-                response_metadata = error.response["ResponseMetadata"]
-                if isinstance(response_metadata, Mapping):
-                    raw_retries: object = 0
-                    if "RetryAttempts" in response_metadata:
-                        raw_retries = response_metadata["RetryAttempts"]
-                    if type(raw_retries) is int and 0 <= raw_retries <= 10:
-                        attempts = raw_retries + 1
             response_payload = RawCallPayload({"operation": "apply_guardrail", "status": "service_error", "attempts": attempts})
             call_status = CallStatus.ERROR
             error_payload = RawCallPayload({"type": "service_error", "retryable": retryable})

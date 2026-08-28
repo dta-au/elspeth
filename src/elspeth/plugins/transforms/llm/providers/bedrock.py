@@ -36,7 +36,7 @@ from elspeth.plugins.transforms.llm.provider import (
     LLMAuditParent,
     LLMQueryResult,
     UnrecognizedFinishReason,
-    parse_finish_reason,
+    finish_reason_from_raw_response,
 )
 
 if TYPE_CHECKING:
@@ -88,8 +88,10 @@ class _LiteLLMSDKAdapter:
     def create(self, **kwargs: Any) -> Any:
         import litellm
 
-        if self._region_name is not None:
-            kwargs.setdefault("aws_region_name", self._region_name)
+        if self._region_name is not None and "aws_region_name" not in kwargs:
+            # Precedence is explicit: a caller's own aws_region_name wins, and
+            # the configured region fills in only when the call names none.
+            kwargs["aws_region_name"] = self._region_name
         return litellm.completion(**kwargs)
 
     def close(self) -> None:
@@ -171,13 +173,7 @@ class BedrockLLMProvider:
         if response is None:
             raise RuntimeError("Bedrock response absent without a typed client error")
 
-        finish_reason = None
-        if response.raw_response is not None:
-            choices = response.raw_response.get("choices")
-            if choices:
-                raw_finish_reason = choices[0].get("finish_reason")
-                if raw_finish_reason is not None:
-                    finish_reason = parse_finish_reason(str(raw_finish_reason))
+        finish_reason = finish_reason_from_raw_response(response.raw_response)
 
         if not response.content or not response.content.strip():
             if finish_reason == FinishReason.TOOL_CALLS:

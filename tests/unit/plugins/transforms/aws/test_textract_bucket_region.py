@@ -17,6 +17,7 @@ from elspeth.plugins.transforms.aws.textract_bucket_region import (
     BucketRegionProof,
     BucketRegionUnverifiedError,
     HeadBucketClient,
+    _strict_mapping,
     _success_proof,
     build_s3_head_bucket_sdk_client,
 )
@@ -306,3 +307,12 @@ def test_head_bucket_audit_identity_projects_request_payload() -> None:
         "profile": "acceptance-docs",
     }
     assert "operator-owned-docs" not in repr(execution.calls[0])
+
+
+@pytest.mark.parametrize("value", [None, [], "BucketRegion", {1: "not a str key"}])
+def test_strict_mapping_boundary_rejects_non_mapping_and_non_string_keys(value: object) -> None:
+    # ``@trust_boundary`` honesty proof for ``_strict_mapping``'s ``value``
+    # parameter: every HeadBucket success response passes through it before
+    # any member is read.
+    with pytest.raises(BucketRegionUnverifiedError, match="unverified"):
+        _strict_mapping(value)

@@ -18,7 +18,7 @@ via their Audited*Client (D2 from architecture remediation).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, TypedDict, runtime_checkable
@@ -28,6 +28,7 @@ from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import trust_boundary
 
 
 class _AuditClientKwargs(TypedDict):
@@ -205,9 +206,8 @@ def classify_finish_reason_failure(finish_reason: ParsedFinishReason) -> FinishR
     if finish_reason is None or finish_reason == FinishReason.STOP:
         return None
     if isinstance(finish_reason, FinishReason):
-        known_failure = _FINISH_REASON_FAILURES.get(finish_reason)
-        if known_failure is not None:
-            return known_failure
+        if finish_reason in _FINISH_REASON_FAILURES:
+            return _FINISH_REASON_FAILURES[finish_reason]
         raw_value = finish_reason.value
     else:
         raw_value = finish_reason.raw
@@ -240,6 +240,41 @@ def parse_finish_reason(raw: str | None) -> ParsedFinishReason:
         return FinishReason(raw)
     except ValueError:
         return UnrecognizedFinishReason(raw)
+
+
+@trust_boundary(
+    tier=3,
+    source="SDK-deserialized chat-completion envelope carried as LLMResponse.raw_response (externally derived)",
+    source_param="raw_response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns the parsed finish_reason of the first choice when the envelope carries one and None on an absent "
+        "envelope or any shape failure; never raises on the envelope and reads no other member"
+    ),
+    non_raising=True,
+)
+def finish_reason_from_raw_response(raw_response: Mapping[str, Any] | None) -> ParsedFinishReason:
+    """Read only ``choices[0].finish_reason`` from an SDK provider's raw envelope.
+
+    The envelope is the SDK's deserialized API response, deep-frozen by
+    ``LLMResponse`` (lists arrive as tuples, dicts as mapping proxies), so the
+    shape is discriminated structurally rather than by exact builtin type.
+    Missing/empty choices or an absent envelope yield ``None``. The full
+    envelope is already recorded in the audit trail via
+    ``AuditedLLMClient.record_call()``, so anomalies are diagnosable there.
+    """
+    if raw_response is None:
+        return None
+    choices = raw_response.get("choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
+        return None
+    first_choice = choices[0]
+    if not isinstance(first_choice, Mapping):
+        return None
+    raw_finish_reason = first_choice.get("finish_reason")
+    if raw_finish_reason is None:
+        return None
+    return parse_finish_reason(str(raw_finish_reason))
 
 
 @dataclass(frozen=True, slots=True)

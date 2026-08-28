@@ -199,11 +199,10 @@ def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, obje
                 # the index as an ordinary value and read back as a resolved
                 # null — indistinguishable from a JSON null and invisible to
                 # on_miss. Row arity is a table defect; refuse it at load.
-                surplus = record.pop(None, None)
-                if surplus is not None:
+                if None in record:
                     raise ReferenceTableError(
                         f"reference table data row {position + 1} has more cells than the "
-                        f"{len(fieldnames)}-column header declares; {surplus!r} belongs to no column."
+                        f"{len(fieldnames)}-column header declares; {record[None]!r} belongs to no column."
                     )
                 # A cell that is present but empty reads as "", so None here can
                 # only be restval — i.e. the row ran out of cells.
@@ -223,14 +222,16 @@ def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, obje
         loaded = json.loads(cfg.reference_content)
     except json.JSONDecodeError as exc:
         raise ReferenceTableError(f"reference table is not valid JSON: {exc}") from exc
-    if not isinstance(loaded, list):
+    # ``json.loads`` yields exact builtins (never a frozen proxy or tuple), so
+    # the exact-type test is the honest discriminator here.
+    if type(loaded) is not list:
         raise ReferenceTableError(
             f"reference table must be a JSON array of objects, got {type(loaded).__name__}. "
             "A key-to-entry object is not accepted: reference_key_name would be meaningless in that shape."
         )
     entries: list[Mapping[str, object]] = []
     for index, entry in enumerate(loaded):
-        if not isinstance(entry, dict):
+        if type(entry) is not dict:
             raise ReferenceTableError(f"reference table entry {index} is a {type(entry).__name__}, expected an object")
         entries.append(entry)
     return entries
@@ -327,20 +328,20 @@ def _coerce_key(value: object) -> str:
     source; matching on the string spelling is the only rule that behaves the
     same for both formats.
     """
-    if isinstance(value, str):
+    if type(value) is str:
         return value
-    if isinstance(value, bool):
-        # Guarded before int: bool is an int subclass and "True" is the honest
-        # spelling, not "1".
+    if type(value) is bool:
+        # Exact-type tests keep bool and int apart without relying on arm
+        # order: "true" is the honest spelling, not "1".
         return "true" if value else "false"
-    if isinstance(value, float):
+    if type(value) is float:
         if not math.isfinite(value):
             raise ReferenceTableError(f"reference key must be a finite number, got {value!r}")
         # An upstream numeric transform or a JSON source can carry 42.0 where the
         # table holds 42. Spelling those differently would silently miss the join,
         # so an integral float takes the integer spelling.
         return str(int(value)) if value.is_integer() else repr(value)
-    if isinstance(value, int):
+    if type(value) is int:
         return str(value)
     raise ReferenceTableError(f"reference key must be a string or number, got {type(value).__name__}")
 
@@ -498,7 +499,7 @@ class ReferenceJoin(BaseTransform):
                 retryable=False,
             )
 
-        entry = self._index.entries.get(key)
+        entry = self._index.entries[key] if key in self._index.entries else None
         values: dict[str, Any] = {}
         missed: list[str] = []
         for field_name in self._output_field_names:

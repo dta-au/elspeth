@@ -25,7 +25,7 @@ from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
 from elspeth.plugins.llm.config_validation import AZURE_MODEL_VALUE_SOURCES, derive_azure_model, validate_azure_endpoint
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMQueryResult, parse_finish_reason
+from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMQueryResult, finish_reason_from_raw_response
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig
 
 if TYPE_CHECKING:
@@ -181,19 +181,9 @@ class AzureLLMProvider:
                 resolved_prompt_template_hash=self._resolved_prompt_template_hash,
             )
 
-            # Extract finish_reason from raw_response.
-            # raw_response is the Azure SDK's deserialized API response (Tier 3
-            # external boundary — validate structure, then safe access on optional keys).
-            # Missing/empty choices or absent raw_response → finish_reason stays None.
-            # The full raw_response is already recorded in the audit trail via
-            # AuditedLLMClient.record_call(), so anomalies are diagnosable there.
-            finish_reason = None
-            if response.raw_response is not None:
-                choices = response.raw_response.get("choices")
-                if choices:
-                    raw_fr = choices[0].get("finish_reason")
-                    if raw_fr is not None:
-                        finish_reason = parse_finish_reason(str(raw_fr))
+            # raw_response is the Azure SDK's deserialized API response: a
+            # Tier 3 envelope read through the declared boundary.
+            finish_reason = finish_reason_from_raw_response(response.raw_response)
 
             # Empty/whitespace content — AuditedLLMClient converts None→""
             # (known fabrication). Detect here and raise typed errors so the
