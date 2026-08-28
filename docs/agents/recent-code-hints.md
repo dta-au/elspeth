@@ -8,6 +8,20 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — the `deep_freeze` → `mappingproxy` trap also covers
+  `NodeSpec.branches`, and a frozen-input pin only detects a dead guard in the
+  MAPPED form.** `NodeSpec.__post_init__` calls `freeze_fields(self,
+  "branches")` separately from `options`, so `node.branches` is a
+  `mappingproxy` too (`isinstance(b, Mapping)` True, `type(b) is dict` False —
+  measured through real `NodeSpec` construction by lane B50). A regression test
+  for such a guard must (a) construct the value through the real producer
+  (`NodeSpec(...)` / `SourceSpec(...)`, never a hand-built dict — a hand-built
+  dict gave a false all-clear) and (b) for branches use the mapped form
+  `{name: connection}`: the list/identity form is normalised by
+  `_row_union_normalized_branches` into an identity mapping, so a
+  `type() is dict` swap returns names where connections are wanted only in the
+  mapped form and is undetectable in the list form.
+
 - **2026-08-29 — a platform-conditional stdlib constant probed with
   `getattr(os, "O_NOFOLLOW", None)` is BOTH a tier_model R2 and a masquerade
   baseline entry; the honest form is a direct read under
