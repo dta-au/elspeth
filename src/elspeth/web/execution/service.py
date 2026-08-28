@@ -44,6 +44,7 @@ from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.blobs_inline import (
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
     BLOB_INLINE_PER_REF_BYTE_CAP,
@@ -407,6 +408,16 @@ def _build_web_plugin_policy_evidence(
 T = TypeVar("T")
 
 
+@observation_boundary(
+    tier=3,
+    source="the runtime YAML config mapping generated from user-authored composition state — every source "
+    "block and option mapping inside it was authored through the composer tool loop or an imported YAML document",
+    source_param="config",
+    suppresses=("R1",),
+    invariant="returns one (label, raw_options) pair per declared blob_rows source and abstains on any "
+    "non-mapping source block or non-string source name; option values are handed back RAW for the caller's "
+    "BlobRowsEntry strict parse to reject — never raises",
+)
 def _discover_blob_rows_sources(config: Mapping[str, Any]) -> list[tuple[str, Any]]:
     """Return ``(source_label, raw_options)`` for every ``blob_rows`` source.
 
@@ -420,17 +431,21 @@ def _discover_blob_rows_sources(config: Mapping[str, Any]) -> list[tuple[str, An
     found: list[tuple[str, Any]] = []
     if "source" in config:
         source = config["source"]
-        if type(source) is dict and cast(dict[str, Any], source).get("plugin") == "blob_rows":
-            found.append(("source", cast(dict[str, Any], source).get("options")))
+        if type(source) is dict:
+            singular: dict[str, Any] = source
+            if singular.get("plugin") == "blob_rows":
+                found.append(("source", singular.get("options")))
     if "sources" in config:
         sources = config["sources"]
         if type(sources) is dict:
-            for source_name, source in sources.items():
-                if type(source_name) is not str or type(source) is not dict:
+            named: dict[str, Any] = sources
+            for source_name, named_source in named.items():
+                if type(source_name) is not str or type(named_source) is not dict:
                     continue
-                if cast(dict[str, Any], source).get("plugin") != "blob_rows":
+                entry: dict[str, Any] = named_source
+                if entry.get("plugin") != "blob_rows":
                     continue
-                found.append((f"source:{source_name}", cast(dict[str, Any], source).get("options")))
+                found.append((f"source:{source_name}", entry.get("options")))
     return found
 
 
@@ -1331,7 +1346,7 @@ class ExecutionServiceImpl:
             allowed_dirs = allowed_source_directories(str(self._settings.data_dir), session_id=str(session_id))
             for source_name, source in composition_state.sources.items():
                 for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
-                    value = source.options.get(key)
+                    value = source.options[key] if key in source.options else None
                     if value is not None:
                         resolved = resolve_data_path(value, str(self._settings.data_dir))
                         if not any(resolved.is_relative_to(d) for d in allowed_dirs):
@@ -1348,7 +1363,7 @@ class ExecutionServiceImpl:
             allowed_sink_dirs = allowed_sink_directories(str(self._settings.data_dir), session_id=str(session_id))
             for output in composition_state.outputs:
                 for key in SINK_LOCAL_PATH_OPTION_KEYS:
-                    value = output.options.get(key)
+                    value = output.options[key] if key in output.options else None
                     if value is not None:
                         resolved = resolve_sink_data_path(value, str(self._settings.data_dir), session_id=str(session_id))
                         if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
@@ -1389,7 +1404,7 @@ class ExecutionServiceImpl:
                 if not isinstance(provider_config, Mapping):
                     continue
                 for key in NESTED_LOCAL_PATH_OPTION_KEYS:
-                    value = provider_config.get(key)
+                    value = provider_config[key] if key in provider_config else None
                     if value is not None:
                         resolved = resolve_sink_data_path(value, str(self._settings.data_dir), session_id=str(session_id))
                         if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
@@ -2155,7 +2170,8 @@ class ExecutionServiceImpl:
                     for source_label, raw_options in blob_rows_bindings:
                         if type(raw_options) is not dict:
                             raise BlobRowsSourceAdmissionError(f"{source_label}.options must be a mapping")
-                        raw_blobs = cast(dict[str, Any], raw_options).get("blobs")
+                        options_mapping: dict[str, Any] = raw_options
+                        raw_blobs = options_mapping["blobs"] if "blobs" in options_mapping else None
                         if type(raw_blobs) is not list or not raw_blobs:
                             raise BlobRowsSourceAdmissionError(f"{source_label}.options.blobs must be a non-empty list")
                         for position, raw_entry in enumerate(raw_blobs):
@@ -2647,7 +2663,12 @@ class ExecutionServiceImpl:
                 # (validation_errors / the /diagnostics discards section),
                 # matching the count-only posture of the neighbouring
                 # run_completed_but_externally_cancelled warning.
-                discard_summary = load_discard_summaries_from_db(landscape_db, (result.run_id,)).get(result.run_id)
+                # Sparse by contract: load_discard_summaries_from_db emits an
+                # entry only for a run whose discard total is above zero, so an
+                # absent key is "this run discarded nothing", never a failed
+                # read that a default would paper over.
+                discard_summaries = load_discard_summaries_from_db(landscape_db, (result.run_id,))
+                discard_summary = discard_summaries[result.run_id] if result.run_id in discard_summaries else None
                 if discard_summary is not None:
                     slog.warning(
                         "run_completed_with_discarded_rows",

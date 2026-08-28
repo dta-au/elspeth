@@ -353,15 +353,6 @@ entries:
   classification: external-parse
   justification: Parses the optional Pydantic-style errors() capability from an external
     exception, filters results to mappings, and projects only safe locations.
-- path: src/elspeth/web/auth/local.py
-  qualname: _open_owner_only_database
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 8f127e225a08b4dd97d1191adbd5fe2e96ff0de5e908e6969ce7f095ed2706af
-  classification: module-getattr
-  justification: Probes the platform-dependent stdlib os.O_NOFOLLOW capability and
-    fails closed when the operating system module does not provide it.
 - path: src/elspeth/web/composer/guided/chat_solver.py
   qualname: _admit_deferred_intent_repair_thread
   kind: getattr

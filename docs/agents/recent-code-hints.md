@@ -8,6 +8,29 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — a platform-conditional stdlib constant probed with
+  `getattr(os, "O_NOFOLLOW", None)` is BOTH a tier_model R2 and a masquerade
+  baseline entry; the honest form is a direct read under
+  `except AttributeError`.** `_open_owner_only_database` (web/auth/local.py,
+  B30) probed `os.O_NOFOLLOW` with a `None` default and then raised
+  `LocalAuthStorageSecurityError` on `None`. Python documents `O_NOFOLLOW` as
+  "not present if not defined by the C library", so the check is real, but
+  the getattr-default is not needed to express it:
+  `try: nofollow = os.O_NOFOLLOW / except AttributeError as exc: raise
+  LocalAuthStorageSecurityError(...) from exc` is the same fail-closed
+  outcome with no dynamic-attribute site — it clears R2 and deletes the
+  `module-getattr` row from `config/cicd/masquerade_baseline.yaml` (reseed in
+  the same commit; `seed_baseline --check` exits 0 only after the reseed).
+  Do NOT reach for `hasattr` (R3) or a module-level probe that turns a
+  first-open failure into an import-time one unless the module already fails
+  to import on that platform for the same reason. Companion in the same lane:
+  `_parse_https_url` (web/auth/urls.py) guarded a pydantic-typed `str` with
+  `isinstance(raw_value, str)`, which ADMITS a `str` subclass — an impostor
+  whose `__contains__`/`find` deny the separators it carries would sail past
+  every scan in that function. `type(raw_value) is not str` is the house
+  scalar idiom and rejects it; pinned by
+  tests/unit/web/auth/test_urls.py::test_url_values_must_be_exact_str_not_a_subclass_or_lookalike,
+  which asserts the impostor's methods were never consulted.
 - **2026-08-29 — `web/execution/` has DECLARATION tests that pin the exact
   tier_model finding set, so REMOVING a finding there turns the lane red until
   you update the `Counter`.** `tests/unit/web/execution/test_validation_trust_tier.py`
@@ -43,6 +66,42 @@ is a working document under the normal delivery posture.
   value type` exactly as the `type(x) is C` narrowing entry below predicts —
   that union discriminator's else-branch IS used.)
 
+- **2026-08-29 — `deep_freeze` turns every NESTED mapping into a
+  `mappingproxy`, so `type(x) is dict` on anything reached through a frozen
+  `options` bag is ALWAYS False.** Measured in B51:
+  `type(deep_freeze({"provider_config": {...}})["provider_config"])` is
+  `mappingproxy`. `NodeSpec.__post_init__` (and its `SourceSpec`/`OutputSpec`
+  siblings) call `freeze_fields(self, "options")`, so every composition-state
+  option value below the top level is frozen. This makes the Wave-1
+  `isinstance` → `type() is` sweep actively DANGEROUS on composition state:
+  `web/execution/service.py`'s nested path allowlist reads
+  `provider_config = node.options["provider_config"]` and guards it with
+  `isinstance(provider_config, Mapping)` — converting that to the exact-type
+  idiom would `continue` past every frozen node and silently disable the
+  defence-in-depth confinement of RAG `persist_directory` writes, with no test
+  failure to show for it (`/execute` does not require `/validate` first, so
+  this loop is the last gate). Rule of thumb: `type(x) is dict` is only ever
+  correct on a value you know has NOT been through `deep_freeze` — a freshly
+  parsed YAML/JSON tree, not composition state. Check the owning dataclass for
+  `freeze_fields` before converting any container check.
+- **2026-08-29 — `for k, v in mapping.items()` DOES keep the `@trust_boundary`
+  derived-name trail, and swapping `cast(dict[str, Any], x).get(...)` for an
+  annotated local RESTORES suppression.** Two measured complements to the
+  `enumerate()` and call-laundering holes below. (1) `subject_is_rooted`
+  descends an `ast.Call` through `Call.func`, so `named.items()` roots at the
+  `Attribute`'s value `named` — derived — where `enumerate(named)` roots at the
+  builtin and is lost; the loop's tuple unpacking then keeps both targets
+  derived. (2) The same `Call.func` descent is why `cast(dict[str, Any],
+  source).get("plugin")` belongs to `cast` and suppresses nothing: bind
+  `singular: dict[str, Any] = source` first and read `singular.get("plugin")`,
+  which is derived through ordinary assignment propagation. That is not a lint
+  dodge — it deletes a `cast` and reads better. In B51 one
+  `@observation_boundary(source_param="config", suppresses=("R1",))` on
+  `_discover_blob_rows_sources` plus those two moves cleared all 4 of the
+  function's R1 findings, verified by the `R_TB_SUPPRESSED` stream. Corollary
+  from the same lane: `@observation_boundary` on a genuine non-raising
+  projector passes `trust_boundary.tests,scope,tier --fail-on-inert` with no
+  `test_ref` obligation and drew no wardline PY-WL-102.
 - **2026-08-29 — the `@trust_boundary` suppressor also loses the derived-name
   trail through a `try:` whose handler RETURNS, so the decode-then-read idiom
   suppresses nothing.** Third known hole in the same walk, after the
@@ -105,6 +164,35 @@ is a working document under the normal delivery posture.
   RATCHET that reports its own overage (`matched 36/11`), so suppressing sites
   under a boundary lowers the count without clearing the finding — only the
   operator can lower the cap, and the residual is not a lane defect.
+- **2026-08-29 — a "NOT a declared trust boundary because X" comment is a
+  claim about the tree at the time it was written; re-verify X before
+  honouring it.** `web/composer/redaction._coerce_stringified_json_object`
+  carried a comment refusing `@observation_boundary` because bare
+  `json.loads` could escape a `RecursionError`. Its own docstring, two
+  paragraphs down, recorded that decoding had since moved to
+  `bounded_json_loads` (which maps `RecursionError` to `JsonBoundaryError`, a
+  `ValueError` the handler already catches) — the refusal had outlived its
+  reason and was blocking an honest declaration. B36 declared it and pinned
+  the invariant with a 20,000-deep `"["*N` input that must return the input
+  object untouched (`test_coerce_stringified_json_object_never_raises_on_hostile_text`).
+  Two neighbours from the same lane: (1) a value returned from a
+  positional-arg call on the source param (`decoded =
+  bounded_json_loads(value, ...)`) stays OUTSIDE the boundary walk, so the R5
+  on `isinstance(decoded, dict)` survived the decorator; because
+  `bounded_json_loads` runs plain `json.loads` with no `object_pairs_hook`,
+  a JSON object decodes to exactly `dict` and `type(decoded) is dict` is the
+  exact nominal form, not a weakening. (2) In a fail-closed redactor, swapping
+  an ABC `isinstance(x, Mapping)` for the Tier-1 nominal `type(x) is dict`
+  changes what happens to the OTHER branch: `redact_source_storage_path.
+  _redact_one` used to return a non-`Mapping` `options` value unchanged, so a
+  read-only-`Mapping` carrier that was previously redacted would have started
+  passing through un-redacted under a naive swap. The correct move is to make
+  every non-dict, non-None carrier RAISE `AuditIntegrityError` (it is a
+  corrupted first-party serializer shape either way), and pin it with a
+  `MappingProxyType` options that carries a private path — see
+  `test_redact_source_storage_path_rejects_non_dict_options_carrying_blob_path`.
+  Read the else-branch before the swap (brief fact 4), and in a redaction
+  surface prefer strengthen-to-raise over preserve-pass-through.
 
 - **2026-08-29 — the `trust_boundary.tests` gate reads exception names out of
   `invariant` PROSE with a `*Error|*Exception|*Warning` suffix regex, so a
