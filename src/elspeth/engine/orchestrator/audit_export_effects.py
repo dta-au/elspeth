@@ -158,7 +158,7 @@ def _derivation_config(
 
 def _private_spool_root(config: LandscapeExportSettings) -> Path:
     root = config.spool_root
-    if not isinstance(root, Path):
+    if root is None:
         raise ValueError("enabled audit export requires an explicit spool_root")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     mode = stat.S_IMODE(root.stat().st_mode)
@@ -304,11 +304,9 @@ def prepare_audit_export_snapshot(
     repository: AuditExportSnapshotRepository | None = None,
 ) -> SinkEffectAuditExportSnapshotInput:
     """Reuse or durably materialize one immutable export snapshot winner."""
-    if not isinstance(db, LandscapeDB):
-        raise TypeError("db must be LandscapeDB")
     if type(config) is not LandscapeExportSettings:
         raise TypeError("config must be exact LandscapeExportSettings")
-    if not isinstance(content_store, AuditExportContentStore) or not content_store.is_durable():
+    if not content_store.is_durable():
         raise TypeError("content_store must implement durable AuditExportContentStore")
     resolver = content_store_resolver or AuditExportContentStoreResolver()
     resolver.register(content_store)

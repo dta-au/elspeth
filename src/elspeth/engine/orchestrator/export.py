@@ -152,7 +152,7 @@ def export_landscape(
         ValueError: If signing requested but ELSPETH_SIGNING_KEY not set,
                    or if sink_factory raises for the configured sink name
     """
-    from elspeth.contracts.audit_export import AuditExportContentStore, AuditExportContentStoreResolver
+    from elspeth.contracts.audit_export import AuditExportContentStoreResolver
     from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.engine.orchestrator.audit_export_effects import execute_audit_export_effect, prepare_audit_export_snapshot
 
@@ -161,8 +161,6 @@ def export_landscape(
     if type(worker_id) is not str or not worker_id.strip():
         raise ValueError("audit export worker_id must be a non-empty exact string")
 
-    if not isinstance(audit_export_content_store, AuditExportContentStore):
-        raise TypeError("audit_export_content_store must implement AuditExportContentStore")
     if not audit_export_content_store.is_durable():
         raise ValueError("audit_export_content_store must prove durability")
     if type(audit_export_content_store_resolver) is not AuditExportContentStoreResolver:
