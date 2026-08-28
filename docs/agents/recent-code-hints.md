@@ -30,7 +30,14 @@ is a working document under the normal delivery posture.
   `guided_json_payload_id("turn", ...)`), so it is Tier-1 server data:
   membership-form reads raising `AuditIntegrityError`, never a
   `@trust_boundary`. The one Tier-3 payload in that module is the planner's
-  candidate `pipeline`, and its boundary is the binder itself.
+  candidate `pipeline`, and its boundary is the binder itself. Worktree trap
+  hit on the way to committing this: the `mypy` pre-commit hook is
+  `.venv/bin/mypy` with no `PYTHONPATH` of its own, so inside a worktree it
+  type-checks the staged worktree files against the MAIN checkout's `elspeth`
+  (editable install) and fails on drift the worktree never had (six
+  `interpretation_state.SOURCE_AUTHORING_KEY` "not explicitly exported" errors
+  from a sibling's tree). `export PYTHONPATH=<wt>/src:<wt>/elspeth-lints/src`
+  before `git commit`; never `--no-verify` around it.
 
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list
