@@ -609,10 +609,9 @@ class TokenManager:
         # by_opener_node() index, not inside register_expand_group — node_id
         # is a declared scope opener only if it appears there; an ordinary
         # (non-scope) multi-row node_id is simply absent, and this is a no-op).
-        if self._group_bindings is not None:
-            opener_binding = self._opener_binding_by_node_id.get(node_id)
-            if opener_binding is not None:
-                self._group_bindings.register_expand_group(expand_group_id, opener_name=opener_binding.opener_name)
+        if self._group_bindings is not None and node_id in self._opener_binding_by_node_id:
+            opener_name = self._opener_binding_by_node_id[node_id].opener_name
+            self._group_bindings.register_expand_group(expand_group_id, opener_name=opener_name)
 
         # Use output_contract (post-transform schema) for all expanded children
         # This ensures downstream transforms can access newly added/renamed fields
