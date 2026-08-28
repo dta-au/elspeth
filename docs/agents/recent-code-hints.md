@@ -34,6 +34,33 @@ is a working document under the normal delivery posture.
   symbol (`sanitize_error`, `_exception_failures`, `_finish_lock_cleanup`) as
   the control. B25 rationalised 16 such handlers in `doctor.py` and 9 in
   `readiness.py` on exactly this ground.
+- **2026-08-29 — the `@trust_boundary` suppression dataflow walk does NOT
+  follow dynamic escapes or comprehension loop variables, and widening an
+  existing decorator's `suppresses` tuple is the cheapest correct burn-down
+  move.** Two facts, learned burning down `web/composer` (B47):
+  1. Several boundaries were declared `suppresses=("R5",)` while their bodies
+     were full of honest `source_param`-derived `.get()` reads. Adding `"R1"`
+     to the tuple removed 20 findings in `required_controls.py` alone with no
+     code change — check the tuple BEFORE writing a rationale or restructuring
+     a parse. `@trust_boundary`/`observation_boundary` still suppress ONLY R1
+     and R5 (`contracts/trust_boundary.py`); R2/R3/R4/R6/R7/R8/R9 always need
+     real code or a rationale.
+  2. The walk tracks derivation from `source_param` through plain attribute
+     and subscript reads and through `for` loops over a derived value, but it
+     CANNOT follow `vars(x)`, `object.__getattribute__(x, ...)`,
+     `type(x).__mro__`, or `descriptor.__get__(...)` — nor a name bound by a
+     *comprehension/genexp* loop variable (`next((i for i, node in
+     enumerate(nodes) if node.get("id") == ...)` stayed flagged inside a
+     decorated function whose ordinary-statement reads of `nodes` were
+     suppressed). Those sites surface unsuppressed even inside a correctly
+     declared boundary, so they need a rationale or a membership-form rewrite;
+     do NOT conclude the decorator is wrong or widen it further.
+  Membership-form is often available with byte-identical semantics and no new
+  raise path: `"id" in node and node["id"] == target` is exactly `.get("id")
+  == target` (missing key → no match, never raises), which matters in
+  `required_controls.py`, whose splice helpers run inside the planner
+  `candidate_finalizer` seam where an unprefixed exception is a TERMINAL
+  failure. Prefer that over `node["id"]` there.
 
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list

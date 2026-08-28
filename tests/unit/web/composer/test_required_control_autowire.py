@@ -1151,6 +1151,138 @@ class TestImplicitDecisionDisclosure:
         assert [entry for entry in report["entries"] if entry["category"] == "policy_control"] == []
 
 
+class TestSpliceRefusalContracts:
+    """Early-return contracts of the splice helpers, called directly.
+
+    These helpers run inside the planner ``candidate_finalizer`` seam, where an
+    unprefixed exception is a terminal failure rather than repair feedback, so
+    every malformed shape must return ``False`` and leave the node list
+    untouched. The integration tests above only reach these helpers along the
+    happy path, so the refusal branches are pinned here at unit level -- in
+    particular the two the trust-tier burn-down touched: the ``on_success``
+    falsiness test (an owned ``NodeSpec`` field declared ``str | None``) and the
+    id-membership index lookup.
+    """
+
+    @staticmethod
+    def _node_spec(*, node_id: str, on_success: str | None) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="llm",
+            input="in",
+            on_success=on_success,
+            on_error="discard",
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    @staticmethod
+    def _empty_state() -> CompositionState:
+        return CompositionState(
+            sources={},
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    @pytest.mark.parametrize("on_success", [None, ""])
+    def test_output_splice_refuses_a_node_with_no_on_success_edge(self, on_success: str | None) -> None:
+        """A gate carries None and an unrouted node carries "": both mean there
+        is no on_success edge to interpose a control on, so the pass inserts
+        nothing rather than authoring an edge the author never wrote."""
+        from elspeth.web.composer.required_controls import _splice_output_control
+
+        nodes: list[dict[str, object]] = [{"id": "assess", "node_type": "transform"}]
+
+        spliced = _splice_output_control(
+            nodes,
+            target=self._node_spec(node_id="assess", on_success=on_success),
+            state=self._empty_state(),
+            capability=PluginCapability.CONTENT_SAFETY,
+            plugin_name="aws_bedrock_content_safety",
+            alias=None,
+            summaries={},
+            reserved=set(),
+        )
+
+        assert spliced is False
+        assert nodes == [{"id": "assess", "node_type": "transform"}]
+
+    def test_output_splice_refuses_a_node_block_carrying_no_id(self) -> None:
+        """The index lookup is membership-form over Tier-3 candidate blocks: a
+        block with no 'id' key simply does not match, and must never raise into
+        the never-raise finalizer seam."""
+        from elspeth.web.composer.required_controls import _splice_output_control
+
+        nodes: list[dict[str, object]] = [{"node_type": "transform"}]
+
+        spliced = _splice_output_control(
+            nodes,
+            target=self._node_spec(node_id="assess", on_success="out"),
+            state=self._empty_state(),
+            capability=PluginCapability.CONTENT_SAFETY,
+            plugin_name="aws_bedrock_content_safety",
+            alias=None,
+            summaries={},
+            reserved=set(),
+        )
+
+        assert spliced is False
+        assert nodes == [{"node_type": "transform"}]
+
+    def test_input_splice_refuses_a_node_block_carrying_no_id(self) -> None:
+        """Same membership-form index lookup on the input edge."""
+        from elspeth.web.composer.required_controls import _splice_input_control
+
+        nodes: list[dict[str, object]] = [{"node_type": "transform", "input": "in"}]
+
+        spliced = _splice_input_control(
+            nodes,
+            target_id="assess",
+            protected_fields=("body",),
+            scanned_fields=(),
+            capability=PluginCapability.PROMPT_SHIELD,
+            plugin_name="aws_bedrock_prompt_shield",
+            alias=None,
+            summaries={},
+            reserved=set(),
+        )
+
+        assert spliced is False
+        assert nodes == [{"node_type": "transform", "input": "in"}]
+
+    def test_input_splice_refuses_a_target_with_no_input_edge(self) -> None:
+        """'input' is optional on a candidate node block (``_parse_node``
+        defaults it to ""), so its absence is a value fact the boundary reports
+        as a refusal, not a KeyError."""
+        from elspeth.web.composer.required_controls import _splice_input_control
+
+        nodes: list[dict[str, object]] = [{"id": "assess", "node_type": "transform"}]
+
+        spliced = _splice_input_control(
+            nodes,
+            target_id="assess",
+            protected_fields=("body",),
+            scanned_fields=(),
+            capability=PluginCapability.PROMPT_SHIELD,
+            plugin_name="aws_bedrock_prompt_shield",
+            alias=None,
+            summaries={},
+            reserved=set(),
+        )
+
+        assert spliced is False
+        assert nodes == [{"id": "assess", "node_type": "transform"}]
+
+
 class TestParseBoundaryHonesty:
     """Raising-shape honesty tests for the ``@trust_boundary``-decorated candidate parsers.
 
