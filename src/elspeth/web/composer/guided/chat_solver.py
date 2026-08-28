@@ -1342,7 +1342,7 @@ class GuidedAdvisoryGraphAuthority:
         payload_error = validate_payload(self.turn_type, self.payload)
         if payload_error is not None:
             raise InvariantError(f"guided advisory current turn payload is invalid: {payload_error}")
-        if self.payload.get("proposal_id") != self.proposal_id or self.payload.get("draft_hash") != self.draft_hash:
+        if self.payload["proposal_id"] != self.proposal_id or self.payload["draft_hash"] != self.draft_hash:
             raise InvariantError("guided advisory graph authority proposal binding does not match its payload")
         expected_payload_id = stable_hash(
             {
@@ -1419,6 +1419,17 @@ def _validate_field_aliases(
     return field_aliases
 
 
+@observation_boundary(
+    tier=3,
+    source="committed SourceResolved carrying web-authored options (untrusted mapping values)",
+    source_param="current_source",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "collects every nameable uploaded field label from well-formed option values only; "
+        "non-mapping options or schema, a non-list guaranteed_fields, and malformed labels or "
+        "sample rows are dropped, never raised on"
+    ),
+)
 def _source_field_labels(current_source: SourceResolved) -> tuple[str, ...]:
     """Collect every uploaded field label this source can name.
 
@@ -2368,7 +2379,7 @@ def _parse_step_1_source_tool_arguments(arguments: str, *, plugin_hint: str | No
         missing.add("plugin")
     if missing:
         raise GuidedToolArgumentShapeError(f"resolve_source arguments missing required keys: {sorted(missing)}")
-    if data.get("resolution", "source") != "source":
+    if "resolution" in data and data["resolution"] != "source":
         raise GuidedToolArgumentShapeError("resolve_source resolution key must be exactly 'source' when provided")
 
     # Absent (never null) with a wizard hint: the missing-set check above has
@@ -2426,7 +2437,7 @@ def _parse_step_1_source_tool_arguments(arguments: str, *, plugin_hint: str | No
     # The composer sets it most of the time, but a passive walk must never stall,
     # so absent / None / empty defaults to "discard". When the model DOES send it,
     # require a non-empty string at this Tier-3 boundary.
-    on_validation_failure_raw = data.get("on_validation_failure")
+    on_validation_failure_raw = data["on_validation_failure"] if "on_validation_failure" in data else None
     if on_validation_failure_raw is None or (isinstance(on_validation_failure_raw, str) and not on_validation_failure_raw):
         on_validation_failure = "discard"
     elif not isinstance(on_validation_failure_raw, str):
@@ -3124,7 +3135,7 @@ def _parse_step_2_sink_tool_arguments(arguments: str) -> tuple[SinkResolved, str
         raise GuidedToolArgumentShapeError(
             f"resolve_sink arguments must contain {sorted(required_top)} (resolution optional); got keys {_shape_safe_keys(data)}"
         )
-    if data.get("resolution", "sink") != "sink":
+    if "resolution" in data and data["resolution"] != "sink":
         raise GuidedToolArgumentShapeError("resolve_sink resolution key must be exactly 'sink' when provided")
     item = data["output"]
     if not isinstance(item, Mapping):
@@ -3137,13 +3148,13 @@ def _parse_step_2_sink_tool_arguments(arguments: str) -> tuple[SinkResolved, str
     name = item["name"]
     if type(name) is not str or not name:
         raise GuidedToolArgumentShapeError("resolve_sink output.name must be a non-empty string")
-    plugin = item.get("plugin")
+    plugin = item["plugin"]
     if not isinstance(plugin, str) or not plugin:
         raise GuidedToolArgumentShapeError(f"resolve_sink output.plugin must be a non-empty string; got {type(plugin).__name__}")
-    options = item.get("options")
+    options = item["options"]
     if not isinstance(options, Mapping):
         raise GuidedToolArgumentShapeError("resolve_sink output.options must be an object")
-    required_fields_raw = item.get("required_fields")
+    required_fields_raw = item["required_fields"]
     if not isinstance(required_fields_raw, list):
         raise GuidedToolArgumentShapeError("resolve_sink output.required_fields must be a list")
     required_fields: list[str] = []
@@ -3151,7 +3162,7 @@ def _parse_step_2_sink_tool_arguments(arguments: str) -> tuple[SinkResolved, str
         if not isinstance(col, str) or not col:
             raise GuidedToolArgumentShapeError(f"resolve_sink output.required_fields[{col_idx}] must be a non-empty string")
         required_fields.append(col)
-    schema_mode = item.get("schema_mode")
+    schema_mode = item["schema_mode"]
     if schema_mode not in ("fixed", "flexible", "observed"):
         raise GuidedToolArgumentShapeError("resolve_sink output.schema_mode must be fixed/flexible/observed")
     on_write_failure = item["on_write_failure"]
