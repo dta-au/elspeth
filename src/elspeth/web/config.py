@@ -21,7 +21,7 @@ from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.core.config import PayloadStoreSettings
 from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.transforms.aws.guardrail_profiles import (
     BEDROCK_GUARDRAIL_PLUGIN_IDS,
     BedrockGuardrailProfileSettings,

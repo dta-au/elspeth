@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.core.url_validation import validate_credential_safe_https_url
 
 
 @pytest.mark.parametrize(

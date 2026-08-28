@@ -96,7 +96,7 @@ _AZURE_DOCUMENT_INTELLIGENCE_HOST_SUFFIXES: tuple[str, ...] = (
 
 def _validate_azure_document_intelligence_endpoint(value: str) -> str:
     """Validate that a credential-bearing endpoint targets Azure Document Intelligence."""
-    from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+    from elspeth.core.url_validation import validate_credential_safe_https_url
 
     endpoint = validate_credential_safe_https_url(value, field_name="endpoint")
     parsed = urlparse(endpoint)

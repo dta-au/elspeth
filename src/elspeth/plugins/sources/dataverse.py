@@ -28,6 +28,7 @@ from elspeth.contracts.wire_visible_identity import (
     is_operator_required_placeholder_value,
     reject_operator_required_placeholder_value,
 )
+from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.clients.dataverse import (
     DataverseAuthConfig,
@@ -39,7 +40,6 @@ from elspeth.plugins.infrastructure.clients.dataverse import (
 from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig, declared_source_schema_field_names
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,

@@ -725,8 +725,6 @@ def _proven_pg_catalog_text_builtin_calls(
             return _EMPTY_TEXT_BUILTIN_PROOF
     except SQLAlchemyError:
         return _EMPTY_TEXT_BUILTIN_PROOF
-    if proof_rows is None:
-        return _EMPTY_TEXT_BUILTIN_PROOF
 
     allowed: dict[tuple[str, int], int] = {}
     sources: dict[str, int] = {}
@@ -819,7 +817,14 @@ def _proven_pg_catalog_text_builtin_calls(
     )
 
 
-def _text_builtin_identity_rows_on_connection(connection: Connection) -> list[Any] | None:
+def _text_builtin_identity_rows_on_connection(connection: Connection) -> list[Any]:
+    """Return the pg_catalog identity proof rows, or raise on a failed probe.
+
+    Probe failure is signalled by the SQLAlchemy error itself rather than by a
+    ``None`` sentinel: the sole caller already converts ``SQLAlchemyError`` into
+    the conservative ``_EMPTY_TEXT_BUILTIN_PROOF``, so one failure policy lives
+    in one place. This handler owns only savepoint cleanup.
+    """
     was_idle = not connection.in_transaction()
     nested_transaction = None
     try:
@@ -854,7 +859,7 @@ def _text_builtin_identity_rows_on_connection(connection: Connection) -> list[An
     except SQLAlchemyError:
         if nested_transaction is not None and nested_transaction.is_active:
             nested_transaction.rollback()
-        return None
+        raise
     finally:
         if was_idle and connection.in_transaction():
             connection.rollback()

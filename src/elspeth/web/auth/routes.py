@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.landscape.auth_audit_repository import AUTH_AUDIT_PRINCIPAL_MAX_LENGTH
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditWriter, classify_authentication_failure
 from elspeth.web.auth.local import LocalAuthProvider, LocalAuthRegistrationConflict, bcrypt_password_bytes

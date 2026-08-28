@@ -24,13 +24,13 @@ from pydantic import BaseModel, Field, model_validator
 
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.core.security.web import NetworkError, SSRFBlockedError, SSRFSafeRequest, validate_url_for_ssrf
+from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     filter_response_headers,
     fingerprint_headers,
     fingerprint_url,
 )
 from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 
 if TYPE_CHECKING:
     from typing import Self
