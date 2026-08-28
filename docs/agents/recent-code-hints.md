@@ -106,6 +106,25 @@ is a working document under the normal delivery posture.
   a behaviour change that misroutes every decline. R5 findings on exception
   classification over an open owned hierarchy are justify candidates, not
   conversion candidates.
+- **2026-08-29 — the `R_TB_SUPPRESSED` lines in an allowlist-disabled
+  `--rules all` run are the ORACLE for what widening a `suppresses` tuple will
+  clear, and comprehension loop variables ARE tracked (B47's entry below is
+  too broad).** Before hand-editing anything inside a `@trust_boundary`, read
+  that file's `R_TB_SUPPRESSED` diagnostics: each names the site, the
+  `source_param`, and the currently declared `suppresses=(...)`. Every site
+  already listed there under R5 has a resolved derivation from
+  `source_param`, and `_boundary_root` roots R1 (`node.func.value`) and R5
+  (`node.args[0]`) at the SAME name — so a `d.get(k)` on a name whose
+  `isinstance` is already suppressed on that line clears the moment `"R1"`
+  joins the tuple. In `planner_authoring_aids.py` (B42) widening three
+  `("R5",)` tuples to `("R1", "R5")` removed 9 of 27 findings with zero code
+  change, and that included `schema.get("composer_hidden")` where `schema` is
+  a SET-COMPREHENSION loop variable over `raw.get("properties").items()`. The
+  walk does follow comprehension/genexp targets bound directly from a derived
+  iterable; what defeated B47 was the `enumerate(nodes)` CALL wrapping the
+  iterable, not the comprehension. So: widen, re-measure, and only then write
+  rationales or restructure what actually survives — every pre-emptive edit
+  shifts `body[N]` for later findings in the same function for no gain.
 
 - **2026-08-29 — adding a DOCSTRING shifts every `body[N]` index inside that
   function, exactly like the `@overload` trap below.** A docstring is
@@ -134,7 +153,9 @@ is a working document under the normal delivery posture.
   the control. B25 rationalised 16 such handlers in `doctor.py` and 9 in
   `readiness.py` on exactly this ground.
 - **2026-08-29 — the `@trust_boundary` suppression dataflow walk does NOT
-  follow dynamic escapes or comprehension loop variables, and widening an
+  follow dynamic escapes or comprehension loop variables (the comprehension
+  half of that claim is NARROWED by the oracle entry above — plain
+  comprehension targets ARE tracked), and widening an
   existing decorator's `suppresses` tuple is the cheapest correct burn-down
   move.** Two facts, learned burning down `web/composer` (B47):
   1. Several boundaries were declared `suppresses=("R5",)` while their bodies
