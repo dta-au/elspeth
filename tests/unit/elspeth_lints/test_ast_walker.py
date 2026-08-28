@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -84,8 +86,71 @@ def test_iter_python_files_skips_dependency_and_cache_directories(tmp_path: Path
     assert list(iter_python_files(tmp_path)) == [source]
 
 
-def test_iter_python_files_allows_roots_inside_hidden_worktree_parent(tmp_path: Path) -> None:
-    source = tmp_path / ".worktrees" / "feature" / "fixtures" / "case" / "good.py"
+def test_iter_python_files_yields_files_not_directories_named_python(tmp_path: Path) -> None:
+    python_named_directory = tmp_path / "archive.py"
+    nested_source = python_named_directory / "nested.py"
+    nested_source.parent.mkdir()
+    nested_source.write_text("value = 1\n", encoding="utf-8")
+
+    assert list(iter_python_files(tmp_path)) == [nested_source]
+
+
+def test_iter_python_files_prunes_only_nested_agent_worktrees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        tmp_path / ".claude" / "tooling.py",
+        tmp_path / "src" / "local.py",
+        tmp_path / "src" / "worktrees" / "tracked.py",
+        tmp_path / "worktrees" / "tracked.py",
+    }
+    ignored_root = tmp_path / ".claude" / "worktrees"
+    candidates = [
+        *expected,
+        ignored_root / "sibling" / "src" / "foreign.py",
+    ]
+    for candidate in candidates:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text("value = 1\n", encoding="utf-8")
+
+    def reject_post_traversal_rglob(self: Path, pattern: str) -> object:
+        raise AssertionError(f"walker used post-traversal rglob({pattern!r}) from {self}")
+
+    monkeypatch.setattr(Path, "rglob", reject_post_traversal_rglob)
+
+    assert set(iter_python_files(tmp_path)) == expected
+
+
+def test_iter_python_files_skips_unreadable_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "good.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    unreadable = tmp_path / "private"
+    hidden_source = unreadable / "hidden.py"
+    unreadable.mkdir()
+    hidden_source.write_text("value = 2\n", encoding="utf-8")
+    original_scandir = os.scandir
+
+    def deny_unreadable_directory(path: str | os.PathLike[str]) -> Iterator[os.DirEntry[str]]:
+        if Path(path) == unreadable:
+            raise PermissionError("synthetic traversal fault")
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", deny_unreadable_directory)
+
+    assert list(iter_python_files(tmp_path)) == [source]
+
+
+@pytest.mark.parametrize(
+    "hidden_parent",
+    (Path(".worktrees") / "feature", Path(".claude") / "worktrees" / "feature"),
+    ids=("legacy-worktree-parent", "agent-worktree-parent"),
+)
+def test_iter_python_files_allows_roots_inside_hidden_worktree_parent(tmp_path: Path, hidden_parent: Path) -> None:
+    source = tmp_path / hidden_parent / "fixtures" / "case" / "good.py"
     source.parent.mkdir(parents=True)
     source.write_text("value = 1\n", encoding="utf-8")
     nested_ignored = source.parent / ".worktrees" / "ignored.py"

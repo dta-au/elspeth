@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ _EXCLUDED_WALK_DIRS = frozenset(
         "venv",
     }
 )
+_EXCLUDED_WALK_PREFIXES: tuple[tuple[str, ...], ...] = ((".claude", "worktrees"),)
 
 # Nested-scope AST node types that a "lexical scope of this function" walker
 # must short-circuit at: descending into their children would conflate names
@@ -215,10 +217,20 @@ def iter_python_files(root: Path, files: Iterable[Path] | None = None) -> Iterat
                 yield candidate
         return
 
-    for file_path in sorted(root.rglob("*.py")):
-        walk_parts = file_path.relative_to(root).parts
-        if not _EXCLUDED_WALK_DIRS.intersection(walk_parts):
-            yield file_path
+    python_files: list[Path] = []
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        current = Path(dirpath)
+        relative_parts = current.relative_to(root).parts
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if dirname not in _EXCLUDED_WALK_DIRS
+            and not any((*relative_parts, dirname)[: len(prefix)] == prefix for prefix in _EXCLUDED_WALK_PREFIXES)
+        ]
+        python_files.extend(current / filename for filename in filenames if filename.endswith(".py"))
+
+    yield from sorted(python_files)
 
 
 def walk_python_files(

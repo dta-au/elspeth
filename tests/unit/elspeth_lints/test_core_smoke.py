@@ -351,11 +351,16 @@ def test_cli_surfaces_parse_and_read_errors_for_whole_repo_rules(tmp_path: Path,
     assert {"parse-error", "read-error"} <= rule_ids
 
 
-def test_cli_whole_repo_parse_diagnostics_respect_rule_path_filter(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_whole_repo_parse_diagnostics_respect_rule_path_filter(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A scoped whole-repo rule must not fail on malformed files outside its path_filter."""
     import argparse
     from collections.abc import Iterable
 
+    from elspeth_lints.core import ast_walker
     from elspeth_lints.core.cli import _run_check
     from elspeth_lints.core.protocols import Category, Finding, RuleContext, RuleMetadata, RuleScope, Severity
     from elspeth_lints.core.registry import RuleRegistry
@@ -385,6 +390,14 @@ def test_cli_whole_repo_parse_diagnostics_respect_rule_path_filter(tmp_path: Pat
     (tmp_path / ".uv-cache").mkdir()
     (tmp_path / ".uv-cache" / "broken.py").write_text("def broken(:\n", encoding="utf-8")
     (tmp_path / "outside.py").write_text("def broken(:\n", encoding="utf-8")
+    parsed_paths: list[str] = []
+    original_parse_python_file = ast_walker.parse_python_file
+
+    def recording_parse_python_file(path: Path) -> object:
+        parsed_paths.append(path.relative_to(tmp_path).as_posix())
+        return original_parse_python_file(path)
+
+    monkeypatch.setattr(ast_walker, "parse_python_file", recording_parse_python_file)
     registry = RuleRegistry()
     registry.register(ScopedWholeRepoRule())
 
@@ -404,6 +417,76 @@ def test_cli_whole_repo_parse_diagnostics_respect_rule_path_filter(tmp_path: Pat
     assert exit_code == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out) == []
+    assert parsed_paths == ["src/good.py"]
+
+
+def test_cli_root_scan_excludes_nested_agent_worktrees_when_rule_path_filter_matches(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A root scan must not report findings from another branch's worktree."""
+    import argparse
+    from collections.abc import Iterable
+
+    from elspeth_lints.core.cli import _run_check
+    from elspeth_lints.core.protocols import Category, Finding, RuleContext, RuleMetadata, RuleScope, Severity
+    from elspeth_lints.core.registry import RuleRegistry
+
+    class WebRule:
+        id = "demo.web"
+        scope = RuleScope.INCREMENTAL
+        metadata = RuleMetadata(
+            id=id,
+            name="Web",
+            description="Demo web rule with a production-shaped path filter.",
+            severity=Severity.ERROR,
+            category=Category.MANIFEST,
+            cwe=(),
+            scope=scope,
+            path_filter=r"(^|/)src/elspeth/web/.+\.py$",
+            examples_violation_count=1,
+            examples_clean_count=1,
+        )
+
+        def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> Iterable[Finding]:
+            del tree
+            display_path = file_path.relative_to(context.root).as_posix()
+            return (
+                Finding(
+                    rule_id=self.id,
+                    file_path=display_path,
+                    line=1,
+                    column=0,
+                    message="visited",
+                    fingerprint=display_path,
+                    severity=self.metadata.severity,
+                ),
+            )
+
+    live = tmp_path / "src" / "elspeth" / "web" / "live.py"
+    leaked = tmp_path / ".claude" / "worktrees" / "sibling" / "src" / "elspeth" / "web" / "leaked.py"
+    for source_path in (live, leaked):
+        source_path.parent.mkdir(parents=True)
+        source_path.write_text("value = 1\n", encoding="utf-8")
+    registry = RuleRegistry()
+    registry.register(WebRule())
+
+    exit_code = _run_check(
+        argparse.Namespace(
+            rules="demo.web",
+            rule_set="static",
+            format="json",
+            root=tmp_path,
+            allowlist_dir=None,
+            repo_root=None,
+            files=None,
+        ),
+        registry=registry,
+    )
+
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert [finding["file_path"] for finding in payload] == ["src/elspeth/web/live.py"]
 
 
 def test_registry_decorator_registers_rule() -> None:

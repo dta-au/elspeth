@@ -10,12 +10,13 @@ import re
 import secrets
 import shlex
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from elspeth_lints.core import ast_walker
 from elspeth_lints.core.allowlist import (
     _JUDGE_METADATA_SIGNATURE_ENV_VAR,
     _JUDGE_METADATA_SIGNATURE_VERIFY_MODE_ENV_VAR,
@@ -29,7 +30,7 @@ from elspeth_lints.core.ast_walker import (
     ParsedPythonFile,
     PythonFileReadError,
     PythonSyntaxError,
-    walk_python_files,
+    iter_python_files,
 )
 from elspeth_lints.core.atomic_io import allowlist_mutation_lock, atomic_update_text
 from elspeth_lints.core.emitters.github import render_github
@@ -1349,9 +1350,11 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
     empty_tree = ast.Module(body=[], type_ignores=[])
     diagnostic_paths: set[Path] = set()
     if whole_repo_rules:
-        for item in walk_python_files(args.root, tuple(args.files or ()) or None):
-            if not _rules_for_path(item.path, root=args.root, rules=whole_repo_rules):
-                continue
+        for item, _applicable_rules in _walk_applicable_python_files(
+            args.root,
+            tuple(args.files or ()) or None,
+            rules=whole_repo_rules,
+        ):
             diagnostic = _diagnostic_finding_for_walk_item(item)
             if diagnostic is not None:
                 findings.append(diagnostic)
@@ -1395,11 +1398,11 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
                         f"({', '.join(rule.id for rule in incremental_rules)})\n"
                     )
                 return 2
-        for item in walk_python_files(args.root, explicit_files or None):
-            item_path = item.path
-            applicable_rules = _rules_for_path(item_path, root=args.root, rules=incremental_rules)
-            if not applicable_rules:
-                continue
+        for item, applicable_rules in _walk_applicable_python_files(
+            args.root,
+            explicit_files or None,
+            rules=incremental_rules,
+        ):
             if isinstance(item, PythonSyntaxError):
                 if item.path not in diagnostic_paths:
                     findings.append(_syntax_error_finding(item))
@@ -1513,6 +1516,19 @@ def _out_of_scope_explicit_files(files: Sequence[Path], *, root: Path, rules: li
         if not any(_path_matches_rule(file_path, root=root, rule=rule) for rule in rules):
             out_of_scope.append(_display_path(_candidate_path(root, file_path), root))
     return out_of_scope
+
+
+def _walk_applicable_python_files(
+    root: Path,
+    files: Sequence[Path] | None,
+    *,
+    rules: list[Rule],
+) -> Iterator[tuple[ParsedPythonFile | PythonSyntaxError | PythonFileReadError, list[Rule]]]:
+    """Parse only Python files claimed by at least one selected rule."""
+    for file_path in iter_python_files(root, files):
+        applicable_rules = _rules_for_path(file_path, root=root, rules=rules)
+        if applicable_rules:
+            yield ast_walker.parse_python_file(file_path), applicable_rules
 
 
 def _rules_for_path(file_path: Path, *, root: Path, rules: list[Rule]) -> list[Rule]:

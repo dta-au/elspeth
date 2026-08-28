@@ -8,6 +8,25 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-28 — root-wide Python lint walks prune repository-local worktrees
+  BEFORE descent, and path filters run BEFORE parsing** (elspeth-9328bf28bb).
+  `core/ast_walker.py::iter_python_files` uses a top-down walk so excluded
+  directories are never entered; `.claude/worktrees` is an exact
+  ROOT-RELATIVE prefix, never a bare `worktrees` component (tracked source may
+  legitimately use that name). A scan rooted inside a worktree remains valid
+  because the excluded prefix is measured from the requested root. Keep
+  explicit `--files` behavior unchanged. Also keep candidate selection on
+  actual filenames: `Path.rglob("*.py")` includes directories whose names end
+  in `.py`, which the generic diagnostics surface misreported as read errors.
+  Keep directory-enumeration errors skippable, matching `Path.rglob`'s legacy
+  behavior; an unreadable or concurrently removed subtree must not abort the
+  whole CLI with a traceback. Per-file read errors remain structured findings.
+  In the CLI, enumerate → apply every selected rule's `path_filter` → parse;
+  reverting that order makes a narrow rule parse the entire repository. Do
+  not turn `_path_matches_rule` from `re.search` into `fullmatch` as part of a
+  walker change: shipped unanchored filters rely on substring semantics and
+  require a separate audited migration.
+
 - **2026-08-28 — in `sign-bundle`, a judged BLOCK is DURABLE STATE, not a
   return value: never use one as a generic "stop the run" mechanism**
   (elspeth-88d8b186f3). `run_sign_bundle_transaction` journals the BLOCK into
