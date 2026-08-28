@@ -55,7 +55,9 @@ is a working document under the normal delivery posture.
   the control. B25 rationalised 16 such handlers in `doctor.py` and 9 in
   `readiness.py` on exactly this ground.
 - **2026-08-29 — the `@trust_boundary` suppression dataflow walk does NOT
-  follow dynamic escapes or comprehension loop variables, and widening an
+  follow dynamic escapes or comprehension loop variables (the comprehension
+  half of that claim is NARROWED by the oracle entry above — plain
+  comprehension targets ARE tracked), and widening an
   existing decorator's `suppresses` tuple is the cheapest correct burn-down
   move.** Two facts, learned burning down `web/composer` (B47):
   1. Several boundaries were declared `suppresses=("R5",)` while their bodies
