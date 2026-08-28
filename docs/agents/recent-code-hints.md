@@ -8,6 +8,25 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — inside a `@trust_boundary`, a name bound ONLY in a `try`
+  body loses its source_param derivation after the `try`.** The tier_model
+  derivation walk intersects the derived-name snapshots of the body and every
+  handler at the join, and does not notice that a handler ending in `raise`
+  never falls through — so `try: data = json.loads(response.content) except
+  ...: raise ...` leaves `data` un-derived and every `data.get`/`isinstance`
+  below it is reported. Keep the decode in a plain helper (`data =
+  _decode_gateway_json(response, ...)` in `providers/gateway.py`) or assert
+  the shape member by member instead of catching `KeyError`; do not widen the
+  `try` to swallow the checks. Filed as a lint observation; until it is fixed
+  this is the shape that suppresses honestly.
+
+- **2026-08-29 — removing a baselined `getattr` site is a masquerade-gate
+  edit.** `config/cicd/masquerade_baseline.yaml` pins `occurrences` per
+  (path, qualname, kind) and fires on a DECREASE and on a stale entry, so the
+  commit that deletes the probe must delete its baseline block too (B20 did
+  this for `textract_client._record_send_attempt`/`_observed_send_attempts`,
+  replaced by a `threading.local` subclass with a declared `count`).
+
 - **2026-08-29 — a component that polls a `Clock` must also SLEEP through
   it.** `elspeth.core.clock.Clock` now carries `sleep(seconds)`: `SystemClock`
   blocks, `MockClock` advances. `SinkEffectCoordinator` defaults its sleep to

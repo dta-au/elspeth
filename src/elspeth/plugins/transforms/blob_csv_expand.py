@@ -277,8 +277,10 @@ def _build_blob_csv_output_schema_config(schema_config: SchemaConfig, cfg: BlobC
     # forbidden by consumer", naming a field the author cannot legally declare.
     # `named_text_field` is None on the blob arm, which removes nothing there.
     removed_field = cfg.named_text_field if cfg.source == "field" else None
-    if removed_field is not None:
-        field_by_name.pop(removed_field, None)
+    if removed_field is not None and removed_field in field_by_name:
+        # Only declared when the author declared it: a flexible input schema
+        # carries no field entries, so absence here is the ordinary case.
+        del field_by_name[removed_field]
 
     base_guaranteed = set(schema_config.guaranteed_fields or ()) - ({removed_field} if removed_field is not None else set())
     output_guaranteed = base_guaranteed | {field.name for field in added_fields}
@@ -486,8 +488,13 @@ class BlobCSVExpand(BaseTransform):
         # genuine collision on the row that arrived. Only the inline arm removes
         # anything — `self.removed_input_fields` is empty on the blob arm, so
         # this is a no-op there rather than an arm test repeated in two places.
+        # `base` carries NORMALIZED keys while the configured name may be the
+        # original header, so resolve it through the contract exactly as
+        # line_explode/json_explode do. `_load_field_text` already routed a row
+        # on which the name does not resolve, so on this path the key exists.
         for removed in self.removed_input_fields:
-            base.pop(removed, None)
+            normalized_removed = removed if removed in base else row.contract.resolve_name(removed)
+            del base[normalized_removed]
 
         output_rows: list[dict[str, Any]] = []
         for row_index, csv_row in enumerate(parsed.rows):

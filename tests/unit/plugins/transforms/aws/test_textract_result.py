@@ -11,6 +11,8 @@ import pytest
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.plugins.transforms.aws.textract_result import (
     MalformedTextractResponse,
+    _mapping,
+    _sequence,
     normalize_analyze_document_result,
     normalize_textract_result,
 )
@@ -899,3 +901,18 @@ def test_analyze_document_block_bound_fails_closed() -> None:
 def test_analyze_document_oversized_native_result_fails_closed() -> None:
     with pytest.raises(MalformedTextractResponse, match="max_result_bytes"):
         _normalize_sync(_sync_response(), max_result_bytes=64)
+
+
+@pytest.mark.parametrize("value", [None, [], "Blocks", 7])
+def test_mapping_boundary_rejects_non_object(value: object) -> None:
+    # ``@trust_boundary`` honesty proof for ``_mapping``'s ``value`` parameter.
+    with pytest.raises(MalformedTextractResponse, match="must be an object"):
+        _mapping(value, "response.DocumentMetadata")
+
+
+@pytest.mark.parametrize("value", [None, {}, "Blocks", b"Blocks", bytearray(b"Blocks"), 7])
+def test_sequence_boundary_rejects_non_list_and_strings(value: object) -> None:
+    # ``@trust_boundary`` honesty proof for ``_sequence``'s ``value`` parameter:
+    # str/bytes are Sequences in the ABC sense and must still be rejected.
+    with pytest.raises(MalformedTextractResponse, match="must be a list"):
+        _sequence(value, "response.Blocks")

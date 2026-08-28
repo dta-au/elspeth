@@ -81,22 +81,45 @@ def _malformed(path: str, detail: str) -> NoReturn:
     raise MalformedTextractResponse(f"{path}: {detail}")
 
 
+@trust_boundary(
+    tier=3,
+    source="Amazon Textract response member expected to be a JSON object (externally derived)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises MalformedTextractResponse unless value is a Mapping; never coerces or defaults",
+    test_ref="tests/unit/plugins/transforms/aws/test_textract_result.py::test_mapping_boundary_rejects_non_object",
+    test_fingerprint="34d444a280a6115783a59403b43bd2943ce7978109bc3adcb97517c8e852cf21",
+)
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         _malformed(path, f"must be an object, got {type(value).__name__}")
     return value
 
 
+@trust_boundary(
+    tier=3,
+    source="Amazon Textract response member expected to be a JSON array (externally derived)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises MalformedTextractResponse unless value is a non-string Sequence; never coerces or defaults",
+    test_ref="tests/unit/plugins/transforms/aws/test_textract_result.py::test_sequence_boundary_rejects_non_list_and_strings",
+    test_fingerprint="f736010f084fc5fa919077eaed8df5bec9a562ae7ec6d635aa2d49cc6203fbf9",
+)
 def _sequence(value: Any, path: str) -> Sequence[Any]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         _malformed(path, f"must be a list, got {type(value).__name__}")
     return value
 
 
-def _required_str(source: Mapping[str, Any], key: str, path: str, *, max_length: int | None = None) -> str:
+def _required_member(source: Mapping[str, Any], key: str, path: str) -> Any:
+    """Return ``source[key]``, failing closed on absence; the caller shapes the value."""
     if key not in source:
         _malformed(path, f"missing required key {key}")
-    value = source[key]
+    return source[key]
+
+
+def _required_str(source: Mapping[str, Any], key: str, path: str, *, max_length: int | None = None) -> str:
+    value = _required_member(source, key, path)
     if type(value) is not str or not value:
         _malformed(f"{path}.{key}", "must be a non-empty string")
     if max_length is not None and len(value) > max_length:
@@ -132,11 +155,12 @@ def _geometry(block: Mapping[str, Any], path: str) -> Mapping[str, Any]:
     source = _mapping(block["Geometry"], f"{path}.Geometry")
     result: dict[str, Any] = {}
     if "BoundingBox" in source:
-        bounding_box = _mapping(source["BoundingBox"], f"{path}.Geometry.BoundingBox")
+        bounding_box_path = f"{path}.Geometry.BoundingBox"
+        bounding_box = _mapping(source["BoundingBox"], bounding_box_path)
         result["BoundingBox"] = {
             member: _finite_float(
-                bounding_box.get(member),
-                f"{path}.Geometry.BoundingBox.{member}",
+                _required_member(bounding_box, member, bounding_box_path),
+                f"{bounding_box_path}.{member}",
                 minimum=0.0,
                 maximum=1.0,
             )
@@ -144,23 +168,22 @@ def _geometry(block: Mapping[str, Any], path: str) -> Mapping[str, Any]:
         }
     if "Polygon" in source:
         polygon = _sequence(source["Polygon"], f"{path}.Geometry.Polygon")
-        result["Polygon"] = [
-            {
-                "X": _finite_float(
-                    _mapping(point, f"{path}.Geometry.Polygon[{index}]").get("X"),
-                    f"{path}.Geometry.Polygon[{index}].X",
-                    minimum=0.0,
-                    maximum=1.0,
-                ),
-                "Y": _finite_float(
-                    _mapping(point, f"{path}.Geometry.Polygon[{index}]").get("Y"),
-                    f"{path}.Geometry.Polygon[{index}].Y",
-                    minimum=0.0,
-                    maximum=1.0,
-                ),
-            }
-            for index, point in enumerate(polygon)
-        ]
+        points: list[dict[str, float]] = []
+        for index, raw_point in enumerate(polygon):
+            point_path = f"{path}.Geometry.Polygon[{index}]"
+            point = _mapping(raw_point, point_path)
+            points.append(
+                {
+                    axis: _finite_float(
+                        _required_member(point, axis, point_path),
+                        f"{point_path}.{axis}",
+                        minimum=0.0,
+                        maximum=1.0,
+                    )
+                    for axis in ("X", "Y")
+                }
+            )
+        result["Polygon"] = points
     if "RotationAngle" in source:
         result["RotationAngle"] = _finite_float(
             source["RotationAngle"],
@@ -180,7 +203,7 @@ def _relationships(block: Mapping[str, Any], path: str) -> tuple[tuple[str, tupl
         relationship_path = f"{path}.Relationships[{index}]"
         relationship = _mapping(item, relationship_path)
         relationship_type = _required_str(relationship, "Type", relationship_path, max_length=128)
-        raw_ids = _sequence(relationship.get("Ids"), f"{relationship_path}.Ids")
+        raw_ids = _sequence(_required_member(relationship, "Ids", relationship_path), f"{relationship_path}.Ids")
         ids: list[str] = []
         for id_index, raw_id in enumerate(raw_ids):
             if type(raw_id) is not str or not raw_id:
@@ -209,7 +232,7 @@ def _page(block: Mapping[str, Any], path: str) -> int:
 def _warning(value: Any, path: str, page_count: int) -> tuple[dict[str, Any], dict[str, Any]]:
     source = _mapping(value, path)
     code = _required_str(source, "ErrorCode", path, max_length=128)
-    raw_pages = _sequence(source.get("Pages"), f"{path}.Pages")
+    raw_pages = _sequence(_required_member(source, "Pages", path), f"{path}.Pages")
     pages = [_bounded_int(page, f"{path}.Pages[{index}]", maximum=page_count) for index, page in enumerate(raw_pages)]
     return {"ErrorCode": code, "Pages": pages}, {"error_code": code, "pages": pages}
 
@@ -282,33 +305,40 @@ def _text_from_children(
     *,
     path: str,
 ) -> str:
+    # Iterative post-order walk. ``visiting`` holds the ids on the current
+    # descent (a child already there is a cycle); ``done`` holds ids whose
+    # text is in ``resolved``. Every id popped from the stack was recorded in
+    # ``paths`` before it was pushed, and every child of an expanded block was
+    # resolved before the block's own expanded entry is reached, so both maps
+    # are total at their read sites.
     root_id = _required_str(block, "Id", path)
-    state: dict[str, int] = {}
+    visiting: set[str] = set()
+    done: set[str] = set()
     resolved: dict[str, str] = {}
     paths = {root_id: path}
     stack: list[tuple[str, bool]] = [(root_id, False)]
     while stack:
         block_id, expanded = stack.pop()
-        block_path = paths.get(block_id, f"block {block_id!r}")
+        block_path = paths[block_id]
         if expanded:
             candidate = index[block_id]
             child_ids = _child_ids(candidate, block_path)
             if child_ids:
-                resolved[block_id] = " ".join(resolved[child_id] for child_id in child_ids if resolved.get(child_id))
+                resolved[block_id] = " ".join(resolved[child_id] for child_id in child_ids if resolved[child_id])
             else:
-                text = candidate.get("Text", "")
+                text = candidate["Text"] if "Text" in candidate else ""
                 if type(text) is not str:
                     _malformed(f"{block_path}.Text", "must be a string")
                 resolved[block_id] = text
-            state[block_id] = 2
+            visiting.remove(block_id)
+            done.add(block_id)
             continue
 
-        candidate_state = state.get(block_id, 0)
-        if candidate_state == 2:
+        if block_id in done:
             continue
-        if candidate_state == 1:
+        if block_id in visiting:
             _malformed(block_path, f"cyclic CHILD relationship through block {block_id!r}")
-        state[block_id] = 1
+        visiting.add(block_id)
         stack.append((block_id, True))
         child_ids = _child_ids(index[block_id], block_path)
         for child_id in reversed(child_ids):
@@ -318,11 +348,11 @@ def _text_from_children(
             child_type = _required_str(child, "BlockType", child_path)
             if child_type == "SELECTION_ELEMENT":
                 resolved[child_id] = ""
-                state[child_id] = 2
+                done.add(child_id)
                 continue
-            if state.get(child_id) == 1:
+            if child_id in visiting:
                 _malformed(child_path, f"cyclic CHILD relationship through block {child_id!r}")
-            if state.get(child_id) != 2:
+            if child_id not in done:
                 stack.append((child_id, False))
     return resolved[root_id]
 
@@ -343,28 +373,31 @@ def _ordered_candidates(
 
 
 def _validate_child_graph(index: Mapping[str, Mapping[str, Any]]) -> None:
-    state: dict[str, int] = {}
+    # Same descent bookkeeping as ``_text_from_children``: ``visiting`` is the
+    # current path, ``done`` is fully explored, and dangling ids were already
+    # rejected so every ``index`` lookup resolves.
+    visiting: set[str] = set()
+    done: set[str] = set()
     for candidate_id in index:
-        if state.get(candidate_id) == 2:
+        if candidate_id in done:
             continue
         stack: list[tuple[str, bool]] = [(candidate_id, False)]
         while stack:
             block_id, expanded = stack.pop()
             if expanded:
-                state[block_id] = 2
+                visiting.remove(block_id)
+                done.add(block_id)
                 continue
-            candidate_state = state.get(block_id, 0)
-            if candidate_state == 2:
+            if block_id in done:
                 continue
-            if candidate_state == 1:
+            if block_id in visiting:
                 _malformed(f"block {block_id!r}", "cyclic CHILD relationship")
-            state[block_id] = 1
+            visiting.add(block_id)
             stack.append((block_id, True))
             for child_id in reversed(_child_ids(index[block_id], f"block {block_id!r}")):
-                child_state = state.get(child_id, 0)
-                if child_state == 1:
+                if child_id in visiting:
                     _malformed(f"block {child_id!r}", "cyclic CHILD relationship")
-                if child_state != 2:
+                if child_id not in done:
                     stack.append((child_id, False))
 
 
@@ -475,7 +508,7 @@ def _project_queries(blocks: Sequence[Mapping[str, Any]], index: Mapping[str, Ma
     result: list[dict[str, Any]] = []
     for query_position, query_block in _ordered_candidates(blocks, block_type="QUERY"):
         query_path = f"Blocks[{query_position}]"
-        query = _mapping(query_block.get("Query"), f"{query_path}.Query")
+        query = _mapping(_required_member(query_block, "Query", query_path), f"{query_path}.Query")
         answer_ids = _child_ids(query_block, query_path, "ANSWER")
         if len(answer_ids) > 1:
             _malformed(query_path, "QUERY block must have at most one ANSWER relationship target")
@@ -560,11 +593,10 @@ def normalize_textract_result(
         status = _required_str(result, "JobStatus", result_path)
         if status != "SUCCEEDED":
             _malformed(f"{result_path}.JobStatus", "must be SUCCEEDED")
-        document_metadata = _mapping(result.get("DocumentMetadata"), f"{result_path}.DocumentMetadata")
-        if "Pages" not in document_metadata:
-            _malformed(f"{result_path}.DocumentMetadata", "missing required key Pages")
+        document_metadata_path = f"{result_path}.DocumentMetadata"
+        document_metadata = _mapping(_required_member(result, "DocumentMetadata", result_path), document_metadata_path)
         candidate_page_count = _bounded_int(
-            document_metadata["Pages"],
+            _required_member(document_metadata, "Pages", document_metadata_path),
             f"{result_path}.DocumentMetadata.Pages",
             maximum=_MAX_DOCUMENT_PAGES,
         )
@@ -577,7 +609,7 @@ def normalize_textract_result(
         elif candidate_model_version != model_version:
             _malformed(f"{result_path}.AnalyzeDocumentModelVersion", "model version changed across result pages")
 
-        raw_blocks = _sequence(result.get("Blocks"), f"{result_path}.Blocks")
+        raw_blocks = _sequence(_required_member(result, "Blocks", result_path), f"{result_path}.Blocks")
         for block_offset, raw_block in enumerate(raw_blocks):
             block = _mapping(raw_block, f"{result_path}.Blocks[{block_offset}]")
             blocks.append(block)
@@ -652,16 +684,14 @@ def normalize_analyze_document_result(
     result = _mapping(response, "response")
     if "HumanLoopActivationOutput" in result:
         _malformed("response.HumanLoopActivationOutput", "human-loop activation output is unsupported")
-    document_metadata = _mapping(result.get("DocumentMetadata"), "response.DocumentMetadata")
-    if "Pages" not in document_metadata:
-        _malformed("response.DocumentMetadata", "missing required key Pages")
+    document_metadata = _mapping(_required_member(result, "DocumentMetadata", "response"), "response.DocumentMetadata")
     page_count = _bounded_int(
-        document_metadata["Pages"],
+        _required_member(document_metadata, "Pages", "response.DocumentMetadata"),
         "response.DocumentMetadata.Pages",
         maximum=_MAX_DOCUMENT_PAGES,
     )
     model_version = _required_str(result, "AnalyzeDocumentModelVersion", "response", max_length=128)
-    raw_blocks = _sequence(result.get("Blocks"), "response.Blocks")
+    raw_blocks = _sequence(_required_member(result, "Blocks", "response"), "response.Blocks")
     blocks: list[Mapping[str, Any]] = []
     for block_offset, raw_block in enumerate(raw_blocks):
         block = _mapping(raw_block, f"response.Blocks[{block_offset}]")

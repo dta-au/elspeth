@@ -297,24 +297,6 @@ entries:
   classification: external-parse
   justification: Reads an optional LiteLLM module capability, validates the returned
     value as a list, and retains only string model identifiers.
-- path: src/elspeth/plugins/transforms/aws/textract_client.py
-  qualname: _observed_send_attempts
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - e14bd0a3576a73c757a8206297682ed40f69dbf59af64a2801a52a5f007f5f61
-  classification: data-container-api
-  justification: Reads ELSPETH's optional per-thread attempt counter from a threading.local
-    data container; absence intentionally means no recorded attempt.
-- path: src/elspeth/plugins/transforms/aws/textract_client.py
-  qualname: _record_send_attempt
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - e14bd0a3576a73c757a8206297682ed40f69dbf59af64a2801a52a5f007f5f61
-  classification: data-container-api
-  justification: Increments ELSPETH's optional per-thread attempt counter stored on
-    threading.local; the default initializes the thread-local data slot.
 - path: src/elspeth/plugins/transforms/aws/textract_document_analysis.py
   qualname: AWSTextractDocumentAnalysisConfig._consistency
   kind: getattr
