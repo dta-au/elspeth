@@ -17,7 +17,7 @@ WEB_COMPOSE = REPO_ROOT / "deploy" / "compose" / "web-postgres.yaml"
 POSTGRES_INIT = REPO_ROOT / "deploy" / "compose" / "postgres-init.sql"
 ENV_EXAMPLE = REPO_ROOT / "deploy" / "compose" / ".env.example"
 
-ELSPETH_IMAGE = "${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}"
+ELSPETH_IMAGE = "${REGISTRY:-ghcr.io/dta-au}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}"
 POSTGRES_IMAGE = "postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
 POSTGRES_PASSWORD_REF = "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}"
 COMPOSE_TEST_ENVIRONMENT = os.environ | {

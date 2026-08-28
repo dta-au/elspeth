@@ -69,7 +69,7 @@ __all__ = [
 ]
 
 
-OPENROUTER_APP_REFERER = "https://github.com/johnm-dta/elspeth"
+OPENROUTER_APP_REFERER = "https://github.com/dta-au/elspeth"
 """Canonical public project URL used for OpenRouter app attribution."""
 
 OPENROUTER_APP_TITLE = "Elspeth"

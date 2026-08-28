@@ -236,7 +236,7 @@ requires the repository-pinned Node.js 24 and npm 11 toolchain; verify it with
 
 ```bash
 # Install
-git clone https://github.com/johnm-dta/elspeth.git && cd elspeth
+git clone https://github.com/dta-au/elspeth.git && cd elspeth
 uv sync --frozen --extra dev
 source .venv/bin/activate
 
@@ -996,11 +996,11 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/state:/app/state \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   run --settings /app/config/pipeline.yaml --execute
 
 # Health check
-docker run --rm ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} health --json
+docker run --rm ghcr.io/dta-au/elspeth:${IMAGE_TAG} health --json
 ```
 
 | Mount | Purpose |

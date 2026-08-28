@@ -263,9 +263,9 @@ check-contracts = "scripts.check_contracts:main"
 elspeth-xdist-auto = "elspeth.testing.pytest_xdist_auto"
 
 [project.urls]
-Homepage = "https://github.com/johnm-dta/elspeth"
-Documentation = "https://github.com/johnm-dta/elspeth#readme"
-Repository = "https://github.com/johnm-dta/elspeth"
+Homepage = "https://github.com/dta-au/elspeth"
+Documentation = "https://github.com/dta-au/elspeth#readme"
+Repository = "https://github.com/dta-au/elspeth"
 
 [build-system]
 requires = ["hatchling"]

@@ -38,20 +38,20 @@ snapshot shrinks.
 Check whether the default branch is protected:
 
 ```bash
-gh api repos/johnm-dta/elspeth/branches/main --jq '{name: .name, protected: .protected}'
+gh api repos/dta-au/elspeth/branches/main --jq '{name: .name, protected: .protected}'
 ```
 
 Inspect active rulesets:
 
 ```bash
-gh api repos/johnm-dta/elspeth/rulesets --jq '[.[] | {id,name,target,enforcement}]'
+gh api repos/dta-au/elspeth/rulesets --jq '[.[] | {id,name,target,enforcement}]'
 ```
 
 Inspect the active `main` ruleset, replacing the ID with the value from the
 previous command:
 
 ```bash
-gh api repos/johnm-dta/elspeth/rulesets/12348893 \
+gh api repos/dta-au/elspeth/rulesets/12348893 \
   --jq '{name: .name, enforcement: .enforcement, rules: [.rules[] | {type, parameters}]}'
 ```
 

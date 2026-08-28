@@ -3,7 +3,7 @@
 A design system for **ELSPETH** — *Extensible Layered Secure Pipeline Engine for Transformation and Handling* — reconstructed from the product's own frontend source so design agents can build on-brand interfaces, mocks, and assets.
 
 > **Sources used to build this system**
-> - GitHub: **https://github.com/johnm-dta/elspeth** (the `johnm-dta/elspeth` repository)
+> - GitHub: **https://github.com/dta-au/elspeth** (the `dta-au/elspeth` repository)
 >   - Design tokens & CSS lifted from `src/elspeth/web/frontend/src/styles/` (`tokens.css`, `base.css`, `shared.css`, `animations.css`, `themes.css`) and per-area component CSS under `src/elspeth/web/frontend/src/components/**`.
 >   - Layout & component structure read from `src/elspeth/web/frontend/src/App.tsx`, `LoginPage.tsx`, and the chat / sidebar / catalog component trees.
 > - A test deployment of the Web Composer (credentials supplied by the project owner) was referenced for UX behaviour.

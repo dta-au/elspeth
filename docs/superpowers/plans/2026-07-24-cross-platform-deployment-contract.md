@@ -548,7 +548,7 @@ git commit -m "feat(cli): add provider-neutral deployment doctor"
 Use `yaml.safe_load` plus subprocess calls to assert:
 
 - the base image is exactly
-  `${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}`;
+  `${REGISTRY:-ghcr.io/dta-au}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}`;
 - no Compose artifact contains a `latest` default;
 - the PostgreSQL overlay uses `postgres:16-alpine`, a named data volume, a
   health check, and `postgres-init.sql`;
@@ -860,7 +860,7 @@ Parse every YAML document and assert:
 - Deployment replicas are exactly one;
 - Deployment strategy is exactly `Recreate`, so an update cannot overlap old
   and new web pods;
-- image repository is `ghcr.io/johnm-dta/elspeth` with an immutable example
+- image repository is `ghcr.io/dta-au/elspeth` with an immutable example
   SHA tag and `imagePullPolicy: IfNotPresent`;
 - command/args start one `elspeth web` process;
 - `WEB_CONCURRENCY=1`;

@@ -212,7 +212,7 @@ describe("UserMenu", () => {
     const help = screen.getByRole("link", { name: /help & documentation/i });
     expect(help).toHaveAttribute(
       "href",
-      "https://github.com/johnm-dta/elspeth/tree/main/docs",
+      "https://github.com/dta-au/elspeth/tree/main/docs",
     );
     // New tab, no opener leakage.
     expect(help).toHaveAttribute("target", "_blank");

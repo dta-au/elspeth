@@ -200,7 +200,7 @@ explicit environment contract.
 ### Docker Compose
 
 The root `docker-compose.yaml` remains the low-friction CLI/SQLite path. It uses
-`ghcr.io/johnm-dta/elspeth` and requires `IMAGE_TAG` instead of silently falling
+`ghcr.io/dta-au/elspeth` and requires `IMAGE_TAG` instead of silently falling
 back to `latest`.
 
 Tracked overlays under `deploy/compose/` provide:

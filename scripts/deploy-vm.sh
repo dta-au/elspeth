@@ -15,7 +15,7 @@
 #
 # Environment Variables:
 #   DEPLOY_DIR          - Deployment directory (default: /srv/elspeth)
-#   REGISTRY            - Container registry (default: ghcr.io/johnm-dta)
+#   REGISTRY            - Container registry (default: ghcr.io/dta-au)
 #   SKIP_BACKUP         - Skip database backup (default: false)
 #   SKIP_SMOKE          - Skip smoke tests (default: false)
 #   ALLOW_MUTABLE_TAG   - Allow mutable tags such as latest (default: false)
@@ -35,7 +35,7 @@ set -euo pipefail
 
 IMAGE_TAG="${1:-}"
 DEPLOY_DIR="${DEPLOY_DIR:-/srv/elspeth}"
-REGISTRY="${REGISTRY:-ghcr.io/johnm-dta}"
+REGISTRY="${REGISTRY:-ghcr.io/dta-au}"
 SKIP_BACKUP="${SKIP_BACKUP:-false}"
 SKIP_SMOKE="${SKIP_SMOKE:-false}"
 ALLOW_MUTABLE_TAG="${ALLOW_MUTABLE_TAG:-false}"
@@ -71,7 +71,7 @@ show_usage() {
     echo ""
     echo "Environment Variables:"
     echo "  DEPLOY_DIR          Deployment directory (default: /srv/elspeth)"
-    echo "  REGISTRY            Container registry (default: ghcr.io/johnm-dta)"
+    echo "  REGISTRY            Container registry (default: ghcr.io/dta-au)"
     echo "  SKIP_BACKUP         Skip database backup (default: false)"
     echo "  SKIP_SMOKE          Skip smoke tests (default: false)"
     echo "  ALLOW_MUTABLE_TAG   Allow mutable tags such as latest (default: false)"

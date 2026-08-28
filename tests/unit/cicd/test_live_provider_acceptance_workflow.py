@@ -404,7 +404,7 @@ def test_sealer_scrubs_canaries_discards_raw_streams_and_writes_exact_envelope(
     monkeypatch.setenv("ELSPETH_STATE_ENGINE_CREDENTIAL_CANARY", credential_canary)
     monkeypatch.setenv("ELSPETH_STATE_ENGINE_PROVIDER_PAYLOAD_CANARY", provider_canary)
     monkeypatch.setenv("TEST_PROVIDER_SECRET", secret_value)
-    monkeypatch.setenv("GITHUB_REPOSITORY", "johnm-dta/elspeth")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "dta-au/elspeth")
     monkeypatch.setenv("GITHUB_SHA", "a" * 40)
     monkeypatch.setenv("GITHUB_RUN_ID", "12345")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")

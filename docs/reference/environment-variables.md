@@ -945,7 +945,7 @@ docker run --rm \
   -e DATABASE_URL="sqlite:////app/data/audit.db" \
   -v elspeth-data:/app/data \
   -v $(pwd)/config:/app/config:ro \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 
@@ -954,7 +954,7 @@ For docker-compose:
 ```yaml
 services:
   elspeth:
-    image: ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set an immutable sha-* or v* tag}
+    image: ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set an immutable sha-* or v* tag}
     environment:
       - ELSPETH_FINGERPRINT_KEY=${ELSPETH_FINGERPRINT_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}

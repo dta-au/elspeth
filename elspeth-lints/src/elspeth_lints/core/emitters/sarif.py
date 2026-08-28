@@ -10,7 +10,7 @@ from elspeth_lints.core.protocols import Finding, RuleMetadata, Severity
 
 SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
 TOOL_NAME = "elspeth-lints"
-TOOL_URI = "https://github.com/johnm-dta/elspeth/tree/main/elspeth-lints"
+TOOL_URI = "https://github.com/dta-au/elspeth/tree/main/elspeth-lints"
 
 
 def render_sarif(findings: Sequence[Finding], *, metadata: Iterable[RuleMetadata] = ()) -> str:

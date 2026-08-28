@@ -651,7 +651,7 @@ class TestExecuteQuery:
             )
 
         request_headers = http_client.last_post.kwargs["headers"]
-        assert request_headers["HTTP-Referer"] == "https://github.com/johnm-dta/elspeth"
+        assert request_headers["HTTP-Referer"] == "https://github.com/dta-au/elspeth"
         assert request_headers["X-OpenRouter-Title"] == "Elspeth"
         assert "elspeth-rapid" not in set(request_headers.values())
 

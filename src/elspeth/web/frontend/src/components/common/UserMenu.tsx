@@ -24,7 +24,7 @@ interface UserMenuProps {
  * directory named by the package metadata (pyproject [project.urls]).
  * Exported so tests pin the single honest destination.
  */
-export const HELP_DOCS_URL = "https://github.com/johnm-dta/elspeth/tree/main/docs";
+export const HELP_DOCS_URL = "https://github.com/dta-au/elspeth/tree/main/docs";
 
 /** The one line that names the signed-in account: display_name when it says
  *  something, otherwise the username. Surrounding whitespace is not part of

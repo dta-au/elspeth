@@ -2257,11 +2257,11 @@ RC-2 fragment files were removed during the repository cleanout because their
 useful history is represented here and in git history.
 
 <!-- Comparison links — tags created at release time -->
-[0.5.1]: https://github.com/tachyon-beep/elspeth/compare/v0.5.0-rc5.0...v0.5.1-rc5.1
-[0.5.0]: https://github.com/tachyon-beep/elspeth/compare/v0.4.1-rc4.1...v0.5.0-rc5.0
-[0.4.1]: https://github.com/tachyon-beep/elspeth/compare/v0.4.0-rc4.0...v0.4.1-rc4.1
-[0.4.0]: https://github.com/tachyon-beep/elspeth/compare/v0.3.4-rc3.4...v0.4.0-rc4.0
-[0.3.4]: https://github.com/tachyon-beep/elspeth/compare/v0.3.3-rc3.3...v0.3.4-rc3.4
-[0.3.3]: https://github.com/tachyon-beep/elspeth/compare/v0.3.0-rc3.2...v0.3.3-rc3.3
-[0.3.0]: https://github.com/tachyon-beep/elspeth/compare/v0.1.0-phase1...v0.3.0-rc3.2
-[0.1.0]: https://github.com/tachyon-beep/elspeth/releases/tag/v0.1.0-phase1
+[0.5.1]: https://github.com/dta-au/elspeth/compare/v0.5.0-rc5.0...v0.5.1-rc5.1
+[0.5.0]: https://github.com/dta-au/elspeth/compare/v0.4.1-rc4.1...v0.5.0-rc5.0
+[0.4.1]: https://github.com/dta-au/elspeth/compare/v0.4.0-rc4.0...v0.4.1-rc4.1
+[0.4.0]: https://github.com/dta-au/elspeth/compare/v0.3.4-rc3.4...v0.4.0-rc4.0
+[0.3.4]: https://github.com/dta-au/elspeth/compare/v0.3.3-rc3.3...v0.3.4-rc3.4
+[0.3.3]: https://github.com/dta-au/elspeth/compare/v0.3.0-rc3.2...v0.3.3-rc3.3
+[0.3.0]: https://github.com/dta-au/elspeth/compare/v0.1.0-phase1...v0.3.0-rc3.2
+[0.1.0]: https://github.com/dta-au/elspeth/releases/tag/v0.1.0-phase1

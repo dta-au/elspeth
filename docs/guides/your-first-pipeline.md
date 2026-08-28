@@ -42,7 +42,7 @@ Choose your environment:
 
 ```bash
 # Clone the repository
-git clone https://github.com/johnm-dta/elspeth.git
+git clone https://github.com/dta-au/elspeth.git
 cd elspeth
 
 # Create the locked virtual environment and install
@@ -350,7 +350,7 @@ moving `latest` tag or infer an image tag from the package version:
 ```bash
 : "${IMAGE_TAG:?export an exact published sha-* or v* image tag}"
 docker buildx imagetools inspect \
-  "ghcr.io/johnm-dta/elspeth:${IMAGE_TAG}" >/dev/null
+  "ghcr.io/dta-au/elspeth:${IMAGE_TAG}" >/dev/null
 ```
 
 ### Step 1: Set Up Directory Structure
@@ -447,7 +447,7 @@ EOF
 docker run --rm \
   -v $(pwd)/config:/app/config:ro \
   -v $(pwd)/input:/app/input:ro \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   validate --settings /app/config/pipeline.yaml
 ```
 
@@ -469,7 +469,7 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 
@@ -499,7 +499,7 @@ For Docker environments where TUI isn't available, use non-interactive explain o
 ```bash
 docker run --rm \
   -v $(pwd)/data:/app/data:ro \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   explain --run latest --row 2 --no-tui --database /app/data/audit.db
 ```
 
@@ -515,7 +515,7 @@ For repeated runs, docker-compose is more convenient:
 # docker-compose.yaml
 services:
   elspeth:
-    image: ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set the confirmed published tag}
+    image: ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set the confirmed published tag}
     volumes:
       - ./config:/app/config:ro
       - ./input:/app/input:ro
@@ -770,7 +770,7 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set the confirmed published tag} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set the confirmed published tag} \
   <command>
 ```
 

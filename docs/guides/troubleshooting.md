@@ -59,7 +59,7 @@ export ELSPETH_ALLOW_RAW_SECRETS=true
 ```bash
 docker run --rm \
   -e ELSPETH_FINGERPRINT_KEY="${ELSPETH_FINGERPRINT_KEY:?generate and export the fingerprint key}" \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 
@@ -306,7 +306,7 @@ uv sync --frozen --extra tracing-langfuse
    ```bash
    docker run --rm \
      -v $(pwd)/input:/app/input:ro \
-     ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
+     ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
      ls /app/input
    ```
 

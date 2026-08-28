@@ -8,7 +8,7 @@ Install Python 3.12 or newer, `uv`, Node.js 24, and npm 11. The repository's
 `.node-version`, `package.json`, and lockfiles are the toolchain authority.
 
 ```bash
-git clone https://github.com/johnm-dta/elspeth.git && cd elspeth
+git clone https://github.com/dta-au/elspeth.git && cd elspeth
 uv sync --frozen --extra dev --extra azure
 source .venv/bin/activate
 

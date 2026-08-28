@@ -2314,7 +2314,7 @@ incomplete.
 After Steps 1–6 are green, assign:
 
 ```text
-ghcr.io/johnm-dta/elspeth:0.7.2-RC-280726
+ghcr.io/dta-au/elspeth:0.7.2-RC-280726
 ```
 
 to the single qualified digest. Inspect the remote manifest after promotion and

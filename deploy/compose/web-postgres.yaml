@@ -28,7 +28,7 @@ x-web-environment: &web-environment
 
 services:
   state-init:
-    image: ${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
+    image: ${REGISTRY:-ghcr.io/dta-au}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
@@ -42,7 +42,7 @@ services:
     restart: "no"
 
   web-init:
-    image: ${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
+    image: ${REGISTRY:-ghcr.io/dta-au}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
     command: ["doctor", "deployment", "--init-schema"]
     environment: *web-environment
     volumes:
@@ -57,7 +57,7 @@ services:
     restart: "no"
 
   web:
-    image: ${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
+    image: ${REGISTRY:-ghcr.io/dta-au}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
     command: ["web", "--host", "0.0.0.0", "--port", "8451"]
     environment: *web-environment
     ports:

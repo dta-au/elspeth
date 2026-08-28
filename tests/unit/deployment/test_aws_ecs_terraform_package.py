@@ -1307,7 +1307,7 @@ def test_application_image_contract_is_baked_verified_and_admitted() -> None:
     assert verify in handoff
     assert "cosign version" in handoff
     assert '--certificate-oidc-issuer "https://token.actions.githubusercontent.com"' in handoff
-    assert '--certificate-identity "https://github.com/johnm-dta/elspeth/.github/workflows/build-push.yaml@refs/tags/$GHCR_TAG"' in handoff
+    assert '--certificate-identity "https://github.com/dta-au/elspeth/.github/workflows/build-push.yaml@refs/tags/$GHCR_TAG"' in handoff
     assert "id-token: write" in workflow
     assert 'run: cosign sign --yes "$IMAGE_DIGEST"' in workflow
     assert 'GHCR_IMAGE="$GHCR_REPOSITORY@$GHCR_IMAGE_DIGEST"' in handoff

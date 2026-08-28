@@ -28,20 +28,20 @@ ELSPETH containers follow a **CLI-first design** - arguments are passed directly
 : "${IMAGE_TAG:?export an exact published sha-* or v* image tag}"
 
 # Show help
-docker run ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} --help
+docker run ghcr.io/dta-au/elspeth:${IMAGE_TAG} --help
 
 # Check version
-docker run ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} --version
+docker run ghcr.io/dta-au/elspeth:${IMAGE_TAG} --version
 
 # List available plugins
-docker run ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} plugins list
+docker run ghcr.io/dta-au/elspeth:${IMAGE_TAG} plugins list
 ```
 
 Confirm the tag exists before use:
 
 ```bash
 docker buildx imagetools inspect \
-  "ghcr.io/johnm-dta/elspeth:${IMAGE_TAG}" >/dev/null
+  "ghcr.io/dta-au/elspeth:${IMAGE_TAG}" >/dev/null
 ```
 
 Do not infer an image tag from the Python package version. A source release and
@@ -79,7 +79,7 @@ docker run --rm --name elspeth-web \
   -e ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0 \
   -e ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60 \
   -v "$(pwd)/data:/app/data" \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   web --host 0.0.0.0 --port 8451
 ```
 
@@ -118,7 +118,7 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 
@@ -149,7 +149,7 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 
@@ -185,7 +185,7 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 
@@ -194,7 +194,7 @@ docker run --rm \
 ```bash
 docker run --rm \
   -v $(pwd)/config:/app/config:ro \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   validate --settings /app/config/pipeline.yaml
 ```
 
@@ -205,7 +205,7 @@ For interactive exploration, mount the state and use the TUI (requires `-it`):
 ```bash
 docker run -it --rm \
   -v $(pwd)/data:/app/data:ro \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   explain --run latest --row 42 --database /app/data/audit.db
 ```
 
@@ -214,12 +214,12 @@ For non-interactive environments (CI/CD), use text or JSON explain output:
 ```bash
 docker run --rm \
   -v $(pwd)/data:/app/data:ro \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   explain --run latest --row 42 --no-tui --database /app/data/audit.db
 
 docker run --rm \
   -v $(pwd)/data:/app/data:ro \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   explain --run latest --row 42 --json --database /app/data/audit.db
 ```
 
@@ -231,7 +231,7 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   resume abc123 --execute
 ```
 
@@ -245,7 +245,7 @@ For easier management, use docker-compose:
 # docker-compose.yaml
 services:
   elspeth:
-    image: ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set IMAGE_TAG to sha-<commit> or v*}
+    image: ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set IMAGE_TAG to sha-<commit> or v*}
     environment:
       - DATABASE_URL=${DATABASE_URL:-sqlite:////app/data/audit.db}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
@@ -335,13 +335,13 @@ The `health` command verifies system readiness:
 
 ```bash
 # Basic health check
-docker run --rm ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} health
+docker run --rm ghcr.io/dta-au/elspeth:${IMAGE_TAG} health
 
 # Verbose output
-docker run --rm ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} health --verbose
+docker run --rm ghcr.io/dta-au/elspeth:${IMAGE_TAG} health --verbose
 
 # JSON output (for automation)
-docker run --rm ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} health --json
+docker run --rm ghcr.io/dta-au/elspeth:${IMAGE_TAG} health --json
 ```
 
 ### Example JSON Output
@@ -392,7 +392,7 @@ publish `latest`. Always inspect the selected registry tag before using it.
 
 Images are published to:
 
-- **GitHub Container Registry**: `ghcr.io/johnm-dta/elspeth`
+- **GitHub Container Registry**: `ghcr.io/dta-au/elspeth`
 - **Azure Container Registry**: `<your-acr>.azurecr.io/elspeth` (if configured)
 
 ### Pulling from Private Registry
@@ -401,7 +401,7 @@ Images are published to:
 # GitHub Container Registry
 printf '%s' "$GITHUB_TOKEN" \
   | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
-docker pull ghcr.io/johnm-dta/elspeth:${IMAGE_TAG}
+docker pull ghcr.io/dta-au/elspeth:${IMAGE_TAG}
 
 # Azure Container Registry
 az acr login --name your-acr
@@ -537,7 +537,7 @@ export ELSPETH_FINGERPRINT_KEY="$(openssl rand -hex 32)"
 : "${IMAGE_TAG:?set the confirmed published image tag}"
 docker run --rm \
   -e ELSPETH_FINGERPRINT_KEY="${ELSPETH_FINGERPRINT_KEY}" \
-  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   health --json
 ```
 

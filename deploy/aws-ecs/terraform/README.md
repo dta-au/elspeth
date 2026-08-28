@@ -409,7 +409,7 @@ mkdir -m 700 "$transfer_work/docker-config"
   GHCR_IMAGE="$GHCR_REPOSITORY@$GHCR_IMAGE_DIGEST"
   cosign verify \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-    --certificate-identity "https://github.com/johnm-dta/elspeth/.github/workflows/build-push.yaml@refs/tags/$GHCR_TAG" \
+    --certificate-identity "https://github.com/dta-au/elspeth/.github/workflows/build-push.yaml@refs/tags/$GHCR_TAG" \
     "$GHCR_IMAGE"
 
   resolve_target_manifest_digest() (

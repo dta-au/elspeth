@@ -35,4 +35,4 @@ In an HTML file, link `styles.css`, load `_ds_bundle.js`, then read components f
 ```
 (Confirm the exact namespace by checking the compiled bundle.) For throwaway mocks, prefer copying the token CSS and the class names from `tokens/primitives.css` directly into a static HTML file.
 
-Source of truth: the product frontend at **https://github.com/johnm-dta/elspeth** (`src/elspeth/web/frontend`).
+Source of truth: the product frontend at **https://github.com/dta-au/elspeth** (`src/elspeth/web/frontend`).

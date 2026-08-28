@@ -75,7 +75,7 @@ The examples use `/opt/elspeth` for the checked-out release:
 sudo install -d -o elspeth -g elspeth -m 0750 /opt/elspeth
 if [ ! -d /opt/elspeth/.git ]; then
   sudo -u elspeth git clone --filter=blob:none \
-    https://github.com/johnm-dta/elspeth.git /opt/elspeth
+    https://github.com/dta-au/elspeth.git /opt/elspeth
 fi
 sudo -u elspeth git -C /opt/elspeth fetch --tags --force
 sudo -u elspeth git -C /opt/elspeth checkout --detach "$ELSPETH_RELEASE_REF"

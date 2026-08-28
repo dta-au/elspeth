@@ -32,7 +32,7 @@ Create custom sources, transforms, and sinks for ELSPETH pipelines.
 - **ELSPETH concepts** - Read [Data Trust and Error Handling](docs/guides/data-trust-and-error-handling.md) for the Three-Tier Trust Model
 
 ```bash
-git clone https://github.com/johnm-dta/elspeth.git && cd elspeth
+git clone https://github.com/dta-au/elspeth.git && cd elspeth
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```

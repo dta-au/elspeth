@@ -149,7 +149,7 @@ ARG RDS_CA_BUNDLE_SHA256
 # Labels for container registry
 LABEL org.opencontainers.image.title="ELSPETH"
 LABEL org.opencontainers.image.description="Auditable Sense/Decide/Act Pipelines"
-LABEL org.opencontainers.image.source="https://github.com/johnm-dta/elspeth"
+LABEL org.opencontainers.image.source="https://github.com/dta-au/elspeth"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL io.elspeth.aws-ecs-config-contract="elspeth.aws-ecs.runtime.v1"
 LABEL io.elspeth.install-extras="$INSTALL_EXTRAS"

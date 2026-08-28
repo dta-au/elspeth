@@ -27,7 +27,7 @@ Install Python 3.12 or newer and `uv`, then synchronize the locked source
 checkout:
 
 ```bash
-git clone https://github.com/johnm-dta/elspeth.git
+git clone https://github.com/dta-au/elspeth.git
 cd elspeth
 uv sync --frozen --all-extras
 source .venv/bin/activate

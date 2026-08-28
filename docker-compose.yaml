@@ -9,7 +9,7 @@
 
 services:
   elspeth:
-    image: ${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
+    image: ${REGISTRY:-ghcr.io/dta-au}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/state/landscape.db}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-}
