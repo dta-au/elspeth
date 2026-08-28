@@ -604,8 +604,10 @@ class BaseTransform(ABC):
         # BaseTransform in the MRO shadows the property without ever appearing
         # there, so reads would silently return the UNDEMOTED model. Assert the
         # property still wins, so that shape fails at class creation rather than
-        # per row — the same posture as the determinism check below.
-        resolved = inspect.getattr_static(cls, "input_schema", None)
+        # per row — the same posture as the determinism check below. No default:
+        # BaseTransform itself defines the property, so the static lookup cannot
+        # miss on any subclass; a default would only be dead code.
+        resolved = inspect.getattr_static(cls, "input_schema")
         if not isinstance(resolved, property):
             raise TypeError(
                 f"{cls.__qualname__} resolves `input_schema` to "
@@ -763,10 +765,16 @@ class BaseTransform(ABC):
         # plausible-but-wrong key is worse than an honest vague one: the rest of
         # the message already names the offending FIELD, which is what the
         # author searches their options for.
-        authored_required = self.config.get("required_input_fields")
-        authored_required_names = (
-            {value for value in authored_required if isinstance(value, str)} if isinstance(authored_required, (list, tuple)) else set()
-        )
+        #
+        # PRESENCE comes from the authored dict (did the author write the key at
+        # all); the NAMES come from the validated model, which has already
+        # checked and stripped every entry — the same normalization
+        # ``declared_input_fields`` was built from, so the comparison below is
+        # like-for-like. ``_initialize_declared_input_fields`` stores the
+        # validated config before calling here.
+        validated_config = self._validated_config
+        assert validated_config is not None, "validated config must be captured before the fixed-schema check"
+        authored_required_names = set(validated_config.required_input_fields or ()) if "required_input_fields" in self.config else set()
         for name in self.declared_input_fields:
             if name in authored_required_names:
                 authored_by.setdefault(name, []).append("required_input_fields")
@@ -1158,8 +1166,9 @@ class BaseTransform(ABC):
         else:
             # Read declared model fields rather than __dict__: that resolves
             # aliases and defaults the way pydantic itself does, and does not
-            # depend on how the instance happens to store its attributes.
-            options = {name: getattr(validated, name, None) for name in type(validated).model_fields}
+            # depend on how the instance happens to store its attributes. Every
+            # declared field is present on a validated instance, so no default.
+            options = {name: getattr(validated, name) for name in type(validated).model_fields}
         named: set[str] = set()
         for key, value in options.items():
             if key in self.output_naming_config_keys or not is_column_naming_config_option(key):

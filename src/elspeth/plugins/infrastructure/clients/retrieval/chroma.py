@@ -30,6 +30,7 @@ from pydantic import BaseModel, field_validator, model_validator
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.enums import CallStatus, CallType
 from elspeth.contracts.probes import CollectionReadinessResult
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.connection import (
     ChromaConnectionConfig,
@@ -108,6 +109,49 @@ class ChromaSearchProviderConfig(BaseModel):
         )
 
 
+@trust_boundary(
+    tier=3,
+    source="chromadb Collection.metadata as returned by the Chroma SDK / server for an existing collection",
+    source_param="collection_metadata",
+    suppresses=("R5",),
+    invariant=(
+        "raises RetrievalError(retryable=False) when the metadata is not a Mapping, carries no 'hnsw:space', "
+        "or its 'hnsw:space' is not a str; never substitutes a default distance function"
+    ),
+    test_ref="tests/unit/plugins/infrastructure/clients/retrieval/test_chroma.py::test_collection_distance_space_rejects_non_mapping_metadata",
+    test_fingerprint="aea5f064c296f13717d3bcd56351bf114f2e951151ea7492e77c5250122f6374",
+)
+def _collection_distance_space(collection_metadata: Any, collection_name: str) -> str:
+    """Parse the distance function an existing Chroma collection was built with.
+
+    Score normalization is only meaningful against the collection's real
+    ``hnsw:space``; a missing or malformed value must fail startup rather than
+    fall back to a guess. ``collection_name`` is only used for the message.
+    """
+    if not isinstance(collection_metadata, Mapping):
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} returned malformed metadata. "
+            "Score normalization requires an exact metadata mapping containing 'hnsw:space'.",
+            retryable=False,
+        )
+    if "hnsw:space" not in collection_metadata:
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} has no 'hnsw:space' "
+            f"in metadata. Score normalization cannot proceed without a "
+            f"known distance function.",
+            retryable=False,
+        )
+    actual_space = collection_metadata["hnsw:space"]
+    if not isinstance(actual_space, str):
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} has a non-string 'hnsw:space' "
+            f"({type(actual_space).__name__}) in metadata. Score normalization requires "
+            f"a named distance function.",
+            retryable=False,
+        )
+    return actual_space
+
+
 class ChromaSearchProvider:
     """ChromaDB implementation of RetrievalProvider.
 
@@ -165,21 +209,7 @@ class ChromaSearchProvider:
             ) from exc
 
         # Validate distance function matches what the collection was created with.
-        collection_metadata = self._collection.metadata
-        if not isinstance(collection_metadata, Mapping):
-            raise RetrievalError(
-                f"Chroma collection {config.collection!r} returned malformed metadata. "
-                "Score normalization requires an exact metadata mapping containing 'hnsw:space'.",
-                retryable=False,
-            )
-        if "hnsw:space" not in collection_metadata:
-            raise RetrievalError(
-                f"Chroma collection {config.collection!r} has no 'hnsw:space' "
-                f"in metadata. Score normalization cannot proceed without a "
-                f"known distance function.",
-                retryable=False,
-            )
-        actual_space = collection_metadata["hnsw:space"]
+        actual_space = _collection_distance_space(self._collection.metadata, config.collection)
         if actual_space != config.distance_function:
             raise RetrievalError(
                 f"Chroma collection {config.collection!r} exists with "
