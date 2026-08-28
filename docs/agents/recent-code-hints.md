@@ -8,6 +8,23 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-28 — the no-stash pre-commit dispatcher needs a truthy,
+  guaranteed-nonexistent `--files` sentinel for deletion-only indexes**
+  (elspeth-c1e85e08c9). A deletion-only index is non-empty even though the
+  `ACMRTUXB` path list is empty. Do not remove the dispatcher's empty-list
+  branch and call `pre-commit run --files` with zero values: pre-commit parses
+  that as `args.files=[]` and silently re-enables stashing. Do not pass the
+  deleted path either: a cached deletion can still exist in the worktree, and
+  filename-bound hooks would inspect content absent from the commit. The
+  dispatcher first proves the index differs from HEAD, then passes a child of
+  Git's index *file* as its impossible sentinel. Pre-commit drops that path
+  from its classifier, keeps `args.files` truthy (stash disabled), and executes
+  `always_run` hooks such as `secret-scan`. An empty-string placeholder is not
+  equivalent; pre-commit normalizes it to `.`. This fix does not make `files:`
+  regexes deletion-aware; whole-repo manifest/tree gates remain CI-owned
+  unless the operator separately changes the local fast-gate policy in
+  `.pre-commit-config.yaml`.
+
 - **2026-08-28 — root-wide Python lint walks prune repository-local worktrees
   BEFORE descent, and path filters run BEFORE parsing** (elspeth-9328bf28bb).
   `core/ast_walker.py::iter_python_files` uses a top-down walk so excluded
