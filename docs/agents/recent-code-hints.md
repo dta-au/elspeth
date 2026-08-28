@@ -22,6 +22,32 @@ is a working document under the normal delivery posture.
   `type() is dict` swap returns names where connections are wanted only in the
   mapped form and is undetectable in the list form.
 
+- **2026-08-29 — an `isinstance(x, Mapping)` → `type(x) is dict` swap can pass
+  mypy AND every runtime test and still be wrong; the discriminator is
+  `reveal_type` on the NEGATIVE arm.** Measured in B45 on the two coalesce
+  `branches` sites in `web/composer/tools/transforms.py`
+  (`dict(validated.branches) if isinstance(validated.branches, Mapping) else
+  tuple(validated.branches)`). Both cheap checks give a false green: mypy
+  compiles the converted form clean because `tuple()` accepts *any* iterable,
+  and no end-to-end test can tell the forms apart because pydantic
+  RECONSTRUCTS the field — `_UpsertNodeArgumentsModel.model_validate` turns a
+  `MappingProxyType`, a `dict` subclass, and a plain `dict` all into exactly
+  `dict`, and a tuple into exactly `list` (measured). So the conversion was
+  applied, the full scoped suite stayed green, and only a narrowing probe
+  caught it: for `b: list[str] | dict[str, str]`, `isinstance(b, Mapping)`
+  reveals the negative arm as `list[str]`, while `type(b) is dict` reveals it
+  as the un-narrowed `list[str] | dict[str, str]`. The exact-type form
+  therefore FORFEITS the static proof that `tuple(...)` receives a list, and
+  its else-branch on a mapping yields a tuple of the KEYS — a named coalesce
+  branch map silently persisted as a positional branch tuple. Generalises
+  B41's dataclass-union finding to builtin containers, and is the operational
+  companion to B51's `deep_freeze`/mappingproxy entry below: composition state
+  is frozen (so `type() is dict` is always False there), while pydantic-validated
+  TOOL ARGUMENTS are exact (so `type() is dict` is always True there) — both
+  make the swap untestable at runtime for opposite reasons. Method to reuse
+  before any `isinstance` → `type() is` conversion in this sweep: write a
+  four-line `reveal_type` probe for both forms and read the negative arm.
+  A green mypy run on the real file is NOT that check.
 - **2026-08-29 — a platform-conditional stdlib constant probed with
   `getattr(os, "O_NOFOLLOW", None)` is BOTH a tier_model R2 and a masquerade
   baseline entry; the honest form is a direct read under
