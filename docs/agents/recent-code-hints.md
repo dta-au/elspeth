@@ -105,6 +105,35 @@ is a working document under the normal delivery posture.
   RATCHET that reports its own overage (`matched 36/11`), so suppressing sites
   under a boundary lowers the count without clearing the finding — only the
   operator can lower the cap, and the residual is not a lane defect.
+- **2026-08-29 — a "NOT a declared trust boundary because X" comment is a
+  claim about the tree at the time it was written; re-verify X before
+  honouring it.** `web/composer/redaction._coerce_stringified_json_object`
+  carried a comment refusing `@observation_boundary` because bare
+  `json.loads` could escape a `RecursionError`. Its own docstring, two
+  paragraphs down, recorded that decoding had since moved to
+  `bounded_json_loads` (which maps `RecursionError` to `JsonBoundaryError`, a
+  `ValueError` the handler already catches) — the refusal had outlived its
+  reason and was blocking an honest declaration. B36 declared it and pinned
+  the invariant with a 20,000-deep `"["*N` input that must return the input
+  object untouched (`test_coerce_stringified_json_object_never_raises_on_hostile_text`).
+  Two neighbours from the same lane: (1) a value returned from a
+  positional-arg call on the source param (`decoded =
+  bounded_json_loads(value, ...)`) stays OUTSIDE the boundary walk, so the R5
+  on `isinstance(decoded, dict)` survived the decorator; because
+  `bounded_json_loads` runs plain `json.loads` with no `object_pairs_hook`,
+  a JSON object decodes to exactly `dict` and `type(decoded) is dict` is the
+  exact nominal form, not a weakening. (2) In a fail-closed redactor, swapping
+  an ABC `isinstance(x, Mapping)` for the Tier-1 nominal `type(x) is dict`
+  changes what happens to the OTHER branch: `redact_source_storage_path.
+  _redact_one` used to return a non-`Mapping` `options` value unchanged, so a
+  read-only-`Mapping` carrier that was previously redacted would have started
+  passing through un-redacted under a naive swap. The correct move is to make
+  every non-dict, non-None carrier RAISE `AuditIntegrityError` (it is a
+  corrupted first-party serializer shape either way), and pin it with a
+  `MappingProxyType` options that carries a private path — see
+  `test_redact_source_storage_path_rejects_non_dict_options_carrying_blob_path`.
+  Read the else-branch before the swap (brief fact 4), and in a redaction
+  surface prefer strengthen-to-raise over preserve-pass-through.
 
 - **2026-08-29 — the `trust_boundary.tests` gate reads exception names out of
   `invariant` PROSE with a `*Error|*Exception|*Warning` suffix regex, so a
