@@ -41,7 +41,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
 )
-from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.infrastructure.base import BaseSink
@@ -109,15 +109,13 @@ class CSVWriteOptions(BaseModel):
             codecs.lookup(value)
         except LookupError as exc:
             raise ValueError("unknown CSV encoding") from exc
-        probe_failed = False
-        encoded: object = None
         try:
-            encoder = codecs.getincrementalencoder(value)(errors="strict")
-            encoded = encoder.encode("", final=True)
+            encoded: object = codecs.getincrementalencoder(value)(errors="strict").encode("", final=True)
         except (LookupError, TypeError, UnicodeError, ValueError):
-            probe_failed = True
-        if probe_failed or not isinstance(encoded, bytes):
             raise ValueError("CSV encoding must encode text to bytes") from None
+        # Text-to-text codecs such as rot13 look up cleanly but never yield bytes.
+        if type(encoded) is not bytes:
+            raise ValueError("CSV encoding must encode text to bytes")
         return value
 
 
@@ -270,12 +268,12 @@ def _compile_key_template(template_source: str) -> _CompiledKeyTemplate:
     from jinja2 import nodes
 
     for body_node in parsed.body:
-        if not isinstance(body_node, nodes.Output):
+        if type(body_node) is not nodes.Output:
             raise ValueError("key template may contain only literal text and approved variables")
         for output_node in body_node.nodes:
-            if isinstance(output_node, nodes.TemplateData):
+            if type(output_node) is nodes.TemplateData:
                 continue
-            if isinstance(output_node, nodes.Name) and output_node.ctx == "load" and output_node.name in {"run_id", "timestamp"}:
+            if type(output_node) is nodes.Name and output_node.ctx == "load" and output_node.name in {"run_id", "timestamp"}:
                 continue
             raise ValueError("key template may contain only literal text and approved variables")
     return cast("_CompiledKeyTemplate", environment.from_string(template_source))
@@ -370,38 +368,32 @@ class _BoundedBinaryWriter:
 class _EncodedTextWriter:
     def __init__(self, writer: _BoundedBinaryWriter, encoding: str) -> None:
         self._writer = writer
-        encoder_failed = False
-        encoder: Any | None = None
         try:
-            encoder = codecs.getincrementalencoder(encoding)(errors="strict")
+            self._encoder = codecs.getincrementalencoder(encoding)(errors="strict")
         except (LookupError, TypeError, UnicodeError, ValueError):
-            encoder_failed = True
-        if encoder_failed or encoder is None:
             raise S3RecordSerializationError from None
-        self._encoder = encoder
 
-    def write(self, value: str) -> int:
+    def _encode(self, value: str, *, final: bool) -> bytes:
+        # The failure is raised after the handler exits so that neither
+        # __cause__ nor __context__ carries the codec's exception, whose message
+        # embeds the row's characters. A registered text-to-text codec can also
+        # return str, which is the same static failure rather than a crash.
         encoding_failed = False
         encoded: object = None
         try:
-            encoded = self._encoder.encode(value, final=False)
+            encoded = self._encoder.encode(value, final=final)
         except (LookupError, TypeError, UnicodeError, ValueError):
             encoding_failed = True
-        if encoding_failed or not isinstance(encoded, bytes):
+        if encoding_failed or type(encoded) is not bytes:
             raise S3RecordSerializationError from None
-        self._writer.write(encoded)
+        return encoded
+
+    def write(self, value: str) -> int:
+        self._writer.write(self._encode(value, final=False))
         return len(value)
 
     def finalize(self) -> None:
-        encoding_failed = False
-        encoded: object = None
-        try:
-            encoded = self._encoder.encode("", final=True)
-        except (LookupError, TypeError, UnicodeError, ValueError):
-            encoding_failed = True
-        if encoding_failed or not isinstance(encoded, bytes):
-            raise S3RecordSerializationError from None
-        self._writer.write(encoded)
+        self._writer.write(self._encode("", final=True))
 
 
 def _json_string_chars(value: str) -> int:
@@ -424,7 +416,7 @@ def _json_value_chars(value: Any, *, seen: set[int]) -> int:
         return 4
     if value is False:
         return 5
-    if isinstance(value, str):
+    if type(value) is str:
         return _json_string_chars(value)
     if type(value) is int:
         return len(str(value))
@@ -432,7 +424,10 @@ def _json_value_chars(value: Any, *, seen: set[int]) -> int:
         if not math.isfinite(value):
             raise S3RecordSerializationError
         return len(json.dumps(value, allow_nan=False))
-    if isinstance(value, Mapping):
+    # The container arms mirror json.JSONEncoder's own dispatch (dict subclasses
+    # and list/tuple) so this estimate accepts exactly what the write path will
+    # encode; a frozen mapping or frozenset is a static failure in both places.
+    if isinstance(value, dict):
         identity = id(value)
         if identity in seen:
             raise S3RecordSerializationError
@@ -440,7 +435,7 @@ def _json_value_chars(value: Any, *, seen: set[int]) -> int:
         try:
             total = 2
             for index, (key, child) in enumerate(value.items()):
-                if not isinstance(key, str):
+                if type(key) is not str:
                     raise S3RecordSerializationError
                 if index:
                     total += 1
@@ -448,7 +443,7 @@ def _json_value_chars(value: Any, *, seen: set[int]) -> int:
             return total
         finally:
             seen.remove(identity)
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         identity = id(value)
         if identity in seen:
             raise S3RecordSerializationError
@@ -461,6 +456,8 @@ def _json_value_chars(value: Any, *, seen: set[int]) -> int:
 
 
 def _check_json_record(row: Mapping[str, Any], max_record_chars: int) -> None:
+    # Raised after the handler exits so the traversal error (which can quote a
+    # row value) is never chained onto the static failure.
     traversal_failed = False
     record_chars = 0
     try:
@@ -478,23 +475,16 @@ def _check_json_record(row: Mapping[str, Any], max_record_chars: int) -> None:
 def _csv_scalar_text(value: Any) -> str:
     if value is None:
         return ""
-    if isinstance(value, str):
+    if type(value) is str:
         return value
     if type(value) is bool:
         return str(value)
-    if type(value) is int:
-        conversion_failed = False
-        rendered = ""
-        try:
-            rendered = str(value)
-        except (ValueError, TypeError, OverflowError):
-            conversion_failed = True
-        if conversion_failed:
-            raise S3RecordSerializationError from None
-        return rendered
-    if type(value) is float:
-        if not math.isfinite(value):
+    if type(value) is int or type(value) is float:
+        if type(value) is float and not math.isfinite(value):
             raise S3RecordSerializationError
+        # Raised after the handler exits so the conversion error is never
+        # chained onto the static failure (str(int) is bounded by
+        # sys.get_int_max_str_digits()).
         conversion_failed = False
         rendered = ""
         try:
@@ -553,7 +543,7 @@ def _serialize_rows_to_spool(
             for row in rows:
                 if set(row) - set(fieldnames):
                     raise S3RecordSerializationError
-                values = [_csv_scalar_text(row.get(field)) for field in fieldnames]
+                values = [_csv_scalar_text(row[field] if field in row else None) for field in fieldnames]
                 if _csv_record_chars(values, csv_options.delimiter) > max_record_chars:
                     raise S3RecordSizeLimitError
                 csv_writer.writerow(values)
@@ -566,6 +556,8 @@ def _serialize_rows_to_spool(
                 _check_json_record(row, max_record_chars)
                 if format == "json" and index:
                     writer.write(b",")
+                # Raised after the handler exits so the encoder's exception,
+                # which can quote the offending value, is never chained.
                 try:
                     for fragment in json_encoder.iterencode(row):
                         text_writer.write(fragment)
@@ -721,8 +713,8 @@ def _provider_failure_kind(error: Exception) -> Literal["conditional", "rejected
         "never raises on a malformed or absent ETag"
     ),
 )
-def _validated_etag(response: Mapping[str, Any]) -> str | None:
-    if "ETag" not in response:
+def _validated_etag(response: object) -> str | None:
+    if not isinstance(response, Mapping) or "ETag" not in response:
         return None
     value = response["ETag"]
     if not isinstance(value, str):
@@ -740,7 +732,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c8afb0215a75fc90"
+    source_file_hash: str | None = "sha256:a63d01a80d52bc5c"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -848,7 +840,22 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
         return code in {"404", "NoSuchKey", "NotFound"} or status == 404
 
     @staticmethod
-    def _observation_from_head(response: Mapping[str, object]) -> RemoteObjectObservation:
+    @trust_boundary(
+        tier=3,
+        source="AWS S3 HeadObject response payload (botocore dict, not ELSPETH-owned)",
+        source_param="response",
+        suppresses=("R5",),
+        invariant=(
+            "raises RemoteObjectPreconditionError unless response is a Mapping whose present "
+            "ContentLength/ETag/Metadata/ChecksumSHA256 fields carry exact, bounded values; "
+            "never coerces a malformed field into the observation"
+        ),
+        test_ref="tests/unit/plugins/sinks/test_aws_s3_sink.py::TestProviderBoundaries::test_present_malformed_head_evidence_is_rejected",
+        test_fingerprint="532d4149c675e2acac1e3e2637396f138e7a0d3e58dce1a92239cc97a2f13431",
+    )
+    def _observation_from_head(response: object) -> RemoteObjectObservation:
+        if not isinstance(response, Mapping):
+            raise RemoteObjectPreconditionError("S3 object inspection returned malformed evidence")
         size: int | None = None
         if "ContentLength" in response:
             size_value = response["ContentLength"]
@@ -856,7 +863,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
                 raise RemoteObjectPreconditionError("S3 object inspection returned malformed ContentLength")
             size = size_value
 
-        etag = _validated_etag(cast("Mapping[str, Any]", response))
+        etag = _validated_etag(response)
         if "ETag" in response and etag is None:
             raise RemoteObjectPreconditionError("S3 object inspection returned malformed ETag")
 
@@ -914,7 +921,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
         if key not in metadata:
             return None
         value = metadata[key]
-        if not isinstance(value, str):
+        if type(value) is not str:
             raise RemoteObjectPreconditionError(f"S3 object inspection returned malformed {key} metadata")
         return value
 
@@ -926,8 +933,6 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
             if self._is_missing(error):
                 return RemoteObjectObservation(False, None, None, None)
             raise RemoteObjectPreconditionError("S3 object inspection failed before effect dispatch") from None
-        if not isinstance(response, Mapping):
-            raise RemoteObjectPreconditionError("S3 object inspection returned malformed evidence")
         return self._observation_from_head(response)
 
     def inspect_effect(
@@ -1033,7 +1038,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
         if predecessor_declared is True:
             observed_hash = evidence["observed_content_hash"]
             observed_size = evidence["observed_size"]
-            if not isinstance(observed_hash, str) or type(observed_size) is not int:
+            if type(observed_hash) is not str or type(observed_size) is not int:
                 serialized.close()
                 raise RemoteObjectPreconditionError("S3 predecessor inspection lacks exact content identity")
             predecessor = ArtifactDescriptor(
@@ -1139,7 +1144,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
                 if failure_kind == "rejected":
                     raise S3SinkWriteError from None
                 raise S3WriteOutcomeUnknownError from None
-            if not isinstance(response, Mapping) or _validated_etag(response) is None:
+            if _validated_etag(response) is None:
                 _raise_outcome_unknown()
         return remote_commit_result(plan, evidence)
 

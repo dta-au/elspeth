@@ -27,6 +27,7 @@ from tempfile import TemporaryFile
 from typing import IO, Final, cast
 from uuid import uuid4
 
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
@@ -215,7 +216,7 @@ class BundlePlanEvidence:
         if mapping["schema"] != BUNDLE_EVIDENCE_SCHEMA:
             raise AuditExportBundlePreconditionError("bundle plan evidence schema is divergent")
         raw_files = mapping["files"]
-        if not isinstance(raw_files, Sequence) or isinstance(raw_files, (str, bytes, bytearray)):
+        if type(raw_files) is not list:
             raise AuditExportBundlePreconditionError("bundle files must be an ordered sequence")
         files = tuple(BundleFileEntry.from_mapping(entry) for entry in raw_files)
         return cls(
@@ -239,11 +240,15 @@ class _RecordSpool:
 
 
 def _closed_mapping(value: object, fields: set[str], label: str) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or set(value) != fields:
+    # Plan evidence arrives deep-frozen from the durable effect store and as
+    # plain containers from as_mapping(); thaw once so the closed-shape checks
+    # compare exact types over a single representation.
+    thawed = deep_thaw(value)
+    if type(thawed) is not dict or set(thawed) != fields:
         raise AuditExportBundlePreconditionError(f"{label} must contain the exact closed field set")
-    if any(type(key) is not str for key in value):
+    if any(type(key) is not str for key in thawed):
         raise AuditExportBundlePreconditionError(f"{label} keys must be exact strings")
-    return cast(Mapping[str, object], value)
+    return cast(dict[str, object], thawed)
 
 
 def _exact_string(value: object, field_name: str) -> str:
@@ -269,8 +274,6 @@ def _validate_relative_name(name: str) -> None:
 
 
 def _absolute_path(path: Path) -> Path:
-    if not isinstance(path, Path):
-        raise TypeError("target_path must be pathlib.Path")
     return Path(os.path.abspath(os.fspath(path.expanduser())))
 
 
@@ -398,7 +401,7 @@ def _csv_relative_path(record_type: object, seen: dict[str, str]) -> str:
 
 
 def _neutralize_csv_formula(value: object) -> object:
-    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+    if type(value) is str and value.startswith(_CSV_FORMULA_PREFIXES):
         return f"'{value}"
     return value
 

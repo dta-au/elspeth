@@ -76,7 +76,7 @@ from elspeth.plugins.sinks._remote_object_effects import (
 )
 
 if TYPE_CHECKING:
-    from azure.storage.blob import ContainerClient
+    from azure.storage.blob import BlobProperties, ContainerClient
 
 
 def _azure_provider_exception_types() -> tuple[type[Exception], ...]:
@@ -84,6 +84,20 @@ def _azure_provider_exception_types() -> tuple[type[Exception], ...]:
     from azure.core.exceptions import AzureError
 
     return (AzureError, ConnectionError, TimeoutError)
+
+
+def _azure_missing_exception_type() -> type[Exception]:
+    """The Azure SDK failure that means the blob does not exist."""
+    from azure.core.exceptions import ResourceNotFoundError
+
+    return ResourceNotFoundError
+
+
+def _azure_conditional_exception_types() -> tuple[type[Exception], ...]:
+    """Azure SDK failures raised when a server-side write condition rejects the upload."""
+    from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
+
+    return (ResourceExistsError, ResourceModifiedError)
 
 
 class CSVWriteOptions(BaseModel):
@@ -361,7 +375,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d7dcc52e20c31b1f"
+    source_file_hash: str | None = "sha256:d770fb0c13de67ac"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -511,17 +525,9 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         )
 
     @staticmethod
-    def _is_missing(error: BaseException) -> bool:
-        from azure.core.exceptions import ResourceNotFoundError
-
-        return isinstance(error, ResourceNotFoundError)
-
-    @staticmethod
-    def _observation_from_properties(properties: object) -> RemoteObjectObservation:
-        from azure.storage.blob import BlobProperties, ContentSettings
-
-        if not isinstance(properties, BlobProperties):
-            raise TypeError("Azure get_blob_properties violated its BlobProperties contract")
+    def _observation_from_properties(properties: BlobProperties) -> RemoteObjectObservation:
+        # ADR-032: the SDK object's class is not the control. Every field read
+        # below is asserted by value before it reaches the owned observation.
         size = properties.size
         if type(size) is not int or size < 0:
             raise RemoteObjectPreconditionError("Azure blob properties contain an invalid size")
@@ -532,7 +538,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         metadata_value: object = properties.metadata
         if metadata_value is None:
             metadata: Mapping[str, str] = {}
-        elif isinstance(metadata_value, Mapping) and all(type(key) is str and type(value) is str for key, value in metadata_value.items()):
+        elif type(metadata_value) is dict and all(type(key) is str and type(value) is str for key, value in metadata_value.items()):
             metadata = metadata_value
         else:
             raise RemoteObjectPreconditionError("Azure blob properties contain invalid metadata")
@@ -550,10 +556,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         plan_hash = optional_metadata("elspeth_plan_hash")
         protocol_version = optional_metadata("elspeth_protocol_version")
 
-        content_settings = properties.content_settings
-        if not isinstance(content_settings, ContentSettings):
-            raise RemoteObjectPreconditionError("Azure blob properties contain invalid content settings")
-        raw_content_md5: object = content_settings.content_md5
+        raw_content_md5: object = properties.content_settings.content_md5
         content_md5: bytes | None
         if raw_content_md5 is None:
             content_md5 = None
@@ -583,9 +586,9 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     def _observe_effect_target(self, blob_path: str) -> RemoteObjectObservation:
         try:
             properties = self._get_container_client().get_blob_client(blob_path).get_blob_properties()
-        except _azure_provider_exception_types() as error:
-            if self._is_missing(error):
-                return RemoteObjectObservation(False, None, None, None)
+        except _azure_missing_exception_type():
+            return RemoteObjectObservation(False, None, None, None)
+        except _azure_provider_exception_types():
             raise RemoteObjectPreconditionError("Azure blob inspection failed before effect dispatch") from None
         return self._observation_from_properties(properties)
 
@@ -690,12 +693,6 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
             raise RemoteObjectPreconditionError("Azure effect target does not match configured container")
         return blob_path
 
-    @staticmethod
-    def _is_conditional_failure(error: BaseException) -> bool:
-        from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
-
-        return isinstance(error, (ResourceExistsError, ResourceModifiedError))
-
     def restage_effect(
         self,
         plan: SinkEffectPlan,
@@ -766,9 +763,9 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
                         content_settings=content_settings,
                         validate_content=True,
                     )
-            except _azure_provider_exception_types() as error:
-                if self._is_conditional_failure(error):
-                    raise RemoteObjectPreconditionError("Azure conditional blob upload was rejected") from None
+            except _azure_conditional_exception_types():
+                raise RemoteObjectPreconditionError("Azure conditional blob upload was rejected") from None
+            except _azure_provider_exception_types():
                 raise RemoteObjectEffectError("Azure blob upload outcome is unknown; reconciliation is required") from None
         return remote_commit_result(plan, evidence)
 
