@@ -1237,7 +1237,7 @@ async def run_tool_batch(
                         if not proposal_acceptable:
                             # ToolResult.data is deep-frozen by __post_init__, so
                             # the membership test must accept a mappingproxy. See
-                            # _prevalidation_feedback_data for the full contract.
+                            # _prevalidation_feedback_seed for the full contract.
                             feedback_data = dict(_prevalidation_feedback_seed(finalized_candidate_result.data))
                             feedback_data.update(
                                 {
