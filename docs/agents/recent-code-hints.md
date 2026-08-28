@@ -8,6 +8,25 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — `validate_credential_safe_https_url` now lives at
+  `elspeth.core.url_validation`, NOT `elspeth.plugins.infrastructure.*`.**
+  The module is stdlib-only (`re` + `urllib.parse`) and was already consumed
+  by `web/` and `core/` as well as plugins, so it moved down a layer under
+  ADR-006's "move the needed code down" protocol; that removed the L1 upward
+  import in `core/llm_profiles.py`, whose lazy in-function import is now a
+  plain module-scope one. ADR-006 forbids compatibility re-exports, so there
+  is NO shim at the old path — all 11 import sites and the test moved in the
+  same commit (`tests/unit/plugins/infrastructure/test_url_validation.py` →
+  `tests/unit/core/test_url_validation.py`). If you are porting a branch
+  written before this, rewrite the import rather than resurrecting the module.
+  The module move shifts tier_model's `source_snapshot_sha256` (a file
+  appears under `src/elspeth/core` and disappears under
+  `src/elspeth/plugins/infrastructure`); that is honest relocation churn, not
+  drift. The remaining L1 in `core/llm_profiles.py`
+  (`plugins.transforms.llm.transform`) is deliberately still lazy: the
+  provider config models are fused with their httpx/`AuditedHTTPClient`
+  runtime clients, so neither of ADR-006's other two remedies applies yet.
+
 - **2026-08-29 — a component that polls a `Clock` must also SLEEP through
   it.** `elspeth.core.clock.Clock` now carries `sleep(seconds)`: `SystemClock`
   blocks, `MockClock` advances. `SinkEffectCoordinator` defaults its sleep to

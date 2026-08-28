@@ -35,7 +35,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.core.url_validation import validate_credential_safe_https_url
 
 SUPPORTED_TRACING_PROVIDERS = frozenset({"none", "azure_ai", "langfuse"})
 

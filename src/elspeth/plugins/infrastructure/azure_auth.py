@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Literal, Self, cast
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.core.url_validation import validate_credential_safe_https_url
 
 if TYPE_CHECKING:
     from azure.storage.blob import BlobServiceClient

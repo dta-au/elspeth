@@ -1572,7 +1572,6 @@ def test_catalog_proof_resists_shadowed_oid_equality(postgres_engine: Engine) ->
         )
         connection.execute(text("SET LOCAL search_path = equality_shadow, pg_catalog, public"))
         rows = _text_builtin_identity_rows_on_connection(connection)
-        assert rows is not None
         assert ("text_result", "chr", 1, "int4") not in rows
         issues = _static_check_issues(
             "btrim(value_text, chr(49)) IS NOT NULL",
@@ -1609,7 +1608,6 @@ def test_catalog_proof_resists_shadowed_text_concatenation(postgres_engine: Engi
         )
         connection.execute(text("SET LOCAL search_path = concat_shadow, pg_catalog, public"))
         rows = _text_builtin_identity_rows_on_connection(connection)
-        assert rows is not None
         assert ("operator_text_result", "||", 2, "text,text") not in rows
         issues = _static_check_issues(
             "btrim(value_text, chr(49) || chr(50)) IS NOT NULL",

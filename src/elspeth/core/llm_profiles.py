@@ -18,6 +18,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from elspeth.core.url_validation import validate_credential_safe_https_url
+
 CredentialScope = Literal["server", "user"]
 PROFILE_ALIAS_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*\Z")
 SECRET_REF_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,255}\Z")
@@ -155,8 +157,6 @@ class LLMProfileSettings(BaseModel):
                     raise ValueError("Azure profile requires operator endpoint and deployment")
                 if self.model != self.deployment_name:
                     raise ValueError("Azure profile model must match deployment_name")
-                from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
-
                 validate_credential_safe_https_url(self.endpoint, field_name="endpoint")
             if self.provider == "gateway":
                 if self.credential_scope != "server":

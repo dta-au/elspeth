@@ -1,4 +1,10 @@
-"""Shared URL validators for credential-bearing plugin configuration."""
+"""Shared URL validators for credential-bearing configuration.
+
+Stdlib-only (``re`` + ``urllib.parse``), so it sits at L1/core per ADR-006's
+"move the needed code down" protocol: plugins, web, and
+:mod:`elspeth.core.llm_profiles` all bind credential-bearing URLs and must
+share one validator rather than one per layer.
+"""
 
 from __future__ import annotations
 

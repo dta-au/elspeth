@@ -6,7 +6,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from elspeth.contracts.value_source import CatalogValueSource, DerivedFromSiblingValueSource, ValueSource
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.llm.model_catalog import MODEL_CATALOG_OPENROUTER
 
 AZURE_MODEL_VALUE_SOURCES: tuple[ValueSource, ...] = (

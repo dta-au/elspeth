@@ -45,6 +45,7 @@ from elspeth.contracts.sink_effects import (
 )
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.core.canonical import canonical_json
+from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.clients.dataverse import (
     DataverseAuthConfig,
@@ -54,7 +55,6 @@ from elspeth.plugins.infrastructure.clients.dataverse import (
 )
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.sinks._diversion_attribution import build_diversion_attribution
 
 # HTTP status codes that may be single-row-attributable when Dataverse also
