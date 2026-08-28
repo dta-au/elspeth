@@ -214,12 +214,11 @@ def _validate_content_descriptor(
     max_size_bytes: int,
 ) -> None:
     _require_lower_hex_64(content_hash, f"{field_prefix}content_hash")
-    assert isinstance(content_hash, str)
     expected_ref = f"sha256:{content_hash}"
-    if content_ref != expected_ref:
+    if type(content_ref) is not str or content_ref != expected_ref:
         raise ValueError(f"{field_prefix}content_ref must equal {expected_ref!r}")
-    assert isinstance(content_ref, str)
     _reject_credential_bearing_reference(content_ref, f"{field_prefix}content_ref")
+
     _require_bounded_positive_int(size_bytes, f"{field_prefix}size_bytes", max_size_bytes)
 
 
@@ -336,8 +335,9 @@ def _freeze_member_sequence(members_input: Sequence[SinkEffectMember], field_nam
     members = tuple(members_input)
     ordinals: list[int] = []
     for member in members:
-        if not isinstance(member, SinkEffectMember):
-            raise TypeError(f"{field_name} entries must be SinkEffectMember")
+        if type(member) is not SinkEffectMember:
+            raise TypeError(f"{field_name} entries must be exact SinkEffectMember values")
+
         ordinals.append(member.ordinal)
     if len(ordinals) != len(set(ordinals)):
         raise ValueError(f"{field_name} ordinals must be unique")
@@ -1084,8 +1084,9 @@ def _create_restricted_audit_export_snapshot_reader(
     _require_bounded_positive_int(max_chunk_records, "max_chunk_records", _AUDIT_EXPORT_MAX_CHUNK_RECORDS)
     _require_utc_microsecond_timestamp(exported_at, "exported_at")
     _require_utc_microsecond_timestamp(source_completed_at, "source_completed_at")
-    if not isinstance(source_status, str) or source_status not in {"completed", "completed_with_failures", "empty"}:
+    if source_status not in {"completed", "completed_with_failures", "empty"}:
         raise ValueError("source_status is not export-terminal")
+
     _require_lower_hex_64(last_chunk_seal_hash, "last_chunk_seal_hash")
     _require_lower_hex_64(snapshot_seal_hash, "snapshot_seal_hash")
     if serialization_version != _AUDIT_EXPORT_SERIALIZATION_VERSION:
@@ -1172,8 +1173,9 @@ class SinkEffectAuditExportSnapshotInput:
         _require_bounded_positive_int(self.chunk_count, "chunk_count", _AUDIT_EXPORT_MAX_CHUNKS)
 
         chunks = tuple(self.chunks)
-        if any(not isinstance(chunk, AuditExportSnapshotChunkInput) for chunk in chunks):
-            raise TypeError("chunks entries must be AuditExportSnapshotChunkInput")
+        if any(type(chunk) is not AuditExportSnapshotChunkInput for chunk in chunks):
+            raise TypeError("chunks entries must be exact AuditExportSnapshotChunkInput values")
+
         ordinals = [chunk.ordinal for chunk in chunks]
         if ordinals != list(range(len(chunks))):
             raise ValueError("chunks ordinals must be dense and ordered from zero")
@@ -1253,18 +1255,19 @@ class SinkEffectPrepareRequest:
 
     def __post_init__(self) -> None:
         _require_nonempty_string(self.effect_id, "effect_id")
-        if not isinstance(self.effect_input, (SinkEffectPipelineMembersInput, SinkEffectAuditExportSnapshotInput)):
-            raise TypeError("effect_input must be a member of the closed sink effect input union")
-        if not isinstance(self.inspection, SinkEffectInspection):
-            raise TypeError("inspection must be SinkEffectInspection")
+        if type(self.effect_input) not in (SinkEffectPipelineMembersInput, SinkEffectAuditExportSnapshotInput):
+            raise TypeError("effect_input must be an exact member of the closed sink effect input union")
+        if type(self.inspection) is not SinkEffectInspection:
+            raise TypeError("inspection must be an exact SinkEffectInspection")
 
     @property
     def input_kind(self) -> SinkEffectInputKind:
         return self.effect_input.input_kind
 
     def validate_plan(self, plan: SinkEffectPlan) -> None:
-        if not isinstance(plan, SinkEffectPlan):
-            raise TypeError("plan must be SinkEffectPlan")
+        if type(plan) is not SinkEffectPlan:
+            raise TypeError("plan must be an exact SinkEffectPlan")
+
         if plan.effect_id != self.effect_id:
             raise ValueError("plan effect_id must equal request effect_id")
         if plan.input_kind is not self.input_kind:

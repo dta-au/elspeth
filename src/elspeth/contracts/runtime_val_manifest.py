@@ -137,7 +137,7 @@ def _normalized_sort_key(value: object) -> str:
 
 def _typing_special_form_name(value: object) -> str | None:
     for module_name in _TYPING_SPECIAL_FORM_MODULES:
-        module = sys.modules.get(module_name)
+        module = sys.modules[module_name] if module_name in sys.modules else None
         if not isinstance(module, ModuleType):
             continue
         for special_form_name in _TYPING_SPECIAL_FORM_NAMES:
@@ -898,11 +898,11 @@ def _merge_qualified_values(
 ) -> list[tuple[str, object, object | None, bool]]:
     merged: dict[str, tuple[object, object | None, bool]] = {}
     for qualified_name, candidate, candidate_owner, directly_called in qualified_values:
-        existing = merged.get(qualified_name)
-        if existing is None:
+        if qualified_name not in merged:
             merged[qualified_name] = (candidate, candidate_owner, directly_called)
             continue
-        existing_candidate, existing_owner, existing_directly_called = existing
+        existing_candidate, existing_owner, existing_directly_called = merged[qualified_name]
+
         if candidate is not existing_candidate or candidate_owner is not existing_owner:
             raise FrameworkBugError(f"Runtime-VAL dependency {qualified_name} did not resolve to one stable binding")
         merged[qualified_name] = (candidate, candidate_owner, existing_directly_called or directly_called)

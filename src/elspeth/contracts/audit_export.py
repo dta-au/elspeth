@@ -239,7 +239,6 @@ def _object(value: object, *, fields: frozenset[str], path: str) -> dict[str, ob
     if type(value) is not dict:
         raise TypeError(f"{path} must be an exact string-keyed object")
     result = value
-    assert isinstance(result, dict)
     if any(type(key) is not str for key in result):
         raise TypeError(f"{path} requires string keys")
     keys = frozenset(result)
@@ -254,7 +253,6 @@ def _list(value: object, path: str) -> list[object]:
     if type(value) is not list:
         raise TypeError(f"{path} must be an ordered list")
     result = value
-    assert isinstance(result, list)
     return result
 
 
@@ -264,7 +262,6 @@ def _string(value: object, path: str, *, allowed: frozenset[str] | None = None) 
     if type(value) is not str or not value:
         raise TypeError(f"{path} must be a non-empty exact string")
     result = value
-    assert isinstance(result, str)
     if allowed is not None and result not in allowed:
         raise ValueError(f"{path} must be one of {sorted(allowed)}")
     return result
@@ -276,7 +273,6 @@ def _integer(value: object, path: str, *, minimum: int = 0, maximum: int = AUDIT
             raise TypeError(f"{path} floats are forbidden")
         raise TypeError(f"{path} must be an exact integer")
     result = value
-    assert isinstance(result, int)
     if result < minimum or result > maximum:
         raise ValueError(f"{path} integer must be within [{minimum}, {maximum}]")
     return result
@@ -430,7 +426,6 @@ def _validate_chunk_seal(payload: object) -> None:
     predecessor = obj["predecessor"]
     if type(predecessor) is not dict:
         raise TypeError("predecessor must be an exact object")
-    assert isinstance(predecessor, dict)
     if "kind" in predecessor and predecessor["kind"] == "genesis":
         _object(predecessor, fields=frozenset({"kind"}), path="predecessor")
     else:
@@ -807,9 +802,13 @@ class AuditExportContentStoreResolver:
         self._stores: dict[str, AuditExportContentStore] = {}
 
     def register(self, store: AuditExportContentStore) -> None:
-        if not isinstance(store, AuditExportContentStore):
-            raise TypeError("store must implement AuditExportContentStore")
+        # No isinstance gate on AuditExportContentStore: it is a runtime_checkable
+        # Protocol, so the check admits any object carrying the right attribute
+        # names and rejects honest dynamic-attribute ones (ADR-032 rule 3). The
+        # binding controls are the value assertions below — the identifier, the
+        # namespace, and the store's own durability proof.
         store_id = validate_credential_free_identifier(store.content_store_id, "content_store_id")
+
         validate_content_namespace(store.namespace)
         if not store.is_durable():
             raise ValueError("audit-export content store must prove durability")
