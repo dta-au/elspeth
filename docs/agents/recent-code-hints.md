@@ -8,6 +8,30 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — the structural-container / nominal-element split is the house
+  shape for validating a constructor parameter, and its `isinstance` half is a
+  justify candidate, not a conversion candidate.** Learned burning down
+  `web/composer/guided` (B46). `GuidedSession._validated_component_mapping`
+  states it in one function: the CONTAINER test is
+  `isinstance(value, Mapping)` because the container is an abstract protocol
+  ELSPETH does not own and the reachable domain genuinely spans `dict` and the
+  `MappingProxyType` the class's own `freeze_guided_json_mapping` produces —
+  `type(x) is dict` would reject the frozen form the class itself emits — while
+  the per-ELEMENT test one line below is `type(item) is not item_type` because
+  `item_type` is always an owned closed class (`SourceResolved`, `SourceIntent`,
+  `SinkOutputResolved`, `SinkIntent`) that must not admit a subclass into a
+  session that is later content-hashed. Same split in
+  `reorder_reviewed_components` (`Sequence` container, exact `UUID` element)
+  and in `SourceIntent.__post_init__`. Corollary trap: the
+  `isinstance(x, (str, bytes, bytearray))` operand paired with every
+  `Sequence` acceptance CANNOT become `type(x) in {...}` — the exclusion has to
+  catch str SUBCLASSES too, and the exact-type form lets one through into the
+  element loop, where an empty `str` subclass would even pass a permutation
+  check as an empty ordering. Also from that lane: `d[k] if k in d else None`
+  cleared all four R1 sites with byte-identical semantics, including
+  `updated.get(key)` inside a `for key in <constant key tuple>` loop, where the
+  membership form is spelled as an `if key not in updated: continue` guard
+  ahead of the read rather than a ternary.
 - **2026-08-29 — `web/execution/` has DECLARATION tests that pin the exact
   tier_model finding set, so REMOVING a finding there turns the lane red until
   you update the `Counter`.** `tests/unit/web/execution/test_validation_trust_tier.py`

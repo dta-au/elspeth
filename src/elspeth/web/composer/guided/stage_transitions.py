@@ -1005,7 +1005,7 @@ def transition_source_schema_form(
         name=intent.name,
         plugin=intent.plugin,
         options=options,
-        observed_columns=reviewed_schema_declared_field_names(options.get("schema")),
+        observed_columns=reviewed_schema_declared_field_names(options["schema"] if "schema" in options else None),
         sample_rows=(),
         on_validation_failure=structural["on_validation_failure"],
     )
@@ -1207,7 +1207,9 @@ def canonical_sink_local_paths(options: Mapping[str, Any]) -> dict[str, JsonValu
     """
     updated = cast(dict[str, JsonValue], dict(options))
     for key in SINK_LOCAL_PATH_OPTION_KEYS:
-        value = updated.get(key)
+        if key not in updated:
+            continue
+        value = updated[key]
         if type(value) is not str or not value or value.startswith(BLOB_REF_PATH_PREFIX):
             continue
         raw = PurePosixPath(value)

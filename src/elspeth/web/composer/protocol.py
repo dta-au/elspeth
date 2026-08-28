@@ -811,9 +811,10 @@ def _canonical_tool_argument_expectation(value: object, argument: str) -> str:
 
     lowered = value.casefold()
     if "object conforming to" in lowered:
-        return _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.get(
-            argument,
-            "an object conforming to the declared argument schema",
+        return (
+            _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS[argument]
+            if argument in _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS
+            else "an object conforming to the declared argument schema"
         )
     if "per session per utc day" in lowered:
         return "within the per session per UTC day interpretation request limit"
