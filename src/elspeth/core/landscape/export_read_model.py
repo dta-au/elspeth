@@ -83,8 +83,6 @@ class ConnectionBoundExportReadModel:
     """Exporter query adapter that can execute only on one supplied connection."""
 
     def __init__(self, connection: Connection) -> None:
-        if not isinstance(connection, Connection):
-            raise TypeError("connection must be a SQLAlchemy Connection")
         self._connection = connection
         self._run_loader = RunLoader()
         self._node_loader = NodeLoader()
@@ -465,8 +463,6 @@ class ConnectionBoundExportReadModel:
 def open_export_read_transaction(engine: Engine) -> Iterator[ConnectionBoundExportReadModel]:
     """Open one explicit, stable export snapshot on a dedicated connection."""
 
-    if not isinstance(engine, Engine):
-        raise TypeError("engine must be a SQLAlchemy Engine")
     connection = engine.connect()
     transaction = None
     try:

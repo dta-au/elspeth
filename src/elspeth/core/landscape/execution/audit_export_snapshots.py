@@ -507,8 +507,6 @@ class AuditExportSnapshotRepository:
         connection: Connection,
         key: AuditExportSnapshotRegistryKey,
     ) -> AuditExportSnapshotWinner | None:
-        if not isinstance(connection, Connection):
-            raise TypeError("connection must be a SQLAlchemy Connection")
         if type(key) is not AuditExportSnapshotRegistryKey:
             raise TypeError("key must be exact AuditExportSnapshotRegistryKey")
         query = select(audit_export_snapshots_table).where(
@@ -538,8 +536,6 @@ class AuditExportSnapshotRepository:
         key: AuditExportSnapshotRegistryKey,
     ) -> tuple[str, ...]:
         """Return signer identities already sealed for this export lineage."""
-        if not isinstance(connection, Connection):
-            raise TypeError("connection must be a SQLAlchemy Connection")
         if type(key) is not AuditExportSnapshotRegistryKey:
             raise TypeError("key must be exact AuditExportSnapshotRegistryKey")
         table = audit_export_snapshots_table.c
