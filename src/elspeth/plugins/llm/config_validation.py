@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import CatalogValueSource, DerivedFromSiblingValueSource, ValueSource
 from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.llm.model_catalog import MODEL_CATALOG_OPENROUTER
@@ -56,8 +57,30 @@ def validate_azure_endpoint(value: str) -> str:
     return validate_credential_safe_https_url(value, field_name="endpoint", allow_http_loopback=True)
 
 
+@trust_boundary(
+    tier=3,
+    source="raw pydantic ``mode='before'`` input for an Azure LLM config — authored settings YAML or a composer-authored proposal payload, ahead of field validation",
+    source_param="data",
+    suppresses=("R5",),
+    invariant=(
+        "Returns its input unchanged for anything that is not a mapping, and for a mapping that already "
+        "carries a non-empty ``model`` or carries no ``deployment_name``. Never raises: an input pydantic "
+        "will reject is handed back for pydantic to reject."
+    ),
+    non_raising=True,
+)
 def derive_azure_model(data: Any) -> Any:
-    """Fill an omitted, null, or empty Azure model from its deployment name."""
+    """Fill an omitted, null, or empty Azure model from its deployment name.
+
+    Tier-3 boundary. A ``mode="before"`` validator sees whatever the caller
+    passed — a mapping from YAML or from the composer, an already-built
+    model instance, or something else entirely — so the mapping check is the
+    admission test, not defensive re-typing of a validated value. The
+    ``tier_model`` rule exempts that construct inline (``R5`` is allowed in a
+    pydantic before-validator); this site sits outside the exemption only
+    because it is factored into one shared helper so the Azure transform
+    config and the Azure source config cannot drift on the derivation.
+    """
     if isinstance(data, dict) and ("model" not in data or data["model"] is None or data["model"] == "") and "deployment_name" in data:
         deployment = data["deployment_name"]
         data["model"] = deployment
