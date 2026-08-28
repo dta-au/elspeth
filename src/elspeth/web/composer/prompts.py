@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final
 
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.capability_skill import render_with_pipeline_capabilities
 from elspeth.web.composer.guided.errors import InvariantError
@@ -266,6 +267,17 @@ def build_catalog_context_string(
 _SERVER_OWNED_DROPPED_OPTION_KEYS: Final[frozenset[str]] = _PROFILE_LOWERING_METADATA_OPTION_KEYS - {INTERPRETATION_REQUIREMENTS_KEY}
 
 
+@observation_boundary(
+    tier=3,
+    source="one serialized component's options block from CompositionState.to_dict() — the container is "
+    "ours, but its option CONTENT is planner/LLM-authored through the composer tool loop and is "
+    "shape-checked nowhere on the from_dict/to_dict round trip (SourceSpec/NodeSpec/OutputSpec.from_dict "
+    "assign options=d['options'] verbatim, and deep_thaw passes non-containers through unchanged)",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns the projected copy, or the input unchanged when it is not a mapping; a malformed "
+    "interpretation_requirements row is passed through rather than reduced — never raises",
+)
 def _project_component_options(options: Any) -> Any:
     """Project one serialized component's options for planner consumption."""
     if not isinstance(options, Mapping):
@@ -281,6 +293,16 @@ def _project_component_options(options: Any) -> Any:
     return projected
 
 
+@observation_boundary(
+    tier=3,
+    source="a CompositionState.to_dict() serialization whose sources/nodes/outputs option CONTENT is "
+    "planner/LLM-authored through the composer tool loop; a state reconstructed by "
+    "CompositionState.from_dict (session seed, finalize-restore) carries that content unvalidated",
+    source_param="serialized",
+    suppresses=("R5",),
+    invariant="returns a projected copy; any component whose shape is not the expected mapping/list is "
+    "carried through unprojected rather than dropped or coerced — never raises",
+)
 def project_server_owned_option_metadata(serialized: dict[str, Any]) -> dict[str, Any]:
     """Project server-owned option metadata out of a serialized state dict.
 

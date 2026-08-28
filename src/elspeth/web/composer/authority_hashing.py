@@ -31,14 +31,14 @@ def project_composer_authority_payload(payload: Mapping[str, Any]) -> dict[str, 
     if type(projected) is not dict:
         raise TypeError("Composer authority payload must thaw to a dict")
 
-    nodes = projected.get("nodes")
+    nodes = projected["nodes"] if "nodes" in projected else None
     if type(nodes) is not list:
         return projected
 
     for node in nodes:
-        if type(node) is not dict or node.get("node_type") != "row_union":
+        if type(node) is not dict or "node_type" not in node or node["node_type"] != "row_union":
             continue
-        branches = node.get("branches")
+        branches = node["branches"] if "branches" in node else None
         if type(branches) is not dict:
             continue
         node["branches"] = {
@@ -59,14 +59,14 @@ def restore_composer_authority_payload(payload: Mapping[str, Any]) -> dict[str, 
     if type(restored) is not dict:
         raise ValueError("Composer authority projection must thaw to a dict")
 
-    nodes = restored.get("nodes")
+    nodes = restored["nodes"] if "nodes" in restored else None
     if type(nodes) is not list:
         return restored
 
     for node in nodes:
-        if type(node) is not dict or node.get("node_type") != "row_union":
+        if type(node) is not dict or "node_type" not in node or node["node_type"] != "row_union":
             continue
-        branches = node.get("branches")
+        branches = node["branches"] if "branches" in node else None
         if type(branches) is not dict:
             continue
         if set(branches) != {"schema", "items"}:

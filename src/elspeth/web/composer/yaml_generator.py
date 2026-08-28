@@ -220,8 +220,8 @@ def _generate_pipeline_dict(
             if contract_error is not None:
                 raise PipelineLoweringError(contract_error)
             queue_entry: dict[str, Any] = {}
-            description = queue.options.get("description")
-            if isinstance(description, str):
+            description = queue.options["description"] if "description" in queue.options else None
+            if type(description) is str:
                 queue_entry["description"] = description
             queues_doc[queue.id] = queue_entry
         doc["queues"] = queues_doc
@@ -520,7 +520,9 @@ def _reattach_guided_reviewed_blob_bindings(state: CompositionState) -> Composit
     changed = False
     for source_name, source in state.sources.items():
         live_reviewed_paths = {
-            value for key in SOURCE_LOCAL_PATH_OPTION_KEYS if type(value := source.options.get(key)) is str and value in all_reviewed_paths
+            value
+            for key in SOURCE_LOCAL_PATH_OPTION_KEYS
+            if key in source.options and type(value := source.options[key]) is str and value in all_reviewed_paths
         }
         if not live_reviewed_paths:
             continue
@@ -561,6 +563,15 @@ def _reattach_guided_reviewed_blob_bindings(state: CompositionState) -> Composit
     return replace(state, sources=reattached) if changed else state
 
 
+@observation_boundary(
+    tier=3,
+    source="an arbitrary-depth value nested inside a source/node/output options block — planner/LLM-authored "
+    "plugin option content reached through the composer tool loop, of no proven shape at any depth",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="returns the projected mapping/list or the value unchanged; a scalar, a string and any "
+    "unrecognised shape are pure passthrough, never coerced and never dropped — never raises",
+)
 def _recursive_public_option_projection(
     value: Any,
     *,

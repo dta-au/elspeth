@@ -168,6 +168,129 @@ is a working document under the normal delivery posture.
   hand-maintained counter to restore the trail, which is reshaping code to
   dodge a lint. Live example: `_well_formed_query_entries` in
   `web/composer/state.py` (observation elspeth-obs-d4eed3b8c2).
+- **2026-08-29 — the pre-commit mypy hook typechecks a changed file's
+  DEPENDENTS, so editing a module other modules import THROUGH can fail on a
+  pre-existing `no_implicit_reexport` error you did not cause.** B24's first
+  tier commit to `web/interpretation_state.py` was rejected by three errors in
+  files it never touched: `composer/pipeline_proposal.py`,
+  `composer/reviewed_source_authority.py` and `composer/guided/chat_solver.py`
+  all import `SOURCE_AUTHORING_KEY` *through* `interpretation_state`, which
+  merely re-imports it from its real owner `web/composer/state.py`. The errors
+  were latent at HEAD (verified by running mypy against HEAD's copy of the
+  file) and only surface once the re-exporting module is in the hook's changed
+  set. Fix it AT the re-export — `from ... import X as X` — which clears every
+  consumer at once and touches no file another lane owns; do not chase the
+  three importers. Ruff then splits that import into its own `from ... import
+  (...)` statement, which ADDS a module-level statement and shifts every later
+  `body[N]`: check `config/cicd/enforce_tier_model/*.yaml` for a signed
+  `ast_path` in the file first (`interpretation_state.py` has none; the only
+  signed entry in that bucket is `web/app.py:R1:_BodySizeLimitMiddleware`,
+  which is `fp=`-keyed and so is immune to the shift).
+
+- **2026-08-29 — `web/interpretation_state.py` now reads its scalar string
+  node options through ONE declared boundary, `_node_str_option(node, key)`.**
+  It returns the value only when the key is present AND holds a `str`, and
+  `None` otherwise; ten `node.options.get(...)` + `isinstance(..., str)` pairs
+  across `materialize_state_for_execution`, `_materialize_node_for_authoring`,
+  `_materialize_node_for_execution`, `_ensure_prompt_template_hash`,
+  `_web_scrape_raw_fields`, `_legacy_placeholder_sites`,
+  `_missing_prompt_template_review_sites` and
+  `_missing_model_choice_review_sites` now consume the owned `str | None` and
+  never re-interrogate the runtime type. Read a new scalar string option
+  through it rather than growing an eleventh inline pair. The module's other
+  Tier-3 reads follow the membership form its existing boundaries already used
+  (`options[KEY] if KEY in options else None`), and `select_only` — a
+  presence-AND-value question — is spelled `"select_only" not in options or
+  options["select_only"] is not True`, never a ternary.
+- **2026-08-29 — the tier_model dataflow walk does NOT carry taint out of a
+  `try:` body, and that — not helper calls — is why a decorated boundary can
+  still show dozens of R1/R5 findings.** In
+  `yaml_importer.composition_state_from_runtime_yaml` the function is decorated
+  `@trust_boundary(source_param="pipeline_yaml")`, yet 16 sites reading `doc`
+  stayed open. The obvious explanation (the walk cannot cross the
+  `_require_mapping(parsed, ...)` call) is WRONG and would have made bad judge
+  evidence: `_queues_from_runtime_mapping` in the same file crosses
+  `_require_mapping` twice and every one of its sites IS suppressed. Three
+  probes pinned it: aliasing `parsed = pipeline_yaml` inside the `try:` clears
+  0 sites; hoisting `parsed = yaml.safe_load(pipeline_yaml)` ABOVE the `try:`
+  (leaving `safe_load` and `_require_mapping` both in place) clears 15. So when
+  a boundary's parse is wrapped in `try:` to map parser errors, expect the
+  downstream reads to need rationales. Do NOT restructure to satisfy the walk —
+  hoisting drops the error mapping. Corollary for burn-down lanes: measure
+  before decorating. `_collector_nodes_from_runtime_lists` was decorated,
+  measured, and reverted because it cleared 0 findings — a suppression that
+  suppresses nothing is a live test obligation for no gain.
+
+- **2026-08-29 — `@observation_boundary` is the cheap correct form for a
+  pure projector, but it stops at comprehensions and closures.** Two guided
+  emitters (`_wire_schema`, `_structured_output_fields`) project untrusted
+  `NodeSpec.options` and never raise, so `@observation_boundary`
+  (= `trust_boundary(non_raising=True)`) fits with NO `test_ref`/
+  `test_fingerprint` obligation — it cleared 15 of 35 findings in that file for
+  two decorators. What it did NOT clear: reads whose derivation runs through a
+  list comprehension plus tuple unpacking (`for query_name, query in entries`)
+  or through a nested closure over an enclosing local (`_wire_schema.names`).
+  The walk is intra-procedural and does not descend into a nested `FunctionDef`
+  or track comprehension results. Budget rationales for those.
+- **2026-08-29 — a declared `@trust_boundary` does NOT cover a name assigned
+  across an `if`/`try` JOIN, so the tier-model burn-down's "already
+  decorated" files still carry live R1/R5.** `DerivedNameState` propagates
+  source_param-derivedness statement by statement and INTERSECTS the
+  end-states of both `if` arms (`visit_If`) and of body-vs-handlers
+  (`_visit_try_like`). So in `source_demand.stamp_source_options_with_guarantees`
+  — which already carries `@observation_boundary(source_param="options")` —
+  `schema` is derived on the `dict(raw_schema)` arm and NOT on the literal
+  `{"mode": "observed"}` arm, so `schema`, and everything read out of it,
+  is un-derived at the join and its `isinstance` still fires. Same in
+  `parse_source_data_contract_accepted_fields`: `payload = json.loads(value)`
+  sits inside a `try`, and the handler arm never binds `payload`. Do NOT
+  "fix" this by writing a spurious mention of the source_param into the
+  other arm — the rootedness test is syntactic, so `x = (options and ...)`
+  would suppress it while meaning nothing. Rationalise the site and say the
+  boundary is already declared. Corollary for choosing a decorator:
+  `observation_boundary` (= `non_raising=True`) needs NO `test_ref` at all, so
+  it is the cheap, honest route for a projection/abstain helper; a RAISING
+  `trust_boundary` additionally needs `test_ref` + `test_fingerprint` bound to
+  a test whose OWN body raises while invoking the function through
+  `source_param`. The fingerprint is not the hard part — the
+  `trust_boundary.tests` rule EMITS the canonical value, so it is obtainable
+  key-free — the hard part is that a suitable directly-invoking raising test
+  must exist to bind. Budget a rationale when it does not. Six such
+  `observation_boundary` decorators landed clean on B49 (`guided_blob_refs` ×3,
+  `prompts` ×2, `yaml_generator` ×1); `trust_boundary.tests,scope,tier` pass
+  with `--fail-on-inert`, and wardline reports no PY-WL-102 for any of them
+  (PY-WL-102 fires on a declared EXTERNAL_RAW -> ASSURED boundary with no
+  rejection path, which is exactly what a non-raising observation is not).
+
+- **2026-08-29 — a whole-tree `trust_tier.tier_model` run under the REAL
+  allowlist currently UNDER-suppresses, because one stale entry makes the
+  loader refuse.** `config/cicd/enforce_tier_model/web.yaml` `allow_hits[154]`
+  binds to `web/composer/guided/steps.py`, which no longer exists, and the
+  loader emits "stale allowlist entry ... Refusing to load." The visible
+  effect is that signed entries which bind perfectly well report as ACTIVE
+  findings in a `--root src/elspeth` run — e.g.
+  `yaml_generator.py:R9:_strip_web_metadata` — so a lane comparing a
+  real-allowlist corpus before/after will misread pre-existing noise as its
+  own regression. To attribute a suspected signed-entry break to your change,
+  scan the ONE file under a throwaway root (`mkdir -p $T/web/composer &&
+  git show <base>:src/.../f.py > $T/web/composer/f.py`, then
+  `check --root $T --repo-root <worktree>`) and A/B base-vs-current there;
+  in isolation the entry binds and the finding disappears. Tracked as
+  observation elspeth-obs-ce7f1c5f56 (operator: drop the entry and re-sign).
+
+- **2026-08-29 — `interpretation_state` re-exported `SOURCE_AUTHORING_KEY`
+  without the `X as X` form, so mypy failed the PRE-COMMIT hook for six
+  modules a lane never touched.** Under `--no-implicit-reexport` a plain
+  `from ... import SOURCE_AUTHORING_KEY` is not a re-export, so
+  `pipeline_proposal`, `tools/_common`, `tools/sources`, `tools/sessions`,
+  `service` and `reviewed_source_authority` all reported
+  `does not explicitly export attribute`. Fixed on B49 with the redundant
+  alias (`SOURCE_AUTHORING_KEY as SOURCE_AUTHORING_KEY`), which ruff then
+  splits into its own `from elspeth.web.composer.state import (...)` block —
+  that split is expected, the file already does it for
+  `plugin_policy.coverage`. General trap: this failure reproduces from an
+  UNMODIFIED file, so before "fixing" a mypy hook failure, run mypy on a file
+  you did not touch and attribute it before you edit anything.
 
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list
