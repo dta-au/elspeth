@@ -242,7 +242,9 @@ class RowUnionExecutor:
                     f"expected one of {list(settings.branches)}"
                 )
             key = (entry.row_union_name, fork_group_id)
-            pending = restored.setdefault(key, _PendingRowUnion(branches={}, first_arrival=entry.arrival_time))
+            if key not in restored:
+                restored[key] = _PendingRowUnion(branches={}, first_arrival=entry.arrival_time)
+            pending = restored[key]
             if branch_name in pending.branches:
                 raise OrchestrationInvariantError(
                     f"Duplicate restored branch '{branch_name}' for row_union '{entry.row_union_name}', fork group {fork_group_id!r}"
@@ -268,7 +270,15 @@ class RowUnionExecutor:
         durable_loss_keys: list[tuple[str, str]] = []
         for key in restored:
             if key in self._completed_keys or self._check_landscape_for_completion(key[0], key[1]):
-                closed_keys[key] = self._completed_keys.get(key, _CLOSED_BY_RELEASE)
+                # Both arms leave the key cached with its TRUE closure reason:
+                # the first by construction, the second because
+                # _check_landscape_for_completion calls _mark_completed before
+                # it returns True (and _mark_completed's bound eviction pops
+                # the OLDEST entry, never the one it just wrote). Read it as a
+                # member: a default would relabel a branch-loss or
+                # prior-failure closure "released", and the reason lands in
+                # _fail_pending's failure outcome below.
+                closed_keys[key] = self._completed_keys[key]
             elif key in self._recorded_loss_groups or self._barrier_restore_reads.has_group_loss(
                 run_id=self._run_id,
                 closer_name=key[0],
@@ -411,7 +421,9 @@ class RowUnionExecutor:
                 settings,
                 node_id,
                 step,
-                closed_reason=self._completed_keys.get(key, _CLOSED_BY_RELEASE),
+                # Cached with its true reason by whichever arm of the test
+                # above fired — see restore_from_journal's closed-key loop.
+                closed_reason=self._completed_keys[key],
             )
         if key in self._recorded_loss_groups or self._barrier_restore_reads.has_group_loss(
             run_id=self._run_id, closer_name=row_union_name, group_id=fork_group_id

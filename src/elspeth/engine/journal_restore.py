@@ -685,7 +685,11 @@ class CollectorJournalRestorer:
         for item in live_items:
             collector_name, group_id, member_key = group_of[item.token_id]
             supplied = state_ids[item.token_id]
-            if open_ids.get(item.token_id) != supplied:
+            # Absence and mismatch are the same audit inconsistency, spelled
+            # apart: a token with no OPEN hold at this node fails the
+            # membership test, one holding a different state fails the
+            # comparison.
+            if item.token_id not in open_ids or open_ids[item.token_id] != supplied:
                 raise AuditIntegrityError(
                     f"state_ids entry {supplied!r} for token {item.token_id!r} (member "
                     f"{member_key!r} of group {group_id!r} at collector {collector_name!r}, "
