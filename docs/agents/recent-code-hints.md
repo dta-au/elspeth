@@ -8,6 +8,41 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — `web/execution/` has DECLARATION tests that pin the exact
+  tier_model finding set, so REMOVING a finding there turns the lane red until
+  you update the `Counter`.** `tests/unit/web/execution/test_validation_trust_tier.py`
+  calls `scan_file_with_observations` at test time and asserts equality against
+  two hand-maintained literals — `_ADJUDICATION_CANDIDATES` (per-file lists,
+  covering the `_validation_*.py` glob plus `validation.py`) and
+  `_COMPLETION_GATE_ADJUDICATION_CANDIDATES` (a `Counter` for
+  `completion_gates.py`) — plus `_EXPECTED_SUPPRESSION_OBSERVATIONS` for the
+  `@trust_boundary`-suppressed lines. B53 cleared the three
+  `R1:parse_completion_gates` reads and the file's own pin failed with
+  `Right contains 1 more item: {'R1:parse_completion_gates': 3}`. Update the
+  literal AND its explanatory comment in the same commit; the comments are the
+  standing adjudication note for those sites, so a stale one misdescribes the
+  code a judge will read. Note `_production_files` discovers by glob with a
+  `_KNOWN_PRODUCTION_FILE_COUNT` floor, so a new `_validation_*.py` sibling
+  joins the pinned set automatically — but `accounting.py`, `fanout_guard.py`,
+  `outputs.py` and `preflight.py` are NOT covered by it.
+- **2026-08-29 — before converting an `x.get(k, ())` iteration to a membership
+  read, check the PUBLISHED field type, not the builder's local variable.** In
+  `web/execution/fanout_guard.py` the local `queue_predecessors` inside
+  `_build_producer_index` is a `dict[str, dict[str, _Producer]]` (keyed for
+  dedupe), but the frozen field it becomes on `_ProducerIndex` is
+  `Mapping[str, tuple[_Producer, ...]]` — `frozen_predecessors` converts each
+  inner dict to a sorted tuple on the way out. Reading the builder and
+  "fixing" the walk site to `.values()` therefore looks like a bug fix and is
+  actually a break: the consumer already iterates producers, not keys. Same
+  file, two names, two shapes. Mypy catches it, so run
+  `PYTHONPATH=<wt>/src:<wt>/elspeth-lints/src .venv/bin/mypy <files>` on every
+  touched file before committing rather than relying on the scoped test run.
+  (Related, confirmed empirically in B53: converting
+  `isinstance(x, InterpretationReviewPending)` to `type(x) is ...` in
+  `_identity_state_for_compiled_ids` fails mypy with `Incompatible return
+  value type` exactly as the `type(x) is C` narrowing entry below predicts —
+  that union discriminator's else-branch IS used.)
+
 - **2026-08-29 — the `@trust_boundary` suppressor also loses the derived-name
   trail through a `try:` whose handler RETURNS, so the decode-then-read idiom
   suppresses nothing.** Third known hole in the same walk, after the
