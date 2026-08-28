@@ -2195,6 +2195,42 @@ def test_sign_bundle_lanes_resign_only_never_judges_and_publishes_deterministic_
     assert "1 action(s) outside the selected lane(s)" in out
 
 
+def test_sign_bundle_lanes_summary_counts_only_selected_actions(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The pre-confirmation summary is scoped to --lanes.
+
+    A resign-only probe must not present the unselected new_judgment action --
+    or the operator override it would carry -- as planned work: the operator
+    confirms exactly what will be attempted.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    widget_finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=widget_finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),
+            ),
+        ),
+    )
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--dry-run", "--operator-override", "--lanes", "resign")))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "sign-bundle: 1 action(s) -- new_judgment=0, drift_repair=0, rotation=0, stale_delete=1" in out
+    assert "planned operator-override actions: 0" in out
+    assert "+0 override action(s) staged" in out
+    assert "1 action(s) outside the selected lane(s)" in out
+
+
 def test_sign_bundle_lanes_rejects_unknown_lane(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)

@@ -4356,14 +4356,19 @@ def _emit_sign_bundle_summary(bundle: Any, *, verification: Any, args: argparse.
     authoritative C3 number is a rolling-window recompute the CLI does post-write,
     so an inline projection here must not be mistaken for it.
     """
+    # Scope to --lanes: the operator confirms what will be attempted, so an
+    # unselected action must not appear as planned work or a planned override
+    # (mirrors the lane filter in _execute_sign_bundle).
+    selected_lanes = None if args.lanes is None else set(args.lanes)
+    selected_actions = [a for a in bundle.actions if selected_lanes is None or a.lane in selected_lanes]
     counts = {"justify": 0, "drift_repair": 0, "rotation": 0, "stale_delete": 0}
-    for action in bundle.actions:
+    for action in selected_actions:
         counts[action.kind] = counts.get(action.kind, 0) + 1
     planned_override = (counts["justify"] + counts["drift_repair"]) if args.operator_override else 0
 
     sys.stdout.write(
         "sign-bundle: "
-        f"{len(bundle.actions)} action(s) -- "
+        f"{len(selected_actions)} action(s) -- "
         f"new_judgment={counts['justify']}, drift_repair={counts['drift_repair']}, "
         f"rotation={counts['rotation']}, stale_delete={counts['stale_delete']}\n"
     )
