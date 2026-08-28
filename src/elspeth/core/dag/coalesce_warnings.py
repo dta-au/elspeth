@@ -130,16 +130,18 @@ def warn_divert_coalesce_interactions(
         return []
 
     # Fork gates by node id, with the branch names their fork_to declares.
-    # Gate node configs carry fork_to from the builder; after
-    # finalize_node_configs the config is a deep-frozen mapping and the list
-    # a tuple, so access stays Mapping-safe.
+    # Gate node configs carry fork_to from the builder, which writes the key
+    # ONLY for a forking gate (GateSettings.validate_fork_to_labels rejects an
+    # empty fork_to outright), so key PRESENCE is the fork signal — and a gate
+    # recorded with no branches would be inert anyway, because the only
+    # consumer below intersects these branch sets. After finalize_node_configs
+    # the config is a deep-frozen mapping and the list a tuple, so access stays
+    # Mapping-safe.
     fork_gate_branches: dict[NodeID, frozenset[str]] = {}
     for node in graph.get_nodes():
-        if node.node_type != NodeType.GATE:
+        if node.node_type != NodeType.GATE or "fork_to" not in node.config:
             continue
-        fork_to = node.config.get("fork_to")
-        if fork_to:
-            fork_gate_branches[node.node_id] = frozenset(str(branch) for branch in fork_to)
+        fork_gate_branches[node.node_id] = frozenset(str(branch) for branch in node.config["fork_to"])
 
     warnings: list[GraphValidationWarning] = []
 
