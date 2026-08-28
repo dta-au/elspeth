@@ -499,15 +499,18 @@ def load_run_accounting_map_from_db(
         rejected_row_total = sum(rejected_rows.values()) + rejected_unattributed[run_id]
         # Union of both maps: a source whose every row was rejected has no
         # rows_table entries at all, and dropping it from the per-source map
-        # would erase the source from accounting (the g01 shape).
-        per_source = {
-            name: RunAccountingSource(
-                rows_processed=source_rows.get(name, 0),
-                rows_rejected=rejected_rows.get(name, 0),
-                rows_read=source_rows.get(name, 0) + rejected_rows.get(name, 0),
+        # would erase the source from accounting (the g01 shape). Absence in
+        # ONE map is a counted fact, not a missing key — a source present only
+        # in the other genuinely processed (or rejected) zero rows.
+        per_source: dict[str, RunAccountingSource] = {}
+        for name in sorted(set(source_rows) | set(rejected_rows)):
+            processed = source_rows[name] if name in source_rows else 0
+            rejected = rejected_rows[name] if name in rejected_rows else 0
+            per_source[name] = RunAccountingSource(
+                rows_processed=processed,
+                rows_rejected=rejected,
+                rows_read=processed + rejected,
             )
-            for name in sorted(set(source_rows) | set(rejected_rows))
-        }
 
         # ADR-038 closure taxonomy: 'closed' — every token decided;
         # 'abandoned' — none unexplained, but some explicitly abandoned;
@@ -576,8 +579,8 @@ def load_run_accounting_from_db(db: LandscapeDB, *, landscape_run_id: str) -> Ru
     corrupt run raises with its violations.
     """
     batch = load_run_accounting_map_from_db(db, (landscape_run_id,))
-    corruption = batch.corrupt.get(landscape_run_id)
-    if corruption is not None:
+    if landscape_run_id in batch.corrupt:
+        corruption = batch.corrupt[landscape_run_id]
         raise ValueError(
             f"Landscape accounting for run {landscape_run_id!r} failed integrity validation: {'; '.join(corruption.violations)}"
         )

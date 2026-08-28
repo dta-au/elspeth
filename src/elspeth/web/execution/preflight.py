@@ -368,8 +368,8 @@ def bind_profiled_s3_source_audit_identities(
         options = cast(dict[str, object], raw_options)
         if set(options) - S3_PROFILED_AUDIT_SAFE_OPTION_NAMES:
             raise ValueError(f"audit-safe options for source {source_name!r} contain a private binding field")
-        alias = options.get("profile")
-        relative_key = options.get("key")
+        alias = options["profile"] if "profile" in options else None
+        relative_key = options["key"] if "key" in options else None
         if type(alias) is not str or alias not in allowed_aliases:
             raise ValueError(f"audit-safe options for source {source_name!r} do not select an available profile")
         if type(relative_key) is not str:
@@ -426,7 +426,7 @@ def bind_profiled_textract_audit_identities(
         options = cast(dict[str, object], raw_options)
         if set(options) - TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES:
             raise ValueError(f"audit-safe options for transform {node_name!r} contain a private binding field")
-        alias = options.get("profile")
+        alias = options["profile"] if "profile" in options else None
         if type(alias) is not str or alias not in allowed_aliases:
             raise ValueError(f"audit-safe options for transform {node_name!r} do not select an available profile")
         try:

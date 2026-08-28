@@ -209,13 +209,13 @@ def parse_completion_gates(
     a malformed shape means corruption or writer drift — raise, never skip
     the gate.
 
-    Tier-model adjudication note (R1 membership / ``.get()`` / R5
-    ``isinstance()`` below): this function is the ADR-032 parse point for a
-    JSON-round-tripped envelope read back off our own ``composition_states``
-    row. The membership checks are sentinel probes for keys whose ABSENCE is
-    a legal, meaningful state (`no envelope written` / `no gate withheld`) —
-    never a silent default. The remaining ``.get()`` calls are required-field
-    reads: every present-but-malformed shape raises, and the two
+    Tier-model adjudication note (R5 ``isinstance()`` below): this function is
+    the ADR-032 parse point for a JSON-round-tripped envelope read back off our
+    own ``composition_states`` row. The membership checks are sentinel probes
+    for keys whose ABSENCE is a legal, meaningful state (`no envelope written`
+    / `no gate withheld`) — never a silent default. Every required field is
+    read in membership form (``d[k] if k in d else None``), so an absent field
+    lands in the same raise as a malformed one, and the two
     ``isinstance(..., Mapping)`` checks are shape validation that constructs
     the owned ``CompletionGateFacts`` type, not defensive masking of a code
     bug. If this function ever stops raising on malformed present values, or
@@ -242,15 +242,16 @@ def parse_completion_gates(
     raw_signoff = raw[_ADVISOR_SIGNOFF_GATE_KEY]
     if not isinstance(raw_signoff, Mapping):
         raise ValueError(f"Tier 1: completion_gates.advisor_signoff is {type(raw_signoff).__name__}, expected a mapping")
-    # From here every probe is get-then-assert: a missing or malformed field
-    # falls through to a raise, so no absence is ever silently defaulted.
-    status = raw_signoff.get("status")
+    # From here every probe is membership-then-assert: an absent field reads as
+    # ``None`` and falls into the same raise as a malformed one, so no absence
+    # is ever silently defaulted.
+    status = raw_signoff["status"] if "status" in raw_signoff else None
     if status != _GATE_STATUS_BLOCKED:
         raise ValueError(f"Tier 1: completion_gates.advisor_signoff.status is {status!r}, expected {_GATE_STATUS_BLOCKED!r}")
-    detail = raw_signoff.get("detail")
+    detail = raw_signoff["detail"] if "detail" in raw_signoff else None
     if type(detail) is not str or not detail:
         raise ValueError("Tier 1: completion_gates.advisor_signoff.detail must be a non-empty string")
-    for_graph = raw_signoff.get("for_graph")
+    for_graph = raw_signoff["for_graph"] if "for_graph" in raw_signoff else None
     if type(for_graph) is not str or not for_graph:
         raise ValueError("Tier 1: completion_gates.advisor_signoff.for_graph must be a non-empty string")
     return CompletionGateFacts(advisor_signoff=AdvisorSignoffGateFact(detail=detail, for_graph=for_graph))

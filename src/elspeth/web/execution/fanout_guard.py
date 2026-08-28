@@ -282,7 +282,10 @@ def _build_producer_index(state: CompositionState) -> _ProducerIndex:
         # its predecessor set instead of the single-producer map, keyed on
         # stable producer identity so duplicates dedupe deterministically.
         if label in queue_ids and _producer_key(producer) != f"node:{label}":
-            queue_predecessors[label].setdefault(_producer_key(producer), producer)
+            predecessors = queue_predecessors[label]
+            producer_key = _producer_key(producer)
+            if producer_key not in predecessors:
+                predecessors[producer_key] = producer
             return
         by_connection[label] = producer
 
@@ -363,9 +366,11 @@ def _trace_upstream_fanout(
         source_markers.append(f"{marker_prefix}{estimated_rows}")
 
     def walk_label(label: str) -> None:
-        producer = producers.by_connection.get(label)
-        if producer is not None:
-            walk_producer(producer)
+        # An unregistered label is a real state: a source or node may publish
+        # under a name nothing upstream produces. Membership form keeps that
+        # answer explicit rather than reading it out of a silent default.
+        if label in producers.by_connection:
+            walk_producer(producers.by_connection[label])
 
     def walk_producer(producer: _Producer) -> None:
         key = _producer_key(producer)
@@ -384,7 +389,13 @@ def _trace_upstream_fanout(
         if node.node_type == "queue":
             # A queue fans in every predecessor; traverse them all so no
             # upstream cardinality or token-creating path is lost behind it.
-            for predecessor in producers.queue_predecessors.get(node.id, ()):
+            # ``_build_producer_index`` seeds an entry for EVERY queue node in
+            # the same state this walk traverses, so a missing entry is index
+            # corruption, not an empty queue — an empty-tuple default would
+            # silently truncate the upstream trace and drop the guard.
+            if node.id not in producers.queue_predecessors:
+                raise RuntimeError(f"Queue node {node.id!r} missing from the producer index")
+            for predecessor in producers.queue_predecessors[node.id]:
                 walk_producer(predecessor)
             return
 

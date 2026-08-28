@@ -66,14 +66,14 @@ _EXPECTED_SUPPRESSION_OBSERVATIONS = {
 }
 
 # This parser is a fail-closed admission point for our JSON-round-tripped
-# completion-gate envelope. Two membership checks distinguish absent optional
-# envelope keys from explicit null, while the three required-field probes and
-# two Mapping shape checks remain explicit release-signing candidates: every
-# malformed present value raises before constructing the owned
-# CompletionGateFacts type.
+# completion-gate envelope. Every key read — the two optional envelope probes
+# and the three required signoff fields — is now membership form, so an absent
+# field lands in the same raise as a malformed one and no R1 remains. The two
+# Mapping shape checks stay explicit release-signing candidates: they validate
+# the round-tripped shape before constructing the owned CompletionGateFacts
+# type, and every malformed present value raises.
 _COMPLETION_GATE_ADJUDICATION_CANDIDATES = Counter(
     {
-        "R1:parse_completion_gates": 3,
         "R5:parse_completion_gates": 2,
     }
 )
