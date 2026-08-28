@@ -845,7 +845,7 @@ def structural_node_plugin_error(node: NodeSpec) -> str | None:
     tier=3,
     source="NodeSpec carrying composer/LLM/user-authored options (untrusted options.description value)",
     source_param="node",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns an error string only for a concretely malformed queue shape; a non-string "
         "options.description is one such violation, and the function never raises"
@@ -2370,7 +2370,8 @@ def _node_topology_cycle(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...] | None:
             continue
         targets: list[str] = []
         for connection in sorted(_node_published_connections(node)):
-            targets.extend(consumers_by_connection.get(connection, ()))
+            if connection in consumers_by_connection:
+                targets.extend(consumers_by_connection[connection])
         successors[node.id] = targets
 
     white, grey, black = 0, 1, 2
@@ -2442,8 +2443,10 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
         """Follow the transform chain consuming ``branch_key`` to a sink hop."""
         connection = branch_key
         for _ in range(len(state.nodes)):
-            consumer = transform_by_input.get(connection)
-            if consumer is None or consumer.on_success is None:
+            if connection not in transform_by_input:
+                return None
+            consumer = transform_by_input[connection]
+            if consumer.on_success is None:
                 return None
             if consumer.on_success in sink_names:
                 return consumer.id, consumer.on_success
@@ -3269,6 +3272,70 @@ def _validate_aggregation_trigger(node_id: str, trigger: Mapping[str, Any]) -> V
             error_code="aggregation_trigger_invalid",
         )
     return None
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying composer/LLM/user-authored options['interpretation_requirements']",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "emits high-severity ValidationEntries only for authored pipeline_decision requirements "
+        "whose user_term is not a registered decision term; absent, non-list, non-mapping and "
+        "non-pipeline_decision shapes are skipped (the interpretation-requirement schema owns "
+        "those) and the function never raises"
+    ),
+)
+def _unregistered_pipeline_decision_term_errors(node: NodeSpec) -> tuple[ValidationEntry, ...]:
+    """Reject authored pipeline_decision reviews naming an unregistered user_term.
+
+    The resolve-side artifact-hash registry raises on unknown terms, so a novel
+    term mints an unresolvable review event and wedges the session at the run
+    gate — the reason this is a blocking validation error rather than a warning.
+
+    ``options['interpretation_requirements']`` is composer/LLM/user-authored
+    payload read back from persisted session state, so it is parsed at this ONE
+    boundary rather than trusted: every level below the declared list/mapping
+    skeleton is shape-checked here, and callers receive owned ``ValidationEntry``
+    values. Malformed entries are skipped rather than reported — entry shape is
+    the interpretation-requirement schema's contract, and double-reporting it
+    here would attribute one defect twice.
+    """
+    from elspeth.web.interpretation_state import (
+        REGISTERED_PIPELINE_DECISION_USER_TERMS,
+        composer_pipeline_decision_user_term_error,
+    )
+
+    authored_requirements = node.options.get("interpretation_requirements")
+    if not isinstance(authored_requirements, (list, tuple)):
+        return ()
+    entries: list[ValidationEntry] = []
+    for requirement in authored_requirements:
+        if not isinstance(requirement, Mapping):
+            continue
+        if requirement.get("kind") != "pipeline_decision":
+            continue
+        term = requirement.get("user_term")
+        if isinstance(term, str) and term.strip() in REGISTERED_PIPELINE_DECISION_USER_TERMS:
+            continue
+        repair = (
+            composer_pipeline_decision_user_term_error(
+                user_term=term,
+                context=f"Node {node.id!r}",
+            )
+            or "The pipeline_decision user_term is not registered."
+            if isinstance(term, str)
+            else "The pipeline_decision user_term must be a registered string."
+        )
+        entries.append(
+            ValidationEntry(
+                component=f"node:{node.id}",
+                message=repair,
+                severity="high",
+                error_code="pipeline_decision_unregistered",
+            )
+        )
+    return tuple(entries)
 
 
 # The names PromptTemplate.render actually supplies (templates.py builds the
@@ -6836,38 +6903,9 @@ class CompositionState:
             # Authored pipeline_decision reviews must use a registered decision
             # term: the resolve-side artifact-hash registry raises on unknown
             # terms, so a novel term mints an unresolvable review event and
-            # wedges the session at the run gate.
-            from elspeth.web.interpretation_state import (
-                REGISTERED_PIPELINE_DECISION_USER_TERMS,
-                composer_pipeline_decision_user_term_error,
-            )
-
-            authored_requirements = node.options.get("interpretation_requirements")
-            if isinstance(authored_requirements, (list, tuple)):
-                for requirement in authored_requirements:
-                    if not isinstance(requirement, Mapping):
-                        continue
-                    if requirement.get("kind") != "pipeline_decision":
-                        continue
-                    term = requirement.get("user_term")
-                    if not isinstance(term, str) or term.strip() not in REGISTERED_PIPELINE_DECISION_USER_TERMS:
-                        repair = (
-                            composer_pipeline_decision_user_term_error(
-                                user_term=term,
-                                context=f"Node {node.id!r}",
-                            )
-                            or "The pipeline_decision user_term is not registered."
-                            if isinstance(term, str)
-                            else "The pipeline_decision user_term must be a registered string."
-                        )
-                        errors.append(
-                            _err(
-                                f"node:{node.id}",
-                                repair,
-                                "high",
-                                "pipeline_decision_unregistered",
-                            )
-                        )
+            # wedges the session at the run gate. The requirement payload is
+            # parsed at ONE boundary — see the helper's decorator.
+            errors.extend(_unregistered_pipeline_decision_term_errors(node))
 
             batch_placement_error = _batch_aware_placement_error(node.id, node.node_type, node.plugin, node.output_mode)
             if batch_placement_error is not None:
@@ -7390,8 +7428,8 @@ class CompositionState:
             if candidate.node_type != "gate" or candidate.fork_to is None:
                 continue
             for branch in dict.fromkeys(candidate.fork_to):
-                owner = fork_branch_owner.get(branch)
-                if owner is not None and owner != candidate.id:
+                if branch in fork_branch_owner and fork_branch_owner[branch] != candidate.id:
+                    owner = fork_branch_owner[branch]
                     errors.append(
                         _err(
                             f"node:{candidate.id}",
@@ -7740,12 +7778,16 @@ class CompositionState:
                         row_union_branch_any_mode_aggregations: dict[str, tuple[NodeSpec, str]] = {}
                         for branch_alias, lineage in branch_lineages:
                             for ancestor in lineage:
-                                if ancestor.node_type == "aggregation" and ancestor.output_mode in (None, "transform"):
-                                    branch_aggregations.setdefault(ancestor.id, (ancestor, branch_alias))
+                                if (
+                                    ancestor.node_type == "aggregation"
+                                    and ancestor.output_mode in (None, "transform")
+                                    and ancestor.id not in branch_aggregations
+                                ):
+                                    branch_aggregations[ancestor.id] = (ancestor, branch_alias)
                                 if ancestor.node_type == "aggregation" and ancestor.id not in row_union_branch_any_mode_aggregations:
                                     row_union_branch_any_mode_aggregations[ancestor.id] = (ancestor, branch_alias)
-                                if ancestor.node_type == "gate" and ancestor.fork_to:
-                                    nested_forks.setdefault(ancestor.id, (ancestor, branch_alias))
+                                if ancestor.node_type == "gate" and ancestor.fork_to and ancestor.id not in nested_forks:
+                                    nested_forks[ancestor.id] = (ancestor, branch_alias)
                         for aggregation, branch_alias in branch_aggregations.values():
                             errors.append(
                                 _err(
