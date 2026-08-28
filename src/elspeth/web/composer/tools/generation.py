@@ -11,7 +11,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal, TypedDict
+from typing import Any, Final, Literal, TypedDict, final
 from uuid import UUID
 
 from opentelemetry import metrics
@@ -20,7 +20,7 @@ from sqlalchemy import Engine
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.schema import FieldDefinition, get_aggregation_contract_options, get_raw_schema_config
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.contracts.value_source import get_catalog_values
 from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionParser
 from elspeth.plugins.infrastructure.manager import (
@@ -1972,9 +1972,16 @@ class ResolvedProofBlob:
             raise AuditIntegrityError("verified proof blob size differs from its custody metadata")
 
 
+@final
 @dataclass(frozen=True, slots=True)
 class UnresolvedClaimedProofBlob:
-    """Nominal marker that a reviewed sentinel's custody claim failed."""
+    """Nominal marker that a reviewed sentinel's custody claim failed.
+
+    ``@final`` is load-bearing, not decoration: ``_compute_proof_diagnostics_for_source``
+    discriminates the closed ``ResolvedProofBlob | UnresolvedClaimedProofBlob | None``
+    resolver union with the house ``type(x) is C`` idiom, which only narrows the
+    negative branch to ``ResolvedProofBlob`` because this marker cannot be subclassed.
+    """
 
 
 class _BlockingDiagnosticPayload(TypedDict):
@@ -2092,6 +2099,17 @@ def _csv_source_schema_config_error_diagnostic(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="The `schema` block inside a persisted SourceSpec options mapping — composer/operator-authored values re-read from session state",
+    source_param="source",
+    suppresses=("R5",),
+    invariant=(
+        "Observes the declared schema mode: returns options['schema']['mode'] lowercased only when "
+        "that block is a mapping carrying a str mode, and None for every other shape. Never raises on "
+        "any options content."
+    ),
+)
 def _source_schema_mode(source: SourceSpec) -> str | None:
     # ``source.options`` is composer/user-authored config re-read from persisted
     # session state — Tier-3 origin (we authored the container, they authored the
@@ -2868,7 +2886,7 @@ def _compute_proof_diagnostics_for_source(
     diagnostics: list[Mapping[str, Any]] = []
 
     resolved_blob = blob_resolver(str(blob_id))
-    if isinstance(resolved_blob, UnresolvedClaimedProofBlob):
+    if type(resolved_blob) is UnresolvedClaimedProofBlob:
         return [
             _blocking_diagnostic(
                 code="source_inspection_failed",

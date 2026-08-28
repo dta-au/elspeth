@@ -102,6 +102,52 @@ is a working document under the normal delivery posture.
   from the same lane: `@observation_boundary` on a genuine non-raising
   projector passes `trust_boundary.tests,scope,tier --fail-on-inert` with no
   `test_ref` obligation and drew no wardline PY-WL-102.
+- **2026-08-29 — three traps from B39 (`web/composer/tools/generation.py`).**
+  (a) **`type(x) is C` on a closed OWNED union needs `@final` on `C`, or mypy
+  refuses to narrow the NEGATIVE branch.** Converting
+  `isinstance(resolved_blob, UnresolvedClaimedProofBlob)` to the house
+  `type(...) is ...` idiom cleared the R5 finding and immediately produced five
+  `union-attr` errors on the reads BELOW it: mypy narrows the positive branch
+  of `type(x) is C` but will not remove `C` from the union on the negative
+  branch unless `C` cannot be subclassed. `@final` on the marker class is the
+  honest fix — it *declares* the closedness the idiom already assumes — not a
+  `cast` and not a revert. Budget it whenever you swap an `isinstance`
+  discriminator over an owned union whose else-branch reads members.
+  (b) **A signed tier-model entry can go DEAD, and its site then looks exactly
+  like a lane's own target.** Five `web.yaml` entries for this file suppress
+  nothing: four `R6:compute_proof_diagnostics` keys whose handlers were
+  extracted into `_compute_proof_diagnostics_for_source` (the SYMBOL component
+  can never bind again) and one whose `fp=` drifted when a `MemoryError`
+  handler was added beside the signed one. So "raw count minus plan count" is
+  not a lane doing extra work. The probe that tells dead from live: copy the
+  ONE file into a throwaway root and run
+  `check --rules trust_tier.tier_model --root $T --repo-root <wt>
+  --allowlist-dir <wt>/config/cicd/enforce_tier_model` — note the explicit
+  `--allowlist-dir`, because the allowlist path resolves off `--root`, not
+  `--repo-root`, and without it the run dies with `FileNotFoundError`. Entries
+  that bind clear their findings; entries that do not are printed by key as
+  "Stale tier-model allowlist entry". Other files' entries also report stale in
+  that run (their files are absent from `$T`) — only lines naming YOUR file are
+  evidence. Carry a dead entry's reasoning onto a live `ast=` key and flag the
+  dead key for pruning (elspeth-obs-07866fb4e4); never hand-edit the YAML.
+  (c) **Do not run wardline through `mcp__wardline__*` from a worktree lane.**
+  The MCP server is launched from the MAIN checkout by `.mcp.json`, and its
+  `path` argument is documented as "subdir relative to project root" — so a
+  path-scoped scan resolves into main, not your worktree: the same split-tree
+  confidently-wrong answer as the `PYTHONPATH` traps above, and silent. What
+  was measured: `mcp__wardline__scan` on `src/elspeth/web/composer/tools`
+  returned 0 active defects AND `resolution.inert: true` (0 trust boundaries
+  recognised) for a subtree carrying five `@trust_boundary` decorators, while
+  the CLI run from inside the worktree recognised 199 boundaries tree-wide and
+  passed `--fail-on-inert`. (Inertness there could be the wrong tree or
+  path-scoped pack resolution — not disentangled; either way the result is
+  void.) Use the gate of record from inside the worktree:
+  `wardline scan . --fail-on ERROR --fail-on-inert --trust-pack
+  scripts.wardline_pack --allow-custom-packs --local-only`. Note the binary is
+  `/home/john/.local/bin/wardline`, NOT `.venv/bin/wardline` (exit 127) — and
+  `wardline` is not importable from the venv either. Corollary: an
+  `inert: true` wardline result is never evidence, whatever its active count.
+
 - **2026-08-29 — the `@trust_boundary` suppressor also loses the derived-name
   trail through a `try:` whose handler RETURNS, so the decode-then-read idiom
   suppresses nothing.** Third known hole in the same walk, after the
