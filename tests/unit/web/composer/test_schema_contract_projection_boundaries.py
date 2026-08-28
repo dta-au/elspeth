@@ -75,6 +75,25 @@ def test_contract_knob_schema_accepts_empty_fields() -> None:
     assert _contract_knob_schema({"fields": []}) == {"fields": []}
 
 
+@pytest.mark.parametrize(
+    ("declared", "expected"),
+    [
+        # ``choices`` alone is the legacy spelling: it is renamed to ``enum``.
+        ({"choices": ["a", "b"]}, {"enum": ["a", "b"]}),
+        # Both spellings present (and equal, or the guard above would have
+        # raised): ``enum`` wins and ``choices`` never reaches the projection.
+        ({"enum": ["a", "b"], "choices": ["a", "b"]}, {"enum": ["a", "b"]}),
+        # Neither spelling present: no enum key is invented.
+        ({}, {}),
+    ],
+    ids=["choices-only", "both-spellings", "neither"],
+)
+def test_contract_knob_schema_projects_one_enum_spelling(declared: dict[str, object], expected: dict[str, object]) -> None:
+    """``choices`` is folded into ``enum`` and never survives the projection."""
+    projected = _contract_knob_schema({"fields": [{"name": "mode", "kind": "enum", "required": True, **declared}]})
+    assert projected == {"fields": [{"name": "mode", "kind": "enum", "required": True, **expected}]}
+
+
 def test_planner_plugin_contract_is_a_bounded_owned_projection() -> None:
     admitted = PluginSchemaInfo(
         name="bounded_transform",
