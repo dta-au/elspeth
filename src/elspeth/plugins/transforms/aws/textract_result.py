@@ -62,8 +62,7 @@ class NormalizedTextractResult:
         #
         # No consumer sees the change: every reader of these eight fields
         # either ``deep_thaw``s first or reads a scalar, and the one raw read
-        # (``metadata["warnings"]``) is already ``isinstance(..., list | tuple)``
-        # tolerant.
+        # (``len(metadata["warnings"])``) is the same on a list or a tuple.
         freeze_fields(
             self,
             "pages",

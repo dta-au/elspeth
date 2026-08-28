@@ -8,7 +8,7 @@ import math
 import re
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Any, ClassVar, Self, cast
 
@@ -441,7 +441,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             raise ValueError("profiled Textract audit-safe config contains a private binding field")
         if set(safe_config) - TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES:
             raise ValueError("profiled Textract audit-safe config contains a private binding field")
-        if safe_config.get("profile") != identity.profile_alias:
+        if "profile" not in safe_config or safe_config["profile"] != identity.profile_alias:
             raise ValueError("profiled Textract audit-safe config does not match its nominal identity")
         if self._static_bucket is None:
             raise ValueError("profiled Textract audit authority requires the static bucket document-location mode")
@@ -551,9 +551,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
 
     def _get_row_client(self, state_id: str, *, token_id: str | None) -> TextractClient:
         with self._row_clients_lock:
-            existing = self._row_clients.get(state_id)
-            if existing is not None:
-                return existing
+            if state_id in self._row_clients:
+                return self._row_clients[state_id]
             if self._recorder is None or self._sdk_client is None or not self._run_id:
                 raise FrameworkBugError("Amazon Textract transform used before on_start")
             client = TextractClient(
@@ -578,8 +577,11 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         try:
             return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id)
         finally:
+            # The row client is created lazily at the SDK call, so a row that
+            # was rejected before reaching it never registered one.
             with self._row_clients_lock:
-                self._row_clients.pop(ctx.state_id, None)
+                if ctx.state_id in self._row_clients:
+                    del self._row_clients[ctx.state_id]
 
     def _read_document_location(self, row: PipelineRow) -> tuple[str, str, str | None] | TransformResult:
         if self._static_bucket is not None:
@@ -607,9 +609,6 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 {"reason": "invalid_input", "field": self._version_field, "actual_type": type(version).__name__},
                 retryable=False,
             )
-        assert isinstance(bucket, str)
-        assert isinstance(key, str)
-        assert version is None or isinstance(version, str)
         if not 3 <= len(bucket) <= 255 or _BUCKET_PATTERN.fullmatch(bucket) is None:
             return TransformResult.error(
                 {"reason": "invalid_input", "field": bucket_field, "error_type": "invalid_s3_bucket"},
@@ -647,8 +646,6 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 {"reason": "invalid_input", "field": self._version_field, "actual_type": type(version).__name__},
                 retryable=False,
             )
-        assert isinstance(key, str)
-        assert version is None or isinstance(version, str)
         try:
             relative_key = validate_relative_s3_path(key, field_name=self._key_field)
         except ValueError:
@@ -835,8 +832,10 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             result.reason["bucket_region_verification"] = evidence
             return result
         assert result.success_reason is not None
-        metadata = result.success_reason.setdefault("metadata", {})
-        metadata["bucket_region_verification"] = evidence
+        # The only success result this transform builds is
+        # `_build_enriched_result`'s, and it always carries `metadata`; a
+        # success reason without one is a bug, not a case to paper over.
+        result.success_reason["metadata"]["bucket_region_verification"] = evidence
         return result
 
     def _verify_bucket_region_live(self, bucket: str, *, state_id: str, token_id: str) -> BucketRegionProof:
@@ -889,9 +888,10 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             if time.monotonic() >= deadline:
                 return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
 
-            status = page.semantic_response.get("JobStatus")
-            if type(status) is not str:
+            semantic_response = page.semantic_response
+            if "JobStatus" not in semantic_response or type(semantic_response["JobStatus"]) is not str:
                 return TransformResult.error({"reason": "malformed_response", "error_type": "job_status"}, retryable=False)
+            status = semantic_response["JobStatus"]
             if status == "IN_PROGRESS":
                 if page.next_token is not None:
                     return TransformResult.error({"reason": "malformed_response", "error_type": "premature_next_token"}, retryable=False)
@@ -917,12 +917,22 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             retained_result_bytes += page_bytes
             if retained_result_bytes > self._max_result_bytes:
                 return TransformResult.error({"reason": "result_too_large"}, retryable=False)
-            pages.append(page.semantic_response)
-            raw_blocks = page.semantic_response.get("Blocks")
-            if isinstance(raw_blocks, Sequence) and not isinstance(raw_blocks, (str, bytes, bytearray)):
-                block_count += len(raw_blocks)
-                if block_count > self._max_blocks:
-                    return TransformResult.error({"reason": "too_many_blocks"}, retryable=False)
+            pages.append(semantic_response)
+            # A SUCCEEDED page carries `Blocks` (an empty list on a blank page);
+            # `normalize_textract_result` reads it as a required member, so a
+            # page without one — or with a non-list one — is malformed here
+            # rather than counted as zero and rejected only after every page
+            # has been fetched and retained. The count is enforced per page so
+            # a runaway result fails before the next request. Frozen SDK
+            # responses carry tuples, fakes and the raw SDK carry lists.
+            if "Blocks" not in semantic_response:
+                return TransformResult.error({"reason": "malformed_response", "error_type": "blocks"}, retryable=False)
+            raw_blocks = semantic_response["Blocks"]
+            if type(raw_blocks) is not list and type(raw_blocks) is not tuple:
+                return TransformResult.error({"reason": "malformed_response", "error_type": "blocks"}, retryable=False)
+            block_count += len(raw_blocks)
+            if block_count > self._max_blocks:
+                return TransformResult.error({"reason": "too_many_blocks"}, retryable=False)
             returned_token = page.next_token
             if returned_token is None:
                 return tuple(pages)
@@ -963,8 +973,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         output_contract = self._apply_declared_output_field_contracts(output_contract)
         output_contract = self._align_output_contract(output_contract)
         metadata = normalized.metadata
-        warnings = metadata["warnings"]
-        warning_count = len(warnings) if isinstance(warnings, list | tuple) else 0
+        # `normalize_textract_result` always builds `warnings` as a list
+        # (frozen to a tuple on the result), so its length needs no shape guard.
+        warning_count = len(metadata["warnings"])
         return TransformResult.success(
             PipelineRow(output, output_contract),
             success_reason={
