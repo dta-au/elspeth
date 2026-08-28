@@ -256,6 +256,45 @@ is a working document under the normal delivery posture.
   `plugin_policy.coverage`. General trap: this failure reproduces from an
   UNMODIFIED file, so before "fixing" a mypy hook failure, run mypy on a file
   you did not touch and attribute it before you edit anything.
+- **2026-08-29 — `@trust_boundary` suppression is CALL-LAUNDERED: decorating a
+  function does NOTHING for a finding on a value a helper RETURNED.** The
+  tier_model walk roots a subject at `source_param` through subscript,
+  attribute, `.get(...)`, iteration, unpacking and walrus — but
+  `trust_boundary_suppress.subject_is_rooted` descends an `ast.Call` through
+  `Call.func`, NOT through `Call.args`, so `helper(payload)`'s result belongs to
+  `helper`, not to `payload`. Two consequences bit B43 and will bite again:
+  (1) `items, error = _current_sequence(payload["x"], ...)` leaves every
+  per-element `isinstance(item, Mapping)` unsuppressed no matter what decorator
+  the enclosing function carries — the element check belongs to the element and
+  must be removed or rationalised; (2) even INSIDE a decorated boundary,
+  `for index, item in enumerate(value)` launders `item`, because the `For`
+  iter is a call rooted at `enumerate`. Do NOT rewrite such a loop to
+  `for index in range(len(value)): item = value[index]` to regain suppression —
+  that is a lint dodge, and the honest answers are a rationale or a real
+  removal. Decide suppressibility by RUNNING the rule (the non-failing
+  `R_TB_SUPPRESSED` observation stream names every site a decorator actually
+  covered) rather than by reading the decorator.
+
+- **2026-08-29 — in `web/composer/guided/protocol.py`, an exact-key check that
+  feeds subscripts is `_exact_nested_mapping`, not `_exact_nested_keys` +
+  `assert isinstance`.** The module's ~17 call sites used to re-assert
+  `isinstance(x, Mapping)` after a successful `_exact_nested_keys` purely so the
+  following subscripts type-check — a runtime re-check of a fact the helper had
+  just proved, and an R5 finding at every one. `_exact_nested_mapping` returns
+  `(narrowed_mapping | None, error | None)`, converging those sites on the
+  `(value, error)` idiom `_sequence_of_mappings` / `_current_sequence` already
+  used; `assert x is not None` is not an R5. Where the subject is already `Any`
+  (a subscript of an already-narrowed mapping, e.g. `node["behavior"]`) the
+  assert is simply DELETED — mypy needs nothing and the check was dead. Same
+  file: `_validate_propose_pipeline_payload`'s four edge indices
+  (`outgoing_flows`, `incoming_edges`, `gate_routes`, `gate_forks`) are now
+  seeded DENSE over the domain their writes are proven to lie in, the way
+  `adjacency`/`reverse_adjacency` always were, so every read is a total
+  member lookup and a broken domain invariant crashes instead of being
+  relabelled "no flows" by a `.get(k, ())` default. Keep new indices in that
+  shape; the `.get()`s that REMAIN there are the ones whose key is an
+  LLM-authored id with no membership proof (`component_kind_by_id`,
+  `node_by_id`) and are justified as such.
 
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list

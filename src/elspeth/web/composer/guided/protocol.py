@@ -864,6 +864,19 @@ class _NodeOptionSummary(TypedDict):
     value: str
 
 
+@trust_boundary(
+    tier=3,
+    source="authored node option value carried on a guided proposal: LLM tool-call output of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns bounded display text, or the empty string for a non-mapping value and for a mapping with no "
+        "exact-string pairs; never coerces a non-string key or target into the rendered text and never raises. "
+        "The Mapping ABC check is the parse — a proposal reaching this renderer on the replay path is "
+        "deep-frozen to MappingProxyType — while each pair is held to exact ``str`` by ``type(...) is str``"
+    ),
+    non_raising=True,
+)
 def _rendered_mapping(value: object) -> str:
     """Render ``{source: target}`` renames as bounded "src → dst" display text."""
 
@@ -896,6 +909,19 @@ _NODE_OPTION_SUMMARY_RENDERERS: Mapping[str, Callable[[object], str]] = {
 }
 
 
+@trust_boundary(
+    tier=3,
+    source="authored node options carried on a guided proposal: LLM tool-call output of unknown shape",
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "returns only pairs whose key is in the server-owned allowlist for ``plugin`` and whose renderer "
+        "produced non-empty bounded text; returns [] for a non-mapping ``options``, an unlisted plugin, or a "
+        "structural node, and never raises. The Mapping ABC check is the parse — a proposal reaching this "
+        "projection on the replay path is deep-frozen to MappingProxyType, which an exact-dict test would reject"
+    ),
+    non_raising=True,
+)
 def node_options_summary(plugin: str | None, options: Mapping[str, Any]) -> list[_NodeOptionSummary]:
     """Project one node's allowlisted key options as bounded display pairs.
 
@@ -942,21 +968,36 @@ def _node_options_summary_error(value: object, path: str, *, plugin: str | None)
     seen: set[str] = set()
     for index, item in enumerate(items):
         item_path = f"{path}[{index}]"
-        if (error := _exact_nested_keys(item, frozenset({"key", "value"}), item_path)) is not None:
+        pair, error = _exact_nested_mapping(item, frozenset({"key", "value"}), item_path)
+        if error is not None:
             return error
-        assert isinstance(item, Mapping)
-        if item["key"] not in allowed:
+        assert pair is not None
+        if pair["key"] not in allowed:
             return f"{item_path}.key is outside the node option summary allowlist"
-        if item["key"] in seen:
+        if pair["key"] in seen:
             return f"{item_path}.key duplicates another projected option"
-        seen.add(item["key"])
-        if (error := _current_text_error(item["value"], f"{item_path}.value", nonempty=True)) is not None:
+        seen.add(pair["key"])
+        if (error := _current_text_error(pair["value"], f"{item_path}.value", nonempty=True)) is not None:
             return error
-        if len(cast(str, item["value"])) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        if len(cast(str, pair["value"])) > _MAX_NODE_OPTION_SUMMARY_VALUE:
             return f"{item_path}.value exceeds the bounded option summary length"
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for a non-mapping value or an inexact key set, and None only when "
+        "``value`` is a Mapping whose key set equals ``expected`` exactly; never coerces, never raises. "
+        "The Mapping ABC check is the parse: guided payloads reach this helper deep-frozen "
+        "(contracts/freeze.py renders every mapping as MappingProxyType), so an exact-dict test would "
+        "reject every durable-load and replay turn"
+    ),
+    non_raising=True,
+)
 def _exact_nested_keys(value: object, expected: frozenset[str], path: str) -> str | None:
     if not isinstance(value, Mapping):
         return f"{path} must be a mapping (got {type(value).__name__})"
@@ -967,6 +1008,21 @@ def _exact_nested_keys(value: object, expected: frozenset[str], path: str) -> st
     if unexpected:
         return f"{path} has unexpected keys: {sorted(unexpected)}"
     return None
+
+
+def _exact_nested_mapping(value: object, expected: frozenset[str], path: str) -> tuple[Mapping[str, Any] | None, str | None]:
+    """Exact-key check that also hands the caller the narrowed mapping.
+
+    Callers used to re-assert ``isinstance(value, Mapping)`` after a successful
+    :func:`_exact_nested_keys` purely so the subsequent subscripts type-check —
+    a runtime re-check of a fact this module already proved. Returning the
+    narrowed value converges those call sites on the ``(value, error)`` idiom
+    :func:`_sequence_of_mappings` and :func:`_current_sequence` already use,
+    so the shape is proven in exactly one place.
+    """
+    if (error := _exact_nested_keys(value, expected, path)) is not None:
+        return None, error
+    return cast(Mapping[str, Any], value), None
 
 
 def _canonical_uuid_error(value: object, path: str) -> str | None:
@@ -981,6 +1037,21 @@ def _canonical_uuid_error(value: object, path: str) -> str | None:
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns (None, error) for anything that is not a non-textual sequence of mappings and "
+        "(the same object, None) otherwise; never coerces, never copies, never raises. The Sequence/Mapping "
+        "ABC checks are the parse and must stay ABC-shaped: deep_freeze renders wire lists as tuple "
+        "(FrozenJsonArray, a tuple subclass) and wire objects as MappingProxyType, so exact-type tests would "
+        "reject every durable-load and replay turn. The str/bytes exclusion is what stops a string being "
+        "admitted as a sequence of its characters"
+    ),
+    non_raising=True,
+)
 def _sequence_of_mappings(value: object, path: str) -> tuple[Sequence[Mapping[str, Any]] | None, str | None]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return None, f"{path} must be a sequence"
@@ -990,6 +1061,19 @@ def _sequence_of_mappings(value: object, path: str) -> tuple[Sequence[Mapping[st
     return cast(Sequence[Mapping[str, Any]], value), None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns (None, error) for anything that is not a non-textual sequence of exact strings and "
+        "(a materialised tuple copy, None) otherwise; never coerces, never raises. The Sequence ABC check is "
+        "the parse — deep_freeze renders wire lists as a tuple subclass, so an exact-list test would reject "
+        "every durable-load and replay turn — while the elements are held to exact ``str`` by ``type(item) is str``"
+    ),
+    non_raising=True,
+)
 def _sequence_of_strings(value: object, path: str) -> tuple[tuple[str, ...] | None, str | None]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return None, f"{path} must be a sequence"
@@ -1031,6 +1115,20 @@ def _current_text_error(value: object, path: str, *, nullable: bool = False, non
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns (None, error) for anything that is not a non-textual sequence or that exceeds the bounded "
+        "item count, and (the same object, None) otherwise; never coerces, never raises. The Sequence ABC "
+        "check is the parse — deep_freeze renders wire lists as a tuple subclass, so an exact-list test would "
+        "reject every durable-load and replay turn — and the str/bytes exclusion stops a string being admitted "
+        "as a sequence of its characters"
+    ),
+    non_raising=True,
+)
 def _current_sequence(
     value: object,
     path: str,
@@ -1062,6 +1160,21 @@ def _current_string_sequence(
     return tuple(decoded), None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for any value outside the bounded public JSON projection "
+        "(over-deep, non-finite float, over-long text, over-wide container, non-JSON leaf) and None otherwise; "
+        "never coerces and never falls back to ``str(value)``. Scalars are held to exact types "
+        "(``type(value) in (bool, int)`` / ``is float`` / ``is str``) while the container arm stays an "
+        "``isinstance`` Mapping test, because deep_freeze renders wire objects as MappingProxyType and an "
+        "exact-dict test would send every durable-load and replay payload down the sequence arm"
+    ),
+    non_raising=True,
+)
 def _public_json_error(value: object, path: str, *, depth: int = 0) -> str | None:
     """Validate a bounded JSON projection without coercion or object fallback."""
 
@@ -1100,26 +1213,27 @@ def _validate_options(value: object, path: str) -> tuple[tuple[str, ...] | None,
     option_ids: list[str] = []
     for index, item in enumerate(items):
         item_path = f"{path}[{index}]"
-        if (error := _exact_nested_keys(item, frozenset({"id", "label", "hint"}), item_path)) is not None:
+        option, error = _exact_nested_mapping(item, frozenset({"id", "label", "hint"}), item_path)
+        if error is not None:
             return None, error
-        assert isinstance(item, Mapping)
-        if (error := _current_text_error(item["id"], f"{item_path}.id", nonempty=True)) is not None:
+        assert option is not None
+        if (error := _current_text_error(option["id"], f"{item_path}.id", nonempty=True)) is not None:
             return None, error
-        if (error := _current_text_error(item["label"], f"{item_path}.label", nonempty=True)) is not None:
+        if (error := _current_text_error(option["label"], f"{item_path}.label", nonempty=True)) is not None:
             return None, error
-        if (error := _current_text_error(item["hint"], f"{item_path}.hint", nullable=True)) is not None:
+        if (error := _current_text_error(option["hint"], f"{item_path}.hint", nullable=True)) is not None:
             return None, error
-        option_ids.append(cast(str, item["id"]))
+        option_ids.append(cast(str, option["id"]))
     if len(option_ids) != len(set(option_ids)):
         return None, f"{path} must not contain duplicate option ids"
     return tuple(option_ids), None
 
 
 def _validate_inspect_payload(payload: Mapping[str, Any]) -> str | None:
-    observed = payload["observed"]
-    if (error := _exact_nested_keys(observed, frozenset({"columns", "samples", "warnings"}), "payload.observed")) is not None:
+    observed, error = _exact_nested_mapping(payload["observed"], frozenset({"columns", "samples", "warnings"}), "payload.observed")
+    if error is not None:
         return error
-    assert isinstance(observed, Mapping)
+    assert observed is not None
     if (error := _current_string_sequence(observed["columns"], "payload.observed.columns", unique=True)[1]) is not None:
         return error
     samples, error = _current_sequence(observed["samples"], "payload.observed.samples")
@@ -1187,18 +1301,19 @@ def _validate_component_review_payload(payload: Mapping[str, Any]) -> str | None
     expected_item_keys = frozenset({"stable_id", "name", "plugin", "status"})
     for index, item in enumerate(items):
         path = f"payload.items[{index}]"
-        if (error := _exact_nested_keys(item, expected_item_keys, path)) is not None:
+        reviewed, error = _exact_nested_mapping(item, expected_item_keys, path)
+        if error is not None:
             return error
-        assert isinstance(item, Mapping)
-        if (error := _canonical_uuid_error(item["stable_id"], f"{path}.stable_id")) is not None:
+        assert reviewed is not None
+        if (error := _canonical_uuid_error(reviewed["stable_id"], f"{path}.stable_id")) is not None:
             return error
         for key in ("name", "plugin"):
-            if (error := _current_text_error(item[key], f"{path}.{key}", nonempty=True)) is not None:
+            if (error := _current_text_error(reviewed[key], f"{path}.{key}", nonempty=True)) is not None:
                 return error
-        if type(item["status"]) is not str or item["status"] != "reviewed":
+        if type(reviewed["status"]) is not str or reviewed["status"] != "reviewed":
             return f"{path}.status must be 'reviewed'"
-        stable_ids.append(cast(str, item["stable_id"]))
-        names.append(cast(str, item["name"]))
+        stable_ids.append(cast(str, reviewed["stable_id"]))
+        names.append(cast(str, reviewed["name"]))
     if len(stable_ids) != len(set(stable_ids)):
         return "payload.items must not contain duplicate stable ids"
     if len(names) != len(set(names)):
@@ -1217,10 +1332,11 @@ def _validate_component_review_payload(payload: Mapping[str, Any]) -> str | None
 
 
 def _validate_knob_schema(value: object, path: str) -> str | None:
-    if (error := _exact_nested_keys(value, frozenset({"fields"}), path)) is not None:
+    schema, error = _exact_nested_mapping(value, frozenset({"fields"}), path)
+    if error is not None:
         return error
-    assert isinstance(value, Mapping)
-    fields, error = _current_sequence(value["fields"], f"{path}.fields")
+    assert schema is not None
+    fields, error = _current_sequence(schema["fields"], f"{path}.fields")
     if error is not None:
         return error
     assert fields is not None
@@ -1232,7 +1348,7 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
     # ``mode`` lives on the concrete sink subclass and therefore lowers after
     # it). Malformed entries are dropped here and rejected by the per-field
     # checks below.
-    all_names = {item["name"] for item in fields if isinstance(item, Mapping) and type(item.get("name")) is str}
+    all_names = {item["name"] for item in fields if isinstance(item, Mapping) and "name" in item and type(item["name"]) is str}
     required = frozenset({"name", "label", "kind", "required", "nullable"})
     optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder", "required_when"})
     for index, item in enumerate(fields):
@@ -1283,7 +1399,6 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
             predicate = item["visible_when"]
             if (error := _exact_nested_keys(predicate, frozenset({"field", "equals"}), f"{field_path}.visible_when")) is not None:
                 return error
-            assert isinstance(predicate, Mapping)
             target = predicate["field"]
             if type(target) is not str or target not in seen_names or target in visibility_gated:
                 return f"{field_path}.visible_when.field must reference one ungated earlier field"
@@ -1294,7 +1409,6 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
             predicate = item["required_when"]
             if (error := _exact_nested_keys(predicate, frozenset({"field", "equals"}), f"{field_path}.required_when")) is not None:
                 return error
-            assert isinstance(predicate, Mapping)
             target = predicate["field"]
             # Deliberately weaker than the visible_when rule above: no
             # earlier-field and no ungated requirement. required_when never
@@ -1309,6 +1423,21 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided schema_form turn payload: LLM tool-call output or client-submitted wire payload, of unknown shape",
+    source_param="payload",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for a mode other than plugin_options, an absent or non-catalog "
+        "plugin id, a knob schema outside the closed field grammar, or a prefilled value that is not a bounded "
+        "public JSON object, and None otherwise; never coerces, never raises. The Mapping ABC check on "
+        "``prefilled`` is the parse that stops a list or scalar being admitted where an object is declared — "
+        "_public_json_error alone would accept either — and it stays ABC-shaped because durable-load and replay "
+        "payloads arrive deep-frozen as MappingProxyType"
+    ),
+    non_raising=True,
+)
 def _validate_schema_form_payload(payload: Mapping[str, Any]) -> str | None:
     if payload["mode"] != "plugin_options":
         return "payload.mode must be 'plugin_options'"
@@ -1318,11 +1447,26 @@ def _validate_schema_form_payload(payload: Mapping[str, Any]) -> str | None:
         return error
     if (error := _validate_knob_schema(payload["knobs"], "payload.knobs")) is not None:
         return error
+    # _public_json_error admits any JSON value, so this Mapping parse is what
+    # stops a list or scalar being accepted where an object is declared.
     if not isinstance(payload["prefilled"], Mapping):
         return "payload.prefilled must be a mapping"
     return _public_json_error(payload["prefilled"], "payload.prefilled")
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for a non-mapping value, an over-wide mapping, or any non-empty-string "
+        "key or value, and None otherwise; never coerces, never raises. The Mapping ABC check is the parse: "
+        "durable-load and replay payloads arrive deep-frozen as MappingProxyType, which an exact-dict test "
+        "would reject"
+    ),
+    non_raising=True,
+)
 def _validate_string_mapping(value: object, path: str) -> str | None:
     if not isinstance(value, Mapping):
         return f"{path} must be a mapping"
@@ -1354,21 +1498,22 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
         *,
         owner_node_type: object | None = None,
     ) -> str | None:
-        if (nested_error := _exact_nested_keys(value, cardinality_keys, path)) is not None:
+        cardinality, nested_error = _exact_nested_mapping(value, cardinality_keys, path)
+        if nested_error is not None:
             return nested_error
-        assert isinstance(value, Mapping)
-        if value["input"] not in cardinality_inputs or value["output"] not in cardinality_outputs:
+        assert cardinality is not None
+        if cardinality["input"] not in cardinality_inputs or cardinality["output"] not in cardinality_outputs:
             return f"{path} is outside the closed cardinality vocabulary"
-        count = value["expected_output_count"]
+        count = cardinality["expected_output_count"]
         if count is not None and (nested_error := _canonical_integer_string_error(count, f"{path}.expected_output_count", positive=False)):
             return nested_error
-        if (count is not None) != (value["output"] == "expected_count"):
+        if (count is not None) != (cardinality["output"] == "expected_count"):
             return f"{path}.expected_output_count must exactly bind expected_count"
-        if value["output"] == "one_per_branch" and owner_node_type != "row_union":
+        if cardinality["output"] == "one_per_branch" and owner_node_type != "row_union":
             return f"{path}.output 'one_per_branch' is only valid for row_union nodes"
-        if owner_node_type == "row_union" and value["input"] != "branches":
+        if owner_node_type == "row_union" and cardinality["input"] != "branches":
             return f"{path}.input must be 'branches' for row_union nodes"
-        if owner_node_type == "row_union" and value["output"] != "one_per_branch":
+        if owner_node_type == "row_union" and cardinality["output"] != "one_per_branch":
             return f"{path}.output must be 'one_per_branch' for row_union nodes"
         return None
 
@@ -1386,23 +1531,24 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
     source_keys = frozenset({"stable_id", "label", "plugin", "on_validation_failure", "guaranteed_fields", "row_cardinality"})
     for index, source in enumerate(sources):
         path = f"payload.sources[{index}]"
-        if (error := _exact_nested_keys(source, source_keys, path)) is not None:
+        wire_source, error = _exact_nested_mapping(source, source_keys, path)
+        if error is not None:
             return error
-        assert isinstance(source, Mapping)
-        if (error := _canonical_uuid_error(source["stable_id"], f"{path}.stable_id")) is not None:
+        assert wire_source is not None
+        if (error := _canonical_uuid_error(wire_source["stable_id"], f"{path}.stable_id")) is not None:
             return error
-        if source["stable_id"] in component_ids:
+        if wire_source["stable_id"] in component_ids:
             return f"{path}.stable_id duplicates another component"
-        component_ids[source["stable_id"]] = "source"
-        if (error := _current_text_error(source["label"], f"{path}.label", nonempty=True)) is not None:
+        component_ids[wire_source["stable_id"]] = "source"
+        if (error := _current_text_error(wire_source["label"], f"{path}.label", nonempty=True)) is not None:
             return error
-        if (error := _catalog_plugin_id_error(source["plugin"], f"{path}.plugin")) is not None:
+        if (error := _catalog_plugin_id_error(wire_source["plugin"], f"{path}.plugin")) is not None:
             return error
-        if error := _current_text_error(source["on_validation_failure"], f"{path}.on_validation_failure", nonempty=True):
+        if error := _current_text_error(wire_source["on_validation_failure"], f"{path}.on_validation_failure", nonempty=True):
             return error
-        if (error := _current_string_sequence(source["guaranteed_fields"], f"{path}.guaranteed_fields")[1]) is not None:
+        if (error := _current_string_sequence(wire_source["guaranteed_fields"], f"{path}.guaranteed_fields")[1]) is not None:
             return error
-        if (error := validate_cardinality(source["row_cardinality"], f"{path}.row_cardinality")) is not None:
+        if (error := validate_cardinality(wire_source["row_cardinality"], f"{path}.row_cardinality")) is not None:
             return error
 
     node_keys = frozenset(
@@ -1421,38 +1567,39 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
     )
     for index, node in enumerate(nodes):
         path = f"payload.nodes[{index}]"
-        if (error := _exact_nested_keys(node, node_keys, path)) is not None:
+        wire_node, error = _exact_nested_mapping(node, node_keys, path)
+        if error is not None:
             return error
-        assert isinstance(node, Mapping)
-        if (error := _canonical_uuid_error(node["stable_id"], f"{path}.stable_id")) is not None:
+        assert wire_node is not None
+        if (error := _canonical_uuid_error(wire_node["stable_id"], f"{path}.stable_id")) is not None:
             return error
-        if node["stable_id"] in component_ids:
+        if wire_node["stable_id"] in component_ids:
             return f"{path}.stable_id duplicates another component"
-        component_ids[node["stable_id"]] = "node"
-        if (error := _current_text_error(node["label"], f"{path}.label", nonempty=True)) is not None:
+        component_ids[wire_node["stable_id"]] = "node"
+        if (error := _current_text_error(wire_node["label"], f"{path}.label", nonempty=True)) is not None:
             return error
-        if node["plugin"] is not None and (error := _catalog_plugin_id_error(node["plugin"], f"{path}.plugin")) is not None:
+        if wire_node["plugin"] is not None and (error := _catalog_plugin_id_error(wire_node["plugin"], f"{path}.plugin")) is not None:
             return error
-        if (error := _validate_node_behavior(node["node_type"], node["behavior"], path)) is not None:
+        if (error := _validate_node_behavior(wire_node["node_type"], wire_node["behavior"], path)) is not None:
             return error
         for name in ("required_fields", "guaranteed_fields"):
-            if (error := _current_string_sequence(node[name], f"{path}.{name}")[1]) is not None:
+            if (error := _current_string_sequence(wire_node[name], f"{path}.{name}")[1]) is not None:
                 return error
         if (
             error := validate_cardinality(
-                node["row_cardinality"],
+                wire_node["row_cardinality"],
                 f"{path}.row_cardinality",
-                owner_node_type=node["node_type"],
+                owner_node_type=wire_node["node_type"],
             )
         ) is not None:
             return error
-        if (error := _public_json_error(node["structured_output_fields"], f"{path}.structured_output_fields")) is not None:
+        if (error := _public_json_error(wire_node["structured_output_fields"], f"{path}.structured_output_fields")) is not None:
             return error
         if (
             error := _node_options_summary_error(
-                node["node_options_summary"],
+                wire_node["node_options_summary"],
                 f"{path}.node_options_summary",
-                plugin=node["plugin"] if type(node["plugin"]) is str else None,
+                plugin=wire_node["plugin"] if type(wire_node["plugin"]) is str else None,
             )
         ) is not None:
             return error
@@ -1461,22 +1608,23 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
     schema_keys = frozenset({"mode", "fields", "guaranteed_fields", "required_fields"})
     for index, output in enumerate(outputs):
         path = f"payload.outputs[{index}]"
-        if (error := _exact_nested_keys(output, output_keys, path)) is not None:
+        wire_output, error = _exact_nested_mapping(output, output_keys, path)
+        if error is not None:
             return error
-        assert isinstance(output, Mapping)
-        if (error := _canonical_uuid_error(output["stable_id"], f"{path}.stable_id")) is not None:
+        assert wire_output is not None
+        if (error := _canonical_uuid_error(wire_output["stable_id"], f"{path}.stable_id")) is not None:
             return error
-        if output["stable_id"] in component_ids:
+        if wire_output["stable_id"] in component_ids:
             return f"{path}.stable_id duplicates another component"
-        component_ids[output["stable_id"]] = "output"
+        component_ids[wire_output["stable_id"]] = "output"
         for name in ("label", "on_write_failure"):
-            if (error := _current_text_error(output[name], f"{path}.{name}", nonempty=True)) is not None:
+            if (error := _current_text_error(wire_output[name], f"{path}.{name}", nonempty=True)) is not None:
                 return error
-        if (error := _catalog_plugin_id_error(output["plugin"], f"{path}.plugin")) is not None:
+        if (error := _catalog_plugin_id_error(wire_output["plugin"], f"{path}.plugin")) is not None:
             return error
-        if (error := _current_string_sequence(output["required_fields"], f"{path}.required_fields")[1]) is not None:
+        if (error := _current_string_sequence(wire_output["required_fields"], f"{path}.required_fields")[1]) is not None:
             return error
-        schema = output["business_schema"]
+        schema = wire_output["business_schema"]
         if (error := _exact_nested_keys(schema, schema_keys, f"{path}.business_schema")) is not None:
             return error
         if (error := _public_json_error(schema, f"{path}.business_schema")) is not None:
@@ -1491,32 +1639,37 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
     seen_connections: set[str] = set()
     for index, connection in enumerate(connections):
         path = f"payload.connections[{index}]"
-        if (error := _exact_nested_keys(connection, connection_keys, path)) is not None:
+        wire_connection, error = _exact_nested_mapping(connection, connection_keys, path)
+        if error is not None:
             return error
-        assert isinstance(connection, Mapping)
-        if (error := _canonical_uuid_error(connection["stable_id"], f"{path}.stable_id")) is not None:
+        assert wire_connection is not None
+        if (error := _canonical_uuid_error(wire_connection["stable_id"], f"{path}.stable_id")) is not None:
             return error
-        if connection["stable_id"] in seen_connections:
+        if wire_connection["stable_id"] in seen_connections:
             return f"{path}.stable_id duplicates another connection"
-        seen_connections.add(connection["stable_id"])
-        if error := _validate_proposal_endpoint(connection["from_endpoint"], f"{path}.from_endpoint", allow_discard=False):
+        seen_connections.add(wire_connection["stable_id"])
+        if error := _validate_proposal_endpoint(wire_connection["from_endpoint"], f"{path}.from_endpoint", allow_discard=False):
             return error
-        if error := _validate_proposal_endpoint(connection["to_endpoint"], f"{path}.to_endpoint", allow_discard=True):
+        if error := _validate_proposal_endpoint(wire_connection["to_endpoint"], f"{path}.to_endpoint", allow_discard=True):
             return error
-        assert isinstance(connection["from_endpoint"], Mapping) and isinstance(connection["to_endpoint"], Mapping)
         for endpoint_name in ("from_endpoint", "to_endpoint"):
-            endpoint = connection[endpoint_name]
-            if endpoint["kind"] != "discard" and component_ids.get(endpoint["stable_id"]) != endpoint["kind"]:
+            # Both endpoints were proven to be exact-key mappings by
+            # _validate_proposal_endpoint immediately above; a discard endpoint
+            # carries ONLY "kind", so the stable_id read must stay inside the
+            # non-discard arm rather than being hoisted above the condition.
+            endpoint = wire_connection[endpoint_name]
+            if endpoint["kind"] != "discard" and (
+                endpoint["stable_id"] not in component_ids or component_ids[endpoint["stable_id"]] != endpoint["kind"]
+            ):
                 return f"{path}.{endpoint_name} does not resolve to its advertised component kind"
-        if (error := _validate_proposal_flow(connection["flow"], f"{path}.flow")) is not None:
+        if (error := _validate_proposal_flow(wire_connection["flow"], f"{path}.flow")) is not None:
             return error
-        contract = connection["schema_contract"]
+        contract = wire_connection["schema_contract"]
         if contract is None:
             continue
         contract_path = f"{path}.schema_contract"
         if (error := _exact_nested_keys(contract, contract_keys, contract_path)) is not None:
             return error
-        assert isinstance(contract, Mapping)
         for key in ("from", "to"):
             if (error := _current_text_error(contract[key], f"{contract_path}.{key}", nonempty=True)) is not None:
                 return error
@@ -1552,12 +1705,13 @@ def _catalog_plugin_id_error(value: object, path: str) -> str | None:
 
 
 def _validate_plugin_ref(value: object, path: str, expected_kind: Literal["source", "transform", "sink"]) -> str | None:
-    if (error := _exact_nested_keys(value, frozenset({"kind", "id"}), path)) is not None:
+    reference, error = _exact_nested_mapping(value, frozenset({"kind", "id"}), path)
+    if error is not None:
         return error
-    assert isinstance(value, Mapping)
-    if value["kind"] != expected_kind:
+    assert reference is not None
+    if reference["kind"] != expected_kind:
         return f"{path}.kind must be {expected_kind!r}"
-    return _catalog_plugin_id_error(value["id"], f"{path}.id")
+    return _catalog_plugin_id_error(reference["id"], f"{path}.id")
 
 
 def _structural_alias_error(value: object, kind: Literal["route", "branch"], path: str) -> str | None:
@@ -1591,10 +1745,14 @@ def _validate_alias_sequence(
 
 
 def _finite_positive_number_error(value: object, path: str) -> str | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
+    # Exact-type, matching _public_json_error's JSON scalar arms: a wire number
+    # decodes to exactly int or float, and the exact test subsumes the bool
+    # special case for free (``type(True) is int`` is False). The exact-type
+    # form does not narrow the negative branch for mypy, hence the cast.
+    if type(value) not in (int, float):
         return f"{path} must be a finite positive number or null"
     try:
-        numeric = float(value)
+        numeric = float(cast(int | float, value))
     except OverflowError:
         return f"{path} must be a finite positive number"
     if not math.isfinite(numeric) or numeric <= 0:
@@ -1613,6 +1771,19 @@ def _canonical_integer_string_error(value: object, path: str, *, positive: bool)
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided proposal node behavior: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="behavior",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for a non-mapping behavior or any behavior whose key set and field "
+        "values do not exactly match the closed schema for ``node_type``, and None otherwise; never coerces, "
+        "never raises. The Mapping ABC check is the parse: durable-load and replay proposals arrive deep-frozen "
+        "as MappingProxyType, which an exact-dict test would reject"
+    ),
+    non_raising=True,
+)
 def _validate_node_behavior(node_type: object, behavior: object, path: str) -> str | None:
     if node_type not in _NODE_TYPES:
         return f"{path}.node_type is not in the closed node vocabulary"
@@ -1779,16 +1950,31 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
 
 
 def _validate_component_target(value: object, path: str) -> str | None:
-    error = _exact_nested_keys(value, frozenset({"kind", "stable_id"}), path)
+    target, error = _exact_nested_mapping(value, frozenset({"kind", "stable_id"}), path)
     if error is not None:
         return error
-    target = value
-    assert isinstance(target, Mapping)
+    assert target is not None
     if target["kind"] not in _COMPONENT_KINDS:
         return f"{path}.kind is not in the closed component vocabulary"
     return _canonical_uuid_error(target["stable_id"], f"{path}.stable_id")
 
 
+@trust_boundary(
+    tier=3,
+    source="guided proposal/wire edge endpoint: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns a path-rooted error string for a non-mapping endpoint, a discard endpoint where discard is not "
+        "allowed, an inexact key set, a kind outside the closed source/node/output vocabulary, or a non-canonical "
+        "stable_id, and None otherwise; never coerces, never raises. The discriminator read is ``value.get('kind')`` "
+        "rather than a subscript because the key set has not been proven yet at that point — a mapping with no "
+        "``kind`` must fall through to the exact-key check and be reported as a missing key, not crash this "
+        "non-raising validator. The Mapping ABC check is the parse: durable-load and replay endpoints arrive "
+        "deep-frozen as MappingProxyType"
+    ),
+    non_raising=True,
+)
 def _validate_proposal_endpoint(value: object, path: str, *, allow_discard: bool) -> str | None:
     if not isinstance(value, Mapping):
         return f"{path} must be a mapping"
@@ -1803,6 +1989,22 @@ def _validate_proposal_endpoint(value: object, path: str, *, allow_discard: bool
     return _canonical_uuid_error(value["stable_id"], f"{path}.stable_id")
 
 
+@trust_boundary(
+    tier=3,
+    source="guided proposal/wire edge flow: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns a path-rooted error string for a non-mapping flow, a kind outside the closed _FLOW_KINDS "
+        "vocabulary, or a key set that does not exactly match the one that kind declares, and None otherwise; "
+        "never coerces, never raises. The discriminator read is ``value.get('kind')`` because the key set is "
+        "kind-dependent and therefore unproven at that point — an absent ``kind`` yields None, which is not a "
+        "member of _FLOW_KINDS and so returns the closed-vocabulary error instead of crashing this non-raising "
+        "validator. The Mapping ABC check is the parse: durable-load and replay flows arrive deep-frozen as "
+        "MappingProxyType"
+    ),
+    non_raising=True,
+)
 def _validate_proposal_flow(value: object, path: str) -> str | None:
     if not isinstance(value, Mapping):
         return f"{path} must be a mapping"
@@ -1854,7 +2056,6 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     counts = payload["component_counts"]
     if error := _exact_nested_keys(counts, frozenset({"sources", "nodes", "edges", "outputs"}), "payload.component_counts"):
         return error
-    assert isinstance(counts, Mapping)
     for kind, maximum in (
         ("sources", _MAX_PROPOSAL_COMPONENTS),
         ("nodes", _MAX_PROPOSAL_COMPONENTS),
@@ -1870,7 +2071,6 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     graph = payload["graph"]
     if (error := _exact_nested_keys(graph, frozenset({"sources", "edges"}), "payload.graph")) is not None:
         return error
-    assert isinstance(graph, Mapping)
     sources, error = _sequence_of_mappings(graph["sources"], "payload.graph.sources")
     if error is not None:
         return error
@@ -1942,16 +2142,21 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             return f"{path}.label must be the exact server ordinal label"
         if (error := _validate_node_behavior(node["node_type"], node["behavior"], path)) is not None:
             return error
+        # _validate_plugin_ref proves the exact {kind, id} key set AND that id
+        # is a catalog-shaped string, so the summary plugin is read straight
+        # out of the arm that validated it rather than re-probed here.
+        summary_plugin: str | None = None
         if node["node_type"] in ("transform", "aggregation", "collector"):
             if (error := _validate_plugin_ref(node["plugin"], f"{path}.plugin", "transform")) is not None:
                 return error
+            summary_plugin = cast(str, node["plugin"]["id"])
         elif node["plugin"] is not None:
             return f"{path}.plugin must be null for a structural node"
         if (
             error := _node_options_summary_error(
                 node["node_options_summary"],
                 f"{path}.node_options_summary",
-                plugin=(node["plugin"]["id"] if isinstance(node["plugin"], Mapping) and type(node["plugin"].get("id")) is str else None),
+                plugin=summary_plugin,
             )
         ) is not None:
             return error
@@ -2014,10 +2219,17 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     adjacency: dict[str, set[str]] = {stable_id: set() for stable_id in component_kind_by_id}
     adjacency[discard_id] = set()
     reverse_adjacency: dict[str, set[str]] = {stable_id: set() for stable_id in adjacency}
-    outgoing_flows: dict[str, list[Mapping[str, Any]]] = {}
-    incoming_edges: dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
-    gate_routes: dict[str, list[str]] = {}
-    gate_forks: dict[str, list[tuple[tuple[str, ...], str]]] = {}
+    # Seeded DENSE over the domain each index is written on, the way adjacency
+    # and reverse_adjacency above already are, so every read below is a total
+    # lookup and a broken domain invariant surfaces as a crash instead of being
+    # relabelled "no flows" by a default. The write domains are proven in the
+    # edge loop: from_stable_id resolves in component_kind_by_id, to_stable_id
+    # resolves there or is discard_id, and gate_routes/gate_forks are written
+    # only for flow kinds whose expected_from_kind is "node".
+    outgoing_flows: dict[str, list[Mapping[str, Any]]] = {stable_id: [] for stable_id in component_kind_by_id}
+    incoming_edges: dict[str, list[tuple[str, Mapping[str, Any]]]] = {stable_id: [] for stable_id in adjacency}
+    gate_routes: dict[str, list[str]] = {stable_id: [] for stable_id in node_by_id}
+    gate_forks: dict[str, list[tuple[tuple[str, ...], str]]] = {stable_id: [] for stable_id in node_by_id}
     branch_origins: dict[str, list[str]] = {}
     branch_origin_gates: dict[str, list[str]] = {}
     branch_uses: list[tuple[str, str, str, str]] = []
@@ -2027,7 +2239,6 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         from_endpoint = edge["from_endpoint"]
         to_endpoint = edge["to_endpoint"]
         flow = edge["flow"]
-        assert isinstance(from_endpoint, Mapping) and isinstance(to_endpoint, Mapping) and isinstance(flow, Mapping)
         from_stable_id = from_endpoint["stable_id"]
         from_kind = from_endpoint["kind"]
         if component_kind_by_id.get(from_stable_id) != from_kind:
@@ -2083,12 +2294,12 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             return f"{path}.flow into a correlated barrier node requires a branch alias"
         adjacency[from_stable_id].add(to_stable_id)
         reverse_adjacency[to_stable_id].add(from_stable_id)
-        outgoing_flows.setdefault(from_stable_id, []).append(flow)
-        incoming_edges.setdefault(to_stable_id, []).append((from_stable_id, flow))
+        outgoing_flows[from_stable_id].append(flow)
+        incoming_edges[to_stable_id].append((from_stable_id, flow))
         if flow_kind == "gate_route":
-            gate_routes.setdefault(from_stable_id, []).append(flow["route"])
+            gate_routes[from_stable_id].append(flow["route"])
         elif flow_kind == "gate_fork":
-            gate_forks.setdefault(from_stable_id, []).append((tuple(flow["routes"]), flow["branch"]))
+            gate_forks[from_stable_id].append((tuple(flow["routes"]), flow["branch"]))
             branch_origins.setdefault(flow["branch"], []).append(to_stable_id)
             branch_origin_gates.setdefault(flow["branch"], []).append(from_stable_id)
         if branch is not None:
@@ -2101,13 +2312,16 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         From there, follow all directed routing, including descendant forks.
         Outer siblings remain excluded because their gate_fork edges leave the
         shared parent gate and are not reachable backwards from this origin.
+
+        Precondition: ``branch`` resolves in ``branch_origins``. Every caller
+        must prove that first; the sole call site does, immediately above it.
         """
 
-        frontier = list(branch_origins.get(branch, ()))
+        frontier = list(branch_origins[branch])
         visited = set(frontier)
         while frontier:
             current = frontier.pop()
-            routed: set[str] = adjacency.get(current, set())
+            routed: set[str] = adjacency[current]
             for target_id in routed - visited:
                 visited.add(target_id)
                 frontier.append(target_id)
@@ -2126,6 +2340,10 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         boundaries: every predecessor must derive from the branch, recursively.
         This mirrors state._runtime_connection_is_downstream() and prevents one
         valid queue path from hiding unrelated traffic.
+
+        Precondition: ``branch`` resolves in ``branch_origins`` (and therefore
+        in ``branch_origin_gates``, which is written in the same gate_fork
+        arm). The sole call site proves that immediately above it.
         """
 
         if producer_id in visiting:
@@ -2133,12 +2351,12 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         node = node_by_id.get(producer_id)
         if node is None:
             return False
-        predecessors = incoming_edges.get(producer_id, ())
+        predecessors = incoming_edges[producer_id]
         if not predecessors:
             return False
         next_visiting = visiting | {producer_id}
-        origin_gates = branch_origin_gates.get(branch, ())
-        origins = branch_origins.get(branch, ())
+        origin_gates = branch_origin_gates[branch]
+        origins = branch_origins[branch]
 
         def predecessor_is_compatible(predecessor_id: str, flow: Mapping[str, Any]) -> bool:
             if flow["kind"] == "gate_fork" and flow["branch"] == branch and predecessor_id in origin_gates and producer_id in origins:
@@ -2156,9 +2374,8 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
 
     for node in nodes:
         behavior = node["behavior"]
-        assert isinstance(behavior, Mapping)
         stable_id = node["stable_id"]
-        flow_kinds = tuple(flow["kind"] for flow in outgoing_flows.get(stable_id, ()))
+        flow_kinds = tuple(flow["kind"] for flow in outgoing_flows[stable_id])
         if node["node_type"] in ("transform", "aggregation"):
             if flow_kinds.count("node_success") != 1 or flow_kinds.count("node_error") != 1 or len(flow_kinds) != 2:
                 return "payload transform and aggregation nodes require exact success and error flows"
@@ -2176,10 +2393,10 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             if opener is None:
                 return "payload collector scope opener must reference a node in the payload"
         elif node["node_type"] == "gate":
-            direct_routes = gate_routes.get(stable_id, ())
+            direct_routes = gate_routes[stable_id]
             if len(direct_routes) != len(set(direct_routes)):
                 return "payload gate direct route aliases must each resolve exactly once"
-            fork_routes = tuple(route for routes, _ in gate_forks.get(stable_id, ()) for route in routes)
+            fork_routes = tuple(route for routes, _ in gate_forks[stable_id] for route in routes)
             if set(direct_routes) & set(fork_routes):
                 return "payload gate route alias cannot select both a direct target and a fork fanout"
             projected_routes = tuple(dict.fromkeys([*direct_routes, *fork_routes]))
@@ -2193,14 +2410,14 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             # cannot express both, so compare the fork set by identity. The
             # behavior's own ``fork_branches`` order still carries the authored
             # ``fork_to`` order; only this cross-check stops reading position.
-            projected_forks = sorted(gate_forks.get(stable_id, ()))
+            projected_forks = sorted(gate_forks[stable_id])
             declared_forks = sorted((tuple(item["routes"]), item["branch"]) for item in behavior["fork_branches"])
             if projected_forks != declared_forks:
                 return "payload gate fork branches do not match its projected flows"
         elif node["node_type"] == "queue":
             if flow_kinds != ("queue_continue",):
                 return "payload queue node requires exactly one queue_continue flow"
-            if not incoming_edges.get(stable_id):
+            if not incoming_edges[stable_id]:
                 return "payload queue node requires at least one authoritative producer flow"
             queue_target = next(iter(adjacency[stable_id]))
             if queue_target not in node_by_id or node_by_id[queue_target]["node_type"] == "queue":
@@ -2208,13 +2425,20 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         elif node["node_type"] == "coalesce":
             if flow_kinds != ("coalesce_success",):
                 return "payload coalesce node requires exactly one coalesce_success flow"
-            incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges.get(stable_id, ()) if flow.get("branch") is not None)
+            # Every inbound flow carries a branch alias: the edge loop's
+            # correlated-barrier check ("flow into a correlated barrier node
+            # requires a branch alias") already rejected any edge into a
+            # coalesce or row_union node whose flow resolved no branch, so
+            # reading the key as a member here reports a broken invariant
+            # instead of silently dropping the flow from the comparison.
+            incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges[stable_id])
             if incoming_branches != tuple(behavior["branch_aliases"]):
                 return "payload coalesce branch aliases do not match its incoming flows"
         elif node["node_type"] == "row_union":
             if flow_kinds != ("row_union_success",):
                 return "payload row_union node requires exactly one row_union_success flow"
-            incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges.get(stable_id, ()) if flow.get("branch") is not None)
+            # Same correlated-barrier guarantee as the coalesce arm above.
+            incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges[stable_id])
             if incoming_branches != tuple(behavior["branch_aliases"]):
                 return "payload row_union branch aliases do not match its incoming flows"
             target_ids = adjacency[stable_id]
@@ -2229,26 +2453,28 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
                 "collector",
             ):
                 return "payload row_union success must target one ordinary processing or queue node"
-            origin_gates = {gate_id for branch in behavior["branch_aliases"] for gate_id in branch_origin_gates.get(branch, ())}
+            origin_gates = {
+                gate_id for branch in behavior["branch_aliases"] if branch in branch_origin_gates for gate_id in branch_origin_gates[branch]
+            }
             if len(origin_gates) != 1:
                 return "payload row_union branches must originate under one gate_fork"
 
     for source in sources:
-        flow_kinds = tuple(flow["kind"] for flow in outgoing_flows.get(source["stable_id"], ()))
+        flow_kinds = tuple(flow["kind"] for flow in outgoing_flows[source["stable_id"]])
         if flow_kinds.count("source_success") != 1 or flow_kinds.count("source_validation_failure") != 1 or len(flow_kinds) != 2:
             return "payload source requires exact success and validation-failure flows"
 
     output_failure_targets: dict[str, str] = {}
     for output in outputs:
         stable_id = output["stable_id"]
-        output_flows = outgoing_flows.get(stable_id, ())
+        output_flows = outgoing_flows[stable_id]
         if len(output_flows) != 1 or output_flows[0]["kind"] != "output_write_failure":
             return "payload output requires exactly one write-failure flow"
         failure_targets = adjacency[stable_id]
         assert len(failure_targets) == 1
         output_failure_targets[stable_id] = next(iter(failure_targets))
     for target_id in output_failure_targets.values():
-        if target_id in component_ids["output"] and output_failure_targets.get(target_id) != discard_id:
+        if target_id in component_ids["output"] and output_failure_targets[target_id] != discard_id:
             return "payload output write-failure flows cannot form a failure chain"
 
     all_route_aliases = [alias for node in nodes if node["node_type"] == "gate" for alias in node["behavior"]["route_aliases"]]
@@ -2268,16 +2494,13 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         if node["node_type"] not in ("coalesce", "row_union"):
             continue
         behavior = node["behavior"]
-        assert isinstance(behavior, Mapping)
         for branch in behavior["branch_aliases"]:
-            existing_owner = branch_barrier_owner.get(branch)
-            if existing_owner is not None and existing_owner != node["stable_id"]:
+            if branch in branch_barrier_owner and branch_barrier_owner[branch] != node["stable_id"]:
                 return "payload fork branch alias cannot be consumed by more than one coalesce/row_union node"
             branch_barrier_owner[branch] = node["stable_id"]
 
     for branch, from_stable_id, flow_kind, path in branch_uses:
-        origins = branch_origins.get(branch)
-        if origins is None or len(origins) != 1:
+        if branch not in branch_origins or len(branch_origins[branch]) != 1:
             return f"{path}.flow branch alias has no unique authoritative gate_fork origin"
         if flow_kind == "gate_fork":
             continue
@@ -2288,10 +2511,8 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         if node["node_type"] not in ("coalesce", "row_union"):
             continue
         behavior = node["behavior"]
-        assert isinstance(behavior, Mapping)
         for branch in behavior["branch_aliases"]:
-            origins = branch_origins.get(branch)
-            if origins is None:
+            if branch not in branch_origins:
                 return "payload correlated barrier branch alias has no authoritative gate_fork origin"
             if node["stable_id"] not in branch_downstream_ids(branch):
                 return "payload correlated barrier branch is not connected to its gate_fork origin"
@@ -2397,7 +2618,6 @@ def validate_proposal_catalog_refs(
     if set(catalog_plugin_ids) != {"source", "transform", "sink"}:
         return "proposal catalog authority must provide exact source, transform, and sink sets"
     graph = payload["graph"]
-    assert isinstance(graph, Mapping)
     references: list[tuple[str, Mapping[str, Any]]] = []
     for source in cast(Sequence[Mapping[str, Any]], graph["sources"]):
         references.append(("payload.graph.sources", source["plugin"]))
