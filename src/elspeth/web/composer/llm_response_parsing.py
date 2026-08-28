@@ -45,6 +45,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMProviderCostSource,
 )
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMProviderMetadata
 from elspeth.web.composer.bounded_json import (
@@ -104,6 +105,17 @@ class _ReasoningMetadata(TypedDict):
 _PYDANTIC_EXTRA_SLOT = "__pydantic_extra__"
 
 
+@observation_boundary(
+    tier=3,
+    source="a LiteLLM/provider response object whose pydantic v2 extra='allow' overflow slot holds undeclared provider fields",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns None unless __pydantic_extra__ resolves through the owning class's __mro__ to a genuine "
+        "__slots__ member descriptor holding a non-empty dict; a provider-defined property is treated as "
+        "absent rather than invoked, so no provider-controlled code runs and the read never raises"
+    ),
+)
 def _pydantic_extra_fields(value: Any) -> Mapping[str, Any] | None:
     """Return a pydantic v2 ``extra="allow"`` overflow mapping, or ``None``.
 
@@ -124,7 +136,12 @@ def _pydantic_extra_fields(value: Any) -> Mapping[str, Any] | None:
     pinned by ``test_provider_reasoning_does_not_invoke_provider_descriptors``.
     """
     for klass in type(value).__mro__:
-        descriptor = klass.__dict__.get(_PYDANTIC_EXTRA_SLOT)
+        # Absence and a None-valued class attribute both mean "this class does
+        # not carry the slot"; each keeps walking the MRO so a genuine
+        # descriptor on a base class is still found.
+        if _PYDANTIC_EXTRA_SLOT not in klass.__dict__:
+            continue
+        descriptor = klass.__dict__[_PYDANTIC_EXTRA_SLOT]
         if descriptor is None:
             continue
         if type(descriptor) is not MemberDescriptorType:
@@ -145,6 +162,16 @@ def _merge_pydantic_extra(value: Any, fields: Mapping[str, Any]) -> Mapping[str,
     return {**extra, **fields}
 
 
+@observation_boundary(
+    tier=3,
+    source="one provider response value: a Mapping payload, or an attribute-style provider/SDK response object",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns None for None and for any object whose vars() is unavailable or is not a Mapping; "
+        "shape mismatch is absence, never a coercion, and the read never raises"
+    ),
+)
 def _provider_field_map(value: Any) -> Mapping[str, Any] | None:
     if isinstance(value, Mapping):
         return value
@@ -214,6 +241,16 @@ def token_usage_from_response(response: Any | None) -> TokenUsage:
     return _token_usage_from_usage(usage)
 
 
+@observation_boundary(
+    tier=3,
+    source="one provider-reported usage payload (Mapping or attribute-style usage object) carried on a LiteLLM response",
+    source_param="usage",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns TokenUsage.unknown() for an absent usage payload and records every missing or "
+        "non-Mapping counter as None (absence) rather than a fabricated zero; never raises"
+    ),
+)
 def _token_usage_from_usage(usage: Any | None) -> TokenUsage:
     """Normalize one already-captured provider usage value."""
 
@@ -281,6 +318,17 @@ def _provider_cost_from_response(response: Any | None) -> tuple[float | None, Co
     return _provider_cost_from_captured_usage(response, usage)
 
 
+@observation_boundary(
+    tier=3,
+    source="a LiteLLM response object's pydantic private-data mapping (__pydantic_private__ -> _hidden_params.response_cost)",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns (None, PROVIDER_COST_SOURCE_NOT_AVAILABLE) whenever the private mapping, its "
+        "_hidden_params entry, or the cost value is absent or malformed; the private read goes through "
+        "object.__getattribute__ so no provider-named property is invoked, and it never raises"
+    ),
+)
 def _provider_cost_from_captured_usage(
     response: Any,
     usage: Any | None,
@@ -297,7 +345,9 @@ def _provider_cost_from_captured_usage(
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
     if not isinstance(private, Mapping):
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
-    hidden_params = private.get("_hidden_params")
+    if "_hidden_params" not in private:
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    hidden_params = private["_hidden_params"]
     if not isinstance(hidden_params, Mapping) or "response_cost" not in hidden_params:
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
     return _validated_provider_cost(
@@ -465,6 +515,13 @@ def _response_field(value: Any, field: str) -> Any:
     return _provider_field(value, field)
 
 
+@observation_boundary(
+    tier=3,
+    source="a LiteLLM response object's provider-authored 'choices' container",
+    source_param="response",
+    suppresses=("R5",),
+    invariant="returns None when choices is absent, is not a list/tuple, or is empty; never raises",
+)
 def _first_response_choice(response: Any | None) -> Any | None:
     if response is None:
         return None
@@ -679,6 +736,17 @@ def _captured_field(fields: Mapping[str, Any] | None, field: str) -> Any:
         return None
 
 
+@observation_boundary(
+    tier=3,
+    source="a LiteLLM response object, with its already-captured first choice and message, from the composer provider call",
+    source_param="response",
+    suppresses=("R5",),
+    invariant=(
+        "records every absent, non-string, or blank provider identifier as None (absence, never a "
+        "fabricated value) and bounds every provider-authored string it retains; never raises on "
+        "response content"
+    ),
+)
 def admit_llm_provider_metadata(
     response: Any,
     *,
@@ -966,7 +1034,14 @@ def apply_anthropic_cache_markers(
         elif (
             not catalog_marked
             and message["role"] == "user"
-            and isinstance(message.get("content"), str)
+            # ``content`` is genuinely optional on a message we author (an
+            # assistant tool-call turn carries none), so its absence is a
+            # value fact, not the first-party bug a missing ``role`` would
+            # be. Presence is therefore asserted explicitly and the value
+            # then read in membership form, keeping the Tier-2 posture the
+            # ``role`` read above states.
+            and "content" in message
+            and type(message["content"]) is str
             and message["content"].startswith(CATALOG_CONTEXT_PREFIX)
         ):
             new_messages[index] = {**message, "cache_control": {"type": "ephemeral"}}

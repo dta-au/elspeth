@@ -39,6 +39,60 @@ is a working document under the normal delivery posture.
   `interpretation_state.SOURCE_AUTHORING_KEY` "not explicitly export" errors
   it surfaced were a pre-existing implicit re-export, fixed on
   `feature/unified-lineage` by 0f6b9b6a3 — merge, do not re-fix.)
+- **2026-08-29 — adding a DOCSTRING shifts every `body[N]` index inside that
+
+  function, exactly like the `@overload` trap below.** A docstring is
+  `body[0]`, so writing one on an existing function moves every tier_model
+  finding in it by one (`body[10]/body[0]/handlers[0]` →
+  `body[10]/body[1]/handlers[0]`) and invalidates any signed `ast_path` in
+  `config/cicd/enforce_tier_model/*.yaml` that runs through it. Measured in
+  B25 on `web/paths._is_uuid_path_segment`. This bites harder than the
+  overload case because adding a docstring feels like a comment-only edit and
+  is a routine part of "clean the file to house style". Re-derive ast paths
+  after ANY docstring addition, not just after signature changes.
+
+- **2026-08-29 — R4 fires on a broad handler even when it returns an explicit
+  error RESULT; only a `raise` clears it.** R4 and R6 are asymmetric, and the
+  asymmetry is in the rule source
+  (`trust_tier/tier_model/rule.py::_check_exception_handler`): R6 calls
+  `_handler_is_silent`, which treats a non-default `return` as an explicit
+  outcome and does NOT fire, whereas the R4 arm scans only for `ast.Raise`.
+  So the whole diagnostic-probe idiom — `except Exception as exc: return
+  ContractCheck(name, False, sanitize_error(...))` — is a permanent R4 justify
+  candidate no matter how explicitly it reports. Do not "fix" these by
+  re-raising: in `web/doctor.py` and `web/readiness.py` the handler is what
+  keeps one failed probe from aborting the other ~20 checks, which is the
+  entire point of a preflight report. Rationalise them, naming the reporting
+  symbol (`sanitize_error`, `_exception_failures`, `_finish_lock_cleanup`) as
+  the control. B25 rationalised 16 such handlers in `doctor.py` and 9 in
+  `readiness.py` on exactly this ground.
+- **2026-08-29 — the `@trust_boundary` suppression dataflow walk does NOT
+  follow dynamic escapes or comprehension loop variables, and widening an
+  existing decorator's `suppresses` tuple is the cheapest correct burn-down
+  move.** Two facts, learned burning down `web/composer` (B47):
+  1. Several boundaries were declared `suppresses=("R5",)` while their bodies
+     were full of honest `source_param`-derived `.get()` reads. Adding `"R1"`
+     to the tuple removed 20 findings in `required_controls.py` alone with no
+     code change — check the tuple BEFORE writing a rationale or restructuring
+     a parse. `@trust_boundary`/`observation_boundary` still suppress ONLY R1
+     and R5 (`contracts/trust_boundary.py`); R2/R3/R4/R6/R7/R8/R9 always need
+     real code or a rationale.
+  2. The walk tracks derivation from `source_param` through plain attribute
+     and subscript reads and through `for` loops over a derived value, but it
+     CANNOT follow `vars(x)`, `object.__getattribute__(x, ...)`,
+     `type(x).__mro__`, or `descriptor.__get__(...)` — nor a name bound by a
+     *comprehension/genexp* loop variable (`next((i for i, node in
+     enumerate(nodes) if node.get("id") == ...)` stayed flagged inside a
+     decorated function whose ordinary-statement reads of `nodes` were
+     suppressed). Those sites surface unsuppressed even inside a correctly
+     declared boundary, so they need a rationale or a membership-form rewrite;
+     do NOT conclude the decorator is wrong or widen it further.
+  Membership-form is often available with byte-identical semantics and no new
+  raise path: `"id" in node and node["id"] == target` is exactly `.get("id")
+  == target` (missing key → no match, never raises), which matters in
+  `required_controls.py`, whose splice helpers run inside the planner
+  `candidate_finalizer` seam where an unprefixed exception is a TERMINAL
+  failure. Prefer that over `node["id"]` there.
 
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list
