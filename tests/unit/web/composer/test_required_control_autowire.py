@@ -961,6 +961,24 @@ class TestAutoWireRefusals:
         ):
             assert wire_required_controls(malformed, snapshot, view) is malformed
 
+    def test_falsy_non_str_on_write_failure_is_not_coerced_to_discard(self, tmp_path: Path) -> None:
+        """A present-but-malformed on_write_failure must fail the projection,
+        not be silently rewritten into the default — the boundary returns the
+        candidate unchanged and downstream validation owns the rejection."""
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        for bad in (0, False, []):
+            candidate = _bare_llm_candidate()
+            candidate["outputs"][0]["on_write_failure"] = bad
+            assert wire_required_controls(candidate, snapshot, view) is candidate
+
+    def test_absent_on_write_failure_defaults_and_still_wires(self, tmp_path: Path) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_candidate()
+        del candidate["outputs"][0]["on_write_failure"]
+        wired = wire_required_controls(candidate, snapshot, view)
+        assert wired is not candidate
+        assert "prompt_shield_auto_1" in _nodes_by_id(wired)
+
     def test_deterministic_ids_skip_authored_collisions(self, tmp_path: Path) -> None:
         view, snapshot = _guardrail_profile_view(tmp_path)
         candidate = _bare_llm_candidate()

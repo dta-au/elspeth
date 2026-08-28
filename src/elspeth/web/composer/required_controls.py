@@ -326,7 +326,9 @@ def _parse_candidate_state(candidate: Mapping[str, Any]) -> CompositionState | N
             sink_name = raw["sink_name"]
             plugin = raw["plugin"]
             options = raw.get("options")
-            on_write_failure = raw.get("on_write_failure") or "discard"
+            on_write_failure = raw.get("on_write_failure")
+            if on_write_failure is None:
+                on_write_failure = "discard"
             if (
                 type(sink_name) is not str
                 or not sink_name
