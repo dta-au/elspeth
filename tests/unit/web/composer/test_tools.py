@@ -3218,6 +3218,26 @@ class TestLegacyMutationArgumentGuards:
 
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
+    def test_upsert_node_rejects_non_object_options_as_argument_error(self) -> None:
+        # Pins the control that makes NodeSpec.options' declared
+        # ``Mapping[str, Any]`` a real guarantee rather than an annotation:
+        # ``_UpsertNodeArgumentsModel.options`` is ``dict[str, Any]``, so a
+        # non-object options payload is rejected at the Tier-3 argument
+        # boundary and never reaches NodeSpec construction. Consumers of
+        # ``NodeSpec.options`` (e.g. ``_backend_surface_args_for_site``)
+        # therefore read it nominally, with no isinstance shape guard.
+        from elspeth.web.composer.protocol import ToolArgumentError
+
+        with pytest.raises(ToolArgumentError) as exc_info:
+            execute_tool(
+                "upsert_node",
+                {"id": "x", "node_type": "transform", "input": "in", "options": ["not", "an", "object"]},
+                _empty_state(),
+                _mock_catalog(),
+            )
+
+        assert isinstance(exc_info.value.__cause__, PydanticValidationError)
+
     def test_upsert_gate_rejects_non_string_condition_as_argument_error(self) -> None:
         from elspeth.web.composer.protocol import ToolArgumentError
 

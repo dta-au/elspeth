@@ -524,6 +524,47 @@ is a working document under the normal delivery posture.
   deadline and wait on the SAME injected clock — never `time.sleep` beside
   `clock.monotonic()` — and any test fake typed as `Clock` needs `sleep`.
 
+- **2026-08-29 — computing a tier_model justify key by hand: `TierModelVisitor`
+  is PATH-SENSITIVE, and the wrong relative path silently INVENTS findings.**
+  No `elspeth-lints check` flag emits the `<file>:<RULE>:<Symbol>:ast=<path>`
+  justify key (`--format json` carries line/col/fingerprint but neither
+  `symbol_context` nor `ast_path`), so a lane that needs keys after its edits
+  shift the ast paths has to call the rule in-process. Use
+  `collect_check_result(root, allowlist_path=<empty dir>)` and read
+  `Finding.symbol_context` / `Finding.ast_path` — NOT a hand-built
+  `TierModelVisitor`. The visitor's first argument must be the path relative to
+  the SCAN ROOT (`src/elspeth`), because `_R5_NAMED_BOUNDARY_CONTEXTS` is keyed
+  on exactly that string and is gated by `if not
+  self.file_path.startswith("web/")`. Passing a path relative to `src/` instead
+  (`elspeth/web/composer/service.py`) misses both the prefix test and the dict
+  key, and the named-boundary exemptions silently stop applying: B33 measured
+  41 findings that way against the scanner's real 31 in
+  `web/composer/service.py` — ten fabricated justify candidates in
+  `_cached_runtime_preflight` and `_validate_advisor_arguments`, with no error
+  and no warning. Cross-check any in-process count against the CLI's line count
+  for the same file before trusting it.
+
+- **2026-08-29 — an ELSPETH-owned "closed sum type" can still be SUBCLASSED by
+  test doubles, and `type(x) is C` breaks them.** The Wave-1 `isinstance` →
+  `type(x) is C` conversion is right for the closed unions listed in the
+  2026-08-29 narrowing entry above, but check for subclasses in `tests/` as
+  well as `src/` before converting: `_ToolOutcomeResponse = ToolResult |
+  Mapping[str, Any] | None` is documented as closed on `_ToolOutcome`, yet
+  `ToolResult` is deliberately subclassed by doubles that ride the real compose
+  loop — `_StrayToolResult`
+  (`tests/property/web/composer/test_compose_loop_invariants.py`,
+  `tests/integration/pipeline/test_composer_llm_eval_characterization.py`) and
+  `_NonCanonicalizableResult`
+  (`tests/unit/web/composer/test_compose_loop_audit_wiring.py`) — precisely to
+  prove that a drifted response shape is sentinelized rather than persisted. An
+  exact-type test at
+  `_tool_batch_staged_terminal_interpretation_review_handoff` would route those
+  down the "not a tool result" arm and skip the `not response.success` check,
+  admitting a FAILED batch into the terminal pending-review verdict. Those
+  three R5 sites are rationalised, not converted (B33). `grep -rn '(ToolResult)'
+  src/ tests/` is the check; "closed" in a docstring means no PRODUCTION
+  variant, not no subclass.
+
 - **2026-08-28 — `.pre-commit-config.yaml` lint hooks are pinned by
   `tests/unit/elspeth_lints/test_pre_commit_triggers.py`** (elspeth-7e8bf1c28b).
   Three whole-config contracts: (1) a `--files` hook may select ONLY
