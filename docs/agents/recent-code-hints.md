@@ -92,6 +92,45 @@ is a working document under the normal delivery posture.
   before any `isinstance` → `type() is` conversion in this sweep: write a
   four-line `reveal_type` probe for both forms and read the negative arm.
   A green mypy run on the real file is NOT that check.
+- **2026-08-29 — B51's `deep_freeze` trap re-checked across B40's four
+  `type()` guards: all four are safe, each for a DIFFERENT reason, and one of
+  them is safe only because it was NOT converted.** The trap is real —
+  `NodeSpec.__post_init__` freezes, so `node.branches` and `node.options` are
+  `mappingproxy` and a frozen `options["interpretation_requirements"]` list is
+  a `tuple`. What the re-check found is that "is this value deep-frozen?" is
+  the wrong question on its own; ask what stands between the frozen bag and
+  the guard:
+  1. `_duplicate_consumer_repair_suggestions`'s `type(patched_branches) is not
+     dict` reads `_serialize_node` output, and `_serialize_branches` thaws
+     (`dict(deep_thaw(branches))`) — so the value is an exact `dict`. This site
+     is ALSO structurally immune: the first alias iteration writes a plain dict
+     back into `patched_consumer["branches"]`, so even a forced `mappingproxy`
+     accumulates correctly (verified by mutation — the behavioural test PASSES
+     under the mutation, which is why the pin is on the serializer's output
+     type, not on the repair behaviour). A behavioural test that survives the
+     mutation is not a pin for that guard; check before writing one.
+  2. `type(stored_rows) not in (list, tuple)` is safe only because it names the
+     PAIR. `stored_options` is `NodeSpec.options` at every call site, so the
+     stored list is always a `tuple`; narrowing to `is not list` makes
+     `_normalize_echoed_interpretation_requirements` abstain on every real call
+     and silently switches off echo normalisation.
+  3. `ReviewedSourceAuthority.__post_init__` names `(dict, MappingProxyType)`,
+     which is exactly `deep_freeze`'s output pair for a mapping.
+  4. **`_merged_component_rejection_result` must KEEP its
+     `isinstance(data, Mapping)`.** `ToolResult.__post_init__` runs
+     `freeze_fields(self, "data")`, so `base.data` is a `mappingproxy` and
+     `type(data) is dict` would be permanently False — every merge would take
+     the else branch and the rejection envelope would reach the model carrying
+     ONLY `components_withheld`, with `error_code` and every detail silently
+     dropped. This one is a data-loss trap, and it is a standing invitation
+     because the surrounding file is full of `type()` conversions.
+  All four are pinned in
+  `tests/unit/web/composer/test_frozen_state_nominal_type_guards.py`, each
+  mutation-verified to fail alone under its specific narrowing. The general
+  rule: before swapping `isinstance(x, Mapping)` for `type(x) is dict` on
+  composition-state or ToolResult data, find the thaw (or the absence of one)
+  between the frozen owner and the read — and if you keep `isinstance`, say in
+  a comment WHY, because the next lane will otherwise "converge" it.
 - **2026-08-29 — a `@trust_boundary`-suppressed site DOES stop counting toward a
   `per_file_rules` `max_hits:` ceiling, and driving a pattern to ZERO turns the
   gate line into `Unused tier-model per-file rule`.** This narrows the B37 note
