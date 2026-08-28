@@ -15,6 +15,7 @@ from collections.abc import Iterable
 from jinja2 import StrictUndefined, nodes
 from jinja2.meta import find_undeclared_variables
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from jinja2.visitor import NodeVisitor
 
 
 class TemplateError(Exception):
@@ -52,8 +53,14 @@ def find_runtime_unbound_variables(ast: nodes.Template) -> frozenset[str]:
     return frozenset(analyzer.unbound | (candidates - analyzer.seen))
 
 
-class _DefiniteBindingAnalyzer:
-    """Conservative flow analysis for Jinja locals relevant to candidates."""
+class _DefiniteBindingAnalyzer(NodeVisitor):
+    """Conservative flow analysis for Jinja locals relevant to candidates.
+
+    Dispatch runs through jinja2's own ``NodeVisitor`` (one ``visit_<Class>``
+    per concrete node class). Every visitor takes the set of names definitely
+    bound before the node and returns the set definitely bound after it;
+    unhandled nodes scan their children without binding anything.
+    """
 
     def __init__(self, candidates: frozenset[str]) -> None:
         self._candidates = candidates
@@ -63,98 +70,33 @@ class _DefiniteBindingAnalyzer:
     def analyze(self, statements: Iterable[nodes.Node], bound: frozenset[str]) -> frozenset[str]:
         current = bound
         for statement in statements:
-            current = self._analyze_node(statement, current)
+            current = self.visit(statement, current)
         return current
 
-    def _analyze_node(self, node: nodes.Node, bound: frozenset[str]) -> frozenset[str]:
-        if isinstance(node, nodes.Name):
-            if node.ctx == "load" and node.name in self._candidates:
-                self.seen.add(node.name)
-                if node.name not in bound:
-                    self.unbound.add(node.name)
-            return bound
-
-        if isinstance(node, nodes.Assign):
-            self._scan(node.node, bound)
-            self._scan_assignment_target(node.target, bound)
-            return bound | _stored_names(node.target)
-
-        if isinstance(node, nodes.AssignBlock):
-            if node.filter is not None:
-                self._scan(node.filter, bound)
-            self.analyze(node.body, bound)
-            self._scan_assignment_target(node.target, bound)
-            return bound | _stored_names(node.target)
-
-        if isinstance(node, nodes.If):
-            return self._analyze_if(node, bound)
-
-        if isinstance(node, nodes.For):
-            self._scan(node.iter, bound)
-            loop_bound = bound | _stored_names(node.target) | {"loop"}
-            if node.test is not None:
-                self._scan(node.test, loop_bound)
-            self.analyze(node.body, loop_bound)
-            self.analyze(node.else_, bound)
-            return bound
-
-        if isinstance(node, nodes.With):
-            for value in node.values:
-                self._scan(value, bound)
-            local_bound = bound
-            for target in node.targets:
-                local_bound |= _stored_names(target)
-            self.analyze(node.body, local_bound)
-            return bound
-
-        if isinstance(node, nodes.Macro):
-            for default in node.defaults:
-                self._scan(default, bound)
-            argument_names = frozenset(argument.name for argument in node.args)
-            self.analyze(node.body, bound | argument_names | {"caller", "kwargs", "varargs"})
-            return bound | {node.name}
-
-        if isinstance(node, nodes.CallBlock):
-            self._scan(node.call, bound)
-            for default in node.defaults:
-                self._scan(default, bound)
-            argument_names = frozenset(argument.name for argument in node.args)
-            self.analyze(node.body, bound | argument_names)
-            return bound
-
-        if isinstance(node, nodes.Import):
-            self._scan(node.template, bound)
-            return bound | {node.target}
-
-        if isinstance(node, nodes.FromImport):
-            self._scan(node.template, bound)
-            imported_names = {item[1] if isinstance(item, tuple) else item for item in node.names}
-            return bound | imported_names
-
-        if isinstance(node, nodes.FilterBlock):
-            self._scan(node.filter, bound)
-            self.analyze(node.body, bound)
-            return bound
-
-        if isinstance(node, nodes.OverlayScope):
-            self._scan(node.context, bound)
-            self.analyze(node.body, bound)
-            return bound
-
-        if isinstance(node, nodes.ScopedEvalContextModifier):
-            for option in node.options:
-                self._scan(option, bound)
-            self.analyze(node.body, bound)
-            return bound
-
-        if isinstance(node, (nodes.Block, nodes.Scope)):
-            self.analyze(node.body, bound)
-            return bound
-
+    def generic_visit(self, node: nodes.Node, bound: frozenset[str]) -> frozenset[str]:
         self._scan_children(node, bound)
         return bound
 
-    def _analyze_if(self, node: nodes.If, bound: frozenset[str]) -> frozenset[str]:
+    def visit_Name(self, node: nodes.Name, bound: frozenset[str]) -> frozenset[str]:
+        if node.ctx == "load" and node.name in self._candidates:
+            self.seen.add(node.name)
+            if node.name not in bound:
+                self.unbound.add(node.name)
+        return bound
+
+    def visit_Assign(self, node: nodes.Assign, bound: frozenset[str]) -> frozenset[str]:
+        self._scan(node.node, bound)
+        self._scan_assignment_target(node.target, bound)
+        return bound | _stored_names(node.target)
+
+    def visit_AssignBlock(self, node: nodes.AssignBlock, bound: frozenset[str]) -> frozenset[str]:
+        if node.filter is not None:
+            self._scan(node.filter, bound)
+        self.analyze(node.body, bound)
+        self._scan_assignment_target(node.target, bound)
+        return bound | _stored_names(node.target)
+
+    def visit_If(self, node: nodes.If, bound: frozenset[str]) -> frozenset[str]:
         self._scan(node.test, bound)
         branch_results = [self.analyze(node.body, bound)]
         for elif_node in node.elif_:
@@ -163,8 +105,74 @@ class _DefiniteBindingAnalyzer:
         branch_results.append(self.analyze(node.else_, bound) if node.else_ else bound)
         return frozenset.intersection(*branch_results)
 
+    def visit_For(self, node: nodes.For, bound: frozenset[str]) -> frozenset[str]:
+        self._scan(node.iter, bound)
+        loop_bound = bound | _stored_names(node.target) | {"loop"}
+        if node.test is not None:
+            self._scan(node.test, loop_bound)
+        self.analyze(node.body, loop_bound)
+        self.analyze(node.else_, bound)
+        return bound
+
+    def visit_With(self, node: nodes.With, bound: frozenset[str]) -> frozenset[str]:
+        for value in node.values:
+            self._scan(value, bound)
+        local_bound = bound
+        for target in node.targets:
+            local_bound |= _stored_names(target)
+        self.analyze(node.body, local_bound)
+        return bound
+
+    def visit_Macro(self, node: nodes.Macro, bound: frozenset[str]) -> frozenset[str]:
+        for default in node.defaults:
+            self._scan(default, bound)
+        argument_names = frozenset(argument.name for argument in node.args)
+        self.analyze(node.body, bound | argument_names | {"caller", "kwargs", "varargs"})
+        return bound | {node.name}
+
+    def visit_CallBlock(self, node: nodes.CallBlock, bound: frozenset[str]) -> frozenset[str]:
+        self._scan(node.call, bound)
+        for default in node.defaults:
+            self._scan(default, bound)
+        argument_names = frozenset(argument.name for argument in node.args)
+        self.analyze(node.body, bound | argument_names)
+        return bound
+
+    def visit_Import(self, node: nodes.Import, bound: frozenset[str]) -> frozenset[str]:
+        self._scan(node.template, bound)
+        return bound | {node.target}
+
+    def visit_FromImport(self, node: nodes.FromImport, bound: frozenset[str]) -> frozenset[str]:
+        self._scan(node.template, bound)
+        imported_names = {item[1] if isinstance(item, tuple) else item for item in node.names}
+        return bound | imported_names
+
+    def visit_FilterBlock(self, node: nodes.FilterBlock, bound: frozenset[str]) -> frozenset[str]:
+        self._scan(node.filter, bound)
+        self.analyze(node.body, bound)
+        return bound
+
+    def visit_OverlayScope(self, node: nodes.OverlayScope, bound: frozenset[str]) -> frozenset[str]:
+        self._scan(node.context, bound)
+        self.analyze(node.body, bound)
+        return bound
+
+    def visit_ScopedEvalContextModifier(self, node: nodes.ScopedEvalContextModifier, bound: frozenset[str]) -> frozenset[str]:
+        for option in node.options:
+            self._scan(option, bound)
+        self.analyze(node.body, bound)
+        return bound
+
+    def visit_Block(self, node: nodes.Block, bound: frozenset[str]) -> frozenset[str]:
+        self.analyze(node.body, bound)
+        return bound
+
+    def visit_Scope(self, node: nodes.Scope, bound: frozenset[str]) -> frozenset[str]:
+        self.analyze(node.body, bound)
+        return bound
+
     def _scan(self, node: nodes.Node, bound: frozenset[str]) -> None:
-        self._analyze_node(node, bound)
+        self.visit(node, bound)
 
     def _scan_children(self, node: nodes.Node, bound: frozenset[str]) -> None:
         for child in node.iter_child_nodes():

@@ -76,8 +76,9 @@ def validate_source_config(
         raise
     except ValueError as exc:
         # Same contract as validate_transform_config: dispatch rejection is a
-        # config error, reported rather than raised.
-        return [ValidationError(field="provider", message=str(exc), value=config.get("provider"))]
+        # config error, reported rather than raised. The value is absent when
+        # the missing key IS the error.
+        return [ValidationError(field="provider", message=str(exc), value=config["provider"] if "provider" in config else None)]
 
     # Handle special case: null_source has no config class
     if config_model is None:
@@ -146,8 +147,9 @@ def validate_transform_config(
         # engine fault: report it through the same channel as a Pydantic
         # rejection so ``PluginManager`` raises the standard prefixed
         # ValueError and every composer probe abstains instead of crashing
-        # ``CompositionState.validate()`` (elspeth-2ed41f0a4a census).
-        return [ValidationError(field="provider", message=str(exc), value=config.get("provider"))]
+        # ``CompositionState.validate()`` (elspeth-2ed41f0a4a census). The
+        # value is absent when the missing key IS the error.
+        return [ValidationError(field="provider", message=str(exc), value=config["provider"] if "provider" in config else None)]
 
     if config_model is None:
         return []  # No validation needed

@@ -167,7 +167,7 @@ def instantiate_plugins_from_config(
         for sink_name, sink_config in config.sinks.items():
             sink_cls = manager.get_sink_by_name(sink_config.plugin)
             if sink_name == delayed_export_sink:
-                if isinstance(sink_cls, type) and issubclass(sink_cls, BaseSink):
+                if issubclass(sink_cls, BaseSink):
                     options = dict(sink_config.options)
                     config_model = sink_cls.get_config_model(options)
                     if config_model is not None:
@@ -178,7 +178,7 @@ def instantiate_plugins_from_config(
             sinks[sink_name]._on_write_failure = sink_config.on_write_failure
             resolved_mode = (
                 sink_cls._resolve_sink_effect_mode(dict(sink_config.options), purpose=sink_effect_purpose)
-                if isinstance(sink_cls, type) and issubclass(sink_cls, BaseSink)
+                if issubclass(sink_cls, BaseSink)
                 else None
             )
             if resolved_mode is not None and type(resolved_mode) is not ResolvedSinkEffectMode:
@@ -215,10 +215,10 @@ def instantiate_plugins_from_config(
 
 
 def _expand_env_placeholders_for_raw_preflight(
-    value: object,
+    options: Mapping[str, object],
     *,
     deferrable_env_vars: frozenset[str],
-) -> tuple[object, bool]:
+) -> tuple[dict[str, object], bool]:
     """Expand ``${VAR}``/``${VAR:-default}`` for pre-secret-loading preflight checks.
 
     Mirrors the loader's ``_expand_env_vars`` semantics (same placeholder
@@ -235,12 +235,50 @@ def _expand_env_placeholders_for_raw_preflight(
     the loader is about to replace would validate the wrong configuration.
 
     Returns:
-        Tuple of (expanded value, fully_resolved).
+        Tuple of (expanded options, fully_resolved).
 
     Raises:
         ValueError: A referenced variable is unset, has no default, and is not
             deferrable — the same failure the loader itself would raise later.
     """
+    expanded: dict[str, object] = {}
+    fully_resolved = True
+    for key, entry in options.items():
+        expanded[key], entry_resolved = _expand_env_placeholder_value(entry, deferrable_env_vars=deferrable_env_vars)
+        fully_resolved = fully_resolved and entry_resolved
+    return expanded, fully_resolved
+
+
+@trust_boundary(
+    tier=3,
+    source="raw sink option values (untrusted, pre-pydantic YAML/JSON) walked for ${VAR} placeholders before secret loading",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError for a ${VAR} placeholder in any nested str whose variable is unset, has no default, "
+        "and is not deferrable; every other value shape is returned unchanged"
+    ),
+    test_ref="tests/unit/plugins/infrastructure/test_runtime_factory.py::test_expand_env_placeholder_value_rejects_unset_variable",
+    test_fingerprint="e2720d03d06785e90247f1f6f6418ca25183415ebb95d8b58f9d06e5615d4525",
+)
+def _expand_env_placeholder_value(value: object, *, deferrable_env_vars: frozenset[str]) -> tuple[object, bool]:
+    """Expand one raw option value; nested mappings and lists recurse."""
+    if isinstance(value, str):
+        return _expand_env_placeholder_string(value, deferrable_env_vars=deferrable_env_vars)
+    if isinstance(value, Mapping):
+        return _expand_env_placeholders_for_raw_preflight(value, deferrable_env_vars=deferrable_env_vars)
+    if isinstance(value, list):
+        entries: list[object] = []
+        fully_resolved = True
+        for entry in value:
+            expanded, entry_resolved = _expand_env_placeholder_value(entry, deferrable_env_vars=deferrable_env_vars)
+            entries.append(expanded)
+            fully_resolved = fully_resolved and entry_resolved
+        return entries, fully_resolved
+    return value, True
+
+
+def _expand_env_placeholder_string(text: str, *, deferrable_env_vars: frozenset[str]) -> tuple[str, bool]:
     import os
     import re
 
@@ -248,35 +286,23 @@ def _expand_env_placeholders_for_raw_preflight(
 
     fully_resolved = True
 
-    def _expand_string(text: str) -> str:
-        def replacer(match: re.Match[str]) -> str:
-            nonlocal fully_resolved
-            var_name = match.group(1)
-            default = match.group(2)  # None if no default specified
-            if var_name in deferrable_env_vars:
-                fully_resolved = False
-                return match.group(0)
-            if var_name in os.environ:
-                return os.environ[var_name]
-            if default is not None:
-                return default
-            raise ValueError(
-                f"Required environment variable '{var_name}' is not set. "
-                f"Either set the variable or use ${{{var_name}:-default}} syntax for optional values."
-            )
+    def replacer(match: re.Match[str]) -> str:
+        nonlocal fully_resolved
+        var_name = match.group(1)
+        default = match.group(2)  # None if no default specified
+        if var_name in deferrable_env_vars:
+            fully_resolved = False
+            return match.group(0)
+        if var_name in os.environ:
+            return os.environ[var_name]
+        if default is not None:
+            return default
+        raise ValueError(
+            f"Required environment variable '{var_name}' is not set. "
+            f"Either set the variable or use ${{{var_name}:-default}} syntax for optional values."
+        )
 
-        return _ENV_VAR_PATTERN.sub(replacer, text)
-
-    def _expand_value(item: object) -> object:
-        if isinstance(item, str):
-            return _expand_string(item)
-        if isinstance(item, Mapping):
-            return {key: _expand_value(entry) for key, entry in item.items()}
-        if isinstance(item, list):
-            return [_expand_value(entry) for entry in item]
-        return item
-
-    return _expand_value(value), fully_resolved
+    return _ENV_VAR_PATTERN.sub(replacer, text), fully_resolved
 
 
 @trust_boundary(
@@ -320,7 +346,7 @@ def validate_sink_effect_eligibility_from_raw_config(
     from elspeth.plugins.infrastructure.base import BaseSink
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
-    if not isinstance(purpose, SinkEffectExecutionPurpose):
+    if type(purpose) is not SinkEffectExecutionPurpose:
         raise TypeError("Sink effect eligibility purpose must be exact SinkEffectExecutionPurpose")
     if type(expand_env_placeholders) is not bool:
         raise TypeError("Sink effect eligibility expand_env_placeholders must be an exact bool")
@@ -333,6 +359,9 @@ def validate_sink_effect_eligibility_from_raw_config(
     raw_sinks = raw_config["sinks"]
     if not isinstance(raw_sinks, Mapping):
         raise ValueError("'sinks' must be a mapping/object for sink effect eligibility")
+    for raw_sink_name in raw_sinks:
+        if not isinstance(raw_sink_name, str) or not raw_sink_name:
+            raise ValueError("Sink names must be non-empty strings for sink effect eligibility")
 
     export_settings = validate_landscape_export_settings_from_raw_config(raw_config)
     delayed_export_name: str | None = None
@@ -351,8 +380,6 @@ def validate_sink_effect_eligibility_from_raw_config(
     manager = None
     modes: dict[str, ResolvedSinkEffectMode] = {}
     for sink_name in selected_names:
-        if not isinstance(sink_name, str) or not sink_name:
-            raise ValueError("Sink names must be non-empty strings for sink effect eligibility")
         component = raw_sinks[sink_name]
         if not isinstance(component, Mapping):
             raise ValueError(f"Sink {sink_name!r} must be a mapping/object")
@@ -361,10 +388,7 @@ def validate_sink_effect_eligibility_from_raw_config(
         plugin_name = component["plugin"]
         if not isinstance(plugin_name, str) or not plugin_name:
             raise ValueError(f"Sink {sink_name!r} plugin must be a non-empty string")
-        if "options" in component:
-            raw_options = component["options"]
-        else:
-            raw_options = {}
+        raw_options = component["options"] if "options" in component else {}
         if not isinstance(raw_options, Mapping):
             raise ValueError(f"Sink {sink_name!r} options must be a mapping/object")
         options = dict(raw_options)
@@ -379,8 +403,6 @@ def validate_sink_effect_eligibility_from_raw_config(
                 # adapter mode yet. The post-expansion admission gates re-run
                 # adapter mode resolution and remain authoritative.
                 continue
-            if not isinstance(expanded_options, dict):  # pragma: no cover - dict in, dict out
-                raise TypeError("expanded sink options must be a mapping")
             options = expanded_options
         if manager is None:
             manager = get_shared_plugin_manager()
@@ -469,7 +491,7 @@ def make_sink_factory(config: ElspethSettings) -> Callable[[str], SinkEffectRunt
         sink._on_write_failure = sink_config.on_write_failure
         from elspeth.plugins.infrastructure.base import BaseSink
 
-        is_base_sink = isinstance(sink_cls, type) and issubclass(sink_cls, BaseSink)
+        is_base_sink = issubclass(sink_cls, BaseSink)
         resolved_mode = None
         publication_preflight = None
         if is_base_sink:

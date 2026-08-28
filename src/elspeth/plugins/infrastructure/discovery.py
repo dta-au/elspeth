@@ -150,7 +150,7 @@ def _bind_canonical_module_to_parent(canonical_name: str, module: object) -> Non
     if not separator:
         return
     parent = importlib.import_module(parent_name)
-    if sys.modules.get(canonical_name) is not module:
+    if canonical_name not in sys.modules or sys.modules[canonical_name] is not module:
         raise RuntimeError(f"Canonical module identity changed while binding {canonical_name!r}")
     setattr(parent, child_name, module)
 
@@ -219,9 +219,9 @@ def _discover_in_file(py_file: Path, base_class: type) -> list[type]:
         try:
             _bind_canonical_module_to_parent(canonical_name, module)
         except Exception:
-            if canonical_registered and sys.modules.get(canonical_name) is module:
+            if canonical_registered and canonical_name in sys.modules and sys.modules[canonical_name] is module:
                 del sys.modules[canonical_name]
-            if registered_name is not None and sys.modules.get(registered_name) is module:
+            if registered_name is not None and registered_name in sys.modules and sys.modules[registered_name] is module:
                 del sys.modules[registered_name]
             raise
 
