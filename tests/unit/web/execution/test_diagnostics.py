@@ -1566,3 +1566,74 @@ def test_diversion_error_types_mirror_the_sink_executor_anchors() -> None:
     from elspeth.web.execution.diagnostics import _DIVERSION_ERROR_TYPES
 
     assert frozenset({"SinkDiscard", "SinkDiversion"}) == _DIVERSION_ERROR_TYPES
+
+
+def test_node_state_error_envelope_normalises_a_non_string_type_to_none() -> None:
+    """A non-string ``type`` must not reach the diversion membership test.
+
+    ``_node_state_error_correlating_exception`` excludes diverted rows with
+    ``envelope.error_type in _DIVERSION_ERROR_TYPES``. ``error_json`` is an
+    unconstrained Text column, so a payload carrying an unhashable ``type``
+    (a list or a mapping) is representable; testing membership on it directly
+    raises ``TypeError: unhashable type``, which would abort the whole
+    diagnostics read rather than degrading that one state to "does not
+    correlate". The owned envelope normalises every non-``str`` ``type`` to
+    ``None``, so the membership test is total.
+    """
+    from elspeth.web.execution.diagnostics import (
+        _node_state_error_correlating_exception,
+        _node_state_error_envelope,
+    )
+
+    for unhashable_type in ([], {}, {"nested": 1}, 17, None):
+        envelope = _node_state_error_envelope({"type": unhashable_type, "exception": "boom, the driver failed"})
+        assert envelope is not None
+        assert envelope.error_type is None
+        assert envelope.exception_text == "boom, the driver failed"
+
+    # End to end: the correlation still succeeds instead of raising.
+    assert (
+        _node_state_error_correlating_exception(
+            json.dumps({"type": [], "exception": "boom, the driver failed"}),
+            "boom, the driver failed",
+        )
+        == "boom, the driver failed"
+    )
+
+
+def test_node_state_error_envelope_rejects_a_non_mapping_payload() -> None:
+    """A decoded envelope that is not a mapping carries no correlatable fields."""
+    from elspeth.web.execution.diagnostics import _node_state_error_envelope
+
+    for payload in (None, "a string envelope", ["a", "list"], 3):
+        assert _node_state_error_envelope(payload) is None
+
+
+def test_node_state_error_envelope_falls_back_to_context_message() -> None:
+    """A blank or absent ``exception`` falls back to ``context.message``, else None."""
+    from elspeth.web.execution.diagnostics import _node_state_error_envelope
+
+    from_context = _node_state_error_envelope({"exception": "   ", "context": {"message": "the real cause"}})
+    assert from_context is not None
+    assert from_context.exception_text == "the real cause"
+
+    no_text = _node_state_error_envelope({"exception": "", "context": {"message": 42}})
+    assert no_text is not None
+    assert no_text.exception_text is None
+
+
+def test_node_state_error_correlation_degrades_on_an_undecodable_envelope() -> None:
+    """An undecodable ``error_json`` withholds correlation instead of raising.
+
+    ``node_states.error_json`` is an unconstrained Text column, and the
+    correlation scan reads up to ``_FAILED_STATE_CORRELATION_SCAN_LIMIT`` of
+    them per failed operation. Raising on one bad row would abort the whole
+    diagnostics read for the run; returning None leaves that state
+    uncorrelated and the failure attributed to its scope owner.
+    """
+    from elspeth.web.execution.diagnostics import _node_state_error_correlating_exception
+
+    assert _node_state_error_correlating_exception("{not valid json", "boom, the driver failed") is None
+    assert _node_state_error_correlating_exception(None, "boom, the driver failed") is None
+    # An empty operation message would match indiscriminately and is refused first.
+    assert _node_state_error_correlating_exception(json.dumps({"exception": "boom"}), "") is None

@@ -8,6 +8,41 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — the `@trust_boundary` suppressor also loses the derived-name
+  trail through a `try:` whose handler RETURNS, so the decode-then-read idiom
+  suppresses nothing.** Third known hole in the same walk, after the
+  `enumerate()`/comprehension ones below. `_visit_try_like`
+  (tier_model `rule.py`) visits each handler from `branch_start` — the state
+  BEFORE the try — and then sets the post-try derived names to
+  `_intersect_snapshots(body_end, *handler_ends)`. It does not model the
+  handler's early `return` as unreachable, so a name bound in the try body is
+  intersected away by any handler that does not rebind it. Concretely,
+  `try: payload = _decode_json(error_json) / except (TypeError, ValueError):
+  return None` leaves `payload` NOT derived, and a
+  `@trust_boundary(source_param="error_json")` on that function suppresses
+  ZERO of the `payload.get(...)` / `isinstance(payload, ...)` reads below it —
+  measured in B52 on `web/execution/diagnostics.py`, where the decorator
+  produced 0 suppressions until the code was split. Note the asymmetry that
+  makes this surprising: ordinary assignment propagation uses the PERMISSIVE
+  subtree scan (`_value_depends_on_boundary` →
+  `_expr_contains_derived_reference`), so `payload = _decode_json(error_json)`
+  outside a try WOULD be derived even though the value passes through a call;
+  it is only the try/except join that drops it.
+  Do NOT pre-seed a name before the try to restore the trail — that is
+  reshaping code to dodge a lint. The honest fix, and the one the brief's
+  preference order already wants, is to split the raising decode from a
+  non-raising projection: keep `try: payload = _decode_json(...)` in the
+  caller and give the parse its own boundary function whose `source_param` IS
+  the already-decoded value, returning an owned frozen dataclass
+  (`_node_state_error_envelope` → `_NodeStateErrorEnvelope`). All 8 R1/R5
+  reads then sit directly on the source param and suppress, the caller reads
+  owned attributes nominally, and only the one R6 on the decode handler needs
+  a rationale. That split also caught a live defect it was not looking for:
+  `payload.get("type") in _DIVERSION_ERROR_TYPES` raises
+  `TypeError: unhashable type` for an envelope carrying a list/mapping `type`,
+  which would abort a whole run's diagnostics read; normalising the field to
+  `str | None` inside the owned envelope makes the membership test total.
+
 - **2026-08-29 — the `trust_boundary.tests` gate reads exception names out of
   `invariant` PROSE with a `*Error|*Exception|*Warning` suffix regex, so a
   boundary whose raise type has no such suffix must not mention an
