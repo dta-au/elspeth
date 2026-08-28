@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -188,6 +190,69 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         with pytest.raises(RuntimeError, match="regular owner-only file"):
             LocalAuthProvider(db_path=db_path, secret_key="test-key")
+
+    def test_open_owner_only_database_creates_missing_file_owner_only(self, tmp_path) -> None:
+        """The ``FileNotFoundError`` arm creates the file and the identity check admits it."""
+        db_path = tmp_path / "auth.db"
+
+        descriptor = auth_local._open_owner_only_database(db_path)
+        try:
+            identity = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+
+        assert stat.S_ISREG(identity.st_mode)
+        assert stat.S_IMODE(identity.st_mode) == 0o600
+        assert identity.st_ino == db_path.stat().st_ino
+
+    def test_open_owner_only_database_recovers_lost_create_race(self, tmp_path, monkeypatch) -> None:
+        """The ``FileExistsError`` arm reopens the file a concurrent creator won, never a fresh one."""
+        db_path = tmp_path / "auth.db"
+        real_open = os.open
+        attempts: list[int] = []
+
+        def racing_open(path: Any, flags: int, mode: int = 0o777, *args: Any, **kwargs: Any) -> int:
+            attempts.append(flags)
+            if flags & os.O_CREAT:
+                # Another process creates the same path between our lookup and our exclusive create.
+                winner = real_open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                os.write(winner, b"winner")
+                os.close(winner)
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", racing_open)
+        descriptor = auth_local._open_owner_only_database(db_path)
+        try:
+            assert os.read(descriptor, 16) == b"winner"
+            assert os.fstat(descriptor).st_ino == db_path.stat().st_ino
+        finally:
+            os.close(descriptor)
+
+        assert [bool(flags & os.O_CREAT) for flags in attempts] == [False, True, False]
+
+    def test_open_owner_only_database_lost_race_still_enforces_identity(self, tmp_path, monkeypatch) -> None:
+        """A file the concurrent creator left group-readable is rejected on the reopen path too."""
+        db_path = tmp_path / "auth.db"
+        real_open = os.open
+
+        def racing_open(path: Any, flags: int, mode: int = 0o777, *args: Any, **kwargs: Any) -> int:
+            if flags & os.O_CREAT:
+                winner = real_open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o640)
+                os.close(winner)
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", racing_open)
+        with pytest.raises(auth_local.LocalAuthStorageSecurityError, match="mode 0600"):
+            auth_local._open_owner_only_database(db_path)
+
+    def test_open_owner_only_database_requires_no_follow_admission(self, tmp_path, monkeypatch) -> None:
+        """A platform without ``os.O_NOFOLLOW`` fails closed by name before any open is attempted."""
+        db_path = tmp_path / "auth.db"
+        monkeypatch.delattr(os, "O_NOFOLLOW")
+
+        with pytest.raises(auth_local.LocalAuthStorageSecurityError, match="no-follow"):
+            auth_local._open_owner_only_database(db_path)
+        assert not db_path.exists()
 
     @pytest.mark.asyncio
     async def test_unverified_user_cannot_login_until_email_token_is_verified(self, provider) -> None:

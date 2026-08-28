@@ -91,7 +91,7 @@ def _canonical_host(parsed: SplitResult, *, field_name: str) -> str:
 
 
 def _parse_https_url(raw_value: str, *, field_name: str) -> tuple[str, SplitResult, _Origin]:
-    if not isinstance(raw_value, str):
+    if type(raw_value) is not str:
         raise _static_error(field_name, "string")
     if any(ord(char) < 32 or ord(char) == 127 for char in raw_value):
         raise _static_error(field_name, "control-character")
