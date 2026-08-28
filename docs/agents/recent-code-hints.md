@@ -22,6 +22,32 @@ is a working document under the normal delivery posture.
   `type() is dict` swap returns names where connections are wanted only in the
   mapped form and is undetectable in the list form.
 
+- **2026-08-29 — a signed tier-model entry binds by `scope_fingerprint`, NOT by
+  its `fp=` key or its `ast_path`; a mismatch in either of those does not make
+  it stale.** Measured in B45 on `config/cicd/enforce_tier_model/web.yaml`. The
+  entry for `transforms.py:R1:_clear_removed_sink_edge_route` carries
+  `fp=7b08c4d302f899b3` and `ast_path: body[39]/body[8]/body[2]/test/left`,
+  while the live tree computes `fp=9f4682f37e40559b` and
+  `body[43]/body[8]/body[2]/test/left` — BOTH stale — yet the finding is
+  suppressed under the real allowlist and is never reported as a stale entry,
+  because the entry's `scope_fingerprint` (`9a16b614…`) still matches the
+  enclosing function exactly. The contrast is in the same two files: the two
+  entries that ARE reported stale (`R5:_execute_upsert_node`,
+  `R5:_execute_set_source_from_blob`) differ from the live tree in
+  `scope_fingerprint` too, because their enclosing functions were edited.
+  Why this matters for a burn-down lane: `fp=`/`ast_path` drift is the NORMAL
+  state after siblings add module-level statements, so judging coverage by
+  comparing them will tell you a bound, judged site is uncovered — and
+  re-rationalising it puts a second authority on unchanged code that already
+  carries a binding ruling. Determine coverage by RUNNING the real allowlist
+  and diffing against the allowlist-disabled corpus; if you want to know *why*
+  a site is or is not covered, compare `scope_fingerprint` between the YAML
+  entry and `Finding.scope_fingerprint`, not the key suffix. Corollary for the
+  reverse direction: a per-file `pattern:`/`max_hits:` ratchet suppresses
+  without any judge ruling at all, so before calling a suppressed site
+  "signed", confirm there is no `source_file:` pattern block for it (at
+  0b980f4d9 there is none for web/composer/tools/*; the only overages are in
+  `plugins.yaml`).
 - **2026-08-29 — an `isinstance(x, Mapping)` → `type(x) is dict` swap can pass
   mypy AND every runtime test and still be wrong; the discriminator is
   `reveal_type` on the NEGATIVE arm.** Measured in B45 on the two coalesce
