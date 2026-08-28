@@ -843,11 +843,11 @@ def build_set_pipeline_candidate(
             )
             # Nominal discrimination of the owned closed union
             # ``_ResolvedSourceBlob | ToolResult`` (ADR-032). Kept as
-            # ``isinstance`` rather than the exact-type idiom because mypy
-            # gives ``type(x) is C`` no negative-branch narrowing on a union,
-            # so the three reads below lose their types; neither class is
-            # subclassed anywhere in the tree, so the two forms are
-            # equivalent at runtime.
+            # ``isinstance`` rather than the exact-type idiom: mypy gives
+            # ``type(x) is C`` no negative-branch narrowing on a union (the
+            # three reads below would lose their types), and ToolResult is
+            # subclassed by test doubles, which an exact-type check would
+            # silently misroute into the blob arm.
             if isinstance(resolved, ToolResult):
                 return _candidate(resolved)
             resolved_source_blob = resolved

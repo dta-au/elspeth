@@ -190,13 +190,14 @@ is a working document under the normal delivery posture.
   Do NOT reach for `hasattr` (R3) or a module-level probe that turns a
   first-open failure into an import-time one unless the module already fails
   to import on that platform for the same reason. Companion in the same lane:
-  `_parse_https_url` (web/auth/urls.py) guarded a pydantic-typed `str` with
-  `isinstance(raw_value, str)`, which ADMITS a `str` subclass — an impostor
-  whose `__contains__`/`find` deny the separators it carries would sail past
-  every scan in that function. `type(raw_value) is not str` is the house
-  scalar idiom and rejects it; pinned by
-  tests/unit/web/auth/test_urls.py::test_url_values_must_be_exact_str_not_a_subclass_or_lookalike,
-  which asserts the impostor's methods were never consulted.
+  `_parse_https_url` (web/auth/urls.py) tightened `isinstance(raw_value, str)`
+  to `type(raw_value) is not str`, the house scalar idiom. NOTE (lens-A audit,
+  comment 8798 F7): the originally taught "impostor `__contains__` sails past
+  the scans" threat cannot occur there — `raw_value.strip()` returns an exact
+  `str` for any subclass, and every separator scan runs on that minted value,
+  so the base tree already rejected the impostor. The narrowing stands as
+  fail-closed house style, not as closing a live hole; pinned by
+  tests/unit/web/auth/test_urls.py::test_url_values_must_be_exact_str_not_a_subclass_or_lookalike.
 - **2026-08-29 — `isinstance(value, Enum)` is a PERMANENT R5 justify candidate:
   `type(value) is Enum` is unconditionally False, so the "swap to the house
   exact-type idiom" move silently deletes the check.** An enum member's
