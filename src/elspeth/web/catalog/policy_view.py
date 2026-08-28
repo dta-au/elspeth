@@ -66,15 +66,40 @@ class PolicyCatalogView:
                 self._full_items_cache[kind] = self._full.list_sinks()
         return self._full_items_cache[kind]
 
+    def _usable_profile_aliases(self, plugin_id: PluginId) -> tuple[str, ...]:
+        """Return the operator-profile aliases this principal may author for ``plugin_id``.
+
+        ``build_plugin_snapshot`` records an entry in
+        ``snapshot.usable_profile_aliases`` only for a plugin whose
+        ``web_config_authority`` is ``WebConfigAuthority.OPERATOR_PROFILED``,
+        so for anything this view can reach, absence means "not
+        operator-profiled" and the explicit empty answer is the RESTRICTIVE
+        one: no alias is offered on the wire, ``public_summary`` /
+        ``public_schema`` are never asked to project a binding that does not
+        exist, and ``lower_operator_profile_options`` refuses every alias.
+        A profiled plugin whose principal has no usable alias is recorded
+        present-with-``()`` *and* declined ``PROFILE_UNAVAILABLE`` by the same
+        producer, so it never enters ``snapshot.available`` and never reaches
+        these callers at all.
+
+        Never widen the absent branch to anything but ``()``: crediting a
+        plugin with aliases the snapshot did not grant it would hand an
+        unprofiled plugin the operator's private binding. Pinned by
+        ``test_unprofiled_plugin_is_granted_no_operator_profile_alias``.
+        """
+        aliases_by_plugin = dict(self.snapshot.usable_profile_aliases)
+        if plugin_id not in aliases_by_plugin:
+            return ()
+        return aliases_by_plugin[plugin_id]
+
     def _visible(self, kind: PluginKind, items: list[PluginSummary]) -> list[PluginSummary]:
         visible = [item for item in items if PluginId(kind, item.name) in self.snapshot.available]
         if self._profiles is None:
             return visible
-        aliases_by_plugin = dict(self.snapshot.usable_profile_aliases)
         projected: list[PluginSummary] = []
         for item in visible:
             plugin_id = PluginId(kind, item.name)
-            aliases = aliases_by_plugin.get(plugin_id, ())
+            aliases = self._usable_profile_aliases(plugin_id)
             if not aliases:
                 projected.append(item)
                 continue
@@ -165,7 +190,7 @@ class PolicyCatalogView:
     def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
         plugin_id = PluginId(plugin_type, name)
         self._require_available(plugin_id)
-        aliases = dict(self.snapshot.usable_profile_aliases).get(plugin_id, ())
+        aliases = self._usable_profile_aliases(plugin_id)
         if self._profiles is None:
             return self._full.get_schema(plugin_type, name)
         return self._profiles.public_schema(
@@ -185,7 +210,7 @@ class PolicyCatalogView:
         self._require_available(plugin_id)
         if self._profiles is None:
             return assistance
-        aliases = dict(self.snapshot.usable_profile_aliases).get(plugin_id, ())
+        aliases = self._usable_profile_aliases(plugin_id)
         if not aliases:
             return assistance
         return self._profiles.public_assistance(plugin_id, assistance)
@@ -204,7 +229,7 @@ class PolicyCatalogView:
         """
         if self._profiles is None:
             raise ValueError("plugin_has_no_operator_profile")
-        available_aliases = dict(self.snapshot.usable_profile_aliases).get(plugin_id, ())
+        available_aliases = self._usable_profile_aliases(plugin_id)
         if alias not in available_aliases:
             raise ValueError("profile_unavailable")
         return self._profiles.lower_options(plugin_id, alias=alias, safe_options=safe_options)

@@ -45,6 +45,34 @@ is a working document under the normal delivery posture.
   scalar idiom and rejects it; pinned by
   tests/unit/web/auth/test_urls.py::test_url_values_must_be_exact_str_not_a_subclass_or_lookalike,
   which asserts the impostor's methods were never consulted.
+- **2026-08-29 — `isinstance(value, Enum)` is a PERMANENT R5 justify candidate:
+  `type(value) is Enum` is unconditionally False, so the "swap to the house
+  exact-type idiom" move silently deletes the check.** An enum member's
+  concrete type is always the authored subclass (`ResponseFormat`,
+  `OutputFieldType`, …) — `Enum` itself is never any member's `type()`. There
+  are 8 such sites tree-wide across at least five buckets
+  (`telemetry/serialization.py`, `telemetry/exporters/{console,datadog}.py`,
+  `contracts/audit_export.py`, `core/landscape/serialization.py`,
+  `core/landscape/execution/sink_effect_identity.py`,
+  `web/catalog/knob_schema.py`), and every one is the same shape: lower a
+  member to `str(member.value)` on the way onto a wire, audit, or persisted
+  projection. They are Tier-1 values and not admission gates — nothing is
+  accepted or rejected, only lowered — so the disposition is a rationale, and
+  `issubclass(type(value), Enum)` is the identical test spelled to evade the
+  matcher and must not be used. B01 already ruled the `audit_export._string`
+  instance of it; B32 ruled `knob_schema._attach_default`. The reason the swap
+  is tempting is that the *class*-side question one function away legitimately
+  reads `isclass(inner) and issubclass(inner, Enum)` (`_kind_for_scalar`) —
+  class side and instance side are different questions and must agree.
+  The mirror-image lesson from the same file: `not isinstance(x, Mapping)` DOES
+  convert to `type(x) is not dict` when the value's permitted set really is the
+  one concrete builtin — in `knob_schema._attach_required_when` the predicate is
+  authored as a dict literal in `json_schema_extra` and the same function
+  already tests `type(extra) is not dict` one line earlier, so the swap is
+  stricter, consistent, and removes the finding. Check the file's own
+  neighbouring idiom before deciding, and fix the error message if it says
+  "mapping".
+
 - **2026-08-29 — `web/execution/` has DECLARATION tests that pin the exact
   tier_model finding set, so REMOVING a finding there turns the lane red until
   you update the `Counter`.** `tests/unit/web/execution/test_validation_trust_tier.py`
