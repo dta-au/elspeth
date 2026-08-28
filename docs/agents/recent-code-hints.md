@@ -133,6 +133,40 @@ is a working document under the normal delivery posture.
   hand-maintained counter to restore the trail, which is reshaping code to
   dodge a lint. Live example: `_well_formed_query_entries` in
   `web/composer/state.py` (observation elspeth-obs-d4eed3b8c2).
+- **2026-08-29 — the pre-commit mypy hook typechecks a changed file's
+  DEPENDENTS, so editing a module other modules import THROUGH can fail on a
+  pre-existing `no_implicit_reexport` error you did not cause.** B24's first
+  tier commit to `web/interpretation_state.py` was rejected by three errors in
+  files it never touched: `composer/pipeline_proposal.py`,
+  `composer/reviewed_source_authority.py` and `composer/guided/chat_solver.py`
+  all import `SOURCE_AUTHORING_KEY` *through* `interpretation_state`, which
+  merely re-imports it from its real owner `web/composer/state.py`. The errors
+  were latent at HEAD (verified by running mypy against HEAD's copy of the
+  file) and only surface once the re-exporting module is in the hook's changed
+  set. Fix it AT the re-export — `from ... import X as X` — which clears every
+  consumer at once and touches no file another lane owns; do not chase the
+  three importers. Ruff then splits that import into its own `from ... import
+  (...)` statement, which ADDS a module-level statement and shifts every later
+  `body[N]`: check `config/cicd/enforce_tier_model/*.yaml` for a signed
+  `ast_path` in the file first (`interpretation_state.py` has none; the only
+  signed entry in that bucket is `web/app.py:R1:_BodySizeLimitMiddleware`,
+  which is `fp=`-keyed and so is immune to the shift).
+
+- **2026-08-29 — `web/interpretation_state.py` now reads its scalar string
+  node options through ONE declared boundary, `_node_str_option(node, key)`.**
+  It returns the value only when the key is present AND holds a `str`, and
+  `None` otherwise; ten `node.options.get(...)` + `isinstance(..., str)` pairs
+  across `materialize_state_for_execution`, `_materialize_node_for_authoring`,
+  `_materialize_node_for_execution`, `_ensure_prompt_template_hash`,
+  `_web_scrape_raw_fields`, `_legacy_placeholder_sites`,
+  `_missing_prompt_template_review_sites` and
+  `_missing_model_choice_review_sites` now consume the owned `str | None` and
+  never re-interrogate the runtime type. Read a new scalar string option
+  through it rather than growing an eleventh inline pair. The module's other
+  Tier-3 reads follow the membership form its existing boundaries already used
+  (`options[KEY] if KEY in options else None`), and `select_only` — a
+  presence-AND-value question — is spelled `"select_only" not in options or
+  options["select_only"] is not True`, never a ternary.
 
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list

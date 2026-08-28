@@ -2621,6 +2621,63 @@ def test_coerce_requirement_rejects_non_string_event_id() -> None:
         _coerce_requirement(value={"id": "req-1", "user_term": "x", "status": "pending", "event_id": 123})
 
 
+def test_coerce_requirement_rejects_resolved_without_string_accepted_value() -> None:
+    """The control that lets _render_prompt_parts read accepted_value nominally.
+
+    `_render_prompt_parts` reaches `requirement["accepted_value"]` only on the
+    non-pending arm, and `InterpretationRequirement.accepted_value` is typed
+    `str | None`. This boundary is what guarantees the resolved case carries a
+    real string, so the renderer needs no runtime type interrogation of its own.
+    """
+    from elspeth.web.interpretation_state import _coerce_requirement
+
+    with pytest.raises(TypeError, match="resolved interpretation requirement must carry accepted_value"):
+        _coerce_requirement(value={"id": "req-1", "user_term": "x", "status": "resolved", "accepted_value": 123})
+
+
+def test_render_prompt_parts_substitutes_resolved_accepted_value() -> None:
+    """A resolved interpretation_ref renders its accepted text into the prompt.
+
+    Pins the resolved-ref arm of `_render_prompt_parts`, which previously
+    re-checked `isinstance(accepted, str)` even though every requirement
+    reaching it is built by `_coerce_requirement` (see the test above). The
+    guard is now `accepted is None`, exactly equivalent over the declared
+    `str | None`, and this asserts the substitution itself still happens.
+    """
+    from elspeth.web.interpretation_state import (
+        _prompt_parts,
+        _render_prompt_parts,
+        _requirements_by_id,
+    )
+
+    options: dict[str, object] = {
+        PROMPT_TEMPLATE_PARTS_KEY: [
+            {"kind": "text", "text": "Rate "},
+            {"kind": "interpretation_ref", "requirement_id": "coolness"},
+            {"kind": "text", "text": ": {{ row.text }}"},
+        ],
+        INTERPRETATION_REQUIREMENTS_KEY: [
+            {
+                "id": "coolness",
+                "kind": "vague_term",
+                "user_term": "coolness",
+                "status": "resolved",
+                "draft": "well-designed and useful",
+                "event_id": "event-1",
+                "accepted_value": "well-designed and useful",
+                "accepted_artifact_hash": None,
+                "resolved_prompt_template_hash": None,
+            }
+        ],
+    }
+
+    parts = _prompt_parts(options)
+    assert parts is not None
+    rendered = _render_prompt_parts(parts, _requirements_by_id(options), unresolved_text=None)
+
+    assert rendered == "Rate well-designed and useful: {{ row.text }}"
+
+
 def test_validate_pipeline_decision_semantics_rejects_malformed_http_mapping() -> None:
     from elspeth.web.interpretation_state import (
         WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
