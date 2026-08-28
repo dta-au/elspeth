@@ -33,11 +33,12 @@ is a working document under the normal delivery posture.
   candidate `pipeline`, and its boundary is the binder itself. Worktree trap
   hit on the way to committing this: the `mypy` pre-commit hook is
   `.venv/bin/mypy` with no `PYTHONPATH` of its own, so inside a worktree it
-  type-checks the staged worktree files against the MAIN checkout's `elspeth`
-  (editable install) and fails on drift the worktree never had (six
-  `interpretation_state.SOURCE_AUTHORING_KEY` "not explicitly exported" errors
-  from a sibling's tree). `export PYTHONPATH=<wt>/src:<wt>/elspeth-lints/src`
-  before `git commit`; never `--no-verify` around it.
+  resolves `elspeth` imports through the MAIN checkout's editable install and
+  type-checks a split tree. `export PYTHONPATH=<wt>/src:<wt>/elspeth-lints/src`
+  before `git commit`; never `--no-verify` around it. (The six
+  `interpretation_state.SOURCE_AUTHORING_KEY` "not explicitly export" errors
+  it surfaced were a pre-existing implicit re-export, fixed on
+  `feature/unified-lineage` by 0f6b9b6a3 — merge, do not re-fix.)
 
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list
