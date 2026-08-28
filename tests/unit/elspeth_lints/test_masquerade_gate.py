@@ -48,7 +48,7 @@ import pytest
 
 from elspeth_lints.core.ast_walker import walk_python_files
 from elspeth_lints.rules.masquerade.baseline import BaselineEntry, MasqueradeBaseline, load_baseline, render_baseline_yaml
-from elspeth_lints.rules.masquerade.inventory import compute_qualname, definition_header_expressions, iter_masquerade_sites
+from elspeth_lints.rules.masquerade.inventory import MasqueradeSite, compute_qualname, definition_header_expressions, iter_masquerade_sites
 from elspeth_lints.rules.masquerade.metadata import SCAN_SUBDIRS
 from elspeth_lints.rules.masquerade.rule import RULE, SiteGroup, collect_sites, group_non_amnestied_sites, scan_root
 from elspeth_lints.rules.masquerade.seed_baseline import build_entries
@@ -68,6 +68,18 @@ def _complete_synthetic_scan_layout(request: pytest.FixtureRequest) -> None:
     tmp_path = request.getfixturevalue("tmp_path")
     for subdir in SCAN_SUBDIRS:
         (tmp_path / subdir).mkdir(parents=True, exist_ok=True)
+
+
+@pytest.fixture(scope="module")
+def live_sites() -> list[MasqueradeSite]:
+    """One whole-tree ``collect_sites`` shared by the read-only live-scan tests.
+
+    A scan walks every covered root (~40s CPU); the tests below only read
+    the result, so they share one per module (per xdist worker). The
+    CI-equivalent gate (``scan_root``) and the seeder-agreement test keep
+    their own independent entry points on purpose.
+    """
+    return collect_sites(REPO_ROOT)
 
 
 def _single_non_amnestied_group(source: str, path: str = "src/elspeth/probe.py") -> SiteGroup:
@@ -135,7 +147,7 @@ def test_self_test_goes_red_if_a_baseline_entry_covers_it_then_green(tmp_path: P
     assert scan_root(tmp_path) == []
 
 
-def test_live_scan_visits_files_and_sites_in_every_covered_root() -> None:
+def test_live_scan_visits_files_and_sites_in_every_covered_root(live_sites: list[MasqueradeSite]) -> None:
     """Per-root non-emptiness guard.
 
     A path-filter regression can zero out one root while the other three
@@ -150,7 +162,7 @@ def test_live_scan_visits_files_and_sites_in_every_covered_root() -> None:
     root's files are all walked but zero of them happen to be parseable
     Python; the file count is checked first and separately.
     """
-    sites = collect_sites(REPO_ROOT)
+    sites = live_sites
     baseline = load_baseline(REPO_ROOT / "config" / "cicd" / "masquerade_baseline.yaml")
     for subdir in SCAN_SUBDIRS:
         subroot = REPO_ROOT / subdir
@@ -165,14 +177,14 @@ def test_live_scan_visits_files_and_sites_in_every_covered_root() -> None:
             assert sites_in_root, f"{subdir}: zero candidate masquerade sites found where the baseline expects entries"
 
 
-def test_live_scan_visits_more_than_zero_files_and_sites_in_aggregate() -> None:
+def test_live_scan_visits_more_than_zero_files_and_sites_in_aggregate(live_sites: list[MasqueradeSite]) -> None:
     """Coarse, corpus-size-independent sanity check on top of the per-root assertions."""
     files_visited = 0
     for subdir in SCAN_SUBDIRS:
         files_visited += sum(1 for _ in walk_python_files(REPO_ROOT / subdir))
     assert files_visited > 1000, "expected the four scan roots to contain well over 1000 Python files"
 
-    sites = collect_sites(REPO_ROOT)
+    sites = live_sites
     baseline = load_baseline(REPO_ROOT / "config" / "cicd" / "masquerade_baseline.yaml")
     baselined_occurrences = sum(entry.occurrences for entry in baseline.entries)
     assert baselined_occurrences > 0, "expected the live baseline to retain tracked candidate sites"
@@ -645,7 +657,7 @@ def test_baseline_loader_rejects_a_non_positive_occurrences_value(tmp_path: Path
         load_baseline(baseline_path)
 
 
-def test_seeder_and_rule_agree_on_every_live_site_key_count_and_shape() -> None:
+def test_seeder_and_rule_agree_on_every_live_site_key_count_and_shape(live_sites: list[MasqueradeSite]) -> None:
     """Blocking amendment A1, checked directly (not just via the zero-findings result).
 
     Every non-amnestied live site the rule enumerates must appear in a
@@ -657,7 +669,7 @@ def test_seeder_and_rule_agree_on_every_live_site_key_count_and_shape() -> None:
     counts still matched in aggregate.
     """
     seeded = {entry.key: (entry.occurrences, entry.probe_shapes) for entry in build_entries(REPO_ROOT)}
-    live_groups = {group.key: (group.count, group.probe_shapes) for group in group_non_amnestied_sites(collect_sites(REPO_ROOT))}
+    live_groups = {group.key: (group.count, group.probe_shapes) for group in group_non_amnestied_sites(live_sites)}
     assert seeded == live_groups
 
 

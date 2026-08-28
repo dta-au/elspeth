@@ -2072,9 +2072,16 @@ Three facts a future attempt will want, all measured 2026-08-16:
   39 human adjudications; land the digest comparison as a test before changing
   anything (the 2026-08-16 change was measured this way: 488/488 sites, zero
   digest/kind/amnesty drift, whole-tree 65.0s → 64.8s after a two-state fast
-  path in `_join_binding_states`). Cost context: one whole-tree scan is ~65s
-  and `test_masquerade_gate.py` runs four of them (~6 min), ~12% of which is
-  a separate quadratic with a ~5-line fix (`elspeth-df09888129`). The
+  path in `_join_binding_states`). Cost context (2026-08-29): one whole-tree scan is ~38s CPU
+  (was ~60s; the per-candidate re-walk `elspeth-df09888129`, an eager
+  per-function deferred projection, a doubled If/Try branch projection, and
+  a full alias-visitor pass per file were removed with an identical site
+  list as the oracle), and `test_masquerade_gate.py` shares one scan across
+  its read-only live tests via the module-scoped `live_sites` fixture — the
+  `scan_root` gate and the seeder-agreement test keep independent scans on
+  purpose. The remaining multiplier is `_suite_transfer_kinds` re-evaluating
+  nested suites once per enclosing statement (~18% of a scan); it is the
+  shared alias evaluator's control-transfer semantics, not a local fix. The
   per-statement state copy in the possible-bindings model is itself
   quadratic in suite length (~3–4× per input doubling on flat 1600-statement
   inputs, before and after); the stop rule is about not making that class

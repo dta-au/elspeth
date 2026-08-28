@@ -147,12 +147,20 @@ def _walk_children_excluding_nested_scopes(node: ast.AST) -> Iterator[ast.AST]:
     that the outer function defined a nested helper or class), but its
     body / args / decorators / class-attributes are not.
     """
-    for child in ast.iter_child_nodes(node):
-        yield child
-        if isinstance(child, _NESTED_SCOPE_TYPES):
-            # Short-circuit: do not descend into the nested scope's children.
-            continue
-        yield from _walk_children_excluding_nested_scopes(child)
+    # Explicit stack rather than recursive ``yield from``: every yielded
+    # node otherwise threads through one generator frame per ancestor, so a
+    # walk costs O(nodes x depth). Pre-order and child order are identical.
+    stack = [ast.iter_child_nodes(node)]
+    while stack:
+        for child in stack[-1]:
+            yield child
+            if isinstance(child, _NESTED_SCOPE_TYPES):
+                # Short-circuit: do not descend into the nested scope's children.
+                continue
+            stack.append(ast.iter_child_nodes(child))
+            break
+        else:
+            stack.pop()
 
 
 @dataclass(frozen=True, slots=True)

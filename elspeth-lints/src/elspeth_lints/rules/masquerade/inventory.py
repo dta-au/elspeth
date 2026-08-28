@@ -278,6 +278,8 @@ def _boundary_source_params(tree: ast.AST) -> dict[int, str]:
     gap PLAN.md Correction 2 calls out in the scratch inventory script.
     """
     result: dict[int, str] = {}
+    if not _may_carry_boundary_decorator(tree):
+        return result
     for match in iter_boundary_decorators(tree):
         # Decorators apply bottom-up.  Only an outermost boundary marker is
         # guaranteed to be the installed callable; an unknown decorator above
@@ -291,6 +293,51 @@ def _boundary_source_params(tree: ast.AST) -> dict[int, str]:
         if isinstance(source_param, str) and source_param:
             result[id(match.function)] = source_param
     return result
+
+
+def _iter_statement_nodes(tree: ast.AST) -> Iterator[ast.AST]:
+    """Yield every statement-level node in ``tree`` without descending into expressions.
+
+    Imports and definitions are statements, so a walk that recurses only
+    through statement containers (suites, ``except`` handlers, ``match``
+    cases) sees all of them while skipping the expression subtrees that make
+    up most of a module's nodes.
+    """
+    stack: list[ast.AST] = [tree]
+    while stack:
+        node = stack.pop()
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.stmt, ast.ExceptHandler, ast.match_case)):
+                stack.append(child)
+
+
+def _may_carry_boundary_decorator(tree: ast.AST) -> bool:
+    """Return whether ``tree`` can contain a resolvable boundary decorator at all.
+
+    :func:`resolve_boundary_kind` recognises a ``Call`` decorator only when
+    the root name of its callee is bound by a proven absolute import whose
+    target is ``elspeth`` or an ``elspeth.`` submodule. This collects every
+    such import-bound name (at any depth — the alias visitor tracks scoped
+    imports too) and every decorator-callee root name; a file where the two
+    sets are disjoint cannot yield a match, so the alias-tracking visitor (a
+    full second pass over the file) is skipped for it. Shadowing can only
+    remove matches, never add them, so this is a strict superset check.
+    """
+    import_bound: set[str] = set()
+    decorator_roots: set[str] = set()
+    for node in _iter_statement_nodes(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for name, target in import_alias_effect(node).proven:
+                if target == "elspeth" or target.startswith("elspeth."):
+                    import_bound.add(name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                if isinstance(decorator, ast.Call):
+                    parts = _dotted_name(decorator.func)
+                    if parts is not None:
+                        decorator_roots.add(parts[0])
+    return not import_bound.isdisjoint(decorator_roots)
 
 
 def _module_level_literal_containers(tree: ast.Module) -> frozenset[str]:
@@ -320,13 +367,22 @@ def _module_level_literal_containers(tree: ast.Module) -> frozenset[str]:
     # whole module, not merely one that happened to have a literal assignment
     # at some earlier point.  Permit only the defining store and membership
     # reads; any reassignment, mutation call, or escape revokes the proof.
-    parents = {id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    # One walk buckets every ``Name`` by identifier alongside its parent; the
+    # per-candidate check then indexes into it instead of re-walking the tree
+    # once per table (elspeth-df09888129).
+    if not candidates:
+        return frozenset()
+    parents: dict[int, ast.AST] = {}
+    names_by_id: dict[str, list[ast.Name]] = {}
+    for owner in ast.walk(tree):
+        for child in ast.iter_child_nodes(owner):
+            if isinstance(child, ast.Name) and child.id in candidates:
+                parents[id(child)] = owner
+                names_by_id.setdefault(child.id, []).append(child)
     closed: set[str] = set()
     for name, defining_target in candidates.items():
         valid = True
-        for candidate in ast.walk(tree):
-            if not isinstance(candidate, ast.Name) or candidate.id != name:
-                continue
+        for candidate in names_by_id.get(name, ()):
             if candidate is defining_target:
                 continue
             parent = parents.get(id(candidate))
@@ -867,6 +923,20 @@ def _iter_statement_states(
             nonlocal reachable
             reachable = _join_binding_states((reachable, state))
 
+        if isinstance(node, ast.If) and not any(isinstance(child, ast.NamedExpr) for child in ast.walk(node.test)):
+            # Without a walrus the test binds nothing, so the branch
+            # projections start from exactly the state ``_runtime_bindings_after``
+            # would use: take ``after`` from the same walk instead of
+            # re-projecting every branch a second time (which compounds per
+            # nesting level).
+            body_possible, body_final = _possible_and_final_runtime_bindings(node.body, current, context)
+            orelse_possible, orelse_final = _possible_and_final_runtime_bindings(node.orelse, current, context)
+            merge(body_possible)
+            merge(orelse_possible)
+            current = _join_binding_states((body_final, orelse_final))
+            merge(current)
+            yield reachable, current
+            continue
         if isinstance(node, ast.If):
             merge(_possible_runtime_bindings(node.body, current, context))
             merge(_possible_runtime_bindings(node.orelse, current, context))
@@ -885,11 +955,28 @@ def _iter_statement_states(
             yield reachable, current
             continue
         elif isinstance(node, (ast.Try, ast.TryStar)):
-            merge(_possible_runtime_bindings(node.body, current, context))
+            # The body and every handler project from ``current`` in both the
+            # reachable and the after computations, so walk each once. The
+            # ``else`` and ``finally`` suites differ (reachable from
+            # ``current``, after from the body / joined state) and are
+            # projected separately, exactly as ``_runtime_bindings_after``.
+            body_possible, body_final = _possible_and_final_runtime_bindings(node.body, current, context)
+            merge(body_possible)
+            final_states = [body_final]
             for handler in node.handlers:
-                merge(_possible_runtime_bindings(handler.body, current, context))
+                handler_possible, handler_final = _possible_and_final_runtime_bindings(handler.body, current, context)
+                merge(handler_possible)
+                final_states.append(handler_final)
             merge(_possible_runtime_bindings(node.orelse, current, context))
             merge(_possible_runtime_bindings(node.finalbody, current, context))
+            if node.orelse:
+                final_states.append(_runtime_bindings_after(node.orelse, final_states[0], context))
+            current = _join_binding_states(final_states)
+            if node.finalbody:
+                current = _runtime_bindings_after(node.finalbody, current, context)
+            merge(current)
+            yield reachable, current
+            continue
         current = _runtime_bindings_after((node,), current, context)
         merge(current)
         yield reachable, current
@@ -1088,6 +1175,38 @@ def _module_runtime_bindings(tree: ast.Module, context: _ExecutionContext) -> di
     return _possible_runtime_bindings(tree.body, dict(_DEFAULT_PROBE_BINDINGS), context)
 
 
+class _LazyBindings:
+    """A deferred-scope binding projection computed on first use and then cached."""
+
+    __slots__ = ("_context", "_incoming", "_nodes", "_value")
+
+    def __init__(
+        self,
+        value: dict[str, BindingTargets] | None,
+        nodes: Sequence[ast.stmt],
+        incoming: dict[str, BindingTargets],
+        context: _ExecutionContext,
+    ) -> None:
+        self._value = value
+        self._nodes = nodes
+        self._incoming = incoming
+        self._context = context
+
+    @classmethod
+    def projected(cls, nodes: Sequence[ast.stmt], incoming: dict[str, BindingTargets], context: _ExecutionContext) -> _LazyBindings:
+        """Project ``nodes`` from ``incoming`` (a private copy) when first asked."""
+        return cls(None, nodes, incoming, context)
+
+    @classmethod
+    def ready(cls, value: dict[str, BindingTargets]) -> _LazyBindings:
+        return cls(value, (), {}, _ExecutionContext(future_annotations=False, function_scope=False))
+
+    def get(self) -> dict[str, BindingTargets]:
+        if self._value is None:
+            self._value = _possible_runtime_bindings(self._nodes, self._incoming, self._context)
+        return self._value
+
+
 class _MasqueradeVisitor(ast.NodeVisitor):
     """Single-pass walker computing site identity, kind, and amnesty flags."""
 
@@ -1111,7 +1230,11 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         self._binding_stack: list[tuple[str, dict[str, BindingTargets]]] = [("module", dict(_DEFAULT_PROBE_BINDINGS))]
         self._runtime_module_bindings = runtime_module_bindings
         self._source_stack: list[set[str]] = [set()]
-        self._deferred_binding_stack: list[dict[str, BindingTargets]] = []
+        # Each entry projects the bindings a later-running nested scope may
+        # see. The projection is a full walk of the enclosing body, so it is
+        # captured at scope entry and computed only if a nested scope,
+        # comprehension, or deferred annotation actually asks for it.
+        self._deferred_binding_stack: list[_LazyBindings] = []
         # The class body being visited and how far into it we are: a lazily
         # evaluated annotation-scope expression immediately inside a class body
         # sees the class dict at access time — every state from its own
@@ -1175,14 +1298,14 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         # never refreshed from the deferred enclosing state.
         local_bindings = function_local_binding_names(node) | _type_parameter_names(node.type_params)
         self._push_binding_scope("function", local_bindings=local_bindings)
-        deferred_bindings = self._deferred_binding_stack[-1] if nested_in_function else self._runtime_module_bindings
+        deferred_bindings = self._deferred_binding_stack[-1].get() if nested_in_function else self._runtime_module_bindings
         self._merge_deferred_bindings(deferred_bindings, excluding=local_bindings)
         for name, targets in captured_defaults.items():
             if name in local_bindings:
                 self._bindings[name] = targets
         source_param = None if nested_in_function else self._boundary_source_params.get(id(node))
         self._source_stack.append({source_param} if source_param is not None else set())
-        self._deferred_binding_stack.append(_possible_runtime_bindings(node.body, dict(self._bindings), self._context))
+        self._deferred_binding_stack.append(_LazyBindings.projected(node.body, dict(self._bindings), self._context))
         try:
             if node.name == "__getattr__":
                 self._record_dunder_getattr(node, parent_kind)
@@ -1204,7 +1327,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         nested_in_function = "function" in self._container_stack[:-1]
         local_bindings = argument_names(node.args)
         self._push_binding_scope("function", local_bindings=local_bindings)
-        deferred_bindings = self._deferred_binding_stack[-1] if nested_in_function else self._runtime_module_bindings
+        deferred_bindings = self._deferred_binding_stack[-1].get() if nested_in_function else self._runtime_module_bindings
         self._merge_deferred_bindings(deferred_bindings, excluding=local_bindings)
         for name, targets in captured_defaults.items():
             if name in local_bindings:
@@ -1217,7 +1340,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         self._comprehension_mutation_stack = []
         lambda_runtime_bindings = dict(self._bindings)
         _apply_runtime_expression(node.body, lambda_runtime_bindings)
-        self._deferred_binding_stack.append(_join_binding_states((self._bindings, lambda_runtime_bindings)))
+        self._deferred_binding_stack.append(_LazyBindings.ready(_join_binding_states((self._bindings, lambda_runtime_bindings))))
         try:
             self.visit(node.body)
         finally:
@@ -1247,7 +1370,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         local_bindings = {name for generator in node.generators for name in assignment_target_names(generator.target)}
         self._push_binding_scope("function", local_bindings=local_bindings)
         if isinstance(node, ast.GeneratorExp):
-            deferred_bindings = self._deferred_binding_stack[-1] if self._deferred_binding_stack else self._runtime_module_bindings
+            deferred_bindings = self._deferred_binding_stack[-1].get() if self._deferred_binding_stack else self._runtime_module_bindings
             self._merge_deferred_bindings(deferred_bindings, excluding=local_bindings)
         # Every iteration after the first enters through the back edge: a
         # walrus in a filter or the element rebinds names for the next pass,
@@ -1366,7 +1489,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         cannot cross the deferral.
         """
         state = self._snapshot_state()
-        outer_deferred = self._deferred_binding_stack[-1] if "function" in self._container_stack else self._runtime_module_bindings
+        outer_deferred = self._deferred_binding_stack[-1].get() if "function" in self._container_stack else self._runtime_module_bindings
         if in_class_body:
             # The class dict is consulted first, so a name the body bound
             # BEFORE this statement (and never deletes) shadows the enclosing
@@ -1440,7 +1563,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         state = self._snapshot_state()
         if deferred:
             self._merge_deferred_bindings(
-                self._deferred_binding_stack[-1] if "function" in self._container_stack else self._runtime_module_bindings
+                self._deferred_binding_stack[-1].get() if "function" in self._container_stack else self._runtime_module_bindings
             )
         self.visit(annotation)
         self._restore_state(state)
