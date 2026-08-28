@@ -69,7 +69,17 @@ def warn_if_not_reasoning_capable(*, model: str, role: str, effort: str) -> None
         import litellm
 
         capable = bool(litellm.supports_reasoning(model=model))
-    except Exception:  # registry lookup is advisory; never block boot
+    except Exception as registry_failure:  # registry lookup is advisory; never block boot
+        # This function's only product is an operator advisory, so a failure
+        # here has no committed outcome to fall back on. Record the failure
+        # class (never the exception text, which can carry provider or path
+        # detail) so an unavailable registry is visible rather than silent.
+        _logger.warning(
+            "composer %s reasoning-capability check for model %r could not run (%s); the reasoning effort hint is applied regardless",
+            role,
+            model,
+            type(registry_failure).__name__,
+        )
         return
     if not capable:
         _logger.warning(

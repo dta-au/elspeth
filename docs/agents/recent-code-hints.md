@@ -820,6 +820,48 @@ is a working document under the normal delivery posture.
   src/ tests/` is the check; "closed" in a docstring means no PRODUCTION
   variant, not no subclass.
 
+- **2026-08-29 — tier_model R8 EXEMPTS `d.setdefault(k, []).append(v)` but
+  fires on the same call the moment its result is bound to a name.** The rule
+  has an explicit carve-out, `_is_immediate_setdefault_grouping_call`, for the
+  grouping idiom where the `setdefault` is the receiver of an immediate
+  `.append`/`.extend`. So in one accumulator loop
+  `consumers.setdefault(name, []).append(identity)` is silent while
+  `destinations = consumers.setdefault(name, [])` two lines above it is an R8 —
+  which reads as rule noise until you know the carve-out exists. Measured in
+  B50 on `web/composer/guided/connection_consumers.py`, where the assigned form
+  was there only because the loop de-duplicates (`if identity not in
+  destinations`) and so cannot chain. The removal is the membership form the
+  brief already prefers — `if k not in d: d[k] = []` then `d[k]` — not a
+  `defaultdict` (which re-hides the missing key on READ) and not a rewrite of
+  the neighbouring chained calls, which are exempt and must be left alone.
+  Corollary: an R8 on an accumulator seed is usually a real removal candidate,
+  unlike an R8 on a lookup, so check whether the site chains before writing a
+  rationale for it.
+
+- **2026-08-29 — for a best-effort telemetry emit, the operator-SIGNED
+  precedent is `web/composer/telemetry_phase8.py`, and the rationale ground is
+  audit primacy, NOT a new log line.** `config/cicd/enforce_tier_model/web.yaml`
+  carries a per-file R4 `pattern:` entry for that module covering all its
+  `record_*` helpers, whose reason is: telemetry is best-effort, a broken OTel
+  exporter must not fail a request whose audit row already wrote, and the
+  `_assert_*` programmer-error guards fire BEFORE the `try` so input validation
+  still crashes loudly. Any sibling emitter with that shape
+  (`web/composer/tutorial_telemetry.py`, `advisor_checkpoint_telemetry.py`)
+  should be rationalised against that adjudicated pattern rather than grown a
+  divergent convention — adding structlog to one counter helper removes no
+  finding and leaves two shapes for one mechanism. The one thing worth CHANGING
+  at these sites is guard ordering: hoist any ELSPETH-OWNED call out of the
+  swallowed region so its programmer errors propagate. In
+  `advisor_checkpoint_telemetry.record_advisor_checkpoint_pass` the owned
+  `stable_hash` was being computed inside `with suppress(Exception)` around the
+  `slog.info` emit, so a canonicalization `ValueError`/`TypeError` about our own
+  payload was indistinguishable from an exporter outage; binding
+  `findings_hash` above the `suppress` fixes that and costs one line. Use the
+  same test to decide whether a swallow needs a `TIER_1_ERRORS` re-raise arm at
+  all: if the protected body contains no owned call (a bare `counter.add`, a
+  third-party registry lookup), no Tier-1 error can originate there and the arm
+  would be dead code — say so in the rationale instead of writing it.
+
 - **2026-08-28 — `.pre-commit-config.yaml` lint hooks are pinned by
   `tests/unit/elspeth_lints/test_pre_commit_triggers.py`** (elspeth-7e8bf1c28b).
   Three whole-config contracts: (1) a `--files` hook may select ONLY
