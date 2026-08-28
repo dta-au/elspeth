@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, cast
 
 from elspeth.contracts.hashing import stable_hash
 from elspeth.engine._error_hash import compute_error_hash
@@ -44,20 +46,27 @@ def parse_diversion_attribution(
     diverted_ordinals: Sequence[int],
 ) -> tuple[DiversionAttribution, ...]:
     """Validate an exact, ordered, one-for-one diverted-member attribution."""
-    if not isinstance(value, (list, tuple)):
+    if type(value) not in {list, tuple}:
         raise ValueError("diversion attribution must be an ordered sequence")
+    entries = cast("list[object] | tuple[object, ...]", value)
     result: list[DiversionAttribution] = []
-    for item in value:
-        if isinstance(item, DiversionAttribution):
+    for item in entries:
+        if type(item) is DiversionAttribution:
             ordinal = item.ordinal
             reason_hash = item.reason_hash
             error_hash = item.error_hash
         else:
-            if not isinstance(item, Mapping) or set(item) != {"error_hash", "ordinal", "reason_hash"}:
+            # A sink authors attribution as plain dicts (as_mapping); persisted
+            # plan evidence comes back deep-frozen as MappingProxyType. No other
+            # mapping type is a member of either domain.
+            if type(item) not in {dict, MappingProxyType}:
                 raise ValueError("diversion attribution entries must have the exact closed field set")
-            ordinal = item["ordinal"]
-            reason_hash = item["reason_hash"]
-            error_hash = item["error_hash"]
+            entry = cast("Mapping[str, Any]", item)
+            if set(entry) != {"error_hash", "ordinal", "reason_hash"}:
+                raise ValueError("diversion attribution entries must have the exact closed field set")
+            ordinal = entry["ordinal"]
+            reason_hash = entry["reason_hash"]
+            error_hash = entry["error_hash"]
         if type(ordinal) is not int or ordinal < 0:
             raise ValueError("diversion attribution ordinal must be a non-negative exact integer")
         if not _is_lower_hex(reason_hash, length=64):

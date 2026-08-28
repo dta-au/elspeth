@@ -94,7 +94,7 @@ class TextSink(BaseSink):
     name = "text"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:62b478f33fc425f8"
+    source_file_hash: str | None = "sha256:a05fe58b8a67b5a3"
     config_model = TextSinkConfig
     supports_resume = True
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -237,9 +237,12 @@ class TextSink(BaseSink):
                 yield from iter_path_chunks(target)
             missing = object()
             for snapshot_member in emitted_members:
-                current_member = current_by_effect_id.get(snapshot_member.member_effect_id)
+                # A predecessor snapshot member is not in this effect's members:
+                # it re-emits but has no ordinal here to accept or divert.
+                member_effect_id = snapshot_member.member_effect_id
+                current_member = current_by_effect_id[member_effect_id] if member_effect_id in current_by_effect_id else None
                 row = deep_thaw(snapshot_member.row)
-                value = row.get(self._field, missing)
+                value = row[self._field] if self._field in row else missing
                 reason: str | None = None
                 encoded: bytes | None = None
                 if type(value) is not str:

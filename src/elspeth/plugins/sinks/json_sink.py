@@ -167,7 +167,7 @@ class JSONSink(BaseSink):
     name = "json"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d256471d62211308"
+    source_file_hash: str | None = "sha256:2629742182442969"
     config_model = JSONSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -467,7 +467,10 @@ class JSONSink(BaseSink):
             source_rows = [deep_thaw(member.row) for member in emitted_members]
             output_rows = apply_display_headers(self, source_rows)
             for snapshot_member, original, output in zip(emitted_members, source_rows, output_rows, strict=True):
-                current_member = current_by_effect_id.get(snapshot_member.member_effect_id)
+                # A predecessor snapshot member is not in this effect's members:
+                # it re-emits but has no ordinal here to accept or divert.
+                member_effect_id = snapshot_member.member_effect_id
+                current_member = current_by_effect_id[member_effect_id] if member_effect_id in current_by_effect_id else None
                 try:
                     serialized = json.dumps(output, indent=self._indent if self._format == "json" else None, allow_nan=False)
                     serialized.encode(self._encoding)
