@@ -1082,7 +1082,7 @@ def _execute_create_blob(
         # receive the safe field-specific allowlist diagnostic rather than a
         # generic model-shape failure. Non-string values remain structural
         # model errors.
-        raw_mime_type = arguments.get("mime_type")
+        raw_mime_type = arguments["mime_type"] if "mime_type" in arguments else None
         if type(raw_mime_type) is str and any(
             tuple(error["loc"]) == ("mime_type",) and error["type"] == "literal_error" for error in exc.errors(include_input=False)
         ):

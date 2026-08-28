@@ -331,7 +331,9 @@ def deferred_intent_management_action_from_dict(value: object) -> DeferredIntent
     try:
         if type(value) is not dict:
             raise InvariantError("deferred intent management action must be an exact dict")
-        action = value.get("action")
+        if "action" not in value:
+            raise InvariantError("deferred intent management action is missing its action discriminator")
+        action = value["action"]
         if action == "cancel":
             if set(value) != {"action", "intent_id", "selection_token"}:
                 raise InvariantError("deferred intent cancel action has an invalid exact keyset")
@@ -434,11 +436,13 @@ def _validate_catalog_identity(
 
 def _stable_option_plugin_identity(subject: StableSubject, guided: GuidedSession) -> tuple[PluginKind, str] | None:
     if subject.component_kind == "source":
-        reviewed_source = guided.reviewed_sources.get(subject.stable_id)
-        return ("source", reviewed_source.plugin) if reviewed_source is not None else None
+        if subject.stable_id not in guided.reviewed_sources:
+            return None
+        return ("source", guided.reviewed_sources[subject.stable_id].plugin)
     if subject.component_kind == "output":
-        reviewed_output = guided.reviewed_outputs.get(subject.stable_id)
-        return ("sink", reviewed_output.plugin) if reviewed_output is not None else None
+        if subject.stable_id not in guided.reviewed_outputs:
+            return None
+        return ("sink", guided.reviewed_outputs[subject.stable_id].plugin)
     return None
 
 
@@ -478,7 +482,6 @@ _SCHEMA_ANNOTATION_KEYS = frozenset(
         "writeOnly",
     }
 )
-_MISSING_SCHEMA_KEY = object()
 
 
 def _schema_resource(schema: _SchemaNode) -> Resource[_SchemaNode]:
@@ -572,9 +575,9 @@ def _option_schema_node(root: _ResolvedSchemaNode, option_path: tuple[str, ...])
             return None
         if type(resolved.schema) is bool:
             return None
-        properties = resolved.schema.get("properties", _MISSING_SCHEMA_KEY)
-        if properties is _MISSING_SCHEMA_KEY:
+        if "properties" not in resolved.schema:
             return None
+        properties = resolved.schema["properties"]
         if type(properties) is not dict:
             raise InvariantError("plugin option schema properties declaration is malformed")
         if segment not in properties:
@@ -1145,9 +1148,10 @@ def _finite_scalar_domain(
             _append_exact_scalar(enum_domain, item)
         candidates.append(tuple(enum_domain))
 
-    type_domain = _finite_type_domain(node.get("type"))
-    if type_domain is not None:
-        candidates.append(type_domain)
+    if "type" in node:
+        type_domain = _finite_type_domain(node["type"])
+        if type_domain is not None:
+            candidates.append(type_domain)
 
     if not candidates:
         return None
@@ -1873,15 +1877,16 @@ class _DeferredCoverageContext:
 
     def resolve(self, subject: StableSubject | PluginSubject) -> _SubjectResolution:
         if type(subject) is StableSubject:
-            exact = self.exact_components.get((subject.component_kind, subject.stable_id))
-            components = (exact,) if exact is not None else ()
+            stable_key = (subject.component_kind, subject.stable_id)
+            components = (self.exact_components[stable_key],) if stable_key in self.exact_components else ()
             return _SubjectResolution(components=components)
         plugin_subject = cast(PluginSubject, subject)
         component_kind = cast(
             Literal["source", "node", "output"],
             {"source": "source", "transform": "node", "sink": "output"}[plugin_subject.plugin_kind],
         )
-        exact = self.exact_components.get((component_kind, plugin_subject.subject_id))
+        exact_key = (component_kind, plugin_subject.subject_id)
+        exact = self.exact_components[exact_key] if exact_key in self.exact_components else None
         matches = tuple(
             component
             for component in self.components
@@ -1941,7 +1946,8 @@ class _DeferredCoverageContext:
                 connections = {node.on_error} if node.on_error is not None else set()
             elif edge_type in {"route_true", "route_false"}:
                 key = "true" if edge_type == "route_true" else "false"
-                value = dict(node.routes or {}).get(key)
+                routes = dict(node.routes or {})
+                value = routes[key] if key in routes else None
                 connections = {value} if value is not None and value != "fork" else set()
             else:
                 connections = set(node.fork_to or ()) if edge_type == "fork" else set()
@@ -1961,7 +1967,11 @@ class _DeferredCoverageContext:
         # claiming it.
         own_identity = (component.kind, component.stable_id)
         return {
-            destination for connection in connections for destination in self.consumers.get(connection, ()) if destination != own_identity
+            destination
+            for connection in connections
+            if connection in self.consumers
+            for destination in self.consumers[connection]
+            if destination != own_identity
         }
 
     def exclusively_reached_gate(self, subject: _CandidateComponent) -> _CandidateComponent | None:
@@ -2113,7 +2123,7 @@ def _coverage_context(candidate: CompositionState, reviewed_guided: GuidedSessio
         components.append(
             _CandidateComponent(
                 kind="source",
-                stable_id=source_ids.get(name, name),
+                stable_id=source_ids[name] if name in source_ids else name,
                 name=name,
                 plugin_kind="source",
                 plugin=source.plugin,
@@ -2137,7 +2147,7 @@ def _coverage_context(candidate: CompositionState, reviewed_guided: GuidedSessio
         components.append(
             _CandidateComponent(
                 kind="output",
-                stable_id=output_ids.get(output.name, output.name),
+                stable_id=output_ids[output.name] if output.name in output_ids else output.name,
                 name=output.name,
                 plugin_kind="sink",
                 plugin=output.plugin,
@@ -2152,7 +2162,9 @@ def _coverage_context(candidate: CompositionState, reviewed_guided: GuidedSessio
         consumers = canonical_connection_consumers(
             candidate,
             node_identities={node.id: node.id for node in candidate.nodes},
-            output_identities={output.name: output_ids.get(output.name, output.name) for output in candidate.outputs},
+            output_identities={
+                output.name: output_ids[output.name] if output.name in output_ids else output.name for output in candidate.outputs
+            },
         )
     except ValueError as exc:
         raise InvariantError("guided candidate canonical consumer identities are malformed") from exc
