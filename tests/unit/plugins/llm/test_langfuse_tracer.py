@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.transforms.llm.langfuse import (
     ActiveLangfuseTracer,
@@ -34,8 +35,11 @@ _OPERATION_PARENT = LLMAuditParent.for_operation(operation_id="operation-1")
 @dataclass
 class FakeGeneration:
     update_calls: list[dict[str, Any]] = field(default_factory=list)
+    update_error: Exception | None = None
 
     def update(self, **kwargs: Any) -> None:
+        if self.update_error is not None:
+            raise self.update_error
         self.update_calls.append(kwargs)
 
 
@@ -395,3 +399,114 @@ class TestActiveLangfuseTracer:
             mock_handler.assert_called_once()
             assert mock_handler.call_args[0][0] == "langfuse_flush_failed"
             assert isinstance(mock_handler.call_args[0][2], RuntimeError)
+
+
+# ── Containment policy: only TIER_1_ERRORS escape the SDK boundary ─────────
+
+
+_SDK_DRIFT_ERRORS = (
+    TypeError("update() got an unexpected keyword argument 'usage_details'"),
+    AttributeError("'Langfuse' object has no attribute 'start_as_current_observation'"),
+    KeyError("trace_id"),
+    NameError("name 'otel' is not defined"),
+)
+
+
+class TestSdkBoundaryContainment:
+    """An exception raised INSIDE the Langfuse SDK is a Tier-3 provider failure
+    whatever its Python class; only ELSPETH's own TIER_1_ERRORS propagate
+    (elspeth-a1ab69607a).
+    """
+
+    @pytest.mark.parametrize("sdk_error", _SDK_DRIFT_ERRORS, ids=lambda e: type(e).__name__)
+    def test_sdk_error_inside_generation_update_is_contained_and_recorded(self, sdk_error: Exception) -> None:
+        client = FakeLangfuseClient(generation=FakeGeneration(update_error=sdk_error))
+        tracer = ActiveLangfuseTracer(transform_name="test_transform", client=client)
+
+        with patch("elspeth.plugins.transforms.llm.langfuse.logger") as mock_logger:
+            tracer.record_success(
+                parent=_ROW_PARENT,
+                query_name="classify",
+                prompt="test",
+                response_content="result",
+                model="gpt-4",
+                usage=TokenUsage.known(10, 20),
+            )
+
+        # The row proceeds (no raise) AND the loss is recorded with the traceback.
+        mock_logger.warning.assert_called_once()
+        args, kwargs = mock_logger.warning.call_args
+        assert args == ("langfuse_trace_failed",)
+        assert kwargs["plugin"] == "test_transform"
+        assert kwargs["error_type"] == type(sdk_error).__name__
+        assert kwargs["exc_info"] is True
+
+    def test_sdk_type_error_inside_error_trace_is_contained_and_recorded(self) -> None:
+        client = FakeLangfuseClient(generation=FakeGeneration(update_error=TypeError("unexpected keyword argument 'level'")))
+        tracer = ActiveLangfuseTracer(transform_name="test_transform", client=client)
+
+        with patch("elspeth.plugins.transforms.llm.langfuse.logger") as mock_logger:
+            tracer.record_error(
+                parent=_ROW_PARENT,
+                query_name="classify",
+                prompt="test",
+                error_message="rate limited",
+                model="gpt-4",
+            )
+
+        mock_logger.warning.assert_called_once()
+        args, kwargs = mock_logger.warning.call_args
+        assert args == ("langfuse_error_trace_failed",)
+        assert kwargs["error_type"] == "TypeError"
+        assert kwargs["exc_info"] is True
+
+    def test_sdk_attribute_error_inside_flush_is_contained_and_recorded(self) -> None:
+        client = FakeLangfuseClient(flush_error=AttributeError("'Langfuse' object has no attribute 'flush'"))
+        tracer = ActiveLangfuseTracer(transform_name="test_transform", client=client)
+
+        with patch("elspeth.plugins.transforms.llm.langfuse.logger") as mock_logger:
+            tracer.flush()
+
+        mock_logger.warning.assert_called_once()
+        args, kwargs = mock_logger.warning.call_args
+        assert args == ("langfuse_flush_failed",)
+        assert kwargs["error_type"] == "AttributeError"
+        assert kwargs["exc_info"] is True
+
+    def test_tier_1_error_inside_record_success_propagates(self) -> None:
+        assert issubclass(contract_errors.FrameworkBugError, contract_errors.TIER_1_ERRORS)
+        client = FakeLangfuseClient(start_error=contract_errors.FrameworkBugError("invariant broken"))
+        tracer = ActiveLangfuseTracer(transform_name="test_transform", client=client)
+
+        with (
+            patch("elspeth.plugins.transforms.llm.langfuse.logger") as mock_logger,
+            pytest.raises(contract_errors.FrameworkBugError, match="invariant broken"),
+        ):
+            tracer.record_success(
+                parent=_ROW_PARENT,
+                query_name="classify",
+                prompt="test",
+                response_content="result",
+                model="gpt-4",
+            )
+        mock_logger.warning.assert_not_called()
+
+    def test_tier_1_error_inside_record_error_propagates(self) -> None:
+        client = FakeLangfuseClient(generation=FakeGeneration(update_error=contract_errors.AuditIntegrityError("audit broken")))
+        tracer = ActiveLangfuseTracer(transform_name="test_transform", client=client)
+
+        with pytest.raises(contract_errors.AuditIntegrityError, match="audit broken"):
+            tracer.record_error(
+                parent=_ROW_PARENT,
+                query_name="classify",
+                prompt="test",
+                error_message="rate limited",
+                model="gpt-4",
+            )
+
+    def test_tier_1_error_inside_flush_propagates(self) -> None:
+        client = FakeLangfuseClient(flush_error=contract_errors.FrameworkBugError("invariant broken"))
+        tracer = ActiveLangfuseTracer(transform_name="test_transform", client=client)
+
+        with pytest.raises(contract_errors.FrameworkBugError, match="invariant broken"):
+            tracer.flush()
