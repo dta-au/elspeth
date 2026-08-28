@@ -635,7 +635,14 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # surface excludes audit_records, and no snapshot contains either hash — so
 # this is a manifest byte correction, NOT a re-freeze, and needs no ruling of
 # the kind META-39/META-41 required for locked-in-buggy oracle semantics.
-EXPECTED_CASE_REGISTRY_SHA256 = "c6d94417cd643634253a3eb0c387de94605ce5c7d2230b827352741cee5cfe3a"
+# Rotated 2026-08-29 for the tier burn-down (elspeth-e66805647c): a PLUGIN
+# PROVENANCE rotation, not a semantic one. json_sink.py replaced a dict.get()
+# with a membership-form read, so its source_file_hash moved
+# (d256471d62211308 -> 2629742182442969, recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash); the manifest's 15
+# literal pins and reopen-resume's resumed_full_projection_sha256 were re-pinned
+# first, then this digest. No oracle_freeze snapshot moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "2de4dc3cd4dd5bc128db2a0f7b4512f8a2360c699219489491e35ba257080f36"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -283,7 +283,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:034b82b4ebab232d"
+    source_file_hash: str | None = "sha256:2b76d08ac316a480"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -332,8 +332,10 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
         del cls
         if purpose is SinkEffectExecutionPurpose.AUDIT_EXPORT:
             return None
-        mode = config.get("mode", "upsert")
-        return ResolvedSinkEffectMode(mode) if isinstance(mode, str) else None
+        mode: object = "upsert"
+        if "mode" in config:
+            mode = config["mode"]
+        return ResolvedSinkEffectMode(mode) if type(mode) is str else None
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

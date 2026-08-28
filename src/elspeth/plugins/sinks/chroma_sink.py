@@ -213,7 +213,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b0ef6bed1e358725"
+    source_file_hash: str | None = "sha256:4a1d0b1cd65b1f8d"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -363,25 +363,25 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
         return hashlib.sha256(payload_bytes).hexdigest(), len(payload_bytes)
 
     def _extract_effect_member(self, member: SinkEffectMember) -> tuple[str, str, dict[str, object] | None]:
+        # SinkEffectMember.__post_init__ freezes row as a mapping, so the thaw
+        # is a dict by construction.
         row = deep_thaw(member.row)
-        if not isinstance(row, dict):  # pragma: no cover - member contract guarantees a mapping
-            raise FrameworkBugError("Chroma effect member row is not an object")
         fm = self._config.field_mapping
         try:
             raw_id = row[fm.id_field]
             raw_document = row[fm.document_field]
         except KeyError as exc:
             raise ValueError(f"Chroma effect member is missing required field {exc.args[0]!r}") from exc
-        if not isinstance(raw_id, str) or not isinstance(raw_document, str):
+        if type(raw_id) is not str or type(raw_document) is not str:
             raise ValueError("Chroma effect member id and document fields must be strings")
         metadata: dict[str, object] = {}
         for field_name in fm.metadata_fields:
             if field_name not in row:
                 continue
             value = row[field_name]
-            if value is not None and not isinstance(value, (str, int, float, bool)):
+            if value is not None and type(value) not in {str, int, float, bool}:
                 raise ValueError(f"Chroma effect member metadata field {field_name!r} is not a supported scalar")
-            if isinstance(value, float) and not math.isfinite(value):
+            if type(value) is float and not math.isfinite(value):
                 raise ValueError(f"Chroma effect member metadata field {field_name!r} must be finite")
             metadata[field_name] = value
         if not metadata:
@@ -509,7 +509,6 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
         diversion_attribution = []
         for ordinal, reason in diversions:
             row = deep_thaw(member_by_ordinal[ordinal].row)
-            assert isinstance(row, dict)
             # Live diversion log BEFORE the plan binds: fails closed with
             # FrameworkBugError when no on_write_failure policy is configured.
             self._divert_row(row, row_index=ordinal, reason=reason)

@@ -112,7 +112,7 @@ class DocumentSink(BaseSink):
     name = "document"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c51c758692a1be69"
+    source_file_hash: str | None = "sha256:f98cae971ef1fc89"
     config_model = DocumentSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -256,10 +256,13 @@ class DocumentSink(BaseSink):
 
         if publishable:
             snapshot_member = emitted_members[0]
-            current_member = current_by_effect_id.get(snapshot_member.member_effect_id)
+            # A predecessor snapshot member is not in this effect's members:
+            # it re-emits but has no ordinal here to accept or divert.
+            member_effect_id = snapshot_member.member_effect_id
+            current_member = current_by_effect_id[member_effect_id] if member_effect_id in current_by_effect_id else None
             row = deep_thaw(snapshot_member.row)
             missing = object()
-            value = row.get(self._field, missing)
+            value = row[self._field] if self._field in row else missing
             reason: str | None = None
             if type(value) is not str:
                 reason = f"Document field {self._field!r} must be a string"
