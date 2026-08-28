@@ -2663,6 +2663,18 @@ def test_deferred_intent_management_decoder_rejects_every_malformed_shape(payloa
         deferred_intent_management_action_from_dict(payload)
 
 
+def test_deferred_intent_management_decoder_names_a_missing_action_discriminator() -> None:
+    """A cancel payload that is complete except for ``action`` is a missing-key shape error.
+
+    The decoder reads ``action`` in membership form (``"action" in value`` then
+    ``value["action"]``) rather than ``.get``; the absent key must surface as
+    its own diagnostic instead of silently decoding as an unsupported ``None``.
+    """
+
+    with pytest.raises(DeferredIntentManagementActionShapeError, match="missing its action discriminator"):
+        deferred_intent_management_action_from_dict({"intent_id": INTENT_ID, "selection_token": SELECTION_TOKEN})
+
+
 def test_create_deferred_clarification_intent_is_constraint_free_and_prose_free() -> None:
     """Last-resort retention (R2-F15): durable, unclaimable, no user prose.
 
