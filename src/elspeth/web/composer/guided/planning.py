@@ -20,7 +20,7 @@ from pydantic import JsonValue
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
-from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver
 from elspeth.web.composer.guided.connection_consumers import canonical_connection_consumers
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError, evaluate_deferred_intent_coverage
@@ -54,7 +54,7 @@ from elspeth.web.composer.guided_blob_refs import (
 )
 from elspeth.web.composer.pipeline_proposal import PipelineProposal
 from elspeth.web.composer.reviewed_output_projection import ReviewedOutputProjectionConflict, reviewed_output_projection_conflict
-from elspeth.web.composer.state import CompositionState, NodeSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, _coalesce_branch_connections, _coalesce_branch_names
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 
 slog = structlog.get_logger()
@@ -367,11 +367,20 @@ def _wire_target_fingerprint(
 ) -> str | None:
     """Fingerprint selected public semantics independent of regenerated IDs."""
 
-    raw_collection = payload.get(collection)
+    if collection not in payload:
+        return None
+    raw_collection = payload[collection]
     if type(raw_collection) is not list or index >= len(raw_collection) or type(raw_collection[index]) is not dict:
         return None
     component = cast(dict[str, Any], deep_thaw(raw_collection[index]))
-    stable_id = component.pop("stable_id", None)
+    # The wire projection stamps a stable_id on every component and every
+    # connection (the identity walk below rejects a component without one, and
+    # a connection is only ever selected BY its stable_id), so the key is a
+    # required member of this server-authored payload, never an optional one.
+    if "stable_id" not in component:
+        raise AuditIntegrityError("guided correction wire projection has malformed stable identities")
+    stable_id = component["stable_id"]
+    del component["stable_id"]
 
     authority_keys = {
         "source": tuple(authority.sources),
@@ -380,12 +389,14 @@ def _wire_target_fingerprint(
     }
     identities: dict[tuple[str, str], str] = {}
     for component_kind, collection_name in (("source", "sources"), ("node", "nodes"), ("output", "outputs")):
-        values = payload.get(collection_name)
+        if collection_name not in payload or type(payload[collection_name]) is not list:
+            raise AuditIntegrityError("guided correction wire projection lost identity collections")
+        values = payload[collection_name]
         keys = authority_keys[component_kind]
-        if type(values) is not list or len(values) != len(keys):
+        if len(values) != len(keys):
             raise AuditIntegrityError("guided correction wire projection lost identity collections")
         for position, value in enumerate(values):
-            if type(value) is not dict or type(value.get("stable_id")) is not str:
+            if type(value) is not dict or "stable_id" not in value or type(value["stable_id"]) is not str:
                 raise AuditIntegrityError("guided correction wire projection has malformed stable identities")
             identities[(component_kind, value["stable_id"])] = keys[position]
 
@@ -399,43 +410,47 @@ def _wire_target_fingerprint(
         # binding check below — the very check that ties an LLM-authored
         # endpoint back to reviewed authority — while a merely wrong endpoint
         # raises.
-        if type(value) is not dict:
+        if type(value) is not dict or "kind" not in value:
             raise AuditIntegrityError("guided correction wire edge has a missing or malformed endpoint")
-        kind = value.get("kind")
-        endpoint_id = value.get("stable_id")
+        kind = value["kind"]
         if kind == "discard":
             return {"kind": "discard"}
-        if type(kind) is not str or type(endpoint_id) is not str or (kind, endpoint_id) not in identities:
+        if type(kind) is not str or "stable_id" not in value:
+            raise AuditIntegrityError("guided correction wire edge has an unbound endpoint")
+        endpoint_id = value["stable_id"]
+        if type(endpoint_id) is not str or (kind, endpoint_id) not in identities:
             raise AuditIntegrityError("guided correction wire edge has an unbound endpoint")
         return {"kind": kind, "key": identities[(kind, endpoint_id)]}
 
     if collection == "connections":
-        from_ep = component.get("from_endpoint")
-        to_ep = component.get("to_endpoint")
-        if from_ep is None:
+        if "from_endpoint" not in component:
             raise AuditIntegrityError("guided correction wire connection is missing from_endpoint")
-        if to_ep is None:
+        if "to_endpoint" not in component:
             raise AuditIntegrityError("guided correction wire connection is missing to_endpoint")
-        component["from_endpoint"] = normalize_endpoint(from_ep)
-        component["to_endpoint"] = normalize_endpoint(to_ep)
+        component["from_endpoint"] = normalize_endpoint(component["from_endpoint"])
+        component["to_endpoint"] = normalize_endpoint(component["to_endpoint"])
     else:
-        connections = payload.get("connections")
-        if type(connections) is not list:
+        if "connections" not in payload or type(payload["connections"]) is not list:
             raise AuditIntegrityError("guided correction wire projection lost connections")
         incident = []
-        for connection in connections:
+        for connection in payload["connections"]:
             if type(connection) is not dict:
                 raise AuditIntegrityError("guided correction wire projection has a malformed connection")
-            origin = connection.get("from_endpoint")
-            destination = connection.get("to_endpoint")
-            is_origin = type(origin) is dict and origin.get("stable_id") == stable_id
-            is_destination = type(destination) is dict and destination.get("stable_id") == stable_id
-            if not is_origin and not is_destination:
-                continue
             normalized = cast(dict[str, Any], deep_thaw(connection))
-            normalized.pop("stable_id", None)
-            normalized["from_endpoint"] = normalize_endpoint(normalized.get("from_endpoint"))
-            normalized["to_endpoint"] = normalize_endpoint(normalized.get("to_endpoint"))
+            for endpoint_key in ("from_endpoint", "to_endpoint"):
+                if endpoint_key not in normalized or type(normalized[endpoint_key]) is not dict:
+                    raise AuditIntegrityError(f"guided correction wire connection is missing {endpoint_key}")
+            if "stable_id" not in normalized:
+                raise AuditIntegrityError("guided correction wire projection has malformed stable identities")
+            is_incident = any(
+                "stable_id" in normalized[endpoint_key] and normalized[endpoint_key]["stable_id"] == stable_id
+                for endpoint_key in ("from_endpoint", "to_endpoint")
+            )
+            if not is_incident:
+                continue
+            del normalized["stable_id"]
+            normalized["from_endpoint"] = normalize_endpoint(normalized["from_endpoint"])
+            normalized["to_endpoint"] = normalize_endpoint(normalized["to_endpoint"])
             incident.append(normalized)
         component["incident_connections"] = incident
     return stable_hash(component)
@@ -731,13 +746,16 @@ def resolve_guided_correction_target(
     """Resolve one exact public stable ID without inventing private edge identity."""
 
     def resolve_owner(kind: str, stable_id: str) -> tuple[Literal["source", "node", "output"], str, int]:
-        collection_name = {"source": "sources", "node": "nodes", "output": "outputs"}.get(kind)
-        if collection_name is None:
+        collection_by_kind = {"source": "sources", "node": "nodes", "output": "outputs"}
+        if kind not in collection_by_kind:
             raise AuditIntegrityError("guided correction edge has an unsupported origin kind")
-        components = wire_payload.get(collection_name)
-        if type(components) is not list:
+        collection_name = collection_by_kind[kind]
+        if collection_name not in wire_payload or type(wire_payload[collection_name]) is not list:
             raise AuditIntegrityError("guided correction wire projection lost a component collection")
-        positions = [index for index, item in enumerate(components) if type(item) is dict and item.get("stable_id") == stable_id]
+        components = wire_payload[collection_name]
+        positions = [
+            index for index, item in enumerate(components) if type(item) is dict and "stable_id" in item and item["stable_id"] == stable_id
+        ]
         if len(positions) != 1:
             raise AuditIntegrityError("guided correction stable target does not resolve exactly once")
         index = positions[0]
@@ -758,14 +776,16 @@ def resolve_guided_correction_target(
     edge_preserved_fingerprint: str | None = None
     edge_sibling_fingerprints: tuple[str, ...] = ()
     if requested.kind == "edge":
-        connections = wire_payload.get("connections")
-        if type(connections) is not list:
+        if "connections" not in wire_payload or type(wire_payload["connections"]) is not list:
             raise AuditIntegrityError("guided correction wire projection lost connections")
-        matches = [item for item in connections if type(item) is dict and item.get("stable_id") == requested.stable_id]
-        if len(matches) != 1 or type(matches[0].get("from_endpoint")) is not dict:
+        connections = wire_payload["connections"]
+        matches = [item for item in connections if type(item) is dict and "stable_id" in item and item["stable_id"] == requested.stable_id]
+        if len(matches) != 1 or "from_endpoint" not in matches[0] or type(matches[0]["from_endpoint"]) is not dict:
             raise AuditIntegrityError("guided correction edge target differs from private authority")
         origin = matches[0]["from_endpoint"]
-        owner_kind, owner_key, _owner_index = resolve_owner(origin.get("kind"), origin.get("stable_id"))
+        if "kind" not in origin or "stable_id" not in origin:
+            raise AuditIntegrityError("guided correction edge origin endpoint is malformed")
+        owner_kind, owner_key, _owner_index = resolve_owner(origin["kind"], origin["stable_id"])
         collection_index = connections.index(matches[0])
         collection: Literal["sources", "nodes", "connections", "outputs"] = "connections"
         authority_key = None
@@ -793,10 +813,13 @@ def resolve_guided_correction_target(
             collection = "nodes"
         else:
             collection = "outputs"
-        components = wire_payload.get(collection)
-        if type(components) is not list or type(components[collection_index]) is not dict:
+        if (
+            collection not in wire_payload
+            or type(wire_payload[collection]) is not list
+            or type(wire_payload[collection][collection_index]) is not dict
+        ):
             raise AuditIntegrityError("guided correction target differs from public wire authority")
-        public_target = components[collection_index]
+        public_target = wire_payload[collection][collection_index]
     before_fingerprint = _wire_target_fingerprint(
         wire_payload,
         collection=collection,
@@ -806,9 +829,9 @@ def resolve_guided_correction_target(
     if before_fingerprint is None:
         raise AuditIntegrityError("guided correction target owner is absent from wire authority")
     if requested.kind == "edge":
-        edge_connections = wire_payload.get("connections")
-        if type(edge_connections) is not list:
+        if "connections" not in wire_payload or type(wire_payload["connections"]) is not list:
             raise AuditIntegrityError("guided correction wire projection lost connections")
+        edge_connections = wire_payload["connections"]
         matching_fingerprints = sum(
             _wire_target_fingerprint(
                 wire_payload,
@@ -894,9 +917,9 @@ def require_guided_correction_target_changed(
     """Reject a plan that edited elsewhere while leaving exact target semantics intact."""
 
     if target.requested.kind == "edge":
-        connections = wire_payload.get("connections")
-        if type(connections) is not list:
+        if "connections" not in wire_payload or type(wire_payload["connections"]) is not list:
             raise AuditIntegrityError("guided correction successor lost public connections")
+        connections = wire_payload["connections"]
         fingerprints = tuple(
             _wire_target_fingerprint(
                 wire_payload,
@@ -2358,11 +2381,7 @@ def _predecessor_reference_names(predecessor: CompositionState) -> set[str]:
             names.update(value for value in node.routes.values() if type(value) is str)
         if node.fork_to is not None:
             names.update(value for value in node.fork_to if type(value) is str)
-        branches = node.branches
-        if isinstance(branches, Mapping):
-            names.update(value for value in branches.values() if type(value) is str)
-        elif branches is not None:
-            names.update(value for value in branches if type(value) is str)
+        names.update(value for value in _coalesce_branch_connections(node.branches) if type(value) is str)
     return names
 
 
@@ -2543,6 +2562,24 @@ def _reviewed_output_projection_conflict_for_bound_candidate(
     return ReviewedOutputProjectionConflict(tuple(missing_fields))
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "guided-planner LLM-authored candidate pipeline (the terminal set_pipeline tool call's topology), "
+        "after server-side deep_thaw and before any reviewed source/output authority is restored"
+    ),
+    source_param="pipeline",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises GuidedCandidateBindingRejected (the binder's typed integrity rejection, carrying one closed repair "
+        "error_code and candidate-authored connectivity facts) for every candidate whose sources, outputs, node identities, "
+        "output aliases, or routing references cannot be bound to reviewed authority; never invents a reviewed "
+        "component, a route target, or a default, and returns a GuidedBoundPipeline whose source/output "
+        "configuration is the reviewed authority verbatim"
+    ),
+    test_ref="tests/unit/web/composer/guided/test_bind_reviewed_components.py::test_bind_rejects_unknown_edge_destination",
+    test_fingerprint="03a95b4db1de60f907d7a3b095f34f3cf772b05666df88d48de6232889cb36c9",
+)
 def bind_guided_reviewed_components(
     pipeline: Mapping[str, Any],
     guided: GuidedSession,
@@ -2613,7 +2650,7 @@ def bind_guided_reviewed_components(
                 },
             )
         raw_sources = {source.name: singular}
-        bound.pop("source", None)
+        del bound["source"]
     expected_source_names = [guided.reviewed_sources[stable_id].name for stable_id in guided.source_order]
     if list(raw_sources) != expected_source_names:
         raise GuidedCandidateBindingRejected(
@@ -2756,14 +2793,14 @@ def bind_guided_reviewed_components(
         # Outputs are terminal sinks referenced BY NAME in on_success/on_error
         # routing; rewrite every sibling reference to the renamed reviewed output
         # so the topology stays wired after the name is restored to authority.
-        sources_map = bound.get("sources")
-        if isinstance(sources_map, dict):
-            for member in sources_map.values():
-                if isinstance(member, dict) and member.get("on_success") in output_rename:
-                    member["on_success"] = output_rename[member["on_success"]]
-        singular_source = bound.get("source")
-        if isinstance(singular_source, dict) and singular_source.get("on_success") in output_rename:
-            singular_source["on_success"] = output_rename[singular_source["on_success"]]
+        # ``bound["sources"]`` is the rebound map built above — one
+        # GuidedBoundSource per reviewed source, each with a str on_success —
+        # so it is read as the owned shape it is. A singular ``source`` key
+        # was consumed by the rebinding (deleted once its on_success was
+        # copied), so no singular rename exists after this point.
+        for rebound_source in rebound_sources.values():
+            if rebound_source["on_success"] in output_rename:
+                rebound_source["on_success"] = output_rename[rebound_source["on_success"]]
         topology_nodes = bound.get("nodes")
         if isinstance(topology_nodes, list):
             for topology_node in topology_nodes:
@@ -2817,7 +2854,7 @@ def bind_guided_reviewed_components(
             positions = [
                 index
                 for index, candidate_node in enumerate(raw_nodes)
-                if type(candidate_node) is dict and candidate_node.get("id") == private_node_id
+                if type(candidate_node) is dict and "id" in candidate_node and candidate_node["id"] == private_node_id
             ]
             if len(positions) != 1:
                 selected = private_node_id == selected_node_id
@@ -2851,7 +2888,7 @@ def bind_guided_reviewed_components(
                 )
             candidate_node_type = candidate_node["node_type"] if "node_type" in candidate_node else None
             candidate_plugin = candidate_node["plugin"] if "plugin" in candidate_node else None
-            if candidate_node_type != private_node.get("node_type") or candidate_plugin != private_node.get("plugin"):
+            if candidate_node_type != private_node["node_type"] or candidate_plugin != private_node["plugin"]:
                 # Facts name only what the CANDIDATE supplied: the reviewed
                 # node's own type and plugin reach the provider through
                 # current_state, so the repair reads them there rather than
@@ -2868,11 +2905,11 @@ def bind_guided_reviewed_components(
                 )
             private_options = cast(dict[str, Any], deep_thaw(private_node["options"]))
             candidate_options = cast(dict[str, Any], candidate_node["options"])
-            for key in public_node_option_keys(cast(str | None, private_node.get("plugin"))):
+            for key in public_node_option_keys(cast(str | None, private_node["plugin"])):
                 if key in candidate_options:
                     private_options[key] = deep_thaw(candidate_options[key])
-                else:
-                    private_options.pop(key, None)
+                elif key in private_options:
+                    del private_options[key]
             candidate_node["options"] = private_options
     projection_conflict = _reviewed_output_projection_conflict_for_bound_candidate(bound, guided)
     if projection_conflict is not None:
@@ -2941,7 +2978,9 @@ def bind_guided_reviewed_components(
     dangling_references: set[str] = set()
 
     def _collect_dangling(member: Mapping[str, Any], key: str) -> None:
-        value = member.get(key)
+        if key not in member:
+            return
+        value = member[key]
         if type(value) is str and value and value not in known_targets:
             dangling_references.add(value)
 
@@ -3274,18 +3313,20 @@ def _canonical_state_from_private_pipeline(raw: dict[str, JsonValue]) -> Composi
     if "source" in raw and "sources" not in raw:
         source = raw.pop("source")
         raw["sources"] = {"source": source} if source is not None else {}
-    sources = raw.get("sources")
-    if type(sources) is dict:
-        for source_spec in sources.values():
+    if "sources" in raw and type(raw["sources"]) is dict:
+        for source_spec in raw["sources"].values():
             if type(source_spec) is dict:
-                source_spec.setdefault("options", {})
-                source_spec.setdefault("on_validation_failure", "discard")
-    nodes = raw.get("nodes")
-    if type(nodes) is list:
-        for node in nodes:
+                if "options" not in source_spec:
+                    source_spec["options"] = {}
+                if "on_validation_failure" not in source_spec:
+                    source_spec["on_validation_failure"] = "discard"
+    if "nodes" in raw and type(raw["nodes"]) is list:
+        for node in raw["nodes"]:
             if type(node) is dict:
-                node.setdefault("plugin", None)
-                node.setdefault("on_success", None)
+                if "plugin" not in node:
+                    node["plugin"] = None
+                if "on_success" not in node:
+                    node["on_success"] = None
                 # Mirror build_set_pipeline_candidate's derivation exactly: a
                 # transform/aggregation with on_error omitted or blank derives
                 # the "discard" error flow. The validated candidate state
@@ -3293,22 +3334,24 @@ def _canonical_state_from_private_pipeline(raw: dict[str, JsonValue]) -> Composi
                 # dict — defaulting to None here drops the node_error edge at
                 # projection and kills a validation-accepted plan at the wire
                 # contract's exact success+error flow check.
-                node["on_error"] = node.get("on_error") or ("discard" if node.get("node_type") in ("transform", "aggregation") else None)
-                node.setdefault("options", {})
-    outputs = raw.get("outputs")
-    if type(outputs) is list:
-        for output in outputs:
+                if "on_error" not in node or not node["on_error"]:
+                    node_type = node["node_type"] if "node_type" in node else None
+                    node["on_error"] = "discard" if node_type in ("transform", "aggregation") else None
+                if "options" not in node:
+                    node["options"] = {}
+    if "outputs" in raw and type(raw["outputs"]) is list:
+        for output in raw["outputs"]:
             if type(output) is dict and "sink_name" in output:
                 output["name"] = output.pop("sink_name")
-    edges = raw.get("edges")
-    if type(edges) is list:
-        for edge in edges:
-            if type(edge) is dict:
-                # set_pipeline's tool schema makes label optional and its
-                # handler reads it with .get(); canonical EdgeSpec.from_dict
-                # is strict, so apply the same default at this adapter.
-                edge.setdefault("label", None)
-    raw.setdefault("metadata", {"name": "Untitled Pipeline", "description": ""})
+    if "edges" in raw and type(raw["edges"]) is list:
+        for edge in raw["edges"]:
+            # set_pipeline's tool schema makes label optional and its
+            # handler reads it with .get(); canonical EdgeSpec.from_dict
+            # is strict, so apply the same default at this adapter.
+            if type(edge) is dict and "label" not in edge:
+                edge["label"] = None
+    if "metadata" not in raw:
+        raw["metadata"] = {"name": "Untitled Pipeline", "description": ""}
     raw["version"] = 1
     try:
         return CompositionState.from_dict(cast(dict[str, Any], raw))
@@ -3380,12 +3423,16 @@ def _node_behavior(
         }
     if node.node_type == "aggregation":
         trigger = dict(deep_thaw(node.trigger or {}))
-        # Preserve the executable scalar semantics, never free-form prose.
+        # Preserve the executable scalar semantics, never free-form prose. A
+        # trigger carries only the kinds it configures, so an absent key IS the
+        # "not configured" value and is read as membership, not defaulted.
         trigger_kinds = [
-            name for name in ("count", "timeout", "condition") if trigger.get(name if name != "timeout" else "timeout_seconds") is not None
+            name
+            for name, key in (("count", "count"), ("timeout", "timeout_seconds"), ("condition", "condition"))
+            if key in trigger and trigger[key] is not None
         ]
-        count = trigger.get("count")
-        timeout_seconds = trigger.get("timeout_seconds")
+        count = trigger["count"] if "count" in trigger else None
+        timeout_seconds = trigger["timeout_seconds"] if "timeout_seconds" in trigger else None
         return {
             "kind": "aggregation",
             "trigger_kinds": trigger_kinds,
@@ -3410,9 +3457,7 @@ def _node_behavior(
         if barrier_incoming_aliases is not None:
             aliases = list(barrier_incoming_aliases)
         else:
-            branches = node.branches
-            names = list(branches.keys()) if isinstance(branches, Mapping) else list(branches or ())
-            aliases = [branch_aliases[name] for name in names]
+            aliases = [branch_aliases[name] for name in _coalesce_branch_names(node.branches)]
         if node.node_type == "row_union":
             return {
                 "kind": "row_union",
@@ -3463,14 +3508,23 @@ def _node_behavior(
 
 
 def _projection_ids_from_payload(payload: Mapping[str, Any]) -> tuple[list[str], list[str]]:
-    nodes = payload.get("nodes")
-    graph = payload.get("graph")
-    if type(nodes) is not list or type(graph) is not dict or type(graph.get("edges")) is not list:
+    if (
+        "nodes" not in payload
+        or "graph" not in payload
+        or type(payload["nodes"]) is not list
+        or type(payload["graph"]) is not dict
+        or "edges" not in payload["graph"]
+        or type(payload["graph"]["edges"]) is not list
+    ):
         raise AuditIntegrityError("guided proposal projection has malformed stable-id containers")
-    node_ids = [node.get("stable_id") for node in nodes if type(node) is dict]
-    edge_ids = [edge.get("stable_id") for edge in graph["edges"] if type(edge) is dict]
-    if len(node_ids) != len(nodes) or len(edge_ids) != len(graph["edges"]):
+    nodes = payload["nodes"]
+    edges = payload["graph"]["edges"]
+    if not all(type(node) is dict and "stable_id" in node for node in nodes) or not all(
+        type(edge) is dict and "stable_id" in edge for edge in edges
+    ):
         raise AuditIntegrityError("guided proposal projection has malformed stable IDs")
+    node_ids = [node["stable_id"] for node in nodes]
+    edge_ids = [edge["stable_id"] for edge in edges]
     if not all(type(i) is str and i for i in node_ids):
         raise AuditIntegrityError("guided proposal projection has malformed node stable IDs")
     if not all(type(i) is str and i for i in edge_ids):
@@ -3515,15 +3569,14 @@ def _build_projection(
         for branch in node.fork_to or ():
             if branch not in branch_names:
                 branch_names.append(branch)
-        raw_branches = node.branches
         # A coalesce's branch identities are its branches KEYS (the fork branch
         # names == gate ``fork_to`` destinations), not its values (the
         # connections carrying each branch's data). Aliasing by value would mint
         # a branch alias with no authoritative gate_fork origin — unsatisfiable
         # at validate_payload. The keys are already added by the gate ``fork_to``
-        # above, so this only dedups; a tuple ``branches`` lists names directly.
-        branch_keys = list(raw_branches.keys()) if isinstance(raw_branches, Mapping) else list(raw_branches or ())
-        for branch in branch_keys:
+        # above, so this only dedups; ``_coalesce_branch_names`` owns the
+        # mapping-vs-tuple reading of ``branches``.
+        for branch in _coalesce_branch_names(node.branches):
             if branch not in branch_names:
                 branch_names.append(branch)
     route_aliases = {key: proposal_structural_label("route", index) for index, key in enumerate(route_keys)}
@@ -3538,8 +3591,7 @@ def _build_projection(
     for node in state.nodes:
         if node.node_type not in ("coalesce", "row_union"):
             continue
-        raw_branches = node.branches
-        branch_pairs = raw_branches.items() if isinstance(raw_branches, Mapping) else ((name, name) for name in (raw_branches or ()))
+        branch_pairs = zip(_coalesce_branch_names(node.branches), _coalesce_branch_connections(node.branches), strict=True)
         for branch_key, branch_value in branch_pairs:
             if type(branch_value) is str and branch_value and branch_key in branch_aliases:
                 barrier_branch_alias[(node_ids[node.id], branch_value)] = branch_aliases[branch_key]
@@ -3576,13 +3628,19 @@ def _build_projection(
         if connection == "discard":
             edge_specs.append((origin, _endpoint("discard"), flow))
             return
-        destinations = consumers.get(connection, ())
-        queue_stable = queue_stable_by_connection.get(connection)
-        if queue_stable is not None:
-            if origin.get("stable_id") == queue_stable:
+        destinations: tuple[tuple[str, str], ...]
+        if connection in queue_stable_by_connection and origin["stable_id"] != queue_stable_by_connection[connection]:
+            # An external producer publishing into a queue's connection reaches
+            # only the fan-in point, whatever else the registry lists.
+            destinations = (("node", queue_stable_by_connection[connection]),)
+        else:
+            if connection not in consumers:
+                raise AuditIntegrityError("guided proposal connection has no canonical consumer")
+            destinations = consumers[connection]
+            if connection in queue_stable_by_connection:
+                # The queue's own republish never targets itself.
+                queue_stable = queue_stable_by_connection[connection]
                 destinations = tuple(dest for dest in destinations if dest != ("node", queue_stable))
-            else:
-                destinations = (("node", queue_stable),)
         if not destinations:
             raise AuditIntegrityError("guided proposal connection has no canonical consumer")
         for kind, stable_id in destinations:
@@ -3591,10 +3649,8 @@ def _build_projection(
             # carry that branch's alias (validate_payload rejects a branch-less
             # flow into a coalesce). The producer emitting the flow does not know
             # its consumer is a fan-in, so stamp the alias here per destination.
-            if kind == "node":
-                branch_alias = barrier_branch_alias.get((stable_id, connection))
-                if branch_alias is not None:
-                    edge_flow = {**flow, "branch": branch_alias}
+            if kind == "node" and (stable_id, connection) in barrier_branch_alias:
+                edge_flow = {**flow, "branch": barrier_branch_alias[(stable_id, connection)]}
             edge_specs.append((origin, _endpoint(kind, stable_id), edge_flow))
 
     for source_name, source in state.sources.items():
@@ -3656,11 +3712,18 @@ def _build_projection(
     # flows in that exact order so the public behavior and protocol validation
     # preserve the runtime N-to-N release contract.
     for node in state.nodes:
-        if node.node_type != "row_union" or not isinstance(node.branches, Mapping):
+        if node.node_type != "row_union" or node.branches is None:
             continue
         stable_id = node_ids[node.id]
-        alias_rank = {branch_aliases[branch_name]: index for index, branch_name in enumerate(node.branches)}
-        positions = [index for index, (_origin, destination, _flow) in enumerate(edge_specs) if destination.get("stable_id") == stable_id]
+        # ``_row_union_normalized_branches`` (NodeSpec construction) makes a
+        # row_union's branches a mapping whose key order is the authored
+        # release order; ``_coalesce_branch_names`` reads that order.
+        alias_rank = {branch_aliases[branch_name]: index for index, branch_name in enumerate(_coalesce_branch_names(node.branches))}
+        positions = [
+            index
+            for index, (_origin, destination, _flow) in enumerate(edge_specs)
+            if "stable_id" in destination and destination["stable_id"] == stable_id
+        ]
         ordered = sorted(
             (edge_specs[index] for index in positions),
             key=lambda spec: alias_rank[cast(str, spec[2]["branch"])],
@@ -3687,10 +3750,16 @@ def _build_projection(
     barrier_stable_ids = {node_ids[node.id] for node in state.nodes if node.node_type in ("coalesce", "row_union")}
     barrier_incoming_branch_aliases: dict[str, list[str]] = {}
     for _edge_origin, edge_destination, edge_flow in edge_specs:
-        destination_id = edge_destination.get("stable_id")
-        branch_alias = edge_flow.get("branch")
-        if destination_id in barrier_stable_ids and isinstance(branch_alias, str) and branch_alias:
-            barrier_incoming_branch_aliases.setdefault(destination_id, []).append(branch_alias)
+        # A discard endpoint carries no stable_id and a failure flow carries no
+        # branch; both are legitimate absences, read as membership.
+        if "stable_id" not in edge_destination or "branch" not in edge_flow:
+            continue
+        destination_id = edge_destination["stable_id"]
+        branch_alias = edge_flow["branch"]
+        if destination_id in barrier_stable_ids and type(branch_alias) is str and branch_alias:
+            if destination_id not in barrier_incoming_branch_aliases:
+                barrier_incoming_branch_aliases[destination_id] = []
+            barrier_incoming_branch_aliases[destination_id].append(branch_alias)
     nodes: list[dict[str, Any]] = [
         {
             "stable_id": node_ids[node.id],
@@ -3702,7 +3771,9 @@ def _build_projection(
                 route_aliases=gate_route_aliases(node) if node.node_type == "gate" else {},
                 branch_aliases=branch_aliases,
                 barrier_incoming_aliases=(
-                    barrier_incoming_branch_aliases.get(node_ids[node.id]) if node.node_type in ("coalesce", "row_union") else None
+                    barrier_incoming_branch_aliases[node_ids[node.id]]
+                    if node.node_type in ("coalesce", "row_union") and node_ids[node.id] in barrier_incoming_branch_aliases
+                    else None
                 ),
                 # The opener is projected by the stable id this projection
                 # already advertises for it; an unresolvable opener fails
@@ -3710,7 +3781,9 @@ def _build_projection(
                 # the binder and validators accepted, so the miss is a
                 # server-side integrity failure, not a planner error).
                 collector_opener_stable_id=(
-                    node_ids.get(node.scope_opener) if node.node_type == "collector" and node.scope_opener is not None else None
+                    node_ids[node.scope_opener]
+                    if node.node_type == "collector" and node.scope_opener is not None and node.scope_opener in node_ids
+                    else None
                 ),
             ),
             # Allowlisted key options as display text (R2-F3). Same closed
@@ -3788,7 +3861,7 @@ def _build_projection(
     return payload
 
 
-def _projection_kind_summary(payload: Mapping[str, Any]) -> _ProjectionKindSummary:
+def _projection_kind_summary(payload: ProposePipelinePayload) -> _ProjectionKindSummary:
     """Structural (Tier-3-safe) node/edge kind summary for projection failure logs.
 
     The PROPOSE_PIPELINE projection is already the closed, redacted wire shape —
@@ -3799,34 +3872,38 @@ def _projection_kind_summary(payload: Mapping[str, Any]) -> _ProjectionKindSumma
     shape (e.g. a coalesce whose branch aliases do not match its incoming flow
     order) without touching private authored values.
     """
-    nodes = payload["nodes"] if isinstance(payload.get("nodes"), list) else []
-    graph = payload["graph"] if isinstance(payload.get("graph"), Mapping) else {}
-    edges = graph["edges"] if isinstance(graph.get("edges"), list) else []
-    node_kinds: list[_ProjectionNodeKindSummary] = [
-        {
-            "stable_id": node.get("stable_id"),
-            "node_type": node.get("node_type"),
-            "plugin": (node["plugin"].get("id") if isinstance(node.get("plugin"), Mapping) else None),
-            "behavior": node["behavior"].get("kind") if isinstance(node.get("behavior"), Mapping) else None,
-            "branch_aliases": (
-                node["behavior"].get("branch_aliases")
-                if isinstance(node.get("behavior"), Mapping) and node["behavior"].get("kind") in ("coalesce", "row_union")
-                else None
-            ),
-        }
-        for node in nodes
-        if isinstance(node, Mapping)
-    ]
-    edge_flows: list[_ProjectionEdgeFlowSummary] = [
-        {
-            "from": edge["from_endpoint"].get("kind") if isinstance(edge.get("from_endpoint"), Mapping) else None,
-            "to": edge["to_endpoint"].get("kind") if isinstance(edge.get("to_endpoint"), Mapping) else None,
-            "flow": edge["flow"].get("kind") if isinstance(edge.get("flow"), Mapping) else None,
-            "branch": edge["flow"].get("branch") if isinstance(edge.get("flow"), Mapping) else None,
-        }
-        for edge in edges
-        if isinstance(edge, Mapping)
-    ]
+    # ``payload`` is the projection ``_build_projection`` itself just built
+    # (its only caller), so every node carries stable_id/node_type/plugin/
+    # behavior and every edge carries both endpoints and a flow with a kind.
+    # Only ``branch_aliases`` (barrier behaviors) and a flow's ``branch`` are
+    # genuinely optional members of the closed wire shape.
+    node_kinds: list[_ProjectionNodeKindSummary] = []
+    for node in payload["nodes"]:
+        behavior = node["behavior"]
+        # The optional members are read through a plain mapping view of the
+        # closed behavior/flow unions: membership is the discriminator.
+        behavior_members: Mapping[str, object] = behavior
+        node_kinds.append(
+            {
+                "stable_id": node["stable_id"],
+                "node_type": node["node_type"],
+                "plugin": node["plugin"]["id"] if node["plugin"] is not None else None,
+                "behavior": behavior["kind"],
+                "branch_aliases": behavior_members["branch_aliases"] if "branch_aliases" in behavior_members else None,
+            }
+        )
+    edge_flows: list[_ProjectionEdgeFlowSummary] = []
+    for edge in payload["graph"]["edges"]:
+        flow = edge["flow"]
+        flow_members: Mapping[str, object] = flow
+        edge_flows.append(
+            {
+                "from": edge["from_endpoint"]["kind"],
+                "to": edge["to_endpoint"]["kind"],
+                "flow": flow["kind"],
+                "branch": flow_members["branch"] if "branch" in flow_members else None,
+            }
+        )
     return {"node_kinds": node_kinds, "edge_flows": edge_flows}
 
 
