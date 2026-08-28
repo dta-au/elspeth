@@ -8,6 +8,7 @@ JSON; those are audit/debug payloads, not safe default UI material.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final, Literal, get_args
 
@@ -16,6 +17,7 @@ from sqlalchemy.engine import Connection, make_url
 
 from elspeth.contracts.errors import TransformErrorCategory
 from elspeth.contracts.secret_scrub import REDACTED_SECRET_TEXT
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.export_mappers import artifact_producer_kind, validate_artifact_publication_projection
 from elspeth.core.landscape.schema import (
@@ -165,6 +167,19 @@ def _redacted_error_message_for_llm(error_message: str | None) -> str | None:
     return f"[diagnostic error text redacted before LLM prompt; chars={len(error_message)}; lines={len(error_message.splitlines()) or 1}]"
 
 
+@trust_boundary(
+    tier=3,
+    source="RunDiagnosticNodeState.error (typed Any) — the JSON-decoded node_states.error_json audit column, "
+    "whose body is an ExecutionError envelope carrying provider/runtime error bodies and arbitrary exception "
+    "to_audit_dict() content; no first-party contract guarantees its keys or their value types",
+    source_param="error_payload",
+    suppresses=("R1",),
+    invariant="never raises on error_payload shape; returns None only for an absent payload, and otherwise a "
+    "fixed-key summary envelope that emits reason/status/classification/remediation only for values passing "
+    "their own exact-type and membership checks, so an unrecognised or malformed payload degrades to the "
+    "redacted shape-only summary rather than leaking payload text",
+    non_raising=True,
+)
 def _summarize_error_payload_for_llm(error_payload: Any | None) -> dict[str, object] | None:
     if error_payload is None:
         return None
@@ -228,6 +243,58 @@ def _decode_json(value: str | None) -> Any | None:
     return json.loads(value)
 
 
+@dataclass(frozen=True, slots=True)
+class _NodeStateErrorEnvelope:
+    """The two correlation-relevant fields of one decoded ``node_states.error_json`` value.
+
+    An ELSPETH-owned projection of a Tier-3 envelope, constructed only by
+    :func:`_node_state_error_envelope`. Both fields are normalised to "a
+    non-blank ``str``, or ``None``" so the correlation policy that consumes
+    them reads owned attributes nominally instead of re-checking payload
+    shapes — and so ``error_type`` is always hashable, which a raw
+    ``payload["type"]`` is not (a list or mapping there would raise
+    ``TypeError`` on the ``_DIVERSION_ERROR_TYPES`` membership test).
+    """
+
+    error_type: str | None
+    exception_text: str | None
+
+
+@trust_boundary(
+    tier=3,
+    source="the JSON-decoded body of node_states.error_json — a Landscape Text column holding a serialised "
+    "ExecutionError envelope whose shape is not schema-enforced, predates the current envelope guarantees, "
+    "and carries exception text originating in third-party driver and provider exceptions",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant="never raises on payload shape; returns None for any non-mapping payload and otherwise a "
+    "_NodeStateErrorEnvelope whose every field is a non-blank str or None, so an unrecognised envelope "
+    "degrades to 'this state does not correlate' rather than propagating an unvalidated value",
+    non_raising=True,
+)
+def _node_state_error_envelope(payload: Any | None) -> _NodeStateErrorEnvelope | None:
+    """Project a decoded error envelope onto the fields correlation reads.
+
+    ``exception`` is the field to key on — ``ExecutionError`` requires it
+    non-empty, whereas ``context`` is an optional structured payload only
+    populated for exceptions exposing ``to_audit_dict()``. It is read as a
+    fallback for envelopes predating that guarantee.
+    """
+    if not isinstance(payload, dict):
+        return None
+    error_type = payload.get("type")
+    exception_text = payload.get("exception")
+    if not isinstance(exception_text, str) or not exception_text.strip():
+        context = payload.get("context")
+        exception_text = context.get("message") if isinstance(context, dict) else None
+    if not isinstance(exception_text, str) or not exception_text.strip():
+        exception_text = None
+    return _NodeStateErrorEnvelope(
+        error_type=error_type if isinstance(error_type, str) else None,
+        exception_text=exception_text,
+    )
+
+
 def _node_state_error_correlating_exception(error_json: str | None, operation_error_message: str | None) -> str | None:
     """The exception this failed node_state records, when it explains the operation.
 
@@ -246,10 +313,10 @@ def _node_state_error_correlating_exception(error_json: str | None, operation_er
     not decide attribution on its own: several states can correlate to one
     operation, and the caller ranks them by how specifically each matches.
 
-    ``exception`` is the field to key on — ``ExecutionError`` requires it
-    non-empty, whereas ``context`` is an optional structured payload only
-    populated for exceptions exposing ``to_audit_dict()``. It is read as a
-    fallback for envelopes predating that guarantee.
+    Envelope shape is not this function's problem:
+    :func:`_node_state_error_envelope` is the Tier-3 boundary that parses the
+    decoded payload into an owned ``_NodeStateErrorEnvelope``, so everything
+    below reads normalised owned attributes.
 
     Returns None for anything it cannot positively correlate — an absent,
     malformed, or unrecognised envelope, an empty message that would match
@@ -266,9 +333,10 @@ def _node_state_error_correlating_exception(error_json: str | None, operation_er
         # error_json is a Text column: a malformed value must degrade this
         # projection to scope attribution, never fail the diagnostics read.
         return None
-    if not isinstance(payload, dict):
+    envelope = _node_state_error_envelope(payload)
+    if envelope is None:
         return None
-    if payload.get("type") in _DIVERSION_ERROR_TYPES:
+    if envelope.error_type in _DIVERSION_ERROR_TYPES:
         # A diverted row is never the cause of a failed operation: its batch
         # effect published, and the operation that failed is a different one.
         # This was structurally unreachable while these states recorded only
@@ -280,11 +348,8 @@ def _node_state_error_correlating_exception(error_json: str | None, operation_er
         # rather than left to the substring gate, because the kind is exactly
         # what makes it a non-cause.
         return None
-    candidate = payload.get("exception")
-    if not isinstance(candidate, str) or not candidate.strip():
-        context = payload.get("context")
-        candidate = context.get("message") if isinstance(context, dict) else None
-    if not isinstance(candidate, str) or not candidate.strip():
+    candidate = envelope.exception_text
+    if candidate is None:
         return None
     if candidate == REDACTED_SECRET_TEXT:
         # The scrubber replaces a whole secret-bearing message with one

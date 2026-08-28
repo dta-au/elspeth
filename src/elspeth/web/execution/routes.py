@@ -601,13 +601,13 @@ async def _load_run_status_snapshot_with_accounting(
             )
         except ValueError as exc:
             raise _RunStatusIntegrityError(str(exc)) from exc
-        corruption = accounting_batch.corrupt.get(run_record.landscape_run_id)
-        if corruption is not None:
+        if run_record.landscape_run_id in accounting_batch.corrupt:
             # Single-run surface: the explicit integrity status IS the
             # structured per-run error envelope. The loader no longer raises,
             # so the corruption marker must be converted here — silently
             # dropping accounting would present the corrupt run as a run
             # with no projection at all (elspeth-d5578ccd98).
+            corruption = accounting_batch.corrupt[run_record.landscape_run_id]
             raise _RunStatusIntegrityError(
                 f"Landscape accounting for run {run_record.landscape_run_id!r} failed integrity validation: "
                 + "; ".join(corruption.violations)

@@ -1343,6 +1343,56 @@ def test_propose_pipeline_represents_fork_and_coalesce_with_shared_branch_aliase
     assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
 
 
+def _strip_branch_from_a_coalesce_inbound_flow(payload: dict[str, Any], barrier_id: str) -> dict[str, Any]:
+    """Re-author one gate->coalesce edge as a branchless direct gate route."""
+    inbound = next(edge for edge in payload["graph"]["edges"] if edge["to_endpoint"].get("stable_id") == barrier_id)
+    inbound["flow"] = {"kind": "gate_route", "route": proposal_structural_label("route", 0), "branch": None}
+    return inbound
+
+
+def _strip_branch_from_a_row_union_inbound_flow(payload: dict[str, Any], barrier_id: str) -> dict[str, Any]:
+    """Drop the branch alias from one producer->row_union node_success edge."""
+    inbound = next(edge for edge in payload["graph"]["edges"] if edge["to_endpoint"].get("stable_id") == barrier_id)
+    inbound["flow"]["branch"] = None
+    return inbound
+
+
+@pytest.mark.parametrize(
+    ("build", "barrier_kind", "strip_branch"),
+    [
+        (_fork_coalesce_payload, "coalesce", _strip_branch_from_a_coalesce_inbound_flow),
+        (_fork_row_union_payload, "row_union", _strip_branch_from_a_row_union_inbound_flow),
+    ],
+    ids=["coalesce", "row_union"],
+)
+def test_propose_pipeline_rejects_a_branchless_flow_into_a_correlated_barrier(
+    build: Any,
+    barrier_kind: str,
+    strip_branch: Any,
+) -> None:
+    """A barrier's inbound edges each carry a branch alias, or the payload is refused.
+
+    This is the control that lets the per-barrier ``incoming_branches``
+    comparison in ``_validate_propose_pipeline_payload`` read ``flow["branch"]``
+    as a MEMBER of every flow in ``incoming_edges[stable_id]``. It ran with a
+    ``flow.get("branch") is not None`` filter in front of it, which would have
+    silently DROPPED a branchless inbound flow from the comparison instead of
+    reporting it; the filter was provably unreachable because of this rejection,
+    and removing it turns a broken invariant into a crash rather than a quiet
+    mismatch. If this test ever goes green-with-a-different-message, that
+    comparison must be revisited before the control is weakened.
+    """
+    payload = build()
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+    barrier_id = next(node["stable_id"] for node in payload["nodes"] if node["node_type"] == barrier_kind)
+    inbound = strip_branch(payload, barrier_id)
+    index = payload["graph"]["edges"].index(inbound)
+
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+
+    assert error == f"payload.graph.edges[{index}].flow into a correlated barrier node requires a branch alias"
+
+
 @pytest.mark.parametrize(
     ("policy", "timeout_seconds"),
     [

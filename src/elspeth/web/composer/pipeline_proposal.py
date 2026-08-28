@@ -511,7 +511,11 @@ def restore_owned_composition_state_authority(
     detached = deep_thaw(authority)
     if type(detached) is not dict or set(detached) != _OWNED_COMPOSITION_STATE_FIELDS:
         raise AuditIntegrityError("owned composition-state authority fields are malformed")
-    if detached.get("authority_kind") != OWNED_COMPOSITION_STATE_AUTHORITY:
+    # Membership read, not a probe: the guard above proves ``set(detached)``
+    # is exactly ``_OWNED_COMPOSITION_STATE_FIELDS``, which contains
+    # "authority_kind" — so a missing key here is a broken invariant that must
+    # crash, not be folded into the malformed-kind branch.
+    if detached["authority_kind"] != OWNED_COMPOSITION_STATE_AUTHORITY:
         raise AuditIntegrityError("owned composition-state authority kind is malformed")
     state_payload = {key: value for key, value in detached.items() if key != "authority_kind"}
     _reject_undeclared_owned_composition_state_fields(state_payload)

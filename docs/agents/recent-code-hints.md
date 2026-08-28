@@ -43,6 +43,41 @@ is a working document under the normal delivery posture.
   value type` exactly as the `type(x) is C` narrowing entry below predicts —
   that union discriminator's else-branch IS used.)
 
+- **2026-08-29 — the `@trust_boundary` suppressor also loses the derived-name
+  trail through a `try:` whose handler RETURNS, so the decode-then-read idiom
+  suppresses nothing.** Third known hole in the same walk, after the
+  `enumerate()`/comprehension ones below. `_visit_try_like`
+  (tier_model `rule.py`) visits each handler from `branch_start` — the state
+  BEFORE the try — and then sets the post-try derived names to
+  `_intersect_snapshots(body_end, *handler_ends)`. It does not model the
+  handler's early `return` as unreachable, so a name bound in the try body is
+  intersected away by any handler that does not rebind it. Concretely,
+  `try: payload = _decode_json(error_json) / except (TypeError, ValueError):
+  return None` leaves `payload` NOT derived, and a
+  `@trust_boundary(source_param="error_json")` on that function suppresses
+  ZERO of the `payload.get(...)` / `isinstance(payload, ...)` reads below it —
+  measured in B52 on `web/execution/diagnostics.py`, where the decorator
+  produced 0 suppressions until the code was split. Note the asymmetry that
+  makes this surprising: ordinary assignment propagation uses the PERMISSIVE
+  subtree scan (`_value_depends_on_boundary` →
+  `_expr_contains_derived_reference`), so `payload = _decode_json(error_json)`
+  outside a try WOULD be derived even though the value passes through a call;
+  it is only the try/except join that drops it.
+  Do NOT pre-seed a name before the try to restore the trail — that is
+  reshaping code to dodge a lint. The honest fix, and the one the brief's
+  preference order already wants, is to split the raising decode from a
+  non-raising projection: keep `try: payload = _decode_json(...)` in the
+  caller and give the parse its own boundary function whose `source_param` IS
+  the already-decoded value, returning an owned frozen dataclass
+  (`_node_state_error_envelope` → `_NodeStateErrorEnvelope`). All 8 R1/R5
+  reads then sit directly on the source param and suppress, the caller reads
+  owned attributes nominally, and only the one R6 on the decode handler needs
+  a rationale. That split also caught a live defect it was not looking for:
+  `payload.get("type") in _DIVERSION_ERROR_TYPES` raises
+  `TypeError: unhashable type` for an envelope carrying a list/mapping `type`,
+  which would abort a whole run's diagnostics read; normalising the field to
+  `str | None` inside the owned envelope makes the membership test total.
+
 - **2026-08-29 — the `trust_boundary.tests` gate reads exception names out of
   `invariant` PROSE with a `*Error|*Exception|*Warning` suffix regex, so a
   boundary whose raise type has no such suffix must not mention an
@@ -75,6 +110,57 @@ is a working document under the normal delivery posture.
   it surfaced were a pre-existing implicit re-export, fixed on
   `feature/unified-lineage` by 0f6b9b6a3 — merge, do not re-fix.)
 
+- **2026-08-29 — the membership-form ternary that clears R1 is NOT a
+  drop-in for `.get()` on a value that might not be a container.**
+  `d["k"] if "k" in d else None` is exactly equivalent to `d.get("k")` for a
+  Mapping and clears the tier_model R1 finding (verified in B35: one
+  conversion, one rescan, −1). But `"k" in x` raises `TypeError` on a
+  non-container where `.get()` could not exist at all, so inside a function
+  whose `@trust_boundary` / `@observation_boundary` invariant declares "never
+  raises" the conversion silently breaks that contract unless a Mapping guard
+  stays ahead of it in the same `and` chain. In
+  `web/composer/pipeline_planner._serialize_provider_discovery_result` the
+  generator reads
+  `isinstance(candidate, Mapping) and (candidate["id"] if "id" in candidate else None) == selected_id`
+  — the guard first, the membership second, both inside the same short-circuit.
+  A second trap in the same conversion: `"k" in c and c["k"] == want` is NOT
+  equivalent to `c.get("k") == want` when `want` can be `None`, because the
+  `.get()` form matches a candidate that lacks the key entirely. Keep the
+  ternary (which preserves that) rather than the two-term `and` unless you have
+  checked that the compared value is never `None`.
+
+- **2026-08-29 — `PlannerDeclined` subclasses `PipelinePlannerError`, so the
+  planner exception classifiers must stay `isinstance`.** `pipeline_planner.py`
+  declares `class PlannerDeclined(PipelinePlannerError)`, and both
+  `plan_pipeline`'s summary classifier and
+  `_PlannerAttemptTrail.finalize_active_exception` depend on that: the former
+  orders the `PlannerDeclined` arm ahead of the `PipelinePlannerError` arm on
+  purpose, and the latter needs a decline to fall INTO the
+  `PipelinePlannerError` arm to reach `exc.code`. Converting either to
+  `type(exc) is PipelinePlannerError` (the house scalar/closed-union idiom) is
+  a behaviour change that misroutes every decline. R5 findings on exception
+  classification over an open owned hierarchy are justify candidates, not
+  conversion candidates.
+- **2026-08-29 — the `R_TB_SUPPRESSED` lines in an allowlist-disabled
+  `--rules all` run are the ORACLE for what widening a `suppresses` tuple will
+  clear, and comprehension loop variables ARE tracked (B47's entry below is
+  too broad).** Before hand-editing anything inside a `@trust_boundary`, read
+  that file's `R_TB_SUPPRESSED` diagnostics: each names the site, the
+  `source_param`, and the currently declared `suppresses=(...)`. Every site
+  already listed there under R5 has a resolved derivation from
+  `source_param`, and `_boundary_root` roots R1 (`node.func.value`) and R5
+  (`node.args[0]`) at the SAME name — so a `d.get(k)` on a name whose
+  `isinstance` is already suppressed on that line clears the moment `"R1"`
+  joins the tuple. In `planner_authoring_aids.py` (B42) widening three
+  `("R5",)` tuples to `("R1", "R5")` removed 9 of 27 findings with zero code
+  change, and that included `schema.get("composer_hidden")` where `schema` is
+  a SET-COMPREHENSION loop variable over `raw.get("properties").items()`. The
+  walk does follow comprehension/genexp targets bound directly from a derived
+  iterable; what defeated B47 was the `enumerate(nodes)` CALL wrapping the
+  iterable, not the comprehension. So: widen, re-measure, and only then write
+  rationales or restructure what actually survives — every pre-emptive edit
+  shifts `body[N]` for later findings in the same function for no gain.
+
 - **2026-08-29 — adding a DOCSTRING shifts every `body[N]` index inside that
   function, exactly like the `@overload` trap below.** A docstring is
   `body[0]`, so writing one on an existing function moves every tier_model
@@ -102,7 +188,9 @@ is a working document under the normal delivery posture.
   the control. B25 rationalised 16 such handlers in `doctor.py` and 9 in
   `readiness.py` on exactly this ground.
 - **2026-08-29 — the `@trust_boundary` suppression dataflow walk does NOT
-  follow dynamic escapes or comprehension loop variables, and widening an
+  follow dynamic escapes or comprehension loop variables (the comprehension
+  half of that claim is NARROWED by the oracle entry above — plain
+  comprehension targets ARE tracked), and widening an
   existing decorator's `suppresses` tuple is the cheapest correct burn-down
   move.** Two facts, learned burning down `web/composer` (B47):
   1. Several boundaries were declared `suppresses=("R5",)` while their bodies
@@ -202,6 +290,134 @@ is a working document under the normal delivery posture.
   (`options[KEY] if KEY in options else None`), and `select_only` — a
   presence-AND-value question — is spelled `"select_only" not in options or
   options["select_only"] is not True`, never a ternary.
+- **2026-08-29 — the tier_model dataflow walk does NOT carry taint out of a
+  `try:` body, and that — not helper calls — is why a decorated boundary can
+  still show dozens of R1/R5 findings.** In
+  `yaml_importer.composition_state_from_runtime_yaml` the function is decorated
+  `@trust_boundary(source_param="pipeline_yaml")`, yet 16 sites reading `doc`
+  stayed open. The obvious explanation (the walk cannot cross the
+  `_require_mapping(parsed, ...)` call) is WRONG and would have made bad judge
+  evidence: `_queues_from_runtime_mapping` in the same file crosses
+  `_require_mapping` twice and every one of its sites IS suppressed. Three
+  probes pinned it: aliasing `parsed = pipeline_yaml` inside the `try:` clears
+  0 sites; hoisting `parsed = yaml.safe_load(pipeline_yaml)` ABOVE the `try:`
+  (leaving `safe_load` and `_require_mapping` both in place) clears 15. So when
+  a boundary's parse is wrapped in `try:` to map parser errors, expect the
+  downstream reads to need rationales. Do NOT restructure to satisfy the walk —
+  hoisting drops the error mapping. Corollary for burn-down lanes: measure
+  before decorating. `_collector_nodes_from_runtime_lists` was decorated,
+  measured, and reverted because it cleared 0 findings — a suppression that
+  suppresses nothing is a live test obligation for no gain.
+
+- **2026-08-29 — `@observation_boundary` is the cheap correct form for a
+  pure projector, but it stops at comprehensions and closures.** Two guided
+  emitters (`_wire_schema`, `_structured_output_fields`) project untrusted
+  `NodeSpec.options` and never raise, so `@observation_boundary`
+  (= `trust_boundary(non_raising=True)`) fits with NO `test_ref`/
+  `test_fingerprint` obligation — it cleared 15 of 35 findings in that file for
+  two decorators. What it did NOT clear: reads whose derivation runs through a
+  list comprehension plus tuple unpacking (`for query_name, query in entries`)
+  or through a nested closure over an enclosing local (`_wire_schema.names`).
+  The walk is intra-procedural and does not descend into a nested `FunctionDef`
+  or track comprehension results. Budget rationales for those.
+- **2026-08-29 — a declared `@trust_boundary` does NOT cover a name assigned
+  across an `if`/`try` JOIN, so the tier-model burn-down's "already
+  decorated" files still carry live R1/R5.** `DerivedNameState` propagates
+  source_param-derivedness statement by statement and INTERSECTS the
+  end-states of both `if` arms (`visit_If`) and of body-vs-handlers
+  (`_visit_try_like`). So in `source_demand.stamp_source_options_with_guarantees`
+  — which already carries `@observation_boundary(source_param="options")` —
+  `schema` is derived on the `dict(raw_schema)` arm and NOT on the literal
+  `{"mode": "observed"}` arm, so `schema`, and everything read out of it,
+  is un-derived at the join and its `isinstance` still fires. Same in
+  `parse_source_data_contract_accepted_fields`: `payload = json.loads(value)`
+  sits inside a `try`, and the handler arm never binds `payload`. Do NOT
+  "fix" this by writing a spurious mention of the source_param into the
+  other arm — the rootedness test is syntactic, so `x = (options and ...)`
+  would suppress it while meaning nothing. Rationalise the site and say the
+  boundary is already declared. Corollary for choosing a decorator:
+  `observation_boundary` (= `non_raising=True`) needs NO `test_ref` at all, so
+  it is the cheap, honest route for a projection/abstain helper; a RAISING
+  `trust_boundary` additionally needs `test_ref` + `test_fingerprint` bound to
+  a test whose OWN body raises while invoking the function through
+  `source_param`. The fingerprint is not the hard part — the
+  `trust_boundary.tests` rule EMITS the canonical value, so it is obtainable
+  key-free — the hard part is that a suitable directly-invoking raising test
+  must exist to bind. Budget a rationale when it does not. Six such
+  `observation_boundary` decorators landed clean on B49 (`guided_blob_refs` ×3,
+  `prompts` ×2, `yaml_generator` ×1); `trust_boundary.tests,scope,tier` pass
+  with `--fail-on-inert`, and wardline reports no PY-WL-102 for any of them
+  (PY-WL-102 fires on a declared EXTERNAL_RAW -> ASSURED boundary with no
+  rejection path, which is exactly what a non-raising observation is not).
+
+- **2026-08-29 — a whole-tree `trust_tier.tier_model` run under the REAL
+  allowlist currently UNDER-suppresses, because one stale entry makes the
+  loader refuse.** `config/cicd/enforce_tier_model/web.yaml` `allow_hits[154]`
+  binds to `web/composer/guided/steps.py`, which no longer exists, and the
+  loader emits "stale allowlist entry ... Refusing to load." The visible
+  effect is that signed entries which bind perfectly well report as ACTIVE
+  findings in a `--root src/elspeth` run — e.g.
+  `yaml_generator.py:R9:_strip_web_metadata` — so a lane comparing a
+  real-allowlist corpus before/after will misread pre-existing noise as its
+  own regression. To attribute a suspected signed-entry break to your change,
+  scan the ONE file under a throwaway root (`mkdir -p $T/web/composer &&
+  git show <base>:src/.../f.py > $T/web/composer/f.py`, then
+  `check --root $T --repo-root <worktree>`) and A/B base-vs-current there;
+  in isolation the entry binds and the finding disappears. Tracked as
+  observation elspeth-obs-ce7f1c5f56 (operator: drop the entry and re-sign).
+
+- **2026-08-29 — `interpretation_state` re-exported `SOURCE_AUTHORING_KEY`
+  without the `X as X` form, so mypy failed the PRE-COMMIT hook for six
+  modules a lane never touched.** Under `--no-implicit-reexport` a plain
+  `from ... import SOURCE_AUTHORING_KEY` is not a re-export, so
+  `pipeline_proposal`, `tools/_common`, `tools/sources`, `tools/sessions`,
+  `service` and `reviewed_source_authority` all reported
+  `does not explicitly export attribute`. Fixed on B49 with the redundant
+  alias (`SOURCE_AUTHORING_KEY as SOURCE_AUTHORING_KEY`), which ruff then
+  splits into its own `from elspeth.web.composer.state import (...)` block —
+  that split is expected, the file already does it for
+  `plugin_policy.coverage`. General trap: this failure reproduces from an
+  UNMODIFIED file, so before "fixing" a mypy hook failure, run mypy on a file
+  you did not touch and attribute it before you edit anything.
+- **2026-08-29 — `@trust_boundary` suppression is CALL-LAUNDERED: decorating a
+  function does NOTHING for a finding on a value a helper RETURNED.** The
+  tier_model walk roots a subject at `source_param` through subscript,
+  attribute, `.get(...)`, iteration, unpacking and walrus — but
+  `trust_boundary_suppress.subject_is_rooted` descends an `ast.Call` through
+  `Call.func`, NOT through `Call.args`, so `helper(payload)`'s result belongs to
+  `helper`, not to `payload`. Two consequences bit B43 and will bite again:
+  (1) `items, error = _current_sequence(payload["x"], ...)` leaves every
+  per-element `isinstance(item, Mapping)` unsuppressed no matter what decorator
+  the enclosing function carries — the element check belongs to the element and
+  must be removed or rationalised; (2) even INSIDE a decorated boundary,
+  `for index, item in enumerate(value)` launders `item`, because the `For`
+  iter is a call rooted at `enumerate`. Do NOT rewrite such a loop to
+  `for index in range(len(value)): item = value[index]` to regain suppression —
+  that is a lint dodge, and the honest answers are a rationale or a real
+  removal. Decide suppressibility by RUNNING the rule (the non-failing
+  `R_TB_SUPPRESSED` observation stream names every site a decorator actually
+  covered) rather than by reading the decorator.
+
+- **2026-08-29 — in `web/composer/guided/protocol.py`, an exact-key check that
+  feeds subscripts is `_exact_nested_mapping`, not `_exact_nested_keys` +
+  `assert isinstance`.** The module's ~17 call sites used to re-assert
+  `isinstance(x, Mapping)` after a successful `_exact_nested_keys` purely so the
+  following subscripts type-check — a runtime re-check of a fact the helper had
+  just proved, and an R5 finding at every one. `_exact_nested_mapping` returns
+  `(narrowed_mapping | None, error | None)`, converging those sites on the
+  `(value, error)` idiom `_sequence_of_mappings` / `_current_sequence` already
+  used; `assert x is not None` is not an R5. Where the subject is already `Any`
+  (a subscript of an already-narrowed mapping, e.g. `node["behavior"]`) the
+  assert is simply DELETED — mypy needs nothing and the check was dead. Same
+  file: `_validate_propose_pipeline_payload`'s four edge indices
+  (`outgoing_flows`, `incoming_edges`, `gate_routes`, `gate_forks`) are now
+  seeded DENSE over the domain their writes are proven to lie in, the way
+  `adjacency`/`reverse_adjacency` always were, so every read is a total
+  member lookup and a broken domain invariant crashes instead of being
+  relabelled "no flows" by a `.get(k, ())` default. Keep new indices in that
+  shape; the `.get()`s that REMAIN there are the ones whose key is an
+  LLM-authored id with no membership proof (`component_kind_by_id`,
+  `node_by_id`) and are justified as such.
 
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list
@@ -363,6 +579,47 @@ is a working document under the normal delivery posture.
   ~300s, 14s CPU). When you add a new poll-until-deadline loop, measure the
   deadline and wait on the SAME injected clock — never `time.sleep` beside
   `clock.monotonic()` — and any test fake typed as `Clock` needs `sleep`.
+
+- **2026-08-29 — computing a tier_model justify key by hand: `TierModelVisitor`
+  is PATH-SENSITIVE, and the wrong relative path silently INVENTS findings.**
+  No `elspeth-lints check` flag emits the `<file>:<RULE>:<Symbol>:ast=<path>`
+  justify key (`--format json` carries line/col/fingerprint but neither
+  `symbol_context` nor `ast_path`), so a lane that needs keys after its edits
+  shift the ast paths has to call the rule in-process. Use
+  `collect_check_result(root, allowlist_path=<empty dir>)` and read
+  `Finding.symbol_context` / `Finding.ast_path` — NOT a hand-built
+  `TierModelVisitor`. The visitor's first argument must be the path relative to
+  the SCAN ROOT (`src/elspeth`), because `_R5_NAMED_BOUNDARY_CONTEXTS` is keyed
+  on exactly that string and is gated by `if not
+  self.file_path.startswith("web/")`. Passing a path relative to `src/` instead
+  (`elspeth/web/composer/service.py`) misses both the prefix test and the dict
+  key, and the named-boundary exemptions silently stop applying: B33 measured
+  41 findings that way against the scanner's real 31 in
+  `web/composer/service.py` — ten fabricated justify candidates in
+  `_cached_runtime_preflight` and `_validate_advisor_arguments`, with no error
+  and no warning. Cross-check any in-process count against the CLI's line count
+  for the same file before trusting it.
+
+- **2026-08-29 — an ELSPETH-owned "closed sum type" can still be SUBCLASSED by
+  test doubles, and `type(x) is C` breaks them.** The Wave-1 `isinstance` →
+  `type(x) is C` conversion is right for the closed unions listed in the
+  2026-08-29 narrowing entry above, but check for subclasses in `tests/` as
+  well as `src/` before converting: `_ToolOutcomeResponse = ToolResult |
+  Mapping[str, Any] | None` is documented as closed on `_ToolOutcome`, yet
+  `ToolResult` is deliberately subclassed by doubles that ride the real compose
+  loop — `_StrayToolResult`
+  (`tests/property/web/composer/test_compose_loop_invariants.py`,
+  `tests/integration/pipeline/test_composer_llm_eval_characterization.py`) and
+  `_NonCanonicalizableResult`
+  (`tests/unit/web/composer/test_compose_loop_audit_wiring.py`) — precisely to
+  prove that a drifted response shape is sentinelized rather than persisted. An
+  exact-type test at
+  `_tool_batch_staged_terminal_interpretation_review_handoff` would route those
+  down the "not a tool result" arm and skip the `not response.success` check,
+  admitting a FAILED batch into the terminal pending-review verdict. Those
+  three R5 sites are rationalised, not converted (B33). `grep -rn '(ToolResult)'
+  src/ tests/` is the check; "closed" in a docstring means no PRODUCTION
+  variant, not no subclass.
 
 - **2026-08-28 — `.pre-commit-config.yaml` lint hooks are pinned by
   `tests/unit/elspeth_lints/test_pre_commit_triggers.py`** (elspeth-7e8bf1c28b).

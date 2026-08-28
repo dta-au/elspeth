@@ -875,15 +875,18 @@ def _direct_control_options(summaries: Mapping[str, list[PluginSummary]], plugin
     remaining required service bindings come from the placeholder table.
     """
     plugin = next(entry for entry in summaries["transform"] if entry.name == plugin_name)
-    candidates_by_field = {requirement.field: requirement.candidates for requirement in plugin.secret_requirements}
-    placeholders = _DIRECT_CONTROL_OPTION_EXEMPLARS.get(plugin_name, {})
+    declared_candidates = {requirement.field: requirement.candidates for requirement in plugin.secret_requirements}
+    # Membership in this map IS "a canonical secret_ref exists for this field".
+    # A requirement that declares no inventory candidate names no deployment
+    # binding, so it is dropped here rather than read back through a default.
+    candidates_by_field = {name: candidates for name, candidates in declared_candidates.items() if candidates}
+    placeholders = _DIRECT_CONTROL_OPTION_EXEMPLARS[plugin_name] if plugin_name in _DIRECT_CONTROL_OPTION_EXEMPLARS else {}
     options: dict[str, object] = {}
     for field in plugin.config_fields:
         if not field.required:
             continue
-        candidates = candidates_by_field.get(field.name)
-        if candidates:
-            options[field.name] = {"secret_ref": candidates[0]}
+        if field.name in candidates_by_field:
+            options[field.name] = {"secret_ref": candidates_by_field[field.name][0]}
         elif field.name in placeholders:
             options[field.name] = placeholders[field.name]
     return options
@@ -907,12 +910,15 @@ def _direct_control_options_are_deployable(summaries: Mapping[str, list[PluginSu
     REQUIRED-but-unselected and the aids keep teaching manual wiring.
     """
     plugin = next(entry for entry in summaries["transform"] if entry.name == plugin_name)
-    candidates_by_field = {requirement.field: requirement.candidates for requirement in plugin.secret_requirements}
+    declared_candidates = {requirement.field: requirement.candidates for requirement in plugin.secret_requirements}
+    # Same membership contract as ``_direct_control_options``: a field is
+    # backed by a real deployment binding exactly when it survives this filter.
+    candidates_by_field = {name: candidates for name, candidates in declared_candidates.items() if candidates}
     caller_authored = {"fields", "schema", "source"}
     for field in plugin.config_fields:
         if not field.required or field.name in caller_authored:
             continue
-        if candidates_by_field.get(field.name):
+        if field.name in candidates_by_field:
             continue
         return False
     return True
@@ -1156,7 +1162,7 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
     _assert_projection_input_bounds(schema.composer_hints)
     json_schema = _contract_json_schema(schema.json_schema)
     knob_schema = _contract_knob_schema(schema.knob_schema)
-    if isinstance(json_schema, bool):
+    if type(json_schema) is bool:
         raise _SchemaContractProjectionUnsupported
     projected = {
         "plugin_id": f"{schema.plugin_type}/{schema.name}",
@@ -1184,7 +1190,7 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
     tier=3,
     source="Plugin-declared JSON Schema 'discriminator' fragment (raw ConfigModel.model_json_schema() output)",
     source_param="raw",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "raises _SchemaContractProjectionUnsupported unless raw is a dict containing only "
         "propertyName (str) and/or mapping (dict[str, str]) keys"
@@ -1213,7 +1219,7 @@ def _contract_discriminator(raw: object) -> dict[str, object]:
     tier=3,
     source="Plugin-declared JSON Schema fragment (raw ConfigModel.model_json_schema() output; recursive)",
     source_param="raw",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "raises _SchemaContractProjectionUnsupported on any JSON Schema KEYWORD outside the closed "
         "projected vocabulary, and on any container-valued keyword whose value shape is wrong; the "
@@ -1288,7 +1294,7 @@ def _contract_json_schema(raw: object) -> dict[str, object] | bool:
     tier=3,
     source="Plugin-declared ELSPETH knob-schema fragment (PolicyCatalogView.get_schema knob_schema; recursive)",
     source_param="raw",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "raises _SchemaContractProjectionUnsupported on any field shape outside the closed "
         "{name,kind,type,required,nullable,default,enum,choices,item_kind,visible_when,required_when,"
@@ -1336,10 +1342,13 @@ def _contract_knob_schema(raw: object) -> dict[str, object]:
         if "item_kind" in raw_field and not isinstance(raw_field["item_kind"], str):
             raise _SchemaContractProjectionUnsupported
         field: dict[str, object] = {key: deepcopy(raw_field[key]) for key in scalar_key_order if key in raw_field}
-        if "choices" in field and "enum" not in field:
-            field["enum"] = field.pop("choices")
-        else:
-            field.pop("choices", None)
+        if "choices" in field:
+            # ``enum`` and ``choices`` are one fact under two spellings, and a
+            # field carrying both with different values was already rejected
+            # above — so the projection keeps ``enum`` and drops ``choices``.
+            if "enum" not in field:
+                field["enum"] = field["choices"]
+            del field["choices"]
         for predicate_key in ("visible_when", "required_when"):
             if predicate_key not in raw_field:
                 continue

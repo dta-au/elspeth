@@ -86,8 +86,11 @@ def test_update_request_accepts_only_show_advanced() -> None:
 
 
 def test_update_request_rejects_non_bool_show_advanced() -> None:
+    # The request model is deliberately NOT strict (ISO datetimes must coerce,
+    # models.py:12-19), so pydantic's lax bool accepts "yes"/"1"/"true". A list
+    # is the value shape lax mode still rejects.
     with pytest.raises(ValidationError):
-        UpdateComposerPreferencesRequest.model_validate({"show_advanced": "yes"})
+        UpdateComposerPreferencesRequest.model_validate({"show_advanced": [1, 2]})
 ```
 
 (`pytest` and `ValidationError` are already imported at the top of that file; check and add `from pydantic import ValidationError` if not.)
@@ -373,10 +376,13 @@ Append inside `describe("ComposerPreferencesForm", ...)`:
     await user.click(within(group).getByRole("radio", { name: "Show technical detail" }));
     expect(updateUserComposerPreferences).toHaveBeenCalledWith({ show_advanced: true });
     expect(usePreferencesStore.getState().showAdvanced).toBe(true);
+    // Store → mounted control (the flag flips from elsewhere, e.g. another tab).
+    act(() => usePreferencesStore.setState({ showAdvanced: false }));
+    expect(within(group).getByRole("radio", { name: "Standard (recommended)" })).toBeChecked();
   });
 ```
 
-Add `within` to the `@testing-library/react` import and `updateUserComposerPreferences` to the `@/api/client` import in that test file.
+Add `act, within` to the `@testing-library/react` import and `updateUserComposerPreferences` to the `@/api/client` import in that test file.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -502,10 +508,22 @@ def test_every_lowered_field_carries_a_tier_defaulting_to_common() -> None:
 
 Check `lower_model_to_knob_schema`'s exact keyword names at its `def` (grep it) and match them.
 
+Rewrite the pre-existing `test_tier_absent_when_unannotated` in `tests/unit/web/composer/test_knob_schema_from_model.py:99-105` — it pins the OLD contract and would fail after Step 3:
+
+```python
+def test_tier_defaults_to_common_when_unannotated():
+    class Opts(BaseModel):
+        debug: Annotated[bool, Field(title="Debug", description="Verbose output")] = False
+
+    ks = lower_model_to_knob_schema(Opts, plugin_kind="source", plugin_name="test")
+    f = ks["fields"][0]
+    assert f["tier"] == "common"
+```
+
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `pytest tests/unit/web/catalog/test_knob_schema_properties.py -q -k tier`
-Expected: FAIL — `KeyError: 'tier'` for `plain`.
+Run: `pytest tests/unit/web/catalog/test_knob_schema_properties.py tests/unit/web/composer/test_knob_schema_from_model.py -q -k tier`
+Expected: FAIL — `KeyError: 'tier'` for the unannotated fields.
 
 - [ ] **Step 3: Default the tier and delete the dead parameter**
 
@@ -529,6 +547,8 @@ def _attach_tier(field: KnobField, info: FieldInfo) -> None:
     field["tier"] = tier
 ```
 
+The discriminated-plugin path builds its discriminator field by hand (`knob_schema.py:506-515`, affects `transform__llm` and `source__llm`) — add `"tier": "common",` to that literal so the "every wire field carries a tier" claim is actually true (`_base_field` is not on that path).
+
 Remove `composer_tier_default` everywhere: the `_lower_field` parameter and its `del`, the `_lower_nested_field` call (`_lower_field(name, info, plugin_kind="", plugin_name="")`), and the `lower_model_to_knob_schema` signature + any caller passing it (grep `composer_tier_default` across `src/` and `tests/`; there must be zero hits when done). Keep `plugin_kind`/`plugin_name` parameters as they are (they are part of the public signature even if unused inside `_lower_field`).
 
 - [ ] **Step 4: Annotate the first advanced knobs**
@@ -537,14 +557,19 @@ Remove `composer_tier_default` everywhere: the `_lower_field` parameter and its 
 
 `src/elspeth/plugins/sources/csv_source.py:43-45` — add `json_schema_extra={"composer_tier": "advanced"}` to `delimiter`, `encoding`, `skip_rows`.
 
-Example of the exact edit shape:
+Example of the exact edit shape — always break the call across lines: the ruff limit is 140 (`pyproject.toml:283`) and the one-line csv_source fields would reach ~150 chars, and ruff's reflow would otherwise shift line citations under the 8 pending tier-model allowlist entries for that file:
 
 ```python
     temperature: float = Field(
-        0.0, ge=0.0, le=2.0, description="Sampling temperature",
+        0.0,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature",
         json_schema_extra={"composer_tier": "advanced"},
     )
 ```
+
+**Ruling recorded here (W1 of the plan review):** knobs default to `"common"`; plugins annotate only `advanced`/`essential`. Ticket `elspeth-9cca900d41`'s original acceptance ("a lint pins that every knob has an explicit tier") is superseded — the test above pins the default instead. Wave 2 `elspeth-ca456d9d8d` builds on the default-to-common contract.
 
 - [ ] **Step 5: Regenerate the golden snapshots deliberately**
 
@@ -576,7 +601,7 @@ Expected: PASS (golden, properties, composer-help, eager lowering).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/elspeth/web/catalog/knob_schema.py src/elspeth/plugins/transforms/llm/base.py src/elspeth/plugins/sources/csv_source.py tests/unit/web/catalog/test_knob_schema_properties.py tests/golden/web/catalog/knob_schema
+git add src/elspeth/web/catalog/knob_schema.py src/elspeth/plugins/transforms/llm/base.py src/elspeth/plugins/sources/csv_source.py tests/unit/web/catalog/test_knob_schema_properties.py tests/unit/web/composer/test_knob_schema_from_model.py tests/golden/web/catalog/knob_schema
 git commit -m "feat(catalog): every knob carries a composer tier; first advanced annotations (elspeth-9cca900d41, elspeth-0bfd019f68)"
 ```
 
@@ -624,6 +649,15 @@ describe("SchemaFormTurn advanced tier", () => {
     expect(screen.getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
   });
 
+  it("opens the disclosure when the flag flips on an already-mounted form", async () => {
+    const user = userEvent.setup();
+    render(<SchemaFormTurn payload={payload} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).not.toHaveAttribute("open");
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
+  });
+
   it("treats a field with no tier as common", async () => {
     const user = userEvent.setup();
     render(<SchemaFormTurn payload={pluginPayload([field({ name: "path", label: "Path", kind: "text" })])} onSubmit={vi.fn()} />);
@@ -633,7 +667,7 @@ describe("SchemaFormTurn advanced tier", () => {
 });
 ```
 
-Add `beforeEach` to the vitest import.
+Add `beforeEach` to the vitest import and `act` to the `@testing-library/react` import.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -781,7 +815,7 @@ Wave 1 orders by a static allowlist; tier-driven ordering from the catalog schem
 `OptionRows.test.tsx`:
 
 ```tsx
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -804,8 +838,9 @@ describe("OptionRows", () => {
     render(<OptionRows options={OPTIONS} ariaLabel="assess options" />);
     const region = screen.getByRole("region", { name: "assess options" });
     const terms = within(region).getAllByRole("term").map((t) => t.textContent);
-    expect(terms.slice(0, 2)).toEqual(["prompt_template", "profile"]);
-    const advanced = within(region).getByText("Advanced settings (2)").closest("details");
+    expect(terms.slice(0, 3)).toEqual(["Prompt", "Model profile", "Row schema"]);
+    expect(region.textContent).not.toMatch(/prompt_template|schema_mode/);
+    const advanced = within(region).getByText("Advanced settings (1)").closest("details");
     expect(advanced).not.toHaveAttribute("open");
     expect(within(region).queryByText(/Raw options/)).not.toBeInTheDocument();
     expect(region.textContent).not.toMatch(/f976fd8b-4432/);
@@ -816,8 +851,16 @@ describe("OptionRows", () => {
     usePreferencesStore.setState({ showAdvanced: true });
     render(<OptionRows options={OPTIONS} ariaLabel="assess options" />);
     const region = screen.getByRole("region", { name: "assess options" });
-    expect(within(region).getByText("Advanced settings (2)").closest("details")).toHaveAttribute("open");
+    expect(within(region).getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
     expect(within(region).getByText("Raw options (JSON)")).toBeInTheDocument();
+  });
+
+  it("reacts when the preference flips on an already-mounted panel (the real user flow)", () => {
+    render(<OptionRows options={OPTIONS} ariaLabel="assess options" />);
+    expect(screen.getByText("Advanced settings (1)").closest("details")).not.toHaveAttribute("open");
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
+    expect(screen.getByText("Raw options (JSON)")).toBeInTheDocument();
   });
 
   it("renders a plain sentence for empty options", () => {
@@ -851,25 +894,36 @@ Expected: FAIL — module not found.
 // ============================================================================
 
 import { CodeBlock } from "@/components/chat/CodeBlock";
+import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
 import { useShowAdvanced } from "@/stores/preferencesStore";
 
-import { ConfigRows } from "./GraphView";
+import { ConfigRows } from "./ConfigRows";
 
-export const ESSENTIAL_OPTION_KEYS: readonly string[] = [
-  "prompt_template",
-  "system_prompt",
-  "profile",
-  "model",
-  "response_field",
-  "path",
-  "mode",
-  "fields",
-  "field_mapping",
-  "select_only",
-  "columns",
-  "url",
-  "query",
-];
+// Visible labels for the authored keys (copy-register rule: no snake_case in
+// visible text). Anything not listed falls back to titleCaseLabel(key), the
+// frontend's single title-casing implementation (elspeth-d2de348437).
+export const OPTION_LABELS: Readonly<Record<string, string>> = {
+  prompt_template: "Prompt",
+  system_prompt: "System prompt",
+  profile: "Model profile",
+  model: "Model",
+  response_field: "Answer written to",
+  path: "File",
+  schema: "Row schema",
+  mode: "Mode",
+  fields: "Fields",
+  field_mapping: "Field mapping",
+  select_only: "Keep only",
+  columns: "Columns",
+  url: "URL",
+  query: "Query",
+};
+
+export function optionLabel(key: string): string {
+  return OPTION_LABELS[key] ?? titleCaseLabel(key);
+}
+
+export const ESSENTIAL_OPTION_KEYS: readonly string[] = Object.keys(OPTION_LABELS);
 
 export const INTERNAL_OPTION_KEYS: ReadonlySet<string> = new Set([
   "interpretation_requirements",
@@ -881,10 +935,12 @@ export const INTERNAL_OPTION_KEYS: ReadonlySet<string> = new Set([
   "system_prompt_source",
 ]);
 
+// Re-key by visible label. (The raw key is recoverable from the Raw options
+// block; ConfigRows has no per-row title plumbing and none is added here.)
 function pick(options: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const key of keys) {
-    if (Object.prototype.hasOwnProperty.call(options, key)) out[key] = options[key];
+    if (Object.prototype.hasOwnProperty.call(options, key)) out[optionLabel(key)] = options[key];
   }
   return out;
 }
@@ -937,7 +993,7 @@ export function OptionRows({
 }
 ```
 
-In `GraphView.tsx`, change `function ConfigValue` and `function ConfigRows` to `export function ...` (no other change to them). Note the import direction: `OptionRows` imports from `GraphView`; `GraphView` will import `OptionRows` — that is a cycle. Avoid it: **move `isRecord`, `ConfigValue`, `ConfigRows` out of `GraphView.tsx` into a new `src/components/inspector/ConfigRows.tsx`** (exported), have both `GraphView.tsx` and `OptionRows.tsx` import from there. Keep the CSS class names unchanged.
+Create `src/components/inspector/ConfigRows.tsx` by **moving** `isRecord`, `ConfigValue`, and `ConfigRows` out of `GraphView.tsx` verbatim (exported), then `import { ConfigRows } from "./ConfigRows";` in `GraphView.tsx`. `OptionRows.tsx` imports from `./ConfigRows` (as in the code above) — never from `./GraphView`, which would be an import cycle. Keep the CSS class names unchanged. `url` stays an essential (always-visible) key: it is authored content; the credential-egress gate for URL fields lives in the Run confirm dialog, not here. `schema` is essential because the llm plugin requires it.
 
 - [ ] **Step 4: Reorder `NodeConfigPanel`**
 
@@ -1123,14 +1179,16 @@ git commit -m "feat(spec): humanised routing rows and shared OptionRows; raw JSO
 
 **Files:**
 - Modify: `src/elspeth/web/frontend/src/components/execution/ValidationResult.tsx`
+- Modify: `src/elspeth/web/frontend/src/components/sidebar/SideRailValidationBanner.tsx:85-95` (`SuggestionList` row text)
 - Test: `src/elspeth/web/frontend/src/components/execution/ValidationResult.test.tsx`
+- Test: `src/elspeth/web/frontend/src/components/sidebar/SideRailValidationBanner.test.tsx`
 
 **Interfaces:**
 - Consumes: `humaniseValidationMessage(message, phraseFor, stepLabelFor)`, `makePhraseFor(compositionState)` from `@/lib/validationHumaniser`; `stepLabelForNodeId(state, id)` from `@/components/chat/interpretationStepLabel`; `useShowAdvanced()`; `useSessionStore((s) => s.compositionState)`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `ValidationResult.test.tsx` (add `import { usePreferencesStore } from "@/stores/preferencesStore";`, `import { useSessionStore } from "@/stores/sessionStore";`, `import { resetStore } from "@/test/store-helpers";`, and `beforeEach` to the vitest import):
+Append to `ValidationResult.test.tsx` (add `import { usePreferencesStore } from "@/stores/preferencesStore";`, `import { useSessionStore } from "@/stores/sessionStore";`, `import { resetStore } from "@/test/store-helpers";`, `act, within` to the `@testing-library/react` import, and `beforeEach` to the vitest import):
 
 ```tsx
 describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
@@ -1147,11 +1205,12 @@ describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
     expect(screen.getByText("All 2 checks passed.")).toBeInTheDocument();
   });
 
-  it("shows the per-stage list, without the stage-id prefix, when show_advanced is on", async () => {
-    usePreferencesStore.setState({ showAdvanced: true });
+  it("shows the check list, without the check-name prefix, once show_advanced flips on a mounted banner", async () => {
     const user = userEvent.setup();
     render(<ValidationResultBanner result={makePassResult()} />);
     await user.click(screen.getByRole("button", { name: "Validation passed. Show details." }));
+    expect(screen.queryByText("Graph structure is valid")).not.toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
     const item = screen.getByText("Graph structure is valid");
     expect(item).toBeInTheDocument();
     expect(item.closest("li")).toHaveAttribute("title", "graph_structure");
@@ -1175,15 +1234,65 @@ describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
         })}
       />,
     );
+    // role="alert" (ValidationResult.tsx:236) wraps the whole error list, so
+    // the raw text IS inside the alert — the contract is that it sits only
+    // inside a closed <details>, never in the headline the AT announces first.
     const alert = screen.getByRole("alert");
-    expect(alert.textContent).not.toMatch(/Schema contract violation/);
-    expect(screen.getByText("Technical details")).toBeInTheDocument();
-    expect(screen.getByText(/Schema contract violation/)).toBeInTheDocument();
+    const raw = within(alert).getByText(/Schema contract violation/);
+    const details = raw.closest("details");
+    expect(details).not.toBeNull();
+    expect(details).not.toHaveAttribute("open");
+    expect(within(details as HTMLElement).getByText("Technical details")).toBeInTheDocument();
+    const item = alert.querySelector("li.validation-banner-error-item") as HTMLElement;
+    const headline = Array.from(item.childNodes)
+      .filter((node) => (node as HTMLElement).tagName !== "DETAILS")
+      .map((node) => node.textContent)
+      .join("");
+    expect(headline).not.toMatch(/Schema contract violation/);
+    expect(headline).toMatch(/assess/i);
   });
 });
 ```
 
 Confirm the error object shape against `ValidationError` in `types/index.ts` (`component_id`, `component_type`, `message`, `suggestion`) and adjust.
+
+Append to `SideRailValidationBanner.test.tsx` inside its top-level `describe` (the file already imports `makeComposition`, `useExecutionStore`, `useSessionStore`, `resetStore`; add `act` to the `@testing-library/react` import and `import { usePreferencesStore } from "@/stores/preferencesStore";`):
+
+```tsx
+  it("names the suggestion's component by its plain phrase, not the raw id, and reacts to a mounted flag flip", () => {
+    resetStore(usePreferencesStore);
+    useSessionStore.setState({ compositionState: makeComposition(1) } as never);
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        summary: "Validation passed",
+        checks: [
+          { name: "graph_structure", passed: true, detail: "Graph structure is valid", affected_nodes: [], outcome_code: null },
+        ],
+        errors: [],
+        warnings: [],
+        readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] },
+        suggestions: [
+          { component: "select_columns", message: "Schema contract violation: 'source' -> 'select_columns': required field 'id' is not guaranteed", severity: "info" },
+        ],
+      } as never,
+    });
+
+    render(<SideRailValidationBanner />);
+
+    const list = screen.getByRole("list", { name: /suggestions/i });
+    expect(list.textContent).not.toMatch(/select_columns:/);
+    expect(list.textContent).not.toMatch(/Schema contract violation/);
+    expect(screen.getByText(/Schema contract violation/).closest("details")).not.toBeNull();
+
+    // The check list under the pass banner appears only once the flag flips ON A MOUNTED tree.
+    expect(screen.queryByText("Graph structure is valid")).not.toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(screen.getByText("Graph structure is valid")).toBeInTheDocument();
+  });
+```
+
+Check how the file's existing tests put `suggestions` on the execution store (the `SUGGESTION` constant at the top of the file shows the `{ component, message, severity }` shape) and match the exact store key they use; give the suggestion `<ul>` an `aria-label="Suggestions"` if it does not already have an accessible name.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -1277,13 +1386,13 @@ Apply the same humanise + details treatment to the warnings list (`warn.message`
 - [ ] **Step 4: Run the execution tests**
 
 Run: `npx vitest run src/components/execution src/components/sidebar`
-Expected: PASS. Existing tests that asserted the literal `plugin_enablement: plugin_enablement passed.` line in the expanded pass view must be updated to set `showAdvanced: true` first or to assert the new summary sentence — do that in the same commit and say so in the message.
+Expected: two pre-existing tests fail first — `"expands to check details on click and collapses again via Collapse"` (ValidationResult.test.tsx:54-73) and `"auto-expands when the pass carries warnings and offers no Collapse"` (:75-96) both assert `/plugin_enablement passed/` with the flag off. Edit each: add `usePreferencesStore.setState({ showAdvanced: true });` as the first line of the test body (the fixture's `detail` text is `"plugin_enablement passed."`, so the regex still matches the now-prefix-free row). Re-run; expected PASS. Also update `SideRailValidationBanner.tsx:91` in this task: `<strong>{s.component}:</strong> {s.message}` renders the raw component id and raw message — pass them through the same `phraseFor` / `humaniseValidationMessage(...).headline` pair (the component already has access to `compositionState` via the store).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/elspeth/web/frontend/src/components/execution/ValidationResult.tsx src/elspeth/web/frontend/src/components/execution/ValidationResult.test.tsx
-git commit -m "fix(validation): execution banner uses the shared humaniser; stage list only with show_advanced (elspeth-27efd1e801)"
+git add src/elspeth/web/frontend/src/components/execution/ValidationResult.tsx src/elspeth/web/frontend/src/components/execution/ValidationResult.test.tsx src/elspeth/web/frontend/src/components/sidebar/SideRailValidationBanner.tsx src/elspeth/web/frontend/src/components/sidebar/SideRailValidationBanner.test.tsx
+git commit -m "fix(validation): execution banner and side-rail suggestions use the shared humaniser; check list only with show_advanced (elspeth-27efd1e801)"
 ```
 
 ---
@@ -1311,11 +1420,11 @@ Run: `pytest tests/ -n 12 -q 2>&1 | tail -30` in the background (worktree prefer
 
 - [ ] **Step 4: Live check on the local deployment**
 
-Deploy per the redeploy notes; sign in as `dta_user`; open session `39578c6f`; confirm: Spec tab shows no hash/UUID with the default preference; toggle "Show technical detail" in Composer preferences; Spec tab now offers "Raw options (JSON)"; Validation inspector expanded shows the stage list only with the flag on; node inspector shows Settings above a collapsed "Connections & schema".
+Executor: the lane that ran Task 8 (it has the branch built). Procedure: build the frontend (`npm run build` in `src/elspeth/web/frontend`), then `sudo systemctl restart elspeth-web` and confirm `/api/system/status` reports the new `frontend_build` value before trusting anything (`is-active` alone lies after a restart — poll the build id). Sign in as `dta_user`; open session `39578c6f`. Confirm: Spec tab shows no hash/UUID with the default preference; toggle "Show technical detail" in Composer preferences; Spec tab now offers "Raw options (JSON)"; Validation inspector expanded shows the check list only with the flag on; node inspector shows Settings above a collapsed "Connections & schema". Report: one `filigree add-comment elspeth-cd8abcba3f` listing each check as pass/fail with the frontend build id; a failed check reopens the task's ticket rather than being noted in prose.
 
 - [ ] **Step 5: Close the tickets**
 
-For each of `elspeth-9c11df65f8`, `elspeth-9cca900d41`, `elspeth-a6ea581e8a`, `elspeth-b9ebdf9011`, `elspeth-27efd1e801`: `filigree add-comment <id> "<what landed, commit sha, what verified>"` then `filigree close <id> --reason="..."`. `elspeth-0bfd019f68` closes only its `composer_tier_default` half (Task 4); leave it open with a comment for the audit-characteristic chip (Wave 2).
+Ticket workflow facts: `elspeth-9c11df65f8` is a *feature* — start it with `filigree start-work elspeth-9c11df65f8 --assignee <lane> --advance` (walks proposed → approved → building); `elspeth-9cca900d41` and `elspeth-27efd1e801` are *bugs* — `--advance` walks triage → confirmed → fixing, and closing requires fixing → verifying first (`filigree update <id> --status verifying` then `filigree close`). For each of `elspeth-9c11df65f8`, `elspeth-9cca900d41`, `elspeth-b9ebdf9011`, `elspeth-27efd1e801`: `filigree add-comment <id> "<what landed, commit sha, what verified>"` then close. **Do not close `elspeth-a6ea581e8a`** — comment that the reorder + collapse landed and leave it open for its Wave 2 follow-up (catalog-tier-driven ordering, roadmap row 8). `elspeth-0bfd019f68`: comment that the `composer_tier_default` half landed here; the chip deletion remains (Wave 3).
 
 ---
 
@@ -1327,24 +1436,24 @@ Each wave gets its own plan file once Wave 1 is merged; the tickets already carr
 
 | Order | Ticket | Scope | Depends on |
 |---|---|---|---|
-| 1 | `elspeth-af559a0bab` | Tool-call cards: sentence primary, identifier secondary; add `splice_transform`; closed-set map test | — |
+| 1 | `elspeth-af559a0bab` | Tool-call cards: sentence primary, identifier secondary; map the 15 unmapped web-registry tools (verified by importing `_dispatch._REGISTERED_TOOLS`, 40 tools); registry-parity test | — |
 | 2 | `elspeth-34e810312c` | Run history & diagnostics behind the flag; keep corruption badge + Explain | Wave 1 |
 | 3 | `elspeth-aa39cffb16` | Import YAML behind the flag; YAML Download stays | Wave 1 |
-| 4 | `elspeth-05a240b82a` | Accounting grid glossary + collapse; recent-errors count | Wave 1, `validationHumaniser` phrase map |
+| 4 | `elspeth-05a240b82a` | Accounting grid glossary + collapse; recent-errors count | Wave 1, `elspeth-27efd1e801` (phrase-map reuse) |
 | 5 | `elspeth-ca456d9d8d` | Wire-stage detail under "Technical details"; `node_options_summary` through tiers; humanise `plugin.id` subtitles | Wave 1 Task 4 |
 | 6 | `elspeth-8555a6a9e0` | Catalog: Capability chips, characteristic strip tiering, Schema view | Wave 1 |
-| 7 | `elspeth-c8a402a9a4` | Version history grouping; humanised applied labels | #1 |
+| 7 | `elspeth-c8a402a9a4` | Version history grouping that keeps every version revertable (expand-in-place); humanised applied labels; edit-source labels need a backend wire field — out of scope | #1 |
 | 8 | `elspeth-a6ea581e8a` (follow-up) | Replace `ESSENTIAL_OPTION_KEYS` with catalog-tier-driven ordering once `pluginCatalogStore` exposes knob schemas to the inspector | Wave 1 Task 6 |
 
 **Wave 3 — register, bugs, cleanup** (independent of the flag; can run in parallel with Wave 2 by a second lane):
 
 | Ticket | Scope |
 |---|---|
-| `elspeth-ee06421268` | `ghost_node` raw-id fallback → "a removed step" (bug) |
+| `elspeth-93f5621f18` | `humaniseStepLabel` raw-id fallback → "a removed step" (design reversal; the :120-124 doctrine and two pinning tests change with it) |
 | `elspeth-d74ab492dd` | Register batch (ModelChip, scope badge, byte count, failure enums, ExplainDialog, egress plugin names, provenance enum, "reviewed" word) |
 | `elspeth-4bf65fe149` | Planner brief: reader's terms; corpus case that fails on `is_valid:`/`options.` tokens |
-| `elspeth-57c6fba409` | Confirm/fix the sr-only component list pointer interception (a11y bug, triage first) |
-| `elspeth-f1394307e3` | Minor gated surfaces: recovery transcript, blob structural disclosure, audit Refresh, Show archived |
-| `elspeth-0bfd019f68` (remainder) | Delete the unknown-audit-characteristic chip; add vocabulary-parity test |
+| `elspeth-d1feee1e67` | e2e keyboard path through the graph a11y list (the 1px clip + `:focus-within` reveal is deliberate; 57c6fba409 closed not_a_bug) |
+| `elspeth-f1394307e3` | Minor gated surfaces: recovery transcript, blob structural disclosure, audit Refresh (Show archived dropped — it is the only archive-restore path) |
+| `elspeth-0bfd019f68` (remainder) | Delete the unknown-audit-characteristic chip (the vocabulary-parity test already exists: test_audit_characteristic_vocabulary_parity.py:38) |
 
 **Sequencing rule for both waves:** one PR per ticket; each PR's default-DOM regression pin (no 32+-hex hash, no UUID, no `[a-z]+_[a-z_]+:` stage prefix outside `<details>`/`<code>` with the flag off) is the acceptance test the reviewer runs first.

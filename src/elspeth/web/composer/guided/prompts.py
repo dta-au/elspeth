@@ -204,8 +204,7 @@ def _summarize_sample_row(
     projection: dict[str, str] = {}
     for key, value in row.items():
         label = str(key)
-        alias = aliases.get(label)
-        if alias is None:
+        if label not in aliases:
             continue
-        projection[alias] = _summarize_sample_value(value)
+        projection[aliases[label]] = _summarize_sample_value(value)
     return projection
