@@ -374,7 +374,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5ee09c732ca7a533"
+    source_file_hash: str | None = "sha256:bd9d46df72c59d6b"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "

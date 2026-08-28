@@ -385,7 +385,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6c11a5da7c240be1"
+    source_file_hash: str | None = "sha256:50c55b1dcfea0f2d"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
