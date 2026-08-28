@@ -17,7 +17,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import ClassVar, Literal, Protocol, cast
+from typing import ClassVar, Literal, Protocol, cast, overload
 
 from elspeth.contracts.audit import SinkEffect, SinkEffectAttempt, SinkEffectMemberRecord
 from elspeth.contracts.enums import CallType
@@ -270,11 +270,11 @@ class SinkEffectCoordinator:
     ) -> None:
         if not isinstance(factory, RecorderFactory):
             raise TypeError("factory must be RecorderFactory")
-        if not isinstance(worker_id, str) or not worker_id.strip():
+        if type(worker_id) is not str or not worker_id.strip():
             raise ValueError("worker_id must be non-empty")
         if type(lease_ttl) is not timedelta or lease_ttl <= timedelta(0):
             raise ValueError("lease_ttl must be a positive timedelta")
-        if not isinstance(poll_interval, int | float) or isinstance(poll_interval, bool):
+        if type(poll_interval) not in {int, float}:
             raise TypeError("poll_interval must be a positive finite number")
         if not math.isfinite(poll_interval) or poll_interval <= 0:
             raise ValueError("poll_interval must be a positive finite number")
@@ -560,8 +560,6 @@ class SinkEffectCoordinator:
         )
         if returned_commit is not None:
             commit_result, commit_attempt = returned_commit
-            if not isinstance(commit_result, SinkEffectCommitResult):
-                raise LandscapeRecordError("durable commit attempt decoded to the wrong result type")
             heartbeat.refresh_and_check()
             result = self._finalize(
                 effect_id=effect.effect_id,
@@ -659,7 +657,7 @@ class SinkEffectCoordinator:
         lease: SinkEffectLease,
         heartbeat: _SinkEffectLeaseHeartbeat,
     ) -> SinkEffectFinalizationResult:
-        if not isinstance(request.effect_input, SinkEffectPipelineMembersInput):  # pragma: no cover - guarded by caller
+        if type(request.effect_input) is not SinkEffectPipelineMembersInput:  # pragma: no cover - guarded by caller
             raise TypeError("member effect execution requires pipeline members")
         effect_input = request.effect_input
         last_exact: tuple[SinkEffectCommitResult | SinkEffectReconcileResult, SinkEffectAttempt] | None = None
@@ -681,8 +679,6 @@ class SinkEffectCoordinator:
             )
             if returned_commit is not None:
                 commit_result, attempt = returned_commit
-                if not isinstance(commit_result, SinkEffectCommitResult):
-                    raise LandscapeRecordError("durable member commit decoded to the wrong result type")
                 self._effects.complete_member_result(attempt.attempt_id, commit_result, lease=lease)
                 last_exact = (commit_result, attempt)
                 continue
@@ -711,10 +707,7 @@ class SinkEffectCoordinator:
                     heartbeat,
                 )
             else:
-                returned_result, reconcile_attempt = returned_reconcile
-                if not isinstance(returned_result, SinkEffectReconcileResult):
-                    raise LandscapeRecordError("durable member reconcile decoded to the wrong result type")
-                reconciliation = returned_result
+                reconciliation, reconcile_attempt = returned_reconcile
             self._effects.complete_member_result(reconcile_attempt.attempt_id, reconciliation, lease=lease)
             if reconciliation.kind is SinkEffectReconcileKind.UNKNOWN:
                 raise SinkEffectUnknownError(plan.effect_id)
@@ -782,7 +775,7 @@ class SinkEffectCoordinator:
 
     def _member_record(self, effect_id: str, ordinal: int) -> SinkEffectMemberRecord:
         record = next((item for item in self._effects.get_members(effect_id) if item.ordinal == ordinal), None)
-        if not isinstance(record, SinkEffectMemberRecord):
+        if record is None:
             raise LandscapeRecordError(f"sink effect {effect_id} is missing member ordinal {ordinal}")
         return record
 
@@ -914,7 +907,7 @@ class SinkEffectCoordinator:
         effect: SinkEffect,
         request: SinkEffectExecutionRequest,
     ) -> SinkEffectExecutionRequest:
-        if not isinstance(request.effect_input, SinkEffectPipelineMembersInput):
+        if type(request.effect_input) is not SinkEffectPipelineMembersInput:
             return request
         durable_members = self._effects.get_members(effect.effect_id)
         caller_by_token = {member.token_id: member for member in request.effect_input.members}
@@ -1007,7 +1000,7 @@ class SinkEffectCoordinator:
         return tuple(snapshot), delivered_count
 
     def _persist_pipeline_member_payloads(self, effect_input: object) -> None:
-        if not isinstance(effect_input, SinkEffectPipelineMembersInput):
+        if type(effect_input) is not SinkEffectPipelineMembersInput:
             return
         store = self._factory.payload_store
         if store is None:
@@ -1018,11 +1011,7 @@ class SinkEffectCoordinator:
             if content_hash != member.payload_hash:
                 raise LandscapeRecordError("sink effect payload store returned a divergent member content hash")
 
-    def _hydrate_member(self, durable: object) -> SinkEffectMember:
-        from elspeth.contracts.audit import SinkEffectMemberRecord
-
-        if not isinstance(durable, SinkEffectMemberRecord):
-            raise TypeError("durable must be SinkEffectMemberRecord")
+    def _hydrate_member(self, durable: SinkEffectMemberRecord) -> SinkEffectMember:
         store = self._factory.payload_store
         if store is None:
             raise LandscapeRecordError("replacing sink effect recovery requires the configured payload store")
@@ -1105,10 +1094,7 @@ class SinkEffectCoordinator:
                 request_hash=request_hash,
             )
             if returned_inspection is not None:
-                inspection_result, _attempt = returned_inspection
-                if not isinstance(inspection_result, SinkEffectInspection):
-                    raise LandscapeRecordError("durable inspect attempt decoded to the wrong result type")
-                inspection = inspection_result
+                inspection, _attempt = returned_inspection
             else:
                 inspection_attempt = self._effects.begin_attempt(
                     SinkEffectAttemptRequest(
@@ -1235,8 +1221,6 @@ class SinkEffectCoordinator:
         )
         if returned is not None:
             result, attempt = returned
-            if not isinstance(result, SinkEffectReconcileResult):
-                raise LandscapeRecordError("durable reconcile attempt decoded to the wrong result type")
             return result, attempt.attempt_id
         attempt = self._effects.begin_attempt(
             SinkEffectAttemptRequest(
@@ -1319,6 +1303,44 @@ class SinkEffectCoordinator:
         for attempt in self._effects.get_attempts(effect_id):
             if attempt.action in actions and attempt.state is SinkEffectAttemptState.INTENT:
                 self._effects.mark_response_lost(attempt.attempt_id, recovery_lease=recovery_lease)
+
+    # The decoder validates the durable envelope against the action it was
+    # asked for — an INSPECT row whose evidence_json carries a commit envelope
+    # raises "envelope is divergent" rather than returning the wrong member of
+    # the union — so the action fixes the result type. Declaring that here
+    # keeps the narrowing static instead of re-asserting it at each call site.
+    @overload
+    def _returned_attempt(
+        self,
+        effect_id: str,
+        *,
+        action: Literal[SinkEffectAttemptAction.INSPECT],
+        request_hash: str,
+        started_after: datetime | None = None,
+        member_ordinal: int | None = None,
+    ) -> tuple[SinkEffectInspection, SinkEffectAttempt] | None: ...
+
+    @overload
+    def _returned_attempt(
+        self,
+        effect_id: str,
+        *,
+        action: Literal[SinkEffectAttemptAction.COMMIT],
+        request_hash: str,
+        started_after: datetime | None = None,
+        member_ordinal: int | None = None,
+    ) -> tuple[SinkEffectCommitResult, SinkEffectAttempt] | None: ...
+
+    @overload
+    def _returned_attempt(
+        self,
+        effect_id: str,
+        *,
+        action: Literal[SinkEffectAttemptAction.RECONCILE],
+        request_hash: str,
+        started_after: datetime | None = None,
+        member_ordinal: int | None = None,
+    ) -> tuple[SinkEffectReconcileResult, SinkEffectAttempt] | None: ...
 
     def _returned_attempt(
         self,

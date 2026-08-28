@@ -271,7 +271,7 @@ class CollectorExecutor:
                 f"arrival fails closed as an engine bug."
             )
 
-        pending = self._pending.get(key)
+        pending = self._pending[key] if key in self._pending else None
         if pending is None:
             pending = self._open_group(collector_name, group_id, first_arrival=now)
         elif now < pending.first_arrival:
@@ -288,7 +288,7 @@ class CollectorExecutor:
                 f"Token {token.token_id} claims member {member_key!r} of group {group_id!r} "
                 f"at collector '{collector_name}' but the durable roster is {sorted(pending.roster)!r}."
             )
-        existing = pending.arrived.get(member_key)
+        existing = pending.arrived[member_key] if member_key in pending.arrived else None
         if existing is not None:
             if existing.token.token_id == token.token_id:
                 # CAS-fenced idempotent skip: lease-expiry redelivery is by design
@@ -325,18 +325,18 @@ class CollectorExecutor:
         # pending.arrived, and _roster_settled can never true for a group
         # missing this member from both arrived and lost, so the group
         # (and its orphaned node_state) could never close by any path.
-        # ordinals.get(member_key) returning None is a genuine audit
-        # inconsistency (pending.roster comes from token_lineage_frames,
+        # A missing ordinal is a genuine audit inconsistency, not an
+        # optional lookup (pending.roster comes from token_lineage_frames,
         # pending.ordinals from token_parents — two different tables, and
         # a member can hold a frame with no token_parents row under the
         # opener) — NOT defensive padding, so the raise stays; only its
         # position relative to the durable write moves.
-        ordinal = pending.ordinals.get(member_key)
-        if ordinal is None:
+        if member_key not in pending.ordinals:
             raise AuditIntegrityError(
                 f"Member {member_key!r} of group {group_id!r} has no token_parents ordinal "
                 f"under opener {pending.opener_token_id!r} — expansion audit inconsistency."
             )
+        ordinal = pending.ordinals[member_key]
 
         step = self._step_resolver(node_id)
         state = self._execution.begin_node_state(
@@ -451,7 +451,7 @@ class CollectorExecutor:
         reach the rebuilt in-memory roster and the group can never settle.
         """
         key = (collector_name, group_id)
-        pending = self._pending.get(key)
+        pending = self._pending[key] if key in self._pending else None
         if pending is not None and member_key in pending.lost:
             return True
         return self._barrier_restore_reads.has_group_member_loss(
@@ -490,7 +490,7 @@ class CollectorExecutor:
         # on for the SAME key.
         if key in self._completed_keys or self._check_landscape_for_completion(collector_name, group_id):
             return None
-        pending = self._pending.get(key)
+        pending = self._pending[key] if key in self._pending else None
         if pending is None:
             pending = self._open_group(collector_name, group_id, first_arrival=self._clock.monotonic())
         if member_key not in pending.roster:
@@ -670,8 +670,7 @@ class CollectorExecutor:
                         f"{member.member_key!r} of group {group_id!r} at collector "
                         f"'{collector_name}' but the durable roster is {sorted(pending.roster)!r}."
                     )
-                ordinal = pending.ordinals.get(member.member_key)
-                if ordinal is None:
+                if member.member_key not in pending.ordinals:
                     # I-6: same ordinal cross-check as accept()'s
                     # fresh-arrival path — a restored member is not exempt
                     # either.
@@ -680,6 +679,7 @@ class CollectorExecutor:
                         f"token_parents ordinal under opener {pending.opener_token_id!r} — "
                         "expansion audit inconsistency."
                     )
+                ordinal = pending.ordinals[member.member_key]
                 pending.arrived[member.member_key] = _MemberEntry(
                     token=member.token, arrival_time=restore_now, state_id=member.state_id, ordinal=ordinal
                 )
