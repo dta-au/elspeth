@@ -1147,7 +1147,11 @@ def row_union_schema_configs_compatible(
         if compatible:
             return True, (), ""
         conflicting_fields = tuple(
-            sorted(name for name in first_fields.keys() | second_fields.keys() if first_fields.get(name) != second_fields.get(name))
+            sorted(
+                name
+                for name in first_fields.keys() | second_fields.keys()
+                if name not in first_fields or name not in second_fields or first_fields[name] != second_fields[name]
+            )
         )
         return False, conflicting_fields, error_msg
 

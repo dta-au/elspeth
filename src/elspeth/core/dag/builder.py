@@ -1707,7 +1707,13 @@ def build_execution_graph(
                         continue
                     if downstream_type in (NodeType.COALESCE, NodeType.ROW_UNION):
                         barrier_kind = downstream_type.value
-                        barrier_name = barrier_display_names.get(downstream, str(downstream))
+                        # Total by construction: every COALESCE / ROW_UNION node in this
+                        # graph is added by the loops above that populate coalesce_ids /
+                        # row_union_ids, and those are the only two sites in the tree that
+                        # add a node of either type. A missing key would mean the graph
+                        # holds a barrier the builder never registered — surface that as a
+                        # KeyError rather than naming the barrier by opaque node id.
+                        barrier_name = barrier_display_names[downstream]
                         raise GraphValidationError(
                             f"{barrier_kind} '{barrier_name}' is downstream of row_union '{union_name}' "
                             f"with no intervening sink. row_union releases N tokens that share one row_id, "
@@ -1719,7 +1725,7 @@ def build_execution_graph(
                             component_id=str(union_name),
                             component_type="row_union",
                         )
-                    downstream_agg = aggregation_settings_by_node.get(downstream)
+                    downstream_agg = aggregation_settings_by_node[downstream] if downstream in aggregation_settings_by_node else None
                     if downstream_agg is not None:
                         trigger = downstream_agg.trigger
                         if trigger.has_count or trigger.has_timeout or trigger.has_condition:
@@ -1802,10 +1808,10 @@ def build_execution_graph(
                     seen_upstream.add(upstream)
                     if graph.get_node_info(upstream).node_type == NodeType.SINK:
                         continue
-                    nested_fork_gate_name = configured_fork_gate_names.get(upstream)
+                    nested_fork_gate_name = configured_fork_gate_names[upstream] if upstream in configured_fork_gate_names else None
                     if nested_fork_gate_name is not None:
                         nested_fork_gate_names.add(nested_fork_gate_name)
-                    upstream_agg = aggregation_settings_by_node.get(upstream)
+                    upstream_agg = aggregation_settings_by_node[upstream] if upstream in aggregation_settings_by_node else None
                     if upstream_agg is not None and upstream_agg.output_mode == OutputMode.TRANSFORM:
                         raise GraphValidationError(
                             f"Aggregation '{upstream_agg.name}' is inside a fork branch that feeds "
