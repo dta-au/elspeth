@@ -1007,51 +1007,31 @@ def test_success_records_operation_parented_trace_with_served_result_details(
     assert isinstance(trace["latency_ms"], float)
 
 
-def test_success_trace_failure_does_not_replace_source_result(
+@pytest.mark.parametrize("record_method", ["record_success", "record_error"])
+def test_source_does_not_re_guard_the_tracer_boundary(
     source: LLMSource,
     source_context: PluginContext,
+    record_method: str,
 ) -> None:
-    provider = FakeProvider()
+    """The tracer owns its SDK boundary (ActiveLangfuseTracer logs and swallows
+    transport failures itself, see test_langfuse_tracer.py); the source does not
+    wrap that boundary a second time, so a tracer that violates its contract by
+    raising escapes unchanged rather than being downgraded to a warning."""
+    provider = FakeProvider() if record_method == "record_success" else FakeProvider(LLMClientError("provider failed", retryable=False))
     tracer = RecordingTracer()
     _install_provider(source, provider)
     source._tracer = tracer
+    failure = RuntimeError("tracer contract violated")
 
     with (
-        patch.object(tracer, "record_success", side_effect=RuntimeError("tracing unavailable")),
+        patch.object(tracer, record_method, side_effect=failure),
         patch("elspeth.plugins.sources.llm.source.logger") as mock_logger,
-    ):
-        rows = list(source.load(source_context))
-
-    assert len(rows) == 1
-    assert rows[0].row["answer"] == "A careful answer"
-    mock_logger.warning.assert_called_once_with(
-        "llm_trace_emission_failed",
-        plugin="llm",
-        error_type="RuntimeError",
-    )
-
-
-def test_error_trace_failure_does_not_replace_provider_error(
-    source: LLMSource,
-    source_context: PluginContext,
-) -> None:
-    provider = FakeProvider(LLMClientError("provider failed", retryable=False))
-    tracer = RecordingTracer()
-    _install_provider(source, provider)
-    source._tracer = tracer
-
-    with (
-        patch.object(tracer, "record_error", side_effect=RuntimeError("tracing unavailable")),
-        patch("elspeth.plugins.sources.llm.source.logger") as mock_logger,
-        pytest.raises(LLMClientError, match="provider failed"),
+        pytest.raises(RuntimeError) as exc_info,
     ):
         list(source.load(source_context))
 
-    mock_logger.warning.assert_called_once_with(
-        "llm_trace_emission_failed",
-        plugin="llm",
-        error_type="RuntimeError",
-    )
+    assert exc_info.value is failure
+    mock_logger.warning.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", [FrameworkBugError("trace invariant failed"), KeyboardInterrupt(), SystemExit(17)])

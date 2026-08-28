@@ -15,7 +15,6 @@ import tempfile
 import time
 from collections.abc import Generator, Mapping
 from collections.abc import Iterator as ABCIterator
-from contextlib import suppress
 from decimal import Decimal
 from types import TracebackType
 from typing import Any, BinaryIO, ClassVar, Literal, Never, Protocol, Self, cast, runtime_checkable
@@ -409,13 +408,11 @@ def _validated_etag(response: Mapping[str, object]) -> str | None:
     value = response["ETag"]
     if not isinstance(value, str) or not value.strip():
         return None
-    try:
-        encoded = value.encode("ascii")
-    except UnicodeEncodeError:
+    # Printable ASCII only, so every character is exactly one byte and the
+    # character count is the encoded length.
+    if not 1 <= len(value) <= _MAX_ETAG_BYTES:
         return None
-    if not 1 <= len(encoded) <= _MAX_ETAG_BYTES:
-        return None
-    if any(byte < 0x20 or byte > 0x7E for byte in encoded):
+    if any(not 0x20 <= ord(character) <= 0x7E for character in value):
         return None
     return value
 
@@ -829,11 +826,8 @@ def _iter_selected_json_items(
         if not found:
             raise _JSONBoundaryError("JSON data_key was not found")
 
-    try:
-        next(events)
-    except StopIteration:
-        return
-    raise _JSONBoundaryError("JSON document contains trailing data")
+    if next(events, None) is not None:
+        raise _JSONBoundaryError("JSON document contains trailing data")
 
 
 def _record_download_call(
@@ -862,7 +856,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:974f13a9219f6298"
+    source_file_hash: str | None = "sha256:2b69bdd5d163852d"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -961,7 +955,9 @@ class AWSS3Source(BaseSource):
             raise ValueError("profiled S3 audit-safe config contains a private binding field")
         if set(safe_config) - S3_PROFILED_AUDIT_SAFE_OPTION_NAMES:
             raise ValueError("profiled S3 audit-safe config contains a private binding field")
-        if safe_config.get("profile") != identity.profile_alias or safe_config.get("key") != identity.relative_key:
+        if "profile" not in safe_config or "key" not in safe_config:
+            raise ValueError("profiled S3 audit-safe config must carry profile and key")
+        if safe_config["profile"] != identity.profile_alias or safe_config["key"] != identity.relative_key:
             raise ValueError("profiled S3 audit-safe config does not match its nominal identity")
         if self._endpoint_url is not None:
             raise ValueError("profiled S3 executable binding includes a custom endpoint")
@@ -1009,8 +1005,6 @@ class AWSS3Source(BaseSource):
 
         self._first_valid_row_processed = False
         started = time.perf_counter()
-        download: _DownloadedObject | None = None
-        failure: S3SourceReadError | None = None
         try:
             download = _download_s3_object(
                 self._get_s3_client(),
@@ -1018,11 +1012,7 @@ class AWSS3Source(BaseSource):
                 key=self._key,
                 max_object_bytes=self._max_object_bytes,
             )
-        except S3SourceReadError as exc:
-            failure = exc
-
-        latency_ms = (time.perf_counter() - started) * 1000
-        if failure is not None:
+        except S3SourceReadError as failure:
             error_data: dict[str, Any] = {
                 "type": failure.provider_error_type,
                 "bytes_read": failure.bytes_read,
@@ -1034,13 +1024,14 @@ class AWSS3Source(BaseSource):
                 ctx,
                 status=CallStatus.ERROR,
                 audit_identity=self._audit_object_identity(),
-                latency_ms=latency_ms,
+                latency_ms=(time.perf_counter() - started) * 1000,
                 error_data=error_data,
             )
-            raise failure from None
+            # The redacted error was raised outside any handler, so it carries
+            # no provider exception in __context__; a bare re-raise keeps it so.
+            raise
 
-        if download is None:
-            raise AssertionError("S3 download completed without a result or failure")
+        latency_ms = (time.perf_counter() - started) * 1000
         self._active_download = download
         parser: Generator[SourceRow, None, None] | None = None
         try:
@@ -1060,9 +1051,8 @@ class AWSS3Source(BaseSource):
                 parser = self._load_jsonl(download.handle, ctx)
 
             while not self._is_closed():
-                try:
-                    row = next(parser)
-                except StopIteration:
+                row = next(parser, _ROW_EXHAUSTED)
+                if row is _ROW_EXHAUSTED:
                     break
                 if self._is_closed():
                     break
@@ -1076,10 +1066,9 @@ class AWSS3Source(BaseSource):
         finally:
             if parser is not None:
                 parser.close()
-            if download is not None and self._active_download is download:
+            if self._active_download is download:
                 self._active_download = None
-            if download is not None:
-                download.close()
+            download.close()
 
     def _file_error(self, ctx: SourceContext, message: str) -> Generator[SourceRow, None, None]:
         raw_row = {**self._audit_object_identity(), "error": message}
@@ -1189,7 +1178,11 @@ class AWSS3Source(BaseSource):
                 row = dict(zip(headers, values, strict=True))
                 yield from self._validate_and_yield(row, ctx, source_row_index=row_count - 1)
         finally:
-            with suppress(ValueError, OSError):
+            # The spool belongs to _DownloadedObject: detach so the wrapper's
+            # teardown cannot close it. A closed wrapper means the owner already
+            # closed the spool (close() while suspended) and there is nothing to
+            # hand back.
+            if not stream.closed:
                 stream.detach()
 
     def _load_jsonl(self, handle: BinaryIO, ctx: SourceContext) -> Generator[SourceRow, None, None]:
@@ -1204,10 +1197,8 @@ class AWSS3Source(BaseSource):
         try:
             while True:
                 try:
-                    raw_line = next(lines)
+                    raw_line = next(lines, _ROW_EXHAUSTED)
                     lines.finish_record()
-                except StopIteration:
-                    return
                 except _RecordLimitExceeded:
                     line_number += 1
                     yield from self._quarantine_parse_row(
@@ -1225,6 +1216,8 @@ class AWSS3Source(BaseSource):
                         "JSONL record has invalid encoded text",
                         line_number - 1,
                     )
+                    return
+                if raw_line is _ROW_EXHAUSTED:
                     return
                 line_number += 1
                 line = raw_line.strip()
@@ -1251,7 +1244,7 @@ class AWSS3Source(BaseSource):
                     continue
                 yield from self._validate_and_yield(row, ctx, source_row_index=line_number - 1)
         finally:
-            with suppress(ValueError, OSError):
+            if not stream.closed:
                 stream.detach()
 
     def _load_json_array(self, handle: BinaryIO, ctx: SourceContext) -> Generator[SourceRow, None, None]:
@@ -1272,16 +1265,16 @@ class AWSS3Source(BaseSource):
         try:
             while True:
                 try:
-                    row = next(items)
-                except StopIteration:
-                    return
+                    row = next(items, _ROW_EXHAUSTED)
                 except (ijson.JSONError, UnicodeDecodeError, _RecordLimitExceeded, _JSONBoundaryError):
                     yield from self._file_error(ctx, "JSON object could not be parsed within configured bounds")
+                    return
+                if row is _ROW_EXHAUSTED:
                     return
                 yield from self._validate_and_yield(row, ctx, source_row_index=source_row_index)
                 source_row_index += 1
         finally:
-            with suppress(ValueError, OSError):
+            if not stream.closed:
                 stream.detach()
 
     def _quarantine_parse_row(
