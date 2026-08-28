@@ -8,9 +8,21 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-_EXCLUDED_WALK_DIRS = frozenset(
+# THE exclusion authority for every Python-file walk in the repository
+# (elspeth-faadf9873e). ``EXCLUDED_WALK_DIRS`` is matched against a single
+# directory name at any depth; ``EXCLUDED_WALK_PREFIXES`` is matched against
+# the exact ROOT-RELATIVE path so a bare ``worktrees`` component elsewhere in
+# tracked source is not silently dropped. Both repository-local worktree
+# conventions are excluded: ``.worktrees/`` (panel subtrees) and
+# ``.claude/worktrees/`` (agent worktrees). A new walker must call
+# :func:`iter_python_files` (or import these constants when it genuinely needs
+# its own traversal) and register itself in
+# ``tests/unit/elspeth_lints/test_python_file_walker_authority.py`` — no
+# walker may carry a private literal exclusion set.
+EXCLUDED_WALK_DIRS = frozenset(
     {
         "__pycache__",
+        ".cache",
         ".git",
         ".hg",
         ".mypy_cache",
@@ -28,7 +40,7 @@ _EXCLUDED_WALK_DIRS = frozenset(
         "venv",
     }
 )
-_EXCLUDED_WALK_PREFIXES: tuple[tuple[str, ...], ...] = ((".claude", "worktrees"),)
+EXCLUDED_WALK_PREFIXES: tuple[tuple[str, ...], ...] = ((".claude", "worktrees"),)
 
 # Nested-scope AST node types that a "lexical scope of this function" walker
 # must short-circuit at: descending into their children would conflate names
@@ -225,8 +237,8 @@ def iter_python_files(root: Path, files: Iterable[Path] | None = None) -> Iterat
         dirnames[:] = [
             dirname
             for dirname in dirnames
-            if dirname not in _EXCLUDED_WALK_DIRS
-            and not any((*relative_parts, dirname)[: len(prefix)] == prefix for prefix in _EXCLUDED_WALK_PREFIXES)
+            if dirname not in EXCLUDED_WALK_DIRS
+            and not any((*relative_parts, dirname)[: len(prefix)] == prefix for prefix in EXCLUDED_WALK_PREFIXES)
         ]
         python_files.extend(current / filename for filename in filenames if filename.endswith(".py"))
 

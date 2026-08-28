@@ -11,6 +11,7 @@ from pathlib import Path
 
 from elspeth_lints.core.allowlist import Allowlist, FindingKey, load_allowlist
 from elspeth_lints.core.allowlist_governance import allowlist_governance_findings_for_root
+from elspeth_lints.core.ast_walker import iter_python_files
 from elspeth_lints.core.protocols import Finding as LintFinding
 from elspeth_lints.core.protocols import RuleContext, RuleMetadata, RuleScope, Severity
 from elspeth_lints.rules.manifest.symbol_inventory.metadata import RULE_ID, RULE_METADATA
@@ -244,7 +245,7 @@ def scan_tree(root: Path, project_root: Path | None = None) -> list[InventoryFin
     """Return ADR-019 source inventory findings under root."""
     project_root = project_root or root
     findings: list[InventoryFinding] = []
-    for path in _iter_python_files(root):
+    for path in iter_python_files(root):
         findings.extend(scan_file(path, project_root))
     return findings
 
@@ -378,17 +379,6 @@ def _display_path(path: Path, project_root: Path) -> str:
         return resolved.relative_to(project_root.resolve()).as_posix()
     except ValueError:
         return resolved.as_posix()
-
-
-def _iter_python_files(root: Path) -> Iterable[Path]:
-    excluded = {"__pycache__", "node_modules", "build", "dist"}
-    for path in sorted(root.rglob("*.py")):
-        rel_parts = path.relative_to(root).parts
-        if any(part.startswith(".") for part in rel_parts):
-            continue
-        if any(part in excluded for part in rel_parts):
-            continue
-        yield path
 
 
 RULE = SymbolInventoryRule()

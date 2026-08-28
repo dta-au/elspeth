@@ -13,6 +13,7 @@ from typing import Any
 import yaml
 
 from elspeth_lints.core.allowlist_governance import RULE_EXPIRED_ENTRY, RULE_STALE_ENTRY
+from elspeth_lints.core.ast_walker import iter_python_files
 from elspeth_lints.core.protocols import Finding, Severity
 
 
@@ -181,11 +182,8 @@ def allowlist_path_for_root(root: Path, directory_name: str) -> Path:
 
 
 def iter_python_paths(root: Path) -> Iterable[Path]:
-    """Yield Python files under a root, excluding cache and frontend dependency trees."""
-    for path in sorted(root.rglob("*.py")):
-        if "__pycache__" in path.parts or "node_modules" in path.parts:
-            continue
-        yield path
+    """Yield Python files under a root via the shared exclusion authority."""
+    yield from iter_python_files(root)
 
 
 def load_class_allowlist(path: Path) -> ClassAllowlist:

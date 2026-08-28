@@ -59,6 +59,26 @@ is a working document under the normal delivery posture.
   unless the operator separately changes the local fast-gate policy in
   `.pre-commit-config.yaml`.
 
+- **2026-08-28 — there is ONE Python-file walk authority:
+  `elspeth_lints.core.ast_walker`** (elspeth-faadf9873e). `iter_python_files`
+  / `walk_python_files` prune `EXCLUDED_WALK_DIRS` (`.venv`, `.worktrees`,
+  `node_modules`, caches, ...) and the root-relative
+  `EXCLUDED_WALK_PREFIXES` (`.claude/worktrees`) BEFORE descent. Every other
+  walker — tier_model `iter_scannable_python_files`, audit_evidence
+  `iter_python_paths`, the manifest rules, `contract_manifest.scan_source_tree`,
+  `scripts/cicd/runtime_rejection_parity.py`, and
+  `tests/unit/test_mock_discipline_baseline.py` — delegates to it. Do NOT
+  write a new `rglob("*.py")` / `os.walk` / dot-prefix-skip / `.parts[:2]`
+  idiom: a new walker MUST call `iter_python_files` (or import the two
+  constants when it genuinely needs its own traversal) AND be registered in
+  `WALKERS` in `tests/unit/elspeth_lints/test_python_file_walker_authority.py`,
+  which runs every walker over a synthetic tree with both worktree
+  conventions and pins `elspeth-lints/src` + `scripts/cicd` against any
+  private walk. Keep BOTH `.worktrees/` and `.claude/worktrees/`; never add a
+  bare undotted `worktrees` component. Changing the constants changes what
+  tier_model's `source_snapshot_sha256` hashes — measure the hash before and
+  after.
+
 - **2026-08-28 — root-wide Python lint walks prune repository-local worktrees
   BEFORE descent, and path filters run BEFORE parsing** (elspeth-9328bf28bb).
   `core/ast_walker.py::iter_python_files` uses a top-down walk so excluded

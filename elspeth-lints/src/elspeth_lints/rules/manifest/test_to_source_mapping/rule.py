@@ -12,6 +12,7 @@ from pathlib import Path
 
 from elspeth_lints.core.allowlist import Allowlist, FindingKey, load_allowlist
 from elspeth_lints.core.allowlist_governance import allowlist_governance_findings_for_root
+from elspeth_lints.core.ast_walker import iter_python_files
 from elspeth_lints.core.protocols import Finding as LintFinding
 from elspeth_lints.core.protocols import RuleContext, RuleMetadata, RuleScope, Severity
 from elspeth_lints.rules.manifest.test_to_source_mapping.metadata import RULE_ID, RULE_METADATA
@@ -260,7 +261,7 @@ def scan_tree(root: Path, project_root: Path | None = None) -> list[InventoryFin
     """Return ADR-019 tests-tree inventory findings under root."""
     project_root = project_root or root
     findings: list[InventoryFinding] = []
-    for path in _iter_python_files(root):
+    for path in iter_python_files(root):
         findings.extend(scan_file(path, project_root))
     return findings
 
@@ -555,17 +556,6 @@ def _is_raw_token_outcomes_sql(value: str) -> bool:
     if TOKEN_OUTCOME_IS_TERMINAL_RE.search(sql_code) is not None:
         return True
     return TOKEN_OUTCOME_COLUMN_RE.search(sql_code) is not None and TOKEN_OUTCOME_PATH_RE.search(sql_code) is None
-
-
-def _iter_python_files(root: Path) -> Iterable[Path]:
-    excluded = {"__pycache__", "node_modules", "build", "dist"}
-    for path in sorted(root.rglob("*.py")):
-        rel_parts = path.relative_to(root).parts
-        if any(part.startswith(".") for part in rel_parts):
-            continue
-        if any(part in excluded for part in rel_parts):
-            continue
-        yield path
 
 
 RULE = TestToSourceMappingRule()

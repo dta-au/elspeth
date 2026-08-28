@@ -8,30 +8,15 @@ unspecced mock constructors hide interface drift and are not allowed.
 from __future__ import annotations
 
 import ast
-import os
 import sys
 from pathlib import Path
 
 import pytest
 
+from elspeth_lints.core.ast_walker import iter_python_files
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCAN_ROOT = REPO_ROOT
-PRUNE_DIRS = frozenset(
-    {
-        ".cache",
-        ".git",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".uv-cache",
-        ".venv",
-        ".worktrees",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-    }
-)
 MOCK_NAMES = frozenset(
     {
         "AsyncMock",
@@ -58,22 +43,10 @@ def _is_specced_mock_call(node: ast.Call) -> bool:
 
 
 def _iter_python_files(root: Path) -> list[Path]:
-    python_files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        current = Path(dirpath)
-        dirnames[:] = [
-            dirname
-            for dirname in dirnames
-            if dirname not in PRUNE_DIRS
-            # Agent worktrees carry their own copy of this gate. Prune only
-            # that nested subtree; first-party Python tooling elsewhere under
-            # .claude remains governed by the main checkout's scan.
-            and (current / dirname).relative_to(root).parts[:2] != (".claude", "worktrees")
-        ]
-        for filename in sorted(filenames):
-            if filename.endswith(".py"):
-                python_files.append(Path(dirpath) / filename)
-    return sorted(python_files)
+    # Agent worktrees carry their own copy of this gate; the shared exclusion
+    # authority prunes only that nested subtree, so first-party Python tooling
+    # elsewhere under .claude remains governed by the main checkout's scan.
+    return list(iter_python_files(root))
 
 
 def _display_path(path: Path) -> str:

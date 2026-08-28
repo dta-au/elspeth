@@ -80,6 +80,8 @@ from typing import Any, Final
 
 import yaml
 
+from elspeth_lints.core.ast_walker import iter_python_files
+
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 BASELINE_PATH: Final = REPO_ROOT / "config" / "cicd" / "runtime_rejection_parity.yaml"
 
@@ -143,10 +145,11 @@ class BaselineEntry:
 
 
 def _iter_python_files(root: Path) -> Iterator[Path]:
+    """Yield one explicit file, or every Python file under ``root`` via the shared exclusion authority."""
     if root.is_file():
         yield root
         return
-    yield from sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
+    yield from iter_python_files(root)
 
 
 def _exception_name(node: ast.expr) -> str:

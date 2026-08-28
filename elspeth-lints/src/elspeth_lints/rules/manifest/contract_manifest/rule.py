@@ -12,6 +12,7 @@ import yaml
 
 from elspeth_lints.core.allowlist import Allowlist, AllowlistEntry
 from elspeth_lints.core.allowlist_governance import allowlist_governance_findings_for_root
+from elspeth_lints.core.ast_walker import iter_python_files
 from elspeth_lints.core.protocols import Finding, RuleContext, RuleMetadata, RuleScope
 from elspeth_lints.rules.manifest.contract_manifest.metadata import (
     RULE_ID,
@@ -229,7 +230,7 @@ def _parse_sites(value_node: ast.expr, manifest_file: Path, contract_name: str) 
 def scan_source_tree(source_root: Path, manifest_file: Path) -> list[RegistrationCall]:
     """Return register_declaration_contract(...) calls under source_root."""
     calls: list[RegistrationCall] = []
-    for py_file in sorted(source_root.rglob("*.py")):
+    for py_file in iter_python_files(source_root):
         if py_file.resolve() == manifest_file.resolve():
             continue
         calls.extend(_scan_file(py_file, source_root))
