@@ -253,12 +253,14 @@ entries:
   kind: getattr_static
   occurrences: 1
   probe_shapes:
-  - 03110fa2ce56a885bb1b56cae50dba8789054cb265e4cf98ae6b1e3bb0160432
+  - 91f5d8b6796e9449354f48bbc7bab41ef308dc6439e84d1f7b8a66709c997a97
   classification: approved-introspection
   justification: __init_subclass__ MRO check that a property wins resolution over
     BaseTransform.input_schema, raising TypeError at class creation on shadowing (elspeth-d6eeb3a71d).
     This site is ITSELF an anti-masquerading guard; a naive 'fix' would delete a real
-    control (PLAN.md Finding 4). Do not rewrite this site.
+    control (PLAN.md Finding 4). Do not remove this check. Re-adjudicated 2026-08-29
+    (tier-B13) after dropping the dead None default — BaseTransform defines the property,
+    so the static lookup cannot miss on a subclass.
 - path: src/elspeth/plugins/infrastructure/base.py
   qualname: BaseTransform.__init_subclass__
   kind: hasattr
@@ -273,10 +275,12 @@ entries:
   kind: getattr
   occurrences: 1
   probe_shapes:
-  - 316d7d09acb7344def3ce999ebe82b20b59782d2da1cacd8450ac569e35a59fd
+  - 775282907a5d0d2ff5fdc1e7bcf352fe5dfdc0bdb14e315ca1d5c5f0a1db2744
   classification: reflection-owned-table
   justification: Extracts values for names from the validated Pydantic model_fields
     declaration; receiver and field-name table are both owned configuration types.
+    Re-adjudicated 2026-08-29 (tier-B13) after dropping the dead None default — every
+    declared field is present on a validated instance.
 - path: src/elspeth/plugins/infrastructure/clients/llm.py
   qualname: _extract_usage_from_provider_response
   kind: getattr

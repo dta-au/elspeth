@@ -21,6 +21,7 @@ from elspeth.contracts.errors import PluginRetryableError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
 
@@ -175,8 +176,25 @@ CONTEXT_LENGTH_PATTERNS = (
 )
 
 
+@trust_boundary(
+    tier=3,
+    source="provider/SDK exception objects raised by the LLM client library (OpenAI, Azure, LiteLLM, httpx)",
+    source_param="exception",
+    suppresses=("R1",),
+    invariant=(
+        "classifies by message text and by an optional instance-level status_code; "
+        "returns 'unknown' rather than raising when the exception carries neither"
+    ),
+    non_raising=True,
+)
 def _classify_llm_error(exception: Exception) -> str:
-    """Classify an LLM error into a canonical category."""
+    """Classify an LLM error into a canonical category.
+
+    Tier 3 boundary: the exception is constructed by the provider SDK, so its
+    attribute set is not ours to assume. ``status_code`` is read from the
+    instance dict only — a class-level or property ``status_code`` on an SDK
+    exception type is not a per-response fact.
+    """
     error_str = str(exception).lower()
 
     if any(pattern in error_str for pattern in _CONTENT_POLICY_PATTERNS):
@@ -188,7 +206,7 @@ def _classify_llm_error(exception: Exception) -> str:
     if re.search(r"\b429\b", error_str) or any(pattern.search(error_str) for pattern in _RATE_LIMIT_PATTERNS):
         return "rate_limit"
 
-    status_code = vars(exception).get("status_code")
+    status_code = exception.__dict__.get("status_code")
     if type(status_code) is int and status_code in (500, 502, 503, 504, 529):
         return "server"
     if _SERVER_ERROR_CODE_PATTERN.search(error_str):

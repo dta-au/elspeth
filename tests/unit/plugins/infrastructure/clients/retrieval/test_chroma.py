@@ -23,6 +23,7 @@ from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.chroma import (  # noqa: E402
     ChromaSearchProvider,
     ChromaSearchProviderConfig,
+    _collection_distance_space,
 )
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk  # noqa: E402
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode  # noqa: E402
@@ -83,6 +84,27 @@ def _precreate_collection(name: str, distance_function: str = "cosine") -> None:
     """
     client = chromadb.Client()
     client.get_or_create_collection(name=name, metadata={"hnsw:space": distance_function})
+
+
+def test_collection_distance_space_rejects_non_mapping_metadata() -> None:
+    """Trust-boundary honesty: non-mapping SDK metadata is rejected, never defaulted."""
+    with pytest.raises(RetrievalError, match="malformed metadata") as exc_info:
+        _collection_distance_space(collection_metadata=12345, collection_name="corrupt")
+    assert exc_info.value.retryable is False
+
+
+def test_collection_distance_space_rejects_missing_hnsw_space() -> None:
+    with pytest.raises(RetrievalError, match="hnsw:space"):
+        _collection_distance_space(collection_metadata={"other": "x"}, collection_name="no-space")
+
+
+def test_collection_distance_space_rejects_non_string_space() -> None:
+    with pytest.raises(RetrievalError, match="non-string 'hnsw:space'"):
+        _collection_distance_space(collection_metadata={"hnsw:space": 7}, collection_name="typed-wrong")
+
+
+def test_collection_distance_space_returns_declared_space() -> None:
+    assert _collection_distance_space(collection_metadata={"hnsw:space": "l2"}, collection_name="ok") == "l2"
 
 
 class TestChromaSearchProviderConfig:
