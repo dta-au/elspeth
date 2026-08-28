@@ -39,8 +39,8 @@ is a working document under the normal delivery posture.
   `interpretation_state.SOURCE_AUTHORING_KEY` "not explicitly export" errors
   it surfaced were a pre-existing implicit re-export, fixed on
   `feature/unified-lineage` by 0f6b9b6a3 — merge, do not re-fix.)
-- **2026-08-29 — adding a DOCSTRING shifts every `body[N]` index inside that
 
+- **2026-08-29 — adding a DOCSTRING shifts every `body[N]` index inside that
   function, exactly like the `@overload` trap below.** A docstring is
   `body[0]`, so writing one on an existing function moves every tier_model
   finding in it by one (`body[10]/body[0]/handlers[0]` →
