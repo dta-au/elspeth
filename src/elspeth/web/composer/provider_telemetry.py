@@ -19,6 +19,7 @@ ComposerRequestTerminalStatus = Literal["completed", "failed", "timed_out", "can
 
 _SURFACES = frozenset({"freeform", "guided"})
 _REQUEST_STATUSES = frozenset({"completed", "failed", "timed_out", "cancelled"})
+_PROVIDER_CALL_STATUSES = frozenset(status.value for status in ComposerLLMCallStatus)
 _METER = metrics.get_meter(__name__)
 _PROVIDER_CALL_COUNTER = _METER.create_counter(
     "composer.llm_call.total",
@@ -167,14 +168,15 @@ def record_settled_composer_audit_message(
     if type(raw_call) not in {dict, MappingProxyType}:
         return
     exact_call = cast("Mapping[str, object]", raw_call)
-    raw_status = exact_call.get("status")
-    latency_ms = exact_call.get("latency_ms")
+    if "status" not in exact_call or "latency_ms" not in exact_call:
+        return
+    raw_status = exact_call["status"]
+    latency_ms = exact_call["latency_ms"]
     if type(raw_status) is not str or type(latency_ms) is not int or latency_ms < 0:
         return
-    try:
-        status = ComposerLLMCallStatus(raw_status)
-    except ValueError:
+    if raw_status not in _PROVIDER_CALL_STATUSES:
         return
+    status = ComposerLLMCallStatus(raw_status)
     _record_provider_call_facts(
         (_ProviderCallFact(status=status, latency_ms=latency_ms),),
         surface="freeform",

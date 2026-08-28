@@ -114,8 +114,12 @@ async def persist_turn_audit(
                 }
             else:
                 decoded_args = (
+                    # bounded_json_loads forwards to json.loads with no
+                    # object_hook and no object_pairs_hook at this call site,
+                    # so a decoded object is always an exact dict, never a
+                    # subclass.
                     {"_decoded_non_object": decoded_json}
-                    if not isinstance(decoded_json, dict)
+                    if type(decoded_json) is not dict
                     else {
                         "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
                         "error_class": tool_outcome.error_class,

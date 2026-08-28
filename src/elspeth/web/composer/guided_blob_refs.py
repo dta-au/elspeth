@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 
 GUIDED_REVIEWED_BLOB_PATH_KEYS = ("path", "file")
@@ -169,6 +170,15 @@ def reviewed_source_is_blob_bound(options: Mapping[str, object]) -> bool:
     return False
 
 
+@observation_boundary(
+    tier=3,
+    source="the `schema` block of one guided reviewed source's option mapping — planner/LLM-authored "
+    "through the composer tool loop, or the same value replayed from a persisted guided session record",
+    source_param="schema",
+    suppresses=("R1", "R5"),
+    invariant="returns the declared mode or None to abstain; a non-mapping schema and a non-string mode "
+    "are both honest absence, so callers project None rather than inventing a mode — never raises",
+)
 def reviewed_schema_mode(schema: object) -> str | None:
     """Return a reviewed source schema's declared mode, or ``None`` if unstated.
 
@@ -184,6 +194,15 @@ def reviewed_schema_mode(schema: object) -> str | None:
     return mode
 
 
+@observation_boundary(
+    tier=3,
+    source="the `schema` block of one guided reviewed source's option mapping — planner/LLM-authored "
+    "through the composer tool loop, or the same value replayed from a persisted guided session record",
+    source_param="schema",
+    suppresses=("R1", "R5"),
+    invariant="returns the ordered distinct declared field names, or () to abstain; a malformed schema, "
+    "a non-sequence `fields`, and a malformed member all drop out of the projection — never raises",
+)
 def reviewed_schema_declared_field_names(schema: object) -> tuple[str, ...]:
     """Return the ordered distinct field names an explicit schema declares.
 
@@ -220,6 +239,15 @@ def reviewed_schema_declared_field_names(schema: object) -> tuple[str, ...]:
     return tuple(names)
 
 
+@observation_boundary(
+    tier=3,
+    source="one member of a guided reviewed source's authored `schema.fields` list — planner/LLM-authored "
+    "through the composer tool loop, or the same value replayed from a persisted guided session record",
+    source_param="spec",
+    suppresses=("R1", "R5"),
+    invariant="returns the declared field name or None for a malformed spec; the caller drops a None "
+    "member from the projection rather than failing the whole schema read — never raises",
+)
 def _declared_field_spec_name(spec: object) -> str | None:
     """Extract one declared field's name, or ``None`` for a malformed spec."""
     if type(spec) is str:
