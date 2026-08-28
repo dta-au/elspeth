@@ -8,6 +8,38 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — the `trust_boundary.tests` gate reads exception names out of
+  `invariant` PROSE with a `*Error|*Exception|*Warning` suffix regex, so a
+  boundary whose raise type has no such suffix must not mention an
+  Error-suffixed base class in its invariant.** `bind_guided_reviewed_components`
+  (guided/planning.py, B38) raises `GuidedCandidateBindingRejected`; an
+  invariant reading "raises GuidedCandidateBindingRejected (an
+  AuditIntegrityError ...)" made the gate extract ONLY `AuditIntegrityError`,
+  find the test_ref raising `GuidedCandidateBindingRejected`, and report
+  `R_TB_TESTS_INVARIANT_MISMATCH`. Name only the exception the test's
+  `pytest.raises(...)` names, or none. Two neighbours from the same lane:
+  (a) `test_fingerprint` is `sha256(ast.dump(<test FunctionDef>,
+  annotate_fields=True, include_attributes=False))` — compute it from the test
+  file rather than guessing, and any edit to that test body re-rolls it; (b)
+  mypy does NOT narrow a union of TypedDicts on `"key" in d`, so read a member
+  that only some union arms carry through a `members: Mapping[str, object] =
+  d` view (`_projection_kind_summary`) instead of reaching for `.get()` or a
+  `cast`. Trust-tier note from the same file: the persisted guided TURN
+  payload (`current_turn["payload"]` — wire and proposal projections) is
+  content-hash-verified on load (`routes/composer/guided.py`,
+  `guided_json_payload_id("turn", ...)`), so it is Tier-1 server data:
+  membership-form reads raising `AuditIntegrityError`, never a
+  `@trust_boundary`. The one Tier-3 payload in that module is the planner's
+  candidate `pipeline`, and its boundary is the binder itself. Worktree trap
+  hit on the way to committing this: the `mypy` pre-commit hook is
+  `.venv/bin/mypy` with no `PYTHONPATH` of its own, so inside a worktree it
+  resolves `elspeth` imports through the MAIN checkout's editable install and
+  type-checks a split tree. `export PYTHONPATH=<wt>/src:<wt>/elspeth-lints/src`
+  before `git commit`; never `--no-verify` around it. (The six
+  `interpretation_state.SOURCE_AUTHORING_KEY` "not explicitly export" errors
+  it surfaced were a pre-existing implicit re-export, fixed on
+  `feature/unified-lineage` by 0f6b9b6a3 — merge, do not re-fix.)
+
 - **2026-08-29 — adding a DOCSTRING shifts every `body[N]` index inside that
   function, exactly like the `@overload` trap below.** A docstring is
   `body[0]`, so writing one on an existing function moves every tier_model
