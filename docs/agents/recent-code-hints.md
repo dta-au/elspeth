@@ -147,6 +147,43 @@ is a working document under the normal delivery posture.
   `/home/john/.local/bin/wardline`, NOT `.venv/bin/wardline` (exit 127) — and
   `wardline` is not importable from the venv either. Corollary: an
   `inert: true` wardline result is never evidence, whatever its active count.
+- **2026-08-29 — mypy gives `type(x) is C` NO negative-branch narrowing on a
+  union, so the exact-type idiom is not a drop-in for `isinstance` when the
+  ELSE branch reads the other arm.** Measured in B41 with a three-case probe:
+  on `A | B`, `if isinstance(r, B): ... return` leaves `r` correctly narrowed
+  to `A` afterwards and checks clean, while BOTH `type(r) is B` and
+  `type(r) is A` leave the full union on the negative branch — the probe
+  raised `union-attr` on `r.plugin` and `arg-type` on the other ordering.
+  Converting `if isinstance(resolved, ToolResult):` in
+  `tools/sessions.build_set_pipeline_candidate` (over the owned closed union
+  `_ResolvedSourceBlob | ToolResult`) produced three fresh mypy errors on the
+  success arm's `resolved.plugin` / `resolved.options` reads. The rule of
+  thumb from the lane brief — "`type(x) is C` is the house idiom for scalars
+  and closed owned unions" — holds only where the negative branch does not
+  need the other arm's type; a POSITIVE-branch-only discriminator
+  (`type(v) is dict` then `dict(v)`, `type(s) is not str` then `raise`) is
+  still fine and still checks clean. Do not reach for a `cast` to rescue the
+  swap: that deletes the real type check to change a lint shape. Such a site
+  is a justify candidate, not a conversion candidate.
+
+- **2026-08-29 — converting an `isinstance` that has a LIVE signed tier-model
+  allowlist entry turns that entry into stale drift; the live run, not the
+  worklist's raw section, tells you which sites those are.** The keyless
+  `--rules all` run reports a signed entry's site as a finding anyway
+  (signature verification is fail-closed without the operator key), so a site
+  can look un-allowlisted while a matching, judge-ACCEPTED, non-expired entry
+  exists. Rewriting it re-rolls the `fp=` key, nothing matches, and the gate
+  gains a `Stale tier-model allowlist entry` line — a net worsening, since
+  `config/cicd/enforce_tier_model/*.yaml` is not agent-editable. Measured in
+  B41 on `sessions.py:R5:_detect_unresolved_interpretation_placeholders_typed`
+  (`fp=d39651187f78a341`, judge_verdict ACCEPTED, expires 2026-10-06): the
+  `isinstance(prompt_template, str)` → `type(...) is not str` conversion
+  removed one R5 and added one stale entry, and was reverted. The reliable
+  discriminator is the LIVE run (real allowlist) against the file: a site the
+  worklist's allowlist-DISABLED "raw findings" section lists but the live run
+  does NOT report is already covered by a signed entry — leave it alone. Take
+  the baseline AFTER `git merge feature/unified-lineage`, or sibling lanes'
+  merged work shows up as your own whole-tree delta.
 
 - **2026-08-29 — the `@trust_boundary` suppressor also loses the derived-name
   trail through a `try:` whose handler RETURNS, so the decode-then-read idiom
