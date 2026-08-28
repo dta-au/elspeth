@@ -1323,6 +1323,14 @@ def _merged_component_rejection_result(
     data = base.data
     merged_data: Any = data
     if components_withheld:
+        # KEEP `isinstance(..., Mapping)`. `ToolResult.__post_init__` runs
+        # `freeze_fields(self, "data")`, so `base.data` is a MappingProxyType,
+        # never an exact dict. Converging this on the house `type(x) is dict`
+        # scalar idiom makes the test permanently False, sends every merge to
+        # the else branch, and drops `error_code` and every detail from the
+        # rejection envelope the model receives. Pinned by
+        # tests/unit/web/composer/test_frozen_state_nominal_type_guards.py::
+        # test_merged_component_rejection_keeps_the_whole_data_payload_of_a_frozen_result
         merged_data = (
             {**data, COMPONENTS_WITHHELD_KEY: components_withheld}
             if isinstance(data, Mapping)
