@@ -40,6 +40,38 @@ is a working document under the normal delivery posture.
   it surfaced were a pre-existing implicit re-export, fixed on
   `feature/unified-lineage` by 0f6b9b6a3 — merge, do not re-fix.)
 
+- **2026-08-29 — the membership-form ternary that clears R1 is NOT a
+  drop-in for `.get()` on a value that might not be a container.**
+  `d["k"] if "k" in d else None` is exactly equivalent to `d.get("k")` for a
+  Mapping and clears the tier_model R1 finding (verified in B35: one
+  conversion, one rescan, −1). But `"k" in x` raises `TypeError` on a
+  non-container where `.get()` could not exist at all, so inside a function
+  whose `@trust_boundary` / `@observation_boundary` invariant declares "never
+  raises" the conversion silently breaks that contract unless a Mapping guard
+  stays ahead of it in the same `and` chain. In
+  `web/composer/pipeline_planner._serialize_provider_discovery_result` the
+  generator reads
+  `isinstance(candidate, Mapping) and (candidate["id"] if "id" in candidate else None) == selected_id`
+  — the guard first, the membership second, both inside the same short-circuit.
+  A second trap in the same conversion: `"k" in c and c["k"] == want` is NOT
+  equivalent to `c.get("k") == want` when `want` can be `None`, because the
+  `.get()` form matches a candidate that lacks the key entirely. Keep the
+  ternary (which preserves that) rather than the two-term `and` unless you have
+  checked that the compared value is never `None`.
+
+- **2026-08-29 — `PlannerDeclined` subclasses `PipelinePlannerError`, so the
+  planner exception classifiers must stay `isinstance`.** `pipeline_planner.py`
+  declares `class PlannerDeclined(PipelinePlannerError)`, and both
+  `plan_pipeline`'s summary classifier and
+  `_PlannerAttemptTrail.finalize_active_exception` depend on that: the former
+  orders the `PlannerDeclined` arm ahead of the `PipelinePlannerError` arm on
+  purpose, and the latter needs a decline to fall INTO the
+  `PipelinePlannerError` arm to reach `exc.code`. Converting either to
+  `type(exc) is PipelinePlannerError` (the house scalar/closed-union idiom) is
+  a behaviour change that misroutes every decline. R5 findings on exception
+  classification over an open owned hierarchy are justify candidates, not
+  conversion candidates.
+
 - **2026-08-29 — adding a DOCSTRING shifts every `body[N]` index inside that
   function, exactly like the `@overload` trap below.** A docstring is
   `body[0]`, so writing one on an existing function moves every tier_model
