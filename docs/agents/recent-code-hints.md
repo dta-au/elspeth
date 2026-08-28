@@ -37,7 +37,11 @@ is a working document under the normal delivery posture.
   _decode_gateway_json(response, ...)` in `providers/gateway.py`) or assert
   the shape member by member instead of catching `KeyError`; do not widen the
   `try` to swallow the checks. Filed as a lint observation; until it is fixed
-  this is the shape that suppresses honestly.
+  this is the shape that suppresses honestly. The same join rule applies to
+  an `if`/`for`: a name pre-bound to `None` and rebound from `source_param`
+  inside a loop body is NOT derived after the loop, so read and act on it
+  inside the body that bound it (`LLMTransform.get_post_call_hints`, B19)
+  rather than accumulating into an outer variable.
 
 - **2026-08-29 — removing a baselined `getattr` site is a masquerade-gate
   edit.** `config/cicd/masquerade_baseline.yaml` pins `occurrences` per

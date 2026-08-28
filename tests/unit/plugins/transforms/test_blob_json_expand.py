@@ -11,11 +11,12 @@ import pytest
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.validation import validate_transform_config
 from elspeth.plugins.transforms.blob_json_expand import BlobJSONExpand
-from elspeth.testing import make_pipeline_row
+from elspeth.testing import make_field, make_pipeline_row
 from tests.fixtures.factories import make_context
 
 DYNAMIC_SCHEMA = {"mode": "observed", "guaranteed_fields": ["url", "blob_ref", "blob_content_type"]}
@@ -376,6 +377,48 @@ def test_the_field_arm_consumes_its_text_column_instead_of_copying_the_document(
     # The OTHER input columns survive — the half the declaration exists for.
     assert emitted["url"] == "https://example.test/a.json"
     assert emitted["run_label"] == "batch-7"
+
+
+def test_the_field_arm_consumes_a_text_column_named_by_its_original_header() -> None:
+    """The consumed column must go even when config names the ORIGINAL header.
+
+    ``row.to_dict()`` is keyed by NORMALIZED names, while ``text_field`` may be
+    the header a source saw (``"Content Body"`` -> ``content_body``). Removing
+    by the literal with a defaulted ``pop`` matched nothing and silently left
+    the whole document on every emitted row — the same defect blob_csv_expand
+    had. The read side already resolves through the contract; the removal
+    side must resolve the same way.
+    """
+    document = json.dumps({"documents": [{"document_id": "d1", "title": "First", "sections": ["a"]}]})
+    transform = BlobJSONExpand(
+        {
+            "schema": {"mode": "observed"},
+            "source": "field",
+            "format": "json",
+            "text_field": "Content Body",
+            "data_key": "documents",
+            "fields": list(DOCUMENT_FIELDS),
+        }
+    )
+    contract = SchemaContract(
+        mode="OBSERVED",
+        fields=(
+            make_field("url", str, original_name="url"),
+            make_field("content_body", str, original_name="Content Body"),
+        ),
+        locked=True,
+    )
+    row = PipelineRow({"url": "https://example.test/a.json", "content_body": document}, contract)
+
+    result = transform.process(row, make_context())
+
+    assert result.status == "success", result.reason
+    assert result.rows is not None
+    emitted = result.rows[0].to_dict()
+    assert "content_body" not in emitted
+    assert "Content Body" not in emitted
+    assert emitted["url"] == "https://example.test/a.json"
+    assert emitted["document_id"] == "d1"
 
 
 def test_the_document_is_not_duplicated_across_a_fan_out() -> None:

@@ -37,6 +37,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistan
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import register_value_source_plugin
 from elspeth.core.llm_profiles import require_lowered_llm_profile_alias
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -1222,7 +1223,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     @classmethod
     def get_config_model(cls, config: dict[str, Any] | None = None) -> type[LLMConfig]:
         """Dispatch to provider-specific config class based on config["provider"]."""
-        provider = config.get("provider") if config is not None else None
+        provider = config["provider"] if config is not None and "provider" in config else None
         if provider is not None and not isinstance(provider, str):
             # ``provider in _PROVIDERS`` on an unhashable value (a mapping from
             # a free-form ``upsert_node`` options payload) raised TypeError and
@@ -1394,9 +1395,9 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
         # Provider dispatch from single registry.
         # config is user YAML (Tier 3 boundary) — distinguish missing key from unknown value.
-        provider_name = base_config.get("provider")
-        if provider_name is None:
+        if "provider" not in base_config:
             raise ValueError(f"LLM config missing required 'provider' key. Valid providers: {sorted(_PROVIDERS)}")
+        provider_name = base_config["provider"]
         if provider_name not in _PROVIDERS:
             raise ValueError(f"Unknown LLM provider '{provider_name}'. Valid providers: {sorted(_PROVIDERS)}")
         config_cls, _ = _PROVIDERS[provider_name]
@@ -1962,33 +1963,52 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             )
         return None
 
+    # ``@classmethod`` must stay OUTERMOST: ``trust_boundary`` reads the wrapped
+    # function's signature to resolve ``source_param``.
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source="composer node options snapshot as the planner authored it (post-call hint input)",
+        source_param="config_snapshot",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "returns advisory hint strings only; every member of config_snapshot is read by presence and "
+            "shape-checked before use, an absent or wrong-shaped member yields no hint, and nothing is raised, "
+            "coerced, or defaulted on malformed input"
+        ),
+        non_raising=True,
+    )
     def get_post_call_hints(
         cls,
         *,
         tool_name: str,
         config_snapshot: Mapping[str, object],
     ) -> tuple[str, ...]:
-        hints: list[str] = []
         # Manual _usage / _model field declared by hand → tell them it's automatic.
-        response_field = config_snapshot.get("response_field")
-        fields: object | None = None
-        fields_location = "schema.fields"
-        for schema_key, location in (("schema", "schema.fields"), ("output_schema", "output_schema.fields")):
-            schema_snapshot = config_snapshot.get(schema_key)
-            if isinstance(schema_snapshot, Mapping) and "fields" in schema_snapshot:
-                fields = schema_snapshot["fields"]
-                fields_location = location
-                break
-
-        if isinstance(response_field, str) and isinstance(fields, Sequence) and not isinstance(fields, (str, bytes)):
-            manual_appendix = {f"{response_field}_usage", f"{response_field}_model"}
-            declared = {field.split(":", 1)[0].strip() if isinstance(field, str) else "" for field in fields}
-            if manual_appendix & declared:
-                hints.append(
-                    f"You declared {sorted(manual_appendix & declared)!r} in the schema, but token-usage and model-ID fields are appended automatically. Remove them from {fields_location}."
-                )
-        return tuple(hints)
+        if "response_field" not in config_snapshot:
+            return ()
+        response_field = config_snapshot["response_field"]
+        if type(response_field) is not str:
+            return ()
+        manual_appendix = {f"{response_field}_usage", f"{response_field}_model"}
+        # The first schema alias that carries a `fields` member is the one the
+        # author wrote; every read stays inside this loop body so the snapshot
+        # is parsed where it is still the boundary's own input.
+        for schema_key, fields_location in (("schema", "schema.fields"), ("output_schema", "output_schema.fields")):
+            if schema_key not in config_snapshot:
+                continue
+            schema_snapshot = config_snapshot[schema_key]
+            if not isinstance(schema_snapshot, Mapping) or "fields" not in schema_snapshot:
+                continue
+            fields = schema_snapshot["fields"]
+            if isinstance(fields, Sequence) and not isinstance(fields, (str, bytes)):
+                declared = {field.split(":", 1)[0].strip() if isinstance(field, str) else "" for field in fields}
+                if manual_appendix & declared:
+                    return (
+                        f"You declared {sorted(manual_appendix & declared)!r} in the schema, but token-usage and model-ID fields are appended automatically. Remove them from {fields_location}.",
+                    )
+            return ()
+        return ()
 
 
 # Register opt-in for value-source compliance: the typed Pydantic config
