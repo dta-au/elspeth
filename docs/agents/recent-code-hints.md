@@ -24,13 +24,19 @@ is a working document under the normal delivery posture.
   other arm — the rootedness test is syntactic, so `x = (options and ...)`
   would suppress it while meaning nothing. Rationalise the site and say the
   boundary is already declared. Corollary for choosing a decorator:
-  `observation_boundary` (= `non_raising=True`) needs NO `test_ref`, so the
-  gate is satisfiable key-free and it is the cheap, honest route for a
-  projection/abstain helper; a RAISING `trust_boundary` needs `test_ref` +
-  a canonical `test_fingerprint` and there is no key-free tool in-tree to
-  derive one — budget for a rationale instead. Five such decorators landed
-  clean on B49 (`guided_blob_refs` ×3, `prompts` ×2, `yaml_generator` ×1);
-  `trust_boundary.tests,scope,tier` pass with `--fail-on-inert`.
+  `observation_boundary` (= `non_raising=True`) needs NO `test_ref` at all, so
+  it is the cheap, honest route for a projection/abstain helper; a RAISING
+  `trust_boundary` additionally needs `test_ref` + `test_fingerprint` bound to
+  a test whose OWN body raises while invoking the function through
+  `source_param`. The fingerprint is not the hard part — the
+  `trust_boundary.tests` rule EMITS the canonical value, so it is obtainable
+  key-free — the hard part is that a suitable directly-invoking raising test
+  must exist to bind. Budget a rationale when it does not. Six such
+  `observation_boundary` decorators landed clean on B49 (`guided_blob_refs` ×3,
+  `prompts` ×2, `yaml_generator` ×1); `trust_boundary.tests,scope,tier` pass
+  with `--fail-on-inert`, and wardline reports no PY-WL-102 for any of them
+  (PY-WL-102 fires on a declared EXTERNAL_RAW -> ASSURED boundary with no
+  rejection path, which is exactly what a non-raising observation is not).
 
 - **2026-08-29 — a whole-tree `trust_tier.tier_model` run under the REAL
   allowlist currently UNDER-suppresses, because one stale entry makes the
