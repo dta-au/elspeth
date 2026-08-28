@@ -8,6 +8,32 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — the `deep_freeze` trap is NOT limited to composition state:
+  `ToolResult.data` is frozen too, and tracing a value's PRODUCERS is not a
+  valid check.** B43b shipped a real regression this way, caught only by
+  B51's trap note. `ToolResult` is `@dataclass(frozen=True, slots=True)` and
+  its `__post_init__` runs `freeze_fields(self, "data")` whenever `data is not
+  None`, so `finalized_candidate_result.data` in `run_tool_batch` is a
+  `mappingproxy` — for which BOTH `type(x) is dict` **and `isinstance(x,
+  dict)`** are False; only `isinstance(x, Mapping)` is True. Converting that
+  guard to the exact form silently sent every prevalidation rejection down the
+  `else` arm, wrapping the candidate's keys under `"candidate_data"` instead of
+  spreading them, and changing the PREVALIDATION_REJECTED payload the composer
+  model receives. Two lessons beyond B51's rule of thumb:
+  1. **Producer-tracing is the wrong check.** An agent traced every producer of
+     `.data` to plain dict literals and `dict | None` annotations and concluded
+     the swap was safe. It was not: the *container* freezes the field after
+     construction, so what the producer built is irrelevant. Check the owning
+     dataclass's `__post_init__` for `freeze_fields`, not the call sites.
+  2. **8838 tests passed over it.** The composer unit and integration suites
+     asserted only the keys that `feedback_data.update({...})` adds
+     (`status`, `applied`), which survive either arm. A status-only assertion
+     cannot see this class of break — the pin has to assert a key that came
+     from the frozen value itself, plus `"candidate_data" not in payload`
+     (`tests/integration/web/composer/test_freeform_proposal_prevalidation.py::
+     test_semantic_rejection_reaches_next_model_turn_then_repair_creates_one_proposal`),
+     and be mutation-tested by flipping the guard back and confirming it FAILS.
+
 - **2026-08-29 — the `deep_freeze` → `mappingproxy` trap also covers
   `NodeSpec.branches`, and a frozen-input pin only detects a dead guard in the
   MAPPED form.** `NodeSpec.__post_init__` calls `freeze_fields(self,

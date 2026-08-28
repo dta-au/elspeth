@@ -273,6 +273,36 @@ async def _try_finalize_proposal_custody(
     return "ready"
 
 
+def _prevalidation_feedback_seed(candidate_data: Any) -> Mapping[str, Any]:
+    """Seed the PREVALIDATION_REJECTED feedback payload from a candidate's data.
+
+    ``candidate_data`` is ``ToolResult.data``, and ``ToolResult`` is a frozen
+    dataclass whose ``__post_init__`` runs ``freeze_fields(self, "data")``
+    whenever it is not None. A mapping therefore arrives here as a
+    ``mappingproxy``, for which BOTH ``type(x) is dict`` **and**
+    ``isinstance(x, dict)`` are False — only ``isinstance(x, Mapping)`` is
+    True. The membership test MUST stay ABC-shaped: an exact-dict form makes
+    the first arm unreachable, sends every rejection to the fallback, and stops
+    the composer model seeing the candidate's own ``error``/``error_code`` keys
+    at the top level of the feedback it is asked to repair from. Tracing the
+    producers does not establish otherwise — the container freezes the field
+    after they built it.
+
+    The fallback carries an unexpected shape structurally rather than letting
+    ``dict()`` raise: the caller invokes this from inside a ``try``'s ``else:``
+    clause, which none of its handlers catch, so a raise would escape
+    ``run_tool_batch`` instead of degrading into feedback.
+
+    Returns a read-only seed; the caller copies it into the mutable payload it
+    then updates with the status fields.
+    """
+    if isinstance(candidate_data, Mapping):
+        return candidate_data
+    if candidate_data is None:
+        return {}
+    return {"candidate_data": candidate_data}
+
+
 def _replace_llm_tool_call_arguments(
     llm_messages: Sequence[Mapping[str, Any]],
     *,
@@ -1205,20 +1235,10 @@ async def run_tool_batch(
                         redacted_arguments = None
                     else:
                         if not proposal_acceptable:
-                            # ToolResult.data is typed Any, but every producer on
-                            # the set_pipeline candidate path returns a plain dict
-                            # or None (_failure_result and friends build dict
-                            # literals; _mutation_result declares dict | None).
-                            # The three arms stay so an unexpected shape is carried
-                            # structurally instead of raising dict() inside this
-                            # try's else-clause, which no handler here would catch.
-                            candidate_data = finalized_candidate_result.data
-                            if type(candidate_data) is dict:
-                                feedback_data = dict(candidate_data)
-                            elif candidate_data is None:
-                                feedback_data = {}
-                            else:
-                                feedback_data = {"candidate_data": candidate_data}
+                            # ToolResult.data is deep-frozen by __post_init__, so
+                            # the membership test must accept a mappingproxy. See
+                            # _prevalidation_feedback_data for the full contract.
+                            feedback_data = dict(_prevalidation_feedback_seed(finalized_candidate_result.data))
                             feedback_data.update(
                                 {
                                     "status": "PREVALIDATION_REJECTED",

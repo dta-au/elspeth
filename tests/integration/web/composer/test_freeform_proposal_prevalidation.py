@@ -303,6 +303,15 @@ async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_on
     invalid_payload = json.loads(invalid_feedback["content"])
     assert invalid_payload["success"] is False
     assert invalid_payload["version"] == state.version
+    # The rejected candidate's OWN data keys are SPREAD into the feedback
+    # payload, never nested. ToolResult.__post_init__ runs
+    # freeze_fields(self, "data"), so `.data` is a mappingproxy by the time
+    # run_tool_batch reads it — and both `type(x) is dict` and
+    # `isinstance(x, dict)` are False for one. An exact-dict guard there
+    # silently sends every rejection down the wrap arm, which is invisible
+    # to a status-only assertion. Pins that regression.
+    assert invalid_payload["data"]["error_code"] == "plugin_not_installed"
+    assert "candidate_data" not in invalid_payload["data"]
     assert invalid_payload["data"]["status"] == "PREVALIDATION_REJECTED"
     assert invalid_payload["data"]["applied"] is False
     assert invalid_payload["validation"]["errors"][0]["component"] == "rejected_mutation"
