@@ -81,7 +81,7 @@ def replay_composer_control_message(
 
     if not tool_calls:
         return None
-    claimed = [item for item in tool_calls if item.get("_kind") == COMPOSER_CONTROL_MESSAGE_KIND]
+    claimed = [item for item in tool_calls if "_kind" in item and item["_kind"] == COMPOSER_CONTROL_MESSAGE_KIND]
     if not claimed:
         return None
     if len(tool_calls) != 1 or len(claimed) != 1:
@@ -93,8 +93,10 @@ def replay_composer_control_message(
         raise AuditIntegrityError("composer control message lacks system-origin audit attribution")
     if envelope["schema"] != COMPOSER_CONTROL_MESSAGE_SCHEMA:
         raise AuditIntegrityError("composer control audit envelope has an unsupported schema")
-    expected_role = _CONTROL_ORIGIN_PROVIDER_ROLES.get(envelope["origin"])
-    if expected_role is None or envelope["provider_role"] != expected_role:
+    if envelope["origin"] not in _CONTROL_ORIGIN_PROVIDER_ROLES:
+        raise AuditIntegrityError("composer control audit envelope has an unsupported origin or provider role")
+    expected_role = _CONTROL_ORIGIN_PROVIDER_ROLES[envelope["origin"]]
+    if envelope["provider_role"] != expected_role:
         raise AuditIntegrityError("composer control audit envelope has an unsupported origin or provider role")
     if envelope["content_hash"] != _content_hash(content):
         raise AuditIntegrityError("composer control audit content hash does not match stored content")

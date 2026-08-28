@@ -221,7 +221,8 @@ class ProducerResolver:
                 # producer_id (a gate routing two labels to one queue is one
                 # predecessor). The queue itself is installed as the canonical
                 # producer for its id after the ordinary scan.
-                queue_predecessors[connection_name].setdefault(entry.producer_id, entry)
+                if entry.producer_id not in queue_predecessors[connection_name]:
+                    queue_predecessors[connection_name][entry.producer_id] = entry
                 return
             if connection_name in producer_map:
                 # Same node registering multiple times against the same
@@ -317,7 +318,9 @@ class ProducerResolver:
         traverse all of these conservatively rather than the single canonical
         producer.
         """
-        return self._queue_predecessors.get(queue_id, ())
+        if queue_id not in self._queue_predecessors:
+            return ()
+        return self._queue_predecessors[queue_id]
 
     def sink_producers(self, sink_name: str) -> tuple[ProducerEntry, ...]:
         """Return the producers writing DIRECTLY to a sink, in registration order.
@@ -330,7 +333,9 @@ class ProducerResolver:
         tuple rather than a single entry. Any consumer-side rule must be
         conservative across all of them.
         """
-        return self._sink_producers.get(sink_name, ())
+        if sink_name not in self._sink_producers:
+            return ()
+        return self._sink_producers[sink_name]
 
     def walk_to_real_producer(self, connection_name: str) -> ProducerEntry | None:
         """Walk back through structural gates to the true producer of a connection.

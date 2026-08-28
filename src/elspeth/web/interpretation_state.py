@@ -29,7 +29,14 @@ from elspeth.web.composer.source_demand import (
     source_data_contract_artifact_hash,
 )
 from elspeth.web.composer.state import (
-    SOURCE_AUTHORING_KEY,
+    # Redundant alias: SOURCE_AUTHORING_KEY's canonical definition lives beside
+    # SourceSpec in composer/state.py, and this module deliberately re-exports
+    # it for its own importers (source_demand must not import this module —
+    # that is an import cycle). Under --no-implicit-reexport the `X as X` form
+    # is what makes the re-export explicit to mypy.
+    SOURCE_AUTHORING_KEY as SOURCE_AUTHORING_KEY,
+)
+from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
     SourceSpec,
