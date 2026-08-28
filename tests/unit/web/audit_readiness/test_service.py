@@ -393,13 +393,40 @@ def _row(snap, row_id):
     return matches[0]
 
 
-def _policy_readiness_snapshot(*, tutorial_profile: str | None, profile_usable: bool = True, required_prompt_shield: bool = False):
+def _policy_readiness_snapshot(
+    *,
+    tutorial_profile: str | None,
+    profile_usable: bool = True,
+    required_prompt_shield: bool = False,
+    declare_optional_plugin: bool = False,
+    optional_plugin_reason=None,
+    required_content_safety: bool = False,
+    select_content_safety: bool = True,
+    llm_alias_entry: bool = True,
+):
+    """Project one plugin-policy readiness snapshot over controlled inputs.
+
+    The keyword flags exist to reach branches the default fixture cannot:
+    ``declare_optional_plugin`` puts a plugin in ``policy.configured_optional``
+    and ``optional_plugin_reason`` gives it a reason in
+    ``snapshot.unavailable`` (``None`` leaves it available),
+    ``select_content_safety=False`` drops a capability out of
+    ``snapshot.selected`` entirely, and ``llm_alias_entry=False`` omits the
+    LLM's row from ``usable_profile_aliases`` rather than giving it an empty
+    alias tuple.  Each of those is a distinct absent-input case that readiness
+    must report on rather than default past.
+    """
     from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.web.audit_readiness.service import build_plugin_policy_readiness
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
-    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+    from elspeth.web.plugin_policy.models import (
+        PluginAvailability,
+        PluginAvailabilitySnapshot,
+        PluginId,
+        WebPluginPolicy,
+    )
     from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
 
     settings = WebSettings.model_validate(
@@ -417,25 +444,36 @@ def _policy_readiness_snapshot(*, tutorial_profile: str | None, profile_usable: 
     )
     llm_id = PluginId("transform", "llm")
     shield_id = PluginId("transform", "azure_prompt_shield")
+    optional_id = PluginId("transform", "reference_join")
+    if declare_optional_plugin:
+        # The deployment's compiled allowlist is empty, so re-compile the same
+        # policy with one optional plugin declared; ``create`` re-derives
+        # ``authorized`` and the policy hash from it.
+        policy = WebPluginPolicy.create(
+            required=policy.required,
+            configured_optional=frozenset({optional_id}),
+            preferences=policy.preferences,
+            control_modes=policy.control_modes,
+            plugin_code_identities=policy.plugin_code_identities,
+        )
     available = set(policy.authorized)
     if required_prompt_shield:
         available.add(shield_id)
+    selected = [(PluginCapability.LLM, llm_id), (PluginCapability.PROMPT_SHIELD, shield_id if required_prompt_shield else None)]
+    if select_content_safety:
+        selected.append((PluginCapability.CONTENT_SAFETY, None))
     snapshot = PluginAvailabilitySnapshot.create(
         policy_hash=policy.policy_hash,
         principal_scope="local:alice",
         available=frozenset(available),
-        unavailable=(),
-        selected=(
-            (PluginCapability.LLM, llm_id),
-            (PluginCapability.PROMPT_SHIELD, shield_id if required_prompt_shield else None),
-            (PluginCapability.CONTENT_SAFETY, None),
-        ),
-        usable_profile_aliases=((llm_id, ("tutorial",) if profile_usable else ()),),
+        unavailable=(() if optional_plugin_reason is None else (PluginAvailability(optional_id, optional_plugin_reason),)),
+        selected=tuple(selected),
+        usable_profile_aliases=(((llm_id, ("tutorial",) if profile_usable else ()),) if llm_alias_entry else ()),
         selected_profile_aliases=((llm_id, "tutorial" if profile_usable else None),),
         binding_generation_fingerprint="a" * 64,
         control_modes=(
             (PluginCapability.PROMPT_SHIELD, ControlMode.REQUIRED if required_prompt_shield else ControlMode.RECOMMEND),
-            (PluginCapability.CONTENT_SAFETY, ControlMode.RECOMMEND),
+            (PluginCapability.CONTENT_SAFETY, ControlMode.REQUIRED if required_content_safety else ControlMode.RECOMMEND),
         ),
     )
     tutorial_state = _state(
@@ -494,6 +532,97 @@ def test_tutorial_required_control_coverage_uses_policy_validator() -> None:
     rows = {row.id: row for row in readiness.rows}
     assert rows["tutorial_required_control_coverage"].status == "error"
     assert "required" in rows["tutorial_required_control_coverage"].summary.lower()
+    assert readiness.tutorial_ready is False
+
+
+def test_optional_plugin_absent_from_the_unavailable_index_is_reported_available() -> None:
+    """Absence from ``snapshot.unavailable`` is a positive availability fact.
+
+    ``snapshot.unavailable`` enumerates every plugin this principal cannot
+    use, so a configured-optional plugin missing from it is available.  The
+    row must say so rather than treating the miss as unknown.
+    """
+    readiness = _policy_readiness_snapshot(tutorial_profile="tutorial", declare_optional_plugin=True)
+
+    local_row = _row(readiness, "local_capability_configuration")
+    assert local_row.status == "ok"
+    assert local_row.summary == "Enabled capability configuration is available"
+
+
+def test_locally_repairable_unavailable_reason_faults_capability_configuration() -> None:
+    from elspeth.web.plugin_policy.models import PluginUnavailableReason
+
+    readiness = _policy_readiness_snapshot(
+        tutorial_profile="tutorial",
+        declare_optional_plugin=True,
+        optional_plugin_reason=PluginUnavailableReason.NOT_INSTALLED,
+    )
+
+    local_row = _row(readiness, "local_capability_configuration")
+    assert local_row.status == "error"
+    assert "transform:reference_join" in (local_row.detail or "")
+    assert readiness.tutorial_ready is False
+
+
+def test_unavailable_for_a_non_local_reason_leaves_capability_configuration_ok() -> None:
+    """Only locally repairable reasons fault the local-configuration row.
+
+    A plugin present in the unavailable index for an authorization reason is
+    not a local misconfiguration, so this row stays ok while the plugin stays
+    unusable.  The membership read keeps that distinction visible; a defaulted
+    read collapsed it into the same miss as "not in the index at all".
+    """
+    from elspeth.web.plugin_policy.models import PluginUnavailableReason
+
+    readiness = _policy_readiness_snapshot(
+        tutorial_profile="tutorial",
+        declare_optional_plugin=True,
+        optional_plugin_reason=PluginUnavailableReason.NOT_AUTHORIZED,
+    )
+
+    assert _row(readiness, "local_capability_configuration").status == "ok"
+
+
+def test_required_control_missing_from_the_selection_reports_not_ready() -> None:
+    """A REQUIRED capability with no ``selected`` entry has no implementation."""
+    readiness = _policy_readiness_snapshot(
+        tutorial_profile="tutorial",
+        required_content_safety=True,
+        select_content_safety=False,
+    )
+
+    local_row = _row(readiness, "local_capability_configuration")
+    assert local_row.status == "error"
+    assert "content_safety" in (local_row.detail or "")
+    assert readiness.tutorial_ready is False
+
+
+def test_required_control_selected_as_none_reports_not_ready() -> None:
+    """An explicit ``None`` selection is unimplemented, like an absent entry."""
+    readiness = _policy_readiness_snapshot(
+        tutorial_profile="tutorial",
+        required_content_safety=True,
+        select_content_safety=True,
+    )
+
+    local_row = _row(readiness, "local_capability_configuration")
+    assert local_row.status == "error"
+    assert "content_safety" in (local_row.detail or "")
+    assert readiness.tutorial_ready is False
+
+
+def test_llm_with_no_usable_alias_entry_is_not_credential_ready() -> None:
+    """An LLM absent from ``usable_profile_aliases`` has no ready profile.
+
+    Distinct from the empty-alias-tuple case: here the plugin has no row in
+    the alias index at all, and readiness must still refuse the tutorial
+    profile instead of defaulting to a value it could match against.
+    """
+    readiness = _policy_readiness_snapshot(tutorial_profile="tutorial", llm_alias_entry=False)
+
+    profile_row = _row(readiness, "tutorial_profile")
+    assert profile_row.status == "error"
+    assert profile_row.summary == "Tutorial LLM profile is not credential-ready"
     assert readiness.tutorial_ready is False
 
 

@@ -162,16 +162,17 @@ def build_plugin_policy_readiness(
     )
 
     unavailable = {item.plugin_id: item.reason for item in snapshot.unavailable}
-    # Tier note: the two ``.get()`` probes below read policy/availability
-    # snapshot mappings where absence is the ordinary healthy state — a
-    # plugin missing from ``unavailable`` is available, a capability missing
-    # from ``selected`` is unselected. Neither is a Tier-1 read where a miss
-    # must crash.
+    # ``snapshot.unavailable`` is the complete owned enumeration of the plugins
+    # this principal cannot use, so absence from the index is a positive fact —
+    # the plugin is available — not an unknown standing in for one. The
+    # membership test says that out loud instead of leaning on a defaulted read
+    # whose miss and whose "reason is not locally repairable" collapse together.
     missing_local_optional = tuple(
         sorted(
             plugin_id
             for plugin_id in policy.configured_optional
-            if unavailable.get(plugin_id)
+            if plugin_id in unavailable
+            and unavailable[plugin_id]
             in {
                 PluginUnavailableReason.NOT_INSTALLED,
                 PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING,
@@ -179,10 +180,14 @@ def build_plugin_policy_readiness(
         )
     )
     selected = dict(snapshot.selected)
+    # A REQUIRED capability is unimplemented in two distinct ways — no entry in
+    # ``selected`` at all, or an entry whose selection is an explicit ``None`` —
+    # and readiness must report NOT ready for both. Each is spelled out: no
+    # default may stand in for a capability whose implementation is unknown.
     missing_required_controls = tuple(
         capability.value
         for capability, mode in snapshot.control_modes
-        if mode is ControlMode.REQUIRED and selected.get(capability) not in snapshot.available
+        if mode is ControlMode.REQUIRED and (capability not in selected or selected[capability] not in snapshot.available)
     )
     local_status: ReadinessStatus
     if missing_local_optional or missing_required_controls:
@@ -240,10 +245,13 @@ def build_plugin_policy_readiness(
         )
 
     llm_id = PluginId("transform", "llm")
-    # Tier note: snapshot probe with an empty default — a deployment with no
-    # usable LLM profile aliases is a legal configuration this row exists to
-    # report (it resolves to "error" below), not audit-data corruption.
-    usable_aliases = dict(snapshot.usable_profile_aliases).get(llm_id, ())
+    # An LLM plugin with no alias entry has no credential-ready profile at all,
+    # which is a legal deployment this row exists to report rather than
+    # audit-data corruption. The absent branch is written out so it can only
+    # resolve to "not credential-ready" below — never to a value that could
+    # satisfy the membership test.
+    usable_alias_index = dict(snapshot.usable_profile_aliases)
+    usable_aliases = usable_alias_index[llm_id] if llm_id in usable_alias_index else ()
     tutorial_profile_status: ReadinessStatus
     if tutorial_profile is None:
         tutorial_profile_status = "error"
