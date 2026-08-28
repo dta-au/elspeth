@@ -444,6 +444,24 @@ def validate_pipeline_decision_node_semantics(
     )
 
 
+@trust_boundary(
+    tier=3,
+    source="CompositionState.nodes[].options['mapping'] / ['select_only'], untyped Mapping[str, Any] "
+    "entries persisted on composer nodes and round-tripped through sessions.db storage, a composer LLM "
+    "tool call, or YAML import; the state's own typed fields are nominal ELSPETH-owned data and are not "
+    "part of this boundary",
+    source_param="state",
+    suppresses=("R5",),
+    invariant="a node whose options['mapping'] is present but not a Mapping, or is empty, is skipped as "
+    "un-analysable rather than coerced to {} — so it can never be credited here with dropping a web-scrape "
+    "raw field. Non-raising, and deliberately NOT the review gate: this function only reports a "
+    "composer-facing CONTRADICTION, and it returns None for a node it could not analyse. The requirement "
+    "that such a node still carry a cleanup review is enforced independently by "
+    "_missing_raw_html_cleanup_review_sites (reached via interpretation_sites), which is fail-safe in the "
+    "same direction — a malformed mapping yields a smaller preserved-field set there and so still emits the "
+    "review site.",
+    non_raising=True,
+)
 def raw_html_cleanup_review_contract_error(state: CompositionState) -> str | None:
     """Return a composer-facing error for unreviewed or contradictory raw cleanup."""
     web_scrape_raw_fields = _web_scrape_raw_fields(state.nodes)
@@ -573,7 +591,7 @@ def _llm_untrusted_remote_content_producers(
 
 
 def _stream_reaches_untrusted(stream: str | None, graph: _OutputStreamGraph, visited: frozenset[str]) -> frozenset[str]:
-    if not isinstance(stream, str) or not stream:
+    if not stream:
         return frozenset()
     reached: set[str] = set()
     for producer in graph.producers_by_stream[stream] if stream in graph.producers_by_stream else ():
@@ -628,7 +646,7 @@ def _llm_has_authorized_shield_upstream(
 
 
 def _stream_proves_shield(stream: str | None, graph: _OutputStreamGraph, visited: frozenset[str]) -> bool:
-    if not isinstance(stream, str) or not stream:
+    if not stream:
         return False  # chain ended without a shield → not proven
     producers = graph.producers_by_stream[stream] if stream in graph.producers_by_stream else ()
     if not producers:
@@ -791,7 +809,7 @@ def _is_raw_html_cleanup_decision(*, user_term: str, draft: str | None) -> bool:
     normalized_term = user_term.strip()
     if normalized_term != RAW_HTML_CLEANUP_USER_TERM:
         return False
-    if not isinstance(draft, str):
+    if draft is None:
         return False
     normalized_draft = draft.lower()
     return all(marker in normalized_draft for marker in _RAW_HTML_CLEANUP_DRAFT_MARKERS)
@@ -821,6 +839,24 @@ def _looks_like_cleanup_node_id(node_id: str) -> bool:
     return "drop" in normalized or "cleanup" in normalized or "clean" in normalized or "raw" in normalized or "html" in normalized
 
 
+@trust_boundary(
+    tier=3,
+    source="the items of node.options['mapping'], an untyped Mapping[str, Any] persisted on a "
+    "field_mapper composer node and round-tripped through sessions.db storage, a composer LLM tool call, "
+    "or YAML import",
+    source_param="mapping",
+    suppresses=("R5",),
+    invariant="collects only entries that are genuinely str; a non-string key or value contributes "
+    "nothing rather than being coerced or stringified, so the returned frozenset never names a field the "
+    "authored mapping does not carry. Non-raising: its one caller, "
+    "raw_html_cleanup_review_contract_error, reads a smaller set as 'this raw field is NOT preserved', "
+    "which falls through to that function's review-requirement check rather than emitting a "
+    "preserves-raw-fields contradiction. The sibling enumerator "
+    "_missing_raw_html_cleanup_review_sites deliberately does NOT call this helper: it needs the STRICTER "
+    "both-sides-str pair filter, and widening it to this helper's per-side collection would grow its "
+    "preserved set and suppress review sites.",
+    non_raising=True,
+)
 def _preserved_mapping_fields(mapping: Mapping[str, Any]) -> frozenset[str]:
     fields: set[str] = set()
     for source_field, target_field in mapping.items():
@@ -829,6 +865,33 @@ def _preserved_mapping_fields(mapping: Mapping[str, Any]) -> frozenset[str]:
         if isinstance(target_field, str):
             fields.add(target_field.strip())
     return frozenset(fields)
+
+
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options[key], an untyped Mapping[str, Any] persisted on the composer node and "
+    "round-tripped through sessions.db storage, a composer LLM tool call, or YAML import; key names one "
+    "of the scalar string-valued options (model, prompt_template, profile, content_field, "
+    "fingerprint_field) — the node's other, typed fields are nominal ELSPETH-owned data and are not part "
+    "of this boundary",
+    source_param="node",
+    suppresses=("R5",),
+    invariant="returns the value only when the key is present AND holds a str, and None in every other "
+    "case; a present-but-non-string value is reported as absent rather than coerced or stringified, so no "
+    "caller can observe a non-str. Non-raising by contract: every caller reads None as 'this node has no "
+    "authored value for key' and takes the same branch an absent key already took, which in each case is "
+    "the conservative one (no materialization, no review site suppressed, no field credited as preserved).",
+    non_raising=True,
+)
+def _node_str_option(node: NodeSpec, key: str) -> str | None:
+    """Read one string-valued option off a composer node's Tier-3 options map.
+
+    The single parse point for the scalar string options this module reads.
+    Callers consume the owned ``str | None`` and never re-interrogate the
+    option's runtime type.
+    """
+    value = node.options[key] if key in node.options else None
+    return value if isinstance(value, str) else None
 
 
 def _raw_html_cleanup_requirement(requirements: Sequence[InterpretationRequirement] | None) -> InterpretationRequirement | None:
@@ -926,9 +989,7 @@ def materialize_state_for_execution(
     """
 
     profile_resolved_model_node_ids = frozenset(
-        node.id
-        for node in state.nodes
-        if node.plugin == "llm" and isinstance(node.options["profile"] if "profile" in node.options else None, str)
+        node.id for node in state.nodes if node.plugin == "llm" and _node_str_option(node, "profile") is not None
     )
     operator_resolved_model_node_ids = operator_resolved_model_node_ids | profile_resolved_model_node_ids
 
@@ -972,8 +1033,8 @@ def _materialize_node_for_authoring(node: NodeSpec) -> NodeSpec:
     if "resolved_prompt_template_hash" in options:
         return node
 
-    prompt_template = options["prompt_template"] if "prompt_template" in options else None
-    if not isinstance(prompt_template, str):
+    prompt_template = _node_str_option(node, "prompt_template")
+    if prompt_template is None:
         return node
     masked = INTERPRETATION_PLACEHOLDER_RE.sub(PENDING_INTERPRETATION_AUTHORING_TEXT, prompt_template)
     return _replace_prompt_if_changed(node, masked, include_hash=False)
@@ -988,13 +1049,13 @@ def _materialize_node_for_execution(
     _validate_pipeline_decision_review(node, all_nodes)
     if node.plugin != "llm":
         return node
-    model = node.options["model"] if "model" in node.options else None
-    if isinstance(model, str) and model and not operator_resolved_model:
+    model = _node_str_option(node, "model")
+    if model and not operator_resolved_model:
         _validate_model_choice_review(node, model)
     parts = _prompt_parts(node.options)
     if parts is None:
-        prompt_template = node.options["prompt_template"] if "prompt_template" in node.options else None
-        if isinstance(prompt_template, str) and prompt_template:
+        prompt_template = _node_str_option(node, "prompt_template")
+        if prompt_template:
             requirement = _prompt_template_review_requirement(node.options)
             if requirement is not None:
                 _validate_prompt_template_review(node, prompt_template)
@@ -1033,8 +1094,8 @@ def _replace_prompt_if_changed(node: NodeSpec, prompt: str, *, include_hash: boo
 
 
 def _ensure_prompt_template_hash(node: NodeSpec) -> NodeSpec:
-    prompt_template = node.options["prompt_template"] if "prompt_template" in node.options else None
-    if not isinstance(prompt_template, str) or not prompt_template:
+    prompt_template = _node_str_option(node, "prompt_template")
+    if not prompt_template:
         return node
     return _replace_prompt_if_changed(node, prompt_template, include_hash=True)
 
@@ -1182,15 +1243,29 @@ def _web_scrape_raw_fields(nodes: Sequence[NodeSpec]) -> frozenset[str]:
     for node in nodes:
         if node.plugin != "web_scrape":
             continue
-        content_field = node.options["content_field"] if "content_field" in node.options else None
-        fingerprint_field = node.options["fingerprint_field"] if "fingerprint_field" in node.options else None
-        if isinstance(content_field, str) and content_field.strip():
+        content_field = _node_str_option(node, "content_field")
+        fingerprint_field = _node_str_option(node, "fingerprint_field")
+        if content_field and content_field.strip():
             fields.add(content_field.strip())
-        if isinstance(fingerprint_field, str) and fingerprint_field.strip():
+        if fingerprint_field and fingerprint_field.strip():
             fields.add(fingerprint_field.strip())
     return frozenset(fields)
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['mapping'] / ['select_only'], untyped Mapping[str, Any] entries persisted "
+    "on a field_mapper composer node and round-tripped through sessions.db storage, a composer LLM tool "
+    "call, or YAML import",
+    source_param="node",
+    suppresses=("R5",),
+    invariant="options['mapping'] must be a present, non-empty Mapping and each preserved field must be "
+    "a genuine str->str pair; anything else contributes no preserved field. Non-raising and fail-safe in "
+    "the review direction: a malformed mapping yields a SMALLER preserved-field set, which means the "
+    "web-scrape raw fields read as NOT preserved and the cleanup review site is still emitted. Malformed "
+    "options can therefore only ADD a required review, never suppress one.",
+    non_raising=True,
+)
 def _missing_raw_html_cleanup_review_sites(
     node: NodeSpec,
     *,
@@ -1230,8 +1305,8 @@ def _missing_raw_html_cleanup_review_sites(
 def _legacy_placeholder_sites(node: NodeSpec) -> tuple[InterpretationReviewSite, ...]:
     if node.plugin != "llm":
         return ()
-    prompt_template = node.options["prompt_template"] if "prompt_template" in node.options else None
-    if not isinstance(prompt_template, str):
+    prompt_template = _node_str_option(node, "prompt_template")
+    if prompt_template is None:
         return ()
     return tuple(
         InterpretationReviewSite(
@@ -1247,8 +1322,8 @@ def _legacy_placeholder_sites(node: NodeSpec) -> tuple[InterpretationReviewSite,
 def _missing_prompt_template_review_sites(node: NodeSpec) -> tuple[InterpretationReviewSite, ...]:
     if node.plugin != "llm":
         return ()
-    prompt_template = node.options["prompt_template"] if "prompt_template" in node.options else None
-    if not isinstance(prompt_template, str) or not prompt_template:
+    prompt_template = _node_str_option(node, "prompt_template")
+    if not prompt_template:
         return ()
     requirement = _prompt_template_review_requirement(node.options)
     if requirement is None:
@@ -1286,8 +1361,8 @@ def _missing_model_choice_review_sites(node: NodeSpec) -> tuple[InterpretationRe
     """
     if node.plugin != "llm":
         return ()
-    model = node.options["model"] if "model" in node.options else None
-    if not isinstance(model, str) or not model:
+    model = _node_str_option(node, "model")
+    if not model:
         return ()
     requirement = _model_choice_review_requirement(node.options)
     if requirement is None:
@@ -1724,7 +1799,7 @@ _ShieldPath = tuple[tuple[str, str | None], ...]
 
 def _prompt_shield_upstream_paths(stream: str | None, graph: _OutputStreamGraph, visited: frozenset[str]) -> list[_ShieldPath]:
     """Enumerate every upstream producer path from ``stream`` toward a shield/untrusted/end."""
-    if not isinstance(stream, str) or not stream:
+    if not stream:
         return [()]
     producers = graph.producers_by_stream[stream] if stream in graph.producers_by_stream else ()
     if not producers:
@@ -1920,7 +1995,7 @@ def _render_prompt_parts(
             rendered.append(unresolved_text)
             continue
         accepted = requirement["accepted_value"]
-        if not isinstance(accepted, str):
+        if accepted is None:
             raise TypeError(f"resolved interpretation requirement {requirement_id!r} has no accepted value")
         rendered.append(accepted)
     return "".join(rendered)
@@ -1970,7 +2045,7 @@ def vague_term_wiring_count(options: Mapping[str, Any], *, user_term: str) -> in
     """
     normalized_user_term = user_term.strip()
     requirements = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
-    matching_ids: list[Any] = []
+    matching_ids: list[str] = []
     if isinstance(requirements, (list, tuple)):
         for requirement in requirements:
             if not isinstance(requirement, Mapping):
@@ -1993,8 +2068,6 @@ def vague_term_wiring_count(options: Mapping[str, Any], *, user_term: str) -> in
             matching_ids.append(requirement_id)
     if len(matching_ids) == 1:
         requirement_id = matching_ids[0]
-        if not isinstance(requirement_id, str) or not requirement_id:
-            return 0
         parts = options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in options else None
         if not isinstance(parts, (list, tuple)):
             return 0
