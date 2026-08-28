@@ -167,6 +167,36 @@ is a working document under the normal delivery posture.
   (`options[KEY] if KEY in options else None`), and `select_only` — a
   presence-AND-value question — is spelled `"select_only" not in options or
   options["select_only"] is not True`, never a ternary.
+- **2026-08-29 — the tier_model dataflow walk does NOT carry taint out of a
+  `try:` body, and that — not helper calls — is why a decorated boundary can
+  still show dozens of R1/R5 findings.** In
+  `yaml_importer.composition_state_from_runtime_yaml` the function is decorated
+  `@trust_boundary(source_param="pipeline_yaml")`, yet 16 sites reading `doc`
+  stayed open. The obvious explanation (the walk cannot cross the
+  `_require_mapping(parsed, ...)` call) is WRONG and would have made bad judge
+  evidence: `_queues_from_runtime_mapping` in the same file crosses
+  `_require_mapping` twice and every one of its sites IS suppressed. Three
+  probes pinned it: aliasing `parsed = pipeline_yaml` inside the `try:` clears
+  0 sites; hoisting `parsed = yaml.safe_load(pipeline_yaml)` ABOVE the `try:`
+  (leaving `safe_load` and `_require_mapping` both in place) clears 15. So when
+  a boundary's parse is wrapped in `try:` to map parser errors, expect the
+  downstream reads to need rationales. Do NOT restructure to satisfy the walk —
+  hoisting drops the error mapping. Corollary for burn-down lanes: measure
+  before decorating. `_collector_nodes_from_runtime_lists` was decorated,
+  measured, and reverted because it cleared 0 findings — a suppression that
+  suppresses nothing is a live test obligation for no gain.
+
+- **2026-08-29 — `@observation_boundary` is the cheap correct form for a
+  pure projector, but it stops at comprehensions and closures.** Two guided
+  emitters (`_wire_schema`, `_structured_output_fields`) project untrusted
+  `NodeSpec.options` and never raise, so `@observation_boundary`
+  (= `trust_boundary(non_raising=True)`) fits with NO `test_ref`/
+  `test_fingerprint` obligation — it cleared 15 of 35 findings in that file for
+  two decorators. What it did NOT clear: reads whose derivation runs through a
+  list comprehension plus tuple unpacking (`for query_name, query in entries`)
+  or through a nested closure over an enclosing local (`_wire_schema.names`).
+  The walk is intra-procedural and does not descend into a nested `FunctionDef`
+  or track comprehension results. Budget rationales for those.
 
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list

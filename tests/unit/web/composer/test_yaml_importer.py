@@ -12,10 +12,14 @@ from elspeth.web.composer.yaml_generator import generate_public_yaml, generate_y
 from elspeth.web.composer.yaml_importer import (
     MAX_RUNTIME_YAML_IMPORT_CHARS,
     RuntimeYamlImportError,
+    _finite_positive_timeout,
     _nodes_from_runtime_list,
     _outputs_from_runtime_sinks,
     _queues_from_runtime_mapping,
+    _reject_unimportable_sections,
+    _require_nonblank_str,
     _require_str,
+    _row_union_branches,
     _source_from_runtime_entry,
     composition_state_from_runtime_yaml,
 )
@@ -26,6 +30,36 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 def test_require_str_rejects_non_string_value() -> None:
     with pytest.raises(RuntimeYamlImportError, match=r"sources\.s\.plugin must be a non-empty string"):
         _require_str({"plugin": 7}, "plugin", "sources.s")
+
+
+def test_require_nonblank_str_rejects_whitespace_only_value() -> None:
+    """Trust-boundary test_ref: a name made only of whitespace is not a name.
+
+    ``_require_str`` accepts it (it is a non-empty string); the nonblank
+    variant exists precisely because the sections that route on identity —
+    row_unions, collectors, scopes — cannot bind ``"   "`` to anything.
+    """
+    with pytest.raises(RuntimeYamlImportError, match=r"row_unions\[0\]\.name must be a non-empty string"):
+        _require_nonblank_str({"name": "   "}, "name", "row_unions[0]")
+
+
+def test_finite_positive_timeout_rejects_non_numeric_value() -> None:
+    """Trust-boundary test_ref: a non-numeric timeout is refused, not coerced."""
+    with pytest.raises(RuntimeYamlImportError, match=r"coalesce\[0\]\.timeout_seconds must be a finite positive number"):
+        _finite_positive_timeout({"timeout_seconds": "soon"}, "coalesce[0]")
+
+
+def test_row_union_branches_rejects_non_string_branch_entry() -> None:
+    """Trust-boundary test_ref: a branch list entry that is not a name is refused."""
+    with pytest.raises(RuntimeYamlImportError, match=r"row_unions\[0\]\.branches\[0\] must be a non-empty string"):
+        _row_union_branches([7, "right"], "row_unions[0].branches")
+
+
+def test_reject_unimportable_sections_refuses_a_declined_section_by_name() -> None:
+    """Trust-boundary test_ref: a modelled section the composer cannot hold is
+    refused NAMING itself, rather than silently dropped (elspeth-9482eda744)."""
+    with pytest.raises(RuntimeYamlImportError, match="commencement_gates"):
+        _reject_unimportable_sections({"transforms": [], "commencement_gates": [{"plugin": "corpus"}]})
 
 
 def test_source_from_runtime_entry_rejects_non_mapping_entry() -> None:
