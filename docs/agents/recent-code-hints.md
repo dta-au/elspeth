@@ -61,6 +61,46 @@ is a working document under the normal delivery posture.
   `required_controls.py`, whose splice helpers run inside the planner
   `candidate_finalizer` seam where an unprefixed exception is a TERMINAL
   failure. Prefer that over `node["id"]` there.
+- **2026-08-29 — a tier_model R6 fires on `except E: errors.append(_err(...))`,
+  which is the HEALTHIEST validator shape in this tree, not a swallow.**
+  `_handler_is_silent` (tier_model `rule.py`) treats only `raise`, a non-default
+  `return`, and a non-default `yield` as explicit outcomes; a handler that
+  appends a `ValidationEntry` to the validator's accumulator and falls off the
+  end matches "no raise, no return ⇒ likely swallow". Every `CompositionState.
+  validate`-family validator is built that way on purpose, because /validate
+  must RETURN a verdict rather than raise (the 500 defect class
+  elspeth-bceffeba19), so the finding is a rule blind spot and the disposition
+  is a rationale naming the accumulator AND the `error_code` — not a
+  restructure. Seven of B34's twenty R6 sites in `web/composer/state.py` were
+  this (`output_name_invalid`, `scope_name_invalid`,
+  `coalesce_union_type_incompatible`, `contract_config_invalid`,
+  `row_union_name_invalid`, `row_union_branch_invalid`,
+  `row_union_on_success_invalid`). Do NOT convert them to a
+  `*_validation_message() -> str | None` helper to clear the finding: several
+  build a structured detail (`CoalesceUnionTypeDetail`) or mutate a dedupe set
+  (`schema_config_reported`) that a string return cannot carry, and it is
+  indirection to move a finding out of sight either way. Corollary for
+  measuring a lane: a boundary-suppressed removal does not delete a line from
+  `check --rules all`, it turns it into an `R_TB_SUPPRESSED` informational
+  line, so the whole-file count drops by less than the number removed (B34:
+  real 47→34 but file total 75→70, because 8 of the 13 became suppressed
+  lines). Count with `--allowlist-dir <empty>` and `grep -v R_TB_SUPPRESSED`.
+
+- **2026-08-29 — the `@trust_boundary`/`@observation_boundary` suppressor loses
+  the derived-name trail through `enumerate(source_param)`.** `_visit_for_like`
+  roots a `for` target with `subject_is_rooted(node.iter, ...)`, and
+  `subject_is_rooted` descends an `ast.Call` through `Call.func` — so
+  `for i, item in enumerate(queries):` roots at the builtin `enumerate`, not at
+  `queries`, and `item` (plus everything derived from it) drops out of the
+  derived-name set even inside a correctly-declared boundary. Reads directly on
+  the `source_param` in the same function ARE suppressed, so the split looks
+  arbitrary until you know this. Same trap for any other builtin wrapper
+  (`zip`, `sorted`, `reversed`, `list`) over the source param — the documented
+  rule is that positional-arg passing never roots a call. Rationalise those
+  sites naming the tracer limitation; do NOT rewrite `enumerate` into a
+  hand-maintained counter to restore the trail, which is reshaping code to
+  dodge a lint. Live example: `_well_formed_query_entries` in
+  `web/composer/state.py` (observation elspeth-obs-d4eed3b8c2).
 
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list
