@@ -8,6 +8,42 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — `deep_freeze` turns every NESTED mapping into a
+  `mappingproxy`, so `type(x) is dict` on anything reached through a frozen
+  `options` bag is ALWAYS False.** Measured in B51:
+  `type(deep_freeze({"provider_config": {...}})["provider_config"])` is
+  `mappingproxy`. `NodeSpec.__post_init__` (and its `SourceSpec`/`OutputSpec`
+  siblings) call `freeze_fields(self, "options")`, so every composition-state
+  option value below the top level is frozen. This makes the Wave-1
+  `isinstance` → `type() is` sweep actively DANGEROUS on composition state:
+  `web/execution/service.py`'s nested path allowlist reads
+  `provider_config = node.options["provider_config"]` and guards it with
+  `isinstance(provider_config, Mapping)` — converting that to the exact-type
+  idiom would `continue` past every frozen node and silently disable the
+  defence-in-depth confinement of RAG `persist_directory` writes, with no test
+  failure to show for it (`/execute` does not require `/validate` first, so
+  this loop is the last gate). Rule of thumb: `type(x) is dict` is only ever
+  correct on a value you know has NOT been through `deep_freeze` — a freshly
+  parsed YAML/JSON tree, not composition state. Check the owning dataclass for
+  `freeze_fields` before converting any container check.
+- **2026-08-29 — `for k, v in mapping.items()` DOES keep the `@trust_boundary`
+  derived-name trail, and swapping `cast(dict[str, Any], x).get(...)` for an
+  annotated local RESTORES suppression.** Two measured complements to the
+  `enumerate()` and call-laundering holes below. (1) `subject_is_rooted`
+  descends an `ast.Call` through `Call.func`, so `named.items()` roots at the
+  `Attribute`'s value `named` — derived — where `enumerate(named)` roots at the
+  builtin and is lost; the loop's tuple unpacking then keeps both targets
+  derived. (2) The same `Call.func` descent is why `cast(dict[str, Any],
+  source).get("plugin")` belongs to `cast` and suppresses nothing: bind
+  `singular: dict[str, Any] = source` first and read `singular.get("plugin")`,
+  which is derived through ordinary assignment propagation. That is not a lint
+  dodge — it deletes a `cast` and reads better. In B51 one
+  `@observation_boundary(source_param="config", suppresses=("R1",))` on
+  `_discover_blob_rows_sources` plus those two moves cleared all 4 of the
+  function's R1 findings, verified by the `R_TB_SUPPRESSED` stream. Corollary
+  from the same lane: `@observation_boundary` on a genuine non-raising
+  projector passes `trust_boundary.tests,scope,tier --fail-on-inert` with no
+  `test_ref` obligation and drew no wardline PY-WL-102.
 - **2026-08-29 — the `@trust_boundary` suppressor also loses the derived-name
   trail through a `try:` whose handler RETURNS, so the decode-then-read idiom
   suppresses nothing.** Third known hole in the same walk, after the
