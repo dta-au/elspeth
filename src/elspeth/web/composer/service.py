@@ -1010,7 +1010,7 @@ def _tool_outcome_is_interpretation_review_handoff(outcome: _ToolOutcome) -> boo
     data = response.data
     if not isinstance(data, Mapping):
         return False
-    return data.get("_kind") in _INTERPRETATION_REVIEW_HANDOFF_KINDS
+    return "_kind" in data and data["_kind"] in _INTERPRETATION_REVIEW_HANDOFF_KINDS
 
 
 def _tool_batch_staged_terminal_interpretation_review_handoff(tool_outcomes: tuple[_ToolOutcome, ...]) -> bool:
@@ -1445,9 +1445,9 @@ def _freeform_planner_conversation_context(
         authorship = history_message.get(COMPOSER_HISTORY_USER_AUTHORED_KEY)
         if authorship is None:
             continue
-        if authorship is not True or history_message.get("role") != "user":
+        if authorship is not True or "role" not in history_message or history_message["role"] != "user":
             raise InvariantError("composer user-authorship marker is malformed")
-        content = history_message.get("content")
+        content = history_message["content"] if "content" in history_message else None
         if type(content) is not str or not content.strip():
             raise InvariantError("composer user chat history content must be a non-empty exact string")
         prior_requests.append(PlannerPriorUserRequest(history_index=history_index, content=content))
@@ -1741,7 +1741,7 @@ def _backend_surface_args_for_site(
         source = state.sources[source_name] if source_name in state.sources else None
         if source is None:
             return None
-        options = source.options if isinstance(source.options, Mapping) else {}
+        options = source.options
         if SOURCE_AUTHORING_KEY not in options:
             return None
         draft = ComposerServiceImpl._matching_requirement_draft(options, kind=site.kind, user_term=site.user_term)
@@ -1773,10 +1773,10 @@ def _backend_surface_args_for_site(
     node = next((candidate for candidate in state.nodes if candidate.id == site.component_id), None)
     if node is None:
         return None
-    options = node.options if isinstance(node.options, Mapping) else {}
+    options = node.options
     if site.kind is InterpretationKind.LLM_MODEL_CHOICE:
-        model = options.get("model")
-        if not isinstance(model, str) or not model:
+        model = options["model"] if "model" in options else None
+        if type(model) is not str or not model:
             return None
         # W1 (writer-boundary necessary-but-not-sufficient): the writer's
         # model_choice else-branch routes through _find_llm_transform_node,
@@ -1787,8 +1787,8 @@ def _backend_surface_args_for_site(
         # precondition here (mirroring the PT path's
         # _has_pending_prompt_template_requirement) and leave the site
         # fail-closed at the run-time gate — the designed advisory polarity.
-        prompt_template = options.get("prompt_template")
-        if not isinstance(prompt_template, str) or not prompt_template:
+        prompt_template = options["prompt_template"] if "prompt_template" in options else None
+        if type(prompt_template) is not str or not prompt_template:
             return None
         draft = ComposerServiceImpl._matching_requirement_draft(options, kind=site.kind, user_term=site.user_term)
         if draft is None or draft != model:
@@ -8297,7 +8297,7 @@ def _build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
     if attempted:
         joined = "\n".join(f"- {_redact_sensitive_content(a)}" for a in attempted)
         user_msg_parts.append(f"\nAlready attempted:\n{joined}")
-    if arguments.get("user_message"):
+    if "user_message" in arguments and arguments["user_message"]:
         # R2-F8a (elspeth-583c2a0792): the END checkpoint's only source of
         # the user's own explicit constraints. Untrusted (user-authored) —
         # fenced with the SAME sentinel pair as the schema excerpt below,
