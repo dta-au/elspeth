@@ -2,9 +2,9 @@
   {
     "column": 0,
     "file_path": "web/composer/tools/blobs.py",
-    "fingerprint": "2d8cea60542bddd9",
-    "line": 2,
-    "message": "raise ValueError(...) at web/composer/tools/blobs.py:2 can escape the tool handler — use ToolArgumentError",
+    "fingerprint": "1f0fb8762bdb6635",
+    "line": 3,
+    "message": "raise ValueError(...) at web/composer/tools/blobs.py:3 can escape the tool handler — use ToolArgumentError",
     "rule_id": "CEC1",
     "severity": "error",
     "suggestion": "raise ToolArgumentError(argument=..., expected=..., actual_type=...) from exc, or catch locally and return _failure_result"

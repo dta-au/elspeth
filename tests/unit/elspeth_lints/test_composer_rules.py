@@ -39,7 +39,7 @@ def test_exception_channel_reports_bare_value_error(tmp_path: Path) -> None:
     findings = _exception_channel_findings(tmp_path, source)
 
     assert [finding.rule_id for finding in findings] == ["CEC1"]
-    assert findings[0].file_path == "web/composer/tools.py"
+    assert findings[0].file_path == "web/composer/tools/blobs.py"
     assert findings[0].line == 2
     assert "ValueError" in findings[0].message
 
@@ -71,7 +71,8 @@ def test_exception_channel_reports_imported_value_error_alias(tmp_path: Path) ->
     assert "ValueError" in findings[0].message
 
 
-def test_exception_channel_reports_explicit_raise_inside_try_except(tmp_path: Path) -> None:
+def test_exception_channel_raise_caught_locally_and_returned_as_failure_result_is_contained(tmp_path: Path) -> None:
+    """The rule's own SUGGESTION sanctions 'catch locally and return _failure_result'; the channel is intact."""
     source = (
         "def _failure_result(state, msg): return msg\n"
         "def f(x, state):\n"
@@ -81,10 +82,7 @@ def test_exception_channel_reports_explicit_raise_inside_try_except(tmp_path: Pa
         "        return _failure_result(state, str(exc))\n"
     )
 
-    findings = _exception_channel_findings(tmp_path, source)
-
-    assert [finding.rule_id for finding in findings] == ["CEC1"]
-    assert findings[0].line == 4
+    assert _exception_channel_findings(tmp_path, source) == []
 
 
 def test_exception_channel_ignores_implicit_raise_from_coercion(tmp_path: Path) -> None:
@@ -274,8 +272,96 @@ def test_catch_order_declared_map_matches_real_composer_exception_mro() -> None:
         assert _BROAD_SUPERTYPES.issubset({ancestor.__name__ for ancestor in cls.__mro__})
 
 
+def test_exception_channel_contains_raise_caught_in_the_same_function(tmp_path: Path) -> None:
+    source = (
+        "def handler(state):\n    try:\n        raise ValueError('bad')\n    except ValueError as exc:\n        return (state, str(exc))\n"
+    )
+
+    assert _exception_channel_findings(tmp_path, source) == []
+
+
+def test_exception_channel_contains_helper_raise_when_every_local_call_is_guarded(tmp_path: Path) -> None:
+    source = (
+        "def _inner(k):\n    if not k:\n        raise ValueError('empty')\n    return k[0]\n"
+        "def _outer(k):\n    return _inner(k)\n"
+        "def handler(state, k):\n    try:\n        return _outer(k)\n    except (KeyError, ValueError) as exc:\n        return (state, str(exc))\n"
+        "def other(state, k):\n    try:\n        return _outer(k)\n    except Exception:\n        return None\n"
+    )
+
+    assert _exception_channel_findings(tmp_path, source) == []
+
+
+def test_exception_channel_reports_helper_raise_reached_through_one_unguarded_call(tmp_path: Path) -> None:
+    source = (
+        "def _inner(k):\n    if not k:\n        raise ValueError('empty')\n    return k[0]\n"
+        "def guarded(state, k):\n    try:\n        return _inner(k)\n    except ValueError as exc:\n        return (state, str(exc))\n"
+        "def unguarded(state, k):\n    return _inner(k)\n"
+    )
+
+    findings = _exception_channel_findings(tmp_path, source)
+
+    assert [(finding.line, finding.rule_id) for finding in findings] == [(3, "CEC1")]
+
+
+def test_exception_channel_reports_helper_with_no_local_caller_as_escaping(tmp_path: Path) -> None:
+    """A helper reached only from another module: the catch is invisible, so fail closed."""
+    source = "def _parse(v):\n    raise ValueError('bad')\n"
+
+    assert [finding.line for finding in _exception_channel_findings(tmp_path, source)] == [2]
+
+
+def test_exception_channel_guard_must_name_the_exception_or_a_base_class(tmp_path: Path) -> None:
+    wrong_type = "def handler(state):\n    try:\n        raise ValueError('bad')\n    except TypeError:\n        return None\n"
+    base_class = "def handler(state):\n    try:\n        raise UnicodeDecodeError('utf-8', b'', 0, 1, 'x')\n    except ValueError:\n        return None\n"
+    bare_except = "def handler(state):\n    try:\n        raise TypeError('bad')\n    except:\n        return None\n"
+    subclass_only = "def handler(state):\n    try:\n        raise ValueError('bad')\n    except UnicodeError:\n        return None\n"
+
+    assert [finding.line for finding in _exception_channel_findings(tmp_path, wrong_type)] == [3]
+    assert _exception_channel_findings(tmp_path, base_class) == []
+    assert _exception_channel_findings(tmp_path, bare_except) == []
+    assert [finding.line for finding in _exception_channel_findings(tmp_path, subclass_only)] == [3]
+
+
+def test_exception_channel_raise_inside_except_handler_or_finally_is_not_guarded_by_that_try(tmp_path: Path) -> None:
+    source = (
+        "def handler(state):\n    try:\n        return state\n    except KeyError:\n        raise ValueError('in handler')\n"
+        "    finally:\n        pass\n"
+    )
+
+    assert [finding.line for finding in _exception_channel_findings(tmp_path, source)] == [5]
+
+
+def test_exception_channel_nested_function_is_its_own_scope(tmp_path: Path) -> None:
+    """A try around a nested def does not guard raises executed later when the closure is called."""
+    source = (
+        "def handler(state):\n    try:\n        def _later():\n            raise ValueError('deferred')\n"
+        "        return _later\n    except ValueError:\n        return None\n"
+    )
+
+    assert [finding.line for finding in _exception_channel_findings(tmp_path, source)] == [4]
+
+
+def test_exception_channel_exempts_post_init_nominal_invariants(tmp_path: Path) -> None:
+    source = (
+        "from dataclasses import dataclass\n@dataclass(frozen=True)\nclass View:\n    blob_id: str\n"
+        "    def __post_init__(self) -> None:\n        if type(self.blob_id) is not str:\n            raise TypeError('nominal')\n"
+        "def handler(state):\n    return View(state)\n"
+    )
+
+    assert _exception_channel_findings(tmp_path, source) == []
+
+
+def test_exception_channel_recursive_helpers_do_not_loop(tmp_path: Path) -> None:
+    source = (
+        "def _walk(node):\n    if node is None:\n        raise ValueError('none')\n    return _walk(node.child)\n"
+        "def handler(state, node):\n    try:\n        return _walk(node)\n    except ValueError:\n        return None\n"
+    )
+
+    assert _exception_channel_findings(tmp_path, source) == []
+
+
 def _exception_channel_findings(tmp_path: Path, source: str) -> list[Finding]:
-    target = tmp_path / "web" / "composer" / "tools.py"
+    target = tmp_path / "web" / "composer" / "tools" / "blobs.py"
     target.parent.mkdir(parents=True, exist_ok=True)
     tree = ast.parse(source, filename=str(target))
     return list(EXCEPTION_CHANNEL_RULE.analyze(tree, target, RuleContext(root=tmp_path)))

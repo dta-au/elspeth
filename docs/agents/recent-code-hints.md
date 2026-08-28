@@ -59,6 +59,27 @@ is a working document under the normal delivery posture.
   unless the operator separately changes the local fast-gate policy in
   `.pre-commit-config.yaml`.
 
+- **2026-08-28 — `composer.exception_channel` follows the module-local call
+  graph; "catch locally" is a real exemption, not a comment** (elspeth-24ba2e24fa).
+  The rule was dead for three months (`path_filter` named `tools.py` after it
+  became a package) and, re-armed naively, flagged 59 sites that are all the
+  sanctioned shape — a `@trust_boundary` Tier-3 parser or private helper
+  raising `ValueError`, and its handler catching and converting. The rule now
+  reports a bare `TypeError`/`ValueError`/`UnicodeError` only when some path
+  lets it ESCAPE the module: a raise is contained when it sits inside a `try`
+  whose handler names the exception, a base class, or everything, or when
+  EVERY module-local call to its function is so guarded (transitively). A
+  function with no module-local caller (a public handler, or a helper only
+  reached from another module) escapes — fail closed. `__post_init__` is
+  exempt (ADR-032 Tier-1 nominal invariants MUST crash). `_dispatch.py` is
+  excluded by filter (dispatcher invariants, not handlers). Consequences:
+  parse an LLM-authored value ONCE inside the guard and reuse it — a second
+  "safe by construction" call outside the `try` is a finding; a trust-boundary
+  helper with no production caller is dead code, delete it. The gate is
+  zero-finding with `--fail-on-inert`; keep it that way rather than seeding
+  `config/cicd/enforce_composer_exception_channel/` (whose `allowed:` schema
+  the rule never read).
+
 - **2026-08-28 — allowlist YAML enumeration is ONE non-recursive authority
   that REFUSES nested documents:** `allowlist.iter_allowlist_yaml_paths`
   (elspeth-3262174e37). `load_allowlist`, the source snapshot, and the

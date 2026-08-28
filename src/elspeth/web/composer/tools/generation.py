@@ -188,29 +188,6 @@ def _csv_source_field_mapping(options: Mapping[str, Any]) -> dict[str, str] | No
     return mapping
 
 
-@trust_boundary(
-    tier=3,
-    source="source 'schema.required_fields' from external / LLM-authored composer source options",
-    source_param="schema",
-    suppresses=("R1", "R5"),
-    invariant="raises ValueError when 'required_fields' is present but not a list/tuple of str; never coerces",
-    test_ref="tests/unit/web/composer/test_generation_source_option_boundaries.py::test_schema_required_fields_rejects_non_sequence",
-    test_fingerprint="b3c30bf7a9ac3f09269f01b4d43a3330440da5a4f2046abf025b1ab272c047ee",
-)
-def _schema_required_fields(schema: Mapping[str, Any]) -> tuple[str, ...]:
-    raw = schema.get("required_fields")
-    if raw is None:
-        return ()
-    if not isinstance(raw, (list, tuple)):
-        raise ValueError(f"schema.required_fields must be a list of strings when present; got {type(raw).__name__}")
-    required: list[str] = []
-    for idx, item in enumerate(raw):
-        if type(item) is not str:
-            raise ValueError(f"schema.required_fields[{idx}] must be str; got {type(item).__name__}")
-        required.append(item)
-    return tuple(required)
-
-
 _EXPRESSION_GRAMMAR = """\
 Expression Syntax Reference
 ===========================
@@ -2960,16 +2937,18 @@ def _compute_proof_diagnostics_for_source(
         # (schema-mismatch, gate/aggregation type checks, text-URL, inspection
         # warnings) depends on ``facts``, which we could not compute, so there is
         # no independent diagnostic left to produce for this blob. The early
-        # return also makes the later ``_csv_source_columns(source.options)`` call
-        # safe-by-construction — reaching it means ``columns`` already parsed here.
+        # return also makes the later ``columns`` use safe-by-construction —
+        # reaching it means ``columns`` already parsed here, so it is parsed
+        # once and reused rather than re-parsed outside this guard.
         try:
+            columns = _csv_source_columns(source.options)
             facts = inspect_csv_source_content(
                 content=content,
                 filename=blob["filename"],
                 mime_type=blob["mime_type"],
                 delimiter=_csv_source_delimiter(source.options),
                 skip_rows=_csv_source_skip_rows(source.options),
-                columns=_csv_source_columns(source.options),
+                columns=columns,
                 content_hash=blob["content_hash"],
             )
         except ValueError as exc:
@@ -3020,7 +2999,7 @@ def _compute_proof_diagnostics_for_source(
             schema_config = None
         if schema_config is not None and schema_config.mode in {"fixed", "flexible"}:
             declared: tuple[Mapping[str, Any], ...] = tuple(schema_config.to_dict()["fields"] or ())
-            headerless_columns = source.plugin == "csv" and _csv_source_columns(source.options) is not None
+            headerless_columns = source.plugin == "csv" and columns is not None
             field_mapping: dict[str, str] | None = None
             field_resolution_failed = False
             if source.plugin == "csv" and not headerless_columns:

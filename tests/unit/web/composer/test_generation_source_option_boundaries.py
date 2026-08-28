@@ -19,7 +19,6 @@ from elspeth.web.composer.tools.generation import (
     _csv_source_columns,
     _csv_source_delimiter,
     _csv_source_skip_rows,
-    _schema_required_fields,
 )
 
 
@@ -51,13 +50,3 @@ def test_csv_source_columns_rejects_non_sequence() -> None:
 def test_csv_source_columns_rejects_non_string_element() -> None:
     with pytest.raises(ValueError, match=r"columns\[1\] must be str"):
         _csv_source_columns(options={"columns": ["a", 2, "c"]})
-
-
-def test_schema_required_fields_rejects_non_sequence() -> None:
-    with pytest.raises(ValueError, match="must be a list of strings"):
-        _schema_required_fields(schema={"required_fields": "id"})
-
-
-def test_schema_required_fields_rejects_non_string_element() -> None:
-    with pytest.raises(ValueError, match=r"required_fields\[0\] must be str"):
-        _schema_required_fields(schema={"required_fields": [1, "name"]})
