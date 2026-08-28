@@ -113,7 +113,7 @@ def _closed_safe_value(value: object, path: str) -> object:
 
 def _credential_free_hash(tag: str, value: Mapping[str, object], field_name: str) -> str:
     closed = _closed_safe_value(value, field_name)
-    if not isinstance(closed, dict):  # pragma: no cover - Mapping input guarantees this
+    if type(closed) is not dict:  # pragma: no cover - Mapping input guarantees this
         raise TypeError(f"{field_name} must be an object")
     if scrub_payload_for_audit(closed) != closed:
         raise ValueError(f"{field_name} must be credential-free")

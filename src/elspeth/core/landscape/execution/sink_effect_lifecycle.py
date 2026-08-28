@@ -50,7 +50,7 @@ _LOWER_HEX_64: Final = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _require_hash(value: object, field_name: str) -> None:
-    if not isinstance(value, str) or _LOWER_HEX_64.fullmatch(value) is None:
+    if type(value) is not str or _LOWER_HEX_64.fullmatch(value) is None:
         raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
 
 
@@ -885,7 +885,7 @@ class SinkEffectLifecycle:
 
     @staticmethod
     def _validate_owner(owner: str) -> None:
-        if not isinstance(owner, str) or not owner.strip():
+        if not owner.strip():
             raise ValueError("lease owner must be non-empty")
         if len(owner) > 128:
             raise ValueError("lease owner exceeds 128 characters")
