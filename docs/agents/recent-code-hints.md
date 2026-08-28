@@ -8,6 +8,18 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — a `@trust_boundary` / `@observation_boundary` can only ever
+  suppress R1 and R5.** `contracts/trust_boundary.py:73` declares
+  `type BoundaryRule = Literal["R1", "R5"]`, so decorating a function does
+  NOTHING for an R2 (`getattr` default), R3, R4 (broad except), R6, R7, R8 or
+  R9 tier_model finding — those must be removed with a real code change or
+  rationalised. Do not reach for `@observation_boundary` as a way to clear a
+  swallowed-exception finding; it is not one. Widening that vocabulary is not
+  a lane-local edit either: the comment at lines 64-72 requires the operator
+  to confirm a static-analysis story first, because a suppressible rule must
+  be derivable from `source_param` through the tier_model dataflow walk, and
+  R4/R6 are properties of a handler rather than of a derived value.
+
 - **2026-08-29 — `validate_credential_safe_https_url` now lives at
   `elspeth.core.url_validation`, NOT `elspeth.plugins.infrastructure.*`.**
   The module is stdlib-only (`re` + `urllib.parse`) and was already consumed
