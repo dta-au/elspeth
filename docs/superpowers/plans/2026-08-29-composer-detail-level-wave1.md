@@ -649,6 +649,15 @@ describe("SchemaFormTurn advanced tier", () => {
     expect(screen.getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
   });
 
+  it("opens the disclosure when the flag flips on an already-mounted form", async () => {
+    const user = userEvent.setup();
+    render(<SchemaFormTurn payload={payload} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).not.toHaveAttribute("open");
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
+  });
+
   it("treats a field with no tier as common", async () => {
     const user = userEvent.setup();
     render(<SchemaFormTurn payload={pluginPayload([field({ name: "path", label: "Path", kind: "text" })])} onSubmit={vi.fn()} />);
@@ -658,7 +667,7 @@ describe("SchemaFormTurn advanced tier", () => {
 });
 ```
 
-Add `beforeEach` to the vitest import.
+Add `beforeEach` to the vitest import and `act` to the `@testing-library/react` import.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -1170,14 +1179,16 @@ git commit -m "feat(spec): humanised routing rows and shared OptionRows; raw JSO
 
 **Files:**
 - Modify: `src/elspeth/web/frontend/src/components/execution/ValidationResult.tsx`
+- Modify: `src/elspeth/web/frontend/src/components/sidebar/SideRailValidationBanner.tsx:85-95` (`SuggestionList` row text)
 - Test: `src/elspeth/web/frontend/src/components/execution/ValidationResult.test.tsx`
+- Test: `src/elspeth/web/frontend/src/components/sidebar/SideRailValidationBanner.test.tsx`
 
 **Interfaces:**
 - Consumes: `humaniseValidationMessage(message, phraseFor, stepLabelFor)`, `makePhraseFor(compositionState)` from `@/lib/validationHumaniser`; `stepLabelForNodeId(state, id)` from `@/components/chat/interpretationStepLabel`; `useShowAdvanced()`; `useSessionStore((s) => s.compositionState)`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `ValidationResult.test.tsx` (add `import { usePreferencesStore } from "@/stores/preferencesStore";`, `import { useSessionStore } from "@/stores/sessionStore";`, `import { resetStore } from "@/test/store-helpers";`, `within` to the `@testing-library/react` import, and `beforeEach` to the vitest import):
+Append to `ValidationResult.test.tsx` (add `import { usePreferencesStore } from "@/stores/preferencesStore";`, `import { useSessionStore } from "@/stores/sessionStore";`, `import { resetStore } from "@/test/store-helpers";`, `act, within` to the `@testing-library/react` import, and `beforeEach` to the vitest import):
 
 ```tsx
 describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
@@ -1194,11 +1205,12 @@ describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
     expect(screen.getByText("All 2 checks passed.")).toBeInTheDocument();
   });
 
-  it("shows the per-stage list, without the stage-id prefix, when show_advanced is on", async () => {
-    usePreferencesStore.setState({ showAdvanced: true });
+  it("shows the check list, without the check-name prefix, once show_advanced flips on a mounted banner", async () => {
     const user = userEvent.setup();
     render(<ValidationResultBanner result={makePassResult()} />);
     await user.click(screen.getByRole("button", { name: "Validation passed. Show details." }));
+    expect(screen.queryByText("Graph structure is valid")).not.toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
     const item = screen.getByText("Graph structure is valid");
     expect(item).toBeInTheDocument();
     expect(item.closest("li")).toHaveAttribute("title", "graph_structure");
@@ -1243,6 +1255,44 @@ describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
 ```
 
 Confirm the error object shape against `ValidationError` in `types/index.ts` (`component_id`, `component_type`, `message`, `suggestion`) and adjust.
+
+Append to `SideRailValidationBanner.test.tsx` inside its top-level `describe` (the file already imports `makeComposition`, `useExecutionStore`, `useSessionStore`, `resetStore`; add `act` to the `@testing-library/react` import and `import { usePreferencesStore } from "@/stores/preferencesStore";`):
+
+```tsx
+  it("names the suggestion's component by its plain phrase, not the raw id, and reacts to a mounted flag flip", () => {
+    resetStore(usePreferencesStore);
+    useSessionStore.setState({ compositionState: makeComposition(1) } as never);
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        summary: "Validation passed",
+        checks: [
+          { name: "graph_structure", passed: true, detail: "Graph structure is valid", affected_nodes: [], outcome_code: null },
+        ],
+        errors: [],
+        warnings: [],
+        readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] },
+        suggestions: [
+          { component: "select_columns", message: "Schema contract violation: 'source' -> 'select_columns': required field 'id' is not guaranteed", severity: "info" },
+        ],
+      } as never,
+    });
+
+    render(<SideRailValidationBanner />);
+
+    const list = screen.getByRole("list", { name: /suggestions/i });
+    expect(list.textContent).not.toMatch(/select_columns:/);
+    expect(list.textContent).not.toMatch(/Schema contract violation/);
+    expect(screen.getByText(/Schema contract violation/).closest("details")).not.toBeNull();
+
+    // The check list under the pass banner appears only once the flag flips ON A MOUNTED tree.
+    expect(screen.queryByText("Graph structure is valid")).not.toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(screen.getByText("Graph structure is valid")).toBeInTheDocument();
+  });
+```
+
+Check how the file's existing tests put `suggestions` on the execution store (the `SUGGESTION` constant at the top of the file shows the `{ component, message, severity }` shape) and match the exact store key they use; give the suggestion `<ul>` an `aria-label="Suggestions"` if it does not already have an accessible name.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -1341,8 +1391,8 @@ Expected: two pre-existing tests fail first — `"expands to check details on cl
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/elspeth/web/frontend/src/components/execution/ValidationResult.tsx src/elspeth/web/frontend/src/components/execution/ValidationResult.test.tsx
-git commit -m "fix(validation): execution banner uses the shared humaniser; stage list only with show_advanced (elspeth-27efd1e801)"
+git add src/elspeth/web/frontend/src/components/execution/ValidationResult.tsx src/elspeth/web/frontend/src/components/execution/ValidationResult.test.tsx src/elspeth/web/frontend/src/components/sidebar/SideRailValidationBanner.tsx src/elspeth/web/frontend/src/components/sidebar/SideRailValidationBanner.test.tsx
+git commit -m "fix(validation): execution banner and side-rail suggestions use the shared humaniser; check list only with show_advanced (elspeth-27efd1e801)"
 ```
 
 ---
@@ -1386,7 +1436,7 @@ Each wave gets its own plan file once Wave 1 is merged; the tickets already carr
 
 | Order | Ticket | Scope | Depends on |
 |---|---|---|---|
-| 1 | `elspeth-af559a0bab` | Tool-call cards: sentence primary, identifier secondary; map the 12 unmapped web-registry tools; registry-parity test | — |
+| 1 | `elspeth-af559a0bab` | Tool-call cards: sentence primary, identifier secondary; map the 15 unmapped web-registry tools (verified by importing `_dispatch._REGISTERED_TOOLS`, 40 tools); registry-parity test | — |
 | 2 | `elspeth-34e810312c` | Run history & diagnostics behind the flag; keep corruption badge + Explain | Wave 1 |
 | 3 | `elspeth-aa39cffb16` | Import YAML behind the flag; YAML Download stays | Wave 1 |
 | 4 | `elspeth-05a240b82a` | Accounting grid glossary + collapse; recent-errors count | Wave 1, `elspeth-27efd1e801` (phrase-map reuse) |
