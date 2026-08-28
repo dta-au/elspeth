@@ -34,6 +34,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 _ROOT = Path(__file__).resolve().parents[3]
 _SOURCE_ROOT = _ROOT / "src" / "elspeth"
 
@@ -83,9 +85,9 @@ class _ConstructionVisitor(ast.NodeVisitor):
 
 def _production_construction_sites() -> set[tuple[str, str]]:
     sites: set[tuple[str, str]] = set()
-    for path in _SOURCE_ROOT.rglob("*.py"):
-        relative = path.relative_to(_SOURCE_ROOT).as_posix()
-        _ConstructionVisitor(relative, sites).visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+    for parsed in iter_gate_sources(_SOURCE_ROOT):
+        relative = parsed.path.relative_to(_SOURCE_ROOT).as_posix()
+        _ConstructionVisitor(relative, sites).visit(parsed.tree)
     return sites
 
 

@@ -38,6 +38,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.telemetry import observed_value
+from tests.helpers.tree_gate import iter_gate_sources
 from tests.unit.web.conftest import _make_session
 
 # Phase 8 Sub-task 7e (Q7 content-probe skip). Gates the route-level
@@ -49,7 +50,7 @@ from tests.unit.web.conftest import _make_session
 # ``auto_interpreted_opt_out`` is a string-literal column value in an
 # audit row, not an exported identifier.
 _WEB_ROOT = pathlib.Path(__file__).resolve().parents[4] / "src" / "elspeth" / "web"
-_PHASE_5B_OPT_OUT_PRESENT = any("auto_interpreted_opt_out" in p.read_text() for p in _WEB_ROOT.rglob("*.py") if p.is_file())
+_PHASE_5B_OPT_OUT_PRESENT = any("auto_interpreted_opt_out" in parsed.source for parsed in iter_gate_sources(_WEB_ROOT))
 
 
 async def _post(test_client: TestClient, url: str) -> Response:

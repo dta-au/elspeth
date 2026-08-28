@@ -61,6 +61,7 @@ from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.tree_gate import iter_gate_files, iter_gate_sources
 
 _ROOT = Path(__file__).resolve().parents[3]
 _MATRIX_FIXTURE = _ROOT / "src/elspeth/web/frontend/src/stores/__fixtures__/pluginPolicyMatrix.json"
@@ -664,25 +665,23 @@ def test_trained_operator_user_id_stays_restricted_through_request_factory_and_c
 
 def test_every_web_tool_context_constructor_supplies_policy_context() -> None:
     missing: list[str] = []
-    for path in (_ROOT / "src/elspeth/web").rglob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
+    for parsed in iter_gate_sources(_ROOT / "src/elspeth/web"):
+        for node in ast.walk(parsed.tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ToolContext":
                 keywords = {keyword.arg for keyword in node.keywords}
                 if not {"catalog", "plugin_snapshot"} <= keywords:
-                    missing.append(f"{path.relative_to(_ROOT)}:{node.lineno}")
+                    missing.append(f"{parsed.path.relative_to(_ROOT)}:{node.lineno}")
     assert missing == []
 
 
 def test_web_preflight_is_the_only_runtime_factory_caller() -> None:
     callers: list[str] = []
-    for path in (_ROOT / "src/elspeth/web/execution").rglob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
+    for parsed in iter_gate_sources(_ROOT / "src/elspeth/web/execution"):
         if any(
             isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "instantiate_plugins_from_config"
-            for node in ast.walk(tree)
+            for node in ast.walk(parsed.tree)
         ):
-            callers.append(str(path.relative_to(_ROOT)))
+            callers.append(str(parsed.path.relative_to(_ROOT)))
     assert callers == ["src/elspeth/web/execution/preflight.py"]
 
 
@@ -695,7 +694,7 @@ def test_core_and_cli_layers_do_not_import_web_policy() -> None:
     for base in (_ROOT / "src/elspeth/core", _ROOT / "src/elspeth/cli"):
         if not base.exists():
             continue
-        paths = base.rglob("*.py") if base.is_dir() else (base,)
+        paths = iter_gate_files(base) if base.is_dir() else (base,)
         for path in paths:
             if "elspeth.web.plugin_policy" in path.read_text():
                 offenders.append(str(path.relative_to(_ROOT)))
@@ -800,9 +799,10 @@ def test_web_tree_has_no_trained_operator_service_roots_or_calls() -> None:
     """HTTP composition roots must never opt into the named non-web mode."""
     offenders: list[str] = []
     request_root = _ROOT / "src/elspeth/web/sessions"
-    paths = [*request_root.rglob("*.py"), _ROOT / "src/elspeth/web/app.py"]
-    for path in paths:
-        tree = ast.parse(path.read_text(), filename=str(path))
+    app_path = _ROOT / "src/elspeth/web/app.py"
+    parsed_trees = [(parsed.path, parsed.tree) for parsed in iter_gate_sources(request_root)]
+    parsed_trees.append((app_path, ast.parse(app_path.read_text(), filename=str(app_path))))
+    for path, tree in parsed_trees:
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "for_trained_operator":
                 offenders.append(f"{path.relative_to(_ROOT)}:{node.lineno}")

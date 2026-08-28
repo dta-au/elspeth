@@ -13,6 +13,7 @@ from elspeth.web.composer.no_tool_policy import (
     classify_pipeline_mutation_intent,
     is_referential_pipeline_mutation_intent,
 )
+from tests.helpers.tree_gate import iter_gate_sources
 
 _PARITY_FIXTURE_DIR = Path(__file__).resolve().parents[4] / "evals" / "composer-parity" / "fixtures"
 _COMPLETE_MULTI_CLAUSE_REQUESTS = (
@@ -663,9 +664,9 @@ def test_intent_classifier_has_no_new_consumers() -> None:
 
     src_root = Path(elspeth.__file__).resolve().parent
     consumers = {
-        path.relative_to(src_root).as_posix()
-        for path in src_root.rglob("*.py")
-        if path.name != "no_tool_policy.py" and "classify_pipeline_mutation_intent" in path.read_text(encoding="utf-8")
+        parsed.path.relative_to(src_root).as_posix()
+        for parsed in iter_gate_sources(src_root)
+        if parsed.path.name != "no_tool_policy.py" and "classify_pipeline_mutation_intent" in parsed.source
     }
     # service.py: the live consumer (surface routing + repair nudge, via the
     # module alias). no_tool_finalize.py: a comment-only historical reference

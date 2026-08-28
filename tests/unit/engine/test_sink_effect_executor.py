@@ -57,6 +57,7 @@ from tests.fixtures.base_classes import inject_write_failure
 from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
 from tests.fixtures.sink_effects import DuplicateObservableSink, DuplicateObservableTarget
 from tests.fixtures.stores import MockPayloadStore
+from tests.helpers.tree_gate import iter_gate_files
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
 
 _ROOT = Path(__file__).parents[3]
@@ -746,7 +747,7 @@ def persist(stream: object, descriptor: int, payload: bytes) -> None:
 def test_production_tree_has_no_legacy_write_or_flush_publication_boundary() -> None:
     violations = {
         str(source_path.relative_to(_ROOT)): calls
-        for source_path in sorted((_ROOT / "src/elspeth").rglob("*.py"))
+        for source_path in iter_gate_files(_ROOT / "src/elspeth")
         if (calls := _legacy_sink_publication_calls(source_path))
     }
 

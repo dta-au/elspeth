@@ -76,6 +76,7 @@ from elspeth.engine.scheduler_drain import ProcessorMode
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.work_items import WorkItem
 from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run, register_test_node
+from tests.helpers.tree_gate import iter_gate_sources
 
 NODE_ID = "normalize"
 LEADER_OWNER = "leader-a"
@@ -1364,8 +1365,9 @@ def test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinn
     assert ast.unparse(route.test) == "self._scheduler_lease_owner_registered"
 
     legacy_references: list[tuple[str, str]] = []
-    for source_path in (repo_root / "src/elspeth").rglob("*.py"):
-        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    for parsed in iter_gate_sources(repo_root / "src/elspeth"):
+        source_path = parsed.path
+        tree = parsed.tree
         parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute) or node.attr != "enqueue_ready_claimed_legacy_unfenced":

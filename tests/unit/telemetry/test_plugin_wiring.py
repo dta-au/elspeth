@@ -32,6 +32,7 @@ from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.core.rate_limit.registry import NoOpLimiter
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.testing import make_pipeline_row
+from tests.helpers.tree_gate import iter_gate_sources
 
 
 class _ExecutionRepositoryDouble:
@@ -639,17 +640,13 @@ class TestExternalCallPluginRegistry:
         audited_client_names = {"AuditedLLMClient", "AuditedHTTPClient"}
         found_plugins: set[str] = set()
 
-        for py_file in plugins_dir.rglob("*.py"):
+        for parsed in iter_gate_sources(plugins_dir):
+            py_file = parsed.path
             if py_file.name.startswith("_"):
                 continue
 
-            try:
-                tree = ast.parse(py_file.read_text())
-            except SyntaxError:
-                continue
-
             # Check for constructor calls: AuditedLLMClient(...) or AuditedHTTPClient(...)
-            for node in ast.walk(tree):
+            for node in ast.walk(parsed.tree):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in audited_client_names:
                     found_plugins.add(str(py_file))
 

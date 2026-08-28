@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 
 def test_all_four_pre_migration_members_remain_tier_1() -> None:
     from elspeth.contracts import errors as errors_mod
@@ -94,9 +96,9 @@ def test_repo_uses_live_tier_1_error_attribute_access_not_from_import_snapshots(
     forbidden_imports: list[str] = []
     src_root = Path("src/elspeth")
 
-    for py_file in sorted(src_root.rglob("*.py")):
-        tree = ast.parse(py_file.read_text(), filename=str(py_file))
-        for node in ast.walk(tree):
+    for parsed in iter_gate_sources(src_root):
+        py_file = parsed.path
+        for node in ast.walk(parsed.tree):
             if not isinstance(node, ast.ImportFrom):
                 continue
             if node.module not in {"elspeth.contracts", "elspeth.contracts.errors", "elspeth.contracts.tier_registry"}:

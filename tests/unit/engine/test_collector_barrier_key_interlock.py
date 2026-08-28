@@ -47,6 +47,7 @@ from elspeth.engine.barrier_coordination import BarrierIntakeCoordinator, Barrie
 from elspeth.engine.clock import MockClock
 from elspeth.engine.executors.collector import CollectorOutcome
 from elspeth.engine.work_items import WorkItemFactory
+from tests.helpers.tree_gate import iter_gate_sources
 from tests.unit.engine.test_barrier_coordination import (
     FakeNav,
     RecordingAggregationExecutor,
@@ -128,8 +129,9 @@ def test_every_production_collector_barrier_key_goes_through_the_helper() -> Non
     only assignments/kwargs literally named barrier_key count."""
     helper_calls: set[tuple[str, str]] = set()
     literal_hits: list[tuple[str, int]] = []
-    for path in sorted((REPO_ROOT / "src" / "elspeth").rglob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
+    for parsed in iter_gate_sources(REPO_ROOT / "src" / "elspeth"):
+        path = parsed.path
+        tree = parsed.tree
         relative = str(path.relative_to(REPO_ROOT))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):

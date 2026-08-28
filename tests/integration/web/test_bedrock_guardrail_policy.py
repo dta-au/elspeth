@@ -26,6 +26,7 @@ from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
+from tests.helpers.tree_gate import iter_gate_sources
 
 _ROOT = Path(__file__).resolve().parents[3]
 _AWS_PROMPT = PluginId("transform", "aws_bedrock_prompt_shield")
@@ -525,11 +526,10 @@ def test_generic_policy_modules_have_no_aws_specific_parallel_mechanism() -> Non
         assert "startup_probe" not in source
 
     duplicate_types: list[str] = []
-    for path in (_ROOT / "src/elspeth/web").rglob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
+    for parsed in iter_gate_sources(_ROOT / "src/elspeth/web"):
+        for node in ast.walk(parsed.tree):
             if isinstance(node, ast.ClassDef) and node.name.startswith("AWS") and ("Snapshot" in node.name or "Inventory" in node.name):
-                duplicate_types.append(f"{path.relative_to(_ROOT)}:{node.lineno}:{node.name}")
+                duplicate_types.append(f"{parsed.path.relative_to(_ROOT)}:{node.lineno}:{node.name}")
     assert duplicate_types == []
 
     availability_source = inspect.getsource(build_plugin_snapshot)

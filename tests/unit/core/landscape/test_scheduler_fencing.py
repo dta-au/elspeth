@@ -26,6 +26,7 @@ from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import run_coordination_table, run_workers_table, runs_table
 from tests.fixtures.landscape import make_landscape_db
+from tests.helpers.tree_gate import iter_gate_sources
 
 RUN_ID = "run-scheduler-fencing"
 WORKER_ID = f"worker:{RUN_ID}:leader"
@@ -466,11 +467,11 @@ def test_legacy_helper_reference_is_isolated_to_named_legacy_adapter_across_pack
     package_dir = Path(elspeth.__file__).parent
     references: list[tuple[str, str | None]] = []
 
-    for path in package_dir.rglob("*.py"):
+    for parsed in iter_gate_sources(package_dir):
         references.extend(
             _legacy_recovery_references(
-                path.read_text(),
-                filename=str(path.relative_to(package_dir)),
+                parsed.source,
+                filename=str(parsed.path.relative_to(package_dir)),
             )
         )
 
@@ -481,12 +482,12 @@ def test_production_sources_do_not_call_legacy_recovery_adapter() -> None:
     package_dir = Path(elspeth.__file__).parent
     references: list[tuple[str, str | None]] = []
 
-    for path in package_dir.rglob("*.py"):
+    for parsed in iter_gate_sources(package_dir):
         references.extend(
             _method_attribute_references(
-                path.read_text(),
+                parsed.source,
                 method_name=LEGACY_RECOVERY_METHOD,
-                filename=str(path.relative_to(package_dir)),
+                filename=str(parsed.path.relative_to(package_dir)),
             )
         )
 

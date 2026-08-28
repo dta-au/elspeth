@@ -41,6 +41,7 @@ from elspeth.core.landscape.schema import (
 )
 from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, register_test_node
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
+from tests.helpers.tree_gate import iter_gate_sources
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
 RUN_ID = "forbidden-path-run"
@@ -523,9 +524,8 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "update_run_status",
     }
     actual: set[str] = set()
-    for source_path in sorted((ROOT / "src/elspeth").rglob("*.py")):
-        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-        for node in ast.walk(tree):
+    for parsed in iter_gate_sources(ROOT / "src/elspeth"):
+        for node in ast.walk(parsed.tree):
             if not isinstance(node, ast.Call):
                 continue
             function_name = (
@@ -653,9 +653,12 @@ def test_f12_waiting_is_unreachable_from_scheduler_and_restore_code() -> None:
     )
     offenders: list[str] = []
     for path in production_paths:
-        files = sorted(path.rglob("*.py")) if path.is_dir() else [path]
-        for file_path in files:
-            tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
+        trees = (
+            ((parsed.path, parsed.tree) for parsed in iter_gate_sources(path))
+            if path.is_dir()
+            else [(path, ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))]
+        )
+        for file_path, tree in trees:
             for node in ast.walk(tree):
                 if isinstance(node, ast.Constant) and node.value == "waiting":
                     offenders.append(f"{file_path.relative_to(ROOT)}:{node.lineno}:string")

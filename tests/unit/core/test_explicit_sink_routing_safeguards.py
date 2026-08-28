@@ -29,6 +29,7 @@ from tests.fixtures.factories import wire_transforms
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.pipeline import build_production_graph
 from tests.fixtures.plugins import CollectSink, ListSource
+from tests.helpers.tree_gate import iter_gate_files
 
 SRC_ROOT = Path(__file__).resolve().parents[3] / "src" / "elspeth"
 
@@ -61,7 +62,7 @@ class TestZeroDefaultSinkGrep:
         """All default_sink references in src/ must be rejection validators or comments."""
         violations: list[str] = []
 
-        for py_file in sorted(SRC_ROOT.rglob("*.py")):
+        for py_file in iter_gate_files(SRC_ROOT):
             rel_path = py_file.relative_to(SRC_ROOT.parent.parent)
             for lineno, line in enumerate(py_file.read_text().splitlines(), start=1):
                 if "default_sink" not in line:

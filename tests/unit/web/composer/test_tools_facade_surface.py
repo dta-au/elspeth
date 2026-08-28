@@ -47,6 +47,8 @@ import pathlib
 
 import pytest
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 
 def _repo_root() -> pathlib.Path:
     """Locate the repository root from this test file's location.
@@ -81,19 +83,13 @@ def _names_imported_from_facade() -> set[str]:
         branch_root = root / branch
         if not branch_root.is_dir():
             continue
-        for py_path in branch_root.rglob("*.py"):
+        for parsed in iter_gate_sources(branch_root):
             # The facade re-exports its own names; an import there is not
             # an external consumer.
-            rel = py_path.relative_to(root).as_posix()
+            rel = parsed.path.relative_to(root).as_posix()
             if rel.endswith("src/elspeth/web/composer/tools/__init__.py"):
                 continue
-            try:
-                tree = ast.parse(py_path.read_text())
-            except SyntaxError:
-                # Malformed test fixtures (deliberately broken Python) are
-                # not consumers of the facade.
-                continue
-            for node in ast.walk(tree):
+            for node in ast.walk(parsed.tree):
                 if isinstance(node, ast.ImportFrom) and node.module == pkg:
                     for alias in node.names:
                         referenced.add(alias.name)

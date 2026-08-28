@@ -6,6 +6,8 @@ import ast
 from collections import Counter
 from pathlib import Path
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TESTS_ROOT = REPO_ROOT / "tests"
 
@@ -191,10 +193,9 @@ def test_hasattr_in_tests_is_limited_to_reviewed_surface_assertions() -> None:
     seen: Counter[str] = Counter()
     locations: dict[str, list[str]] = {}
     violations: list[str] = []
-    for path in sorted(TESTS_ROOT.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for parsed in iter_gate_sources(TESTS_ROOT):
+        path = parsed.path
+        tree = parsed.tree
         parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):

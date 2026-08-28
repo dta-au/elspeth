@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 from scripts.cicd import runtime_rejection_parity
+from tests.helpers import tree_gate
 from tests.unit import test_mock_discipline_baseline
 
 from elspeth_lints.core import ast_walker
@@ -71,6 +72,8 @@ WALKERS: dict[str, Callable[[Path], Iterable[Path]]] = {
     "contract_manifest.scan_source_tree": _contract_manifest_walk,
     "runtime_rejection_parity._iter_python_files": runtime_rejection_parity._iter_python_files,
     "test_mock_discipline_baseline._iter_python_files": test_mock_discipline_baseline._iter_python_files,
+    "tree_gate.iter_gate_files": tree_gate.iter_gate_files,
+    "tree_gate.iter_gate_sources": lambda root: _paths_of_parsed(tree_gate.iter_gate_sources(root)),
 }
 
 
@@ -103,16 +106,27 @@ def test_both_worktree_conventions_are_excluded_and_no_bare_worktrees_component(
 
 _PRIVATE_WALK_RE = re.compile(r"""rglob\(\s*['"]\*\.py['"]\s*\)|\bos\.walk\(""")
 _AUTHORITY = Path(ast_walker.__file__).resolve()
+# ``tests/`` is pinned wholesale: every whole-tree gate walks through
+# ``tests/helpers/tree_gate.py`` (the shared-checkout race fix, 2026-08-29),
+# so a fresh ``rglob("*.py")`` anywhere under tests/ is a new unprotected gate.
 _PINNED_ROOTS: tuple[Path, ...] = (
     REPO_ROOT / "elspeth-lints" / "src",
     REPO_ROOT / "scripts" / "cicd",
+    REPO_ROOT / "tests",
 )
-_PINNED_FILES: tuple[Path, ...] = (REPO_ROOT / "tests" / "unit" / "test_mock_discipline_baseline.py",)
+_PINNED_FILES: tuple[Path, ...] = ()
+# Walks that are NOT Python-file walks and so carry no exclusion obligation:
+# ``tests/conftest.py`` fingerprints EVERY directory entry (lstat of each
+# name, sorted) to detect stray writes into ``.elspeth/`` — pruning anything
+# from it would defeat its purpose.
+_NOT_PYTHON_FILE_WALKS: frozenset[Path] = frozenset({REPO_ROOT / "tests" / "conftest.py"})
 
 
 def test_no_private_python_file_walk_outside_the_authority() -> None:
     candidates = [path for root in _PINNED_ROOTS for path in iter_python_files(root) if "fixtures" not in path.parts]
     candidates.extend(_PINNED_FILES)
+    self_and_authority_helper = {Path(__file__).resolve(), Path(tree_gate.__file__).resolve(), *_NOT_PYTHON_FILE_WALKS}
+    candidates = [path for path in candidates if path.resolve() not in self_and_authority_helper]
     assert candidates, "pin scanned nothing"
 
     offenders = sorted(

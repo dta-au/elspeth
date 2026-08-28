@@ -18,6 +18,7 @@ import ast
 from pathlib import Path
 
 from elspeth.contracts.enums import GroupSettlementReason
+from tests.helpers.tree_gate import iter_gate_sources
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _ENUM_SOURCE = REPO_ROOT / "src" / "elspeth" / "contracts" / "enums.py"
@@ -57,10 +58,11 @@ def test_no_production_module_hand_writes_a_settlement_reason_literal() -> None:
     """
     vocabulary = {r.value for r in GroupSettlementReason}
     hits: list[tuple[str, int, str]] = []
-    for path in sorted((REPO_ROOT / "src" / "elspeth").rglob("*.py")):
+    for parsed in iter_gate_sources(REPO_ROOT / "src" / "elspeth"):
+        path = parsed.path
         if path == _ENUM_SOURCE:
             continue
-        tree = ast.parse(path.read_text(), filename=str(path))
+        tree = parsed.tree
         docstring_nodes: set[int] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) and node.body:

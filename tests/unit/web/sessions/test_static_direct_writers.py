@@ -50,6 +50,8 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from tests.helpers.tree_gate import ParsedPythonFile, iter_gate_sources
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -353,19 +355,20 @@ class _WriterCollector(ast.NodeVisitor):
         )
 
 
-def _iter_python_files(roots: Sequence[Path]) -> Iterator[tuple[Path, Path]]:
-    """Yield ``(root, py_file)`` for every Python source under each root.
+def _iter_python_files(roots: Sequence[Path]) -> Iterator[tuple[Path, ParsedPythonFile]]:
+    """Yield ``(root, parsed)`` for every Python source under each root.
 
+    Enumeration, reading, and parsing go through the whole-tree gate helper.
     Skips this scanner module via resolved-path equality.
     """
 
     for root in roots:
         if not root.exists():
             continue
-        for py_file in sorted(root.rglob("*.py")):
-            if py_file.resolve() == _SCANNER_SELF_PATH:
+        for parsed in iter_gate_sources(root):
+            if parsed.path.resolve() == _SCANNER_SELF_PATH:
                 continue
-            yield root, py_file
+            yield root, parsed
 
 
 def scan_writers(
@@ -380,20 +383,8 @@ def scan_writers(
     """
 
     matches: list[WriterMatch] = []
-    for root, py_file in _iter_python_files(roots):
-        try:
-            source = py_file.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            # Synthetic-test fixtures occasionally write non-UTF-8 bytes;
-            # the scanner's job is to parse Python, so skip what doesn't
-            # decode rather than crash.
-            continue
-        try:
-            tree = ast.parse(source, filename=str(py_file))
-        except SyntaxError:
-            # A test fixture may write deliberately invalid Python to
-            # exercise unrelated parsers; skip rather than crash.
-            continue
+    for root, parsed in _iter_python_files(roots):
+        py_file, source, tree = parsed.path, parsed.source, parsed.tree
         parents = _parent_map(tree)
 
         anchor = path_anchor or root
@@ -429,16 +420,8 @@ def _codebase_defines_symbol(symbol: str, roots: Sequence[Path]) -> bool:
     exists, the checks return no violations.
     """
 
-    for _, py_file in _iter_python_files(roots):
-        try:
-            source = py_file.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        try:
-            tree = ast.parse(source, filename=str(py_file))
-        except SyntaxError:
-            continue
-        for node in ast.walk(tree):
+    for _, parsed in _iter_python_files(roots):
+        for node in ast.walk(parsed.tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol:
                 return True
     return False
@@ -571,15 +554,8 @@ def check_lock_discipline(
     allowed_keys = {(entry.path, entry.enclosing_symbol, entry.helper_name) for entry in allowlist}
 
     findings: list[LockDisciplineViolation] = []
-    for root, py_file in _iter_python_files(roots):
-        try:
-            source = py_file.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        try:
-            tree = ast.parse(source, filename=str(py_file))
-        except SyntaxError:
-            continue
+    for root, parsed in _iter_python_files(roots):
+        py_file, source, tree = parsed.path, parsed.source, parsed.tree
         parents = _parent_map(tree)
         anchor = path_anchor or root
         try:
@@ -643,15 +619,8 @@ def check_helper_lock_assertions(
         return []
 
     findings: list[LockDisciplineViolation] = []
-    for root, py_file in _iter_python_files(roots):
-        try:
-            source = py_file.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        try:
-            tree = ast.parse(source, filename=str(py_file))
-        except SyntaxError:
-            continue
+    for root, parsed in _iter_python_files(roots):
+        py_file, source, tree = parsed.path, parsed.source, parsed.tree
         parents = _parent_map(tree)
         anchor = path_anchor or root
         try:
@@ -806,15 +775,8 @@ def check_inline_state_version_allocation(
         return []
 
     findings: list[InlineAllocViolation] = []
-    for root, py_file in _iter_python_files(roots):
-        try:
-            source = py_file.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        try:
-            tree = ast.parse(source, filename=str(py_file))
-        except SyntaxError:
-            continue
+    for root, parsed in _iter_python_files(roots):
+        py_file, source, tree = parsed.path, parsed.source, parsed.tree
         parents = _parent_map(tree)
         anchor = path_anchor or root
         try:

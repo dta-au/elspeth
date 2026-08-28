@@ -6,6 +6,8 @@ import ast
 import uuid
 from pathlib import Path
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 
 def test_generate_id_lives_on_neutral_core_surface() -> None:
     """ID generation is a core primitive, not a landscape-private helper."""
@@ -24,9 +26,9 @@ def test_production_code_does_not_import_generate_id_from_landscape_helpers() ->
     root = Path(__file__).parents[3] / "src" / "elspeth"
     offenders: list[tuple[str, int]] = []
 
-    for source_path in root.rglob("*.py"):
-        tree = ast.parse(source_path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
+    for parsed in iter_gate_sources(root):
+        source_path = parsed.path
+        for node in ast.walk(parsed.tree):
             if not isinstance(node, ast.ImportFrom):
                 continue
             if any(alias.name == "generate_id" for alias in node.names):

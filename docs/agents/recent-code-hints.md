@@ -2271,6 +2271,32 @@ frontend ports do not isolate that file, so otherwise independent runs can
 corrupt each other's authenticated state. Run every Playwright suite
 sequentially per worktree.
 
+### 9. Whole-tree gates walk through `tests/helpers/tree_gate.py`; scratch goes in `tests/_scratch/` (2026-08-29)
+
+A sibling session dropped a throwaway `test_zz_scratch_repro_*.py` into
+`tests/unit/web/composer/` and deleted it while another session's full suite
+was mid-run. The hasattr gate had already enumerated it via `rglob` and died
+on the read with a bare `FileNotFoundError` naming a file nobody committed.
+Every one of the ~25 whole-tree gates had the same exposure. Two rules now:
+
+- **Never write a private Python-file walk under `tests/`.** Enumerate with
+  `iter_gate_files(root)` / `iter_gate_sources(root)` from
+  `tests/helpers/tree_gate.py`. They derive from the lints exclusion
+  authority (`ast_walker.iter_python_files`), subtract everything git ignores
+  so local gates measure exactly the tree CI measures, and raise a NAMED
+  `TreeNotFrozenError` (file vanished mid-walk → the run is void, use a
+  worktree) or `GateSourceError` (undecodable / unparseable) instead of
+  skipping. `test_python_file_walker_authority.py` pins all of `tests/`
+  against the literal `rglob("*.py")` / `os.walk(` — including in docstrings
+  and comments — so a fresh walk (or a mention of one) turns that test red.
+  A walk that is genuinely not a Python-file walk (the conftest directory
+  fingerprint) goes in its `_NOT_PYTHON_FILE_WALKS` allowlist with a reason.
+- **Scratch repro tests live in `tests/_scratch/` and nowhere else.** It is
+  gitignored, pytest still collects and runs it, and no gate can see it —
+  so a scratch file appearing or vanishing mid-run cannot crash or skew a
+  gate on the shared checkout. A scratch file anywhere else under `tests/`
+  IS a gate input from the moment it exists.
+
 ## Recent conventions (prune when archived)
 
 - **2026-08-25 — pdf_rasterize / out-of-process render seam.** First plugin in

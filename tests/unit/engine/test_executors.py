@@ -5574,20 +5574,17 @@ class TestReRaiseGuardPattern:
         import ast
         from pathlib import Path
 
+        from tests.helpers.tree_gate import iter_gate_sources
+
         src_root = Path("src/elspeth")
         violations: list[str] = []
 
-        for py_file in sorted(src_root.rglob("*.py")):
+        for parsed in iter_gate_sources(src_root):
+            py_file = parsed.path
             if py_file.name in self._HANDLER_ALLOWLIST:
                 continue
 
-            source = py_file.read_text()
-            try:
-                tree = ast.parse(source, filename=str(py_file))
-            except SyntaxError:
-                continue
-
-            for node in ast.walk(tree):
+            for node in ast.walk(parsed.tree):
                 if not isinstance(node, ast.ExceptHandler):
                     continue
 
@@ -5623,17 +5620,13 @@ class TestReRaiseGuardPattern:
         import ast
         from pathlib import Path
 
+        from tests.helpers.tree_gate import iter_gate_sources
+
         src_root = Path("src/elspeth")
         count = 0
 
-        for py_file in sorted(src_root.rglob("*.py")):
-            source = py_file.read_text()
-            try:
-                tree = ast.parse(source, filename=str(py_file))
-            except SyntaxError:
-                continue
-
-            for node in ast.walk(tree):
+        for parsed in iter_gate_sources(src_root):
+            for node in ast.walk(parsed.tree):
                 if isinstance(node, ast.ExceptHandler) and _is_framework_audit_handler(node):
                     count += 1
 

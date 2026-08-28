@@ -12,6 +12,7 @@ from sqlalchemy import select
 from elspeth.contracts import NodeType, RunStatus
 from elspeth.core.landscape.schema import nodes_table, rows_table, runs_table
 from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.helpers.tree_gate import iter_gate_files
 
 
 def test_runs_table_has_audit_story_columns() -> None:
@@ -559,7 +560,7 @@ def test_landscape_core_keeps_web_session_identifiers_out_of_audit_schema() -> N
     landscape_root = Path(__file__).parents[4] / "src" / "elspeth" / "core" / "landscape"
     forbidden = ("session_id", "chat_message_id", "composition_state_id")
     hits: list[str] = []
-    for path in landscape_root.rglob("*.py"):
+    for path in iter_gate_files(landscape_root):
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             if token in text:

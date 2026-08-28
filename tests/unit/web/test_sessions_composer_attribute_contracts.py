@@ -16,6 +16,7 @@ from elspeth.web.composer.implicit_decisions import _is_auto_wired_control
 from elspeth.web.composer.state import NodeSpec
 from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
 from elspeth.web.sessions.routes._helpers import _failure_log_request_id, _is_client_disconnect_cancel
+from tests.helpers.tree_gate import iter_gate_sources
 
 
 @dataclass(frozen=True, order=True)
@@ -60,10 +61,10 @@ class _ProbeCollector(ast.NodeVisitor):
 def _attribute_probes(repo_root: Path) -> set[_AttributeProbe]:
     probes: set[_AttributeProbe] = set()
     for relative_root in ("src/elspeth/web/sessions", "src/elspeth/web/composer"):
-        for path in sorted((repo_root / relative_root).rglob("*.py")):
-            relative_path = path.relative_to(repo_root).as_posix()
+        for parsed in iter_gate_sources(repo_root / relative_root):
+            relative_path = parsed.path.relative_to(repo_root).as_posix()
             collector = _ProbeCollector(file_path=relative_path)
-            collector.visit(ast.parse(path.read_text(), filename=relative_path))
+            collector.visit(parsed.tree)
             probes.update(collector.probes)
     return probes
 

@@ -7,6 +7,8 @@ import subprocess
 from collections import Counter
 from pathlib import Path
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 _ROOT = Path(__file__).resolve().parents[3]
 _SOURCE_ROOT = _ROOT / "src" / "elspeth"
 
@@ -55,9 +57,9 @@ class _SinkCallVisitor(ast.NodeVisitor):
 
 def _production_sink_calls() -> Counter[tuple[str, str, str, str, str]]:
     calls: Counter[tuple[str, str, str, str, str]] = Counter()
-    for path in _SOURCE_ROOT.rglob("*.py"):
-        relative = path.relative_to(_SOURCE_ROOT).as_posix()
-        _SinkCallVisitor(relative, calls).visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+    for parsed in iter_gate_sources(_SOURCE_ROOT):
+        relative = parsed.path.relative_to(_SOURCE_ROOT).as_posix()
+        _SinkCallVisitor(relative, calls).visit(parsed.tree)
     return calls
 
 

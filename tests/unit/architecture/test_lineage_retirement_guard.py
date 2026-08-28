@@ -18,6 +18,8 @@ import ast
 import dataclasses
 from pathlib import Path
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.landscape import schema
@@ -70,8 +72,9 @@ def _modules_inserting_into(table_attr: str) -> set[str]:
     those are not AST-detectable without a type-inference pass.
     """
     hits: set[str] = set()
-    for path in SRC_ROOT.rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for parsed in iter_gate_sources(SRC_ROOT):
+        path = parsed.path
+        tree = parsed.tree
 
         # First pass: collect straight-line aliases (Name → table_attr) at module scope
         # and within functions. Only one hop: _frames = token_lineage_frames_table.
