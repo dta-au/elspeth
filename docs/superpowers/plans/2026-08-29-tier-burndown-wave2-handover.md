@@ -22,13 +22,30 @@ landed 3 unrelated `docs(plans)` commits on the branch (`2ab533425`, `ed1592ee1`
    Requirements given: Mapping-compatible guard restored, frozen-input test through the REAL
    ToolResult producer, both arms, mutation-checked; re-verify its other `type() is` conversions.
    If the lane is gone: finish from the worktree (ping first — pytest may be running).
-2. **Lens A of the two-lens audit (IN FLIGHT, resumed after the same limit cut).** Agent
-   `audit-w2-controls-A` (fable), brief `scratchpad/CONTROL_AUDIT_BRIEF_W2.md`. Lens B is DONE
-   (epic comment 8797): F1 = the known B43b regression; F2 low (str-subclass tolerance divergence
-   `_node_str_option` vs `_backend_surface_args_for_site`, no production path); F3 → bug
-   `elspeth-61ae1eaa32` filed (run_status_projection.py:207 unhashable membership, pre-existing).
-   **Lens B left the composer-invariant "server authors pipeline structure" half UNSWEPT — lens A
-   must cover it or the wave sign-off carries that as an explicit gap.**
+2. **Lens A: DONE (epic comment 8798, 2026-08-28). ALL-STOP: none.** Covered all 38 merges via
+   9 file-owning sub-lanes + a range-wide sweep, INCLUDING the composer-invariant half lens B
+   left unswept (Class 3: zero findings — no server authoring, no tutorial-special path, every
+   new boundary's suppression ≤ its honest parse). Range-wide frozen-narrowing sweep: B43b's
+   tool_batch site is the ONLY `type() is` read on a freeze_fields'd field in the range — the
+   ledger's "re-run frozen-narrowing audit" wave-end mandate is SATISFIED. Hub disposition of
+   its findings (all landed 2026-08-28/29):
+   - F3 FIXED `6a22c6087` (required_controls `or "discard"` coerced falsy non-str; now
+     absent/null-only default, falsy-value test mutation-checked).
+   - F6+F7 FIXED `6f2aae0c9` (false ToolResult-never-subclassed comment in tools/sessions.py;
+     false impostor-`__contains__` rationale in recent-code-hints.md).
+   - F2 → bug `elspeth-3db5745ba7` (P1, pre-existing: blobs active-run retention guard reads the
+     dead pre-2026-05 column shape; TypeError 500 on every delete/replace under an active run;
+     pinning tests seed the dead shape).
+   - F4 config rider → bug `elspeth-4562900623` (P3, `_is_loopback_or_private_origin` accepts
+     `127.1`/hex/decimal/octal/localhost.localdomain as public_base_url).
+   - F9a/b/c + unpinned narrowings → task `elspeth-7b5af9015b` (P3 residual worklist).
+   - F4/F5 signed-sidecar wording defects (~13 items across B25/B34/B33/B24/B35/B47) + B32
+     docstring → fix lane `tier/lensA-wording` (worktree `.claude/worktrees/lensA-wording`);
+     merge before the suite. F8 (B39 signing bookkeeping) already in the hub ledger.
+   - Wave-3 method notes from the audit: the repo's `elspeth-xdist-auto` plugin defaults pytest
+     to `-n auto` — EVERY lane/sub-lane brief must mandate an explicit `-n`; loomweave
+     under-enumerates callers vs `git grep` (missed 3/6 redaction callers) — grep is the
+     authority for reachability claims.
 3. **Full suite** on the final tip (after B43c): worktree + `-n 16` background job, per
    `feedback_long_suite_runs_use_a_worktree_not_the_shared_checkout`. Expected caveats: same as
    Wave 1 (litellm-poisoning fixtures; 3 pre-existing freeze_guards) + `test_validation_trust_tier.py`
