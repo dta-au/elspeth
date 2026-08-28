@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.schema import FieldDefinition
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.knob_schema import KnobSchema
 from elspeth.web.composer._producer_resolver import source_producer_id
 from elspeth.web.composer.guided._display import plugin_display_label
@@ -534,8 +535,26 @@ def build_step_4_wire_turn(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="composer-authored node/output plugin options (free-form Tier-3 payload, never schema-validated by the composer)",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "observes only; returns the weakest honest business-schema projection "
+        "('observed' mode, empty field/name lists) for any option shape it "
+        "cannot read, and never raises on a malformed options payload"
+    ),
+)
 def _wire_schema(options: Mapping[str, Any]) -> _WireBusinessSchema:
-    """Project only the business schema, never adjacent path/secret options."""
+    """Project only the business schema, never adjacent path/secret options.
+
+    ``options`` is a ``NodeSpec``/``OutputSpec`` ``options`` mapping: free-form
+    plugin configuration authored through the composer (planner tool calls or
+    the schema_form), which the composer stores verbatim and never validates
+    against a plugin schema — the plugin does that at execution time. So every
+    read here is a Tier-3 boundary read, not a defensive read of owned state.
+    """
 
     raw = options.get("schema", options.get("schema_config", {}))
     schema = raw if isinstance(raw, Mapping) else {}
@@ -566,8 +585,24 @@ def _wire_schema(options: Mapping[str, Any]) -> _WireBusinessSchema:
     }
 
 
+@observation_boundary(
+    tier=3,
+    source="composer-authored llm node plugin options (free-form Tier-3 payload, never schema-validated by the composer)",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "observes only; skips any query or output-field entry whose shape it "
+        "cannot read and returns the fields it could project, never raising on "
+        "a malformed options payload"
+    ),
+)
 def _structured_output_fields(options: Mapping[str, Any]) -> list[_WireStructuredOutputField]:
-    """Return typed LLM result fields without prompts, templates, or values."""
+    """Return typed LLM result fields without prompts, templates, or values.
+
+    Same Tier-3 provenance as :func:`_wire_schema`: ``options`` is the llm
+    node's free-form ``NodeSpec.options``, stored verbatim by the composer and
+    validated only by the plugin at execution time.
+    """
 
     queries = options.get("queries")
     if isinstance(queries, Mapping):
