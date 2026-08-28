@@ -2,6 +2,12 @@
 #
 # This speeds up builds and reduces image size by excluding
 # development files, tests, documentation, and git metadata.
+#
+# SEMANTICS: this is NOT gitignore. Docker matches each pattern with Go's
+# filepath.Match against the context-relative path, anchored at the root:
+# `*.db` excludes only a top-level foo.db and `worktrees/` only ./worktrees.
+# A pattern matches at any depth ONLY when written `**/`-prefixed. Pinned by
+# tests/unit/deployment/test_deploy_ignore_policy.py.
 
 # Git
 .git/
@@ -9,8 +15,8 @@
 .gitattributes
 
 # Python development
-__pycache__/
-*.py[cod]
+**/__pycache__/
+**/*.py[cod]
 *$py.class
 *.so
 .Python
@@ -87,14 +93,18 @@ docker-compose*.yaml
 docker-compose*.yml
 .docker/
 
-# Worktrees
-.worktrees/
+# Worktrees — agent worktrees live under .claude/worktrees/<name> (AGENTS.md)
+# and may nest; the panel convention is .worktrees/. Each is a full checkout,
+# so a top-level-only pattern lets gigabytes of sibling branches (and their
+# untracked .env / *.pem / *.db) into the build context.
+**/.claude/
+**/.worktrees/
 worktrees/
 
 # Data and state (mounted at runtime)
-*.db
-*.sqlite
-*.sqlite3
+**/*.db
+**/*.sqlite
+**/*.sqlite3
 payloads/
 landscape.db
 
@@ -107,12 +117,14 @@ landscape.db
 *.tfvars.json
 !*.tfvars.example
 
-# Secrets (never include in image!)
-.env
-.env.*
-*.pem
+# Secrets (never include in image!) — any depth, so a stray credential inside
+# src/ or a worktree cannot ride in on `COPY src/ ./src/`.
+**/.env
+**/.env.*
+**/*.pem
 !deploy/aws-ecs/trust/global-bundle.pem
-*.key
+**/*.key
+# Top-level only on purpose: src/elspeth/web/secrets/ is a real package.
 secrets/
 
 # Logs
