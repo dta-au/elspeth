@@ -495,6 +495,32 @@ class TestReplayedCallNestedMutationRejected:
 # ── deep_freeze must leave dataclasses discriminable by ``type(x) is C`` ─────
 
 
+def _value_transform_node() -> Any:
+    """A real value_transform NodeSpec whose options went through freeze_fields.
+
+    Contracts keeps no module-level dependency on web, so the spec type is
+    imported here rather than at module scope.
+    """
+    from elspeth.contracts.enums import NodeType
+    from elspeth.web.composer.state import NodeSpec
+
+    return NodeSpec(
+        id="t1",
+        node_type=NodeType.TRANSFORM,
+        plugin="value_transform",
+        input="in",
+        on_success="out",
+        on_error=None,
+        options={"operations": [{"target": "amount"}]},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
 class TestDeepFreezeLeavesDataclassesDiscriminable:
     """``deep_freeze`` must return dataclass instances unchanged.
 
@@ -533,14 +559,35 @@ class TestDeepFreezeLeavesDataclassesDiscriminable:
         assert frozen["resolved"] is marker
         assert type(frozen["resolved"]) is UnresolvedClaimedProofBlob
 
-    def test_nested_containers_are_retyped_so_type_is_dict_would_be_always_false(self) -> None:
-        """The contrast: container types DO change, dataclass types do not."""
-        frozen = deep_freeze({"operations": [{"target": "amount"}]})
+    def test_frozen_node_options_retype_containers_so_type_is_dict_would_be_always_false(self) -> None:
+        """The contrast: container types DO change, dataclass types do not.
 
-        operations = frozen["operations"]
+        Built through the REAL producer (``NodeSpec.__post_init__``), never a
+        hand-built mapping handed straight to ``deep_freeze``: the hand-built
+        form keeps passing if ``NodeSpec`` ever stops freezing its options,
+        which would leave ``_value_transform_preserves_field``'s guards dead
+        while this test stayed green (lane B50's false all-clear).
+        """
+        node = _value_transform_node()
+
+        operations = node.options["operations"]
         assert type(operations) is tuple
         assert not isinstance(operations, list)
 
         operation = operations[0]
         assert type(operation) is not dict
         assert isinstance(operation, Mapping)
+
+    def test_value_transform_guard_reads_frozen_options_on_both_arms(self) -> None:
+        """The guard those ``isinstance`` checks protect, on real frozen input.
+
+        Pins behaviour, not just types: a ``type(x) is dict`` conversion makes
+        the ``Mapping`` arm always-False, so every field would read as
+        preserved and the targeted-field arm below would flip to True.
+        """
+        from elspeth.web.composer.tools.generation import _value_transform_preserves_field
+
+        node = _value_transform_node()
+
+        assert _value_transform_preserves_field(node, "amount") is False
+        assert _value_transform_preserves_field(node, "untouched") is True
