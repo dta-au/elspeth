@@ -8,6 +8,33 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — adding a DOCSTRING shifts every `body[N]` index inside that
+  function, exactly like the `@overload` trap below.** A docstring is
+  `body[0]`, so writing one on an existing function moves every tier_model
+  finding in it by one (`body[10]/body[0]/handlers[0]` →
+  `body[10]/body[1]/handlers[0]`) and invalidates any signed `ast_path` in
+  `config/cicd/enforce_tier_model/*.yaml` that runs through it. Measured in
+  B25 on `web/paths._is_uuid_path_segment`. This bites harder than the
+  overload case because adding a docstring feels like a comment-only edit and
+  is a routine part of "clean the file to house style". Re-derive ast paths
+  after ANY docstring addition, not just after signature changes.
+
+- **2026-08-29 — R4 fires on a broad handler even when it returns an explicit
+  error RESULT; only a `raise` clears it.** R4 and R6 are asymmetric, and the
+  asymmetry is in the rule source
+  (`trust_tier/tier_model/rule.py::_check_exception_handler`): R6 calls
+  `_handler_is_silent`, which treats a non-default `return` as an explicit
+  outcome and does NOT fire, whereas the R4 arm scans only for `ast.Raise`.
+  So the whole diagnostic-probe idiom — `except Exception as exc: return
+  ContractCheck(name, False, sanitize_error(...))` — is a permanent R4 justify
+  candidate no matter how explicitly it reports. Do not "fix" these by
+  re-raising: in `web/doctor.py` and `web/readiness.py` the handler is what
+  keeps one failed probe from aborting the other ~20 checks, which is the
+  entire point of a preflight report. Rationalise them, naming the reporting
+  symbol (`sanitize_error`, `_exception_failures`, `_finish_lock_cleanup`) as
+  the control. B25 rationalised 16 such handlers in `doctor.py` and 9 in
+  `readiness.py` on exactly this ground.
+
 - **2026-08-29 — `type(x) is C` and `isinstance(x, C)` narrow DIFFERENTLY in
   the negative branch.** Only `isinstance` removes `list` from the non-list
   arm under mypy; the exact-type form leaves the else-branch type untouched.
