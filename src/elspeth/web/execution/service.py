@@ -24,6 +24,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import PurePath
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from uuid import UUID
 
@@ -415,8 +416,9 @@ T = TypeVar("T")
     source_param="config",
     suppresses=("R1",),
     invariant="returns one (label, raw_options) pair per declared blob_rows source and abstains on any "
-    "non-mapping source block or non-string source name; option values are handed back RAW for the caller's "
-    "BlobRowsEntry strict parse to reject — never raises",
+    "non-mapping source block or non-string source name; a frozen source block reads as the mapping it is, "
+    "so the admission block always sees every declared blob_rows source; option values are handed back RAW "
+    "for the caller's BlobRowsEntry strict parse to reject — never raises",
 )
 def _discover_blob_rows_sources(config: Mapping[str, Any]) -> list[tuple[str, Any]]:
     """Return ``(source_label, raw_options)`` for every ``blob_rows`` source.
@@ -427,22 +429,37 @@ def _discover_blob_rows_sources(config: Mapping[str, Any]) -> list[tuple[str, An
     ``source:<name>``).  Options are returned raw — the admission block
     parses each entry with the plugin-owned ``BlobRowsEntry`` model so both
     surfaces share one definition of a well-formed entry.
+
+    The source-block tests name ``(dict, MappingProxyType)`` — exactly
+    ``deep_freeze``'s output pair for a mapping — rather than ``type(x) is
+    dict``.  This function's answer decides whether the blob_rows ADMISSION
+    block runs at all, so a source block it fails to recognise is not a
+    conservative abstention — it silently skips ownership, status, payload-hash
+    and metadata-divergence checks for that source.  ``FrozenRunSettings``
+    freezes ``executable_config`` in ``__post_init__``, so every nested source
+    block reachable from a run's policy decision is a ``mappingproxy``: an
+    exact-``dict`` test here would return ``[]`` for a config whose only thaw
+    (``deep_thaw`` in ``_run_pipeline``) had been moved or removed, and every
+    existing test would stay green.  Naming the frozen form makes the
+    recognition independent of that upstream thaw; a frozen block that reaches
+    the admission strict parse is then rejected there, loudly, by
+    ``BlobRowsSourceAdmissionError`` — fail closed rather than fail open.
     """
     found: list[tuple[str, Any]] = []
     if "source" in config:
         source = config["source"]
-        if type(source) is dict:
-            singular: dict[str, Any] = source
+        if type(source) in (dict, MappingProxyType):
+            singular: Mapping[str, Any] = source
             if singular.get("plugin") == "blob_rows":
                 found.append(("source", singular.get("options")))
     if "sources" in config:
         sources = config["sources"]
-        if type(sources) is dict:
-            named: dict[str, Any] = sources
+        if type(sources) in (dict, MappingProxyType):
+            named: Mapping[str, Any] = sources
             for source_name, named_source in named.items():
-                if type(source_name) is not str or type(named_source) is not dict:
+                if type(source_name) is not str or type(named_source) not in (dict, MappingProxyType):
                     continue
-                entry: dict[str, Any] = named_source
+                entry: Mapping[str, Any] = named_source
                 if entry.get("plugin") != "blob_rows":
                     continue
                 found.append((f"source:{source_name}", entry.get("options")))
