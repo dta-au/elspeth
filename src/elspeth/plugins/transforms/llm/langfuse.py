@@ -166,8 +166,6 @@ class ActiveLangfuseTracer:
                 generation.update(**update_kwargs)
         except contract_errors.TIER_1_ERRORS:
             raise
-        except (TypeError, AttributeError, KeyError, NameError):
-            raise
         except Exception as e:
             _handle_trace_failure("langfuse_trace_failed", self.transform_name, e)
 
@@ -221,8 +219,6 @@ class ActiveLangfuseTracer:
                 generation.update(**update_kwargs)
         except contract_errors.TIER_1_ERRORS:
             raise
-        except (TypeError, AttributeError, KeyError, NameError):
-            raise
         except Exception as e:
             _handle_trace_failure("langfuse_error_trace_failed", self.transform_name, e)
 
@@ -231,8 +227,6 @@ class ActiveLangfuseTracer:
         try:
             self.client.flush()
         except contract_errors.TIER_1_ERRORS:
-            raise
-        except (TypeError, AttributeError, KeyError, NameError):
             raise
         except Exception as e:
             _handle_trace_failure("langfuse_flush_failed", self.transform_name, e)
@@ -247,9 +241,12 @@ def _handle_trace_failure(
 
     Langfuse is itself an optional telemetry path. If it fails, structlog is
     the independent last-resort channel and the pipeline result remains
-    primary. Tier-1 and programming errors never reach here: the callers
-    re-raise them ahead of the broad clause, so only SDK/transport failures
-    are recorded and swallowed.
+    primary. Only ``TIER_1_ERRORS`` — ELSPETH's own invariant classes — are
+    re-raised ahead of the broad clause. Everything else raised inside the
+    SDK call is a Tier-3 provider failure and is contained here: a
+    ``TypeError`` from a langfuse signature drift cannot be told apart from a
+    programming error by its class, and a row whose provider call is already
+    audited must not fail on its optional trace (elspeth-a1ab69607a).
     """
     logger.warning(
         event_name,
