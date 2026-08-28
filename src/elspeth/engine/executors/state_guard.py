@@ -98,10 +98,13 @@ def stamp_node_state_id(exc: BaseException, state_id: str) -> None:
 def stamped_node_state_id(exc: BaseException) -> str | None:
     """Return the node-state id stamped on ``exc``, or None if unstamped."""
     try:
-        stamped = vars(exc).get(_EXCEPTION_NODE_STATE_ID_ATTR)
+        attributes = vars(exc)
     except TypeError:
         return None
-    return stamped if isinstance(stamped, str) else None
+    if _EXCEPTION_NODE_STATE_ID_ATTR not in attributes:
+        return None
+    stamped = attributes[_EXCEPTION_NODE_STATE_ID_ATTR]
+    return stamped if type(stamped) is str else None
 
 
 def _render_exception_message(exc_type: type[BaseException], exc_val: BaseException | None) -> str:
@@ -386,7 +389,7 @@ class NodeStateGuard:
         """
         if status not in _GUARD_TERMINAL_NODE_STATE_STATUSES:
             valid = ", ".join(member.name for member in sorted(_GUARD_TERMINAL_NODE_STATE_STATUSES, key=lambda item: item.value))
-            status_name = status.name if isinstance(status, NodeStateStatus) else repr(status)
+            status_name = status.name if type(status) is NodeStateStatus else repr(status)
             raise OrchestrationInvariantError(
                 f"NodeStateGuard.complete() only accepts terminal node states ({valid}); got {status_name}. "
                 "Use ExecutionRepository.complete_node_state() directly for non-terminal state transitions."
@@ -394,7 +397,9 @@ class NodeStateGuard:
 
         # The repository signature takes Mapping-typed rows; rebuilding the
         # list widens the invariant element type (dict[str, Any] stays the
-        # runtime type either way).
+        # runtime type either way). isinstance, not an exact-type test: only
+        # isinstance narrows list OUT of the non-list arm, which is what makes
+        # the mapping arm assignable without a cast.
         normalized_output: Mapping[str, object] | list[Mapping[str, object]] | None = (
             list(output_data) if isinstance(output_data, list) else output_data
         )
