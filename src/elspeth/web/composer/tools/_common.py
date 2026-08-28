@@ -38,6 +38,7 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import TriggerConfig
 from elspeth.core.secrets import (
     collect_credential_field_violations,
@@ -212,10 +213,10 @@ def _requirement_matches_field_value(requirement: Mapping[str, Any], field_value
     """
     status = requirement["status"] if "status" in requirement else None
     if status == "pending":
-        return requirement.get("draft") == field_value
+        return "draft" in requirement and requirement["draft"] == field_value
     if status != "resolved":
         return False
-    return requirement.get("resolved_prompt_template_hash") == stable_hash(field_value)
+    return "resolved_prompt_template_hash" in requirement and requirement["resolved_prompt_template_hash"] == stable_hash(field_value)
 
 
 def _trusted_requirement_id_for_kind(
@@ -235,6 +236,17 @@ def _trusted_requirement_id_for_kind(
     return matching_ids[0] if len(matching_ids) == 1 else None
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored node or source options mapping (Tier-3) whose "
+    "interpretation_requirements entry is an untyped list of untyped rows: an untrusted "
+    "upsert_node / patch_node_options / set_source payload, a YAML import, or a sessions.db round-trip",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns a shallow copy of options carrying the requirement list; a non-list "
+    "interpretation_requirements value and a non-mapping row both abstain (the row is copied through "
+    "unchanged for the admission validators to reject), never raises",
+)
 def _options_with_pending_requirement(
     options: Mapping[str, Any],
     *,
@@ -286,6 +298,16 @@ def _options_with_pending_requirement(
     return patched
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored node options mapping (Tier-3) whose prompt_template value is "
+    "untyped: an untrusted upsert_node / patch_node_options payload, a YAML import, or a "
+    "sessions.db round-trip",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns options unchanged when the node is not an llm node or carries no non-empty "
+    "string prompt_template, otherwise a copy with the review requirement staged; never raises",
+)
 def _options_with_default_prompt_template_review(
     *,
     node_id: str,
@@ -314,6 +336,15 @@ def _options_with_default_prompt_template_review(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored node options mapping (Tier-3) whose model value is untyped: an "
+    "untrusted upsert_node / patch_node_options payload, a YAML import, or a sessions.db round-trip",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns options unchanged when the node is not an llm node or carries no non-empty "
+    "string model, otherwise a copy with the review requirement staged; never raises",
+)
 def _options_with_default_model_choice_review(
     *,
     node_id: str,
@@ -398,6 +429,16 @@ _TYPOGRAPHIC_TRANSLATION = str.maketrans(_TYPOGRAPHIC_TO_ASCII)
 _WIRE_VISIBLE_SCRAPE_HEADER_FIELDS = ("scraping_reason", "abuse_contact")
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored node options mapping (Tier-3) whose nested http block and header "
+    "field values are untyped: an untrusted upsert_node / patch_node_options payload, a YAML import, "
+    "or a sessions.db round-trip",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns the input mapping unchanged or a shallow copy with folded header strings; every "
+    "malformed-shape branch abstains and returns the input, never raises",
+)
 def _options_with_ascii_safe_scrape_headers(
     *,
     plugin: str | None,
@@ -725,15 +766,17 @@ def _duplicate_consumer_repair_suggestions(
         # the first. Insertion order preserves the cross-node sequence.
         patched_consumers: dict[str, dict[str, Any]] = {}
         for (node, consumer_branch_alias), branch_name in zip(consumer_nodes, branch_names, strict=True):
-            patched_consumer = patched_consumers.get(node.id)
-            if patched_consumer is None:
-                patched_consumer = _serialize_node(node)
-                patched_consumers[node.id] = patched_consumer
+            if node.id not in patched_consumers:
+                patched_consumers[node.id] = _serialize_node(node)
+            patched_consumer = patched_consumers[node.id]
             if consumer_branch_alias is None:
                 patched_consumer["input"] = branch_name
             else:
+                # _serialize_node writes "branches" as exactly ``dict`` (mapping
+                # form), exactly ``list`` (alias form), or None — a closed owned
+                # union built by _serialize_branches, so the nominal check is exact.
                 patched_branches = patched_consumer["branches"]
-                if not isinstance(patched_branches, dict):
+                if type(patched_branches) is not dict:
                     patched_branches = dict(
                         zip(
                             _coalesce_branch_names(node.branches),
@@ -1696,8 +1739,14 @@ def _validate_plugin_name(
     plugin_type: PluginKind,
     name: object,
 ) -> PluginPolicyViolation | None:
-    """Validate a new plugin selection against one request policy view."""
-    if not isinstance(name, str):
+    """Validate a new plugin selection against one request policy view.
+
+    ``name`` is Tier-3 (an LLM tool-call argument), so the exact-``str`` check
+    is fail-closed on purpose: a ``str`` subclass whose ``__eq__`` / ``__hash__``
+    disagree with its bytes would otherwise reach the registry and catalog
+    lookups below under one identity and be compared under another.
+    """
+    if type(name) is not str:
         return PluginPolicyViolation(
             error_code=PluginUnavailableReason.NOT_INSTALLED,
             message=_plugin_unavailable_message(plugin_type, PluginUnavailableReason.NOT_INSTALLED),
@@ -1843,7 +1892,7 @@ def _validate_transform_provider_config_path(
     if data_dir is None:
         return None
 
-    provider_config = options.get("provider_config")
+    provider_config = options["provider_config"] if "provider_config" in options else None
     if not isinstance(provider_config, Mapping):
         return None
 
@@ -2022,6 +2071,16 @@ def _prevalidate_plugin_options(
     return None
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored llm node options mapping (Tier-3) whose prompt_template value is "
+    "untyped, taken from an untrusted upsert_node / patch_node_options payload before plugin "
+    "config prevalidation",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="rewrites options['prompt_template'] in place only when it is present and holds a str; "
+    "any other shape (absent, non-str, or already resolved) is left untouched, never raises",
+)
 def _mask_pending_interpretation_placeholders_for_authoring_validation(
     options: dict[str, Any],
 ) -> None:
@@ -2072,6 +2131,16 @@ def _echoed_metadata_note(*, requirement_echo: bool, authoring_echo: bool = Fals
     return " ".join(notes) if notes else None
 
 
+@observation_boundary(
+    tier=3,
+    source="the untrusted composer tool-call delta's options mapping (Tier-3) whose "
+    "interpretation_requirements entry carries rows the planner echoed back from a serialized state",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns (options, False) unchanged for every echoed row that does not hash-match a "
+    "stored row, so a row this boundary cannot read is left verbatim for the admission gate to "
+    "reject; never raises",
+)
 def _normalize_echoed_interpretation_requirements(
     options: Mapping[str, Any],
     *,
@@ -2104,9 +2173,11 @@ def _normalize_echoed_interpretation_requirements(
     """
     if stored_options is None or INTERPRETATION_REQUIREMENTS_KEY not in options:
         return options, False
+    if INTERPRETATION_REQUIREMENTS_KEY not in stored_options:
+        return options, False
     supplied_rows = options[INTERPRETATION_REQUIREMENTS_KEY]
-    stored_rows = stored_options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in stored_options else None
-    if type(supplied_rows) is not list or not isinstance(stored_rows, (list, tuple)):
+    stored_rows = stored_options[INTERPRETATION_REQUIREMENTS_KEY]
+    if type(supplied_rows) is not list or type(stored_rows) not in (list, tuple):
         return options, False
     shells_by_echo_hash: dict[str, dict[str, Any]] = {}
     for stored in stored_rows:
@@ -2128,7 +2199,8 @@ def _normalize_echoed_interpretation_requirements(
     normalized_any = False
     for supplied in supplied_rows:
         if isinstance(supplied, Mapping):
-            matched_shell = shells_by_echo_hash.get(stable_hash(deep_thaw(supplied)))
+            echo_hash = stable_hash(deep_thaw(supplied))
+            matched_shell = shells_by_echo_hash[echo_hash] if echo_hash in shells_by_echo_hash else None
             if matched_shell is not None:
                 normalized_rows.append(dict(matched_shell))
                 normalized_any = True
@@ -2139,6 +2211,16 @@ def _normalize_echoed_interpretation_requirements(
     return {**options, INTERPRETATION_REQUIREMENTS_KEY: normalized_rows}, True
 
 
+@observation_boundary(
+    tier=3,
+    source="the untrusted composer tool-call delta's options mapping (Tier-3) whose "
+    "interpretation_requirements entry is an untyped list of untyped rows authored by the planner",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns an admission error string for every row shape it does not accept and None "
+    "only for a fully accepted list; never raises, so a malformed delta becomes a recoverable "
+    "tool rejection rather than a terminal failure in the candidate_finalizer seam",
+)
 def _resolver_owned_interpretation_requirement_error(
     options: Mapping[str, Any],
     *,
@@ -2265,6 +2347,16 @@ def _resolver_owned_interpretation_requirement_error(
     return registration_error
 
 
+@observation_boundary(
+    tier=3,
+    source="a component options mapping (Tier-3) whose interpretation_requirements entry is an "
+    "untyped list of untyped rows: composer tool-call output, trusted proposal replay, reviewed "
+    "settlement, or a sessions.db round-trip",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns the canonical-invariant error string for every row shape it does not accept "
+    "and None only for a fully accepted list; never raises",
+)
 def _canonical_interpretation_requirement_error(
     options: Mapping[str, Any],
     *,
@@ -2391,6 +2483,17 @@ def _composition_canonical_interpretation_requirement_error(
     return None
 
 
+@observation_boundary(
+    tier=3,
+    source="a trusted-path component options mapping (Tier-3 by shape) whose "
+    "interpretation_requirements rows may still carry the historical pre-canonical field set, "
+    "re-read from sessions.db storage or a YAML import",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns options unchanged for every row shape outside the eligible legacy subset "
+    "(including a parse failure, which is swallowed so unconditional invariant B rejects the row); "
+    "never raises",
+)
 def _normalize_trusted_legacy_interpretation_requirements(
     options: Mapping[str, Any],
 ) -> Mapping[str, Any]:
@@ -2428,6 +2531,18 @@ def _normalize_trusted_legacy_interpretation_requirements(
     return normalized
 
 
+@observation_boundary(
+    tier=3,
+    source="the STORED component's options mapping (Tier-3) re-read from sessions.db storage or a "
+    "YAML import, consulted only to recover the id a prior pending row already carries for the same "
+    "(kind, user_term)",
+    source_param="existing_options",
+    suppresses=("R1", "R5"),
+    invariant="every row of existing_options that is not an exact-str kind/user_term/id triple is "
+    "skipped, and an ambiguous (kind, user_term) yields no id at all — a stored row this boundary "
+    "cannot read only costs id continuity and never raises. The AssertionErrors below are control-"
+    "dependent on the ALREADY-ADMITTED options argument, not on existing_options",
+)
 def _canonicalize_authored_interpretation_requirements(
     options: Mapping[str, Any],
     *,
@@ -2485,13 +2600,15 @@ def _canonicalize_authored_interpretation_requirements(
         if type(kind) is not str or (type(user_term) is not str and type(user_term) is not ServerStagedRequiredControlUserTerm):
             raise AssertionError("interpretation requirement kind/user_term must be admitted before canonicalization")
         persisted_user_term = str(user_term)
-        requirement_id = existing_ids.get(
-            (kind, persisted_user_term.strip()),
-            _authored_interpretation_requirement_id(
+        existing_key = (kind, persisted_user_term.strip())
+        requirement_id = (
+            existing_ids[existing_key]
+            if existing_key in existing_ids
+            else _authored_interpretation_requirement_id(
                 component_id=component_id,
                 user_term=persisted_user_term,
                 source=source,
-            ),
+            )
         )
         draft = requirement["draft"]
         if type(draft) is not str:
@@ -2579,7 +2696,9 @@ def _source_options_for_prevalidation(options: Mapping[str, Any]) -> dict[str, A
     for key in _WEB_ONLY_SOURCE_KEYS:
         if key in filtered:
             del filtered[key]
-    if options.get("blob_ref") is not None and options.get("mode") == "bind_source" and "mode" in filtered:
+    blob_ref = options["blob_ref"] if "blob_ref" in options else None
+    mode = options["mode"] if "mode" in options else None
+    if blob_ref is not None and mode == "bind_source" and "mode" in filtered:
         del filtered["mode"]
     return filtered
 
@@ -2605,7 +2724,8 @@ def _sink_required_option_keys(plugin_name: str) -> frozenset[str]:
     config_model = get_sink_config_model(plugin_name)
     if config_model is None:
         return frozenset()
-    required = config_model.model_json_schema().get("required", ())
+    json_schema = config_model.model_json_schema()
+    required = json_schema["required"] if "required" in json_schema else ()
     return frozenset(key for key in required if type(key) is str)
 
 
@@ -2891,7 +3011,7 @@ def _prevalidate_transform_for_context(
         # what is actually switched off.
         return f"Invalid options for transform '{plugin_name}': {blocking[0].error_code} — {blocking[0].message}"
     alias = options["profile"] if "profile" in options else plugin_name
-    if not isinstance(alias, str):
+    if type(alias) is not str:
         return f"Invalid options for transform '{plugin_name}': profile_unavailable"
     return _prevalidate_transform(plugin_name, profile_validation.executable_state.nodes[0].options)
 
@@ -2930,7 +3050,7 @@ class ReviewedSourceAuthority:
             raise TypeError("ReviewedSourceAuthority.reviewed_sources must be a mapping")
         if any(type(stable_id) is not str or not stable_id for stable_id in self.reviewed_sources):
             raise TypeError("ReviewedSourceAuthority.reviewed_sources keys must be non-empty exact strings")
-        if any(not isinstance(source, Mapping) for source in self.reviewed_sources.values()):
+        if any(type(source) not in (dict, MappingProxyType) for source in self.reviewed_sources.values()):
             raise TypeError("ReviewedSourceAuthority.reviewed_sources values must be mappings")
         if type(self.verified_blob_paths) not in (dict, MappingProxyType):
             raise TypeError("ReviewedSourceAuthority.verified_blob_paths must be a mapping")
