@@ -375,7 +375,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d770fb0c13de67ac"
+    source_file_hash: str | None = "sha256:6cc019995c68ad0d"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -527,15 +527,24 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     @staticmethod
     def _observation_from_properties(properties: BlobProperties) -> RemoteObjectObservation:
         # ADR-032: the SDK object's class is not the control. Every field read
-        # below is asserted by value before it reaches the owned observation.
-        size = properties.size
+        # below is asserted by value before it reaches the owned observation,
+        # and a field the SDK object does not carry at all (including a
+        # missing or None ``content_settings``) is the same malformed
+        # evidence as a wrong value: it routes into the precondition path
+        # rather than escaping as a raw AttributeError past
+        # ``_observe_effect_target``'s provider-exception handler.
+        try:
+            size: object = properties.size
+            etag: object = properties.etag
+            metadata_value: object = properties.metadata
+            raw_content_md5: object = properties.content_settings.content_md5
+        except AttributeError:
+            raise RemoteObjectPreconditionError("Azure blob properties do not carry the declared SDK shape") from None
         if type(size) is not int or size < 0:
             raise RemoteObjectPreconditionError("Azure blob properties contain an invalid size")
-        etag = properties.etag
         if type(etag) is not str or not etag:
             raise RemoteObjectPreconditionError("Azure blob properties contain an invalid etag")
 
-        metadata_value: object = properties.metadata
         if metadata_value is None:
             metadata: Mapping[str, str] = {}
         elif type(metadata_value) is dict and all(type(key) is str and type(value) is str for key, value in metadata_value.items()):
@@ -556,7 +565,6 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         plan_hash = optional_metadata("elspeth_plan_hash")
         protocol_version = optional_metadata("elspeth_protocol_version")
 
-        raw_content_md5: object = properties.content_settings.content_md5
         content_md5: bytes | None
         if raw_content_md5 is None:
             content_md5 = None
