@@ -901,6 +901,43 @@
   margin-bottom: var(--space-2xs);
 }
 
+/* Standard-view stand-in for the per-check list (elspeth-27efd1e801):
+   show_advanced off shows this one line instead of .validation-banner-checks.
+   Same slot, same font size, but neutral text colour — it isn't itemising
+   pass/fail per check, so it shouldn't borrow .validation-banner-checks'
+   success-green. */
+.validation-banner-checks-summary {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+
+/* Technical-details disclosure for a humanised finding's raw engine dump
+   (elspeth-27efd1e801) — shared by ValidationResult.tsx's error/warning rows
+   and SideRailValidationBanner.tsx's suggestion rows, so both surfaces keep
+   one visual treatment for "the plain headline is above; the raw text is
+   here, closed by default". Mirrors .readiness-row-detail-raw's summary/pre
+   pairing (audit.css) without importing across component directories. */
+.validation-banner-technical {
+  margin-top: var(--space-2xs);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+
+.validation-banner-technical summary {
+  cursor: pointer;
+}
+
+.validation-banner-technical pre {
+  margin: var(--space-2xs) 0 0;
+  padding: var(--space-xs);
+  background-color: var(--color-surface);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .validation-banner-warnings-section {
   margin-top: var(--space-1-5);
 }

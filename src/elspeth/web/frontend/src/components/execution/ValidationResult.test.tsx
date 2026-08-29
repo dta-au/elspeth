@@ -1,8 +1,11 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ValidationResultBanner } from "./ValidationResult";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import { resetStore } from "@/test/store-helpers";
 import type { ValidationResult } from "@/types/index";
 
 const READY_READINESS = {
@@ -52,6 +55,7 @@ describe("ValidationResultBanner", () => {
   });
 
   it("expands to check details on click and collapses again via Collapse", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     const user = userEvent.setup();
     render(<ValidationResultBanner result={makePassResult()} />);
 
@@ -73,6 +77,7 @@ describe("ValidationResultBanner", () => {
   });
 
   it("auto-expands when the pass carries warnings and offers no Collapse", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     render(
       <ValidationResultBanner
         result={makePassResult({
@@ -295,5 +300,67 @@ describe("ValidationResultBanner", () => {
     expect(
       screen.getByText(/Choose a supported projection/),
     ).toHaveClass("validation-banner-suggestion");
+  });
+});
+
+describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
+  beforeEach(() => {
+    resetStore(usePreferencesStore);
+    useSessionStore.setState({ compositionState: null });
+  });
+
+  it("keeps the per-stage check list out of the expanded pass view by default", async () => {
+    const user = userEvent.setup();
+    render(<ValidationResultBanner result={makePassResult()} />);
+    await user.click(screen.getByRole("button", { name: "Validation passed. Show details." }));
+    expect(screen.queryByText(/plugin_enablement/)).not.toBeInTheDocument();
+    expect(screen.getByText("All 2 checks passed.")).toBeInTheDocument();
+  });
+
+  it("shows the check list, without the check-name prefix, once show_advanced flips on a mounted banner", async () => {
+    const user = userEvent.setup();
+    render(<ValidationResultBanner result={makePassResult()} />);
+    await user.click(screen.getByRole("button", { name: "Validation passed. Show details." }));
+    expect(screen.queryByText("Graph structure is valid")).not.toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    const item = screen.getByText("Graph structure is valid");
+    expect(item).toBeInTheDocument();
+    expect(item.closest("li")).toHaveAttribute("title", "graph_structure");
+    expect(screen.queryByText(/^graph_structure:/)).not.toBeInTheDocument();
+  });
+
+  it("humanises a contract-violation dump into a headline and keeps the raw text behind Technical details", () => {
+    render(
+      <ValidationResultBanner
+        result={makePassResult({
+          is_valid: false,
+          errors: [
+            {
+              component_id: "assess",
+              component_type: "transform",
+              message:
+                "Schema contract violation: 'source' -> 'assess': required field 'case_study1' is not guaranteed by the producer",
+              suggestion: null,
+            },
+          ],
+        })}
+      />,
+    );
+    // role="alert" (ValidationResult.tsx:236) wraps the whole error list, so
+    // the raw text IS inside the alert — the contract is that it sits only
+    // inside a closed <details>, never in the headline the AT announces first.
+    const alert = screen.getByRole("alert");
+    const raw = within(alert).getByText(/Schema contract violation/);
+    const details = raw.closest("details");
+    expect(details).not.toBeNull();
+    expect(details).not.toHaveAttribute("open");
+    expect(within(details as HTMLElement).getByText("Technical details")).toBeInTheDocument();
+    const item = alert.querySelector("li.validation-banner-error-item") as HTMLElement;
+    const headline = Array.from(item.childNodes)
+      .filter((node) => (node as HTMLElement).tagName !== "DETAILS")
+      .map((node) => node.textContent)
+      .join("");
+    expect(headline).not.toMatch(/Schema contract violation/);
+    expect(headline).toMatch(/assess/i);
   });
 });

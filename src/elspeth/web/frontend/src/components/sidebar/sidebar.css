@@ -112,6 +112,19 @@
   cursor: not-allowed;
 }
 
+/* Sibling of .side-rail-suggestion-list, not a descendant (elspeth-27efd1e801):
+   holds each humanised suggestion's Technical-details disclosure OUTSIDE the
+   list so the list's own text stays plain-language only. .validation-banner-
+   technical (shared.css) carries the disclosure's own type treatment; this
+   just stacks multiple suggestions' disclosures with the rail's standard
+   horizontal inset. */
+.side-rail-suggestion-technical {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding: 0 var(--space-sm) var(--space-xs);
+}
+
 /* Primary side-rail slot-fill button layout (the import button below shares
    it as its own rule). */
 .side-rail-execute-btn {

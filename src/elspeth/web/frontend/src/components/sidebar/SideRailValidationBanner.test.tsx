@@ -1,10 +1,11 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SideRailValidationBanner } from "./SideRailValidationBanner";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
 import { useExecutionStore } from "@/stores/executionStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
 import { makeComposition } from "@/test/composerFixtures";
@@ -526,5 +527,58 @@ describe("SideRailValidationBanner", () => {
 
       expect(header).toHaveAttribute("aria-expanded", "false");
     });
+  });
+
+  it("names the suggestion's component by its plain phrase, not the raw id, and reacts to a mounted flag flip", async () => {
+    const user = userEvent.setup();
+    // Suggestions live on compositionState.validation_suggestions (see the
+    // SUGGESTION-constant tests above), not on validationResult — the brief's
+    // illustrative snippet put them on the wrong store; corrected to match
+    // SideRailValidationBanner's actual `compositionState?.validation_suggestions`
+    // read.
+    resetStore(usePreferencesStore);
+    useSessionStore.setState({
+      compositionState: makeComposition(1, {
+        validation_suggestions: [
+          {
+            component: "select_columns",
+            message:
+              "Schema contract violation: 'source' -> 'select_columns': required field 'id' is not guaranteed",
+            severity: "info",
+          },
+        ],
+      }),
+    } as never);
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        summary: "Validation passed",
+        checks: [
+          { name: "graph_structure", passed: true, detail: "Graph structure is valid", affected_nodes: [], outcome_code: null },
+        ],
+        errors: [],
+        warnings: [],
+        readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] },
+      } as never,
+    });
+
+    render(<SideRailValidationBanner />);
+
+    const list = screen.getByRole("list", { name: /suggestions/i });
+    expect(list.textContent).not.toMatch(/select_columns:/);
+    expect(list.textContent).not.toMatch(/Schema contract violation/);
+    expect(screen.getByText(/Schema contract violation/).closest("details")).not.toBeNull();
+
+    // The check list under the pass banner appears only once the flag flips
+    // ON A MOUNTED tree — the pass banner must also be expanded (its own
+    // independent Show-details toggle, ValidationResult.test.tsx's parallel
+    // "shows the check list..." case) since a collapsed banner renders
+    // nothing underneath regardless of show_advanced.
+    await user.click(
+      screen.getByRole("button", { name: "Validation passed. Show details." }),
+    );
+    expect(screen.queryByText("Graph structure is valid")).not.toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(screen.getByText("Graph structure is valid")).toBeInTheDocument();
   });
 });

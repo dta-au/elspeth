@@ -15,9 +15,13 @@
 // The Execute button enables/disables based on this result.
 // ============================================================================
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import { Button, Icon } from "@/components/ui";
+import { stepLabelForNodeId } from "@/components/chat/interpretationStepLabel";
+import { humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
+import { useShowAdvanced } from "@/stores/preferencesStore";
+import { useSessionStore } from "@/stores/sessionStore";
 import {
   VALIDATION_ADVISORY_CHECK_NAMES,
   type ValidationResult as ValidationResultType,
@@ -48,12 +52,22 @@ interface ValidationResultProps {
 
 /**
  * Resolve a component_id to a human-readable display name.
- * Falls back to the raw component_id if no matching node is found.
+ *
+ * Ladder: an explicit componentNames map (built from the live composition,
+ * SideRailValidationBanner's buildValidationComponentNames) wins outright.
+ * Absent that, with no nodes list at all there is nothing to resolve against
+ * except the id itself — the caller passed no context, so the raw id is the
+ * only honest thing to show. With a nodes list, a component that IS still
+ * wired keeps its structural `type:id` label; one that's vanished from the
+ * composition (or was never in it) falls through to `phraseFor`, the shared
+ * plain-language resolver (elspeth-27efd1e801) — never a bare raw id when a
+ * nicer phrase is available.
  */
 function resolveComponentName(
   componentId: string | null,
   nodes: NodeSpec[] | undefined,
   componentNames: Record<string, string> | undefined,
+  phraseFor: (componentId: string | null) => string,
 ): string {
   if (!componentId) return "unknown";
   if (
@@ -64,7 +78,7 @@ function resolveComponentName(
   }
   if (!nodes) return componentId;
   const node = nodes.find((n) => n.id === componentId);
-  return node ? `${node.node_type}:${node.id}` : componentId;
+  return node ? `${node.node_type}:${node.id}` : phraseFor(componentId);
 }
 
 function isNavigableComponent(
@@ -97,6 +111,11 @@ export function ValidationResultBanner({
   // result is cleared (session switch, new composition version), so a fresh
   // result starts collapsed again.
   const [userExpanded, setUserExpanded] = useState(false);
+  const showAdvanced = useShowAdvanced();
+  const compositionState = useSessionStore((s) => s.compositionState);
+  const phraseFor = useMemo(() => makePhraseFor(compositionState), [compositionState]);
+  const stepLabelFor = (componentId: string): string | null =>
+    stepLabelForNodeId(compositionState, componentId);
 
   if (result.is_valid) {
     const warnings = result.warnings ?? [];
@@ -161,10 +180,27 @@ export function ValidationResultBanner({
             </Button>
           )}
         </div>
-        {result.checks.length > 0 && (
+        {result.checks.length > 0 && !showAdvanced && (
+          <p className="validation-banner-checks-summary">
+            All {result.checks.length} checks passed.
+          </p>
+        )}
+        {result.checks.length > 0 && showAdvanced && (
           <ul className="validation-banner-checks">
             {result.checks.map((check, i) => (
-              <li key={i} className="validation-banner-check-item">
+              <li key={i} className="validation-banner-check-item" title={check.name}>
+                <Icon name={check.passed ? "check" : "cross"} />{" "}
+                {check.name === "advisor_signoff"
+                  ? `${validationCheckDisplayName(check.name)}: ${check.detail}`
+                  : check.detail}
+              </li>
+            ))}
+          </ul>
+        )}
+        {!showAdvanced && (advisoryChecks.length > 0 || failedAdvisorChecks.length > 0) && (
+          <ul className="validation-banner-checks">
+            {[...advisoryChecks, ...failedAdvisorChecks].map((check, i) => (
+              <li key={i} className="validation-banner-check-item" title={check.name}>
                 <Icon name={check.passed ? "check" : "cross"} />{" "}
                 {validationCheckDisplayName(check.name)}: {check.detail}
               </li>
@@ -181,20 +217,25 @@ export function ValidationResultBanner({
                 const isClickable =
                   Boolean(onComponentClick) &&
                   isNavigableComponent(warn.component_id, nodes, componentNames);
+                const finding = humaniseValidationMessage(
+                  warn.message,
+                  phraseFor,
+                  stepLabelFor,
+                );
                 // The warning TEXT is what the button navigates from; the
                 // suggestion is a sibling note. See the error list below for
                 // why the two must not share one element (elspeth-7bcc3d5233).
                 const warningText = (
                   <>
                     <strong>
-                      [{warn.component_type ?? "unknown"}]{" "}
                       {resolveComponentName(
                         warn.component_id,
                         nodes,
                         componentNames,
+                        phraseFor,
                       )}:
                     </strong>{" "}
-                    {warn.message}
+                    {finding.headline}
                   </>
                 );
 
@@ -221,6 +262,12 @@ export function ValidationResultBanner({
                         Suggestion: {warn.suggestion}
                       </div>
                     )}
+                    {finding.raw !== null && (
+                      <details className="validation-banner-technical">
+                        <summary>Technical details</summary>
+                        <pre>{finding.raw}</pre>
+                      </details>
+                    )}
                   </li>
                 );
               })}
@@ -244,6 +291,7 @@ export function ValidationResultBanner({
           const isClickable =
             Boolean(onComponentClick) &&
             isNavigableComponent(err.component_id, nodes, componentNames);
+          const finding = humaniseValidationMessage(err.message, phraseFor, stepLabelFor);
           // elspeth-7bcc3d5233. The suggestion is a SIBLING of the button,
           // never its child: a block-level <div> inside a <button> is invalid
           // (flow content in a button), and it dragged the button's underline
@@ -254,10 +302,9 @@ export function ValidationResultBanner({
           const errorText = (
             <>
               <strong>
-                [{err.component_type ?? "unknown"}]{" "}
-                {resolveComponentName(err.component_id, nodes, componentNames)}:
+                {resolveComponentName(err.component_id, nodes, componentNames, phraseFor)}:
               </strong>{" "}
-              {err.message}
+              {finding.headline}
             </>
           );
 
@@ -283,6 +330,12 @@ export function ValidationResultBanner({
                 <div className="validation-banner-suggestion">
                   Suggestion: {err.suggestion}
                 </div>
+              )}
+              {finding.raw !== null && (
+                <details className="validation-banner-technical">
+                  <summary>Technical details</summary>
+                  <pre>{finding.raw}</pre>
+                </details>
               )}
             </li>
           );

@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { ValidationResultBanner } from "@/components/execution/ValidationResult";
 import { Button } from "@/components/ui";
+import { stepLabelForNodeId } from "@/components/chat/interpretationStepLabel";
 import { useComposer } from "@/hooks/useComposer";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
+import { humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import {
@@ -17,9 +19,15 @@ import {
 
 interface SuggestionListProps {
   suggestions: ValidationEntryDTO[];
+  phraseFor: (componentId: string | null) => string;
+  stepLabelFor: (componentId: string) => string | null;
 }
 
-function SuggestionList({ suggestions }: SuggestionListProps): JSX.Element {
+function SuggestionList({
+  suggestions,
+  phraseFor,
+  stepLabelFor,
+}: SuggestionListProps): JSX.Element {
   const { sendMessage, isComposing } = useComposer();
   // Apply is a programmatic freeform sender (routes through useComposer →
   // runComposeWithTimeout). Hold it closed until the backend compose wall
@@ -51,6 +59,20 @@ function SuggestionList({ suggestions }: SuggestionListProps): JSX.Element {
       setExpanded((prev) => !prev);
     }
   }
+
+  // Humanise once per suggestion (elspeth-27efd1e801): the raw dump moves
+  // behind a Technical-details disclosure rendered OUTSIDE the <ul> — a
+  // <details> nested inside a list item still contributes its (closed)
+  // content to the list's textContent, so a reader that only wants the
+  // list's own words would still see the raw dump. Keeping the disclosure a
+  // sibling of the list, not a descendant, is what keeps it out.
+  const humanisedSuggestions = suggestions.map((s) => ({
+    suggestion: s,
+    finding: humaniseValidationMessage(s.message, phraseFor, stepLabelFor),
+  }));
+  const hasTechnicalDetails = humanisedSuggestions.some(
+    ({ finding }) => finding.raw !== null,
+  );
 
   return (
     <div className="side-rail-suggestion-banner">
@@ -84,11 +106,11 @@ function SuggestionList({ suggestions }: SuggestionListProps): JSX.Element {
         </div>
       )}
       {expanded && (
-        <ul className="side-rail-suggestion-list">
-          {suggestions.map((s, i) => (
+        <ul className="side-rail-suggestion-list" aria-label="Suggestions">
+          {humanisedSuggestions.map(({ suggestion: s, finding }, i) => (
             <li key={i} className="side-rail-suggestion-item">
               <span className="side-rail-suggestion-item-text">
-                <strong>{s.component}:</strong> {s.message}
+                <strong>{phraseFor(s.component)}:</strong> {finding.headline}
               </span>
               <Button
                 variant="bare"
@@ -106,6 +128,18 @@ function SuggestionList({ suggestions }: SuggestionListProps): JSX.Element {
             </li>
           ))}
         </ul>
+      )}
+      {expanded && hasTechnicalDetails && (
+        <div className="side-rail-suggestion-technical">
+          {humanisedSuggestions.map(({ finding }, i) =>
+            finding.raw !== null ? (
+              <details key={i} className="validation-banner-technical">
+                <summary>Technical details</summary>
+                <pre>{finding.raw}</pre>
+              </details>
+            ) : null,
+          )}
+        </div>
       )}
     </div>
   );
@@ -144,6 +178,12 @@ export function SideRailValidationBanner({
   const suggestions = compositionState?.validation_suggestions ?? [];
   const validationComponentNames =
     buildValidationComponentNames(compositionState);
+  // Shared with SuggestionList (elspeth-27efd1e801) so its suggestion rows
+  // name components and phrase messages identically to the ValidationResult
+  // banner above it — hooks must run before the early-return below.
+  const phraseFor = useMemo(() => makePhraseFor(compositionState), [compositionState]);
+  const stepLabelFor = (componentId: string): string | null =>
+    stepLabelForNodeId(compositionState, componentId);
 
   if (!error && !validationResult && suggestions.length === 0) {
     return null;
@@ -183,7 +223,13 @@ export function SideRailValidationBanner({
           onComponentClick={handleValidationComponentClick}
         />
       )}
-      {suggestions.length > 0 && <SuggestionList suggestions={suggestions} />}
+      {suggestions.length > 0 && (
+        <SuggestionList
+          suggestions={suggestions}
+          phraseFor={phraseFor}
+          stepLabelFor={stepLabelFor}
+        />
+      )}
     </div>
   );
 }
