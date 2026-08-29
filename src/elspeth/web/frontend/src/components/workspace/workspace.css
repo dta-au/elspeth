@@ -1197,14 +1197,3 @@
   font-size: var(--font-size-sm);
   overflow-wrap: anywhere;
 }
-
-.pipeline-spec-options {
-  margin-top: var(--space-sm);
-  /* Container cap, not a character cap on the code itself: the JSON block
-     stretched its bordered box to ~1450px around ~430px of content
-     (elspeth-d01115c75e). Long lines still scroll horizontally inside —
-     the artifact panel is the one region the scroll-ownership contract
-     permits to scroll horizontally. */
-  max-width: 90ch;
-  overflow-x: auto;
-}
