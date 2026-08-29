@@ -78,7 +78,7 @@
 - [ ] **Step 1: Capture the lint corpus at the branch point**
 
 ```bash
-ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt; grep -c . /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt  # grep -c prints 0 and exits 1 on zero matches — do not wrap in set -e
+ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/w2-lints-before.txt; grep -c . /tmp/w2-lints-before.txt  # grep -c prints 0 and exits 1 on zero matches — do not wrap in set -e
 ```
 
 Record the count and the HEAD sha beside it. This must happen before Task 1 lands, or another lane's churn is attributed to this wave.
@@ -242,7 +242,7 @@ Update `toolCallDescriptions.test.ts` `EXPECTED_READ_ONLY` (`:25-40`) — add th
 
 Run: `pytest tests/unit/web/composer/test_tool_call_description_parity.py -q` → PASS.
 Run (from `src/elspeth/web/frontend`): `npx vitest run src/components/chat/toolCallDescriptions.test.ts` → PASS.
-Per-task lint-corpus diff (memo: mandatory for every backend-touching task, so a finding is attributable to THIS lane, not discovered at closeout): `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/claude-1000/-home-john-elspeth/w2-lints-task1.txt; diff /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt /tmp/claude-1000/-home-john-elspeth/w2-lints-task1.txt` → empty (a `tests/`-only Python addition cannot move a `src/elspeth` corpus; the run is the proof, not the reasoning).
+Per-task lint-corpus diff (memo: mandatory for every backend-touching task, so a finding is attributable to THIS lane, not discovered at closeout): `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/w2-lints-task1.txt; diff /tmp/w2-lints-before.txt /tmp/w2-lints-task1.txt` → empty (a `tests/`-only Python addition cannot move a `src/elspeth` corpus; the run is the proof, not the reasoning).
 
 - [ ] **Step 5: Commit the vocabulary**
 
@@ -1242,7 +1242,7 @@ pytest tests/unit/web/composer/guided tests/unit/web/composer/test_proposals.py 
 
 Expected: PASS.
 
-Per-task lint-corpus diff (memo: mandatory for every backend-touching task): `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/claude-1000/-home-john-elspeth/w2-lints-task5.txt; diff /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt /tmp/claude-1000/-home-john-elspeth/w2-lints-task5.txt` → no added findings. Task 9's whole-wave diff remains the backstop.
+Per-task lint-corpus diff (memo: mandatory for every backend-touching task): `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/w2-lints-task5.txt; diff /tmp/w2-lints-before.txt /tmp/w2-lints-task5.txt` → no added findings. Task 9's whole-wave diff remains the backstop.
 
 - [ ] **Step 3: Commit the backend half**
 
@@ -2248,8 +2248,8 @@ With the local stack up (`docs/agents`/`examples/AGENTS.md` describe the runnabl
 - [ ] **Step 2: Lint corpus diff (backend-touching: Tasks 1 and 5)**
 
 ```bash
-ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/claude-1000/-home-john-elspeth/w2-lints-after.txt
-diff /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt /tmp/claude-1000/-home-john-elspeth/w2-lints-after.txt; grep -c . /tmp/claude-1000/-home-john-elspeth/w2-lints-after.txt  # grep -c prints 0 and exits 1 on zero matches — do not wrap in set -e
+ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/w2-lints-after.txt
+diff /tmp/w2-lints-before.txt /tmp/w2-lints-after.txt; grep -c . /tmp/w2-lints-after.txt  # grep -c prints 0 and exits 1 on zero matches — do not wrap in set -e
 ```
 
 Expected: no added findings, identical counts (COUNT the corpus, never `tail` it). Task 5's `protocol.py` edits use the file's existing Mapping-membership parse idiom under the standing `@trust_boundary` decorators — no new dynamic-attribute sites; if the diff disagrees, the code is wrong, not the gate.

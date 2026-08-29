@@ -663,7 +663,7 @@ Assert the new unit:
 - has no workers flag and sets `WEB_CONCURRENCY=1`;
 - allows writes only under `/var/lib/elspeth` and `/run/elspeth`;
 - retains the existing hardening directives and `Restart=on-failure`; and
-- does not contain `/home/john`.
+- does not contain a developer home-directory path.
 
 Assert the environment example names target, state mode, data path, payload
 path, both optional external database URLs as commented examples, the four

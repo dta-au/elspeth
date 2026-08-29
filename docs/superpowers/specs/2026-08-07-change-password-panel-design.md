@@ -626,7 +626,7 @@ Stays on `release/0.7.2`. Before handback:
 children before the parent in FK-safe order, so the reset is clean;
 `remove` prompts interactively unless `--yes`, and `display_name` / `email`
 must be re-supplied. On the ECS scenario stack `REGISTRATION_MODE=open`
-(`locals.tf:447`), so self-registration also works; foundryside.dev is
+(`locals.tf:447`), so self-registration also works; the staging host is
 `closed`.
 
 If either unblocks the demo, this work is **not** a demo blocker and should

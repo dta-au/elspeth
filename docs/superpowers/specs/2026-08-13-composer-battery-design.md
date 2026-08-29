@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-13 (rev 1) · rev 2/3 2026-08-16 · **rev 4 2026-08-16**
 **Status:** Rev 4 — **approved** (two panel reviews + the Decision 7 panel,
-`2026-08-16-composer-battery-design-review.md`); pre-implementation
+review record retired from the tree, see git history); pre-implementation
 **Home:** `evals/composer-battery/` (new), reusing `evals/lib/` and the
 `evals/composer-parity/` fixture format
 **Owner:** the ELSPETH maintainer; the corpus is curated by whoever edits
@@ -133,7 +133,7 @@ Agreed 2026-08-13:
    at 0–5/5 granularity; ~95-run pooled aggregate.
 3. **Corpus: new, from `examples/`** — stratified by shape, frozen as
    `corpus_version: 1` after a calibration firing.
-4. **Substrate: `https://elspeth.foundryside.dev`** (local live deploy) —
+4. **Substrate: `https://<staging host>`** (local live deploy) —
    app-layer measurement; battery traffic stays out of the gov-domain
    production DB.
 5. **Triage: mechanical classification + evidence bundles** — no LLM judge.
@@ -508,7 +508,7 @@ nothing is not, and would need a capture change plus a new identity field.
 ## 4. Driver
 
 `evals/composer-battery/drive_battery.py` (standalone Python, tracked).
-Flags: `--base` (default `https://elspeth.foundryside.dev`),
+Flags: `--base` (default `https://<staging host>`),
 `--round <name>` (e.g. `2026-08-20-baseline`), `--repeats` (default 5),
 `--cases a,b,c` (comma-separated case names; omit for all), `--resume`,
 `--cleanup`, `--probe` (runs the §7 paired probe; calibration only).
@@ -582,7 +582,7 @@ Per run:
                        "reason": "…", "source": "422_detail|composer_progress|none" },
   "identity": {
     "binding": {
-      "substrate": "https://elspeth.foundryside.dev",
+      "substrate": "https://<staging host>",
       "composer_model": "openrouter/anthropic/claude-sonnet-5",
       "advisor_model": "openrouter/anthropic/claude-opus-4-8",
       "model_returned": "…",

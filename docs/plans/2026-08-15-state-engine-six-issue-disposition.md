@@ -80,7 +80,7 @@ On 2026-08-14 20:34 UTC the actor `codex-p1-closeout` transitioned
 > "…the retired AWS-only witness is not remaining work."
 
 Ten minutes later the same actor **force-closed** `elspeth-82592e3aa1` as
-"obsolete under the corrected acceptance boundary" — the closure John already
+"obsolete under the corrected acceptance boundary" — the closure the maintainer already
 rejected, replacing it with the slim successor `elspeth-29a7f5a21a`.
 
 The phrase "corrected acceptance boundary" appears **nowhere in the repository**:
@@ -158,13 +158,13 @@ still accurate — this is cosmetic drift, listed for completeness only.
 
 ## 3. Plan
 
-### Step 1 — Record F1 and put the decision to John (blocking, do first)
+### Step 1 — Record F1 and put the decision to the maintainer (blocking, do first)
 
 Add a comment to `elspeth-f227dd8d2f` stating the finding with the evidence above.
 That much is uncontroversial and should happen regardless of the disposition.
 
-Then **John chooses** between two dispositions — this is his call, not the agent's,
-because it mirrors a judgement he has already made once:
+Then **the maintainer chooses** between two dispositions — this is their call, not the agent's,
+because it mirrors a judgement they have already made once:
 
 - **(a) Reopen `f227dd8d2f`.** Restores the honest blocked-by edge on
   `f89d82e925`. Most faithful to the evidence; costs a forced transition.
@@ -181,7 +181,7 @@ finding is about survives at a glance, with the truth one comment-click away.
 **Recommendation: (b), with that cost stated.** It keeps the closed record intact
 rather than rewriting history, and produces the same true gating.
 
-But the precedent argument is weaker here than for the sibling: John accepted a
+But the precedent argument is weaker here than for the sibling: the maintainer accepted a
 successor for `82592e3aa1` because that closure's *rationale was correct* — AWS
 restoration genuinely is not repo work — and only the tail needed an owner. Here
 the rationale is fabricated. (a) is the better choice if he wants the sweep's
@@ -193,7 +193,7 @@ Do **not** force-transition it unilaterally either way.
 ### Step 2 — Release the seven stale claims (cheap, unambiguous)
 
 ```bash
-cd /home/john/elspeth   # CLI from repo root, per the MCP-write-conflict rule
+cd "$(git rev-parse --show-toplevel)"   # CLI from repo root, per the MCP-write-conflict rule
 R="claim expired; claimant branch/worktree deleted 2026-08-13 (work patch-contained on release/0.7.2)"
 for i in cc0b256aca eefd990b46 c0d4a28e11 2e66723070 9cd07962c7 2aba594afb 6f6bbbec00; do
   filigree --actor claude release "elspeth-$i" --reason "$R"
@@ -308,7 +308,7 @@ AWS restored (operator, outside the tracker)
 
 `29a7f5a21a`'s exit gate also admits the alternative: **a deliberate
 completeness-criteria amendment retires the live-lane requirement.** That is a
-legitimate path and it is John's to take — but it must be written into
+legitimate path and it is the maintainer's to take — but it must be written into
 `completeness-criteria.md` as an amendment. Asserting it in a close reason, which
 is what F1 did, is not that.
 
@@ -370,6 +370,6 @@ over `completed` deliberately: the v2 completion this tree described never happe
 - Does not close any of the six. Nothing in the evidence supports it.
 - Does not edit the published assessment package (digest-frozen by design).
 - Does not force-transition `f227dd8d2f` in either direction — F1 is surfaced for
-  John's decision, with a recommendation.
+  the maintainer's decision, with a recommendation.
 - Does not treat AWS restoration as tracked work; it is operator infrastructure,
   and `29a7f5a21a` correctly owns only the repo-facing tail.

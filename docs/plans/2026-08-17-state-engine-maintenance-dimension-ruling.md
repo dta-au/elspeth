@@ -6,7 +6,7 @@ Predecessor: `docs/plans/2026-08-17-state-engine-local-residual-split.md` §5, w
 said the 133 first-party single-process `maintenance` cells "need a *pattern*, not
 per-leg improvisation … Resolve before authoring 133 of them."
 
-Status: **DRAFT — not ruled.** John rules; a small panel reviews this draft and the
+Status: **DRAFT — not ruled.** the maintainer rules; a small panel reviews this draft and the
 candidate node first. Nothing here changes `completeness-criteria.md` yet.
 
 ## 1. The question
@@ -236,7 +236,7 @@ below was re-verified by the drafter against the tree.
    maintenance overrides" is a new validator restriction; `derived` is an
    unconstrained object, so a derived status is not schema-blocked.
 
-**Revised recommendation (drafter's, advisory — John rules)**
+**Revised recommendation (drafter's, advisory — the maintainer rules)**
 
 - **Withdraw M1** (declaration test + rename deadlock recording a *false* `fail`)
   and **withdraw M2+G's gate** (redundant, will be silenced).
