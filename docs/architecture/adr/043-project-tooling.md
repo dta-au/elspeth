@@ -1,4 +1,4 @@
-# ADR-043: Project Tooling — Filigree and Loomweave Only; Everything Else Ruled Out Until Superseded
+# ADR-043: Project Tooling — Filigree and Loomweave Are the Maintainer's Integrations; the Project Ships No Others
 
 **Date:** 2026-08-29
 **Status:** Accepted
@@ -31,8 +31,9 @@ last ran.
 ### Approved tooling
 
 Beneath everything sits the baseline Python toolchain, and above it three
-tools carry standing agent instructions in `AGENTS.md`: one first-party,
-two third-party.
+tools carry standing agent instructions: one first-party (in `AGENTS.md`),
+two third-party (in `docs/maintainer/toolchain.md`, since the 2026-08-30
+amendment below).
 
 **Baseline toolchain — ruff and mypy** (with `uv`, `pytest`, and
 `pre-commit` as their carriers). Both are pinned as dev dependencies in
@@ -143,14 +144,17 @@ worked is adoption, re-run with the same transcript forensics after the next
 delivery wave. If lane and Explore agents still make zero Loomweave calls
 against a working index, this section is amended to a retirement.
 
-### Everything else is ruled out
+### The project ships no tool integrations beyond these
 
-No other tool may carry standing agent instructions, an MCP server entry in
-`.mcp.json`, a hook in `.claude/settings.json` or `.git/hooks/`, a skill
-copy, or a configuration file in this repository unless an ADR that
-supersedes or amends this one names it and records why. This explicitly
-includes the three tools retired on 2026-08-29 — **Wardline, Legis, and
-Warpline** — and any future tool that a sibling installer offers to add.
+The project ships no tool integrations beyond the ones named above;
+contributors use whatever tools they like. What this rules out is the
+*repository* carrying an integration — standing agent instructions, an MCP
+server entry in `.mcp.json`, a hook in `.claude/settings.json` or
+`.git/hooks/`, a skill copy, or a configuration file — for any other tool
+unless an ADR that supersedes or amends this one names it and records why.
+This explicitly includes the three tools retired on 2026-08-29 — **Wardline,
+Legis, and Warpline** — and any future tool that a sibling installer offers
+to add. It says nothing about what a contributor runs locally.
 
 Mechanism: `tests/unit/docs/test_project_agent_guidance.py` pins the
 *absence* of every installer-written surface for each excluded tool
@@ -263,3 +267,47 @@ rest; the full `pytest tests/` run before merge stays the rule.
 - Binaries under `~/.local/bin` for the retired tools were uninstalled
   (`uv tool uninstall legis wardline warpline`); nothing in the repository
   references them.
+
+## Amendment 2026-08-30: covenant / toolchain split
+
+**Amendment Deciders:** ELSPETH maintainers
+
+`AGENTS.md` had grown to 425 lines and blended three layers: project
+invariants any contributor needs, project-specific knowledge, and the
+maintainer's personal agent toolchain (Filigree, Loomweave, the lane-manager
+skill, the standing delegation grant) stated as a mandate. Because
+`tests/unit/docs/test_project_agent_guidance.py` failed CI whenever the docs
+stopped naming those tools, the toolchain had become a product commitment —
+exactly what [ADR-046](046-audit-grade-is-a-product-characteristic.md) says
+project tooling must not be. ELSPETH is a public repository; a contributor
+should not read a tracker or code-map choice as a condition of contributing.
+
+Decision: split by layer.
+
+- `AGENTS.md` is a short, harness-neutral public covenant: orientation,
+  quick reference, repository gotchas, delivery posture, the composer
+  invariants, and the judge-signature stage. It carries a one-paragraph
+  pointer to the maintainer document and states that nothing there is
+  required to contribute.
+- `docs/maintainer/toolchain.md` holds everything removed: the Filigree and
+  Loomweave installer blocks (the installers rewrite those blocks; they now
+  live in this file), ELSPETH's own Loomweave usage notes, the standing
+  authorization for skills/subagents/workflows, the lane-manager pointer,
+  and the retired-tool note. It opens with a labelled disclaimer that it
+  describes how the maintainer works and is not a requirement of the project.
+- `elspeth-lints` stays in the covenant unchanged: it is product under
+  ADR-046, and its judge-signature seam is how allowlist signatures are
+  produced. The covenant describes that seam by its elspeth-lints flags
+  (`--judge-tools readonly`) and no longer names a specific judge harness;
+  the maintainer's harness choice is recorded in the toolchain document.
+- The §"Everything else is ruled out" clause above is reworded: the project
+  ships no tool integrations beyond the named ones, and contributors use
+  whatever tools they like. The CI mechanism is unchanged — the guidance
+  tests still pin the *absence* of retired-tool surfaces and the repository
+  invariants (hooks bound to `${CLAUDE_PROJECT_DIR}`, bounded timeouts, no
+  private home paths, no hook bypass) — but they no longer assert that the
+  docs name any external tool.
+
+The approved-tooling section and the retirement evidence above stand as
+written; this amendment changes where the instructions live and what the
+project asks of contributors, not which tools the maintainer's agents use.

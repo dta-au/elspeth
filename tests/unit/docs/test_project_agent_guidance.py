@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from pathlib import Path
@@ -16,10 +17,60 @@ JUDGE_SKILLS = (
 CICD_AUDIT_SKILL = REPO_ROOT / ".agents" / "skills" / "cicd-allowlist-audit" / "SKILL.md"
 CONFIG_CONTRACTS_SKILL = REPO_ROOT / ".agents" / "skills" / "config-contracts-guide" / "SKILL.md"
 AWS_SKILL_DIR = REPO_ROOT / ".agents" / "skills" / "operating-aws-ecs-container"
+AGENTS_GUIDE = REPO_ROOT / "AGENTS.md"
+CLAUDE_GUIDE = REPO_ROOT / "CLAUDE.md"
+MAINTAINER_TOOLCHAIN = REPO_ROOT / "docs" / "maintainer" / "toolchain.md"
+
+# The elspeth-lints flags that make a judge run safe to hand to an agent-staged
+# bundle: read-only judge tools and a dry-run preview. Which *transport* runs
+# the judge is the operator's choice, so the tests validate any named transport
+# against the CLI's own argparse choices instead of pinning one harness.
+_JUDGE_TRANSPORT_FLAG = re.compile(r"--judge-transport\s+(?P<value>\S+)")
+_JUDGE_TOOLS_FLAG = re.compile(r"--judge-tools\s+(?P<value>\S+)")
+
+
+def _judge_cli_choices(option: str) -> tuple[str, ...]:
+    from elspeth_lints.core.cli import _build_parser
+
+    for action in _build_parser()._actions:  # argparse exposes subparsers only via _actions
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        for subparser in action.choices.values():
+            for sub_action in subparser._actions:
+                if option in sub_action.option_strings and sub_action.choices is not None:
+                    return tuple(str(choice) for choice in sub_action.choices)
+    raise AssertionError(f"{option} has no argparse choices on any elspeth-lints subcommand")
+
+
+def _assert_judge_flags_are_readonly_and_valid(text: str, *, require_dry_run: bool) -> None:
+    transports = [match.group("value").rstrip("`.,") for match in _JUDGE_TRANSPORT_FLAG.finditer(text)]
+    tools = [match.group("value").rstrip("`.,") for match in _JUDGE_TOOLS_FLAG.finditer(text)]
+
+    assert tools, "the skill never names --judge-tools"
+    assert set(tools) == {"readonly"}, tools
+    assert set(tools) <= set(_judge_cli_choices("--judge-tools"))
+    assert set(transports) <= set(_judge_cli_choices("--judge-transport")), transports
+    if require_dry_run:
+        assert "--dry-run" in text
 
 
 def _settings() -> dict[str, Any]:
     return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+
+
+def _agent_guidance_text() -> str:
+    """Every tracked file an installer may write a standing-instruction block into."""
+    return "\n".join(path.read_text(encoding="utf-8") for path in (AGENTS_GUIDE, CLAUDE_GUIDE, MAINTAINER_TOOLCHAIN))
+
+
+def _mcp_servers() -> dict[str, Any]:
+    """`.mcp.json` is gitignored (local MCP wiring); an absent file wires no server."""
+    path = REPO_ROOT / ".mcp.json"
+    if not path.exists():
+        return {}
+    servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+    assert isinstance(servers, dict)
+    return dict(servers)
 
 
 def _hook_commands(settings: dict[str, Any]) -> list[str]:
@@ -74,13 +125,13 @@ def test_wardline_is_not_wired_into_the_project() -> None:
     agent instruction. Historical plans, specs, and ledgers may still mention
     Wardline; the live guidance and configuration may not.
     """
-    agents_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    agents_text = _agent_guidance_text()
     assert "wardline:instructions" not in agents_text
     assert "wardline scan" not in agents_text
     assert "scripts.wardline_pack" not in agents_text
     assert "mcp__wardline__" not in agents_text
 
-    mcp_servers = json.loads((REPO_ROOT / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    mcp_servers = _mcp_servers()
     assert "wardline" not in mcp_servers
 
     for path in WARDLINE_SURFACES:
@@ -100,11 +151,11 @@ def test_legis_is_not_wired_into_the_project() -> None:
     a SessionStart hook; pin the absence of each so a sibling-tool upgrade
     cannot re-add it silently.
     """
-    agents_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    agents_text = _agent_guidance_text()
     assert "legis:instructions" not in agents_text
     assert "mcp__legis__" not in agents_text
 
-    mcp_servers = json.loads((REPO_ROOT / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    mcp_servers = _mcp_servers()
     assert "legis" not in mcp_servers
 
     assert not any("legis" in command for command in _hook_commands(_settings()))
@@ -125,11 +176,11 @@ def test_warpline_is_not_wired_into_the_project() -> None:
     this project lands work — were never recorded and its answers were
     confidently incomplete. Pin the absence of every installer-written surface.
     """
-    agents_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    agents_text = _agent_guidance_text()
     assert "warpline:instructions" not in agents_text
     assert "mcp__warpline__" not in agents_text
 
-    mcp_servers = json.loads((REPO_ROOT / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    mcp_servers = _mcp_servers()
     assert "warpline" not in mcp_servers
 
     assert not any("warpline" in command for command in _hook_commands(_settings()))
@@ -138,10 +189,10 @@ def test_warpline_is_not_wired_into_the_project() -> None:
         assert not path.exists(), path
 
 
-def test_judge_skill_copies_use_codex_readonly_signing() -> None:
+def test_judge_skill_copies_use_readonly_dry_run_signing() -> None:
     for path in JUDGE_SKILLS:
         text = path.read_text(encoding="utf-8")
-        assert "--judge-transport codex-cli --judge-tools readonly --dry-run" in text
+        _assert_judge_flags_are_readonly_and_valid(text, require_dry_run=True)
         assert "**`stage_scan`**" in text
 
 
@@ -150,8 +201,62 @@ def test_cicd_audit_routes_signed_row_changes_through_staging() -> None:
 
     assert "mcp__elspeth-judge__stage_scan" in text
     assert "stale_delete" in text
-    assert "--judge-transport codex-cli --judge-tools readonly --dry-run" in text
+    _assert_judge_flags_are_readonly_and_valid(text, require_dry_run=True)
     assert "remove that stale row" not in text
+
+
+def test_agents_guide_is_a_public_covenant_without_tool_catalogues() -> None:
+    """AGENTS.md is the harness-neutral covenant (ADR-043, 2026-08-30 amendment).
+
+    The maintainer's tracker and code-map instructions live in
+    docs/maintainer/toolchain.md; the covenant must not re-absorb their
+    installer blocks or verb catalogues, and must keep the product-level
+    sections every contributor needs.
+    """
+    text = AGENTS_GUIDE.read_text(encoding="utf-8")
+
+    assert "filigree:instructions" not in text
+    assert "loomweave:instructions" not in text
+    assert "## Filigree Issue Tracker" not in text
+    assert "## Loomweave" not in text
+    assert "mcp__filigree__" not in text
+    assert "mcp__loomweave__" not in text
+    assert "work_start_next" not in text
+    assert "entity_callers_list" not in text
+    assert "## Standing authorization" not in text
+    assert "lane-manager" not in text
+
+    assert "docs/maintainer/toolchain.md" in text
+    assert "none of it is required to contribute" in " ".join(text.split())
+    for heading in (
+        "## Quick reference",
+        "## Gotchas",
+        "## Project delivery posture",
+        "## Composer invariants (non-negotiable)",
+        "## Judge-signature stage (tier-model allowlist signing)",
+    ):
+        assert heading in text, heading
+    assert "--judge-tools readonly" in text
+    assert "--judge-transport codex-cli" not in text
+    # ADR-043 amendment target is 150 lines; the ceiling ratchets down, never up.
+    assert len(text.splitlines()) <= 180
+
+    claude_text = CLAUDE_GUIDE.read_text(encoding="utf-8")
+    assert "@AGENTS.md" in claude_text
+    assert "docs/maintainer/toolchain.md" in claude_text
+    assert "lane-manager" not in claude_text
+
+
+def test_maintainer_toolchain_doc_is_labelled_not_required() -> None:
+    text = MAINTAINER_TOOLCHAIN.read_text(encoding="utf-8")
+
+    assert text.startswith("# Maintainer toolchain\n")
+    assert "not a requirement of the project" in text.split("\n## ", maxsplit=1)[0]
+    assert "<!-- filigree:instructions:" in text and "<!-- /filigree:instructions -->" in text
+    assert "<!-- loomweave:instructions:" in text and "<!-- /loomweave:instructions -->" in text
+    assert "## Standing authorization: skills, subagents, and workflows" in text
+    assert "lane-manager" in text
+    assert "/home/john" not in text
 
 
 def test_config_contracts_routes_new_entries_through_staging() -> None:
