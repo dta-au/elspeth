@@ -107,7 +107,7 @@ def test_completion_advisory_notice_is_evidence_scoped_trusted_copy() -> None:
     assert visible_message_segments(content=content, raw_content="") == (
         TrustedSystemNoticeSegment(
             "Completion advisory review did not clear after the available attempts. "
-            "Composer completion is withheld. Review the pipeline and retry the evidence-scoped advisor review. "
+            "Composer completion is withheld. Review the pipeline; validation and the advisory review run again on your next message. "
             "ELSPETH withheld the composer's own summary of this exchange; "
             "verify the pipeline before assuming every requested change was applied."
         ),
@@ -284,9 +284,7 @@ def test_grounding_correction_trusts_only_fixed_wrapper() -> None:
             "The state below is authoritative; the prose may be stale or refer to an earlier turn."
         ),
         AssistantTextSegment(f"- {explanation_canary}"),
-        TrustedSystemNoticeSegment(
-            "Re-read the actual state via `get_pipeline_state` before making further claims about pipeline configuration."
-        ),
+        TrustedSystemNoticeSegment("Re-check the actual pipeline state before making further claims about pipeline configuration."),
     )
 
 

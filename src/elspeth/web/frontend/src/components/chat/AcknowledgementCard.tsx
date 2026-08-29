@@ -125,6 +125,17 @@ interface CardPresentation {
   acceptAriaLabel: string;
 }
 
+/**
+ * Strip a trailing `[user_term: ...]` annotation from a pipeline_decision
+ * draft body. The annotation is registry plumbing that older backend draft
+ * constants embedded verbatim (removed at the source by elspeth-9665dcca32,
+ * but events persisted before that fix still carry it), and the card is a
+ * user surface — internal registry keys never render.
+ */
+function stripUserTermAnnotation(draft: string): string {
+  return draft.replace(/\s*\[user_term:[^\]]*\]\s*$/, "");
+}
+
 function getCardPresentation(
   event: InterpretationEvent,
   stepLabel: string,
@@ -146,7 +157,7 @@ function getCardPresentation(
         title: `${stepLabel} step · decision`,
         line: (
           <span className="ack-card-decision">
-            {llmDraft || "(no decision recorded)"}
+            {stripUserTermAnnotation(llmDraft) || "(no decision recorded)"}
           </span>
         ),
         acceptAriaLabel: "Acknowledge the pipeline decision",

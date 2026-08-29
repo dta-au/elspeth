@@ -1949,7 +1949,11 @@ def test_prompt_shield_warning_is_advisory_not_blocking() -> None:
     validation = state.validate()
     warning_text = " ".join(w.message for w in validation.warnings)
 
-    assert "prompt_injection_shield_recommendation" in warning_text
+    # The warning identifies its subject in user register — the raw registry
+    # key (`prompt_injection_shield_recommendation`) rides the requirement's
+    # structured user_term field, never the message body (elspeth-9665dcca32).
+    assert "prompt-injection" in warning_text
+    assert "prompt_injection_shield_recommendation" not in warning_text
     assert "continuing without it is allowed" in warning_text
 
     materialized = materialize_state_for_execution(state)

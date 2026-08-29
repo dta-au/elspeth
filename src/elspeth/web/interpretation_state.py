@@ -137,11 +137,10 @@ def composer_pipeline_decision_user_term_error(*, user_term: str, context: str) 
 
 
 PROMPT_SHIELD_WARNING_DRAFT: Final[str] = (
-    "Recommend inserting azure_prompt_shield (or the deployment equivalent prompt-injection shield) "
+    "Recommend inserting a prompt-injection shield transform "
     "between the external-content fetch step and this LLM. The current draft routes "
     "internet-controlled text directly into the LLM without that shield, which is a prompt-injection "
     "exposure on untrusted remote content, but continuing without it is allowed. "
-    "[user_term: prompt_injection_shield_recommendation]"
 )
 PROMPT_SHIELD_AVAILABLE_DRAFT: Final[str] = (
     "An authorized prompt-injection shield IS available in this deployment. Wire "
@@ -149,7 +148,6 @@ PROMPT_SHIELD_AVAILABLE_DRAFT: Final[str] = (
     "text routed straight into the LLM is a prompt-injection exposure, and the "
     "shield is configured and ready to use. Wiring it in is strongly recommended, "
     "but you may proceed without it. "
-    "[user_term: prompt_injection_shield_recommendation]"
 )
 # Provenance-honest siblings for an LLM with NO externally-fetched content
 # upstream. The remote-content constants above assert an "external-content
@@ -161,12 +159,11 @@ PROMPT_SHIELD_AVAILABLE_DRAFT: Final[str] = (
 # untrusted remote producers present -> the constants above (verbatim,
 # unchanged — they are security advisories); none -> these.
 PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT: Final[str] = (
-    "Recommend inserting azure_prompt_shield (or the deployment equivalent prompt-injection shield) "
+    "Recommend inserting a prompt-injection shield transform "
     "in front of this LLM if its input data may carry adversarial text. This pipeline has no "
     "external-content fetch step: the LLM consumes operator-supplied source content, so the "
     "exposure is limited to adversarial text already present in that data, and continuing "
     "without a shield is allowed. "
-    "[user_term: prompt_injection_shield_recommendation]"
 )
 PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT: Final[str] = (
     "An authorized prompt-injection shield IS available in this deployment. This pipeline has no "
@@ -174,7 +171,6 @@ PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT: Final[str] = (
     "exposure is limited to adversarial text already present in that data. Wiring the shield in "
     "front of this LLM is recommended if that data may carry adversarial text, and you may "
     "proceed without it. "
-    "[user_term: prompt_injection_shield_recommendation]"
 )
 
 _RAW_HTML_CLEANUP_DRAFT_MARKERS: Final[tuple[str, ...]] = ("raw html", "fingerprint")

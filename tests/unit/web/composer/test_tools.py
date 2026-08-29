@@ -2073,7 +2073,10 @@ class TestUpsertNode:
         # non-blocking validation warning rather than rejecting the upsert.
         assert result.success is True
         warning_text = " ".join(w.message for w in result.updated_state.validate().warnings)
-        assert PROMPT_SHIELD_USER_TERM in warning_text
+        # The registry key rides the requirement's structured user_term field,
+        # never the warning body (user register, elspeth-9665dcca32).
+        assert PROMPT_SHIELD_USER_TERM not in warning_text
+        assert "prompt-injection" in warning_text
         assert "continuing without it is allowed" in warning_text
 
     def test_replaces_existing_node(self) -> None:
