@@ -492,7 +492,9 @@ def subject_is_rooted(node: ast.AST, derived_names: frozenset[str]) -> bool:
       call at ``arguments``. The ``Call.args[0]`` descent the original task
       description mentions only applies to method-style calls like
       ``arguments.get(...)``, where ``Call.func`` already chains through
-      the receiver.
+      the receiver. Values BOUND from a call (``for e in f(arguments)``,
+      ``x = f(arguments)``, ``with f(arguments) as h``) are a different
+      question, answered by :func:`_expr_contains_derived_reference`.
     * ``ast.Starred.value`` — ``*arguments`` is rooted at ``arguments``;
     * ``ast.IfExp`` / ``ast.BoolOp`` — bottoming-out on any operand that is
       rooted counts (an expression like ``arguments.get("x") or default``

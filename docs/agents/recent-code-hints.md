@@ -8,6 +8,42 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — five tier_model precision classes are FIXED (elspeth-8d46db34ff);
+  do not rationalise or reshape code around them any more, and do not expect the
+  pre-fix finding sets.** (D1) A name bound in a `try` body now survives the
+  post-try derived-name join when EVERY handler ends in an unconditional
+  `raise`/`return`/`break`/`continue` — `try: data = json.loads(resp.content)
+  except ... as e: raise X from e` keeps `data` rooted at `source_param`; a
+  single falling-through handler still drops it. (D2) The frozen-dataclass
+  `__post_init__` R5 exemption follows `for part in self.<field>` loop
+  variables and locals bound to a MODULE-PRIVATE call over a self field
+  (`frozen = _freeze(self.row, ...)`); a public callee (`freeze(self.row)`) is
+  NOT trusted. (D3) R4 uses the same "explicit outcome" predicate as R6
+  (`_handler_is_silent`): a non-default `return`/`yield`, a `raise`, a routed
+  `TransformResult.error`, or a recorded error entry clears a broad handler;
+  `return None`/`return []` still fire. (D4) Recording a CONSTRUCTED record
+  into a validator accumulator is explicit — receiver name in
+  `errors/warnings/diagnostics/entries/failures/issues/problems` (bare or
+  `self._errors`), value a non-builtin call or a handler-local bound to one, or
+  any `append/add` of a call carrying `error_code=`; `errors.append(str(exc))`
+  and `seen.append(_normalise(exc))` still fire. (D5) A BOUND value derives
+  by the assignment rule everywhere: `for e in _require_sequence(payload)`,
+  `enumerate(f(payload))`, `f(payload).items()`, comprehension iterables and
+  `with f(payload) as h` now bind derived targets exactly as
+  `e = f(payload)` always did (`_value_depends_on_boundary`); the strict
+  `subject_is_rooted` rule is for FINDING SUBJECTS only —
+  `normalise(payload).get()` still roots at `normalise`. (D6) The `if` join
+  skips a branch that cannot fall through, like the `try` join — `else:
+  return []` no longer erases names bound on the surviving branches.
+  NOT changed, deliberately: a nested `def`/`lambda` inside a boundary does
+  NOT inherit the enclosing derived names
+  (`TestBoundaryDoesNotInheritIntoNestedScopes`, since df3463583) — a closure
+  can escape the boundary and defer the Tier-3 read past its invariant, and the
+  lint has no escape analysis; that stays a policy call for the operator.
+  Measured allowlist-disabled @ae34b48b3: 2573 → 2460, 113 removed, 0 added.
+  The re-stage will find signed entries for those sites gone →
+  `stale_delete`, and per-file caps in `config/cicd/enforce_tier_model/*.yaml`
+  ratchet down (chat_solver 31→13).
 - **2026-08-29 — the tier_model `_R5_NAMED_BOUNDARY_CONTEXTS` exemption map is
   MEASURED now: every entry must resolve to exactly ONE live definition, and a
   moved function is NOT successor-included.** Before elspeth-0bd4fb6042 the

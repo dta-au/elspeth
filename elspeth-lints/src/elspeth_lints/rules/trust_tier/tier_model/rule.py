@@ -1173,6 +1173,72 @@ class TierModelVisitor(ast.NodeVisitor):
                     return True
         return False
 
+    _ERROR_ENTRY_KEYWORD = "error_code"
+    _VALIDATOR_ACCUMULATOR_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {"errors", "warnings", "diagnostics", "entries", "failures", "issues", "problems"}
+    )
+    _RECORD_BUILTIN_CALLS: ClassVar[frozenset[str]] = frozenset({"str", "repr", "format", "dict", "list", "tuple"})
+
+    @classmethod
+    def _is_error_entry_call(cls, node: ast.AST) -> bool:
+        """True for a constructor call carrying an ``error_code=`` keyword."""
+        return isinstance(node, ast.Call) and any(keyword.arg == cls._ERROR_ENTRY_KEYWORD for keyword in node.keywords)
+
+    @classmethod
+    def _is_constructed_record(cls, node: ast.AST | None) -> bool:
+        """True for a call that builds a record object rather than a bare string."""
+        if not isinstance(node, ast.Call):
+            return False
+        if isinstance(node.func, ast.Name):
+            return node.func.id not in cls._RECORD_BUILTIN_CALLS
+        return isinstance(node.func, ast.Attribute)
+
+    @classmethod
+    def _is_validator_accumulator(cls, receiver: ast.expr) -> bool:
+        """``errors`` / ``self._diagnostics`` — a validator's result accumulator by name."""
+        if isinstance(receiver, ast.Name):
+            name = receiver.id
+        elif isinstance(receiver, ast.Attribute):
+            name = receiver.attr
+        else:
+            return False
+        return name.lstrip("_") in cls._VALIDATOR_ACCUMULATOR_NAMES
+
+    def _records_error_entry_in_accumulator(self, nodes: list[ast.AST]) -> bool:
+        """True when a handler records a constructed error entry (elspeth-8d46db34ff D4).
+
+        ``errors.append(_err(component, str(exc), "high", code))`` and
+        ``diagnostics.append(_blocking_diagnostic(code=..., ...))`` report the
+        failure into the enclosing validator's result the same way a
+        ``TransformResult.error`` routed to completion does. Two closed
+        vocabularies bound it: the receiver must be a validator accumulator by
+        name, and the recorded value must be a constructed record (directly or
+        via a local bound in the handler) — ``errors.append(str(exc))`` and
+        ``seen.append(_normalise(exc))`` are still swallows. A call carrying an
+        ``error_code=`` keyword is accepted on any receiver.
+        """
+        record_names: set[str] = set()
+        for child in nodes:
+            if isinstance(child, ast.Assign) and self._is_constructed_record(child.value):
+                record_names.update(target.id for target in child.targets if isinstance(target, ast.Name))
+            elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name) and self._is_constructed_record(child.value):
+                record_names.add(child.target.id)
+        for child in nodes:
+            if not (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr in {"append", "add"}):
+                continue
+            if not child.args:
+                continue
+            recorded = child.args[0]
+            if self._is_error_entry_call(recorded):
+                return True
+            if not self._is_validator_accumulator(child.func.value):
+                continue
+            if self._is_constructed_record(recorded):
+                return True
+            if isinstance(recorded, ast.Name) and recorded.id in record_names:
+                return True
+        return False
+
     def _handler_is_silent(self, node: ast.ExceptHandler) -> bool:
         """Return True if the handler swallows errors without an explicit outcome."""
         own_scope_nodes = [child for statement in node.body for child in iter_own_scope(statement)]
@@ -1181,6 +1247,9 @@ class TierModelVisitor(ast.NodeVisitor):
             return False
 
         if self._routes_transform_error_to_completion(own_scope_nodes):
+            return False
+
+        if self._records_error_entry_in_accumulator(own_scope_nodes):
             return False
 
         yields = [child for child in own_scope_nodes if isinstance(child, (ast.Yield, ast.YieldFrom))]
@@ -1359,9 +1428,30 @@ class TierModelVisitor(ast.NodeVisitor):
         if current_function is None or current_function.name != "__post_init__":
             return set()
         aliases: set[str] = set()
-        for stmt in current_function.body:
+
+        def is_self_field_or_alias(value: ast.expr | None) -> bool:
+            if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and value.value.id == "self":
+                return True
+            return isinstance(value, ast.Name) and value.id in aliases
+
+        def is_private_validator_over_self_field(value: ast.expr | None) -> bool:
+            # elspeth-8d46db34ff D2(b): ``_freeze(self.row, "row")`` returns the
+            # field's own (normalised) value. Only module-private callees are
+            # trusted for this — a public helper may return anything.
+            return (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id.startswith("_")
+                and any(is_self_field_or_alias(arg) for arg in value.args)
+            )
+
+        statements = sorted(
+            (child for stmt in current_function.body for child in iter_own_scope(stmt) if isinstance(child, ast.stmt)),
+            key=lambda child: child.lineno,
+        )
+        for stmt in statements:
             if stmt.lineno >= lineno:
-                continue
+                break
             target: ast.expr | None = None
             value: ast.expr | None = None
             if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
@@ -1370,14 +1460,15 @@ class TierModelVisitor(ast.NodeVisitor):
             elif isinstance(stmt, ast.AnnAssign):
                 target = stmt.target
                 value = stmt.value
-            if not (
-                isinstance(target, ast.Name)
-                and isinstance(value, ast.Attribute)
-                and isinstance(value.value, ast.Name)
-                and value.value.id == "self"
-            ):
+            elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                # elspeth-8d46db34ff D2(a): ``for part in self.content`` — the
+                # loop variable IS an element of the field.
+                target = stmt.target
+                value = stmt.iter
+            if not isinstance(target, ast.Name):
                 continue
-            aliases.add(target.id)
+            if is_self_field_or_alias(value) or is_private_validator_over_self_field(value):
+                aliases.add(target.id)
         return aliases
 
     def _is_self_field_isinstance(self, node: ast.Call) -> bool:
@@ -1740,7 +1831,15 @@ class TierModelVisitor(ast.NodeVisitor):
 
         self._join_import_alias_paths((body_aliases, orelse_aliases))
         if state is not None:
-            self._set_current_derived_names(self._intersect_snapshots((body_end, orelse_end)))
+            # elspeth-8d46db34ff D6: a branch that cannot fall through takes no
+            # part in the join (same rule as the ``try`` join) — ``else: return``
+            # must not erase names bound on the surviving branches.
+            surviving: list[frozenset[str]] = []
+            if not self._statement_sequence_terminates(node.body):
+                surviving.append(body_end)
+            if not node.orelse or not self._statement_sequence_terminates(node.orelse):
+                surviving.append(orelse_end)
+            self._set_current_derived_names(self._intersect_snapshots(tuple(surviving)))
 
     def _visit_try_like(self, node: ast.Try | ast.TryStar) -> None:
         state = self._current_derived_state()
@@ -1754,7 +1853,13 @@ class TierModelVisitor(ast.NodeVisitor):
             self._restore_import_aliases(body_aliases)
             body_end = self._visit_statement_sequence_from_snapshot("orelse", node.orelse, body_end)
             body_aliases = dict(self._import_aliases)
-        branch_ends = [body_end]
+        # elspeth-8d46db34ff D1: only paths that can reach the statement after
+        # the ``try`` take part in the derived-name join. A handler (or body)
+        # ending in an unconditional raise/return/break/continue contributes
+        # nothing, so a name bound only in the body survives when every handler
+        # re-raises.
+        body_falls_through = not self._statement_sequence_terminates(node.orelse or node.body)
+        branch_ends = [body_end] if body_falls_through else []
         alias_ends = [body_aliases]
 
         handler_start_aliases = {name: target for name, target in alias_start.items() if name not in body_mutations}
@@ -1768,7 +1873,9 @@ class TierModelVisitor(ast.NodeVisitor):
                     self._visit_ast_child("type", handler.type)
                 if handler.name is not None:
                     self._invalidate_import_aliases((handler.name,))
-                branch_ends.append(self._visit_statement_sequence_from_snapshot("body", handler.body, branch_start))
+                handler_end = self._visit_statement_sequence_from_snapshot("body", handler.body, branch_start)
+                if not self._statement_sequence_terminates(handler.body):
+                    branch_ends.append(handler_end)
                 alias_ends.append(dict(self._import_aliases))
             finally:
                 self.node_stack.pop()
@@ -1812,7 +1919,10 @@ class TierModelVisitor(ast.NodeVisitor):
     def _visit_for_like(self, node: ast.For | ast.AsyncFor) -> None:
         state = self._current_derived_state()
         snapshot = frozenset() if state is None else state.snapshot()
-        target_is_derived = subject_is_rooted(node.iter, snapshot)
+        # A loop target is an assignment from the iterable, so it derives by
+        # the assignment rule (elspeth-8d46db34ff): ``for e in _require_sequence(payload)``
+        # binds ``e`` exactly as ``e = _require_sequence(payload)[0]`` would.
+        target_is_derived = self._value_depends_on_boundary(node.iter, snapshot)
 
         self._visit_ast_child("iter", node.iter)
         entry_aliases = dict(self._import_aliases)
@@ -1850,7 +1960,7 @@ class TierModelVisitor(ast.NodeVisitor):
             self.path_stack.append(f"items[{index}]")
             try:
                 snapshot = frozenset() if state is None else state.snapshot()
-                optional_vars_is_derived = subject_is_rooted(item.context_expr, snapshot)
+                optional_vars_is_derived = self._value_depends_on_boundary(item.context_expr, snapshot)
                 self._visit_ast_child("context_expr", item.context_expr)
                 if item.optional_vars is not None:
                     if state is not None:
@@ -1880,7 +1990,7 @@ class TierModelVisitor(ast.NodeVisitor):
             self.path_stack.append(f"generators[{index}]")
             try:
                 snapshot = frozenset() if state is None else state.snapshot()
-                target_is_derived = subject_is_rooted(generator.iter, snapshot)
+                target_is_derived = self._value_depends_on_boundary(generator.iter, snapshot)
                 self._visit_ast_child("iter", generator.iter)
                 if state is not None:
                     state.assign_target(generator.target, is_derived=target_is_derived)
@@ -2033,23 +2143,14 @@ class TierModelVisitor(ast.NodeVisitor):
                     is_broad = True
                     break
 
-        if is_broad:
-            # Check if the handler re-raises
-            has_reraise = False
-            for statement in node.body:
-                for child in iter_own_scope(statement):
-                    if isinstance(child, ast.Raise):
-                        has_reraise = True
-                        break
-                if has_reraise:
-                    break
-
-            if not has_reraise:
-                self._add_finding(
-                    "R4",
-                    node,
-                    f"Broad exception caught without re-raise: {self._get_code_snippet(node.lineno)}",
-                )
+        if is_broad and self._handler_is_silent(node):
+            # R4 and R6 share one notion of "explicit outcome" (elspeth-8d46db34ff D3):
+            # a re-raise, a non-default return/yield, or a recorded error result.
+            self._add_finding(
+                "R4",
+                node,
+                f"Broad exception caught without re-raise: {self._get_code_snippet(node.lineno)}",
+            )
 
         # R6: specific exception swallowed without re-raise or explicit return
         if not is_broad and self._handler_is_silent(node):
