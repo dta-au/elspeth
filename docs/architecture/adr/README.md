@@ -62,9 +62,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [040](040-composer-runtime-validation-posture.md) | The Composer/Runtime Validation Posture — Soundness, Placement, and Per-Rule Authority | 2026-08-07 | **Accepted** |
 | [041](041-state-engine-supported-profiles.md) | State-Engine Supported Profiles | 2026-08-11 | **Accepted** |
 | [042](042-group-settlement-observability.md) | Group Settlement Vocabulary and Observability — One Closed Reason Set for Coalesce/Scope Settlement, One Lineage Read Authority | 2026-08-25 | **Accepted** |
-| [043](043-retire-wardline.md) | Retire Wardline — elspeth-lints Is the Sole Trust-Boundary Gate | 2026-08-29 | **Accepted** |
-| [044](044-retire-legis.md) | Retire Legis — the elspeth-judge Seam Is the Governance Layer | 2026-08-29 | **Accepted** |
-| [045](045-retire-warpline.md) | Retire Warpline — Loomweave and git Answer the Change-Impact Question | 2026-08-29 | **Accepted** |
+| [043](043-project-tooling.md) | Project Tooling — Filigree and Loomweave Only; Everything Else Ruled Out Until Superseded (folds the Wardline, Legis and Warpline retirements) | 2026-08-29 | **Accepted** |
 | [046](046-audit-grade-is-a-product-characteristic.md) | Audit Grade Is a Product Characteristic, Not a Project One | 2026-08-29 | **Accepted** |
 
 ## Status Definitions

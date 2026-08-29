@@ -107,11 +107,13 @@ elspeth run --settings examples/<name>/settings.yaml --execute
   worktrees inherit them. Commit edits to them like any other file; installer
   upgrades that rewrite these files show up as diffs — review before staging.
 - Wardline is NOT part of this project (rolled back 2026-08-29,
-  [ADR-043](docs/architecture/adr/043-retire-wardline.md)): do not run
+  [ADR-043](docs/architecture/adr/043-project-tooling.md)): do not run
   Wardline scans, do not add `weft.toml`, a `wardline-gate` skill, or an
   `.mcp.json` server for it. It arrived via a Loomweave upgrade, and
   `wardline install` rewrites all of those on every run — a guidance test pins
-  their absence. Older plans, ledgers, and hints that cite it are history.
+  their absence. The same ADR retires Legis and Warpline and rules out any
+  tool other than Filigree and Loomweave until a superseding ADR names it.
+  Older plans, ledgers, and hints that cite them are history.
   Trust-boundary honesty is enforced by `elspeth-lints` (`trust_boundary.tests`
   and the masquerade gate) alone.
 - Directory-scoped guides exist where the details live:

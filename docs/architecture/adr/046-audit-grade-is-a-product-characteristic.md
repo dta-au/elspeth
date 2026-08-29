@@ -3,7 +3,7 @@
 **Date:** 2026-08-29
 **Status:** Accepted
 **Deciders:** ELSPETH maintainers
-**Tags:** delivery-posture, tooling, process, related-adr-043, related-adr-044, related-adr-045
+**Tags:** delivery-posture, tooling, process, related-adr-043
 
 ## Context
 
@@ -14,9 +14,8 @@ what the *product* guarantees to the people who run pipelines with it.
 
 The project also carries a great deal of development tooling: the Filigree
 issue tracker and its SQLite store, the Loomweave code map, session and git
-hooks, scan caches, uv-installed helpers, and — until
-[ADR-043](043-retire-wardline.md), [ADR-044](044-retire-legis.md) and
-[ADR-045](045-retire-warpline.md) — three Weft-suite tools that arrived by
+hooks, scan caches, uv-installed helpers, and — until the tooling decision in
+[ADR-043](043-project-tooling.md) — three Weft-suite tools that arrived by
 installer rather than by decision. While retiring them, the same
 audit-grade instincts that are correct for the product began attaching to
 the tooling: weighing whether marking 79,000 orphaned scanner rows "fixed"
@@ -50,8 +49,8 @@ Concretely:
   around them, not the need to ask.
 - **Tooling decisions still get a record when they change what agents are
   told to do.** Adding or removing a tool that carries standing instructions
-  in `AGENTS.md` is a project decision and gets a short ADR, as the three
-  retirements did — because agents act on those instructions. The state
+  in `AGENTS.md` is a project decision and amends [ADR-043](043-project-tooling.md),
+  as the three retirements did — because agents act on those instructions. The state
   *inside* such a tool does not.
 
 ## Consequences

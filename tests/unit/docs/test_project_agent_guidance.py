@@ -107,7 +107,7 @@ LEGIS_SURFACES = (
 
 
 def test_legis_is_not_wired_into_the_project() -> None:
-    """Legis was retired 2026-08-29 (ADR-044): a generic twin of the elspeth-judge seam.
+    """Legis was retired 2026-08-29 (ADR-043): a generic twin of the elspeth-judge seam.
 
     Its installer writes an AGENTS.md block, two skill copies, an MCP server and
     a SessionStart hook; pin the absence of each so a sibling-tool upgrade
@@ -133,7 +133,7 @@ WARPLINE_SURFACES = (
 
 
 def test_warpline_is_not_wired_into_the_project() -> None:
-    """Warpline was retired 2026-08-29 (ADR-045): its only ingestion path was a
+    """Warpline was retired 2026-08-29 (ADR-043): its only ingestion path was a
     per-clone post-commit hook, so worktree-authored commits and merges — how
     this project lands work — were never recorded and its answers were
     confidently incomplete. Pin the absence of every installer-written surface.
