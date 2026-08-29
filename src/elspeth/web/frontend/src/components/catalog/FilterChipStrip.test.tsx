@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { FilterChipStrip, type CatalogFilters } from "./FilterChipStrip";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 
 const ALL_OFF: CatalogFilters = {
   capabilityTags: new Set(),
@@ -106,7 +107,7 @@ describe("detail level (elspeth-8555a6a9e0)", () => {
   const empty = { capabilityTags: new Set<string>(), auditCharacteristics: new Set<string>() };
 
   it("hides the Capability group and non-behavioural audit chips by default", () => {
-    render(
+    const { container } = render(
       <FilterChipStrip
         availableCapabilityTags={["csv", "llm"]}
         availableAuditCharacteristics={audits}
@@ -114,6 +115,9 @@ describe("detail level (elspeth-8555a6a9e0)", () => {
         onChange={vi.fn()}
       />,
     );
+    // The raw audit keys (external_call, non_deterministic) are the chips'
+    // INPUT here; the pin proves none of them reaches a chip's label.
+    expectNoIdentifiersInDefaultDom(container);
     expect(screen.queryByText("Capability:")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "quarantines bad rows" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "needs credentials" })).toBeInTheDocument();

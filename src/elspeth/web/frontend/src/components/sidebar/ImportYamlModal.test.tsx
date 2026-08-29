@@ -15,6 +15,7 @@ import {
   IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE,
 } from "./ImportYamlModal";
 import { OPEN_IMPORT_YAML_MODAL_EVENT } from "@/lib/composer-events";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import * as api from "@/api/client";
@@ -445,7 +446,7 @@ describe("ImportYamlModal", () => {
   });
 
   it("shows a parsed preview and validation summary before Import is enabled", () => {
-    render(<ImportYamlModal onClose={onClose} />);
+    const { container } = render(<ImportYamlModal onClose={onClose} />);
     typeYaml(
       "source:\n" +
         "  plugin: csv\n" +
@@ -475,6 +476,14 @@ describe("ImportYamlModal", () => {
       /Ready for server validation/i,
     );
     expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+    // Task 3's preflight surface under the wave's shared acceptance pin: the
+    // draft's own YAML keys (on_success, on_write_failure) are the INPUT, and
+    // none of them may reach the preview or the summary prose. The textarea is
+    // allowed — and ONLY the textarea — because React renders a controlled
+    // textarea's value as a real text node, and the reader's own paste is not
+    // composer copy. Everything else here is authored prose ("Parsed preview",
+    // "1 source, 1 processing step, 1 output", "Ready for server validation.").
+    expectNoIdentifiersInDefaultDom(container, { allowSelectors: ["textarea"] });
   });
 
   it("counts section body entries when the section header has an inline comment", () => {

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { OptionRows } from "./OptionRows";
 
 const OPTIONS = {
@@ -259,7 +260,8 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
   });
 
   it("falls back to the static split when the schema is not cached (regression pin — green before this task)", () => {
-    render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
+    const { container } = render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
+    expectNoIdentifiersInDefaultDom(container);
     const region = screen.getByRole("region", { name: "assess options" });
     const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
     expect(visibleTerms).toEqual(["Prompt", "Model profile", "Row schema"]);

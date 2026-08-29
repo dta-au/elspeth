@@ -8,6 +8,7 @@ import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { makeVersionHistory } from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import type { ChatMessage, CompositionStateVersion, NodeSpec } from "@/types/index";
 
 // The selector reads show_advanced (Wave 2 Task 7): the flag flattens the
@@ -420,11 +421,15 @@ describe("HeaderVersionSelector", () => {
 
     it("renders 4 top-level items by default and every version via expansion", async () => {
       const user = userEvent.setup();
-      render(<HeaderVersionSelector />);
+      const { container } = render(<HeaderVersionSelector />);
       await user.click(screen.getByRole("button", { name: /Composition history/ }));
       // v19 (current), v15–v18 group, v14 (applied), v11–v13 group — from the
       // helper's unit test.
       expect(screen.getAllByRole("treeitem")).toHaveLength(4);
+      // The wave's shared acceptance pin, allowing nothing: version labels and
+      // group ranges are authored prose, and the applied stamp is a curated
+      // sentence — no tool name, no state id.
+      expectNoIdentifiersInDefaultDom(container);
       const group = screen.getByRole("treeitem", {
         name: /Versions 15 to 18 — 4 edits/,
       });
