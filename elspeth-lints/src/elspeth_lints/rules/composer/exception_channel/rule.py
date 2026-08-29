@@ -6,7 +6,7 @@ LLM-argument failures — that channel is :class:`ToolArgumentError`, or a
 locally caught error turned into a failure result.
 
 The composer tool planes are written in the sanctioned "catch locally" shape:
-a private helper (often a wardline ``@trust_boundary`` Tier-3 parser whose
+a private helper (often a ``@trust_boundary`` Tier-3 parser whose
 *declared* contract is ``raises ValueError``) raises, and the handler that
 calls it catches and converts. A raise-site-only check cannot see that catch,
 so it either flags every helper or is scoped so narrowly it checks nothing

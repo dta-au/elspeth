@@ -31,7 +31,7 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 | Marketing / landing site | `website/` | Standalone static site (HTML/CSS/JS), built and served independently of the app frontend. |
 | Runtime / working data | `data/`, `state/` | App working data and the audit database (see [§ Working-state](#working-state-where-runtime-data-lives)). Mostly gitignored. |
 | Local tool/runtime state | the gitignored dot-dirs | `.venv`, `.ruff_cache`, `.mypy_cache`, `.pytest_cache`, `.hypothesis`, `.uv-cache`, `node_modules`, `.loomweave`, `.filigree`, `.weft`, `.clarion`, `.claude`, `.codex`, `.agents`, `.superpowers`, `.worktrees`, `scratch/`, … — never shipped, never relied on by tracked code. One bucket; do not itemise. |
-| Root metadata & manifests | root files | Governance/community docs (`LICENSE`, `GOVERNANCE.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `SUPPORT.md`), product docs (`README.md`, `ARCHITECTURE.md`, `PLUGIN.md`, `CHANGELOG.md`), and build/tooling config (`pyproject.toml`, `uv.lock`, `package*.json`, `Dockerfile`, `weft.toml`, `.pre-commit-config.yaml`, `.mcp.json`, dot-config). |
+| Root metadata & manifests | root files | Governance/community docs (`LICENSE`, `GOVERNANCE.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `SUPPORT.md`), product docs (`README.md`, `ARCHITECTURE.md`, `PLUGIN.md`, `CHANGELOG.md`), and build/tooling config (`pyproject.toml`, `uv.lock`, `package*.json`, `Dockerfile`, `.pre-commit-config.yaml`, `.mcp.json`, dot-config). |
 
 > Agent-instruction files (`CLAUDE.md`, `AGENTS.md`) are **tracked** in git (as
 > of 2026-07-28) so that every worktree inherits the same agent context. Commit

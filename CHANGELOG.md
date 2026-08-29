@@ -8,6 +8,15 @@ All notable changes to ELSPETH are documented here.
 
 ### Removed
 
+- **Wardline trust-boundary gate** — the `weft.toml` stanza, `.mcp.json`
+  server, `scripts/wardline_pack.py` grammar pack, `wardline-gate` skill
+  copies, and the standing agent instruction to run `wardline scan` before
+  handoff. It arrived with a Loomweave upgrade rather than by decision; in
+  two months and 18 scans its taint rule (`PY-WL-101`) never fired because
+  the project declares no sinks, and its only output (`PY-WL-102`, 115
+  findings) was contract-shape noise already enforced by `elspeth-lints`
+  `trust_boundary.tests`. Rationale in ADR-043. Boundary honesty stays with
+  `elspeth-lints` (`trust_boundary.*` and the masquerade gate).
 - **Composer pipeline recipes** — the `list_recipes` and
   `apply_pipeline_recipe` tools, the five bundled recipe templates, and the
   slot-schema contracts behind them. The server-side prose-to-recipe matcher

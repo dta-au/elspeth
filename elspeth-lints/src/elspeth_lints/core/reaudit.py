@@ -710,7 +710,7 @@ def reaudit_entries(
     1. ``rule_filter`` — entries whose key encodes a rule outside the
        supported scanner are silently skipped (defensive at boundary
        since the YAML may carry entries from other rule packages once
-       wardline-style multi-rule allowlists land).
+       multi-rule allowlists land).
     2. ``include_pre_judge`` — entries with ``judge_verdict is None``
        are skipped unless this flag is set. Default off because the
        pre-judge corpus is ~700 entries and routine sweeps target the

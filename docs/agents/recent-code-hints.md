@@ -683,7 +683,7 @@ is a working document under the normal delivery posture.
   function's R1 findings, verified by the `R_TB_SUPPRESSED` stream. Corollary
   from the same lane: `@observation_boundary` on a genuine non-raising
   projector passes `trust_boundary.tests,scope,tier --fail-on-inert` with no
-  `test_ref` obligation and drew no wardline PY-WL-102.
+  `test_ref` obligation.
 - **2026-08-29 — three traps from B39 (`web/composer/tools/generation.py`).**
   (a) **`type(x) is C` on a closed OWNED union needs `@final` on `C`, or mypy
   refuses to narrow the NEGATIVE branch.** Converting
@@ -1141,9 +1141,7 @@ is a working document under the normal delivery posture.
   must exist to bind. Budget a rationale when it does not. Six such
   `observation_boundary` decorators landed clean on B49 (`guided_blob_refs` ×3,
   `prompts` ×2, `yaml_generator` ×1); `trust_boundary.tests,scope,tier` pass
-  with `--fail-on-inert`, and wardline reports no PY-WL-102 for any of them
-  (PY-WL-102 fires on a declared EXTERNAL_RAW -> ASSURED boundary with no
-  rejection path, which is exactly what a non-raising observation is not).
+  with `--fail-on-inert`.
 
 - **2026-08-29 — a whole-tree `trust_tier.tier_model` run under the REAL
   allowlist currently UNDER-suppresses, because one stale entry makes the

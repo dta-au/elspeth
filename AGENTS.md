@@ -106,6 +106,14 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 - `AGENTS.md` and `CLAUDE.md` are tracked in git (since 2026-07-28) so fresh
   worktrees inherit them. Commit edits to them like any other file; installer
   upgrades that rewrite these files show up as diffs — review before staging.
+- Wardline is NOT part of this project (rolled back 2026-08-29,
+  [ADR-043](docs/architecture/adr/043-retire-wardline.md)): do not run
+  Wardline scans, do not add `weft.toml`, a `wardline-gate` skill, or an
+  `.mcp.json` server for it. It arrived via a Loomweave upgrade, and
+  `wardline install` rewrites all of those on every run — a guidance test pins
+  their absence. Older plans, ledgers, and hints that cite it are history.
+  Trust-boundary honesty is enforced by `elspeth-lints` (`trust_boundary.tests`
+  and the masquerade gate) alone.
 - Directory-scoped guides exist where the details live:
   `examples/AGENTS.md` (how to run every example) and
   `src/elspeth/plugins/transforms/AGENTS.md` (row data vs audit provenance).
@@ -397,43 +405,6 @@ recordable override or human sign-off, or when you need git/CI context.
 
 Full reference: the `legis-workflow` skill, `legis --help`, MCP schemas.
 <!-- /legis:instructions -->
-
-<!-- wardline:instructions:v1:df4787d1 -->
-<!-- wardline:last-writer:wardline install -->
-This project uses **wardline** as its trust-boundary gate. Before handing back code that touches external input, run `wardline scan . --fail-on ERROR --trust-pack scripts.wardline_pack --allow-custom-packs` (exit 0 = clean, 1 = gate tripped, 2 = wardline error) and fix findings at the boundary, not the sink. This project declares trust-grammar pack(s) scripts.wardline_pack in weft.toml; the grant flags shown are REQUIRED — without them the scan exits 2 (pack not trusted), because repository config cannot self-authorise importing code. The full scan -> explain -> fix -> rescan loop and the baseline-vs-waiver discipline live in the `wardline-gate` skill and in `docs/agents.md`.
-<!-- /wardline:instructions -->
-
-### ELSPETH's Wardline invocation
-
-The block above is written and overwritten by `wardline install` — never edit
-inside it. It now renders ELSPETH's pack grants itself. The one thing it does not
-carry is **`--fail-on-inert`**: Wardline exits 0 on a scan that recognised zero
-trust boundaries, so without that flag a green gate is indistinguishable from a
-gate that checked nothing. The gate of record is therefore:
-
-```bash
-wardline scan . --fail-on ERROR --fail-on-inert \
-  --trust-pack scripts.wardline_pack --allow-custom-packs --local-only
-```
-
-Exit `0` = clean *and* non-inert; `1` = active ERROR findings, or an
-inert/zero-boundary gate; `2` = pack not granted, or a Wardline/configuration
-error. The `mcp__wardline__*` tools are equivalent — `.mcp.json` carries the same
-grants at server launch.
-
-Why the grants are required: ELSPETH marks its Tier-3 boundaries with its own
-`@trust_boundary` (`src/elspeth/contracts/trust_boundary.py`), whose
-`tier`/`source_param`/`suppresses`/`invariant` metadata the elspeth-lints tier
-model also consumes — Wardline is the second consumer, not the owner.
-`scripts/wardline_pack.py` maps that vocabulary onto Wardline's grammar, and
-Wardline trusts a pack only when the *caller* grants it (there is no
-machine-level trust store, so repository config cannot self-authorise importing
-code).
-
-Re-run the installer as **`wardline install --no-pre-commit`** — the whole-tree
-scan belongs in CI, not the commit path (see the header contract in
-`.pre-commit-config.yaml`). Everything else is Wardline's to own: let it rewrite
-its own block and skill rather than hand-patching them.
 
 ## Judge-signature stage (tier-model allowlist signing)
 
