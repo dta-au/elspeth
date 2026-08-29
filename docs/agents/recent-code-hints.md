@@ -3795,6 +3795,27 @@ Every one of the ~25 whole-tree gates had the same exposure. Two rules now:
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-29 — advisor-cohort terminal copy carries a SHARED withheld-prose
+  disclosure, and every publication site is attributed.**
+  `no_tool_policy.ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE` is appended to all
+  six advisor-cohort terminal messages (`_ADVISOR_SIGNOFF_PENDING_NOTICE`,
+  `_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE`, `ADVISOR_REPAIR_SUCCESS/REVIEW/
+  REVIEW_WITH_FINDINGS/UNVERIFIED_PUBLIC_MESSAGE`) — edit the disclosure ONCE
+  there, never fork per-message copies, and keep it OUT of
+  `compose_preflight_failure_message` (that chrome is shared with non-cohort
+  turns where prose is not withheld). The finalize suffixes and the
+  `visible_message_segments` recognizer derive from the same constants, so
+  extending a notice keeps trusted chrome minting by construction — a
+  hand-copied suffix string anywhere else breaks
+  `test_advisor_terminal_publication.py`. Separately, every advisor-cohort
+  terminal publication now emits `composer.advisor_terminal_publication`
+  (`record_advisor_terminal_publication`, closed branch + preflight-shape
+  vocabularies, best-effort per the signed telemetry_phase8 posture,
+  elspeth-fa18d54eef): if you add a publication branch to
+  `_replace_advisor_repair_public_result` or a new blocked terminal, add its
+  branch literal and emit — an unattributed publication site re-opens the
+  forensic hole this closed.
+
 - **2026-08-29 — a `@trust_boundary` whose `source_param` is a `Path` DOES suppress
   the reads of the document that function opens itself, and the precise try-join
   rule is about where the READ sits, not whether the handler raises.** Measured in
