@@ -9,7 +9,7 @@ migration, no ``record_guided_event()`` method.
 Tier 1 (audit-trust). Coercion forbidden — invalid input crashes.
 Events go through the existing recorder via ``recorder.record(invocation)``.
 
-See docs/superpowers/specs/2026-05-11-composer-guided-mode-design.md §9.1.
+See docs/specs/2026-05-11-composer-guided-mode-design.md §9.1.
 """
 
 from __future__ import annotations

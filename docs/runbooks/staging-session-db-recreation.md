@@ -422,9 +422,9 @@ sudo systemctl restart elspeth-web.service
 
 After restart, verify by composing a new session and confirming the new guidance is reflected in the assistant's behaviour (for Phase 5b.8: the LLM offers `request_interpretation_review` when the composition includes a non-trivial interpretive choice; for Phase 5a.8: simple chat-typed source data prefers `inline_blob` over CSV upload).
 
-## Staging Reset For `elspeth.foundryside.dev`
+## Staging Reset For `elspeth.example.gov.au`
 
-The staging site is a source-checkout systemd/Caddy deployment from `/home/john/elspeth`, not the generic VM/Docker flow. When a pre-release plan changes the session DB schema (e.g. composer-progress-persistence Phase 1A and later schema-changing phases), the schema validator at startup will refuse a stale DB; the only accepted cutover path is archive + delete + recreate. Row-level `DELETE FROM chat_messages` / `DELETE FROM composition_states` is incorrect: it leaves the old table shape behind and startup rejects the stale DB.
+The staging site is a source-checkout systemd/Caddy deployment from `/srv/elspeth`, not the generic VM/Docker flow. When a pre-release plan changes the session DB schema (e.g. composer-progress-persistence Phase 1A and later schema-changing phases), the schema validator at startup will refuse a stale DB; the only accepted cutover path is archive + delete + recreate. Row-level `DELETE FROM chat_messages` / `DELETE FROM composition_states` is incorrect: it leaves the old table shape behind and startup rejects the stale DB.
 
 For an ordinary frontend rebuild and backend restart that does not require a
 schema reset, use
@@ -437,9 +437,9 @@ For SQLite, `sessions.db`, `sessions.db-wal`, `sessions.db-shm`, and `sessions.d
 
 ### Preconditions
 
-1. The host is the staging host for `elspeth.foundryside.dev`.
+1. The host is the staging host for `elspeth.example.gov.au`.
 2. No human operator is mid-session.
-3. The source checkout at `/home/john/elspeth` is on the commit being deployed.
+3. The source checkout at `/srv/elspeth` is on the commit being deployed.
 4. `deploy/elspeth-web.env` has been inspected directly for session DB settings without printing secret values.
 5. The Stop/Go Gates above have been run: Landscape code/schema must not reference web-session identifiers.
 6. The candidate source ref has been recorded. Archived predecessor databases
@@ -461,7 +461,7 @@ Use a host shell with `systemctl` and `sudo` access. The Codex sandbox cannot ru
 ```bash
 set -euo pipefail
 
-PROJECT_ROOT="/home/john/elspeth"
+PROJECT_ROOT="/srv/elspeth"
 ENV_FILE="$PROJECT_ROOT/deploy/elspeth-web.env"
 SERVICE="elspeth-web.service"
 PROJECT_ROOT_CANON="$(realpath -m "$PROJECT_ROOT")"
@@ -480,7 +480,7 @@ fi
 # live in the same file. Precedence:
 #   1. ELSPETH_WEB__SESSION_DB_URL=file-or-sqlite-url
 #   2. ELSPETH_WEB__DATA_DIR/sessions.db
-#   3. /home/john/elspeth/data/sessions.db
+#   3. /srv/elspeth/data/sessions.db
 SESSION_DB_URL="$(grep -E '^ELSPETH_WEB__SESSION_DB_URL=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
 DATA_DIR="$(grep -E '^ELSPETH_WEB__DATA_DIR=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
 
@@ -571,7 +571,7 @@ done
 sudo systemctl start "$SERVICE"
 
 curl --unix-socket /run/elspeth/uvicorn.sock -fsS http://localhost/api/health
-curl -fsS https://elspeth.foundryside.dev/api/health
+curl -fsS https://elspeth.example.gov.au/api/health
 sudo systemctl status "$SERVICE" --no-pager --lines=20
 ```
 

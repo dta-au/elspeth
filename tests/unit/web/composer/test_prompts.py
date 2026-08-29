@@ -896,7 +896,7 @@ class TestBuildSystemPrompt:
         assert "policy-filtered schema and plugin assistance" in flattened
         assert "Never invent a deployment identity, contact, secret, or fallback" in flattened
         assert "stage that exact decision for review" in flattened
-        assert "abuse-contact-unset@elspeth.foundryside.dev" not in result
+        assert "abuse-contact-unset@elspeth.example.gov.au" not in result
         assert "web_scrape" not in result
 
     def test_core_skill_treats_utility_transforms_as_planned_plugins(self) -> None:
@@ -1356,7 +1356,7 @@ class TestServerOwnedMetadataProjection:
             "fingerprint_field": "page_fingerprint",
             "format": "text",
             "http": {
-                "abuse_contact": "review@foundryside.dev",
+                "abuse_contact": "review@example.gov.au",
                 "scraping_reason": "context round-trip test",
             },
             "schema": {"mode": "observed"},

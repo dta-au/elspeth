@@ -264,7 +264,8 @@ class WebSettings(BaseModel):
     # ``api_base``/``api_key`` from every LiteLLM call entirely, so an
     # unconfigured deployment is byte-identical to pre-endpoint-affordance
     # behaviour. Configuration surface only — see
-    # docs/superpowers/plans/2026-07-31-llm-gateway-phase3-endpoint-affordance.md.
+    # docs/reference/environment-variables.md ("Custom LLM Endpoints"); the
+    # 2026-07-31 gateway phase-3 plan that introduced it is in git history.
     # Setting this does NOT rewrite ``composer_model``: LiteLLM shapes the
     # request off the model prefix, not off ``api_base``, so a custom
     # endpoint generally wants an ``openai/``-prefixed (or bare OpenAI-name)
@@ -286,7 +287,7 @@ class WebSettings(BaseModel):
     # defaults like gpt-5.5 that reject non-default temperature values.
     # Sent verbatim when set; provider rejection is the operator's config
     # error and is validated at boot. See
-    # docs/superpowers/specs/2026-06-03-composer-operator-set-sampling-config-design.md.
+    # docs/specs/2026-06-03-composer-operator-set-sampling-config-design.md.
     composer_temperature: float | None = Field(default=None, ge=0, le=2)
     composer_seed: int | None = None
     # Tests/offline development can disable the real provider boot probe.

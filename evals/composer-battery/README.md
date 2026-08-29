@@ -1,7 +1,7 @@
 # Composer path-quality battery
 
-Spec: `docs/superpowers/specs/2026-08-13-composer-battery-design.md` (rev 4).
-Plan: `docs/superpowers/plans/2026-08-17-composer-battery.md`.
+Spec: `docs/specs/2026-08-13-composer-battery-design.md` (rev 4).
+Plan: implemented; the 2026-08-17 composer-battery plan is retrievable from git history.
 
 The battery fires a fixed operator-voice corpus (`corpus.md`, 18 stratified
 cases + canary) at the local live composer, captures every run to
@@ -36,7 +36,7 @@ an account.
   crash-loop).
 - `deploy/elspeth-web.env` present (advisor model and the two turn budgets
   are read from it into the binding identity).
-- The substrate is healthy: `curl -s https://elspeth.foundryside.dev/api/system/status | jq .composer_available` → `true`.
+- The substrate is healthy: `curl -s https://elspeth.example.gov.au/api/system/status | jq .composer_available` → `true`.
 
 ## Commands
 
@@ -65,7 +65,7 @@ too, and their captures are on disk under the same names.
 pre-flight (calibration/debugging only — never for a rate-bearing round).
 
 Other flags: `--base <url>` (default `$ELSPETH_EVAL_BASE_URL`, else
-`https://elspeth.foundryside.dev`), `--env-file` (default
+`https://elspeth.example.gov.au`), `--env-file` (default
 `deploy/elspeth-web.env`), `--state-dir` (default `~/.elspeth-battery`),
 `--runs-dir` (default `evals/composer-battery/runs`). `--cases canary`
 still fires the tripwire — pass `--no-tripwire` as well to fire the canary
@@ -74,7 +74,7 @@ call.
 
 ### Fire against the origin, not the public hostname (elspeth-ad5628ecda)
 
-`https://elspeth.foundryside.dev` is served through Cloudflare, whose origin
+`https://elspeth.example.gov.au` is served through Cloudflare, whose origin
 read timeout cuts any response the origin has not begun answering within a
 **measured ~125.0 s** and returns a 524. The origin's own composer budget is
 `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=600.0`, so the two limits disagree by

@@ -2,7 +2,7 @@
 """Tests for LLMConfig.image_inputs (Task 4): config fields, caps, and declared inputs.
 
 Covers the config-shape acceptance/rejection contract from the design spec
-(docs/superpowers/specs/2026-08-25-llm-image-input-design.md §4) and the
+(docs/specs/2026-08-25-llm-image-input-design.md §4) and the
 declared-input-fields wiring LLMTransform exposes for the DAG.
 """
 

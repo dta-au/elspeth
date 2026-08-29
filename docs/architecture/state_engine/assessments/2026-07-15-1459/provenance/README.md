@@ -4,7 +4,7 @@
 
 | Property | Value |
 | --- | --- |
-| Repository | `/home/john/elspeth` |
+| Repository | main checkout (repository root) |
 | Branch | `release/0.7.1` |
 | Assessment HEAD | `0dcd61acaa44082d93ec205683700e798748ee6d` |
 | Map baseline commit | `31a06b16d32c6d94ac98f288f72f55474225730e` |
@@ -42,7 +42,7 @@ At documentation-write time, the worktree already contained user-owned changes:
 
 - modified `docs/README.md`;
 - untracked `docs/architecture/dag/`;
-- untracked `docs/superpowers/plans/2026-07-15-dag-information-area.md`.
+- untracked `docs/plans/2026-07-15-dag-information-area.md`.
 
 This task used those files as a structural example but did not modify them. All
 new writes are confined to `docs/architecture/state_engine/`.

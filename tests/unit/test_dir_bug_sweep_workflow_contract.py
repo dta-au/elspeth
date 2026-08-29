@@ -13,7 +13,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".claude" / "workflows" / "dir-bug-sweep.js"
-SKILL = REPO_ROOT / ".claude" / "skills" / "bug-sweep" / "SKILL.md"
+SKILL = REPO_ROOT / ".agents" / "skills" / "bug-sweep" / "SKILL.md"
 
 _NODE_HARNESS = r"""
 const fs = require('fs')

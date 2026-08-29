@@ -75,7 +75,7 @@ def test_sequential_execution_contract_is_guarded_and_documented() -> None:
         shared_fixtures._require_sequential_postgres_acceptance(cast(pytest.FixtureRequest, _WorkerRequest()))
     assert shared_fixtures._SEQUENTIAL_TEST_COMMAND in str(exc_info.value)
 
-    plan_path = Path(__file__).parents[3] / "docs/superpowers/plans/2026-07-24-cross-platform-deployment-contract.md"
+    plan_path = Path(__file__).parents[3] / "docs/plans/2026-07-24-cross-platform-deployment-contract.md"
     task12 = plan_path.read_text(encoding="utf-8").split("### Task 12:", maxsplit=1)[1]
     focused_command = task12.split("###", maxsplit=1)[0].split("```bash", maxsplit=1)[1].split("```", maxsplit=1)[0]
 

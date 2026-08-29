@@ -1,5 +1,5 @@
 // Staging-targeted Playwright config. Runs the existing specs against an
-// already-deployed ELSPETH (elspeth.foundryside.dev by default) instead
+// already-deployed ELSPETH (the origin named by STAGING_BASE_URL) instead
 // of spawning a local backend + frontend.
 //
 // Differences from playwright.config.ts:
@@ -13,10 +13,10 @@
 //     same staging origin.
 //
 // Invocation:
-//   STAGING_BASE_URL=https://elspeth.foundryside.dev \
+//   STAGING_BASE_URL=https://elspeth.example.gov.au \
 //   STAGING_USERNAME="${STAGING_USERNAME:?set STAGING_USERNAME in the environment}" \
 //   STAGING_PASSWORD="${STAGING_PASSWORD:?set STAGING_PASSWORD in the environment}" \
-//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
+//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
 //   npx playwright test --config=playwright.staging.config.ts composer-preferences
 
 import { dirname, resolve } from "node:path";
@@ -33,8 +33,12 @@ const STORAGE_STATE_PATH = resolve(
   "staging-user.json",
 );
 
-const STAGING_BASE_URL =
-  process.env.STAGING_BASE_URL ?? "https://elspeth.foundryside.dev";
+const STAGING_BASE_URL = process.env.STAGING_BASE_URL;
+if (!STAGING_BASE_URL) {
+  throw new Error(
+    "STAGING_BASE_URL is not set: the staging config has no default host; export the deployed origin",
+  );
+}
 
 export default defineConfig({
   testDir: "./tests/e2e",

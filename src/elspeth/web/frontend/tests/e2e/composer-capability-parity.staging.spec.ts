@@ -14,8 +14,8 @@
 // offline. The staging runner supplies STAGING_* credentials (via global setup)
 // and ELSPETH_EVAL_API_KEY, deploys the integrated revision, and runs:
 //
-//   STAGING_BASE_URL=https://elspeth.foundryside.dev \
-//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
+//   STAGING_BASE_URL=https://elspeth.example.gov.au \
+//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
 //   STAGING_USERNAME=... STAGING_PASSWORD=... \
 //   ELSPETH_EVAL_API_KEY=... ELSPETH_EVAL_REVISION="$(git rev-parse HEAD)" \
 //   npx playwright test --config=playwright.staging.config.ts \

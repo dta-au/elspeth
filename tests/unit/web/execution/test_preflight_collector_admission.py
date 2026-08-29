@@ -99,4 +99,4 @@ def test_the_retired_kernel_survives_only_in_history() -> None:
                 continue
             if _RETIRED_KERNEL in path.read_text(encoding="utf-8", errors="ignore"):
                 hits.append(str(path.relative_to(_REPO_ROOT)))
-    assert sorted(hit for hit in hits if not hit.startswith("docs/superpowers/plans/")) == [str(Path(__file__).relative_to(_REPO_ROOT))]
+    assert sorted(hit for hit in hits if not hit.startswith("docs/plans/")) == [str(Path(__file__).relative_to(_REPO_ROOT))]

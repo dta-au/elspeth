@@ -13,25 +13,17 @@
   },
   "baseline": {
     "mode": "current",
-    "repository_root": "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan",
+    "repository_root": ".",
     "remote": "https://github.com/johnm-dta/elspeth.git",
     "branch": "codex/state-engine-completion-plan",
     "commit": "af79b34040f5ce5fd989aa0d42a1b80ad8366829",
     "tree": "c4abd284a970783be8a19cb70dccc3e59072ec87",
-    "worktree_status_at_evidence_capture": [
-      "# branch.oid af79b34040f5ce5fd989aa0d42a1b80ad8366829",
-      "# branch.head codex/state-engine-completion-plan",
-      "1 .M N... 100644 100644 100644 92ab663d1402fa33dfd93718f85f1daa181c891b 92ab663d1402fa33dfd93718f85f1daa181c891b docs/architecture/state_engine/README.md",
-      "1 .M N... 100644 100644 100644 1a8c061bdaa3dc5405ba39ffe2ce61b41e765fde 1a8c061bdaa3dc5405ba39ffe2ce61b41e765fde docs/architecture/state_engine/architecture.md",
-      "1 .M N... 100644 100644 100644 d30521f20c583bfd661fc9f6020f2e15ed8c3f3b d30521f20c583bfd661fc9f6020f2e15ed8c3f3b docs/architecture/state_engine/assessments/README.md",
-      "1 .M N... 100644 100644 100644 e862ddb668747d87ba1870de16abfe1d07dd6735 e862ddb668747d87ba1870de16abfe1d07dd6735 docs/architecture/state_engine/proof-matrix.md",
-      "? docs/architecture/state_engine/assessments/2026-08-12-0239/"
-    ],
+    "worktree_status_at_evidence_capture": [],
     "submodules": [],
     "worktrees_at_capture": [
-      "/home/john/elspeth 4e8042d266568d277b6546f2d1bbe7fe79891556 release/0.7.2",
-      "/home/john/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12 af79b34040f5ce5fd989aa0d42a1b80ad8366829 detached",
-      "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan af79b34040f5ce5fd989aa0d42a1b80ad8366829 codex/state-engine-completion-plan",
+      "~/elspeth 4e8042d266568d277b6546f2d1bbe7fe79891556 release/0.7.2",
+      "~/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12 af79b34040f5ce5fd989aa0d42a1b80ad8366829 detached",
+      "~/elspeth/.claude/worktrees/state-engine-completion-plan af79b34040f5ce5fd989aa0d42a1b80ad8366829 codex/state-engine-completion-plan",
       "Other concurrent worktrees were present and were not used or modified."
     ]
   },
@@ -41,7 +33,7 @@
     "locale": "LANG=C.UTF-8; LC_ALL=C.UTF-8",
     "kernel": "Linux 6.8.0-136-generic x86_64",
     "python": "3.13.1",
-    "python_executable": "/home/john/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12/.venv/bin/python",
+    "python_executable": "~/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12/.venv/bin/python",
     "python_build": "main, Dec 19 2024 14:32:25",
     "pytest": "9.0.3",
     "uv": "0.10.2",

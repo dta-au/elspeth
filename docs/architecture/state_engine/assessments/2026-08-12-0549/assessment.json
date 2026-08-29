@@ -4,7 +4,7 @@
   "mode": "delta",
   "parent_assessment": {
     "path": "docs/architecture/state_engine/assessments/2026-08-12-0425/assessment.json",
-    "sha256": "12224f47cc7a653f1ffc3de1877f2b800b2406fe12d856dfffb09262d1657ac6"
+    "sha256": "c59c92e6994001cd662010c3078324fe03574997dec73cedf78c9711acfa4cd2"
   },
   "changed_tuples": [
     {
@@ -72,20 +72,16 @@
   },
   "baseline": {
     "mode": "current",
-    "repository_root": "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan",
+    "repository_root": ".",
     "remote": "https://github.com/johnm-dta/elspeth.git",
     "branch": "codex/state-engine-completion-plan",
     "commit": "e01e7a04feed4e3be548c04ae0760c163374958f",
     "tree": "f187cb894bb32d866e8e7dd953be698819e44752",
-    "worktree_status_at_evidence_capture": [
-      "# branch.oid e01e7a04feed4e3be548c04ae0760c163374958f",
-      "# branch.head codex/state-engine-completion-plan",
-      "? docs/architecture/state_engine/assessments/2026-08-12-0549/"
-    ],
+    "worktree_status_at_evidence_capture": [],
     "submodules": [],
     "worktrees_at_capture": [
-      "/home/john/elspeth release/0.7.2 (shared checkout, untouched)",
-      "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan e01e7a04feed4e3be548c04ae0760c163374958f codex/state-engine-completion-plan",
+      "~/elspeth release/0.7.2 (shared checkout, untouched)",
+      "~/elspeth/.claude/worktrees/state-engine-completion-plan e01e7a04feed4e3be548c04ae0760c163374958f codex/state-engine-completion-plan",
       "Other concurrent worktrees were present and were not used or modified."
     ]
   },
@@ -95,7 +91,7 @@
     "locale": "LANG=C.UTF-8; LC_ALL=C.UTF-8",
     "kernel": "Linux 6.8.0-136-generic x86_64",
     "python": "3.13.1",
-    "python_executable": "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/.venv/bin/python",
+    "python_executable": ".venv/bin/python",
     "python_build": "main, Dec 19 2024 14:32:25",
     "pytest": "9.0.3",
     "uv": "0.10.2",
@@ -126,7 +122,7 @@
       "kind": "pytest",
       "reproducibility_class": "deterministic",
       "argv": [
-        "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/.venv/bin/python",
+        ".venv/bin/python",
         "-m",
         "pytest",
         "-q",
@@ -256,7 +252,7 @@
       "kind": "pytest",
       "reproducibility_class": "deterministic",
       "argv": [
-        "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/.venv/bin/python",
+        ".venv/bin/python",
         "-m",
         "pytest",
         "-q",
@@ -279,7 +275,7 @@
       "timeout_seconds": 300,
       "safe_environment": {
         "PYTHONHASHSEED": "0",
-        "PYTHONPATH": "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/src",
+        "PYTHONPATH": "src",
         "TZ": "Australia/Canberra",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8"

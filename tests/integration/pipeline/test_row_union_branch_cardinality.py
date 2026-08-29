@@ -6,7 +6,7 @@ satisfy the barrier. Coalesce — which correlates identically — surfaces that
 as a loud duplicate-arrival invariant error.
 
 **Reclassified under ruling 28 (spec §7 rule 5, Task 8, WS2 controller ruling
-2026-08-23; see `docs/superpowers/specs/2026-08-21-barrier-scopes-full-nesting-spec.md`
+2026-08-23; see `docs/specs/2026-08-21-barrier-scopes-full-nesting-spec.md`
 §7 rule 5).** This module used to prove the RUNTIME-adjudicated posture:
 before elspeth-a5b86149d4, the mid-branch continuation dropped the barrier
 binding, so exploded children walked straight through the union node and the

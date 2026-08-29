@@ -22,20 +22,18 @@ history.
 | Investigating audit data | [Landscape MCP Analysis](guides/landscape-mcp-analysis.md) and [Architecture Overview](../ARCHITECTURE.md) |
 | Developing plugins | [Data Trust and Error Handling](guides/data-trust-and-error-handling.md), [Plugin Development Guide](../PLUGIN.md), then [Plugin Protocol](contracts/plugin-protocol.md) |
 | Contributing to the codebase | [Contributing](../CONTRIBUTING.md) |
-| Evaluating ELSPETH | [Executive Summary](release/executive-summary.md), [Composer Guide](release/composer-guide.md), [Platform Architecture](release/platform-architecture.md), [Public-Sector Assessment Mapping](release/assessment-mapping.md), and [Audit and Lineage Guarantees](release/guarantees.md) |
-| Reviewing delivery confidence and decisions | [Project Control Report](project-control/project-control-report.md), with the supporting [T&M](project-control/tm-register.md), [RAID](project-control/raid-register.md), and [milestone forecast](project-control/milestone-forecast-register.md) registers |
+| Evaluating ELSPETH | [Composer Guide](release/composer-guide.md), [Platform Architecture](release/platform-architecture.md), and [Audit and Lineage Guarantees](release/guarantees.md) |
+| Reviewing delivery confidence and decisions | [Project Control](project-control/README.md) — the control registers are maintained by the project but not published in the repository |
 
 ---
 
 ## Project Control
 
 ELSPETH uses a lean four-document control set, not a full project-management
-method. Start with the [Project Control Report](project-control/project-control-report.md)
-for the current status, exceptions, and asks. Its supporting registers are:
-
-- [T&M Register](project-control/tm-register.md) — resource evidence, allocation, and reconciliation gaps
-- [RAID Register](project-control/raid-register.md) — live material risks, assumptions, issues, and dependencies
-- [Milestone and Forecast Register](project-control/milestone-forecast-register.md) — commitments, forecasts, dependencies, and change
+method: a Project Control Report with supporting T&M, RAID, and milestone and
+forecast registers. They are maintained by the project but are not published
+in this repository; [docs/project-control/README.md](project-control/README.md)
+explains the arrangement and how to request them.
 
 ---
 
@@ -44,6 +42,7 @@ for the current status, exceptions, and asks. Its supporting registers are:
 Current architecture and design references.
 
 - [Repository Directory Strategy](repository-structure.md) — purpose of every top-level folder and where new files belong
+- [Maintainer Toolchain](maintainer/toolchain.md) — how the maintainer's own agents work (tracker, code map, delegation); not a requirement for contributors
 - [Architecture Overview](../ARCHITECTURE.md) — C4 model, data flows, and system-level orientation
 - [System Overview](architecture/overview.md) — compatibility pointer to the maintained root architecture overview
 - [Requirements Matrix](architecture/requirements.md) — compatibility pointer to current requirement and contract sources
@@ -117,10 +116,8 @@ Runbooks and production procedures.
 Audience-facing release and evaluation documents. See the
 [release docs README](release/README.md) for the full index.
 
-- [Executive Summary](release/executive-summary.md) — capability and assurance brief for Australian public-sector evaluators *(DRAFT — awaiting operator sign-off)*
 - [Composer Guide](release/composer-guide.md) — current user-facing guide to the web authoring surface
 - [Platform Architecture](release/platform-architecture.md) — current platform architecture, trust-boundary, and operational-responsibility overview
-- [Public-Sector Assessment Mapping](release/assessment-mapping.md) — current evidence map for government evaluation touchpoints
 - [Audit and Lineage Guarantees](release/guarantees.md) — long-lived assurance narrative; refreshed per release (current contract surface; §1–§10 RC-3 base, §11–§14 RC-5.2 additions)
 - Per-period progress and velocity reports (RC-1 to RC-5) are internal work
   product and no longer ship as active public docs.

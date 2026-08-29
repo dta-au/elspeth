@@ -4,7 +4,7 @@ Used by ``scripts/eval/backfill_2026_05_03_outputs.py`` to extract sink output
 paths from a captured ``final_yaml.json``, enumerate auto-increment-renamed
 candidate files on disk, and timestamp-correlate them against a run window.
 
-See ``docs/superpowers/plans/2026-05-06-eval-per-row-output-archival.md``
+See ``docs/plans/2026-05-06-eval-per-row-output-archival.md``
 (Phase A) for the full design rationale, and the ELSPETH auditability
 standard in CLAUDE.md for why audit-grade evidence demands the
 ``correlation_confidence`` flag.

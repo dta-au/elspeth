@@ -7,7 +7,7 @@
 
 ## Context
 
-The unified-lineage campaign (spec `docs/superpowers/specs/2026-08-21-barrier-scopes-full-nesting-spec.md`,
+The unified-lineage campaign (spec `docs/specs/2026-08-21-barrier-scopes-full-nesting-spec.md`,
 rev 3.2) replaced the three per-token columns (`branch_name` / `fork_group_id`
 / `expand_group_id`) with ONE lineage truth: `TokenInfo.lineage_path`, a stack
 of `LineageFrame(kind, group_id, member_key)` minted at every opening

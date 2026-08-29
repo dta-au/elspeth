@@ -549,8 +549,8 @@ separately (the same precedent as 0.5.4 into 0.6.0).
   `routes/composer.py` is decomposed into a `routes/composer/` area package,
   splitting the route module without changing its HTTP surface.
 - **Release documentation cleanout completed** — the remaining implemented
-  plans and design specs under `docs/plans/`, `docs/superpowers/plans/`, and
-  `docs/superpowers/specs/` were removed from tracked active docs while
+  plans and design specs under `docs/plans/`, `docs/plans/`, and
+  `docs/specs/` were removed from tracked active docs while
   keeping `docs/` focused on current user, operator, architecture, and release
   documentation. Maintainers may preserve the removed files in a local ignored
   archive; public provenance remains available through git history.
@@ -1969,7 +1969,7 @@ Major feature release: Dataverse and RAG retrieval plugins, output schema contra
 - Historical design specs and implementation plans from this era are no longer
   active docs. They are preserved in git history or the dated docs archives;
   start from the current ADRs, contracts, and archive manifests rather than old
-  `docs/superpowers/` paths.
+  `docs/` paths.
 
 ---
 

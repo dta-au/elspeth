@@ -9,7 +9,7 @@ DAG builder change.
 **Date:** 2026-08-23.
 
 **Adjudicator:** Panel synthesis (`.superpowers/sdd/2026-08-21-unified-lineage-ws2-config-validation/panel/synthesis.md`),
-maintainer-ratified. RC-3 (`docs/superpowers/plans/2026-08-21-unified-lineage-protocols.md:805-814`) names the
+maintainer-ratified. RC-3 (`docs/plans/2026-08-21-unified-lineage-protocols.md:805-814`) names the
 replacement topology; the panel resolved a transcription-drift ambiguity between two candidate readings
 in favour of RC-3's own text.
 

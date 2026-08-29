@@ -8,7 +8,7 @@ Predecessor: `docs/plans/2026-08-15-state-engine-six-issue-disposition.md` §3 s
 which said the first action on this issue is to split PB-09's 2,022 local cells into
 locally-authorable vs provider-dependent "before committing effort".
 
-> **STATUS 2026-08-17: DECIDED.** John ruled Decision 1 = (1a) and Decision 2 =
+> **STATUS 2026-08-17: DECIDED.** The maintainer ruled Decision 1 = (1a) and Decision 2 =
 > (2b) then (2a). Both rulings are written into
 > `docs/architecture/state_engine/completeness-criteria.md` as normative
 > amendments ("Follower-profile applicability is narrowed per leg, in the

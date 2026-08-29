@@ -24,7 +24,7 @@ ENV = {"advisor_model": tg.ADVISOR, "composition_turns": 30, "discovery_turns": 
 def _battery(tmp_path: Path, client: FakeClient, **kw) -> db.Battery:
     b = db.Battery(
         client,
-        base="https://elspeth.foundryside.dev",
+        base="https://elspeth.example.gov.au",
         round_name="r1",
         runs_dir=tmp_path / "runs",
         corpus_version=0,

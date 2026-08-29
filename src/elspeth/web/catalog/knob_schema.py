@@ -2,7 +2,7 @@
 
 Lowering happens at catalog load time inside ``CatalogServiceImpl.__init__``;
 this module exposes the result types and the lowering entry points. See
-docs/superpowers/specs/2026-05-14-composer-one-knob-design.md.
+docs/specs/2026-05-14-composer-one-knob-design.md.
 
 Trust tier: L3 web layer. ``KnobSchema`` instances are Tier 1 because we write
 them from plugin models we control. Prefilled values from

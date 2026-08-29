@@ -7,7 +7,7 @@ poll), and enriches the row with extracted content and structured facets.
 All HTTP flows through AuditedHTTPClient (full request/response audit, header
 fingerprinting so the api-key is never stored raw, telemetry, rate limiting).
 GA api-version 2024-11-30. See
-docs/superpowers/specs/2026-06-30-azure-document-intelligence-transform-design.md.
+docs/specs/2026-06-30-azure-document-intelligence-transform-design.md.
 
 SECURITY:
 - A SAS token embedded in a ``urlSource`` value is forwarded to Azure and

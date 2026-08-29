@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pre-1.0 sandblasting SME review fleet (foundation: single-file, serial lenses).
 
-See docs/superpowers/specs/2026-06-28-codex-panel-review-design.md.
+See docs/specs/2026-06-28-codex-panel-review-design.md.
 
 Helpers from ``codex_audit_common`` are bound at module scope (required so the
 runner test can monkeypatch ``run_codex_once``) via a dual-import shim, so this
@@ -24,7 +24,7 @@ from typing import Any
 # the package form works when pytest imports this as scripts.codex_panel_review.
 # All helpers are bound at module scope (every name is used below) — also required
 # for the runner test's monkeypatch of run_codex_once. See
-# docs/superpowers/plans/2026-06-28-codex-panel-review-foundation.md.
+# docs/plans/2026-06-28-codex-panel-review-foundation.md.
 try:
     from codex_audit_common import (  # type: ignore[import-not-found]
         append_log,

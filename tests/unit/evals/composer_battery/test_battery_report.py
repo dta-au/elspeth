@@ -90,7 +90,7 @@ def _round(tmp_path: Path, name: str = "r1") -> Path:
         json.dumps(
             {
                 "round": name,
-                "base": "https://elspeth.foundryside.dev",
+                "base": "https://elspeth.example.gov.au",
                 "started_at": "2026-08-17T00:00:00Z",
                 "completed": [],
                 "aborted": False,

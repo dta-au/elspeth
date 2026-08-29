@@ -389,7 +389,7 @@ def _reviewed_web_scrape_state() -> tuple[CompositionState, dict[str, object]]:
         "fingerprint_field": "page_fingerprint",
         "format": "text",
         "http": {
-            "abuse_contact": "review@foundryside.dev",
+            "abuse_contact": "review@example.gov.au",
             "scraping_reason": "authoritative mutation test",
             "allowed_hosts": "public_only",
         },
@@ -478,7 +478,7 @@ def test_exact_payload_round_trips_through_real_set_pipeline_with_authoritative_
         "fingerprint_field": "page_fingerprint",
         "format": "text",
         "http": {
-            "abuse_contact": "review@foundryside.dev",
+            "abuse_contact": "review@example.gov.au",
             "scraping_reason": "exact authoring reconciliation test",
         },
         "schema": {"mode": "observed"},

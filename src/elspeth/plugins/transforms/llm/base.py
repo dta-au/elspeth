@@ -153,7 +153,7 @@ class LLMConfig(TransformDataConfig):
         json_schema_extra={"composer_tier": "advanced"},
     )
 
-    # Image inputs (docs/superpowers/specs/2026-08-25-llm-image-input-design.md §4):
+    # Image inputs (docs/specs/2026-08-25-llm-image-input-design.md §4):
     # absent (None) is exactly today's text-only behavior. Each entry names a
     # row column holding a payload-store blob ref (str or list[str]); its image
     # format comes from a literal or a per-row mime column, resolved at message

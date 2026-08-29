@@ -1,6 +1,6 @@
 """Guided-mode state-machine data: GuidedSession, TerminalState, TurnRecord.
 
-See docs/superpowers/specs/2026-05-11-composer-guided-mode-design.md §5.
+See docs/specs/2026-05-11-composer-guided-mode-design.md §5.
 
 Trust tier: Tier 1 (audit). Coercion forbidden — every field crashes on
 malformed input. The freeze_fields contract applies because these structures

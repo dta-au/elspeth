@@ -137,8 +137,9 @@ def _call_openrouter(api_key: str, system: str, user: str) -> str:
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://elspeth.foundryside.dev",
             "X-Title": "elspeth-panel-cohort-drafter",
+            # OpenRouter attribution: name the configured substrate, never a hard-coded host.
+            **({"HTTP-Referer": referer} if (referer := os.environ.get("ELSPETH_EVAL_BASE_URL")) else {}),
         },
         method="POST",
     )

@@ -12,7 +12,7 @@
     "sha256_at_evidence_capture": "2e025df8fcb61869f4ac2575d2d1b0c5bba5aa63c88c0d059e630431062eef2e"
   },
   "baseline": {
-    "repository_root": "/home/john/elspeth",
+    "repository_root": ".",
     "remote": "https://github.com/johnm-dta/elspeth.git",
     "branch": "release/0.7.1",
     "upstream": "origin/release/0.7.1",
@@ -22,28 +22,7 @@
     "tree": "302f43dbc9c89ea67a21ccb3b80cd7cdec06b75f",
     "behavioral_overlay": null,
     "worktree_note": "The merge commit is the exact behavioral baseline. During evidence capture the only worktree overlay was this new documentation assessment package; all non-doc paths matched the commit.",
-    "worktree_status_at_evidence_capture": [
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/README.md",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-001.junit.xml",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-001.stderr",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-001.stdout",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-002.junit.xml",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-002.stderr",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-002.stdout",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-003.junit.xml",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-003.stderr",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-003.stdout",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-004.junit.xml",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-004.stderr",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/artifacts/EV-004.stdout",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/assessment.json",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/evidence.md",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/nodes/EV-001.txt",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/nodes/EV-002.txt",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/nodes/EV-003.txt",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/nodes/EV-004.txt",
-      "?? docs/architecture/state_engine/assessments/2026-07-18-1820/review.md"
-    ],
+    "worktree_status_at_evidence_capture": [],
     "baseline_transition": {
       "prior_assessment_commit": "42241500931926c5fd914ab7d92b479d9da1f8c2",
       "merge_commit": "3c782ac3c7efb0550495be38f75800eddffa639a",
@@ -54,22 +33,22 @@
     "submodules": [],
     "worktrees_at_capture": [
       {
-        "path": "/home/john/elspeth",
+        "path": "~/elspeth",
         "commit": "3c782ac3c7efb0550495be38f75800eddffa639a",
         "branch": "release/0.7.1"
       },
       {
-        "path": "/home/john/elspeth/.worktrees/composer-capability-parity",
+        "path": "~/elspeth/.worktrees/composer-capability-parity",
         "commit": "cb1aa49a27b9cda1ef6e3bd7a55b0b80880d2b4b",
         "branch": "feat/composer-capability-parity"
       },
       {
-        "path": "/home/john/elspeth/.worktrees/dag-reassessment-20260717",
+        "path": "~/elspeth/.worktrees/dag-reassessment-20260717",
         "commit": "5686198ba813f46f8760ff3dde71c8bc7e4f501e",
         "branch": "codex/dag-reassessment-20260717"
       },
       {
-        "path": "/home/john/elspeth/.worktrees/source-completed-crash-seam",
+        "path": "~/elspeth/.worktrees/source-completed-crash-seam",
         "commit": "a85b29c4eddee1f7d54a346fcadd4624303d342e",
         "branch": "codex/source-completed-crash-seam"
       }
@@ -81,7 +60,7 @@
     "locale": "LC_CTYPE=en_US.UTF-8; remaining categories C",
     "kernel": "Linux 6.8.0-124-generic x86_64",
     "python": "3.13.1",
-    "python_executable": "/home/john/elspeth/.venv/bin/python",
+    "python_executable": ".venv/bin/python",
     "python_build": "main Dec 19 2024 14:32:25",
     "pytest": "9.0.3",
     "uv": "0.10.2",

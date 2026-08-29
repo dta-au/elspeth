@@ -8,7 +8,7 @@ import type { CompositionState } from "@/types";
 
 // Overridable by Playwright configs so the same specs can run against either
 // the local-spawned webServer or an already-deployed environment (e.g.
-// elspeth.foundryside.dev).
+// elspeth.example.gov.au).
 const BACKEND_PORT = process.env.PLAYWRIGHT_BACKEND_PORT ?? "8451";
 const BACKEND_BASE_URL =
   process.env.PLAYWRIGHT_BACKEND_BASE_URL ?? `http://127.0.0.1:${BACKEND_PORT}`;

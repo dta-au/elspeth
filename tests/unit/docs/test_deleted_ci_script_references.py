@@ -14,8 +14,8 @@ SUPPORTED_TIER_MODEL_GATE = (
 )
 HISTORICAL_DOC_PREFIXES = (
     "docs-archive/",
-    "docs/superpowers/plans/",
-    "docs/superpowers/specs/",
+    "docs/plans/",
+    "docs/specs/",
 )
 HISTORICAL_DOC_PATHS = ("CHANGELOG.md",)
 SOURCE_PREFIXES_OUT_OF_SCOPE = ("src/elspeth/web/",)
@@ -25,8 +25,8 @@ def _active_markdown_paths() -> list[Path]:
     paths = [
         *REPO_ROOT.glob("*.md"),
         *REPO_ROOT.glob("docs/**/*.md"),
+        # .agents/skills is the canonical skills tree; .claude/skills holds symlinks into it.
         *REPO_ROOT.glob(".agents/skills/**/*.md"),
-        *REPO_ROOT.glob(".claude/skills/**/*.md"),
     ]
     return [
         path
@@ -49,8 +49,8 @@ def _active_reference_paths() -> list[Path]:
     paths = [
         *REPO_ROOT.glob("*.md"),
         *REPO_ROOT.glob("docs/**/*.md"),
+        # .agents/skills is the canonical skills tree; .claude/skills holds symlinks into it.
         *REPO_ROOT.glob(".agents/skills/**/*.md"),
-        *REPO_ROOT.glob(".claude/skills/**/*.md"),
         *REPO_ROOT.glob("src/elspeth/**/*.py"),
     ]
     return [

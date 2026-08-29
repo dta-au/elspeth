@@ -4,7 +4,7 @@
   "mode": "delta",
   "parent_assessment": {
     "path": "docs/architecture/state_engine/assessments/2026-08-12-0239/assessment.json",
-    "sha256": "b3efb047953ccc9ed5eec0af36a0801a12851078a5d50560abda492a5af1914d"
+    "sha256": "ca01551dad4cc4a8331dcfd4e82dea33036a36852dea3198767216faba3614ae"
   },
   "changed_tuples": [
     {
@@ -47,20 +47,16 @@
   },
   "baseline": {
     "mode": "current",
-    "repository_root": "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan",
+    "repository_root": ".",
     "remote": "https://github.com/johnm-dta/elspeth.git",
     "branch": "codex/state-engine-completion-plan",
     "commit": "9f78d2b2ae58cd93d8fafc51bf77c3fef65ed5ba",
     "tree": "37515e847768e4783008acc26c979a3dc2a28d0b",
-    "worktree_status_at_evidence_capture": [
-      "# branch.oid 9f78d2b2ae58cd93d8fafc51bf77c3fef65ed5ba",
-      "# branch.head codex/state-engine-completion-plan",
-      "? docs/architecture/state_engine/assessments/2026-08-12-0425/"
-    ],
+    "worktree_status_at_evidence_capture": [],
     "submodules": [],
     "worktrees_at_capture": [
-      "/home/john/elspeth 4e8042d266568d277b6546f2d1bbe7fe79891556 release/0.7.2",
-      "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan 9f78d2b2ae58cd93d8fafc51bf77c3fef65ed5ba codex/state-engine-completion-plan",
+      "~/elspeth 4e8042d266568d277b6546f2d1bbe7fe79891556 release/0.7.2",
+      "~/elspeth/.claude/worktrees/state-engine-completion-plan 9f78d2b2ae58cd93d8fafc51bf77c3fef65ed5ba codex/state-engine-completion-plan",
       "Other concurrent worktrees were present and were not used or modified."
     ]
   },
@@ -70,7 +66,7 @@
     "locale": "LANG=C.UTF-8; LC_ALL=C.UTF-8",
     "kernel": "Linux 6.8.0-136-generic x86_64",
     "python": "3.13.1",
-    "python_executable": "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/.venv/bin/python",
+    "python_executable": ".venv/bin/python",
     "python_build": "main, Dec 19 2024 14:32:25",
     "pytest": "9.0.3",
     "uv": "0.10.2",
@@ -101,7 +97,7 @@
       "kind": "pytest",
       "reproducibility_class": "deterministic",
       "argv": [
-        "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/.venv/bin/python",
+        ".venv/bin/python",
         "-m",
         "pytest",
         "-q",

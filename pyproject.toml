@@ -322,7 +322,8 @@ extend-immutable-calls = ["typer.Option", "typer.Argument"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["T20"]  # Allow print in tests
 "scripts/**/*.py" = ["T20"]  # Allow print in CLI scripts
-".claude/skills/**/*.py" = ["T20"]  # Skill helper CLIs: print is the output channel the orchestrator parses
+".agents/skills/**/*.py" = ["T20"]  # Skill helper CLIs: print is the output channel the orchestrator parses
+".claude/skills/**/*.py" = ["T20"]  # Symlinks into .agents/skills; kept so a resolved path is treated the same
 "evals/composer-parity/live_acceptance.py" = ["T20"]  # CLI oracle: print/stderr is the accept/reject output channel
 "evals/composer-battery/*.py" = ["T20"]  # CLI: print is the report/stderr output channel
 "notes/**/*.py" = ["T20"]  # Ad-hoc diagnostic scripts — print is the output channel

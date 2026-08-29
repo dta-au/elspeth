@@ -4,7 +4,7 @@ Covers every container shape the iterator must descend into. Both the
 adequacy guard and the runtime walker consume this iterator; gaps here
 silently allow gaps in either consumer. The current redaction design records
 the original B2 finding and its resolution in
-docs/superpowers/specs/2026-04-30-composer-progress-persistence-design.md §12.2.
+docs/specs/2026-04-30-composer-progress-persistence-design.md §12.2.
 """
 
 from __future__ import annotations

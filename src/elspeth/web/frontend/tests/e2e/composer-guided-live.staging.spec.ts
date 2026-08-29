@@ -20,8 +20,8 @@
 // real provider tokens, which is the point.
 //
 // Invocation (dev server):
-//   STAGING_BASE_URL=https://elspeth.foundryside.dev \
-//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
+//   STAGING_BASE_URL=https://elspeth.example.gov.au \
+//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
 //   STAGING_USERNAME=... STAGING_PASSWORD=... \
 //   ELSPETH_RUN_COMPOSER_LIVE=1 \
 //   ELSPETH_LIVE_OUTPUTS_DIR=<server data_dir>/outputs \

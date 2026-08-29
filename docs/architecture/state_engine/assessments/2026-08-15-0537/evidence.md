@@ -2,7 +2,7 @@
 
 All evidence was captured at frozen commit
 `2b4b04a8a852a839b7b395b0bcdfceb95676606b` in the dedicated worktree
-`/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment`
+`.claude/worktrees/state-engine-v3-assessment` (under the main checkout)
 (branch `codex/state-engine-v3-assessment`), with a hermetic venv built by
 `uv venv .venv --python 3.13 && uv sync --frozen --all-extras` and the
 in-tree import verified (`elspeth.__file__` under the worktree `src/`)

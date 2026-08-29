@@ -3808,9 +3808,9 @@ class TestWebScrapeAbuseContactValidation:
     @pytest.mark.parametrize(
         "address",
         [
-            "abuse-contact-unset@elspeth.foundryside.dev",
+            "abuse-contact-unset@elspeth.example.gov.au",
             "ops@somecompany.gov.au",
-            "abuse@example.foundryside.dev",  # 'example' as a label, not the reserved TLD
+            "abuse@example.somecompany.gov.au",  # 'example' as a label, not the reserved TLD
             "user@reallytest.example-mail.org",  # not endswith ".test" / ".example.org"
             "ops@notlocalhost.com",
             "ops@subdomain.example.io",  # 'example' inside string but not reserved
@@ -5183,7 +5183,7 @@ class TestSchemaContractValidation:
             "format": "text",
             "fingerprint_mode": "content",
             "http": {
-                "abuse_contact": "pipeline-tests@elspeth.foundryside.dev",
+                "abuse_contact": "pipeline-tests@elspeth.example.gov.au",
                 "scraping_reason": "test scrape",
                 "allowed_hosts": "public_only",
             },

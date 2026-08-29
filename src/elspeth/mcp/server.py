@@ -6,10 +6,10 @@ infrastructure.
 
 Usage:
     # Direct execution
-    python -m elspeth.mcp.server --database sqlite:////home/john/elspeth/data/runs/audit.db
+    python -m elspeth.mcp.server --database sqlite:////srv/elspeth/data/runs/audit.db
 
     # Or as an MCP server
-    elspeth-mcp --database sqlite:////home/john/elspeth/data/runs/audit.db
+    elspeth-mcp --database sqlite:////srv/elspeth/data/runs/audit.db
 
 The analyzer logic lives in ``mcp.analyzer`` (facade) and
 ``mcp.analyzers.*`` (domain submodules). This file contains only

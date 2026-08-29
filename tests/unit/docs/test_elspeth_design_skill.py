@@ -1,4 +1,4 @@
-"""Executable contracts for the shipped ELSPETH design skill."""
+"""Executable contracts for the shipped ELSPETH design pack (top-level ``design/``)."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import yaml
 from elspeth.core.config import load_settings_from_yaml_string
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DESIGN_SKILL = REPO_ROOT / ".claude" / "skills" / "elspeth-design"
-SKILL_WEBSITE = DESIGN_SKILL / "ui_kits" / "website"
+DESIGN_PACK = REPO_ROOT / "design"
+SKILL_WEBSITE = DESIGN_PACK / "ui_kits" / "website"
 CANONICAL_WEBSITE = REPO_ROOT / "website"
 
 
