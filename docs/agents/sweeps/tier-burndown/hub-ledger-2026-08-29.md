@@ -165,3 +165,56 @@
   Path` is a live bug (pydantic yields PosixPath); gate_ledger got no boundary because 4/5 callers are write-path
   self-checks (read-back prose would be false). Filed by lane: elspeth-obs-539724f2db (wrong check id on
   malformed captured_at). Issue title/description corrected to 215.
+- tier-B26 MERGED (e0caff32d, lane HEAD b425286a7, elspeth-1213f153ae): 198 → 23 (175 removed, 23 rationalised).
+  Hub scan 2575 → 2400 vs ae34b48b3, outside-bucket identity EMPTY. Hub-reviewed in full: threaded receipt-node
+  budget replaces the nonlocal counter exactly; `_sentinel_observed` extracted as a staticmethod boundary;
+  `_operator_receipt` exact-type on the OperatorTelemetryEvidence/OutageEvidence closed union (git grep: no
+  subclasses). Measured method corrections now in recent-code-hints: helper return values DO keep the trail
+  (W3-4 was wrong); the trail-killer is a name assigned inside a `try:` and read after it; "extract a
+  `_decode_or_none` helper" trades the loss for a fresh R6. Fragility noted by lane: `_validate_scenario_inventory`
+  test_ref points at a shared parametrized test — any added param case rotates its fingerprint. Hints conflict
+  resolved additively. Masquerade baseline up to date (37); trust_boundary gates rc=0; 1108 harness/arch/lints
+  tests green on the merged tree. NOTE: `docs/architecture/adr/024-...md` is modified in the shared checkout by
+  ANOTHER session (not hub, not any lane) — left untouched; `tier-lintprecision` worktree likewise not ours.
+- B26 positive proof (post-merge re-measure at fb95c4c89): its five files emit exactly 175 R_TB_SUPPRESSED lines
+  = the 175 findings removed — every removal is a live suppression, none a voided decorator (zero
+  R_TB_NONLITERAL/MALFORMED/UNKNOWN_KWARG/STACKED tree-wide). Lane's post-merge branch commit 7852f55db (tip
+  re-merge + hints reword, --no-verify with hand-run gates) was superseded by the hub's e0caff32d and deleted.
+
+## WAVE 4 AUDIT (range 99d43f87d..e0caff32d; evidence scratchpad/auditW4A, auditW4B)
+- Corpus at e0caff32d: 2594 → 2210 = 384 removed (harness 434 → 50; outside-harness identity EMPTY vs base).
+  W1–W4 total 3,898 → 2,210 = 1,688. John 2026-08-29: goal was ~2k — "I'll call it a win".
+- Lens A (code, fable, 5 sub-lanes): ALL-STOP NO. 17 exact-type sites, 120 removed guard lines, 18 membership
+  conversions, 8 restructures probed old-vs-new, 13 AST shapes for the exemption map, 31 rendered commands —
+  0 weakened controls. P1: capture.py:388 test_ref pins 1/3 invariant clauses (control measured real). P2:
+  three orphan_sweep observation_boundary "never raises" invariants false (caught by outer R4 → fail-closed).
+  P3: 18/78 map entries exempt zero sites (standing grants the liveness check accepts); `$USER` unquoted by
+  design; receipt expires_at wrong-type reports control_manifest_schema.
+- Lens B (prose/pins, fable): ALL-STOP YES by the brief's letter — 8 non_raising/observation boundaries whose
+  "never raises" is false on constructible input (orphan_sweep ×4, bedrock RecursionError under the 64 KiB cap,
+  evidence.py `_decoded_log_message` lone-surrogate/RecursionError REACHABLE from an operator evidence file,
+  textract unconstructible-shape, scenario_inventory set() before type test → acceptance_internal). P1: paged
+  token/destination TypeError holes; check_error_with_cause `str(exc)` outside suppress; FIVE B26 rationales with
+  false mechanism ("strict=True removal would make the target rootable" — measured identical; "botocore returns
+  datetime subclasses" — botocore returns exact datetime, naive when tz-less). P2: receipt invariants omit the
+  control_manifest_schema code; two s3 R6 pin claims name tests that never reach the handler; bedrock R5
+  sentence inverted; `_orphan_call` rationale omits the `else:` arm that retires the finding; B27 hint overstates
+  R_TB_NONLITERAL (voids ONE decorator, reported, not per-file); 5/6 state.py from_dict map entries inert.
+  Confirmed by probe: helper-return keeps trail, try-body loss, `_decode_or_none` R6, zip/enumerate unrootable.
+- HUB ADJUDICATION: no fail-open, no deleted gate, no composer breach; every raise is caught into a named
+  fail-closed error (only evidence.py #6 is an operator-visible crash). Downgraded from ALL-STOP to a P1 BATCH
+  owned by the hub BEFORE the re-stage; John informed. Fix lane tier-w4fix (fable, worktree, brief
+  LANE_BRIEF_W4FIX.md) dispatched from e0caff32d with 18 work items (code A.1–9, prose B.10–15, tickets C.16–18).
+- Sequencing after w4fix merges: merge fix/codex-salvage (pre-re-stage merge, own delta vs 2210, 1 sidecar key
+  on audit_export_snapshots.py to re-derive), ONE full suite on the final tip, close Wave-4 issues at that tip,
+  close the 5 codex PRs, PAUSE for the operator re-stage.
+
+## PRE-RE-STAGE MERGE: fix/codex-salvage (John authorised 2026-08-29; MERGED e42bfe0c0)
+- Six commits (base fe4d87e6b, tip f36f9b81a): PRs #117 #123 #127 #128 #129 re-ported/cherry-picked. Zero merge
+  conflicts; 132 touched-file tests pass; masquerade baseline up to date; full suite at e0caff32d was green
+  (43709 passed) and this merge touches cli.py, contracts/errors.py, landscape/factory.py,
+  landscape/execution/audit_export_snapshots.py + tests + a runbook line — the final full suite runs on the tip
+  after tier-w4fix merges. Corpus delta vs Wave-4 close: 2210 → 2210 (ZERO). One sidecar key re-derived from
+  the post-merge tree (audit_export_snapshots.py R6 register_verified_candidate: body[31] → body[32], new
+  module-level import). Five GitHub PRs closed as landed (johnm-dta). Not a wave; reported separately by John's
+  instruction.

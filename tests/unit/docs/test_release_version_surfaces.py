@@ -24,29 +24,13 @@ def test_package_and_lockfile_use_current_release_version() -> None:
     assert locked_project["version"] == CURRENT_VERSION
 
 
-def test_current_release_indexes_name_release_072() -> None:
+def test_current_public_release_surfaces_name_release_072() -> None:
     assert "**Framework status:** `0.7.2`" in _text("docs/README.md")
+    assert "## 0.7.2 - Release candidate" in _text("CHANGELOG.md")
 
-    current_state = _text("docs/product/current-state.md")
-    assert "**Release branch:** `release/0.7.2`" in current_state
-    assert "root package metadata and lockfile identify 0.7.2" in current_state
-
-    roadmap = _text("docs/product/roadmap.md")
-    assert "Ship the 0.7.2 line" in roadmap
-    assert "`release/0.7.2`" in roadmap
-
-
-def test_current_state_names_the_live_session_epoch() -> None:
-    """Bind the product resume brief's epoch claim to the live constant.
-
-    Every other release surface (README, CHANGELOG, website, both runbooks,
-    sharing guide) is already pinned to ``SESSION_SCHEMA_EPOCH``.
-    ``current-state.md`` stated the number in prose with nothing checking it,
-    so an epoch bump could — and did — leave it a whole epoch behind.
-    """
-    current_state = _text("docs/product/current-state.md")
-
-    assert f"`SESSION_SCHEMA_EPOCH` is {SESSION_SCHEMA_EPOCH}, guided checkpoint schema is 11" in current_state
+    readme = _text("README.md")
+    assert "![Status: 0.7.2]" in readme
+    assert "## What Changed In 0.7.2" in readme
 
 
 def test_current_container_examples_require_a_confirmed_published_tag() -> None:

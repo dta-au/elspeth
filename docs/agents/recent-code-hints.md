@@ -4003,7 +4003,7 @@ Every one of the ~25 whole-tree gates had the same exposure. Two rules now:
   guided `test_schema9_epoch`), `CHANGELOG.md`, `website/get-started.html`
   ("29 → NN", pinned by `test_release_site_contract`),
   `docs/guides/sharing-pipelines.md` (pinned by
-  `test_release_version_surfaces`), and `docs/product/current-state.md`.
+  `test_release_version_surfaces`).
 - **2026-08-14 — a two-column equality join needs a two-column index, or
   SQLite guesses wrong**: an audit database has no `sqlite_stat1` (nothing runs
   `ANALYZE`), so when a join offers `run_id=?` AND `token_id=?` and each column
