@@ -537,15 +537,19 @@ def _attach_tier(field: KnobField, info: FieldInfo) -> None:
     ``json_schema_extra={"composer_tier": "advanced"}``; ``"essential"`` is
     reserved for the knobs a guided step asks about by name. Every wire field
     carries a tier so the form never has to guess (elspeth-9cca900d41).
+    An unrecognised tier string lowers to "common" rather than raising:
+    tier is presentational, not audit-bearing.
     """
     tier: FieldTier = "common"
-    extra = info.json_schema_extra
-    if type(extra) is dict and "composer_tier" in extra:
+    extra = _composer_extras(info)
+    if extra is not None and "composer_tier" in extra:
         declared = extra["composer_tier"]
         if declared in ("essential", "common", "advanced"):
             tier = cast(FieldTier, declared)
     field["tier"] = tier
 ```
+
+Read the extras through `_composer_extras` (landed in `760d708ee`, after this plan was reviewed): it admits the `MappingProxyType` form `deep_freeze` produces and raises on any other present type, and `tests/unit/web/catalog/test_knob_schema_composer_help.py::test_callable_and_absent_extras_stay_the_no_op` (~L292) pins that a frozen `{"composer_tier": "advanced"}` still lowers to `"advanced"`. Do NOT reintroduce `type(extra) is dict` here — it would silently drop the declaration for frozen extras and turn that test red. An unrecognised tier *string* deliberately keeps lowering to `"common"` (the pre-existing behaviour; tier is presentational, not audit-bearing) — say so in the docstring rather than raising.
 
 The discriminated-plugin path builds its discriminator field by hand (`knob_schema.py:506-515`, affects `transform__llm` and `source__llm`) — add `"tier": "common",` to that literal so the "every wire field carries a tier" claim is actually true (`_base_field` is not on that path).
 
@@ -1412,7 +1416,7 @@ Expected: all green.
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/claude-1000/-home-john-elspeth/lints-after.txt; wc -l /tmp/claude-1000/-home-john-elspeth/lints-after.txt
 ```
 
-Compare the finding count against the pre-change capture taken before Task 1 (capture it then with the same command to `lints-before.txt`). Expected: identical counts; `diff` shows no added findings. `knob_schema.py`'s `_attach_tier` uses `type(extra) is dict` + membership + index exactly as before (no `getattr`), so the attribute-contracts and masquerade gates are untouched.
+Compare the finding count against the pre-change capture taken before Task 1 (capture it then with the same command to `lints-before.txt`). Expected: identical counts; `diff` shows no added findings. `knob_schema.py`'s `_attach_tier` reads through `_composer_extras` + membership + index exactly as the other extras readers do (no `getattr`), so the attribute-contracts and masquerade gates are untouched.
 
 - [ ] **Step 3: Backend full suite as a background job**
 
