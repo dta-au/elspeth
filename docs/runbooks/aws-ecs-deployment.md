@@ -1981,6 +1981,10 @@ one of those digests as the generic GHCR/ACR release image.
 
 ## Immutable RDS trust-root admission
 
+For server-certificate rotation, trust-root changes, and emergency distrust,
+follow the maintained
+[RDS trust-root response rules](../../deploy/aws-ecs/trust/README.md#rotation-and-emergency-distrust).
+
 The image must contain `/etc/elspeth/rds/global-bundle.pem` with SHA-256
 `e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3`.
 Its OCI CA label must be `rds-ca-rsa2048-g1`. Every ELSPETH container in the
