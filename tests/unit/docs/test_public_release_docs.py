@@ -7,10 +7,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PUBLIC_RELEASE_DOCS = (
     REPO_ROOT / "docs" / "release" / "README.md",
-    REPO_ROOT / "docs" / "release" / "executive-summary.md",
     REPO_ROOT / "docs" / "release" / "composer-guide.md",
     REPO_ROOT / "docs" / "release" / "platform-architecture.md",
-    REPO_ROOT / "docs" / "release" / "assessment-mapping.md",
     REPO_ROOT / "docs" / "release" / "guarantees.md",
 )
 INTERNAL_TRACKER_TERMS = ("Filigree", "filigree", "session-context")

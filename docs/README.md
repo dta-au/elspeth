@@ -44,6 +44,7 @@ for the current status, exceptions, and asks. Its supporting registers are:
 Current architecture and design references.
 
 - [Repository Directory Strategy](repository-structure.md) — purpose of every top-level folder and where new files belong
+- [Maintainer Toolchain](maintainer/toolchain.md) — how the maintainer's own agents work (tracker, code map, delegation); not a requirement for contributors
 - [Architecture Overview](../ARCHITECTURE.md) — C4 model, data flows, and system-level orientation
 - [System Overview](architecture/overview.md) — compatibility pointer to the maintained root architecture overview
 - [Requirements Matrix](architecture/requirements.md) — compatibility pointer to current requirement and contract sources

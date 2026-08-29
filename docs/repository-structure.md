@@ -35,7 +35,11 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 
 > Agent-instruction files (`CLAUDE.md`, `AGENTS.md`) are **tracked** in git (as
 > of 2026-07-28) so that every worktree inherits the same agent context. Commit
-> edits to them like any other file.
+> edits to them like any other file. `AGENTS.md` is the short, harness-neutral
+> project covenant; the maintainer's own agent toolchain (issue tracker, code
+> map, delegation conventions) is described in
+> [`docs/maintainer/toolchain.md`](maintainer/toolchain.md) and is not required
+> to contribute.
 
 ## One level down (where it aids placement)
 
