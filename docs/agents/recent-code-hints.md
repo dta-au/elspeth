@@ -8,6 +8,57 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — pydantic passes a NESTED mapping through by IDENTITY even
+  under `strict=True`, so a `dict[str, Any]` request field is NOT proof that
+  its inner values are exact dicts.** Measured in B57 on
+  `GuidedRespondRequest`: `model_validate({..., "edited_values": {"plugin":
+  "csv", "options": MappingProxyType({...})}}, strict=True).edited_values
+  ["options"]` is a `mappingproxy`, while the OUTER `edited_values` is coerced
+  to an exact `dict` (a `MappingProxyType` supplied there is rejected
+  outright). This is the mirror image of the B45 entry below — pydantic
+  RECONSTRUCTS a field it has a model for, and passes an `Any` through
+  untouched — and it matters because "the field is annotated `dict`" is the
+  usual argument for converting an inner `isinstance(x, Mapping)` to
+  `type(x) is dict`. It is not a valid one for anything below the annotated
+  level. Over HTTP the JSON decoder only ever produces exact dicts, so such a
+  narrowing is typically LATENT rather than live; say so honestly in a
+  rationale rather than claiming a live break, and check whether any
+  in-process caller (the guided chat lane builds `GuidedRespondRequest`s
+  directly) can reach the site.
+- **2026-08-29 — a guided TURN payload is `deep_thaw`-ed at BOTH of its
+  producers, so the "frozen composition state" argument does NOT transfer to
+  it.** B57 nearly shipped four rationales asserting that
+  `turn["payload"]["knobs"] / ["prefilled"] / ["options"]` arrive as
+  `MappingProxyType` on durable load. Measured, they do not:
+  `_load_durable_current_turn` builds `payload=dict(deep_thaw(prepared.
+  payload))` and `_finalize_guided_turn` builds `payload=dict(deep_thaw(turn
+  ["payload"]))`, so every guided turn payload reaching the route layer is
+  exact `dict`/`list` all the way down. `freeze_guided_json_mapping` really
+  does produce `mappingproxy` + `FrozenJsonArray` (both verified), but the
+  thaw stands between it and every route read — which is exactly the "find the
+  thaw between the frozen owner and the read" test B40's entry prescribes,
+  applied in the direction that DEFEATS the frozen-container claim. The
+  Mapping ABC checks at those sites are still right, on ADR-032 Tier-3
+  read-back grounds and to agree with the `@trust_boundary`-declared
+  `_validate_schema_form_payload` that certifies the same bytes — but a
+  rationale must argue the trust domain, not a container identity that is
+  measurably false. General rule: run the two-line `type()` probe before
+  writing "arrives deep-frozen" into a rationale; a plausible frozen-state
+  story is now the most likely way for a false claim to enter the judge
+  corpus.
+- **2026-08-29 — dispatching on a pydantic discriminated union's own tag
+  clears the R5 findings AND narrows better than the exact-class form.** In
+  `routes/composer/guided.py::_schema8_transition`, six `isinstance(action,
+  <ConcreteAction>)` tests over `GuidedComponentAction` (declared
+  `Annotated[... , Field(discriminator="action")]`) became `action.action ==
+  "add" | "edit" | ...`. This is not a lint dodge: pydantic guarantees the tag
+  matches the class it built, and mypy narrows a `Literal` tag on BOTH
+  branches where `type(x) is C` narrows only the positive one — probed, the
+  exact-class form raises five `union-attr` errors on the `kind` ternary that
+  reads `action.target` / `action.component_kind`. Reach for the tag whenever
+  the union carries a discriminator; keep the closed union's fail-closed
+  `else: raise` arm, which still fires for a tag outside the set.
+
 - **2026-08-29 — POLARITY decides how bad a `type(x) is dict` freeze trap is,
   and an accept-gate that GATES A CONTROL BLOCK is fail-OPEN, not a
   conservative abstention.** Landed by the Wave-3 hygiene lane over the four
