@@ -110,7 +110,9 @@ def _textract_alias_as_bucket_finding(component: _Component, alias_inventory: fr
     if component.plugin_id != PluginId("transform", "aws_textract_document_analysis") or not alias_inventory:
         return None
     for option_name in ("bucket", "bucket_field"):
-        value = component.options.get(option_name)
+        if option_name not in component.options:
+            continue
+        value = component.options[option_name]
         if type(value) is str and value in alias_inventory:
             return PluginPolicyFinding(
                 stage="operator_profile_options",
@@ -156,7 +158,9 @@ def validate_plugin_policy(
             continue
         if component.plugin_id in snapshot.available:
             continue
-        reason = unavailable.get(component.plugin_id, PluginUnavailableReason.NOT_AUTHORIZED)
+        # An authorized-but-unavailable plugin carries its recorded reason; a
+        # plugin the snapshot never declined at all was simply never authorized.
+        reason = unavailable[component.plugin_id] if component.plugin_id in unavailable else PluginUnavailableReason.NOT_AUTHORIZED
         findings.append(
             PluginPolicyFinding(
                 stage="plugin_enablement",
@@ -189,7 +193,7 @@ def validate_plugin_policy(
     selected = dict(snapshot.selected)
     required = tuple(capability for capability, mode in snapshot.control_modes if mode is ControlMode.REQUIRED)
     for capability in required:
-        selected_plugin = selected.get(capability)
+        selected_plugin = selected[capability] if capability in selected else None
         if selected_plugin is not None and selected_plugin in snapshot.available:
             continue
         findings.append(
@@ -374,15 +378,6 @@ def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyF
     )
 
 
-def _plugin_id(kind: Literal["source", "transform", "sink"], name: object) -> PluginId | None:
-    if type(name) is not str:
-        return None
-    try:
-        return PluginId(kind, name)
-    except ValueError:
-        return None
-
-
 def _components(state: CompositionState) -> tuple[_Component, ...]:
     result: list[_Component] = []
     for source_name, source in _stable_source_items(state):
@@ -391,7 +386,7 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
             _Component(
                 component_id=component_id,
                 component_type="source",
-                plugin_id=_plugin_id("source", source.plugin),
+                plugin_id=PluginId.for_name("source", source.plugin),
                 options=(deep_thaw(source.options) if isinstance(source.options, Mapping) else {}),
                 source_on_validation_failure=source.on_validation_failure,
             )
@@ -403,7 +398,7 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
             _Component(
                 component_id=node.id,
                 component_type="transform",
-                plugin_id=_plugin_id("transform", node.plugin),
+                plugin_id=PluginId.for_name("transform", node.plugin),
                 options=deep_thaw(node.options),
                 source_on_validation_failure=None,
             )
@@ -413,7 +408,7 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
             _Component(
                 component_id=output.name,
                 component_type="sink",
-                plugin_id=_plugin_id("sink", output.plugin),
+                plugin_id=PluginId.for_name("sink", output.plugin),
                 options=deep_thaw(output.options),
                 source_on_validation_failure=None,
             )
@@ -450,7 +445,7 @@ def _lower_profiled_components(
         component_options = {name: deep_thaw(value) for name, value in component.options.items()}
         if component.component_type == "source":
             route = component.source_on_validation_failure
-            duplicate_route = component_options.get("on_validation_failure", route)
+            duplicate_route = component_options["on_validation_failure"] if "on_validation_failure" in component_options else route
             if type(route) is not str or type(duplicate_route) is not str or duplicate_route != route:
                 findings.append(
                     PluginPolicyFinding(
@@ -468,8 +463,8 @@ def _lower_profiled_components(
             component_options["on_validation_failure"] = route
         authored_options = {name: value for name, value in component_options.items() if name not in _PROFILE_LOWERING_METADATA_OPTION_KEYS}
         authoring_metadata = {name: value for name, value in component_options.items() if name in _PROFILE_LOWERING_METADATA_OPTION_KEYS}
-        alias = authored_options.pop("profile", None)
-        if not isinstance(alias, str) or alias not in aliases:
+        alias = authored_options.pop("profile") if "profile" in authored_options else None
+        if type(alias) is not str or alias not in aliases:
             findings.append(_profile_unavailable_finding(component, plugin_id, available_aliases=tuple(aliases)))
             continue
         public_schema = resolved_public_schema.json_schema
@@ -485,11 +480,11 @@ def _lower_profiled_components(
             # option (e.g. max_capacity_retry_seconds) read as "profile gone"
             # and no planner could repair it. Unexpected option NAMES are
             # author-authored keys; offending VALUES are never echoed.
-            allowed_properties = set(public_schema.get("properties") or ())
+            allowed_properties = set(public_schema["properties"] or ()) if "properties" in public_schema else set()
             unexpected = sorted(set(public_options) - allowed_properties)
             if unexpected:
-                storage_component_kind = _STORAGE_PROFILED_COMPONENT_KINDS.get(plugin_id)
-                if storage_component_kind is not None:
+                if plugin_id in _STORAGE_PROFILED_COMPONENT_KINDS:
+                    storage_component_kind = _STORAGE_PROFILED_COMPONENT_KINDS[plugin_id]
                     detail = (
                         f"option(s) not authorable on a profile-bound {storage_component_kind}: {unexpected}. "
                         "Remove them; the operator profile supplies the private storage binding."
@@ -557,7 +552,7 @@ def _lower_profiled_components(
             continue
         executable_options = deep_thaw(lowered.executable_options)
         if component.component_type == "source":
-            lowered_route = executable_options.pop("on_validation_failure", None)
+            lowered_route = executable_options.pop("on_validation_failure") if "on_validation_failure" in executable_options else None
             if type(lowered_route) is not str or lowered_route != component.source_on_validation_failure:
                 findings.append(
                     PluginPolicyFinding(
@@ -587,26 +582,25 @@ def _lower_profiled_components(
 
     sources: dict[str, SourceSpec] = {}
     for source_name, source in state.sources.items():
-        component_id = "source" if source_name == "source" else f"source:{source_name}"
-        options = lowered_options.get(("source", component_id))
-        sources[source_name] = source if options is None else replace(source, options=options)
+        source_key = ("source", _source_component_id(source_name))
+        sources[source_name] = replace(source, options=lowered_options[source_key]) if source_key in lowered_options else source
     nodes: list[NodeSpec] = []
     for node in state.nodes:
-        options = lowered_options.get(("transform", node.id))
-        nodes.append(node if options is None else replace(node, options=options))
+        node_key = ("transform", node.id)
+        nodes.append(replace(node, options=lowered_options[node_key]) if node_key in lowered_options else node)
     outputs: list[OutputSpec] = []
     for output in state.outputs:
-        options = lowered_options.get(("sink", output.name))
-        outputs.append(output if options is None else replace(output, options=options))
+        output_key = ("sink", output.name)
+        outputs.append(replace(output, options=lowered_options[output_key]) if output_key in lowered_options else output)
     profiled_s3_audit_identities = tuple(
-        (source_name, identity)
+        (source_name, s3_audit_identities_by_component[component_id])
         for source_name in sources
-        if (identity := s3_audit_identities_by_component.get("source" if source_name == "source" else f"source:{source_name}")) is not None
+        if (component_id := _source_component_id(source_name)) in s3_audit_identities_by_component
     )
     profiled_textract_audit_identities = tuple(
-        (node.id, textract_identity)
+        (node.id, textract_audit_identities_by_component[node.id])
         for node in state.nodes
-        if (textract_identity := textract_audit_identities_by_component.get(node.id)) is not None
+        if node.id in textract_audit_identities_by_component
     )
     return (
         replace(state, sources=sources, nodes=tuple(nodes), outputs=tuple(outputs)),
