@@ -6,6 +6,7 @@ import * as api from "@/api/client";
 import { useAuthStore } from "@/stores/authStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 import { unavailablePluginDisplayName } from "./UnavailableComponentRow";
 
 vi.mock("@/api/client", () => ({
@@ -381,6 +382,11 @@ const azure = {
 
 describe("CatalogDrawer — Phase 7B reshape", () => {
   beforeEach(() => {
+    // This block's capability-tag filter chips (elspeth-8555a6a9e0: hidden
+    // by default) are the feature under test here, not the detail-level
+    // gate — set the flag on so the pre-existing filter-chip assertions
+    // still exercise the mechanism they were written to pin.
+    usePreferencesStore.setState({ showAdvanced: true });
     usePluginCatalogStore.getState().clear();
     useSessionStore.setState({ compositionState: null } as never);
     vi.mocked(api.listSources).mockResolvedValue({

@@ -8,11 +8,15 @@
 //      variant, labelled via the discriminator mapping.
 // ============================================================================
 
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, within, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PluginCard } from "./PluginCard";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
+
+beforeEach(() => resetStore(usePreferencesStore));
 
 function makePlugin(overrides: Partial<PluginSummary> = {}): PluginSummary {
   return {
@@ -81,6 +85,24 @@ const DISCRIMINATED_SCHEMA: PluginSchemaInfo = {
   },
 };
 
+// Fixtures for the detail-level describe block below (elspeth-8555a6a9e0).
+// Written as distinct literals rather than reusing makePlugin()/FLAT_SCHEMA:
+// those existing fixtures' audit_characteristics and json_schema.required
+// don't match what the gating tests need to assert against.
+const CARD_PLUGIN: PluginSummary = makePlugin({
+  audit_characteristics: ["deterministic", "quarantine", "credentials", "coerce"],
+});
+
+const CARD_SCHEMA: PluginSchemaInfo = {
+  name: "example",
+  plugin_type: "transform",
+  description: "An example plugin",
+  json_schema: {
+    properties: { profile: { type: "string" } },
+    required: ["profile"],
+  },
+};
+
 describe("PluginCard — collapsed header", () => {
   it("renders display name (primary), raw id (metadata), and description without expanding", () => {
     render(
@@ -122,6 +144,11 @@ describe("PluginCard — collapsed header", () => {
 });
 
 describe("PluginCard — flat single-model schema", () => {
+  // These tests exercise the Schema disclosure mechanics themselves (not the
+  // detail-level gate), so they need the Schema button visible — see the
+  // "detail level (elspeth-8555a6a9e0)" describe block below for the gate.
+  beforeEach(() => usePreferencesStore.setState({ showAdvanced: true }));
+
   it("links the schema disclosure to the expanded schema panel", async () => {
     const user = userEvent.setup();
     render(
@@ -163,6 +190,10 @@ describe("PluginCard — flat single-model schema", () => {
 });
 
 describe("PluginCard — discriminated union", () => {
+  // Schema-disclosure mechanics — needs the Schema button visible; see the
+  // "detail level (elspeth-8555a6a9e0)" describe block for the gate itself.
+  beforeEach(() => usePreferencesStore.setState({ showAdvanced: true }));
+
   it("renders one section per variant labelled by discriminator value", async () => {
     const user = userEvent.setup();
     render(
@@ -345,6 +376,10 @@ describe("PluginCard — discriminated union", () => {
 });
 
 describe("PluginCard — error and loading states", () => {
+  // Schema-disclosure mechanics — needs the Schema button visible; see the
+  // "detail level (elspeth-8555a6a9e0)" describe block for the gate itself.
+  beforeEach(() => usePreferencesStore.setState({ showAdvanced: true }));
+
   it("shows schema error message and suppresses content", async () => {
     const user = userEvent.setup();
     const onRetrySchema = vi.fn();
@@ -418,6 +453,9 @@ describe("PluginCard — Phase 7B reshape", () => {
   });
 
   it("renders one audit-characteristic icon per flag", () => {
+    // io_read is not one of the DEFAULT_VISIBLE_AUDIT_FLAGS; this test pins
+    // the general per-flag rendering mechanism, not the detail-level gate.
+    usePreferencesStore.setState({ showAdvanced: true });
     render(
       <PluginCard
         plugin={makePlugin({ audit_characteristics: ["io_read", "quarantine"] })}
@@ -432,6 +470,9 @@ describe("PluginCard — Phase 7B reshape", () => {
   it("exposes the audit strip as a group named 'Audit characteristics' (WCAG 1.3.1)", () => {
     // aria-label on a role-less div is not exposed to AT; the strip must
     // carry role="group" for the label to associate (elspeth-37293a3b7c).
+    // io_read is not a DEFAULT_VISIBLE_AUDIT_FLAGS entry, so the flag must
+    // be on for the strip to render at all.
+    usePreferencesStore.setState({ showAdvanced: true });
     render(
       <PluginCard
         plugin={makePlugin({ audit_characteristics: ["io_read"] })}
@@ -827,6 +868,7 @@ describe("PluginCard — Phase 7B reshape", () => {
   });
 
   it("calls onExpand when the 'Schema →' disclosure is activated", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     const onExpand = vi.fn();
     render(<PluginCard plugin={makePlugin({ name: "csv" })} schema={null} onExpand={onExpand} />);
     const disclosure = screen.getByRole("button", { name: /schema for csv/i });
@@ -835,6 +877,7 @@ describe("PluginCard — Phase 7B reshape", () => {
   });
 
   it("renders the expanded schema after onExpand resolves and schema arrives", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     const schema: PluginSchemaInfo = {
       name: "csv",
       plugin_type: "source",
@@ -846,5 +889,39 @@ describe("PluginCard — Phase 7B reshape", () => {
     } as unknown as PluginSchemaInfo;
     render(<PluginCard plugin={makePlugin({ name: "csv" })} schema={schema} onExpand={() => {}} initialExpanded />);
     expect(screen.getByText("path")).toBeInTheDocument();
+  });
+});
+
+describe("detail level (elspeth-8555a6a9e0)", () => {
+  it("shows only the behavioural flags and no Schema button by default", () => {
+    render(<PluginCard plugin={CARD_PLUGIN} schema={null} onExpand={vi.fn()} />);
+    const strip = screen.getByRole("group", { name: "Audit characteristics" });
+    expect(within(strip).getByText("quarantines bad rows")).toBeInTheDocument();
+    expect(within(strip).getByText("needs credentials")).toBeInTheDocument();
+    expect(within(strip).queryByText("deterministic")).not.toBeInTheDocument();
+    expect(within(strip).queryByText("can coerce types")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Schema for / })).not.toBeInTheDocument();
+  });
+
+  it("shows all flags, the Schema button, and separated schema columns with show_advanced on", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(<PluginCard plugin={CARD_PLUGIN} schema={CARD_SCHEMA} onExpand={vi.fn()} initialExpanded />);
+    const strip = screen.getByRole("group", { name: "Audit characteristics" });
+    for (const label of ["deterministic", "quarantines bad rows", "needs credentials", "can coerce types"]) {
+      expect(within(strip).getByText(label)).toBeInTheDocument();
+    }
+    expect(screen.getByRole("button", { name: /^Schema for / })).toBeInTheDocument();
+    const row = screen.getByText("profile").closest(".plugin-card-field-row") as HTMLElement;
+    expect(within(row).getByText("string")).toBeInTheDocument();
+    expect(within(row).getByText("required")).toBeInTheDocument();
+  });
+
+  it("closes an open Schema panel when the flag goes off on a mounted card", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(<PluginCard plugin={CARD_PLUGIN} schema={CARD_SCHEMA} onExpand={vi.fn()} initialExpanded />);
+    expect(screen.getByText("profile")).toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: false }));
+    expect(screen.queryByText("profile")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Schema for / })).not.toBeInTheDocument();
   });
 });

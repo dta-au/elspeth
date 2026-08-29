@@ -13,7 +13,8 @@
 
 import { useCallback } from "react";
 import { Button } from "@/components/ui";
-import { lookupAuditCharacteristic } from "./auditCharacteristics";
+import { useShowAdvanced } from "@/stores/preferencesStore";
+import { DEFAULT_VISIBLE_AUDIT_FLAGS, lookupAuditCharacteristic } from "./auditCharacteristics";
 
 // Trust tier is kind-derived internal metadata (see 16b OD-C rationale):
 // it is not surfaced as a filter dimension in the catalog UI.
@@ -42,6 +43,7 @@ export function FilterChipStrip({
   filters,
   onChange,
 }: FilterChipStripProps) {
+  const showAdvanced = useShowAdvanced();
   const anyActive =
     filters.capabilityTags.size > 0 ||
     filters.auditCharacteristics.size > 0;
@@ -63,12 +65,16 @@ export function FilterChipStrip({
     [onChange],
   );
 
+  const visibleAuditCharacteristics = availableAuditCharacteristics.filter(
+    (flag) => showAdvanced || (DEFAULT_VISIBLE_AUDIT_FLAGS as readonly string[]).includes(flag),
+  );
+
   return (
     // role="group" so "Catalog filters" is exposed as the strip's accessible
     // name — aria-label on a role-less div (role=generic) is ignored by AT
     // (WCAG 1.3.1, elspeth-37293a3b7c).
     <div className="filter-chip-strip" role="group" aria-label="Catalog filters">
-      {availableCapabilityTags.length > 0 && (
+      {showAdvanced && availableCapabilityTags.length > 0 && (
         <ChipGroup label="Capability">
           {availableCapabilityTags.map((tag) => (
             <Chip
@@ -80,9 +86,9 @@ export function FilterChipStrip({
           ))}
         </ChipGroup>
       )}
-      {availableAuditCharacteristics.length > 0 && (
+      {visibleAuditCharacteristics.length > 0 && (
         <ChipGroup label="Audit">
-          {availableAuditCharacteristics.map((flag) => {
+          {visibleAuditCharacteristics.map((flag) => {
             const meta = lookupAuditCharacteristic(flag);
             const label = meta?.label ?? flag;
             return (
