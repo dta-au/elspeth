@@ -47,6 +47,7 @@ import {
 import { plural } from "@/utils/plural";
 import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
 import { Button, TypeBadge } from "@/components/ui";
+import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import type { CompositionState } from "@/types/index";
 
 import { ConfigRows } from "./ConfigRows";
@@ -556,6 +557,7 @@ interface SelectedComponentConfig {
   id: string;
   typeLabel: MiniMapNodeKind;
   plugin: string | null;
+  pluginKind: "source" | "transform" | "sink";
   connections: Record<string, unknown>;
   options: Record<string, unknown>;
 }
@@ -620,6 +622,7 @@ function selectedComponentConfig(
       id: componentId,
       typeLabel: "source",
       plugin: source.plugin,
+      pluginKind: "source",
       connections: withoutNullishFields({
         on_success: source.on_success,
         on_validation_failure: source.on_validation_failure,
@@ -634,6 +637,7 @@ function selectedComponentConfig(
       id: node.id,
       typeLabel: node.node_type,
       plugin: node.plugin,
+      pluginKind: "transform",
       connections: withoutNullishFields({
         input: node.input,
         on_success: node.on_success,
@@ -658,6 +662,7 @@ function selectedComponentConfig(
       id: output.name,
       typeLabel: "sink",
       plugin: output.plugin,
+      pluginKind: "sink",
       connections: {},
       options: output.options,
     };
@@ -695,7 +700,12 @@ function NodeConfigPanel({
           <TypeBadge type={config.typeLabel} />
           <h3>{config.id} config</h3>
           {config.plugin && (
-            <p className="graph-config-plugin">{config.plugin}</p>
+            /* Human register on the line, the raw catalog id in `title`
+               (elspeth-ca456d9d8d) — the config panel names the plugin's
+               identity, so it uses the catalog register. */
+            <p className="graph-config-plugin" title={config.plugin}>
+              {pluginDisplayName(config.plugin)}
+            </p>
           )}
         </div>
         <Button
@@ -715,7 +725,11 @@ function NodeConfigPanel({
 
       <section className="graph-config-section">
         <h4>Settings</h4>
-        <OptionRows options={config.options} ariaLabel={`${config.id} settings`} />
+        <OptionRows
+          options={config.options}
+          ariaLabel={`${config.id} settings`}
+          plugin={config.plugin === null ? null : { kind: config.pluginKind, name: config.plugin }}
+        />
       </section>
 
       <details className="graph-config-section graph-config-connections">

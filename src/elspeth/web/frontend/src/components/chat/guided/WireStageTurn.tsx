@@ -2,8 +2,11 @@ import { useId, useState } from "react";
 
 import { Button } from "@/components/ui";
 import type { GuidedEditTarget, NodeOptionSummary, ProposalFlow, ProposalNodeBehavior, WireRowCardinality, WireStageData } from "@/types/guided";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { focusAcknowledgementCard } from "../AcknowledgementCard";
 import { stepLabelForPlugin } from "../interpretationStepLabel";
+import { behaviorSummary, humanToken } from "./behaviorSummary";
+import { optionTier } from "./optionTiers";
 import { WireReviewList } from "./WireReviewList";
 
 /**
@@ -119,10 +122,6 @@ export function routesSummaryText(edges: WireEdge[]): string {
   return parts.length > 0 ? `${heading} — ${parts.join(", ")}` : heading;
 }
 
-function humanToken(value: string): string {
-  return value.replace(/_/g, " ");
-}
-
 function cardinalityText(cardinality: WireRowCardinality): string {
   const expected = cardinality.expected_output_count === null
     ? ""
@@ -202,9 +201,11 @@ function behaviorDetails(
     }
     case "gate":
       return [
-        // The authored predicate, verbatim (F11) — followed by each
-        // author-visible route key resolved to the entity it feeds.
-        `When ${behavior.condition}`,
+        // The authored predicate itself (F11, verbatim) is the row's
+        // always-visible summary line now (elspeth-ca456d9d8d), so the
+        // disclosure starts at each author-visible route key resolved to the
+        // entity it feeds — repeating the predicate here would print the same
+        // sentence twice in one row.
         ...behavior.routes.map(({ alias, key }) => {
           const destination = routeDestination(alias);
           return destination === null
@@ -287,6 +288,7 @@ export function WireStageTurn({
   validationIssues,
   onCorrect,
 }: WireStageTurnProps) {
+  const showAdvanced = useShowAdvanced();
   const edges = reconstructWireEdges(data);
   const entityNames = buildEntityNames(data);
   const nameFor = (id: string): string => entityNames.get(id) ?? id;
@@ -428,11 +430,15 @@ export function WireStageTurn({
             <ul>
               {data.sources.map((source) => (
                 <li key={source.stable_id}>
-                  <strong>{source.label}</strong> <span>({source.plugin})</span>
-                  <p>{cardinalityText(source.row_cardinality)}</p>
-                  <p>{fieldsText("Guaranteed", source.guaranteed_fields)}</p>
+                  <strong>{source.label}</strong>{" "}
+                  <span>({stepLabelForPlugin(source.plugin)})</span>
                   <p>Validation failure: {humanToken(source.on_validation_failure)}</p>
-                  <details><summary>Stable ID</summary><code>{source.stable_id}</code></details>
+                  <details className="wire-stage__row-technical" open={showAdvanced}>
+                    <summary>Technical details</summary>
+                    <p>{cardinalityText(source.row_cardinality)}</p>
+                    <p>{fieldsText("Guaranteed", source.guaranteed_fields)}</p>
+                    <p>Stable ID: <code>{source.stable_id}</code></p>
+                  </details>
                 </li>
               ))}
             </ul>
@@ -445,30 +451,47 @@ export function WireStageTurn({
             <ul>
               {data.nodes.map((node) => (
                 <li key={node.stable_id}>
-                  <strong>{node.label}</strong> <span>({node.plugin ?? humanToken(node.node_type)})</span>
-                  <p>{cardinalityText(node.row_cardinality)}</p>
-                  <p>{fieldsText("Required", node.required_fields)}</p>
-                  <p>{fieldsText("Guaranteed", node.guaranteed_fields)}</p>
-                  {behaviorDetails(
-                    node.behavior,
-                    routeDestinationFor(node.stable_id),
-                    (stableId) => data.nodes.find((candidate) => candidate.stable_id === stableId)?.label ?? null,
-                  ).map((detail) => <p key={detail}>{detail}</p>)}
-                  {node.node_options_summary.map((entry) => (
-                    <p key={entry.key}>{nodeOptionText(entry)}</p>
-                  ))}
-                  {node.structured_output_fields.length > 0 ? (
-                    <ul aria-label={`${node.label} structured output fields`}>
-                      {node.structured_output_fields.map((field) => (
-                        <li key={`${field.query}:${field.field}`}>
-                          {`${field.field} (${field.type}) from ${field.query}${
-                            field.enum_values.length > 0 ? `; values: ${field.enum_values.join(", ")}` : ""
-                          }`}
-                        </li>
+                  <strong>{node.label}</strong>{" "}
+                  <span>({stepLabelForPlugin(node.plugin ?? node.node_type)})</span>
+                  <p>
+                    {node.behavior.kind === "gate"
+                      ? `When ${node.behavior.condition}`
+                      : behaviorSummary(node.behavior, (stableId) =>
+                          data.nodes.find((candidate) => candidate.stable_id === stableId)?.label ?? null)}
+                  </p>
+                  {node.node_options_summary
+                    .filter((entry) => optionTier(entry) !== "advanced")
+                    .map((entry) => (
+                      <p key={entry.key}>{nodeOptionText(entry)}</p>
+                    ))}
+                  <details className="wire-stage__row-technical" open={showAdvanced}>
+                    <summary>Technical details</summary>
+                    <p>{cardinalityText(node.row_cardinality)}</p>
+                    <p>{fieldsText("Required", node.required_fields)}</p>
+                    <p>{fieldsText("Guaranteed", node.guaranteed_fields)}</p>
+                    {behaviorDetails(
+                      node.behavior,
+                      routeDestinationFor(node.stable_id),
+                      (stableId) => data.nodes.find((candidate) => candidate.stable_id === stableId)?.label ?? null,
+                    ).map((detail) => <p key={detail}>{detail}</p>)}
+                    {node.node_options_summary
+                      .filter((entry) => optionTier(entry) === "advanced")
+                      .map((entry) => (
+                        <p key={entry.key}>{nodeOptionText(entry)}</p>
                       ))}
-                    </ul>
-                  ) : null}
-                  <details><summary>Stable ID</summary><code>{node.stable_id}</code></details>
+                    {node.structured_output_fields.length > 0 ? (
+                      <ul aria-label={`${node.label} structured output fields`}>
+                        {node.structured_output_fields.map((field) => (
+                          <li key={`${field.query}:${field.field}`}>
+                            {`${field.field} (${field.type}) from ${field.query}${
+                              field.enum_values.length > 0 ? `; values: ${field.enum_values.join(", ")}` : ""
+                            }`}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    <p>Stable ID: <code>{node.stable_id}</code></p>
+                  </details>
                 </li>
               ))}
             </ul>
@@ -481,24 +504,28 @@ export function WireStageTurn({
             <ul>
               {data.outputs.map((output) => (
                 <li key={output.stable_id}>
-                  <strong>{output.label}</strong> <span>({output.plugin})</span>
-                  <p>{fieldsText("Required", output.required_fields)}</p>
+                  <strong>{output.label}</strong>{" "}
+                  <span>({stepLabelForPlugin(output.plugin)})</span>
                   <p>Write failure: {humanToken(output.on_write_failure)}</p>
-                  <p>Schema mode: {humanToken(output.business_schema.mode)}</p>
-                  {output.business_schema.fields.length > 0 ? (
-                    <ul aria-label={`${output.label} business schema fields`}>
-                      {output.business_schema.fields.map((field) => (
-                        <li key={field.name}>
-                          {`${field.name}: ${field.type} — ${field.required ? "required" : "optional"}, ${
-                            field.nullable ? "nullable" : "non-null"
-                          }`}
-                        </li>
-                      ))}
-                    </ul>
-                  ) : null}
-                  <p>{fieldsText("Guaranteed", output.business_schema.guaranteed_fields)}</p>
-                  <p>{fieldsText("Required", output.business_schema.required_fields)}</p>
-                  <details><summary>Stable ID</summary><code>{output.stable_id}</code></details>
+                  <details className="wire-stage__row-technical" open={showAdvanced}>
+                    <summary>Technical details</summary>
+                    <p>{fieldsText("Required", output.required_fields)}</p>
+                    <p>Schema mode: {humanToken(output.business_schema.mode)}</p>
+                    {output.business_schema.fields.length > 0 ? (
+                      <ul aria-label={`${output.label} business schema fields`}>
+                        {output.business_schema.fields.map((field) => (
+                          <li key={field.name}>
+                            {`${field.name}: ${field.type} — ${field.required ? "required" : "optional"}, ${
+                              field.nullable ? "nullable" : "non-null"
+                            }`}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    <p>{fieldsText("Guaranteed", output.business_schema.guaranteed_fields)}</p>
+                    <p>{fieldsText("Required", output.business_schema.required_fields)}</p>
+                    <p>Stable ID: <code>{output.stable_id}</code></p>
+                  </details>
                 </li>
               ))}
             </ul>

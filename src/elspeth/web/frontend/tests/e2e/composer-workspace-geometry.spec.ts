@@ -729,6 +729,13 @@ test.describe("Composer deterministic workspace geometry", () => {
       await setShowAdvanced(ctx, true);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
+      // The bar's width now depends on Import YAML being mounted, and that
+      // button appears only when fetchUserComposerPreferences() resolves
+      // (preferencesStore). Without this barrier a boundingBox capture can
+      // resolve against the pre-mount, two-verb bar while the button's own
+      // auto-waiting locator resolves post-mount — every button assertion
+      // passes and only the reason's wrapped height is wrong.
+      await expect(composer.importYaml()).toBeVisible();
       await expect(composer.validationStatus()).toHaveAccessibleName(
         "Validation: Passed",
       );
@@ -805,6 +812,13 @@ test.describe("Composer deterministic workspace geometry", () => {
       await setShowAdvanced(ctx, true);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
+      // The bar's width now depends on Import YAML being mounted, and that
+      // button appears only when fetchUserComposerPreferences() resolves
+      // (preferencesStore). Without this barrier a boundingBox capture can
+      // resolve against the pre-mount, two-verb bar while the button's own
+      // auto-waiting locator resolves post-mount — every button assertion
+      // passes and only the reason's wrapped height is wrong.
+      await expect(composer.importYaml()).toBeVisible();
 
       // Asserted, not assumed. Without the reason line in flow the completion
       // group is the same height as the status group and both invariants hold
@@ -892,6 +906,13 @@ test.describe("Composer deterministic workspace geometry", () => {
       await setShowAdvanced(ctx, true);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
+      // The bar's width now depends on Import YAML being mounted, and that
+      // button appears only when fetchUserComposerPreferences() resolves
+      // (preferencesStore). Without this barrier a boundingBox capture can
+      // resolve against the pre-mount, two-verb bar while the button's own
+      // auto-waiting locator resolves post-mount — every button assertion
+      // passes and only the reason's wrapped height is wrong.
+      await expect(composer.importYaml()).toBeVisible();
       const reason = page.locator(".side-rail-execute-reason");
       await expect(reason).toBeVisible();
       await expect(composer.validationStatus()).toHaveAccessibleName(
@@ -957,16 +978,27 @@ test.describe("Composer deterministic workspace geometry", () => {
      the bar back on flex-start the chips (and the control) would sit above the
      buttons by half the difference — the elspeth-15e8cff7a5 misregistration
      from the other side. 900 tall so the density regime does not widen the
-     column and hand the reason two lines instead of three. */
+     column and hand the reason two lines instead of three. Measured against
+     the TECHNICAL-MODE three-verb bar: the three-line wrap is a property of
+     the reason column's width, and Wave 2 gates Import YAML on show_advanced,
+     so the DEFAULT bar is a two-verb bar whose wider reason column wraps to
+     two lines (36px) and cannot exercise the alignment at all. The flag is
+     seeded here exactly as the sibling tests seed it. */
   test("a three-line reason keeps the chips, the verbs and the collapse control on one centre", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1280, height: 900 });
     const sessionId = await installWorkspaceScenario(page, "validation-audit-issues");
     const composer = new ComposerPage(page);
+    const ctx = await authedContext(tokenFromStorageState(await page.context().storageState()));
     try {
+      await setShowAdvanced(ctx, true);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
+      // Both a precondition and a barrier: the three-verb bar must be mounted
+      // before anything is measured, and Import YAML mounts only when
+      // fetchUserComposerPreferences() resolves.
+      await expect(composer.importYaml()).toBeVisible();
       await expect(composer.validationStatus()).toHaveAccessibleName(
         "Validation: 24 errors",
       );
@@ -1001,6 +1033,7 @@ test.describe("Composer deterministic workspace geometry", () => {
       expect(bottomRow).not.toBeNull();
       expectBottomRowContract(bottomRow!);
     } finally {
+      await setShowAdvanced(ctx, false);
       await deleteWorkspaceScenario(page, sessionId);
     }
   });

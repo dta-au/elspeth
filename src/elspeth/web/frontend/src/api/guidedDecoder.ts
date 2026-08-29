@@ -193,15 +193,23 @@ function stringArray(value: unknown, path: string): string[] {
 
 /** The allowlisted node options the backend already rendered as display text
  *  (R2-F3). The key vocabulary is server-owned and enforced server-side, so
- *  this seam pins the SHAPE — an exact {key, value} string pair — and leaves
- *  which keys are publishable to the projection's own allowlist. */
+ *  this seam pins the SHAPE — a {key, value} string pair plus an OPTIONAL
+ *  presentational `tier` — and leaves which keys are publishable to the
+ *  projection's own allowlist. `tier` is optional because fresh projections
+ *  always emit it while durable turns written before it landed do not
+ *  (elspeth-ca456d9d8d); an absent tier reads as "common" (see optionTiers). */
 function nodeOptionsSummary(value: unknown, path: string): NodeOptionSummary[] {
-  return arrayValue(value, path).map((item, index) => {
+  return arrayValue(value, path).map((item, index): NodeOptionSummary => {
     const entryPath = `${path}[${index}]`;
-    const entry = exactRecord(item, entryPath, ["key", "value"]);
+    const entry = exactRecord(item, entryPath, ["key", "value"], ["tier"]);
+    const tier = entry.tier === undefined ? undefined : stringValue(entry.tier, `${entryPath}.tier`);
+    if (tier !== undefined && tier !== "essential" && tier !== "common" && tier !== "advanced") {
+      invalid(`${entryPath}.tier`, "expected a composer field tier");
+    }
     return {
       key: stringValue(entry.key, `${entryPath}.key`),
       value: stringValue(entry.value, `${entryPath}.value`),
+      ...(tier === undefined ? {} : { tier }),
     };
   });
 }

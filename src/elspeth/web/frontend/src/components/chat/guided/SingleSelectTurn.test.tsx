@@ -94,11 +94,13 @@ describe("SingleSelectTurn — option click", () => {
       id: "00000000-0000-4000-8000-000000000831",
       filename: "first.csv",
       sizeBytes: 16,
+      createdAt: "2026-07-26T09:00:00Z",
     };
     const second = {
       id: "00000000-0000-4000-8000-000000000832",
       filename: "second.csv",
       sizeBytes: 16,
+      createdAt: "2026-07-26T09:00:00Z",
     };
     const { rerender } = render(
       <SingleSelectTurn
@@ -161,11 +163,13 @@ describe("SingleSelectTurn — option click", () => {
           id: "00000000-0000-4000-8000-000000000841",
           filename: "first.csv",
           sizeBytes: 16,
+          createdAt: "2026-07-26T09:00:00Z",
         },
         {
           id: "00000000-0000-4000-8000-000000000842",
           filename: "second.csv",
           sizeBytes: 24,
+          createdAt: "2026-07-26T09:00:00Z",
         },
       ];
       render(
@@ -239,11 +243,13 @@ describe("SingleSelectTurn — allow_custom=true", () => {
         id: "00000000-0000-4000-8000-000000000821",
         filename: "first.csv",
         sizeBytes: 16,
+        createdAt: "2026-07-26T09:00:00Z",
       },
       {
         id: "00000000-0000-4000-8000-000000000822",
         filename: "second.csv",
         sizeBytes: 24,
+        createdAt: "2026-07-26T09:00:00Z",
       },
     ];
     render(
@@ -275,11 +281,13 @@ describe("SingleSelectTurn — allow_custom=true", () => {
         id: "00000000-0000-4000-8000-000000000831",
         filename: "first.csv",
         sizeBytes: 16,
+        createdAt: "2026-07-26T09:00:00Z",
       },
       {
         id: "00000000-0000-4000-8000-000000000832",
         filename: "second.csv",
         sizeBytes: 24,
+        createdAt: "2026-07-26T09:00:00Z",
       },
     ];
     const { rerender } = render(
@@ -408,5 +416,112 @@ describe("SingleSelectTurn — tutorial passive mode", () => {
     expect(
       screen.getByText(/choosing an option continues/i),
     ).toBeInTheDocument();
+  });
+});
+
+// ── Duplicate-filename disambiguation (elspeth-ca456d9d8d) ───────────────────
+
+describe("SingleSelectTurn — duplicate source filenames", () => {
+  // Locale/timezone are the runner's, so the expectation is computed with the
+  // same formatter the component uses rather than hard-coded.
+  const uploadTime = new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+
+  it("names two same-named uploads by upload time when the times separate them", () => {
+    const earlier = {
+      id: "00000000-0000-4000-8000-000000000851",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:04:00Z",
+    };
+    const later = {
+      id: "00000000-0000-4000-8000-000000000852",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:37:00Z",
+    };
+    render(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[earlier, later]}
+        sourceBlobChoiceRequired
+      />,
+    );
+
+    expect(
+      screen.getByRole("option", {
+        name: `duplicate.csv (uploaded ${uploadTime.format(new Date(earlier.createdAt))})`,
+      }),
+    ).toHaveValue(earlier.id);
+    expect(
+      screen.getByRole("option", {
+        name: `duplicate.csv (uploaded ${uploadTime.format(new Date(later.createdAt))})`,
+      }),
+    ).toHaveValue(later.id);
+  });
+
+  it("falls back to size + id fragment when the uploads share a minute", () => {
+    const first = {
+      id: "00000000-0000-4000-8000-000000000861",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:04:11Z",
+    };
+    const second = {
+      id: "00000000-0000-4000-8000-000000000862",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:04:52Z",
+    };
+    render(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[first, second]}
+        sourceBlobChoiceRequired
+      />,
+    );
+
+    expect(
+      screen.getByRole("option", { name: "duplicate.csv — 16 B — ID 00000861" }),
+    ).toHaveValue(first.id);
+    expect(
+      screen.getByRole("option", { name: "duplicate.csv — 16 B — ID 00000862" }),
+    ).toHaveValue(second.id);
+  });
+
+  it("falls back to size + id fragment when an upload time is unusable", () => {
+    // Intl.DateTimeFormat.format() throws on an invalid Date: the label must
+    // degrade, never crash the turn.
+    const good = {
+      id: "00000000-0000-4000-8000-000000000871",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:04:00Z",
+    };
+    const broken = {
+      id: "00000000-0000-4000-8000-000000000872",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "not a timestamp",
+    };
+    render(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[good, broken]}
+        sourceBlobChoiceRequired
+      />,
+    );
+
+    expect(
+      screen.getByRole("option", { name: "duplicate.csv — 16 B — ID 00000871" }),
+    ).toHaveValue(good.id);
+    expect(
+      screen.getByRole("option", { name: "duplicate.csv — 16 B — ID 00000872" }),
+    ).toHaveValue(broken.id);
   });
 });

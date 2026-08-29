@@ -461,6 +461,21 @@
   color: var(--color-text-secondary);
 }
 
+/* Per-row technical disclosure on each source / node / output entry: the
+   cardinality enums, field lists and stable id an operator needs, held out of
+   the default read and opened by the show_advanced preference
+   (elspeth-ca456d9d8d). Deliberately quieter than .wire-stage__raw above,
+   which is a routes-level dump and is NOT flag-controlled. */
+.wire-stage__row-technical {
+  margin-top: var(--space-2xs);
+}
+
+.wire-stage__row-technical > summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
 /* ── Wire-stage inventory (operator pass 2026-07-22) ──────────────────────────
    The proposal card's structure applied to the wiring review: grid rhythm,
    grouped regions with quiet headings, component entries as bounded card rows

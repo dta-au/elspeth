@@ -1,9 +1,37 @@
-import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-import type { WireStageData } from "@/types/guided";
+import { stepLabelForPlugin } from "@/components/chat/interpretationStepLabel";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+import { resetStore } from "@/test/store-helpers";
+import type { NodeOptionSummary, WireStageData } from "@/types/guided";
 import { buildEntityNames, reconstructWireEdges, WireStageTurn } from "./WireStageTurn";
+
+// WireStageTurn reads show_advanced through useShowAdvanced(); the store is a
+// module singleton, so every test in this file starts from the default (off).
+beforeEach(() => resetStore(usePreferencesStore));
+
+/** The routes-level raw-edge dump's expander. Every component row now carries
+ *  its own "Technical details" summary too (elspeth-ca456d9d8d), so the pins
+ *  on THIS one address it by its class. */
+function rawDetails(container: HTMLElement): HTMLElement {
+  const details = container.querySelector("details.wire-stage__raw");
+  expect(details).not.toBeNull();
+  return details as HTMLElement;
+}
+
+/** Text of a region with the per-row Technical details subtrees removed — a
+ *  closed <details> still contributes to textContent, so "not in the default
+ *  row" has to be asserted against the row MINUS its disclosure. */
+function defaultRowText(region: HTMLElement): string {
+  const clone = region.cloneNode(true) as HTMLElement;
+  for (const details of clone.querySelectorAll("details.wire-stage__row-technical")) {
+    details.remove();
+  }
+  return clone.textContent ?? "";
+}
 
 const SOURCE_ID = "00000000-0000-4000-8000-000000000010";
 const NODE_ID = "00000000-0000-4000-8000-000000000020";
@@ -285,10 +313,12 @@ describe("WireStageTurn", () => {
         ? { ...connection, schema_contract: { ...connection.schema_contract!, missing_fields: ["body"], satisfied: false } }
         : connection),
     });
-    render(<WireStageTurn data={data} onConfirm={vi.fn()} confirmDisabled={false} />);
+    const { container } = render(<WireStageTurn data={data} onConfirm={vi.fn()} confirmDisabled={false} />);
     expect(screen.getByText("Review expansion cardinality.")).toBeInTheDocument();
     expect(screen.getByText("Missing fields: body")).toBeInTheDocument();
-    expect(screen.getByText("Technical details")).toBeInTheDocument();
+    expect(within(rawDetails(container)).getByText("Technical details")).toBeInTheDocument();
+    // The stable ids moved into the per-row disclosures (elspeth-ca456d9d8d).
+    expect(within(container).getAllByText(/^Stable ID:/)).toHaveLength(3);
   });
 
   it("renders the key transform options a behavior discriminant alone cannot show", () => {
@@ -323,8 +353,8 @@ describe("WireStageTurn", () => {
         ? { ...connection, schema_contract: null }
         : connection),
     });
-    render(<WireStageTurn data={data} onConfirm={vi.fn()} confirmDisabled={false} />);
-    await userEvent.click(screen.getByText("Technical details"));
+    const { container } = render(<WireStageTurn data={data} onConfirm={vi.fn()} confirmDisabled={false} />);
+    await userEvent.click(within(rawDetails(container)).getByText("Technical details"));
 
     expect(screen.queryByText(/\(contract unchecked\)/)).not.toBeInTheDocument();
     expect(
@@ -347,8 +377,8 @@ describe("WireStageTurn", () => {
           ? { ...connection, schema_contract: null }
           : connection),
     });
-    render(<WireStageTurn data={data} onConfirm={vi.fn()} confirmDisabled={false} />);
-    await userEvent.click(screen.getByText("Technical details"));
+    const { container } = render(<WireStageTurn data={data} onConfirm={vi.fn()} confirmDisabled={false} />);
+    await userEvent.click(within(rawDetails(container)).getByText("Technical details"));
 
     const rawRows = screen.getByText(/00000000-0000-4000-8000-000000000041/).textContent ?? "";
     expect(rawRows).toContain("(contract not statically checked)");
@@ -610,5 +640,79 @@ describe("WireStageTurn", () => {
     expect(screen.getByText("6 routes — 1 connected, 5 not yet checked")).toBeInTheDocument();
     expect(screen.getAllByText("not yet checked")).toHaveLength(5);
     expect(screen.getByText(new RegExp(EDGE_ID))).toBeInTheDocument();
+  });
+});
+
+describe("detail level (elspeth-ca456d9d8d)", () => {
+  const withNodeOptions = (node_options_summary: NodeOptionSummary[]): WireStageData => {
+    const base = canonicalData();
+    return { ...base, nodes: [{ ...base.nodes[0], node_options_summary }] };
+  };
+
+  it("keeps cardinality enums, field lists, and raw plugin ids out of the default row; shows display names", () => {
+    const { container } = render(
+      <WireStageTurn data={canonicalData()} onConfirm={vi.fn()} confirmDisabled={false} />,
+    );
+    const components = screen.getByRole("region", { name: "Reviewed components" });
+    // Positive: the display name renders (field_mapper → "Output", inline_blob/json likewise).
+    expect(within(components).getByText(`(${stepLabelForPlugin("field_mapper")})`)).toBeInTheDocument();
+    expect(within(components).getByText(`(${stepLabelForPlugin("inline_blob")})`)).toBeInTheDocument();
+    // Negatives, on a fixture that DOES carry these values by construction.
+    expect(defaultRowText(components)).not.toMatch(/\(field_mapper\)|\(inline_blob\)|\(json\)/);
+    expect(defaultRowText(components)).not.toMatch(/zero or many|Cardinality:|Required fields:|Guaranteed fields:/);
+    expect(screen.getByText(/Validation failure:/)).toBeInTheDocument();
+    // Scoped to the per-row class: the routes-level raw-edge dump
+    // (`.wire-stage__raw`) also has a "Technical details" summary, is not
+    // flag-controlled, and is untouched.
+    const rowDetails = container.querySelectorAll("details.wire-stage__row-technical");
+    expect(rowDetails).toHaveLength(3); // exactly one per source / node / output row of canonicalData()
+    for (const details of rowDetails) {
+      expect(details).not.toHaveAttribute("open");
+    }
+    expectNoIdentifiersInDefaultDom(container, {
+      allowSelectors: [".wire-stage__row-technical", ".wire-stage__raw"],
+    });
+  });
+
+  it("opens every per-row Technical details when show_advanced flips on a mounted turn", () => {
+    const { container } = render(
+      <WireStageTurn data={canonicalData()} onConfirm={vi.fn()} confirmDisabled={false} />,
+    );
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    const rowDetails = container.querySelectorAll("details.wire-stage__row-technical");
+    expect(rowDetails).toHaveLength(3);
+    for (const details of rowDetails) {
+      expect(details).toHaveAttribute("open");
+    }
+    // The routes-level raw dump is deliberately NOT flag-controlled.
+    expect(container.querySelector("details.wire-stage__raw")).not.toHaveAttribute("open");
+  });
+
+  it("shows common option pairs inline and advanced pairs only in the disclosure", () => {
+    render(
+      <WireStageTurn
+        data={withNodeOptions([
+          { key: "mapping", value: "a → b", tier: "common" },
+          { key: "select_only", value: "only the mapped fields are kept", tier: "advanced" },
+        ])}
+        onConfirm={vi.fn()}
+        confirmDisabled={false}
+      />,
+    );
+    expect(screen.getByText("Mapping: a → b").closest("details")).toBeNull();
+    expect(
+      screen.getByText("Select only: only the mapped fields are kept").closest("details"),
+    ).not.toBeNull();
+  });
+
+  it("treats a tier-less pair as common (pre-tier durable payloads)", () => {
+    render(
+      <WireStageTurn
+        data={withNodeOptions([{ key: "mapping", value: "a → b" }])}
+        onConfirm={vi.fn()}
+        confirmDisabled={false}
+      />,
+    );
+    expect(screen.getByText("Mapping: a → b").closest("details")).toBeNull();
   });
 });

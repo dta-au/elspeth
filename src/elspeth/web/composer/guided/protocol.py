@@ -13,6 +13,7 @@ from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web.catalog.knob_schema import FieldTier
 from elspeth.web.catalog.knob_schema import SchemaFormPayload as SchemaFormPayload
 
 # Wire sentinel for a blob-backed source's ``path`` knob in a schema_form payload.
@@ -852,16 +853,30 @@ def proposal_structural_label(kind: Literal["route", "branch"], index: int) -> s
 # as ``_wire_schema``: path-, credential-, and prompt-adjacent options must
 # never reach a public projection, so adding a plugin here is a deliberate
 # per-option decision rather than a whole-options dump.
-_NODE_OPTION_SUMMARY_ALLOWLIST: Mapping[str, tuple[str, ...]] = {
-    "field_mapper": ("mapping", "select_only"),
+# Each allowlisted key carries its presentational catalog tier
+# (elspeth-ca456d9d8d). Per-plugin on purpose: adding a plugin or a key here is
+# a deliberate per-option decision, and two plugins may tier a same-named knob
+# differently. The tier lives here rather than being derived because both
+# projections and the audit verifier's re-derivation run without a catalog
+# handle; tests/unit/web/catalog/test_guided_option_tier_parity.py pins every
+# entry to the lowering.
+_NODE_OPTION_SUMMARY_ALLOWLIST: Mapping[str, Mapping[str, FieldTier]] = {
+    "field_mapper": {"mapping": "common", "select_only": "common"},
 }
 _MAX_NODE_OPTION_SUMMARY_PAIRS = 20
 _MAX_NODE_OPTION_SUMMARY_VALUE = 240
+# The two accepted projected-pair shapes: fresh projections always carry
+# ``tier``, durable turns written before it landed do not.
+_NODE_OPTION_SUMMARY_PAIR_KEYS = frozenset({"key", "value"})
+_NODE_OPTION_SUMMARY_PAIR_KEYS_WITH_TIER = frozenset({"key", "value", "tier"})
 
 
 class _NodeOptionSummary(TypedDict):
     key: str
     value: str
+    # Emitted on every fresh projection; NotRequired because durable turns
+    # written before the tier landed replay through the same shape.
+    tier: NotRequired[FieldTier]
 
 
 @trust_boundary(
@@ -916,9 +931,10 @@ _NODE_OPTION_SUMMARY_RENDERERS: Mapping[str, Callable[[object], str]] = {
     suppresses=("R5",),
     invariant=(
         "returns only pairs whose key is in the server-owned allowlist for ``plugin`` and whose renderer "
-        "produced non-empty bounded text; returns [] for a non-mapping ``options``, an unlisted plugin, or a "
-        "structural node, and never raises. The Mapping ABC check is the parse — a proposal reaching this "
-        "projection on the replay path is deep-frozen to MappingProxyType, which an exact-dict test would reject"
+        "produced non-empty bounded text, each pair carrying the allowlist's presentational ``tier``; returns "
+        "[] for a non-mapping ``options``, an unlisted plugin, or a structural node, and never raises. The "
+        "Mapping ABC check is the parse — a proposal reaching this projection on the replay path is "
+        "deep-frozen to MappingProxyType, which an exact-dict test would reject"
     ),
     non_raising=True,
 )
@@ -930,16 +946,16 @@ def node_options_summary(plugin: str | None, options: Mapping[str, Any]) -> list
     an empty summary as "no key options", never as a missing section.
     """
 
-    keys = _NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", ())
-    if not keys or not isinstance(options, Mapping):
+    tiers = _NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", {})
+    if not tiers or not isinstance(options, Mapping):
         return []
     summary: list[_NodeOptionSummary] = []
-    for key in keys:
+    for key, tier in tiers.items():
         if key not in options:
             continue
         value = _NODE_OPTION_SUMMARY_RENDERERS[key](options[key])
         if value:
-            summary.append({"key": key, "value": value})
+            summary.append({"key": key, "value": value, "tier": tier})
     return summary
 
 
@@ -954,7 +970,7 @@ def public_node_option_keys(plugin: str | None) -> frozenset[str]:
 
     if plugin is not None and type(plugin) is not str:
         raise TypeError("plugin must be an exact string or None")
-    return frozenset(_NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", ()))
+    return frozenset(_NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", {}).keys())
 
 
 def _node_options_summary_error(value: object, path: str, *, plugin: str | None) -> str | None:
@@ -964,14 +980,24 @@ def _node_options_summary_error(value: object, path: str, *, plugin: str | None)
     if error is not None:
         return error
     assert items is not None
-    allowed = _NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", ())
+    allowed = _NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", {})
     seen: set[str] = set()
     for index, item in enumerate(items):
         item_path = f"{path}[{index}]"
-        pair, error = _exact_nested_mapping(item, frozenset({"key", "value"}), item_path)
-        if error is not None:
-            return error
+        # A stored pair may LACK tier (pre-tier durable turns replay here) but
+        # may never carry an unknown key or a non-tier value. Both shapes are
+        # tried through _exact_nested_mapping, which owns the Mapping parse —
+        # this validator never re-asserts it (same delegation as the
+        # _current_sequence call above) — and a pair matching neither shape is
+        # reported against the canonical pre-tier key set.
+        pair, tier_error = _exact_nested_mapping(item, _NODE_OPTION_SUMMARY_PAIR_KEYS_WITH_TIER, item_path)
+        if tier_error is not None:
+            pair, error = _exact_nested_mapping(item, _NODE_OPTION_SUMMARY_PAIR_KEYS, item_path)
+            if error is not None:
+                return error
         assert pair is not None
+        if "tier" in pair and pair["tier"] not in ("essential", "common", "advanced"):
+            return f"{item_path}.tier is not a composer field tier"
         if pair["key"] not in allowed:
             return f"{item_path}.key is outside the node option summary allowlist"
         if pair["key"] in seen:

@@ -225,6 +225,9 @@ export interface GuidedSourceBlobCandidate {
   id: string;
   filename: string;
   sizeBytes: number;
+  /** Upload time (BlobMetadata.created_at), the disambiguator two uploads of
+   *  the same filename are told apart by. Client-side only — never on the wire. */
+  createdAt: string;
 }
 
 export type GuidedComponentAction =
@@ -718,6 +721,8 @@ export interface ProposePipelinePayload {
 export interface NodeOptionSummary {
   key: string;
   value: string;
+  /** Presentational catalog tier; absent on pre-tier durable payloads → "common". */
+  tier?: FieldTier;
 }
 
 export interface WireRowCardinality {

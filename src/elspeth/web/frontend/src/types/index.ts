@@ -7,6 +7,7 @@
 // ============================================================================
 
 import type { AuditCharacteristicFlag } from "../components/catalog/auditCharacteristics";
+import type { FieldTier } from "./guided";
 import type { FailedTurn } from "./recovery";
 
 // ── Auth ────────────────────────────────────────────────────────────────────
@@ -432,12 +433,26 @@ export interface PluginSummary {
   audit_characteristics: AuditCharacteristicFlag[];
 }
 
+/** One lowered composer knob as the inspector needs it — the catalog side of
+ *  the same lowered field the guided form reads as KnobField (types/guided.ts).
+ *  `tier` is OPTIONAL: the catalog lowering sets it on every field
+ *  (knob_schema.py _attach_tier), but the operator-profile policy views
+ *  (web/plugin_policy/profiles.py) hand-build their projections and have
+ *  shipped fields with no `tier` at all — the live `transform:llm` policy
+ *  view was entirely untiered (elspeth-a6ea581e8a). A field the catalog
+ *  knows but does not tier reads as "common" (see `optionTier` in
+ *  components/chat/guided/optionTiers.ts): visible, never demoted. */
+export type CatalogKnobField = { name: string; tier?: FieldTier };
+
 /** Detailed plugin schema info including configuration JSON Schema. */
 export interface PluginSchemaInfo {
   name: string;
   plugin_type: "source" | "transform" | "sink";
   description: string;
   json_schema: Record<string, unknown>;
+  /** Lowered composer knob schema — already on the wire (catalog/schemas.py),
+   *  now typed so pluginCatalogStore exposes it to the inspector. */
+  knob_schema: { fields: CatalogKnobField[] };
 }
 
 export type PluginPolicyCapability = "llm" | "prompt_shield" | "content_safety";

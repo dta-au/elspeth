@@ -6,6 +6,7 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { resetStore } from "@/test/store-helpers";
+import { makeComposition } from "@/test/composerFixtures";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import type { RunDiagnostics } from "@/types/index";
 
@@ -92,6 +93,11 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
     ...overrides,
   };
 }
+
+// File-level, not per-describe: the drawer is a sessionStore reader on two
+// counts — the empty-state session title and the curated failure row's node
+// naming — so compositionState must not leak between tests in either block.
+beforeEach(() => resetStore(useSessionStore));
 
 describe("RunsHistoryDrawer", () => {
   beforeEach(() => {
@@ -392,8 +398,10 @@ describe("RunsHistoryDrawer", () => {
     await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1 · /i }));
 
     const failure = screen.getByTestId("run-state-failure-state-1");
-    expect(failure).toHaveTextContent(
-      "transform_textract_93c6c46b8b72 failed - InvalidS3ObjectException",
+    expect(failure).toHaveTextContent("failed - InvalidS3ObjectException");
+    expect(failure.querySelector("[title]")).toHaveAttribute(
+      "title",
+      "transform_textract_93c6c46b8b72",
     );
     expect(failure).toHaveTextContent("Reason: submit_failed");
     expect(failure).toHaveTextContent("Cause: s3_object_unreadable");
@@ -444,7 +452,8 @@ describe("RunsHistoryDrawer", () => {
     await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
 
     const failure = screen.getByTestId("run-state-failure-state-1");
-    expect(failure).toHaveTextContent("transform_textract failed - submit_failed");
+    expect(failure).toHaveTextContent("failed - submit_failed");
+    expect(failure.querySelector("[title]")).toHaveAttribute("title", "transform_textract");
     expect(failure).not.toHaveTextContent(oversizedCode);
     expect(failure).not.toHaveTextContent(oversizedErrorType);
   });
@@ -469,9 +478,8 @@ describe("RunsHistoryDrawer", () => {
     await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
 
     const failure = screen.getByTestId("run-state-failure-state-1");
-    expect(failure).toHaveTextContent(
-      "transform_textract failed - InvalidS3ObjectException",
-    );
+    expect(failure).toHaveTextContent("failed - InvalidS3ObjectException");
+    expect(failure.querySelector("[title]")).toHaveAttribute("title", "transform_textract");
     expect(failure).not.toHaveTextContent("arbitrary provider text");
   });
 
@@ -648,6 +656,26 @@ describe("detail level (elspeth-34e810312c)", () => {
   });
 
   it("gates the token/operation lists and raw failure <pre> behind the flag; keeps count, Explain, and the curated failure detail", async () => {
+    // The curated row is the only diagnostics content left visible with the
+    // flag off, so it is held to the whole default-DOM acceptance pin — not a
+    // hand-rolled negative over two ids. Its node id and all three diagnostic
+    // identifiers (code, reason, cause) are seeded so the pin actually
+    // exercises every raw value the row can render.
+    useSessionStore.setState({
+      compositionState: makeComposition(2, {
+        nodes: [
+          {
+            id: "rate_colours",
+            node_type: "transform",
+            plugin: "llm",
+            input: "source",
+            on_success: null,
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+    } as never);
     useExecutionStore.setState({
       loadRunDiagnostics: vi.fn().mockResolvedValue(undefined),
       diagnosticsByRunId: {
@@ -656,7 +684,16 @@ describe("detail level (elspeth-34e810312c)", () => {
           tokens: [
             {
               ...makeDiagnostics().tokens[0],
-              states: [{ ...makeDiagnostics().tokens[0].states[0], error: { code: "some_code" } }],
+              states: [
+                {
+                  ...makeDiagnostics().tokens[0].states[0],
+                  error: {
+                    code: "some_code",
+                    reason: "submit_failed",
+                    cause: "s3_object_unreadable",
+                  },
+                },
+              ],
             },
           ],
         }),
@@ -670,9 +707,13 @@ describe("detail level (elspeth-34e810312c)", () => {
     expect(drawer.querySelector(".run-diagnostics-tokens")).toBeNull();
     expect(drawer.querySelector(".run-diagnostics-operations")).toBeNull();
     expect(screen.queryByTestId("run-failure-detail")).not.toBeInTheDocument();
-    expect(drawer.textContent).not.toMatch(/token-1|state-1/);
-    // Curated authored surface stays (closed identifiers + authored hint).
-    expect(screen.getByTestId("run-state-failure-state-1")).toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(drawer);
+    // Curated authored surface stays (closed identifiers + authored hint), with
+    // the node NAMED from the composition — the same phrase map ProgressView
+    // uses — and the raw id recoverable from the row's title.
+    const stateFailure = screen.getByTestId("run-state-failure-state-1");
+    expect(stateFailure).toHaveTextContent("Rate Colours failed - some_code");
+    expect(stateFailure.querySelector("[title]")).toHaveAttribute("title", "rate_colours");
     act(() => usePreferencesStore.setState({ showAdvanced: true }));
     expect(drawer.querySelector(".run-diagnostics-tokens")).not.toBeNull();
     expect(screen.getByTestId("run-failure-detail")).toBeInTheDocument();

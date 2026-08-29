@@ -21,6 +21,19 @@ const IDENTIFIER_SURFACES = [
   ".tool-call-info-bubble-name",
 ] as const;
 
+// `textContent` CONCATENATES adjacent elements' text with no separator, which
+// silently defeats the \b anchors below: a row rendering "Explain" beside
+// "rate_colours" reads as "Explainrate_colours", where SNAKE_RE cannot match
+// because the token no longer starts on a word boundary. Measured 2026-08-30 —
+// it let a bare node id through this very pin. Join text NODES instead, so
+// every DOM-adjacent run is anchored on its own.
+function visibleText(root: HTMLElement): string {
+  const parts: string[] = [];
+  const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) parts.push(walker.currentNode.nodeValue ?? "");
+  return parts.join("\n");
+}
+
 export function expectNoIdentifiersInDefaultDom(
   container: HTMLElement,
   options: { allowSelectors?: readonly string[] } = {},
@@ -29,7 +42,7 @@ export function expectNoIdentifiersInDefaultDom(
   for (const selector of [...IDENTIFIER_SURFACES, ...(options.allowSelectors ?? [])]) {
     clone.querySelectorAll(selector).forEach((el) => el.remove());
   }
-  const text = clone.textContent ?? "";
+  const text = visibleText(clone);
   expect(text).not.toMatch(UUID_RE);
   expect(text).not.toMatch(HEX32_RE);
   expect(text).not.toMatch(SNAKE_RE);

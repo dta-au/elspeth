@@ -58,7 +58,7 @@ class KnobField(TypedDict):
     description: NotRequired[str]
     placeholder: NotRequired[str]
     kind: FieldKind
-    tier: NotRequired[FieldTier]
+    tier: FieldTier
     required: bool
     default: NotRequired[object]
     nullable: bool
@@ -178,6 +178,11 @@ def _base_field(
         "name": wire_name,
         "label": info.title or wire_name,
         "kind": kind,
+        # ``tier`` is a required key of KnobField (elspeth-ca456d9d8d: the
+        # guided option summary reads it as a presentational tier), so the
+        # literal seeds the same default ``_attach_tier`` lowers to; the call
+        # below overwrites it from the field's ``composer_tier`` metadata.
+        "tier": "common",
         "required": info.is_required(),
         "nullable": nullable,
     }

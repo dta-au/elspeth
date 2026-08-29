@@ -15,6 +15,7 @@ import { PluginCard } from "./PluginCard";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 
 beforeEach(() => resetStore(usePreferencesStore));
 
@@ -44,6 +45,7 @@ const FLAT_SCHEMA: PluginSchemaInfo = {
     },
     required: ["path"],
   },
+  knob_schema: { fields: [] },
 };
 
 // Minimal Pydantic-shaped discriminated union (real LLM transform shape,
@@ -83,6 +85,7 @@ const DISCRIMINATED_SCHEMA: PluginSchemaInfo = {
       },
     },
   },
+  knob_schema: { fields: [] },
 };
 
 // Fixtures for the detail-level describe block below (elspeth-8555a6a9e0).
@@ -101,6 +104,7 @@ const CARD_SCHEMA: PluginSchemaInfo = {
     properties: { profile: { type: "string" } },
     required: ["profile"],
   },
+  knob_schema: { fields: [] },
 };
 
 describe("PluginCard — collapsed header", () => {
@@ -894,7 +898,8 @@ describe("PluginCard — Phase 7B reshape", () => {
 
 describe("detail level (elspeth-8555a6a9e0)", () => {
   it("shows only the behavioural flags and no Schema button by default", () => {
-    render(<PluginCard plugin={CARD_PLUGIN} schema={null} onExpand={vi.fn()} />);
+    const { container } = render(<PluginCard plugin={CARD_PLUGIN} schema={null} onExpand={vi.fn()} />);
+    expectNoIdentifiersInDefaultDom(container);
     const strip = screen.getByRole("group", { name: "Audit characteristics" });
     expect(within(strip).getByText("quarantines bad rows")).toBeInTheDocument();
     expect(within(strip).getByText("needs credentials")).toBeInTheDocument();

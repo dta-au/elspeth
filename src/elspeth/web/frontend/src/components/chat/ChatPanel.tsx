@@ -1238,6 +1238,7 @@ export function ChatPanel({
                   id: blob.id,
                   filename: blob.filename,
                   sizeBytes: blob.size_bytes,
+                  createdAt: blob.created_at,
                 } satisfies GuidedSourceBlobCandidate,
               ] as const,
           ),
@@ -1262,6 +1263,7 @@ export function ChatPanel({
         id: blob.id,
         filename: blob.filename,
         sizeBytes: blob.size_bytes,
+        createdAt: blob.created_at,
       };
       setGuidedSourceBlobCandidateSet((current) => {
         if (
@@ -1369,6 +1371,7 @@ export function ChatPanel({
                   id: blob.id,
                   filename: blob.filename,
                   sizeBytes: blob.size_bytes,
+                  createdAt: blob.created_at,
                 },
               },
         );

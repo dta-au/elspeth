@@ -729,10 +729,83 @@ describe("guided schema-10 wire decoder", () => {
     }
   });
 
+  it("decodes a tiered pair on a PROPOSAL node too (same helper, second call site)", () => {
+    // node_options_summary rides both projections (emitters.py and
+    // planning.py), and the proposal node has a different plugin shape from
+    // the wire node, so its decoder is a separate call site. Both route
+    // through the one nodeOptionsSummary helper — this pins that.
+    const response = JSON.parse(
+      JSON.stringify(rowUnionProposalWireResponse()),
+    ) as Record<string, unknown>;
+    const payload = (response.next_turn as { payload: { nodes: Array<Record<string, unknown>> } })
+      .payload;
+    payload.nodes[1].plugin = { kind: "transform", id: "field_mapper" };
+    payload.nodes[1].node_options_summary = [
+      { key: "mapping", value: "given_name → first_name", tier: "common" },
+      { key: "select_only", value: "only the mapped fields are kept" },
+    ];
+
+    const decoded = decodeGetGuidedResponse(response);
+
+    expect(decoded.next_turn?.type).toBe("propose_pipeline");
+    if (decoded.next_turn?.type !== "propose_pipeline") {
+      throw new Error("proposal fixture did not decode as a proposal");
+    }
+    expect(decoded.next_turn.payload.nodes[1].node_options_summary).toEqual([
+      { key: "mapping", value: "given_name → first_name", tier: "common" },
+      { key: "select_only", value: "only the mapped fields are kept" },
+    ]);
+
+    const bad = JSON.parse(JSON.stringify(response)) as Record<string, unknown>;
+    (bad.next_turn as { payload: { nodes: Array<Record<string, unknown>> } })
+      .payload.nodes[1].node_options_summary = [
+      { key: "mapping", value: "a → b", tier: "loud" },
+    ];
+    expect(() => decodeGetGuidedResponse(bad)).toThrow(/tier/);
+  });
+
+  it("decodes a tiered pair and leaves a pre-tier pair untiered", () => {
+    // elspeth-ca456d9d8d: the backend emits `tier` on every fresh projection,
+    // but durable turns written before it landed replay through this decoder
+    // as {key, value}. Both shapes decode; the component treats an absent
+    // tier as "common".
+    const decoded = decodeGetGuidedResponse(
+      wireResponse({
+        nodes: [
+          {
+            stable_id: "00000000-0000-4000-8000-000000000009",
+            label: "rename",
+            node_type: "transform",
+            plugin: "field_mapper",
+            behavior: { kind: "transform" },
+            required_fields: [],
+            guaranteed_fields: [],
+            row_cardinality: { input: "one", output: "one", expected_output_count: null },
+            structured_output_fields: [],
+            node_options_summary: [
+              { key: "mapping", value: "given_name → first_name", tier: "common" },
+              { key: "select_only", value: "only the mapped fields are kept" },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(decoded.next_turn?.type).toBe("confirm_wiring");
+    if (decoded.next_turn?.type === "confirm_wiring") {
+      expect(decoded.next_turn.payload.nodes[0].node_options_summary).toEqual([
+        { key: "mapping", value: "given_name → first_name", tier: "common" },
+        { key: "select_only", value: "only the mapped fields are kept" },
+      ]);
+    }
+  });
+
   it.each([
     ["missing pair value", [{ key: "mapping" }]],
     ["non-string pair value", [{ key: "mapping", value: 7 }]],
     ["extra pair key", [{ key: "mapping", value: "a → b", raw: { a: "b" } }]],
+    ["non-tier tier", [{ key: "mapping", value: "a → b", tier: "loud" }]],
+    ["non-string tier", [{ key: "mapping", value: "a → b", tier: 3 }]],
   ])("rejects a wire node options summary with a %s", (_label, summary) => {
     expect(() => decodeGetGuidedResponse(
       wireResponse({

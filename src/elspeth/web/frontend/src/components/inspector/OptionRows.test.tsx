@@ -1,29 +1,40 @@
 import { act, render, screen, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { usePreferencesStore } from "@/stores/preferencesStore";
+import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { OptionRows } from "./OptionRows";
 
 const OPTIONS = {
   profile: "sonnet",
   prompt_template: "Rate {{ row['case_study1'] }}",
   temperature: 0.2,
+  max_retries: 3,
   schema: { mode: "observed", guaranteed_fields: ["id"] },
   interpretation_requirements: [{ id: "x", accepted_artifact_hash: "3876" + "a".repeat(60) }],
   blob_ref: "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0",
 };
 
-describe("OptionRows", () => {
-  beforeEach(() => resetStore(usePreferencesStore));
+// Top-level (module-scope) beforeEach, not nested in a describe: OptionRows
+// reads BOTH stores, and the catalog-tier-ordering describe below is a
+// sibling of describe("OptionRows", ...), not nested inside it, so a reset
+// scoped only to that inner describe would not reach it and state would leak
+// across the file's two describe blocks.
+beforeEach(() => {
+  resetStore(usePreferencesStore);
+  resetStore(usePluginCatalogStore);
+});
 
+describe("OptionRows", () => {
   it("shows essential rows first, advanced behind a closed disclosure, and no raw JSON by default", () => {
     render(<OptionRows options={OPTIONS} ariaLabel="assess options" />);
     const region = screen.getByRole("region", { name: "assess options" });
     const terms = within(region).getAllByRole("term").map((t) => t.textContent);
     expect(terms.slice(0, 3)).toEqual(["Prompt", "Model profile", "Row schema"]);
     expect(region.textContent).not.toMatch(/prompt_template|schema_mode/);
-    const advanced = within(region).getByText("Advanced settings (1)").closest("details");
+    const advanced = within(region).getByText("Advanced settings (2)").closest("details");
     expect(advanced).not.toHaveAttribute("open");
     expect(within(region).queryByText(/Raw options/)).not.toBeInTheDocument();
     expect(region.textContent).not.toMatch(/f976fd8b-4432/);
@@ -34,15 +45,15 @@ describe("OptionRows", () => {
     usePreferencesStore.setState({ showAdvanced: true });
     render(<OptionRows options={OPTIONS} ariaLabel="assess options" />);
     const region = screen.getByRole("region", { name: "assess options" });
-    expect(within(region).getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
+    expect(within(region).getByText("Advanced settings (2)").closest("details")).toHaveAttribute("open");
     expect(within(region).getByText("Raw options (JSON)")).toBeInTheDocument();
   });
 
   it("reacts when the preference flips on an already-mounted panel (the real user flow)", () => {
     render(<OptionRows options={OPTIONS} ariaLabel="assess options" />);
-    expect(screen.getByText("Advanced settings (1)").closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByText("Advanced settings (2)").closest("details")).not.toHaveAttribute("open");
     act(() => usePreferencesStore.setState({ showAdvanced: true }));
-    expect(screen.getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
+    expect(screen.getByText("Advanced settings (2)").closest("details")).toHaveAttribute("open");
     expect(screen.getByText("Raw options (JSON)")).toBeInTheDocument();
   });
 
@@ -141,5 +152,147 @@ describe("OptionRows", () => {
     expect(within(region).queryByText("Customer Id")).not.toBeInTheDocument();
     expect(within(region).getByText("entity")).toBeInTheDocument();
     expect(within(region).queryByText("Entity")).not.toBeInTheDocument();
+  });
+});
+
+describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
+  const LLM_SCHEMA = {
+    name: "llm",
+    plugin_type: "transform",
+    description: "",
+    json_schema: {},
+    knob_schema: {
+      fields: [
+        { name: "profile", tier: "common" },
+        { name: "prompt_template", tier: "common" },
+        { name: "temperature", tier: "advanced" },
+        { name: "schema", tier: "common" },
+      ],
+    },
+  } as const;
+  const seedCatalog = (schemas: Record<string, unknown>) =>
+    usePluginCatalogStore.setState({ key: "alice:fp-1", principal: "alice", fingerprint: "fp-1", schemas } as never);
+
+  it("orders visible rows by the schema and sends advanced-tier + unknown keys to the disclosure", () => {
+    seedCatalog({ "transform:llm": LLM_SCHEMA });
+    render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
+    const region = screen.getByRole("region", { name: "assess options" });
+    // `.graph-config-nested` excluded: OPTIONS.schema is a record, and ConfigValue
+    // renders its keys as nested <dt>s (ConfigRows.tsx:41-52) in the visible partition.
+    const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
+    // Schema field order — DIFFERENT from the fallback's label-map order
+    // (["Prompt", "Model profile", "Row schema"]); this is the oracle that
+    // distinguishes the two partitions.
+    expect(visibleTerms).toEqual(["Model profile", "Prompt", "Row schema"]);
+    const advanced = within(region).getByText("Advanced settings (2)").closest("details") as HTMLElement;
+    expect(within(advanced).getByText("Temperature")).toBeInTheDocument(); // advanced tier
+    expect(within(advanced).getByText("Max Retries")).toBeInTheDocument(); // unknown to the schema
+    expect(region.textContent).not.toMatch(/blob_ref|interpretation_requirements/);
+  });
+
+  // Review fix round 1: LLM_SCHEMA above never tiers a field "essential", so
+  // the "essentials first, then commons, each in schema order" rule had no
+  // regression pin — a regression that dropped the essentials branch, or
+  // interleaved essentials and commons instead of ordering essentials ahead,
+  // would not have been caught. This fixture's schema order deliberately
+  // puts the essential field (prompt_template) THIRD, behind two commons
+  // (profile, schema is 3rd too — profile is 1st, prompt_template is 2nd,
+  // schema is 3rd) so the assertion only passes if tier — not schema
+  // position — decides who goes first.
+  it("orders an essential-tier field ahead of commons even when it comes later in schema order", () => {
+    const schemaWithEssential = {
+      name: "llm",
+      plugin_type: "transform",
+      description: "",
+      json_schema: {},
+      knob_schema: {
+        fields: [
+          { name: "profile", tier: "common" },
+          { name: "prompt_template", tier: "essential" },
+          { name: "schema", tier: "common" },
+          { name: "temperature", tier: "advanced" },
+        ],
+      },
+    } as const;
+    seedCatalog({ "transform:llm": schemaWithEssential });
+    render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
+    const region = screen.getByRole("region", { name: "assess options" });
+    const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
+    // prompt_template (essential) jumps ahead of profile and schema (both
+    // common), even though schema order lists it after profile.
+    expect(visibleTerms).toEqual(["Prompt", "Model profile", "Row schema"]);
+  });
+
+  // Live regression (build index-D3qXar6h.js, session 39578c6f): the operator
+  // policy view for `transform:llm` returned all 14 knob fields with NO `tier`
+  // on any of them, because web/plugin_policy/profiles.py hand-builds that
+  // projection. With the schema cached and tier read strictly, every visible
+  // partition emptied and the prompt sank into "Advanced settings (5)" — worse
+  // than the uncached fallback. A field the catalog KNOWS but does not tier is
+  // visible; only keys the schema does not list at all are advanced.
+  it("treats an untiered schema field as common — the live untiered llm policy view keeps every known key visible", () => {
+    const untieredSchema = {
+      name: "llm",
+      plugin_type: "transform",
+      description: "",
+      json_schema: {},
+      knob_schema: {
+        fields: [
+          { name: "profile" },
+          { name: "prompt_template" },
+          { name: "temperature" },
+          { name: "schema" },
+        ],
+      },
+    } as const;
+    seedCatalog({ "transform:llm": untieredSchema });
+    render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
+    const region = screen.getByRole("region", { name: "assess options" });
+    const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
+    // Schema field order, all four present keys — including `temperature`,
+    // which the tiered LLM_SCHEMA above sends to the disclosure.
+    expect(visibleTerms).toEqual(["Model profile", "Prompt", "Temperature", "Row schema"]);
+    // The disclosure holds ONLY the key the schema does not list. An absent
+    // tier promotes a known field; it does not promote an unknown one.
+    const advanced = within(region).getByText("Advanced settings (1)").closest("details") as HTMLElement;
+    expect(within(advanced).getByText("Max Retries")).toBeInTheDocument();
+    expect(within(advanced).queryByText("Temperature")).not.toBeInTheDocument();
+  });
+
+  it("falls back to the static split when the schema is not cached (regression pin — green before this task)", () => {
+    const { container } = render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
+    expectNoIdentifiersInDefaultDom(container);
+    const region = screen.getByRole("region", { name: "assess options" });
+    const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
+    expect(visibleTerms).toEqual(["Prompt", "Model profile", "Row schema"]);
+  });
+
+  it("re-partitions when the catalog loads after mount (no request is made before the catalog has a key)", () => {
+    const loadSchema = vi.fn().mockResolvedValue(undefined);
+    usePluginCatalogStore.setState({ loadSchema } as never);
+    render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
+    expect(loadSchema).not.toHaveBeenCalled(); // key is null: the store would no-op; we don't even ask
+    act(() => seedCatalog({ "transform:llm": LLM_SCHEMA }));
+    expect(loadSchema).toHaveBeenCalledWith("transform", "llm");
+    const region = screen.getByRole("region", { name: "assess options" });
+    const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
+    expect(visibleTerms).toEqual(["Model profile", "Prompt", "Row schema"]);
+  });
+
+  it("masks a blob:<ref> path even when the catalog tiers `path` advanced (masking binds to the value, not the partition)", () => {
+    seedCatalog({
+      "source:csv": { ...LLM_SCHEMA, name: "csv", plugin_type: "source", knob_schema: { fields: [{ name: "path", tier: "advanced" }] } },
+    });
+    render(
+      <OptionRows
+        options={{ path: "blob:f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0" }}
+        ariaLabel="source options"
+        plugin={{ kind: "source", name: "csv" }}
+      />,
+    );
+    const region = screen.getByRole("region", { name: "source options" });
+    const advanced = within(region).getByText("Advanced settings (1)").closest("details") as HTMLElement;
+    expect(within(advanced).getByText("Uploaded sample data")).toHaveAttribute("title", "blob:f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0");
+    expect(region.textContent).not.toMatch(/f976fd8b-4432/);
   });
 });

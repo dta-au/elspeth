@@ -235,8 +235,8 @@ def test_projected_node_options_survive_persistence_and_reverify_byte_for_byte()
     )
 
     assert payload["nodes"][0]["node_options_summary"] == [
-        {"key": "mapping", "value": "given_name → first_name, meta.source → origin"},
-        {"key": "select_only", "value": "only the mapped fields are kept"},
+        {"key": "mapping", "value": "given_name → first_name, meta.source → origin", "tier": "common"},
+        {"key": "select_only", "value": "only the mapped fields are kept", "tier": "common"},
     ]
     # The non-allowlisted neighbour option must not ride along.
     assert all(canary not in repr(payload) for canary in CANARIES)

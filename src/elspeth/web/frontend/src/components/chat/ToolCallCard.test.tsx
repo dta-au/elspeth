@@ -376,6 +376,30 @@ describe("ToolCallCard humanised primary label (elspeth-af559a0bab)", () => {
     );
     expectNoIdentifiersInDefaultDom(container);
   });
+
+  it("describes request_interpretation_review instead of shipping a raw snake_case primary (elspeth-af559a0bab live-check finding)", () => {
+    // request_interpretation_review is session-aware, not a ToolDeclaration,
+    // so it is invisible to _REGISTERED_TOOLS-derived parity checks alone.
+    // It is a durable interpretation-event write: the settled ribbon must
+    // read "Completed: <sentence>", never the bare tool name.
+    const { container } = render(
+      <ToolCallCard
+        toolCall={makeToolCall("request_interpretation_review", { outcome: "completed" })}
+        proposal={null}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText(
+        "Completed: Asks you to review an assumption the planner made before it is built into the pipeline.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("request_interpretation_review", { selector: "code" }),
+    ).toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
 });
 
 describe("ToolCallCard proposal change surface (elspeth-10f76f9250)", () => {

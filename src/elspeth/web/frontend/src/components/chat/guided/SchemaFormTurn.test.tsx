@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SchemaFormTurn } from "./SchemaFormTurn";
@@ -986,7 +986,12 @@ describe("SchemaFormTurn", () => {
   // path = blob:<id> plus on_validation_failure = discard.
   describe("late-upload path prefill (sourceFormPathPrefill)", () => {
     const BLOB_ID = "3e80ec24-392f-4862-ad22-ace24502c0bc";
-    const prefillBlob = { id: BLOB_ID, filename: "demo.csv", sizeBytes: 204 };
+    const prefillBlob = {
+      id: BLOB_ID,
+      filename: "demo.csv",
+      sizeBytes: 204,
+      createdAt: "2026-07-26T09:00:00Z",
+    };
 
     function pathFields(): KnobField[] {
       return [
@@ -1127,5 +1132,17 @@ describe("SchemaFormTurn advanced tier", () => {
     render(<SchemaFormTurn payload={pluginPayload([field({ name: "path", label: "Path", kind: "text" })])} onSubmit={vi.fn()} />);
     await user.click(screen.getByRole("button", { name: "Edit" }));
     expect(screen.queryByText(/Advanced settings/)).not.toBeInTheDocument();
+  });
+
+  it("renders a schema whose every field is advanced entirely inside the disclosure", async () => {
+    const user = userEvent.setup();
+    const allAdvanced = pluginPayload([
+      field({ name: "temperature", label: "Temperature", kind: "number-float", tier: "advanced", default: 0 }),
+    ]);
+    render(<SchemaFormTurn payload={allAdvanced} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    const details = screen.getByText("Advanced settings (1)").closest("details") as HTMLElement;
+    expect(within(details).getByRole("spinbutton", { name: "Temperature" })).toBeInTheDocument();
+    expect(screen.getByRole("spinbutton", { name: "Temperature" }).closest("details")).toBe(details);
   });
 });

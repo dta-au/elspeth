@@ -1,12 +1,18 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
 import type {
   GuidedProposalReviewState,
   ProposePipelinePayload,
 } from "@/types/guided";
 import { ProposePipelineTurn } from "./ProposePipelineTurn";
+
+// The components list gates advanced-tier option pairs on show_advanced, so
+// this turn is a preferences-store reader; the store is a module singleton.
+beforeEach(() => resetStore(usePreferencesStore));
 
 const IDS = {
   proposal: "00000000-0000-4000-8000-000000000401",
@@ -250,8 +256,10 @@ describe("ProposePipelineTurn", () => {
     expect(screen.getAllByText(/when true \(route-1\) forks to branch-1/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/when false \(route-2\)/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/on error → discard/i).length).toBeGreaterThan(0);
-    expect(screen.getByText("source-2 · json")).toBeVisible();
-    expect(screen.getByText("output-2 · csv")).toBeVisible();
+    // elspeth-ca456d9d8d: the components list names a plugin by its display
+    // label ("JSON", "CSV"), not its raw catalog id.
+    expect(screen.getByText("source-2 · JSON")).toBeVisible();
+    expect(screen.getByText("output-2 · CSV")).toBeVisible();
   });
 
   it("renders the key transform options beside the behavior discriminant", () => {
@@ -295,6 +303,64 @@ describe("ProposePipelineTurn", () => {
     expect(screen.getByText("Select only: only the mapped fields are kept")).toBeVisible();
   });
 
+  it("shows an advanced-tier option pair only when show_advanced is on", () => {
+    // elspeth-ca456d9d8d: the components list has no per-row disclosure, so an
+    // advanced pair is plainly gated — debug mode expands what is shown, it
+    // never adds a surface.
+    const base = payload();
+    const mapperPayload: ProposePipelinePayload = {
+      ...base,
+      component_counts: { sources: 0, nodes: 1, edges: 0, outputs: 0 },
+      graph: { sources: [], edges: [] },
+      nodes: [
+        {
+          ...base.nodes[0],
+          stable_id: IDS.aggregation,
+          label: "node-1",
+          node_type: "transform",
+          plugin: { kind: "transform", id: "field_mapper" },
+          behavior: { kind: "transform" },
+          node_options_summary: [
+            { key: "mapping", value: "given_name → first_name", tier: "common" },
+            {
+              key: "select_only",
+              value: "only the mapped fields are kept",
+              tier: "advanced",
+            },
+          ],
+        },
+      ],
+      outputs: [],
+      edit_targets: [],
+    };
+
+    const { rerender } = render(
+      <ProposePipelineTurn
+        payload={mapperPayload}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Mapping: given_name → first_name")).toBeVisible();
+    expect(
+      screen.queryByText("Select only: only the mapped fields are kept"),
+    ).toBeNull();
+
+    usePreferencesStore.setState({ showAdvanced: true });
+    rerender(
+      <ProposePipelineTurn
+        payload={mapperPayload}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText("Select only: only the mapped fields are kept"),
+    ).toBeVisible();
+  });
+
   it("renders row_union as a distinct N-to-N barrier with its own success flow and honest copy", () => {
     const rowUnionPayload = payload();
     rowUnionPayload.nodes[3] = {
@@ -324,6 +390,14 @@ describe("ProposePipelineTurn", () => {
     expect(
       container.querySelector('[data-node-kind="row_union"]'),
     ).not.toBeNull();
+    // The components list names the node type in the reader's register, never
+    // the raw union member, with the raw token recoverable from `title` — the
+    // same derivation the sibling wire-stage row uses.
+    const componentRow = container.querySelector(
+      '.guided-proposal__components strong[title="row_union"]',
+    );
+    expect(componentRow).not.toBeNull();
+    expect(componentRow!.textContent).toBe("node-4 · Row Union");
     expect(
       container.querySelector(
         ".guided-readonly-graph__node--row_union",
@@ -684,7 +758,7 @@ describe("ProposePipelineTurn", () => {
       />,
     );
     expect(screen.getByRole("img", { name: /pipeline proposal graph/i })).toBeVisible();
-    expect(screen.getByText("source-1 · csv")).toBeVisible();
+    expect(screen.getByText("source-1 · CSV")).toBeVisible();
     expect(screen.getByText(/press Review wiring to continue/i)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();

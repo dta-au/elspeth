@@ -80,6 +80,7 @@ vi.mock("@/api/client", () => ({
         properties: { path: { type: "string", description: "File path" } },
         required: ["path"],
       },
+      knob_schema: { fields: [] },
     },
     snapshotFingerprint: "catalog-test-snapshot",
   }),

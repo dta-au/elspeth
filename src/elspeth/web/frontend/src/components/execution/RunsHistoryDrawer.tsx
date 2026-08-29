@@ -6,11 +6,13 @@
 // runs after the inspector Runs tab is removed.
 // ============================================================================
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useShowAdvanced } from "@/stores/preferencesStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
+import { makePhraseFor } from "@/lib/validationHumaniser";
+import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { RunOutputsPanel } from "@/components/inspector/RunOutputsPanel";
 import { Button, StatusBadge } from "@/components/ui";
@@ -111,7 +113,10 @@ function buildPendingWorkingView(diagnostics: RunDiagnostics): RunDiagnosticsWor
 }
 
 interface VisibleStateFailure {
-  label: string;
+  /** Null when no closed diagnostic identifier survived the parse — the row
+      then names the step and lets Cause/hint carry the detail, rather than
+      dressing the prose fallback "recorded failure" up as an error code. */
+  label: string | null;
   reason: string | null;
   cause: string | null;
   hint: string | null;
@@ -194,7 +199,7 @@ function visibleStateFailure(error: unknown): VisibleStateFailure | null {
   // scalar identifiers needed by an operator. The one longer hint admitted
   // here is authored by ELSPETH for its exact S3-unreadable classification.
   return {
-    label: code ?? errorType ?? reason ?? "recorded failure",
+    label: code ?? errorType ?? reason,
     reason,
     cause,
     hint,
@@ -210,19 +215,50 @@ function RunStateFailureDetail({
   nodeId: string;
   stateId: string;
 }): JSX.Element | null {
+  // This row is the ONE diagnostics surface that stays visible with
+  // show_advanced off (curated failures are audit-required), so it carries the
+  // default-view copy register: the step is NAMED, and every raw diagnostic
+  // identifier is demoted to <code> with the node id recoverable from `title`.
+  // Naming goes through the same phrase map ProgressView uses for
+  // `err.node_id` (ProgressView.tsx) so the two execution surfaces agree on
+  // what a node is called.
+  const compositionState = useSessionStore((s) => s.compositionState);
+  const phraseFor = useMemo(() => makePhraseFor(compositionState), [compositionState]);
   const failure = visibleStateFailure(error);
   if (failure === null) return null;
+
+  // A run in the HISTORY drawer may name a node the current composition no
+  // longer has, and "this step" would then say less than the id itself. Same
+  // discrimination ReadinessRowDetail makes; the id falls back to the
+  // identifier register rather than into bare prose.
+  const phrase = phraseFor(nodeId);
+  const stepName =
+    phrase === UNKNOWN_COMPONENT_PHRASE ? <code>{nodeId}</code> : phrase;
 
   return (
     <div
       className="run-diagnostics-state-failure"
       data-testid={`run-state-failure-${stateId}`}
     >
-      <div>
-        {nodeId} failed - {failure.label}
+      <div title={nodeId}>
+        {stepName} failed
+        {failure.label === null ? null : (
+          <>
+            {" - "}
+            <code>{failure.label}</code>
+          </>
+        )}
       </div>
-      {failure.reason && <div>Reason: {failure.reason}</div>}
-      {failure.cause && <div>Cause: {failure.cause}</div>}
+      {failure.reason && (
+        <div>
+          Reason: <code>{failure.reason}</code>
+        </div>
+      )}
+      {failure.cause && (
+        <div>
+          Cause: <code>{failure.cause}</code>
+        </div>
+      )}
       {failure.hint && <div>{failure.hint}</div>}
     </div>
   );

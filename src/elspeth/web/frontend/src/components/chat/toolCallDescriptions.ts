@@ -92,6 +92,8 @@ const MUTATING_TOOL_CALL_DESCRIPTIONS: Record<string, string> = {
     "Pins an uploaded file's content into a configuration field by hash.",
   wire_secret_ref:
     "Places a credential reference in the pipeline configuration, resolved at run time.",
+  request_interpretation_review:
+    "Asks you to review an assumption the planner made before it is built into the pipeline.",
 };
 
 export const TOOL_CALL_DESCRIPTIONS: Record<string, string> = {

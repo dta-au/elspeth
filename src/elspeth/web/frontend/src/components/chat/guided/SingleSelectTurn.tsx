@@ -50,12 +50,38 @@ function distinguishingBlobIdSuffix(
   return candidateId;
 }
 
+/** Upload times read as a wall-clock time, not a raw timestamp: the label is
+ *  the disambiguator a person actually holds ("the one I added at 2:14 pm"). */
+const UPLOAD_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+/**
+ * Label for one ready upload in the source chooser.
+ *
+ * A unique filename is the whole label. Two uploads sharing a filename need a
+ * disambiguator, and upload TIME is the one a person can act on
+ * (elspeth-ca456d9d8d) — size and an id fragment are the machine-register
+ * fallback, used when the times do not actually separate the candidates
+ * (same-minute uploads) or when a stamp is unusable.
+ */
 function sourceBlobCandidateLabel(
   candidate: GuidedSourceBlobCandidate,
   candidates: readonly GuidedSourceBlobCandidate[],
 ): string {
   const duplicates = candidates.filter((item) => item.filename === candidate.filename);
   if (duplicates.length === 1) return candidate.filename;
+  const stamps = duplicates.map((item) => new Date(item.createdAt));
+  // Validate BEFORE formatting: Intl.DateTimeFormat.format() THROWS RangeError
+  // on an invalid Date, so an unparseable created_at must fall through to the
+  // id fallback rather than crash the turn.
+  if (stamps.every((stamp) => !Number.isNaN(stamp.getTime()))) {
+    const distinct = new Set(stamps.map((stamp) => UPLOAD_TIME_FORMATTER.format(stamp)));
+    if (distinct.size === duplicates.length) {
+      return `${candidate.filename} (uploaded ${UPLOAD_TIME_FORMATTER.format(new Date(candidate.createdAt))})`;
+    }
+  }
   return `${candidate.filename} — ${formatCandidateBytes(candidate.sizeBytes)} — ID ${distinguishingBlobIdSuffix(candidate, duplicates)}`;
 }
 
