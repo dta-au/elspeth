@@ -167,7 +167,16 @@ export function OptionRows({
     visibleKeys = FALLBACK_VISIBLE_OPTION_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(options, key));
     advancedKeys = candidateKeys.filter((key) => !FALLBACK_VISIBLE_OPTION_KEYS.includes(key));
   } else {
-    const tierByKey = new Map(schema.knob_schema.fields.map((field) => [field.name, field.tier]));
+    // Absent tier = "common": a field the catalog KNOWS but does not tier is
+    // visible, never demoted. The operator-profile policy views hand-build
+    // their projections and shipped fields with no `tier` at all — the live
+    // `transform:llm` view was entirely untiered, which emptied `visibleKeys`
+    // and buried the prompt under the advanced disclosure. Defaulting at map
+    // construction (not at the comparison) keeps the default scoped to keys
+    // the schema lists; keys the schema does not list stay advanced, which is
+    // the separate `advancedKeys` rule below. Same posture as `optionTier`
+    // in components/chat/guided/optionTiers.ts (elspeth-a6ea581e8a).
+    const tierByKey = new Map(schema.knob_schema.fields.map((field) => [field.name, field.tier ?? "common"]));
     const schemaOrder = schema.knob_schema.fields.map((field) => field.name);
     const present = (key: string): boolean => candidateKeys.includes(key);
     const essentials = schemaOrder.filter((key) => present(key) && tierByKey.get(key) === "essential");

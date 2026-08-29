@@ -435,10 +435,14 @@ export interface PluginSummary {
 
 /** One lowered composer knob as the inspector needs it — the catalog side of
  *  the same lowered field the guided form reads as KnobField (types/guided.ts).
- *  `tier` is REQUIRED here: the catalog lowering sets it on every field
- *  (knob_schema.py _attach_tier); only the guided-turn projection has a
- *  pre-tier durable story. */
-export type CatalogKnobField = { name: string; tier: FieldTier };
+ *  `tier` is OPTIONAL: the catalog lowering sets it on every field
+ *  (knob_schema.py _attach_tier), but the operator-profile policy views
+ *  (web/plugin_policy/profiles.py) hand-build their projections and have
+ *  shipped fields with no `tier` at all — the live `transform:llm` policy
+ *  view was entirely untiered (elspeth-a6ea581e8a). A field the catalog
+ *  knows but does not tier reads as "common" (see `optionTier` in
+ *  components/chat/guided/optionTiers.ts): visible, never demoted. */
+export type CatalogKnobField = { name: string; tier?: FieldTier };
 
 /** Detailed plugin schema info including configuration JSON Schema. */
 export interface PluginSchemaInfo {

@@ -222,6 +222,42 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
     expect(visibleTerms).toEqual(["Prompt", "Model profile", "Row schema"]);
   });
 
+  // Live regression (build index-D3qXar6h.js, session 39578c6f): the operator
+  // policy view for `transform:llm` returned all 14 knob fields with NO `tier`
+  // on any of them, because web/plugin_policy/profiles.py hand-builds that
+  // projection. With the schema cached and tier read strictly, every visible
+  // partition emptied and the prompt sank into "Advanced settings (5)" — worse
+  // than the uncached fallback. A field the catalog KNOWS but does not tier is
+  // visible; only keys the schema does not list at all are advanced.
+  it("treats an untiered schema field as common — the live untiered llm policy view keeps every known key visible", () => {
+    const untieredSchema = {
+      name: "llm",
+      plugin_type: "transform",
+      description: "",
+      json_schema: {},
+      knob_schema: {
+        fields: [
+          { name: "profile" },
+          { name: "prompt_template" },
+          { name: "temperature" },
+          { name: "schema" },
+        ],
+      },
+    } as const;
+    seedCatalog({ "transform:llm": untieredSchema });
+    render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
+    const region = screen.getByRole("region", { name: "assess options" });
+    const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
+    // Schema field order, all four present keys — including `temperature`,
+    // which the tiered LLM_SCHEMA above sends to the disclosure.
+    expect(visibleTerms).toEqual(["Model profile", "Prompt", "Temperature", "Row schema"]);
+    // The disclosure holds ONLY the key the schema does not list. An absent
+    // tier promotes a known field; it does not promote an unknown one.
+    const advanced = within(region).getByText("Advanced settings (1)").closest("details") as HTMLElement;
+    expect(within(advanced).getByText("Max Retries")).toBeInTheDocument();
+    expect(within(advanced).queryByText("Temperature")).not.toBeInTheDocument();
+  });
+
   it("falls back to the static split when the schema is not cached (regression pin — green before this task)", () => {
     render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
     const region = screen.getByRole("region", { name: "assess options" });
