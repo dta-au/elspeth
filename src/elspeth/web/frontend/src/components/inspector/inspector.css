@@ -618,6 +618,50 @@
   font-style: italic;
 }
 
+/* Node inspector reorder (elspeth-a6ea581e8a): "Connections & schema" moved
+   from an always-open .graph-config-section (h4 label) to a collapsed
+   <details> carrying that class alongside this one, so it keeps the grid
+   rhythm but needs its own <summary> treatment — the same uppercase small-caps
+   label register .graph-config-section h4 used, plus the pointer cursor a
+   disclosure trigger needs. */
+.graph-config-connections > summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  line-height: var(--line-height-tight);
+  text-transform: uppercase;
+}
+
+/* OptionRows (elspeth-a6ea581e8a): the shared essential / advanced / raw
+   options renderer, used here and reused by the Spec tab (elspeth-b9ebdf9011)
+   so the two views cannot drift. The wrapper is a grid so the essential
+   ConfigRows block and the two disclosures below it share the same vertical
+   rhythm as every other .graph-config-section child. */
+.option-rows {
+  display: grid;
+  gap: var(--space-xs);
+}
+
+/* Advanced settings / Raw options (JSON) disclosures — same idiom as
+   .guided-schema-advanced and .wire-stage__raw: a top rule separates the
+   disclosure from the essential rows above it, and the summary picks up the
+   pointer cursor plus the file's secondary-text register instead of
+   inheriting raw UA <summary> chrome. */
+.option-rows-advanced,
+.option-rows-raw {
+  margin-top: var(--space-2xs);
+  padding-top: var(--space-xs);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--font-size-xs);
+}
+
+.option-rows-advanced > summary,
+.option-rows-raw > summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+
 @media (max-width: 760px) {
   .graph-config-panel {
     top: auto;
