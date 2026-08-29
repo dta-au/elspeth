@@ -197,19 +197,17 @@ export function appliedToolCallName(
 }
 
 /**
- * Audience-facing description of the applied operation behind this version,
- * or null when the version has no applied tool-call stamp or the tool is
- * not in the catalog. Suitable as a tooltip alongside the label.
+ * The raw applied-tool identifier behind this version, as "Applied: <name>",
+ * or null when the version has no applied tool-call stamp. The visible row
+ * carries the audience-facing sentence (deriveVersionLabel); this is the
+ * `title` for operators who need the exact tool name (elspeth-af559a0bab).
  */
-export function describeVersionOperation(
+export function versionOperationIdentifier(
   version: CompositionStateVersion,
   messages: ChatMessage[],
 ): string | null {
   const name = appliedToolCallName(version, messages);
-  if (name === null) {
-    return null;
-  }
-  return TOOL_CALL_DESCRIPTIONS[name] ?? null;
+  return name === null ? null : `Applied: ${name}`;
 }
 
 /**
@@ -234,7 +232,8 @@ export function deriveVersionLabel(
 ): string {
   const appliedName = appliedToolCallName(version, messages);
   if (appliedName !== null) {
-    return `Applied: ${appliedName}`;
+    const sentence = TOOL_CALL_DESCRIPTIONS[appliedName];
+    return sentence !== undefined ? `Applied: ${sentence}` : `Applied: ${appliedName}`;
   }
   const derivedFrom = version.derived_from_state_id;
   if (derivedFrom) {

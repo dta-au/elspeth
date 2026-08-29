@@ -194,6 +194,13 @@ export function toolCallOutcomeLabel(
   return `${prefix}: ${name}${qualifier}`;
 }
 
+export function toolCallOutcomeLabelParts(
+  name: string,
+  outcome: ToolCall["outcome"],
+): ToolCallLabelParts {
+  return outcomeLabelParts(name, outcome);
+}
+
 /**
  * Label for a MID-FLIGHT tool call in the live tool log. Stamped outcomes
  * reuse toolCallOutcomeLabel verbatim. Without a stamp, the fabrication

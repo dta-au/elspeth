@@ -194,9 +194,13 @@ describe("HeaderVersionSelector", () => {
     );
 
     const option = screen.getByRole("option", {
-      name: /^version 2 — applied: upsert_edge$/i,
+      name: /^version 2 — applied: adds or replaces a connection between two nodes in the pipeline\.$/i,
     });
-    expect(within(option).getByText("Applied: upsert_edge")).toBeInTheDocument();
+    expect(
+      within(option).getByText(
+        "Applied: Adds or replaces a connection between two nodes in the pipeline.",
+      ),
+    ).toBeInTheDocument();
   });
 
   // Snapshot-only rows carry nothing a user can decide on ("no visible
