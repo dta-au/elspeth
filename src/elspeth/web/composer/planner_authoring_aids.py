@@ -970,7 +970,23 @@ _SCHEMA_EVIDENCE_MAX_OMISSIONS: Final[int] = 16
 _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES: Final[int] = 96 * 1024
 
 _JSON_SCHEMA_PROSE_KEYS: Final[frozenset[str]] = frozenset(
-    {"$comment", "title", "description", "examples", "example", "composer_description", "composer_placeholder"}
+    {
+        "$comment",
+        "title",
+        "description",
+        "examples",
+        "example",
+        "composer_description",
+        "composer_placeholder",
+        # UI-disclosure hint (elspeth-9cca900d41): presentational, not
+        # audit-bearing (mirrors knob_schema._attach_tier's own docstring).
+        # The knob_schema projection already treats "tier" as prose
+        # (_contract_knob_schema's own prose_keys); this is the raw
+        # json_schema side of the same fact, since pydantic bakes
+        # json_schema_extra={"composer_tier": ...} onto the property's
+        # generated schema the same way it does composer_description.
+        "composer_tier",
+    }
 )
 _JSON_SCHEMA_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
     {

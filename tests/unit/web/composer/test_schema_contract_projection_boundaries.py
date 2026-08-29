@@ -66,6 +66,30 @@ def test_contract_json_schema_rejects_invalid_scalar_keyword_domains(schema: dic
         _contract_json_schema(schema)
 
 
+def test_contract_json_schema_drops_composer_tier_as_prose() -> None:
+    # ``composer_tier`` is a UI-disclosure hint (elspeth-9cca900d41): pydantic
+    # bakes json_schema_extra={"composer_tier": ...} as a sibling key onto the
+    # property's own generated JSON Schema, the same way it does for
+    # composer_description/composer_placeholder. Tier is presentational, not
+    # audit-bearing (see knob_schema._attach_tier's own docstring), and the
+    # planner's raw json_schema contract already carries no other UI-prose
+    # key — this must project like composer_description does (dropped), not
+    # trip the closed-vocabulary fail-closed branch that guards genuinely
+    # unmodelled schema semantics.
+    projected = _contract_json_schema(
+        {
+            "type": "object",
+            "properties": {
+                "temperature": {"type": "number", "composer_tier": "advanced"},
+            },
+        }
+    )
+    assert projected == {
+        "type": "object",
+        "properties": {"temperature": {"type": "number"}},
+    }
+
+
 def test_contract_knob_schema_rejects_missing_fields_key() -> None:
     with pytest.raises(_SchemaContractProjectionUnsupported):
         _contract_knob_schema({"not_fields": []})
