@@ -234,6 +234,13 @@ worktree CWD discipline, operator gates on destructive shared-state actions,
 and the box's finite resources — a wide fan-out must brief an explicit
 per-agent test-parallelism ceiling, because 24 CPUs do not multiply.
 
+When fanning several lanes out from a ticket list, use the `lane-manager`
+skill: it keeps a per-run state file under `.claude/lanes/`, verifies every
+lane from `git log`/`git diff` and the lane's test command rather than its
+own report, checks `ListAgents` + the worktree before calling an idle lane
+dead, escalates nudge → re-dispatch → BLOCKED without stalling, and emits the
+landed/blocked/merge-order report.
+
 Optimization priorities when choosing how to work, in order:
 
 1. **Code quality** — correctness, integrity, and maintainability come first.

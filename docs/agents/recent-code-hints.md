@@ -8,6 +8,15 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — `.claude/skills/**/*.py` IS scanned by every whole-tree test
+  gate (masquerade, hasattr, mock-discipline, walker authority): only
+  `.claude/worktrees/` is excluded.** A skill helper script is production code
+  to those gates — no `getattr`/`hasattr`, no unspecced mocks, exact-type
+  checks on parsed JSON. It is NOT under the `elspeth-lints --root src/elspeth`
+  tier gate. Ruff `T20` (print) is ignored there by `per-file-ignores`, the same
+  treatment as `scripts/`. First occupant: `.claude/skills/lane-manager/`
+  (hub-side lane orchestration; state under `.claude/lanes/`, tests in
+  `tests/unit/test_lane_manager_skill.py`).
 - **2026-08-29 — five tier_model precision classes are FIXED (elspeth-8d46db34ff);
   do not rationalise or reshape code around them any more, and do not expect the
   pre-fix finding sets.** (D1) A name bound in a `try` body now survives the
