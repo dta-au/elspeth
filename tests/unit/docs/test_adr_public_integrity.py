@@ -59,9 +59,12 @@ _PROVENANCE_REJECTION = re.compile(
     r"\b(?:do not|must not|never|reject(?:ed)?|forbid(?:den)?|not (?:a )?(?:durable|valid|acceptable|public))\b",
     re.IGNORECASE,
 )
-_OPAQUE_MEMORY_REFERENCE = re.compile(r"MEMORY\.md::|project memory", re.IGNORECASE)
-_MEMORY_KEY = re.compile(r"\b(?P<key>(?:project|feedback)_[a-z0-9_]+)\b", re.IGNORECASE)
-_TECHNICAL_MEMORY_FIELDS = frozenset({"project_id", "feedback_channel"})
+_OPAQUE_MEMORY_REFERENCE = re.compile(
+    r"MEMORY\.md::|\bproject memory\b|"
+    r"\bmemory(?:\s+(?:authority|evidence|entry|key|policy|provenance|record|reference))?"
+    r"\s*[:=]?\s*`?(?:project|feedback)_[a-z0-9_]+\b",
+    re.IGNORECASE,
+)
 
 
 def _active_adrs() -> tuple[Path, ...]:
@@ -88,11 +91,6 @@ def _public_provenance_violations(text: str) -> tuple[str, ...]:
 
         if _OPAQUE_MEMORY_REFERENCE.search(paragraph):
             violations.append("opaque project-memory authority")
-
-        if has_provenance_context:
-            memory_keys = (match.group("key").lower() for match in _MEMORY_KEY.finditer(paragraph))
-            if any(key not in _TECHNICAL_MEMORY_FIELDS for key in memory_keys):
-                violations.append("opaque project-memory authority")
 
     return tuple(dict.fromkeys(violations))
 
@@ -164,10 +162,18 @@ def test_active_adrs_do_not_use_private_or_ephemeral_provenance() -> None:
         ("**Review evidence:**\n  `/tmp/review.json`", True),
         ("**Reference:** `/home/john`", True),
         ("**Reference:** `/Users/alice`", True),
-        ("**Decision evidence:** `project_db_migration_policy`", True),
+        ("**Decision evidence:** `MEMORY.md::project_db_migration_policy`", True),
+        ("**Decision evidence:** project memory `project_db_migration_policy`", True),
+        ("**Decision evidence:** memory project_db_migration_policy", True),
+        ("**Decision evidence:** memory key feedback_review_policy", True),
         ("Runtime uses `/tmp/cache` for spill files.", False),
         ("The `project_id` field identifies the project.", False),
         ("The `feedback_channel` field routes messages.", False),
+        ("Review code validates the `project_name` field.", False),
+        ("The source schema includes `feedback_text`.", False),
+        ("Policy code reads the `project_slug` setting.", False),
+        ("Evidence rows may include `feedback_score`.", False),
+        ("**Decision evidence:** `project_db_migration_policy` is tracked in the repository.", False),
         ("References to `/tmp/review.json` are rejected as evidence.", False),
     ],
 )
