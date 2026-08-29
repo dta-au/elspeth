@@ -269,6 +269,8 @@
   ENTRY, not a top-level statement; both indices re-verified to resolve to the named functions post-merge).
   Cosmetic prose drift only: B06 cites contracts/errors.py:961 (now 965), B07 cites engine/processor.py:5298
   (now 5302) — correct symbols named in both, no mechanism falsehood, left as-is.
-- Full suite at 570194aae launched in a detached worktree (result recorded below when complete). The operator
+- Full suite at 570194aae GREEN: 43,773 passed / 66 skipped / 1 xfailed / 0 failed (18m19s, -n 24, detached
+  worktree, dual-root PYTHONPATH). Suite + lane worktrees reclaimed; fix/barrier-nav-width deleted (-d,
+  fully merged). The operator
   re-stage baseline is now AFTER this merge: the ONE stage_scan covers W1–W4 + w4fix + codex-salvage +
   barrier-nav-width.
