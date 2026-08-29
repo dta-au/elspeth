@@ -399,6 +399,12 @@
   cursor: pointer;
 }
 
+.composer-preferences-hint {
+  margin: 0.25rem 0 0;
+  font-size: 0.86rem;
+  color: var(--color-text-secondary);
+}
+
 .composer-preferences-reset {
   margin-top: var(--space-lg);
 }

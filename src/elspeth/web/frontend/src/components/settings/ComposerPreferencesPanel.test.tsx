@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
   ComposerPreferencesForm,
@@ -8,6 +8,7 @@ import {
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
+import { updateUserComposerPreferences } from "@/api/client";
 
 // API mock — the real preferencesStore module imports these helpers and
 // would receive undefined without the entries.
@@ -125,7 +126,7 @@ describe("ComposerPreferencesForm", () => {
     const { container } = render(<ComposerPreferencesForm />);
 
     const groups = screen.getAllByRole("group");
-    expect(groups).toHaveLength(2);
+    expect(groups).toHaveLength(3);
     for (const group of groups) {
       expect(group).toHaveClass("composer-preferences-fieldset");
       expect(group.getAttribute("style")).toBeNull();
@@ -135,7 +136,7 @@ describe("ComposerPreferencesForm", () => {
     }
 
     const radios = screen.getAllByRole("radio");
-    expect(radios).toHaveLength(5);
+    expect(radios).toHaveLength(7);
     for (const radio of radios) {
       expect(radio.closest("label")).toHaveClass("composer-preferences-option");
     }
@@ -205,6 +206,31 @@ describe("ComposerPreferencesForm", () => {
     expect(
       screen.getByRole("button", { name: /reset tutorial/i }),
     ).toBeInTheDocument();
+  });
+
+  it("offers a Detail level group and writes show_advanced", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateUserComposerPreferences).mockResolvedValueOnce({
+      default_mode: "guided",
+      banner_dismissed_at: null,
+      freeform_intro_dismissed_at: null,
+      tutorial_completed_at: null,
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+      show_advanced: true,
+      updated_at: "2026-05-15T00:00:00Z",
+    });
+    render(<ComposerPreferencesForm />);
+    const group = screen.getByRole("group", { name: "Detail level" });
+    expect(within(group).getByRole("radio", { name: "Standard (recommended)" })).toBeChecked();
+    await user.click(within(group).getByRole("radio", { name: "Show technical detail" }));
+    expect(updateUserComposerPreferences).toHaveBeenCalledWith({ show_advanced: true });
+    expect(usePreferencesStore.getState().showAdvanced).toBe(true);
+    // Store → mounted control (the flag flips from elsewhere, e.g. another tab).
+    act(() => usePreferencesStore.setState({ showAdvanced: false }));
+    expect(within(group).getByRole("radio", { name: "Standard (recommended)" })).toBeChecked();
   });
 });
 

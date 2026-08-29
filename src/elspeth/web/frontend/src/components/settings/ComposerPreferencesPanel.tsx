@@ -31,6 +31,8 @@ export function ComposerPreferencesForm({
   const writeError = usePreferencesStore((s) => s.writeError);
   const setDefaultMode = usePreferencesStore((s) => s.setDefaultMode);
   const resetTutorial = usePreferencesStore((s) => s.resetTutorial);
+  const showAdvanced = usePreferencesStore((s) => s.showAdvanced);
+  const setShowAdvanced = usePreferencesStore((s) => s.setShowAdvanced);
   const { theme, setTheme } = useTheme();
 
   // TODO(hidden-jobs-settings): Add a user-settings view for hidden jobs
@@ -67,6 +69,18 @@ export function ComposerPreferencesForm({
       setTheme(nextTheme);
     },
     [setTheme],
+  );
+
+  const onDetailLevelChange = useCallback(
+    async (value: boolean) => {
+      try {
+        await setShowAdvanced(value);
+      } catch (err) {
+        // Surfaced via writeError -> role="alert" region below.
+        console.error("[preferences] setShowAdvanced failed:", err);
+      }
+    },
+    [setShowAdvanced],
   );
 
   if (!loaded || defaultMode === null) return null;
@@ -136,6 +150,38 @@ export function ComposerPreferencesForm({
           />
           <span>Dark</span>
         </label>
+      </fieldset>
+      <fieldset
+        disabled={writing}
+        aria-busy={writing}
+        className="composer-preferences-fieldset"
+      >
+        <legend className="composer-preferences-legend">Detail level</legend>
+        <label className="composer-preferences-option">
+          <Input
+            type="radio"
+            name="composer-detail-level"
+            value="standard"
+            checked={!showAdvanced}
+            disabled={writing}
+            onChange={() => void onDetailLevelChange(false)}
+          />
+          <span>Standard (recommended)</span>
+        </label>
+        <label className="composer-preferences-option">
+          <Input
+            type="radio"
+            name="composer-detail-level"
+            value="technical"
+            checked={showAdvanced}
+            disabled={writing}
+            onChange={() => void onDetailLevelChange(true)}
+          />
+          <span>Show technical detail</span>
+        </label>
+        <p className="composer-preferences-hint">
+          Technical detail shows raw plugin settings, every validation check, and advanced options. The audit trail is always shown.
+        </p>
       </fieldset>
       {writeError !== null && (
         <div role="alert" className="composer-preferences-error">
