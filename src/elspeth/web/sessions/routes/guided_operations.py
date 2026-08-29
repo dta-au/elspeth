@@ -133,7 +133,7 @@ def guided_response_hash(response: BaseModel) -> str:
     """Hash the complete strict HTTP response domain used for replay."""
 
     config = type(response).model_config
-    if config.get("strict") is not True or config.get("extra") != "forbid":
+    if "strict" not in config or config["strict"] is not True or "extra" not in config or config["extra"] != "forbid":
         raise AuditIntegrityError("Guided operation replay requires a strict, extra-forbid response DTO")
     # Re-validate the emitted representation strictly.  Constructed Pydantic
     # instances can bypass validation through ``model_construct``; a replay
@@ -167,10 +167,9 @@ def raise_guided_operation_failure(
     form silently.
     """
 
-    safe = _SAFE_FAILURES.get(outcome.failure_code)
-    if safe is None:
+    if outcome.failure_code not in _SAFE_FAILURES:
         raise AuditIntegrityError("Guided operation returned an unknown failure code")
-    status_code, detail = safe
+    status_code, detail = _SAFE_FAILURES[outcome.failure_code]
     body: dict[str, object] = {
         "error_type": "guided_operation_terminal_failure",
         "failure_code": outcome.failure_code,
@@ -285,8 +284,11 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     if not takeover_expired and reserve_if_absent:
         raise AuditIntegrityError("Non-taking-over guided operation lookup must not reserve an absent operation")
 
-    operation_id = request.model_dump(mode="python").get("operation_id")
-    if not isinstance(operation_id, str):
+    dumped_request = request.model_dump(mode="python")
+    if "operation_id" not in dumped_request:
+        raise AuditIntegrityError("Strict guided operation request has no operation_id")
+    operation_id = dumped_request["operation_id"]
+    if type(operation_id) is not str:
         raise AuditIntegrityError("Strict guided operation request has a non-string operation_id")
     request_hash = guided_operation_request_hash(session_id=session_id, kind=kind, request=request)
 
@@ -327,11 +329,17 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
         outcome = existing
         observed_by_get = True
     while True:
-        if isinstance(outcome, (GuidedOperationClaimed, GuidedOperationTakenOver)):
+        # ``GuidedOperationOutcome`` is a closed union of five exact,
+        # unsubclassed frozen dataclasses this package owns, so the exact-type
+        # form is the house idiom for the positive arms. The terminal guard
+        # below stays ``isinstance`` deliberately: ``type(x) is not C`` gives
+        # no negative-branch narrowing, and the ``GuidedOperationActive``
+        # reads after it need it.
+        if type(outcome) is GuidedOperationClaimed or type(outcome) is GuidedOperationTakenOver:
             return GuidedOperationLease(fence=outcome.fence)
-        if isinstance(outcome, GuidedOperationCompleted):
+        if type(outcome) is GuidedOperationCompleted:
             return await _replay_completed(outcome, replay, after_verified)
-        if isinstance(outcome, GuidedOperationFailed):
+        if type(outcome) is GuidedOperationFailed:
             raise_guided_operation_failure(outcome)
         if not isinstance(outcome, GuidedOperationActive):
             raise AuditIntegrityError("Guided operation reserve returned an unknown outcome")

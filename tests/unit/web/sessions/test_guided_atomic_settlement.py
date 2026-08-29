@@ -990,6 +990,70 @@ def test_payload_preparation_rejects_store_that_retrieves_altered_bytes() -> Non
         )
 
 
+def test_load_guided_json_payload_rejects_a_store_that_lies_about_its_content_bytes(tmp_path: Path) -> None:
+    """The replay read re-derives the content address instead of trusting the store.
+
+    Every other invalid-content case reaches ``load_guided_json_payload``
+    through a real ``FilesystemPayloadStore``, whose own ``retrieve`` already
+    verifies the hash — so the re-derivation inside the loader is only ever
+    exercised by a store that lies, and without this test the line survives
+    being deleted. It is also the control the loader relies on in place of the
+    ``runtime_checkable`` Protocol ``isinstance`` ADR-032 withdrew: this fake
+    would pass that check, and is rejected on its bytes instead.
+    """
+    replay = importlib.import_module("elspeth.web.sessions.guided_replay")
+    honest = FilesystemPayloadStore(tmp_path / "lying-store-source")
+    payload_id = honest.store(b'{"schema":"guided.json-payload.v1","purpose":"turn","payload":{"question":"Choose"}}')
+
+    class _LyingStore:
+        def store(self, content: bytes) -> str:
+            return payload_id
+
+        def retrieve(self, content_hash: str) -> bytes:
+            return b'{"schema":"guided.json-payload.v1","purpose":"turn","payload":{"question":"SUBSTITUTED"}}'
+
+        def exists(self, content_hash: str) -> bool:
+            return True
+
+        def delete(self, content_hash: str) -> bool:
+            return False
+
+    with pytest.raises(AuditIntegrityError, match="bytes do not match the content id"):
+        replay.load_guided_json_payload(_LyingStore(), payload_id=payload_id, purpose="turn")
+
+
+def test_payload_settlement_verification_rejects_a_store_whose_content_changed(tmp_path: Path) -> None:
+    """The pre-SQL re-read compares bytes, not merely that a store is configured.
+
+    ``verify_guided_json_payloads`` runs immediately before settlement so a
+    payload that was durable at prepare time but has since been substituted
+    cannot be committed against. The sibling test
+    ``test_settlement_requires_store_retrieval_for_every_payload_and_can_retry``
+    pins only the "no store configured" arm; this one pins the byte comparison,
+    which is the control that replaced the withdrawn Protocol ``isinstance``.
+    """
+    preparation = importlib.import_module("elspeth.web.sessions.guided_payloads")
+    honest = FilesystemPayloadStore(tmp_path / "settlement-verify")
+    prepared = preparation.prepare_guided_json_payload(honest, purpose="turn", payload={"question": "Choose"})
+
+    class _SubstitutedStore:
+        def store(self, content: bytes) -> str:
+            return prepared.payload_id
+
+        def retrieve(self, content_hash: str) -> bytes:
+            return b'{"schema":"guided.json-payload.v1","purpose":"turn","payload":{"question":"SUBSTITUTED"}}'
+
+        def exists(self, content_hash: str) -> bool:
+            return True
+
+        def delete(self, content_hash: str) -> bool:
+            return False
+
+    preparation.verify_guided_json_payloads(honest, (prepared,))
+    with pytest.raises(AuditIntegrityError, match="content differs from the prepared payload"):
+        preparation.verify_guided_json_payloads(_SubstitutedStore(), (prepared,))
+
+
 def test_next_turn_payload_requires_turn_purpose() -> None:
     payload = PreparedGuidedJsonPayload(
         payload_id=guided_json_payload_id("turn_response", {"question": "Choose"}),

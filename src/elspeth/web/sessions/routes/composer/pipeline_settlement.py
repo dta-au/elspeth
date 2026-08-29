@@ -263,8 +263,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                 "VALIDATION_FAILED": "validation_failed",
                 "BASE_CONFLICT": "base_conflict",
             }
-            reason = reason_by_code.get(exc.code)
-            if reason is not None:
+            if exc.code in reason_by_code:
+                reason = reason_by_code[exc.code]
                 await _await_with_deferred_cancellation(
                     service.reject_pipeline_composition_proposal(
                         session_id=proposal.session_id,

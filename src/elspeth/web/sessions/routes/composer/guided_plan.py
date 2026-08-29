@@ -557,7 +557,7 @@ async def post_guided_plan(
         )
         return joined
     except asyncio.CancelledError as exc:
-        if exc.__dict__.get(_GUIDED_ATOMIC_SETTLEMENT_COMPLETED) is True:
+        if _GUIDED_ATOMIC_SETTLEMENT_COMPLETED in exc.__dict__ and exc.__dict__[_GUIDED_ATOMIC_SETTLEMENT_COMPLETED] is True:
             try:
                 (joined, _cancelled_during_replay) = await _await_with_deferred_cancellation(
                     reserve_or_replay_guided_operation(
@@ -586,7 +586,7 @@ async def post_guided_plan(
                 )
             )
             raise
-        settlement_failure = exc.__dict__.get(_GUIDED_ATOMIC_SETTLEMENT_FAILURE)
+        settlement_failure = exc.__dict__[_GUIDED_ATOMIC_SETTLEMENT_FAILURE] if _GUIDED_ATOMIC_SETTLEMENT_FAILURE in exc.__dict__ else None
         caller_task = asyncio.current_task()
         caller_cancelled = caller_task is not None and caller_task.cancelling() > 0
         disconnected = _is_client_disconnect_cancel(exc)

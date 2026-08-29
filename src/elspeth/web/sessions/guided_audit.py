@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 from uuid import UUID
 
@@ -310,13 +310,30 @@ def validate_guided_audit_payload_references(
     for row in rows:
         if row.kind != "tool":
             continue
-        invocation = row.envelope.get("invocation")
-        if not isinstance(invocation, Mapping):
+        # Every "tool" envelope this module builds is
+        # ``{"_kind": "audit", "invocation": <projection>}`` and every
+        # projection carries ``tool_name`` and ``arguments_canonical``
+        # (``prepare_guided_audit_rows``, ``_omitted_success_invocation``),
+        # so an absent key is malformed evidence, not a row to skip.
+        if "invocation" not in row.envelope:
             raise AuditIntegrityError("guided tool audit invocation envelope is malformed")
-        tool_name = invocation.get("tool_name")
+        invocation = row.envelope["invocation"]
+        # ``PreparedGuidedAuditRow.__post_init__`` runs
+        # ``freeze_fields(self, "envelope")``, so ``deep_freeze`` has already
+        # rendered this nested projection a ``mappingproxy`` — measured, not
+        # inferred — and ``type(invocation) is dict`` would be permanently
+        # False. Name deep_freeze's output pair, exactly as the dataclass's
+        # own envelope guard does.
+        if type(invocation) not in (dict, MappingProxyType):
+            raise AuditIntegrityError("guided tool audit invocation envelope is malformed")
+        if "tool_name" not in invocation:
+            raise AuditIntegrityError("guided tool audit invocation envelope is malformed")
+        tool_name = invocation["tool_name"]
         if tool_name not in {"guided_turn_emitted", "guided_turn_answered"}:
             continue
-        raw_arguments = invocation.get("arguments_canonical")
+        if "arguments_canonical" not in invocation:
+            raise AuditIntegrityError("guided synthetic audit arguments are malformed")
+        raw_arguments = invocation["arguments_canonical"]
         if type(raw_arguments) is not str:
             raise AuditIntegrityError("guided synthetic audit arguments are malformed")
         arguments = json.loads(raw_arguments)
@@ -328,8 +345,10 @@ def validate_guided_audit_payload_references(
             payload_id = arguments["response_payload_id"]
             expected_purpose = "turn_response"
             hash_field = "response_hash"
-        payload = by_id.get(payload_id)
-        if payload is None or payload.purpose != expected_purpose or arguments[hash_field] != payload_id:
+        if payload_id not in by_id:
+            raise AuditIntegrityError("guided synthetic audit payload reference is absent or purpose-mismatched")
+        payload = by_id[payload_id]
+        if payload.purpose != expected_purpose or arguments[hash_field] != payload_id:
             raise AuditIntegrityError("guided synthetic audit payload reference is absent or purpose-mismatched")
 
 

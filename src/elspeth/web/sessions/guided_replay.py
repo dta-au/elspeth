@@ -184,10 +184,15 @@ def load_guided_json_payload(
     payload_id: str,
     purpose: GuidedJsonPayloadPurpose,
 ) -> PreparedGuidedJsonPayload:
-    """Load and fully revalidate one canonical guided JSON payload for replay."""
+    """Load and fully revalidate one canonical guided JSON payload for replay.
 
-    if not isinstance(payload_store, PayloadStore):
-        raise TypeError("payload_store must implement PayloadStore")
+    ``payload_store`` carries no runtime type gate: ``PayloadStore`` is a
+    ``runtime_checkable`` Protocol, withdrawn as a control by ADR-032 (an
+    impostor with the method names passes it). The control here is the
+    content-address re-derivation below — the retrieved bytes must hash to
+    ``payload_id`` and re-canonicalise to themselves.
+    """
+
     if type(payload_id) is not str or len(payload_id) != 64 or any(char not in "0123456789abcdef" for char in payload_id):
         raise AuditIntegrityError("Guided replay payload id is malformed")
     if purpose not in {"turn", "turn_response"}:
@@ -239,8 +244,13 @@ def parse_guided_response_descriptor(record: CompositionStateRecord) -> GuidedRe
     if record.composer_meta is None:
         raise AuditIntegrityError("Guided result state has no composer metadata")
     composer_meta = deep_thaw(record.composer_meta)
-    raw = composer_meta.get(GUIDED_REPLAY_META_KEY)
-    if not isinstance(raw, Mapping):
+    if GUIDED_REPLAY_META_KEY not in composer_meta:
+        raise AuditIntegrityError("Guided result state has no valid replay descriptor")
+    raw = composer_meta[GUIDED_REPLAY_META_KEY]
+    # ``deep_thaw`` recursively rebuilds every mapping as an exact ``dict``,
+    # so the exact-type test is the house form here — the same one
+    # ``_guided_session`` below already uses on the sibling key.
+    if type(raw) is not dict:
         raise AuditIntegrityError("Guided result state has no valid replay descriptor")
     return GuidedResponseDescriptor.from_dict(raw)
 
@@ -248,7 +258,10 @@ def parse_guided_response_descriptor(record: CompositionStateRecord) -> GuidedRe
 def _guided_session(record: CompositionStateRecord) -> GuidedSession:
     if record.composer_meta is None:
         raise AuditIntegrityError("Guided result state has no composer metadata")
-    raw = deep_thaw(record.composer_meta).get("guided_session")
+    composer_meta = deep_thaw(record.composer_meta)
+    if "guided_session" not in composer_meta:
+        raise AuditIntegrityError("Guided result state has no guided checkpoint")
+    raw = composer_meta["guided_session"]
     if type(raw) is not dict:
         raise AuditIntegrityError("Guided result state has no guided checkpoint")
     return GuidedSession.from_dict(raw)
@@ -439,7 +452,7 @@ def guided_response_projection_hash(response: BaseModel) -> str:
     """Hash one strictly revalidated guided response projection."""
 
     config = type(response).model_config
-    if config.get("strict") is not True or config.get("extra") != "forbid":
+    if "strict" not in config or config["strict"] is not True or "extra" not in config or config["extra"] != "forbid":
         raise AuditIntegrityError("Guided operation replay requires a strict, extra-forbid response DTO")
     strict_response = type(response).model_validate(response.model_dump(mode="python"), strict=True)
     return stable_hash(strict_response.model_dump(mode="json"))
