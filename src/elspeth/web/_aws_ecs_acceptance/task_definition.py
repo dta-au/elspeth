@@ -14,6 +14,7 @@ from typing import cast
 
 import yaml
 
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.secrets import is_secret_field
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
 
@@ -161,6 +162,18 @@ def _decode_cloudwatch_agent_config(value: object) -> bytes:
     return decoded
 
 
+@trust_boundary(
+    tier=3,
+    source="base64-decoded CloudWatch agent JSON config carried in an ECS task definition's sidecar environment",
+    source_param="content",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError on content that is not UTF-8, is not JSON, repeats an object key, "
+        "carries a JSON constant literal, or does not decode to a mapping; never coerces external values"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_manifest_task_definition.py::test_cloudwatch_json_object_rejects_content_that_is_not_a_json_object",
+    test_fingerprint="a13e7a7eefd8163cb51298fc5875d83efd30b7fd67d6eae4fd2ccf33f18d7cd8",
+)
 def _cloudwatch_json_object(content: bytes) -> Mapping[str, object]:
     def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
@@ -176,26 +189,51 @@ def _cloudwatch_json_object(content: bytes) -> Mapping[str, object]:
             object_pairs_hook=unique_object,
             parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
         )
+        if not isinstance(document, Mapping):
+            raise ValueError
+        return document
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
         raise AcceptanceCheckError("task_definition_policy_binding") from None
-    if not isinstance(document, Mapping):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    return document
 
 
+@trust_boundary(
+    tier=3,
+    source="base64-decoded CloudWatch agent OTel YAML carried in an ECS task definition's sidecar environment",
+    source_param="content",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError on content that is not UTF-8, is not YAML, exhausts the parser, "
+        "or does not decode to a mapping; never coerces external values"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_manifest_task_definition.py::test_cloudwatch_yaml_object_rejects_content_that_is_not_a_yaml_mapping",
+    test_fingerprint="16da7fef8a4fb17ca1a0a9226555504721f45adbf7663d2d5a54199e14ff95e7",
+)
 def _cloudwatch_yaml_object(content: bytes) -> Mapping[str, object]:
     try:
         document = yaml.safe_load(content.decode("utf-8"))
-    except (UnicodeDecodeError, yaml.YAMLError, RecursionError, OverflowError):
+        if not isinstance(document, Mapping):
+            raise ValueError
+        return document
+    except (UnicodeDecodeError, ValueError, yaml.YAMLError, RecursionError, OverflowError):
         raise AcceptanceCheckError("task_definition_policy_binding") from None
-    if not isinstance(document, Mapping):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    return document
 
 
+@trust_boundary(
+    tier=3,
+    source="the cloudwatch-agent container definition inside an ECS DescribeTaskDefinition response",
+    source_param="sidecar",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on any sidecar field that departs from the tracked "
+        "image, resource, entrypoint, command, health-check, mount or environment shape, and on a "
+        "config/otel payload whose decoded bytes do not hash to the manifest-bound digest; "
+        "never coerces external values"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_manifest_task_definition.py::test_cloudwatch_sidecar_rejects_a_non_mapping_environment_entry",
+    test_fingerprint="98dbb1748caf2a6c62235574989b586a25ea987e523719d98901106b8d6d05db",
+)
 def _validate_cloudwatch_agent_sidecar(
     sidecar: Mapping[str, object],
-    main_container: Mapping[str, object],
     values: Mapping[str, object],
 ) -> None:
     if (
@@ -211,7 +249,6 @@ def _validate_cloudwatch_agent_sidecar(
         or sidecar.get("mountPoints", []) != []
         or sidecar.get("portMappings", []) != []
         or sidecar.get("environmentFiles", []) != []
-        or main_container.get("dependsOn") != [{"containerName": "cloudwatch-agent", "condition": "HEALTHY"}]
     ):
         raise AcceptanceCheckError("task_definition_policy_binding")
 
@@ -249,6 +286,24 @@ def _validate_cloudwatch_agent_sidecar(
         raise AcceptanceCheckError("task_definition_policy_binding")
 
 
+@trust_boundary(
+    tier=3,
+    source="ECS DescribeTaskDefinition response returned by the live acceptance account",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on a payload that is not an ACTIVE task definition, "
+        "on any container, environment, secret, volume or mount entry whose shape or value departs "
+        "from the manifest-bound protected inventory, and on a returned image, role ARN or secret ARN "
+        "outside the acceptance run's own partition, account, region and namespace; "
+        "never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_manifest_task_definition.py::"
+        "test_task_definition_policy_binding_rejects_unreviewed_container_definitions"
+    ),
+    test_fingerprint="7de8fb382ea611ffe1df5b360c55278d2aa8cc792efe5550162c67a041850439",
+)
 def validate_task_definition_policy_binding(
     payload: object,
     *,
@@ -311,7 +366,9 @@ def validate_task_definition_policy_binding(
         if is_published_web_container:
             raise AcceptanceCheckError("task_definition_policy_binding")
     else:
-        _validate_cloudwatch_agent_sidecar(sidecars[0], container, values)
+        if container.get("dependsOn") != [{"containerName": "cloudwatch-agent", "condition": "HEALTHY"}]:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        _validate_cloudwatch_agent_sidecar(sidecars[0], values)
     ecr = cast(Mapping[str, object], manifest["ecr"])
     registry = ecr["registry"]
     repository = ecr["repository"]
@@ -374,7 +431,7 @@ def validate_task_definition_policy_binding(
         observed[name] = value
     if any(name in _TASK_DEFINITION_AWS_OVERRIDE_ENV or _plaintext_task_definition_secret(name) for name in observed):
         raise AcceptanceCheckError("task_definition_policy_binding")
-    if any(observed.get(name) != values[name] for name in _TASK_DEFINITION_COMPOSER_MODEL_ENV):
+    if any(name not in observed or observed[name] != values[name] for name in _TASK_DEFINITION_COMPOSER_MODEL_ENV):
         raise AcceptanceCheckError("task_definition_policy_binding")
     composer_providers = {
         infer_provider_from_model_name(observed[name]) or infer_provider_from_unprefixed_model_name(observed[name])
@@ -437,9 +494,9 @@ def validate_task_definition_policy_binding(
     }
     if secret_names.intersection((*protected_names, *expected_runtime)):
         raise AcceptanceCheckError("task_definition_policy_binding")
-    if any(observed.get(name) != values[name] for name in protected_names):
+    if any(name not in observed or observed[name] != values[name] for name in protected_names):
         raise AcceptanceCheckError("task_definition_policy_binding")
-    if any(observed.get(name) != value for name, value in expected_runtime.items()):
+    if any(name not in observed or observed[name] != value for name, value in expected_runtime.items()):
         raise AcceptanceCheckError("task_definition_policy_binding")
     data_dir_value = observed["ELSPETH_WEB__DATA_DIR"]
     payload_root_value = observed["ELSPETH_WEB__PAYLOAD_STORE_PATH"]
