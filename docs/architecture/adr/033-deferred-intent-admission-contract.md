@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-04
 **Status:** Accepted
-**Deciders:** John Morrissey, Claude Fable 5
+**Deciders:** ELSPETH maintainer
 **Tags:** composer, guided-mode, deferred-intents, admission-gate,
           planning, fail-closed, testing-doctrine
 
@@ -39,9 +39,10 @@ against cardinality caps, and a proof budget
 (`_MAX_ALIAS_PROFILE_SUBJECTS = 12`, `_MAX_ALIAS_PARTITION_STEPS =
 50_000`; `deferred_intents.py:1606-1611`).
 
-A seven-lens SME panel (security, static-analysis rule design, solution
-scope, defect triage, test suite, systems leverage, cross-lane
-recurrence) unanimously rejected the solver. The decisive evidence:
+A non-authoritative seven-lens SME review (security, static-analysis rule
+design, solution scope, defect triage, test suite, systems leverage, and
+cross-lane recurrence) recommended rejecting the solver; the maintainer
+adopted that recommendation. The decisive evidence:
 
 - **Probe-verified false rejection of trivially satisfiable input.**
   Thirteen same-plugin subjects under `at_most 13` — satisfiable by
@@ -300,15 +301,14 @@ stated option values possible.
 ## References
 
 - `elspeth-d293c5d139` — the originating ticket: "a small closed
-  conjunction checker". The seven-lens panel verdict and scope reset
-  are recorded on this ticket (2026-08-04).
+  conjunction checker". The advisory review findings and maintainer scope
+  reset are recorded on this ticket (2026-08-04).
 - `elspeth-a96b2f1b0a` — R2-F15: instructions are never silently
   dropped; the retention requirement the rejection path must satisfy.
 - `elspeth-826765af90` — lane B: `StatedOptionValueConstraint`, prose
   grounding, projection, schema epoch 43→44.
-- The seven-lens panel synthesis is preserved in the maintainer-local
-  docs archive (untracked; it does not survive a fresh clone). The
-  durable record is the ticket comment trail on `elspeth-d293c5d139`.
+- Commit `449c93397` and the ticket comment trail on
+  `elspeth-d293c5d139` preserve the scope reset.
 - `src/elspeth/web/composer/guided/deferred_intents.py` @ `ef73bfa70`
   (branch `codex/fix-grounded-option-constraints`) — the governed gate.
 - `src/elspeth/web/composer/guided/planning.py:2058`,

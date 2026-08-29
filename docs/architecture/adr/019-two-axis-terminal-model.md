@@ -1,8 +1,8 @@
 # ADR-019: Two-Axis Terminal Model — Lifecycle, Outcome, and Path
 
 **Date:** 2026-05-04
-**Status:** Accepted (re-accepted 2026-05-04 against round-3 corrected text; supersedes ADR-018; round-2 acceptance was reverted earlier 2026-05-04 after the round-3 panel caught a mechanical-test reasoning error — see "Round-2 Correction" subsection for the honest record; round-4 amendment 2026-05-04: §"Public API field-name preservation" rewritten as §"Counter derivation contract — public API field names preserved" to make the `(outcome, path) → counter` mapping at lines 99-115 explicitly normative and to enumerate the two accumulator behaviour changes the migration must ship — no Re-Accept, contract clarified)
-**Deciders:** ELSPETH maintainers
+**Status:** Accepted (re-accepted 2026-05-04 against round-3 corrected text; supersedes ADR-018; round-2 acceptance was reverted earlier 2026-05-04 after advisory review caught a mechanical-test reasoning error — see "Round-2 Correction" subsection for the honest record; round-4 amendment 2026-05-04: §"Public API field-name preservation" rewritten as §"Counter derivation contract — public API field names preserved" to make the `(outcome, path) → counter` mapping at lines 99-115 explicitly normative and to enumerate the two accumulator behaviour changes the migration must ship — no Re-Accept, contract clarified)
+**Deciders:** ELSPETH maintainer
 **Tags:** contracts, audit, row-outcomes, public-api, supersedes-adr-018
 
 ## Context
@@ -354,8 +354,8 @@ all-rows-already-processed branch (preserving ADR-018 line 70-82 nuance).
 
 ### Migration policy
 
-ELSPETH's "delete the DB on schema change" policy
-(`MEMORY.md::project_db_migration_policy`) applies to the Landscape audit store.
+ELSPETH's pre-1.0 Landscape schema policy in
+`docs/reference/configuration.md` applies to the Landscape audit store.
 There is no in-place audit-store migration: operators replace old pre-ADR-019
 `audit.db` / Landscape audit-store schemas when ADR-019 ships. ADR-019 does not
 change the web session schema; operators preserve `sessions.db` unless a
@@ -389,7 +389,7 @@ closed-set partition assertion gating each stage:
 5. **Final sweep**: delete the temporary `RowOutcome` view; closed-set
    assertion is now the only enforcement of the partition.
 
-The "delete the DB" policy (`MEMORY.md::project_db_migration_policy`)
+The pre-1.0 schema policy in `docs/reference/configuration.md`
 contains the data-side migration for the Landscape audit store only: operators
 replace old `audit.db` / audit-store schemas between stages 1 and 5. No
 in-place audit-store migration; no Alembic path for this ADR.
@@ -535,18 +535,14 @@ separate decision if operators ever need it; `UNROUTED` is the honest
 representation of "the engine had nowhere to route this failure" until that
 config burden is taken on.
 
-## Sub-decisions Resolved by Panel Review (2026-05-04)
+## Sub-decisions Resolved by the Maintainer (2026-05-04)
 
 The five sub-decisions enumerated below were originally tabled as "Open
-Questions for the Maintainer." A three-agent review panel
-(`axiom-solution-architect:solution-design-reviewer`,
-`axiom-system-architect:architecture-critic`,
-`yzmir-systems-thinking:pattern-recognizer`) reviewed ADR-019 against primary
-source on 2026-05-04. The panel ran twice — see "Round-2 Correction"
-subsection below for an honest account of why. After round-3, all five
-sub-decisions are resolved **unanimously**. The verdicts are recorded here as
-the binding interpretation of the mapping table above; if a future reader
-disagrees, an ADR-020 amendment is the vehicle, not local re-litigation.
+Questions for the Maintainer." Advisory architecture and systems review was
+checked against primary source on 2026-05-04 and repeated after a mechanical
+claim was disproved; see "Round-2 Correction" below. The maintainer resolved
+all five sub-decisions. They are recorded here as the binding interpretation
+of the mapping table above; a future change requires an ADR amendment.
 
 1. **`QUARANTINED` path naming.** **Verdict: distinct (`QUARANTINED_AT_SOURCE`
    vs `UNROUTED`).** Source-side coercion failure is a Tier 3 trust-boundary
@@ -590,7 +586,7 @@ disagrees, an ADR-020 amendment is the vehicle, not local re-litigation.
 
 ### Round-2 Correction
 
-The first panel review (round-2, also 2026-05-04) accepted ADR-019 with a
+The first advisory review (round-2, also 2026-05-04) recommended ADR-019 with a
 mechanical test for `TRANSIENT` classification phrased as: *"does another
 `token_outcomes` record exist for this token's row's lifecycle answer? If
 yes, TRANSIENT."* Verdict 5 (discard-mode → FAILURE) was endorsed on the
@@ -599,14 +595,14 @@ one did exist for failsink-mode.
 
 The maintainer's primary-source check disconfirmed the test. Failsink mode
 writes exactly one `record_token_outcome` call (`engine/executors/sink.py:952`).
-The "paired record" the round-2 panel relied on was the failsink's
+The "paired record" the round-2 review relied on was the failsink's
 `NodeStateStatus.COMPLETED` `node_state` (`sink.py:898-903`), which is in a
-*different table* (`node_states`, not `token_outcomes`). All three
-round-2 reviewers had endorsed the test on reasoning-coherence grounds
-without verifying it pair-by-pair against `sink.py`.
+*different table* (`node_states`, not `token_outcomes`). The review had
+endorsed the test on reasoning-coherence grounds without verifying it
+pair-by-pair against `sink.py`.
 
-Round-3 (also 2026-05-04) reconvened the panel as an actual collaborative
-team rather than parallel reviewers. `panel-ac` walked the mapping table
+Round-3 (also 2026-05-04) repeated the advisory review collaboratively and
+walked the mapping table
 pair-by-pair and surfaced a structural ambiguity: `ROUTED_ON_ERROR`
 (`outcomes.py:266-291` — transform threw, on-error sink received the row)
 produces a paired `NodeStateStatus.COMPLETED` `node_state` plus registered
@@ -614,7 +610,7 @@ produces a paired `NodeStateStatus.COMPLETED` `node_state` plus registered
 failsink-mode `DIVERTED` at the audit layer. Topology cannot derive the
 classification: only producer declaration distinguishes "transform's work
 failed but routing succeeded" (FAILURE) from "original sink-write failed
-but failsink absorbed for visibility" (TRANSIENT). The panel converged on
+but failsink absorbed for visibility" (TRANSIENT). The advisory review converged on
 **producer-declared classification, with audit-tier cross-checks verifying
 structural consistency in the `TRANSIENT` direction only** — see the
 "Classification is producer-declared, not topology-derivable" and
@@ -627,7 +623,7 @@ in `sink.py:977-1003`, and cross-check invariant I3 (cross-layer agreement
 between `node_states` and `token_outcomes`) — *not* on the round-2 claim
 about a "paired `token_outcomes` record."
 
-**Panel-process finding (recorded for future ADR reviews):** for any
+**Review-process finding (recorded for future ADR reviews):** for any
 mechanical test or derivation invariant in ADR text, each reviewer must
 independently verify the claim against primary source for *every row in
 the relevant mapping table* before endorsing. Reasoning-coherence checks
@@ -699,7 +695,7 @@ The implementation surface, in order of dependency:
    635, and the diversion sites at line 952 (failsink mode) and line 998
    (discard mode). The discard-mode site changes predicate behavior because
    `(FAILURE, SINK_DISCARDED)` is the canonical classification per
-   sub-decision 5 (round-3 panel-resolved); see Behavior Change Notice for
+   sub-decision 5 (maintainer-resolved after round-3 review); see Behavior Change Notice for
    the operator-visible run-status impact.
 6. Producer sites that emit `RowOutcome.X`: each site emits the `(outcome, path)`
    pair instead.

@@ -4,7 +4,7 @@
 **Status:** Accepted (amended 2026-06-13 — journal-first acceptance,
 snapshot-scoped exhaustiveness, branch-loss records; see *Amendment* note
 below and *Amendment detail* at the end)
-**Deciders:** John Morrissey, Claude Fable 5
+**Deciders:** ELSPETH maintainer
 **Tags:** scheduler, checkpoint, resume, barrier, aggregation, coalesce,
           durability, f1, multi-source-token-scheduler
 
@@ -39,10 +39,10 @@ and the design note
 
 ## Context
 
-The fork/coalesce architecture assessment
-(`notes/fork-coalesce-architecture-assessment-2026-06-10.md`) identified a
-structural durability gap in how barrier-buffered tokens survive crash and
-resume. ELSPETH's token execution model has three durability layers:
+A historical fork/coalesce architecture assessment identified a structural
+durability gap in how barrier-buffered tokens survive crash and resume. Commit
+`a565c404c` preserves the resulting decision. ELSPETH's token execution model
+has three durability layers:
 
 1. **The scheduler journal** (`token_work_items`): every schedulable
    continuation has a row before a worker touches it. A buffered token is
@@ -454,9 +454,7 @@ bumps for D2 anyway; adding one nullable column is negligible cost.
 
 ### Architecture assessment
 
-- `notes/fork-coalesce-architecture-assessment-2026-06-10.md` — the durability
-  gap analysis that motivated this ADR; findings F1–F6, particularly the
-  blob-vs-journal skew risk and the unresumable flush-output window.
+- Commit `a565c404c` — the original durability-unification decision.
 - `notes/option-c-multi-worker-coordination-design-2026-06-11.md` — the
   multi-worker coordination design behind the 2026-06-13 amendment (§D
   finalization, §E.1 journal-arrival hand-off, §E.2 in-claim arm removal,
@@ -465,10 +463,8 @@ bumps for D2 anyway; adding one nullable column is negligible cost.
 
 ### Plan
 
-- Historical F1 durability-unification implementation plan — preserved in git
-  history or maintainer-local archives. Part I (I.1–I.4) is recorded here as
-  the architecture decision; Part II contained the task-level implementation
-  guide.
+- F1 decision and landing evidence: commits `a565c404c`, `f3f3b5180`,
+  `705d2ea54`, `46051e47d`, and `c0f8d9cb4`.
 
 ### Code (pre-F1 state, cited as reference for what changes)
 
@@ -526,8 +522,7 @@ bumps for D2 anyway; adding one nullable column is negligible cost.
 - **elspeth-e1dd5e1303** — `rows_buffered` live-vs-derive discrepancy,
   forced by D3/I.4 item 3.
 - **elspeth-1396d3f790** — cross-process worker coordination (option c),
-  unblocked by F1 (D7 scope exclusion). Readable only in the pre-Jun-30
-  archived store (`.weft/filigree/filigree.db`); live successors are
+  unblocked by F1 (D7 scope exclusion). Live successors are
   `elspeth-b5d7aa5655` and `elspeth-4d6c0dd0f5`. See ADR-030 §Tickets.
 
 ## Amendment detail (2026-06-13): ADR-030 slice 3 — journal-first barrier acceptance

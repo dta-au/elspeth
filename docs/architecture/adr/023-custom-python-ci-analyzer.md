@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-19
 **Status:** Accepted
-**Deciders:** ELSPETH maintainers
+**Deciders:** ELSPETH maintainer
 **Tags:** cicd, static-analysis, custom-tooling, elspeth-lints, refactor
 
 ## Context
@@ -18,7 +18,13 @@ ELSPETH's CI originally enforced a growing set of project-specific invariants th
 | **Composer** | `composer.catch_order`, `composer.exception_channel` | Except-handler ordering, composer exception-routing invariant |
 | **Manifest** | `manifest.contract_manifest`, `manifest.symbol_inventory`, `manifest.test_to_source_mapping` | Recompute a manifest from source, compare to checked-in declaration; symbol-inventory and test-to-source-mapping invariants |
 
-The enforcement scripts have grown organically. A structural review on 2026-05-19 (filigree epic `elspeth-8843308cfe`) identified that the 14 scripts should consolidate into a single `elspeth-lints` package with a rule registry, a shared CLI, SARIF output, and a findings-parity contract. **That consolidation has since landed** — `elspeth-lints/` ships the registry, CLI, rule tree, MCP surface, and SARIF output. The last script outside the package — the adapter-method-budget check — was ported on 2026-08-06 as `contract_invariants.adapter_method_budget` and deleted (`elspeth-3575a7f15d`); no `enforce_*.py` scripts remain. The original epic and its children live only in the pre-Jun-30 archived store (`.weft/filigree/filigree.db`).
+The enforcement scripts grew organically. A structural review on 2026-05-19
+identified that the 14 scripts should consolidate into a single
+`elspeth-lints` package with a rule registry, shared CLI, SARIF output, and a
+findings-parity contract. **That consolidation has since landed**. The last
+script outside the package was ported as
+`contract_invariants.adapter_method_budget` and deleted
+(`elspeth-3575a7f15d`, commit `7882a127d`); no `enforce_*.py` scripts remain.
 
 This ADR records the prior, more fundamental question: **should ELSPETH be writing this enforcement in custom Python at all, or porting the rules to an off-the-shelf static analyzer?**
 
@@ -42,19 +48,33 @@ The four candidates considered were CodeQL (already in the toolchain via `.githu
 **Why custom Python:**
 
 * **Project-specific semantic abstractions.** The invariants we enforce reach into Python concepts the off-the-shelf tools don't model well — Pydantic field metadata, `@dataclass(frozen=True, slots=True)` discipline, the `freeze_fields()` contract from `core/contracts/freeze.py`, decorator-based audit emission with specific kwarg shapes, and class-attribute conventions on plugin base classes. CodeQL's Python pack abstracts AST nodes but does not currently expose dataclass-field-aware semantics. Re-deriving these in QL would mean rebuilding what `ast` + project-specific helpers give us natively.
-* **Manifest-class rules are not static analysis in the off-the-shelf sense.** `plugin_contract.plugin_hashes`, `manifest.contract_manifest`, `manifest.symbol_inventory`, and `manifest.test_to_source_mapping` recompute a manifest from source and compare it to a checked-in YAML/Python declaration. They read non-source artifacts (manifest YAML, hash files) and assert equivalence with computed values. This is outside the analysis model of CodeQL, Semgrep, and ast-grep entirely. Even if we ported the AST rules, the manifest rules would have to stay in custom Python — committing us to a two-toolchain world for no net simplification.
-* **Existing investment is paid for.** 8,758 LOC of working enforcement, 19 test files, fingerprint-rotation discipline against AST-index drift (see [[feedback_ast_shift_fingerprint_rotation]]), a working allowlist mechanism with per-file expiry. Re-implementing in QL is rebuilding what we have; the labour is unjustified absent a capability gap we don't have today.
-* **Team Python fluency vs zero QL fluency.** A rule that takes 30 minutes to write today (write Python, run pytest, done) would take days against QL on the first attempt and a sustained fraction-of-a-FTE in maintenance forever after. The CodeQL CLI, query console, and database-build-then-query workflow is high friction for the bespoke per-rule iteration ELSPETH actually does.
-* **Pre-commit incremental analysis is natural in Python.** CodeQL is database-build-then-query; running it incrementally on changed files only is awkward and a known weak point of that toolchain. Python rules walking single ASTs are trivially incremental.
-* **No vendor lock-in.** CodeQL's licensing is GPL with caveats and is governed by GitHub/Microsoft. The custom Python implementation has no equivalent dependency.
+* **Manifest-class rules require project-specific cross-artifact recomputation.** `plugin_contract.plugin_hashes`, `manifest.contract_manifest`, `manifest.symbol_inventory`, and `manifest.test_to_source_mapping` recompute a manifest from source and compare it to a checked-in YAML/Python declaration. General-purpose analyzers can inspect some of those files, but do not natively replace this project-specific equivalence check. Even if we ported the AST rules, the manifest rules would stay in custom Python — committing us to a two-toolchain world for no net simplification.
+* **Existing investment is paid for.** Fourteen working enforcement scripts,
+  regression coverage, and an allowlist mechanism with per-file expiry already
+  existed when this decision was taken. Re-implementing them in QL would
+  rebuild working project-specific enforcement without closing a capability gap.
+* **Local authoring fit.** Python rules use the repository's existing language,
+  fixtures, and pytest workflow. The CodeQL CLI and query workflow add a second
+  authoring and debugging environment for bespoke per-rule iteration.
+* **Pre-commit analysis is simple in Python.** Python rules can walk the changed
+  files directly without a separate analysis database in the local hook.
+* **Additional dependency avoided.** CodeQL introduces a separately licensed
+  CLI and a GitHub-governed toolchain. The custom Python implementation has no
+  equivalent external toolchain dependency.
 
 **Why not Semgrep or ast-grep specifically:** they would handle the AST pattern rules well, but they don't fit the manifest-class rules at all. Adopting either would commit us to running TWO toolchains (Semgrep + custom Python for the manifest stuff) — worst of both worlds.
 
 ### D2. CodeQL stays in the toolchain as a complement, not as a replacement
 
-**Decision:** `.github/workflows/codeql.yaml` continues to run on the schedule it does today. CodeQL covers what it is good at: generic CVE-class vulnerabilities (CWE coverage in the standard query suite), inter-procedural taint analysis on patterns the upstream Python pack already models, and dependency-aware security scanning that integrates with GitHub Dependabot. CodeQL findings appear in the Security tab alongside `elspeth-lints` findings (D5 below distinguishes them by `category`).
+**Decision:** `.github/workflows/codeql.yaml` continues to run on its configured
+schedule. CodeQL covers CWE-tagged vulnerability patterns and inter-procedural
+taint analysis that the upstream Python pack models. CodeQL findings appear in
+GitHub Code Scanning; `elspeth-lints` findings are currently retained as CI
+SARIF artifacts.
 
-**Why complement rather than choose:** the two analyzers cover different surface area. Custom Python covers ELSPETH-specific invariants (D1). CodeQL covers generic Python vulnerability classes. There is no overlap that justifies retiring either.
+**Why complement rather than choose:** the current responsibilities are
+distinct enough that retiring either would lose useful coverage. Custom Python
+covers ELSPETH-specific invariants; CodeQL covers general Python vulnerability patterns.
 
 ### D3. The acceptance of a "bespoke" reviewer-perception cost is explicit
 
@@ -72,7 +92,8 @@ The four candidates considered were CodeQL (already in the toolchain via `.githu
 
 * New CodeQL queries land under a new path (e.g. `.github/codeql/custom-queries/`) and feed into the existing `codeql.yaml` workflow alongside the standard query suite
 * They do NOT replace any rule already in `elspeth-lints`; they cover net-new invariants that custom Python can't reach
-* The mixed-toolchain world is acknowledged and accepted at that point. Both analyzers emit SARIF; both surface in the Security tab; the rule taxonomies stay in their respective tools
+* The mixed-toolchain world is acknowledged and accepted at that point. Both
+  analyzers emit SARIF; their publication destinations and rule taxonomies stay explicit
 * A new ADR documenting the introduction of taint queries supersedes the relevant section of this one if a different toolchain choice is made then
 
 ### D5. The `elspeth-lints` package is workspace-only, not PyPI-published
@@ -81,9 +102,12 @@ The four candidates considered were CodeQL (already in the toolchain via `.githu
 
 **Why workspace-only:** publishing implies semver discipline, breaking-change shims, dependency management for external consumers, and documentation overhead none of which is justified before ELSPETH itself has shipped. The package boundary exists to enforce internal modularity (rule registry, shared CLI surface, fixture harness), not to deliver an external product. If post-release we identify other projects that want to adopt some of the rule machinery, a future ADR will document the publishing decision then.
 
-### D6. CodeQL findings and elspeth-lints findings coexist via SARIF `category`
+### D6. CodeQL and `elspeth-lints` both emit SARIF
 
-**Decision:** Both analyzers upload to GitHub Code Scanning. To prevent collision in the Security tab, `elspeth-lints` uploads with `category: elspeth-lints` (the upload mechanism is tracked in filigree `elspeth-b79958739e`). CodeQL uses the default category. Findings are visually distinguishable in the Security tab, the Code Scanning API, and any downstream dashboard.
+**Decision:** Both analyzers emit SARIF. CodeQL uploads to GitHub Code Scanning;
+the current CI retains `elspeth-lints` SARIF as the `elspeth-lints-sarif`
+workflow artifact. If `elspeth-lints` is uploaded to Code Scanning later, it
+must use a distinct category so the finding sources remain distinguishable.
 
 ## Revisit Triggers
 
@@ -99,14 +123,22 @@ Re-open this ADR if one of these conditions becomes true:
 
 ### What this commits us to
 
-* **Maintaining a static analyzer is on us.** Custom Python means custom maintenance — when a rule produces false positives, we own the fix; when the rule set decays (see the `cicd-allowlist-audit` skill for the lifecycle telemetry, currently DECAYING with +51% FP growth in 32 days as of project memory `project_cicd_allowlist_audit_2026-05-19`), we own the remediation. The consolidation epic explicitly addresses the maintenance posture but does not eliminate the maintenance.
+* **Maintaining a static analyzer is on us.** Custom Python means custom
+  maintenance: when a rule produces false positives or an allowlist decays, we
+  own the remediation. The tracked `cicd-allowlist-audit` skill defines the
+  current audit procedure.
 * **`elspeth-lints` becomes a load-bearing internal tool.** It runs in pre-commit and PR CI on every code change. Its reliability is a contributor-experience concern. The package gets the test discipline, fixture coverage, and rule-author guide that any internal tool of that exposure deserves.
 * **We lose CodeQL's data-flow library.** If a new invariant requires inter-procedural taint tracking *before* the planned taint-analysis work begins, we'll feel this — we'd either write a one-off CodeQL query for that rule (per D4's principle) or defer until the planned taint work catches up. Acknowledged cost.
 * **External reviewers may raise the "why not CodeQL" question.** D3 accepts this. This ADR is the answer.
 
 ### What this defers
 
-This ADR does not defer items into a "follow-up" pile. The consolidation work (rule registry, SARIF emission, parity harness, per-category ports, meta-CI gate, ADR-name rename, pre-commit incremental split, CI-graph collapse, GitHub Code Scanning upload, rule-taxonomy rationale doc, epic-close verification) was tracked in epic `elspeth-8843308cfe` and its 17 child tasks, which now live only in the pre-Jun-30 archived store; the work has landed in full, with the final residual closed at `elspeth-3575a7f15d` (2026-08-06). The taint-analysis future direction (D4) has no committed timeline by operator decision; when it begins, a new ADR will record the chosen toolchain for those specific rules.
+The consolidation work (rule registry, SARIF emission, parity harness,
+per-category ports, meta-CI gate, ADR-name rename, pre-commit incremental split,
+CI-graph collapse, and rule-taxonomy rationale) has landed, with the final
+residual closed at `elspeth-3575a7f15d` (2026-08-06). The taint-analysis future
+direction (D4) has no committed timeline; when it begins, a new ADR will record
+the chosen toolchain for those specific rules.
 
 ### Operator actions
 
@@ -114,10 +146,13 @@ None at ADR-acceptance time. The consolidation work has since landed in full; th
 
 ## References
 
-* **Consolidation residual (closed 2026-08-06):** filigree `elspeth-3575a7f15d` — the last CI enforcement script (the adapter-method-budget check) ported into elspeth-lints as `contract_invariants.adapter_method_budget` and deleted. The original epic `elspeth-8843308cfe` and its children were not carried across the 2026-06-30 tracker cutover and are readable only in `.weft/filigree/filigree.db`.
-* **Rule-taxonomy rationale doc** (broader companion to this ADR, scoped to the catalog of rules rather than the toolchain decision): filigree `elspeth-797cac825e` — archived store only.
-* **SARIF upload to GitHub Code Scanning:** filigree `elspeth-b79958739e` — archived store only.
+* **Consolidation residual (closed 2026-08-06):** filigree
+  `elspeth-3575a7f15d` and commit `7882a127d`.
+* **Rule-taxonomy rationale:** [elspeth-lints rationale](../../elspeth-lints/rationale.md).
+* **Current SARIF publication:** [CI workflow](../../../.github/workflows/ci.yaml).
 * **CodeQL workflow:** [.github/workflows/codeql.yaml](../../../.github/workflows/codeql.yaml)
 * **Existing enforcement scripts:** [scripts/cicd/](../../../scripts/cicd/)
-* **CICD allowlist lifecycle telemetry:** project memory `project_cicd_allowlist_audit_2026-05-19`; skill `cicd-allowlist-audit`
-* **Fingerprint-rotation gotcha (relevant to D1's "existing investment" argument):** project memory `feedback_ast_shift_fingerprint_rotation`
+* **CICD allowlist lifecycle procedure:**
+  `.agents/skills/cicd-allowlist-audit/SKILL.md`
+* **Judge-signature and fingerprint workflow:**
+  `docs/judge-signature-handoff.md`

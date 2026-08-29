@@ -2,7 +2,8 @@
 
 **Date:** 2026-02-22
 **Status:** Accepted
-**Deciders:** Architecture Critic (SME agent), Systems Thinking Analyst (SME agent), Python Code Reviewer (SME agent), Claude (synthesis/lead)
+**Deciders:** ELSPETH maintainer
+**Review evidence:** Advisory architecture, systems-thinking, and Python-engineering review
 **Tags:** architecture, dependency-cycles, contracts, core, engine, layer-enforcement
 
 ## Context
@@ -56,7 +57,7 @@ in contracts/            →    import workaround     →   increases
                restructuring is too big now"
 ```
 
-The system was accumulating ~0.5 new violations per development-day. Without intervention, the window for cheap restructuring was closing.
+The violation set was growing. Without intervention, the window for cheap restructuring was closing.
 
 ### Key Findings from Code Analysis
 
@@ -181,19 +182,21 @@ After all violations are fixed:
 
 **Considered because:** The violations cause no runtime errors. The lazy imports work.
 
-**Rejected because:** The systems analysis showed this IS the symptomatic solution driving the Shifting the Burden loop. The restructuring effort was estimated at ~1 developer-day at time of analysis. Each additional violation increases this cost. The window for cheap restructuring was closing — estimated at ~30 days before the stock of violations would exceed the "prioritizable against feature work" threshold. ELSPETH has no external users, so breaking changes are free. There will never be a better time.
+**Rejected because:** The systems analysis showed this IS the symptomatic
+solution driving the Shifting the Burden loop. Each additional violation
+increases the eventual restructuring cost, so deferral would make the same
+correction harder without adding product value.
 
 ## Related Decisions
 
 - ADR-005: Declarative DAG Wiring — establishes `input:`/`on_success:` naming that interacts with ExpressionParser validation
-- T6 (`elspeth-rapid-09469d`): ExpressionParser move — Phase 1 of this ADR
-- T7 (`elspeth-rapid-6971d4`): MaxRetriesExceeded/BufferEntry move — complementary TYPE_CHECKING violation fixes
-- T23 (`elspeth-rapid-7af373`): config.py decomposition — depends on Phases 1 and 3 of this ADR (reduce before restructure)
+- ExpressionParser move — Phase 1 of this ADR
+- MaxRetriesExceeded/BufferEntry move — complementary TYPE_CHECKING violation fixes
+- `config.py` decomposition — depends on Phases 1 and 3 of this ADR
 
 ## References
 
-- Filigree epic: `elspeth-rapid-d7f75f` (RC3.3 Architectural Remediation) — contains full task list with dependencies
-- Architecture analysis: `docs/arch-analysis-2026-02-22-0446/` — findings and evidence
+- Decision and implementation history: commit `fc189fe9d`
 - Senge, Peter M. *The Fifth Discipline* (1990) — "Shifting the Burden" archetype (Chapter 6)
 - Meadows, Donella. *Thinking in Systems* (2008) — leverage point hierarchy (Chapter 6)
 - Git blame evidence: All 10 violations trace to RC2 initial commit `f4f348de` (2026-02-02) or within days of it
@@ -207,7 +210,7 @@ After all 5 phases:
 - `grep -rn 'from elspeth.engine' src/elspeth/core/` returns 0 results (excluding TYPE_CHECKING blocks)
 - `trust_tier.tier_model` CI gate passes with no allowlist entries for layer violations
 - `contracts/__init__.py` docstring accurately states "leaf module with no runtime dependencies on core/engine/plugins"
-- All 8,000+ tests pass
+- The CI-equivalent full test suite passes
 - mypy passes with no new `# type: ignore` additions
 
 ### Implementation Ordering

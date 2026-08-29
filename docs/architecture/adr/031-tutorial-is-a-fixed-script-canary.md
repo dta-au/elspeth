@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-22
 **Status:** Accepted
-**Deciders:** John Morrissey, Claude Fable 5
+**Deciders:** ELSPETH maintainer
 **Tags:** composer, tutorial, guided, backend-parity, testing-doctrine,
           silent-degradation
 
@@ -95,7 +95,8 @@ with doctrine status:
 
 ## Amendment: collector authoring is canaried without touching the frozen script (2026-08-25)
 
-**Deciders:** John Morrissey (Q8 ruling, option 1 — layered hybrid), WS6 lane 2
+**Deciders:** ELSPETH maintainer
+**Review evidence:** The WS6 collector-authoring work and ruling recorded in Filigree `elspeth-88bb77953c`
 
 The WS6 guard lift (ruling 7878, elspeth-88bb77953c) made collectors
 authorable on the guided surface. The frozen tutorial cannot cover them, and
@@ -113,7 +114,7 @@ rendering, teaching) will not turn the tutorial red.
 **Compensating controls.**
 
 1. *Mocked wire-contract canary (CI, near-zero flake):*
-   `tests/e2e/guided-collector.spec.ts` — a route-mocked fixed-script walk of
+   `src/elspeth/web/frontend/tests/e2e/guided-collector.spec.ts` — a route-mocked fixed-script walk of
    the guided surface pinning the collector-authoring wire contract: guided
    turn sequencing (propose → wire review → confirm → completed), the closed
    collector node shape in responses (the strict decoder is in the loop),

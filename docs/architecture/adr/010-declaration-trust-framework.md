@@ -2,7 +2,8 @@
 
 **Date:** 2026-04-19
 **Status:** Accepted (amended 2026-04-20 — see Amendment A3 below for H2 cluster)
-**Deciders:** John Morrissey (author); five-reviewer panel (solution-architect, systems-thinker, python-engineer, quality-engineer, security-architect) per session `/home/john/.claude/plans/elspeth-track-2-phase-2a-declaration-framework.review.json`
+**Deciders:** ELSPETH maintainer
+**Review evidence:** Advisory solution-architecture, systems-thinking, Python-engineering, quality, and security review
 **Supersedes:** (partial, clause-level) — see "Supersession map" below
 **Tags:** framework, declaration-contract, audit-evidence, tier-1, registry, audit-integrity
 **Review date:** 2026-10-19 (six months from acceptance; ADR-010 §Consequences must be re-evaluated against observed 2B/2C experience by that date)
@@ -151,7 +152,7 @@ A YAML schema enumerates declarations; a code-generator produces stubs. Rejected
 
 ### Alternative 3: `AuditEvidence` as a structural `@runtime_checkable` Protocol
 
-Rejected. The five-reviewer panel's security review identified this as a Critical Spoofing (STRIDE S) finding: any class exposing `to_audit_dict()` would satisfy the structural protocol, including accidental matches from third-party libraries, test helpers, or unrelated plugin code. Nominal `AuditEvidenceBase` requires explicit author declaration and closes the spoofing vector.
+Rejected. Any class exposing `to_audit_dict()` would satisfy the structural protocol, including accidental matches from third-party libraries, test helpers, or unrelated plugin code. Nominal `AuditEvidenceBase` requires explicit author declaration and closes the spoofing vector.
 
 ### Alternative 4: defer the entire `DeclarationContract` protocol to Phase 2B
 
@@ -159,14 +160,13 @@ Considered seriously in review. Rejected because: (a) the nominal `AuditEvidence
 
 ## References
 
-- Plan: `/home/john/.claude/plans/elspeth-track-2-phase-2a-declaration-framework.md`
-- Reviewer verdicts: `.review.json` alongside the plan file (5-reviewer panel, 2026-04-19)
+- Decision record: commit `187e1fcee`
 - Predecessor ADRs: 007 (pass-through propagation), 008 (runtime cross-check), 009 (pathway fusion)
 - Successor ADRs (Phase 2B/2C): each declaration gets its own ADR per §Supersession map ADR-008 reference
 - CLAUDE.md §Three-Tier Trust Model, §Plugin Ownership, §Frozen Dataclass Immutability, §Defensive Programming Forbidden
 - Track 2 filigree epic: `elspeth-a3ac5d88c6`; ADR-009 §Clause 3 SLA hard trigger 2026-07-18
 - H2 cluster landing (2026-04-20): `elspeth-425047a599` (H2), `elspeth-10dc0b747f` (N1), `elspeth-60890a7388` (N3), `elspeth-f52d7c5a47` (F2), `elspeth-5fc876138d` (F3), `elspeth-b513c01cff` (F4), `elspeth-121b268aec` (F5), `elspeth-5dae105959` (H1 amendment)
-- H2 design sketch: preserved in git history or maintainer-local archives
+- H2 implementation and amendment record: commit `009b6009c`
 - H2 decision anchor: comment #417 on `elspeth-425047a599` — ADR-010 §Semantics audit-complete decision record
 
 ---

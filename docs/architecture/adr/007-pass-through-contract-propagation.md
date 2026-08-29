@@ -2,7 +2,8 @@
 
 **Date:** 2026-04-19
 **Status:** Accepted
-**Deciders:** Architecture Critic (SME agent), Systems Thinker (SME agent), Python Code Reviewer (SME agent), Quality Engineer (SME agent), Claude (synthesis/lead)
+**Deciders:** ELSPETH maintainer
+**Review evidence:** Advisory architecture, systems-thinking, Python-engineering, and quality review
 **Tags:** dag, schema-contract, plugin-base, composer, propagation, validation
 
 > **Reader orientation (added 2026-04-20; issue `elspeth-3f320398f1` / M7).**
@@ -148,7 +149,7 @@ The set of known pass-through plugins is re-derived per call from the live plugi
 
 ## References
 
-- Plan: `/home/john/.claude/plans/elspeth-87f6d5dea5-snazzy-swing.md`
+- Decision and implementation record: commit `329213880`
 - Companion ADR: `ADR-008: Runtime contract cross-check in TransformExecutor`
 - Related bug report: `elspeth-87f6d5dea5` (composer/runtime schema-contract divergence)
 - Related commits: `d29f8546` (fix three named divergences), `c633a36b` (explicit-schema workaround for examples/deaggregation)

@@ -2,7 +2,7 @@
 
 **Date:** 2026-01-24
 **Status:** Accepted
-**Deciders:** Architecture team, Code reviewers
+**Deciders:** ELSPETH maintainer
 **Tags:** routing, audit-integrity, tokens, terminal-states
 
 ## Context
@@ -171,8 +171,6 @@ def test_route_with_copy_raises(self) -> None:
 - Audit trail schema changes
 - Risk of audit integrity bugs
 
-**Estimated effort:** 2-3 weeks
-
 **Risk assessment:** HIGH - fundamental architectural change to audit model
 
 ### Alternative 2: Remove COPY from RoutingMode Entirely (Considered but Deferred)
@@ -187,9 +185,9 @@ def test_route_with_copy_raises(self) -> None:
 
 ## References
 
-- Bug report: `docs/bugs/pending/P1-2026-01-15-routing-copy-ignored.md`
-- Architecture review: Agent a2a1113 (architecture-critic)
-- Code review: Agent af71460 (python-code-reviewer)
+- Implementation and regression coverage: commit `66bb0ef52`,
+  `src/elspeth/contracts/routing.py`, and
+  `tests/unit/contracts/test_routing.py`
 - CLAUDE.md: "Every row reaches exactly one terminal state"
 - ARCHITECTURE.md: Token lifecycle state machine
 

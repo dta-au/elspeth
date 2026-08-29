@@ -5,7 +5,7 @@
 Preconditions*; the separate deployment-shape ADR required by
 Precondition #9 is now authored as ADR-030 — proposed at slice
 0 of its landing plan, → Accepted at slice 5)
-**Deciders:** John Morrissey, Claude Opus
+**Deciders:** ELSPETH maintainer
 **Tags:** scheduler, checkpoint, resume, leases, cas, audit-integrity,
           embedded-database, rc6, multi-source-token-scheduler
 
@@ -845,9 +845,8 @@ for the move.
 - **Postgres backend.** If the project ever needs a non-
   embedded backend, the same scheduler schema, CAS
   discipline, and lease semantics port directly to
-  Postgres. The decision to remain SQLite-only at the
-  v1 layer (memory `project_phase9_sqlite_only`) is
-  preserved here.
+  Postgres. ADR-030 records the historical SQLite one-host profile and
+  ADR-041 governs the current supported state-engine profiles.
 
 ## Revision history
 
@@ -996,9 +995,8 @@ for the move.
   Tier-3 boundary classification is unchanged.
 - **ADR-023** (custom Python CI analyzer) — the
   `tier-model` rule under `elspeth-lints` will see
-  fingerprint rotation as scheduler-related code lands
-  (memory `feedback_ast_shift_fingerprint_rotation`); the
-  enforcement contract is preserved.
+  fingerprint rotation as scheduler-related code lands; the
+  enforcement contract and `docs/judge-signature-handoff.md` workflow apply.
 - **ADR-024** (delivery governance for single-maintainer
   mode) — preserved and load-bearing. The embedded-database
   discipline, the no-external-broker discipline, and the
@@ -1053,18 +1051,11 @@ for the move.
 - `3025168b2` — G1 lease self-steal fix.
 - `3dcebe9ec` — G3 PENDING_SINK drain starvation fix.
 
-### Review notes
+### Review history
 
-- `notes/branch-review-multi-source-token-scheduler-architecture-2026-05-22.md`
-  — load-bearing primitives, the scheduler-primitive overview,
-  the *post-fix* determinism story.
-- `notes/branch-review-multi-source-token-scheduler-consolidation-2026-05-22.md`
-  — the 32 canonical findings, tier-1 sequencing, the
-  *"scheduler primitive itself is well-designed"* framing.
-- `.worktrees/multi-source-token-scheduler/notes/multi-source-audit-dedup-map.md`
-  — execution-detail dedup map.
-- `notes/RC6-large-list.md` — canonical RC6 ticket
-  enumeration.
+- Commit `e73509ad6` preserves the historical consolidation review.
+- Commit `1e53826e3` records the later claim-order, scheduler-event, and
+  source-document reconciliation.
 
 ### Project policy
 
@@ -1073,12 +1064,10 @@ for the move.
   `AuditIntegrityError` paths embody), *No Legacy Code
   Policy* (the `_drain_in_memory_work_queue` cleanup
   precondition).
-- Memory `project_phase9_sqlite_only` — SQLite-only baseline
-  (rationale for the embedded-database choice).
-- Memory `project_db_migration_policy` — *delete the old DB*
-  rather than migrate.
-- Memory `project_multi_source_token_scheduler_rc6` — this
-  branch targets RC6.
+- ADR-030 and ADR-041 — historical SQLite profile and current supported
+  state-engine profiles.
+- `docs/reference/configuration.md` — pre-1.0 Landscape schema policy.
+- `CHANGELOG.md` — the 0.6.0 multi-source and scheduler release record.
 
 ## Notes
 

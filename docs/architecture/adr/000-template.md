@@ -2,7 +2,8 @@
 
 **Date:** YYYY-MM-DD
 **Status:** [Proposed | Accepted | Deprecated | Superseded by ADR-XXX]
-**Deciders:** [List of people involved in the decision]
+**Deciders:** ELSPETH maintainer
+**Review evidence:** [Optional: advisory technical review, analysis, or tools that informed the accountable decision]
 **Tags:** [component-name, pattern-name, etc.]
 
 ## Context

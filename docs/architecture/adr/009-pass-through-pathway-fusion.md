@@ -2,6 +2,7 @@
 
 **Date:** 2026-04-19
 **Status:** Accepted
+**Deciders:** ELSPETH maintainer
 **Supersedes:** ADR-007 §Decision 1 ("unconditional on every row"), §Negative Consequences #2 (duplicated walkers), §Neutral Consequences line 83 (invariant test placeholder); ADR-008 §Decision scope statement ("cross-check applies per-row in executor")
 **Tags:** dag, schema-contract, propagation, runtime-validation, audit-integrity, composer-parity
 
@@ -110,6 +111,6 @@ Probe instantiation uses a new `BaseTransform.probe_config()` classmethod. Every
 
 - [ADR-007: Pass-through contract propagation](007-pass-through-contract-propagation.md) — amended by this ADR § Clauses 1, 3, 4.
 - [ADR-008: Runtime contract cross-check](008-runtime-contract-cross-check.md) — amended by this ADR § Clause 2.
-- Track 2 epic: TBD (follow-up filigree epic with SLA dependency linking Track 1 merge date).
+- Track 2 declaration-framework epic: `elspeth-300abf520d`; see ADR-010.
 - CLAUDE.md §Three-Tier Trust Model, §Plugin Ownership, §"No Legacy Code Policy".
-- Review artefacts: `/tmp/elspeth-track1/plan.md`, `/tmp/elspeth-track1/synthesis.md`, `/tmp/elspeth-track1/spec.md`.
+- Implementation and regression evidence: commits `2ba34c2b6` and `09fad40f9`.
