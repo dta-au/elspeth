@@ -8,13 +8,27 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
-- **2026-08-29 — `.claude/skills/**/*.py` IS scanned by every whole-tree test
+- **2026-08-30 — `.agents/skills/` is the ONE canonical skills tree; every
+  `.claude/skills/<name>` is a committed relative symlink (`git ls-files -s`
+  mode 120000) into it, and the design pack lives at top-level `design/`
+  (elspeth-1e9d011295).** Add or edit a skill under `.agents/skills/` only;
+  a real directory under `.claude/skills/` is a regression. Pin paths in
+  tests, scripts, and `per-file-ignores` at `.agents/skills/...` and
+  `design/...`. Git never sees a path *through* a symlink (`git check-ignore`
+  says "beyond a symbolic link"), so the installer's write to
+  `.claude/skills/loomweave-workflow/SKILL.md` lands at
+  `.agents/skills/loomweave-workflow/SKILL.md`, which `.gitignore` already
+  covers. `Path.glob("**")` on Python 3.13 and the shared
+  `iter_python_files` walker (`followlinks=False`) both refuse to descend
+  into the symlinks, so nothing is double-counted; glob `.agents/skills`
+  only.
+- **2026-08-29 — `.agents/skills/**/*.py` IS scanned by every whole-tree test
   gate (masquerade, hasattr, mock-discipline, walker authority): only
   `.claude/worktrees/` is excluded.** A skill helper script is production code
   to those gates — no `getattr`/`hasattr`, no unspecced mocks, exact-type
   checks on parsed JSON. It is NOT under the `elspeth-lints --root src/elspeth`
   tier gate. Ruff `T20` (print) is ignored there by `per-file-ignores`, the same
-  treatment as `scripts/`. First occupant: `.claude/skills/lane-manager/`
+  treatment as `scripts/`. First occupant: `.agents/skills/lane-manager/`
   (hub-side lane orchestration; state under `.claude/lanes/`, tests in
   `tests/unit/test_lane_manager_skill.py`).
 - **2026-08-29 — five tier_model precision classes are FIXED (elspeth-8d46db34ff);

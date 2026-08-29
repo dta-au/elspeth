@@ -28,7 +28,7 @@ harness gives you three primitives, whatever they are called:
 | **message**(name, text) | send text to a running worker |
 
 Everything else — state, verification, the idle verdict, the escalation
-ladder, the report — is the CLI `python .claude/skills/lane-manager/lane_manager.py`
+ladder, the report — is the CLI `python .agents/skills/lane-manager/lane_manager.py`
 (`--help` for flags), which is plain Python + git and is the contract. The
 state file is documented JSON under `.claude/lanes/<run-id>.json`; any agent,
 script, or human can read or resume it.
@@ -48,7 +48,7 @@ lane-id, branch `lane/<ticket>` and worktree `.claude/worktrees/lane-<ticket>`.
 
 ```bash
 S=.claude/lanes/<run-id>.json
-python .claude/skills/lane-manager/lane_manager.py init --state $S --run-id <run-id> \
+python .agents/skills/lane-manager/lane_manager.py init --state $S --run-id <run-id> \
   --base-ref <branch you will merge into> --tickets tickets.json
 # tickets.json: [{"ticket":"elspeth-…","title":"…","files":["src/…"],"test_command":"pytest tests/… -n 4 -q"}]
 ```
@@ -65,7 +65,7 @@ the worktree CWD, the files, the test command, and the delivery channel
 ("commit to `lane/<ticket>`; do not touch the main checkout").
 
 ```bash
-python .claude/skills/lane-manager/lane_manager.py dispatch --state $S --lane <lane-id> --agent-name <lane-id>
+python .agents/skills/lane-manager/lane_manager.py dispatch --state $S --lane <lane-id> --agent-name <lane-id>
 ```
 
 Add `--dry-run` to record the plan without spawning (used for rehearsals; the
@@ -75,7 +75,7 @@ attempts are rehearsal: the first real `dispatch` resets that lane's ladder.
 ## Phase 3 — Verify (on every "done", and before any merge)
 
 ```bash
-python .claude/skills/lane-manager/lane_manager.py verify --state $S --lane <lane-id>   # exit 0 = landed
+python .agents/skills/lane-manager/lane_manager.py verify --state $S --lane <lane-id>   # exit 0 = landed
 ```
 
 This runs `git rev-parse` / `git log base..branch` / `git diff --name-only
@@ -93,7 +93,7 @@ A quiet or "idle" lane is **not** a dead lane. Two checks, in order:
 2. Worktree — `idle` inspects uncommitted changes and recent file activity.
 
 ```bash
-python .claude/skills/lane-manager/lane_manager.py idle --state $S --lane <lane-id> --listed      # or --not-listed
+python .agents/skills/lane-manager/lane_manager.py idle --state $S --lane <lane-id> --listed      # or --not-listed
 ```
 
 Pass `--listed` / `--not-listed` from the **list-live** result you just
@@ -106,7 +106,7 @@ first, in this same step.
 ## Phase 5 — Escalation ladder
 
 ```bash
-python .claude/skills/lane-manager/lane_manager.py escalate --state $S --lane <lane-id> --reason "<evidence>"
+python .agents/skills/lane-manager/lane_manager.py escalate --state $S --lane <lane-id> --reason "<evidence>"
 ```
 
 | Rung | Printed action | You do |
@@ -120,7 +120,7 @@ Each rung fires once. The ladder cannot be reset by a persuasive message.
 ## Phase 6 — Report
 
 ```bash
-python .claude/skills/lane-manager/lane_manager.py report --state $S --out .claude/lanes/<run-id>.report.md
+python .agents/skills/lane-manager/lane_manager.py report --state $S --out .claude/lanes/<run-id>.report.md
 ```
 
 One markdown report: landed lanes (branch, commits, files, test exit), blocked

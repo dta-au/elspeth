@@ -22,7 +22,7 @@ from types import ModuleType
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SKILL_DIR = REPO_ROOT / ".claude" / "skills" / "lane-manager"
+SKILL_DIR = REPO_ROOT / ".agents" / "skills" / "lane-manager"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 SCRIPT = SKILL_DIR / "lane_manager.py"
 

@@ -90,8 +90,8 @@ EXCLUDE_SUFFIXES = {".pyc", ".pyo"}
 # Project instruction documents and skills that encode project-specific local rules
 # (tier model, engine patterns, etc.). These are auto-loaded into agent context
 # so static analysis prompts have the full authoritative rule set, not just the
-# CLAUDE.md summary. Prefer Codex-native AGENTS.md and `.agents/skills`, while
-# retaining CLAUDE.md / `.claude/skills` as migration fallbacks.
+# CLAUDE.md summary. `.agents/skills` is the single canonical skills tree
+# (`.claude/skills` holds symlinks into it); CLAUDE.md is retained as a fallback.
 PROJECT_CONTEXT_FILES = ["AGENTS.md", "CLAUDE.md"]
 SKILL_NAMES = [
     "tier-model-deep-dive",
@@ -99,7 +99,7 @@ SKILL_NAMES = [
     "config-contracts-guide",
     "logging-telemetry-policy",
 ]
-SKILL_ROOTS = [".agents/skills", ".claude/skills"]
+SKILL_ROOTS = [".agents/skills"]
 
 REPORT_METADATA_FILENAMES = frozenset({"RUN_METADATA.md", "SUMMARY.md", "FINDINGS_INDEX.md"})
 PRIORITY_COPY_DIR = "by-priority"
