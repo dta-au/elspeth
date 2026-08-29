@@ -4910,3 +4910,41 @@ def test_retain_tool_description_states_the_node_kind_partition() -> None:
 
     assert "Gate, coalesce, row_union, and queue are structural node types, never transform plugins;" in description
     assert "transform, aggregation, and collector are node types that each REQUIRE a transform plugin," in description
+
+
+class TestStep1SourceToolSchema:
+    """elspeth-79e66ff613 Stage 1: the unhinted first turn constrains `plugin`.
+
+    With no wizard selection the parser has no server-owned default to
+    tolerate an omitted ``plugin`` (the ~1-in-4 first-turn failure), so the
+    tool schema itself carries the catalog enum and an explicit
+    required-even-now description. The catalog is server-owned DATA — the
+    model still chooses, so composer invariant 1 is untouched. With a hint
+    the base schema is byte-identical to before (the parser's hint default
+    already makes ``plugin`` effectively constant there).
+    """
+
+    def test_unhinted_schema_carries_catalog_enum(self) -> None:
+        from elspeth.web.composer.guided.chat_solver import _step_1_source_tool
+
+        tool = _step_1_source_tool(plugin_hint=None, available_source_plugins=("csv", "json", "azure_blob"))
+        plugin = tool["function"]["parameters"]["properties"]["plugin"]
+        assert plugin["enum"] == ["azure_blob", "csv", "json"]
+        assert "REQUIRED" in plugin["description"]
+        assert "plugin" in tool["function"]["parameters"]["required"]
+
+    def test_hinted_schema_is_the_unmodified_base(self) -> None:
+        from elspeth.web.composer.guided.chat_solver import _STEP_1_SOURCE_TOOL, _step_1_source_tool
+
+        assert _step_1_source_tool(plugin_hint="csv", available_source_plugins=("csv", "json")) is _STEP_1_SOURCE_TOOL
+
+    def test_empty_catalog_falls_back_to_base(self) -> None:
+        from elspeth.web.composer.guided.chat_solver import _STEP_1_SOURCE_TOOL, _step_1_source_tool
+
+        assert _step_1_source_tool(plugin_hint=None, available_source_plugins=()) is _STEP_1_SOURCE_TOOL
+
+    def test_builder_does_not_mutate_the_module_constant(self) -> None:
+        from elspeth.web.composer.guided.chat_solver import _STEP_1_SOURCE_TOOL, _step_1_source_tool
+
+        _step_1_source_tool(plugin_hint=None, available_source_plugins=("csv",))
+        assert "enum" not in _STEP_1_SOURCE_TOOL["function"]["parameters"]["properties"]["plugin"]
