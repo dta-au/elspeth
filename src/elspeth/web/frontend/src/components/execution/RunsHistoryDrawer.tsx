@@ -9,6 +9,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { RunOutputsPanel } from "@/components/inspector/RunOutputsPanel";
@@ -239,6 +240,7 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
   const loadRunDiagnostics = useExecutionStore((s) => s.loadRunDiagnostics);
   const evaluateRunDiagnostics = useExecutionStore((s) => s.evaluateRunDiagnostics);
   const cancel = useExecutionStore((s) => s.cancel);
+  const showAdvanced = useShowAdvanced();
   // Title-first convention (HeaderSessionSwitcher): never surface the raw
   // session UUID in user-facing chrome (elspeth-ef8c18a6cb).
   const activeSessionTitle = useSessionStore(
@@ -312,8 +314,12 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
               <li key={run.id} className="runs-history-item">
                 <div className="runs-history-item-summary">
                   <span className="runs-history-item-identity">
-                    <span className="runs-history-item-label">{runLabel}</span>
-                    <span className="runs-history-item-id">{run.id}</span>
+                    <span className="runs-history-item-label" title={run.id}>
+                      {runLabel}
+                    </span>
+                    {showAdvanced && (
+                      <span className="runs-history-item-id">{run.id}</span>
+                    )}
                   </span>
                   <span className="runs-history-item-actions">
                   {/* ui/StatusBadge carries the a11y glyph map (⚠ / ∅) so
@@ -344,7 +350,7 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
                     <Button
                       variant="danger"
                       className="btn-small"
-                      aria-label={`Cancel run ${run.id}: ${runLabel}`}
+                      aria-label={`Cancel ${runLabel}`}
                       disabled={run.cancel_requested === true}
                       onClick={() => setCancelTargetRunId(run.id)}
                     >
@@ -356,8 +362,8 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
                     aria-controls={`run-history-diagnostics-${run.id}`}
                     aria-label={
                       expandedRunId === run.id
-                        ? `Hide detail for ${run.id}: ${runLabel}`
-                        : `Show detail for ${run.id}: ${runLabel}`
+                        ? `Hide detail for ${runLabel}`
+                        : `Show detail for ${runLabel}`
                     }
                     className="btn-small"
                     onClick={() => {
@@ -441,6 +447,7 @@ function RunDiagnosticsPanel({
   onExplain,
   onRefresh,
 }: RunDiagnosticsPanelProps): JSX.Element {
+  const showAdvanced = useShowAdvanced();
   const visibleWorkingView =
     workingView ?? (isEvaluating && diagnostics ? buildPendingWorkingView(diagnostics) : null);
 
@@ -471,7 +478,7 @@ function RunDiagnosticsPanel({
 
       {error && <div role="alert">{error}</div>}
 
-      {diagnostics?.failure_detail && (
+      {showAdvanced && diagnostics?.failure_detail && (
         <div role="alert" data-testid="run-failure-detail" className="run-failure-detail">
           <div>
             {diagnostics.failure_detail.operation_type} failed - {diagnostics.failure_detail.node_id}
@@ -480,14 +487,27 @@ function RunDiagnosticsPanel({
         </div>
       )}
 
-      {runError !== null && runError.trim().length > 0 && !diagnostics?.failure_detail && (
+      {showAdvanced && runError !== null && runError.trim().length > 0 && !diagnostics?.failure_detail && (
         <div role="alert" data-testid="run-stored-failure-detail" className="run-failure-detail">
           <div>Stored failure cause</div>
           <pre>{runError}</pre>
         </div>
       )}
 
-      {diagnostics && (
+      {diagnostics?.tokens.flatMap((token) =>
+        token.states
+          .filter((state) => state.status === "failed")
+          .map((state) => (
+            <RunStateFailureDetail
+              key={`${state.state_id}-failure`}
+              error={state.error}
+              nodeId={state.node_id}
+              stateId={state.state_id}
+            />
+          )),
+      )}
+
+      {diagnostics && showAdvanced && (
         <>
           {diagnostics.operations.length > 0 && (
             <div className="run-diagnostics-operations">
@@ -514,16 +534,6 @@ function RunDiagnosticsPanel({
                       </span>
                     ))}
                   </span>
-                  {token.states.map((state) =>
-                    state.status === "failed" ? (
-                      <RunStateFailureDetail
-                        key={`${state.state_id}-failure`}
-                        error={state.error}
-                        nodeId={state.node_id}
-                        stateId={state.state_id}
-                      />
-                    ) : null,
-                  )}
                 </div>
               ))}
             </div>

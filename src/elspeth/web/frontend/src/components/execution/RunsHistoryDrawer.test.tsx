@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { RunsHistoryDrawer } from "./RunsHistoryDrawer";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import type { RunDiagnostics } from "@/types/index";
 
 const TEXTRACT_S3_UNREADABLE_HINT =
@@ -92,6 +95,7 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
 
 describe("RunsHistoryDrawer", () => {
   beforeEach(() => {
+    resetStore(usePreferencesStore);
     useExecutionStore.setState({
       runs: [
         { id: "r1", status: "completed" } as never,
@@ -113,6 +117,7 @@ describe("RunsHistoryDrawer", () => {
   });
 
   it("lists every run from the store", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
     expect(screen.getByText(/r1/)).toBeInTheDocument();
     expect(screen.getByText(/r2/)).toBeInTheDocument();
@@ -122,6 +127,7 @@ describe("RunsHistoryDrawer", () => {
     // elspeth-d5578ccd98: the backend ships accounting_corruption INSTEAD of
     // accounting for a corrupt run; the list must render the run with an
     // explicit marker while healthy runs stay ordinary.
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       runs: [
         { id: "r1", status: "completed" } as never,
@@ -168,6 +174,7 @@ describe("RunsHistoryDrawer", () => {
         } as never,
       ],
     } as never);
+    usePreferencesStore.setState({ showAdvanced: true });
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
 
@@ -286,13 +293,13 @@ describe("RunsHistoryDrawer", () => {
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
 
     expect(
-      screen.queryByRole("button", { name: /cancel run r1/i }),
+      screen.queryByRole("button", { name: /^Cancel Run 1 · /i }),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /cancel run r2/i }),
+      screen.getByRole("button", { name: /^Cancel Run 2 · /i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /cancel run r3/i }),
+      screen.getByRole("button", { name: /^Cancel Run 3 · /i }),
     ).toBeInTheDocument();
   });
 
@@ -304,7 +311,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /cancel run r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Cancel Run 1 · /i }));
 
     // Confirm gates the REST call.
     expect(cancel).not.toHaveBeenCalled();
@@ -322,7 +329,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /cancel run r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Cancel Run 1 · /i }));
     await userEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
 
     expect(cancel).not.toHaveBeenCalled();
@@ -338,12 +345,13 @@ describe("RunsHistoryDrawer", () => {
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
 
-    const button = screen.getByRole("button", { name: /cancel run r2/i });
+    const button = screen.getByRole("button", { name: /^Cancel Run 1 · /i });
     expect(button).toBeDisabled();
     expect(button).toHaveTextContent(/cancelling/i);
   });
 
   it("loads and renders diagnostics detail for a selected run", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     const loadRunDiagnostics = vi.fn().mockResolvedValue(undefined);
     useExecutionStore.setState({
       loadRunDiagnostics,
@@ -351,7 +359,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
 
     expect(loadRunDiagnostics).toHaveBeenCalledWith("r2");
     expect(screen.getByTestId("run-failure-detail")).toHaveTextContent(
@@ -381,7 +389,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1 · /i }));
 
     const failure = screen.getByTestId("run-state-failure-state-1");
     expect(failure).toHaveTextContent(
@@ -407,7 +415,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
 
     const failure = screen.getByTestId("run-state-failure-state-1");
     expect(failure).toHaveTextContent(
@@ -433,7 +441,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
 
     const failure = screen.getByTestId("run-state-failure-state-1");
     expect(failure).toHaveTextContent("transform_textract failed - submit_failed");
@@ -458,7 +466,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
 
     const failure = screen.getByTestId("run-state-failure-state-1");
     expect(failure).toHaveTextContent(
@@ -480,7 +488,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
 
     const failure = screen.getByTestId("run-state-failure-state-1");
     expect(failure).toHaveTextContent(
@@ -491,6 +499,7 @@ describe("RunsHistoryDrawer", () => {
   });
 
   it("shows the stored run failure cause immediately before diagnostics load", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     const loadRunDiagnostics = vi.fn().mockResolvedValue(undefined);
     useExecutionStore.setState({
       runs: [
@@ -505,7 +514,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1 · /i }));
 
     expect(screen.getByTestId("run-stored-failure-detail")).toHaveTextContent(
       "max_output_tokens below minimum value",
@@ -513,6 +522,7 @@ describe("RunsHistoryDrawer", () => {
   });
 
   it("keeps the stored run failure cause visible when diagnostics have no failure_detail", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       runs: [
         {
@@ -525,7 +535,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1 · /i }));
 
     expect(screen.queryByTestId("run-failure-detail")).not.toBeInTheDocument();
     expect(screen.getByTestId("run-stored-failure-detail")).toHaveTextContent(
@@ -540,7 +550,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
 
     expect(screen.getByText("Reading current run evidence")).toBeInTheDocument();
     expect(screen.getByText("1 token is visible in the runtime trace.")).toBeInTheDocument();
@@ -554,7 +564,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
     await userEvent.click(screen.getByRole("button", { name: /explain/i }));
 
     expect(evaluateRunDiagnostics).toHaveBeenCalledWith("r2");
@@ -568,7 +578,7 @@ describe("RunsHistoryDrawer", () => {
   it("traps Tab and Shift+Tab inside the drawer", async () => {
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
     const closeBtn = screen.getByRole("button", { name: /close/i });
-    const firstDetail = screen.getByRole("button", { name: /show detail for r1/i });
+    const firstDetail = screen.getByRole("button", { name: /^Show detail for Run 1 · /i });
     closeBtn.focus();
     await userEvent.tab();
     expect(firstDetail).toHaveFocus();
@@ -612,5 +622,71 @@ describe("RunsHistoryDrawer", () => {
     expect(opener).toHaveFocus();
 
     opener.remove();
+  });
+});
+
+describe("detail level (elspeth-34e810312c)", () => {
+  const UUID_RUN_ID = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
+  const uuidRun = (status: string, extra: Record<string, unknown> = {}) =>
+    ({ id: UUID_RUN_ID, status, started_at: "2026-08-29T10:00:00Z", ...extra }) as never;
+
+  beforeEach(() => resetStore(usePreferencesStore));
+
+  it("keeps the UUID out of visible text and aria-labels with the flag off, but in the label title", () => {
+    const { container } = render(
+      <RunsHistoryDrawer onClose={vi.fn()} runsOverride={[uuidRun("running")]} />,
+    );
+    expectNoIdentifiersInDefaultDom(container);
+    expect(screen.getByText(/^Run 1 · /)).toHaveAttribute("title", UUID_RUN_ID);
+    expect(screen.getByRole("button", { name: /^Cancel Run 1 · / })).toBeInTheDocument();
+  });
+
+  it("shows the UUID span when show_advanced is on", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(<RunsHistoryDrawer onClose={vi.fn()} runsOverride={[uuidRun("completed")]} />);
+    expect(screen.getByText(UUID_RUN_ID)).toBeInTheDocument();
+  });
+
+  it("gates the token/operation lists and raw failure <pre> behind the flag; keeps count, Explain, and the curated failure detail", async () => {
+    useExecutionStore.setState({
+      loadRunDiagnostics: vi.fn().mockResolvedValue(undefined),
+      diagnosticsByRunId: {
+        [UUID_RUN_ID]: makeDiagnostics({
+          run_id: UUID_RUN_ID,
+          tokens: [
+            {
+              ...makeDiagnostics().tokens[0],
+              states: [{ ...makeDiagnostics().tokens[0].states[0], error: { code: "some_code" } }],
+            },
+          ],
+        }),
+      },
+    } as never);
+    render(<RunsHistoryDrawer onClose={vi.fn()} runsOverride={[uuidRun("failed")]} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1/ }));
+    expect(screen.getByText(/1 token/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Explain" })).toBeInTheDocument();
+    const drawer = screen.getByRole("dialog", { name: "Pipeline runs" });
+    expect(drawer.querySelector(".run-diagnostics-tokens")).toBeNull();
+    expect(drawer.querySelector(".run-diagnostics-operations")).toBeNull();
+    expect(screen.queryByTestId("run-failure-detail")).not.toBeInTheDocument();
+    expect(drawer.textContent).not.toMatch(/token-1|state-1/);
+    // Curated authored surface stays (closed identifiers + authored hint).
+    expect(screen.getByTestId("run-state-failure-state-1")).toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(drawer.querySelector(".run-diagnostics-tokens")).not.toBeNull();
+    expect(screen.getByTestId("run-failure-detail")).toBeInTheDocument();
+    // One render site: still exactly one curated failure row with the flag on.
+    expect(screen.getAllByTestId("run-state-failure-state-1")).toHaveLength(1);
+  });
+
+  it("keeps the accounting-corruption badge regardless of the flag", () => {
+    render(
+      <RunsHistoryDrawer
+        onClose={vi.fn()}
+        runsOverride={[uuidRun("completed", { accounting_corruption: { violations: ["duplicate terminal outcome"] } })]}
+      />,
+    );
+    expect(screen.getByText("⚠ audit accounting corrupt")).toBeInTheDocument();
   });
 });
