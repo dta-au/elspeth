@@ -522,7 +522,8 @@ def validate_openers_bound_in_region(
                     f"Fork gate '{gate_name}' inside bound region '{binding.closer_name}' is unbound: its branches "
                     f"reach '{binding.closer_name}' with no coalesce or row_union of their own. Inside a bound region "
                     f"a shape change must itself be a group (spec §7 rule 5, ruling 28): close the fork at an "
-                    f"in-region coalesce/row_union before '{binding.closer_name}', or move the fork outside the region.",
+                    f"in-region coalesce before '{binding.closer_name}' (a row_union closer is itself rejected — "
+                    f"pass-through closers violate one-token-per-member), or move the fork outside the region.",
                     component_id=gate_name,
                     component_type="gate",
                 )

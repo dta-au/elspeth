@@ -525,6 +525,8 @@ TransformErrorCategory = Literal[
     "csv_column_count_mismatch",
     "too_many_rows",
     "too_many_images",  # Row-declared image inputs exceed configured max_images_per_call
+    "expand_width_exceeded",  # ENGINE-synthesized (like retry_exhausted): a multi-row expansion exceeds
+    # settings.max_expand_group_width; refused at the opener before the mint transaction (elspeth-258bd49d81)
     # PDF rasterization (Tier 2 - document bytes that did not survive rendering)
     "pdf_encrypted",  # password/security-protected PDF; no password path exists
     "pdf_malformed",  # pdfium could not parse the document

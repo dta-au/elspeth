@@ -1766,6 +1766,27 @@ is a working document under the normal delivery posture.
     `source_demand` reads it from state — do not re-import
     `interpretation_state` into `source_demand` (import cycle) and do not
     re-literal the string.
+- **2026-08-27 — expand width is fenced at run (`settings.max_expand_group_width`,
+  default 100k, elspeth-258bd49d81), and two conventions around it.** (a) The
+  gate lives in the traversal's multi-row arm AHEAD of `expand_token` and
+  routes the refusal through `handle_transform_error_status` — but the
+  `error_sink` unpacked from `_execute_transform_with_retry` is **None on a
+  SUCCESS result** (the executor only sets it on the error path), so an
+  engine-synthesized refusal after a successful transform must pass
+  `transform.on_error`, never the in-scope `error_sink` — reusing it builds a
+  `(FAILURE, ON_ERROR_ROUTED)` RowResult with `sink_name=None`, which the
+  RowResult invariant rejects. `TokenManager.expand_token` carries the same
+  ceiling as a fail-closed backstop BEFORE any DB work (the mint is one eager
+  transaction); callers without a loss channel (aggregation flush) hit that
+  raise and the run fails closed rather than OOM. (b) Loss-ledger categories
+  derive from ONE helper, `token_traversal._branch_loss_reason` — a new
+  category that must stay explicit in `group_losses`/`coalesce_branch_losses`
+  (like `expand_width_exceeded`, `retry_exhausted`→`max_retries_exceeded`)
+  extends the helper, never the arms, which previously restated the mapping
+  twice. `expand_width_exceeded` is also a `TransformErrorCategory` member —
+  engine-synthesized like `retry_exhausted`; it is NOT a
+  `GroupSettlementReason` (that closed enum is the coalesce/scope settlement
+  vocabulary and stays untouched).
 
 - **2026-08-27 — server-owned option metadata is a THREE-surface parity set:
   planner projection, echo-tolerant write gates, and disclosure provenance**

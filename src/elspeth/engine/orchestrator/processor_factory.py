@@ -463,6 +463,10 @@ def build_row_processor(
         unbound_branch_first_node=unbound_branch_first_node,
         sink_names=frozenset(config.sinks),
         coalesce_on_success_map=coalesce_on_success_map,
+        # The expand-width fence (elspeth-258bd49d81). settings is None only on
+        # repository-level direct constructions; the width stays unfenced there
+        # exactly like the other settings-derived maps above.
+        max_expand_group_width=settings.max_expand_group_width if settings is not None else None,
         barrier_restore=barrier_restore,
         barrier_restore_reads=factory.barrier_restore,
         payload_store=payload_store,
