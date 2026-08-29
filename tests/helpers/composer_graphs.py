@@ -1,4 +1,4 @@
-"""Surface-agnostic composition-graph isomorphism helper (Plan 05 Task 3).
+"""Surface-agnostic composition-graph isomorphism helper.
 
 This is the shared correctness core of the composer capability-parity matrix.
 The three authoring surfaces (freeform, guided-full, guided-staged) each derive
@@ -10,8 +10,7 @@ profile metadata) legitimately differs. This module reduces a committed
 and provides :func:`assert_isomorphic`, which reports the first differing
 *semantic* attribute.
 
-Preserve / canonicalize split — design §8.1
-(``2026-07-13-composer-guided-freeform-capability-parity-design.md:677``):
+Preserve / canonicalize split:
 
 PRESERVE (must survive canonicalization; a difference here is a real regression):
   node and plugin kinds, normalized options, directed edge roles, route labels,
@@ -58,8 +57,8 @@ __all__ = [
 
 # Sentinel terminal a routed failure/discard edge points at when the route is a
 # literal ``discard`` (or absent) rather than a named connection. Keeping this a
-# distinct atom preserves the terminal-vs-routed distinction that the design
-# lists under PRESERVE (a failure policy that discards is not the same graph as
+# distinct atom preserves the terminal-vs-routed distinction listed under
+# PRESERVE above (a failure policy that discards is not the same graph as
 # one that routes to a real sink).
 _DISCARD = "\x00discard"
 
@@ -75,8 +74,8 @@ class CanonicalGraph:
     ``structure`` is a plain JSON-able dict with connection names / node ids
     relabelled to structural tokens and every list canonically sorted; equal
     ``structure`` dicts mean the two source graphs are isomorphic under the
-    §8.1 split. ``fingerprint`` is a stable string digest of ``structure`` for
-    cheap set/equality use.
+    preserve/canonicalize split above. ``fingerprint`` is a stable string digest
+    of ``structure`` for cheap set/equality use.
     """
 
     structure: dict[str, Any]
@@ -123,7 +122,7 @@ def _effective_options(options: Any, plugin_kind: str | None, plugin_name: str |
     guided stage protocol persists the full pydantic ``model_dump`` (every
     default made explicit — e.g. csv ``delimiter`` / ``encoding`` / ``skip_rows``,
     json ``indent`` / ``headers``). Those are the identical effective
-    configuration, so "normalized options" (a §8.1 PRESERVE attribute) must mean
+    configuration, so "normalized options" (a PRESERVE attribute above) must mean
     the *effective* options, not the authored surface form. Dropping every option
     key whose value equals its plugin config-model field default collapses that
     explicit-vs-default noise on both sides while keeping every non-default value
@@ -245,7 +244,7 @@ def _build_model(state: Mapping[str, Any]) -> _Model:
             # non-None on_error on gate/coalesce (route errors to a real sink) as
             # well as transform/aggregation, and runtime routing honours it
             # generically — dropping gate/coalesce on_error would violate the
-            # §8.1 PRESERVE list ("every failure policy"). Queue always forbids
+            # PRESERVE list above ("every failure policy"). Queue always forbids
             # on_error (it is None there). Emit unconditionally and normalize
             # through ``.get`` so an absent key (set_pipeline authored-minimal)
             # and an explicit None (guided-staged full model_dump) both collapse
@@ -495,7 +494,7 @@ def assert_isomorphic(
     left: str = "left",
     right: str = "right",
 ) -> None:
-    """Assert two committed graphs are semantically isomorphic under §8.1.
+    """Assert two committed graphs satisfy the local canonicalization contract.
 
     Accepts raw ``CompositionState`` objects (canonicalized here) or already
     computed :class:`CanonicalGraph` values. On mismatch, raises

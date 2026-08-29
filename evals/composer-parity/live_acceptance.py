@@ -1,4 +1,4 @@
-"""Composer capability-parity live-acceptance oracle (Plan 05 Task 5).
+"""Composer capability-parity live-acceptance oracle.
 
 This module is the *oracle*: given sanitized evidence exported from a single
 deployed revision, it decides whether the two-LLM colour hybrid pipeline
@@ -29,7 +29,7 @@ literally fabricating provider request ids and usage: a non-sentinel
 ``prompt_tokens`` / ``completion_tokens``. A fake run that *lies* in its
 manifest (``provider.mode == "live"``) is still rejected on those intrinsic
 per-call properties. This is the acceptance bar for the whole oracle: get the
-discriminator wrong and Task 6's live proof validates nothing.
+discriminator wrong and the staging live proof validates nothing.
 
 Evidence-directory hygiene is enforced on load: the resolved revision directory
 and every file under it must have restrictive permissions (no group/other
@@ -40,10 +40,10 @@ the exporter must have stripped them (``redact_evidence`` does so before write),
 and their presence means retention discipline failed.
 
 The module is import-safe offline: no live-run / litellm / httpx dependency is
-imported at module scope. The ``run`` CLI path (which drives a real surface
-against ``$ELSPETH_EVAL_BASE_URL`` with environment-only credentials) lazily
-imports its dependencies and is never exercised by this workflow's tests — it
-is the entry point Task 6 invokes against staging.
+imported at module scope. ``run_live`` accepts an injected collector for tests
+or harnesses, while the ``run`` CLI currently selects the fail-closed default
+until a concrete collector is wired. The staging Playwright journey instead
+exports evidence and invokes the ``verify`` command.
 """
 
 from __future__ import annotations
@@ -76,8 +76,7 @@ EXPECTED_ASSESSMENTS = 2 * EXPECTED_ROW_COUNT
 #: One completed coalesce per source row.
 EXPECTED_COALESCES = EXPECTED_ROW_COUNT
 
-#: The exact hybrid output contract after cleanup (design §"Hybrid Output
-#: Contract"). Order is the design's declared field order.
+#: The exact hybrid output contract after cleanup, in declared field order.
 APPROVED_OUTPUT_FIELDS: tuple[str, ...] = (
     "color_name",
     "hex",
@@ -90,7 +89,7 @@ APPROVED_OUTPUT_FIELDS: tuple[str, ...] = (
 )
 APPROVED_OUTPUT_FIELD_SET: frozenset[str] = frozenset(APPROVED_OUTPUT_FIELDS)
 
-#: Fields that identify a source row uniquely (design "Input").
+#: Fields that identify a source row uniquely.
 IDENTITY_FIELDS: tuple[str, ...] = ("color_name", "hex")
 
 #: Branch-exclusive typed contracts.
@@ -789,10 +788,10 @@ def _check_run_accounting(evidence: Evidence, calls: Sequence[Mapping[str, Any]]
 def _check_authoring_discipline(evidence: Evidence) -> None:
     """At most one automatic structured repair and no operator correction.
 
-    Task 6 runs each surface from a clean session and allows at most one
+    Each live-acceptance run starts from a clean session and allows at most one
     automatic structured repair and NO operator topology/configuration
-    correction; the oracle enforces both from the manifest so a run that was
-    hand-steered to success cannot be accepted as an autonomous derivation.
+    correction; the oracle enforces both from the manifest so a hand-steered
+    success cannot be accepted as an autonomous derivation.
     """
     provider = _require_mapping(evidence.manifest.get("provider"), "provider_shape", "manifest.provider")
 
@@ -856,9 +855,9 @@ def verify_evidence_dir(evidence_dir: str | os.PathLike[str], revision: str) -> 
 class LiveCollectionUnavailable(RuntimeError):
     """No staging evidence collector is wired for the requested surface.
 
-    The oracle refuses to fabricate provider evidence. Task 6 supplies the
-    concrete staging collector (or exports evidence via the Playwright journey
-    and calls ``verify``); this default declines rather than invent a run.
+    The oracle refuses to fabricate provider evidence. A staging harness must
+    supply the concrete collector (or export evidence via the Playwright journey
+    and call ``verify``); this default declines rather than invent a run.
     """
 
 
@@ -886,7 +885,8 @@ class LiveEvidenceCollector:
     ) -> Mapping[str, Any]:
         raise LiveCollectionUnavailable(
             f"no staging evidence collector is wired for surface {surface!r}; "
-            f"Task 6 drives {base_url} and exports evidence for `live_acceptance verify`. "
+            f"a staging journey must drive {base_url} and export evidence for "
+            "`live_acceptance verify`. "
             "This oracle never fabricates provider evidence."
         )
 
@@ -905,11 +905,12 @@ def run_live(
     """Collect, redact, persist, and verify evidence for one live run.
 
     This is the offline-testable machinery of the ``run`` command: it never
-    reads the environment and never imports a provider SDK. A live run injects
-    no collector and gets :class:`LiveEvidenceCollector` (which declines); Task
-    6 / tests inject a concrete collector. The collected document is redacted
-    and written with restrictive permissions, then re-loaded and verified
-    through the same path an operator's ``verify`` invocation takes.
+    reads the environment and never imports a provider SDK. Tests or harnesses
+    inject a concrete collector. Without one, the default
+    :class:`LiveEvidenceCollector` declines rather than fabricating a live run.
+    A collected document is redacted and written with restrictive permissions,
+    then re-loaded and verified through the same path an operator's ``verify``
+    invocation takes.
     """
     active = collector if collector is not None else LiveEvidenceCollector()
     document = active(
@@ -928,8 +929,10 @@ def _run_live(args: argparse.Namespace) -> int:
     """CLI glue for ``run``: gate on env credentials, then delegate to :func:`run_live`.
 
     Key-gated and environment-only for credentials. The deterministic test suite
-    exercises :func:`run_live` with an injected collector; the CLI path performs
-    a REAL provider run and is never invoked by the tests.
+    exercises :func:`run_live` with an injected collector. The CLI currently
+    delegates to the declining default collector; staging evidence is exported
+    by the Playwright journey and checked with ``verify`` until a concrete CLI
+    collector is wired.
     """
     base_url = args.base_url or os.environ.get("ELSPETH_EVAL_BASE_URL")
     if not base_url:

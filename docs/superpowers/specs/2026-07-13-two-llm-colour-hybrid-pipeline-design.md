@@ -1,8 +1,8 @@
 # Two-LLM Colour Hybrid Pipeline Design
 
 > **HISTORICAL ACCEPTANCE FIXTURE (2026-07-17).** Refresh schema and deployment
-> assumptions before reuse; see
-> [the Composer plan disposition](../plans/composer-parity/2026-07-17-current-plan-disposition.md).
+> assumptions before reuse; the maintained executable corpus and oracle live in
+> the [Composer parity evaluation](../../../evals/composer-parity/README.md).
 
 ## Purpose
 

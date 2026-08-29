@@ -1,8 +1,7 @@
 """Loader/validator for the composer capability-parity fixture corpus.
 
-Plan 05 Task 2. This is the TDD anchor for the corpus: every canonical fixture
-must validate here before it is admitted. Two structural checks run per fixture,
-matching the plan's declared Task 2 scope:
+This is the TDD anchor for the corpus: every canonical fixture must validate
+here before it is admitted. Two structural checks run per fixture:
 
 1. The ``canonical_arguments`` payload validates against
    ``SetPipelineArgumentsModel.model_validate``
@@ -15,11 +14,12 @@ matching the plan's declared Task 2 scope:
    that is not installed (e.g. a typo, or a plugin that was removed).
 
 Full committed-graph validation (``validate_composition_state``) is the costlier
-alternative and is DEFERRED to Task 3's real-path matrix: the
+alternative and belongs to the real-path matrix: the
 args -> ``CompositionState`` conversion lives only inside the session-bound
 ``_execute_set_pipeline`` handler (``tools/sessions.py``), so reusing it here
-would duplicate Task 3 and pull in session/engine wiring. Task 2 gates argument
-shape + plugin availability; Task 3 gates the committed graph.
+would duplicate that integration coverage and pull in session/engine wiring.
+This module gates argument shape + plugin availability; the real-path matrix
+gates the committed graph.
 
 The two colour-scenario files are hashed against the pinned byte form recorded
 in the eval ``README.md`` so the fixture corpus cannot silently drift.

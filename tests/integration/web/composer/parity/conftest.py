@@ -1,4 +1,4 @@
-"""Shared fixtures for the composer capability-parity real-path matrix (Task 3).
+"""Shared fixtures for the composer capability-parity real-path matrix.
 
 This conftest builds ONE production stack that all parity surfaces share:
 
@@ -246,7 +246,7 @@ def _empty_state() -> CompositionState:
 # a source/output to the guided default — while free node-to-node connection
 # names (``rows``, ``stats``, ``gate_in``, …) stay verbatim (the comparator
 # canonicalizes them). The committed graph is then isomorphic to the reference;
-# only the component *names* differ, which §8.1 canonicalizes away.
+# only the component *names* differ, which the comparator canonicalizes away.
 
 
 def _guided_naming(args: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, str]]:

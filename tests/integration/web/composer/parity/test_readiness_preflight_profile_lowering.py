@@ -1,4 +1,4 @@
-"""Task-6 blocker probe: the readiness preflight must not false-positive on a
+"""The readiness preflight must not false-positive on a
 committed operator-profiled multi-query LLM node.
 
 Background

@@ -1,4 +1,4 @@
-"""Negative / behavioural parity cases for the capability-parity matrix (Plan 05 Task 3).
+"""Negative / behavioural parity cases for the capability-parity matrix.
 
 The positive matrix (``test_fixture_matrix.py``) proves that every ordinary
 authoring surface derives the *same committed graph* for a well-behaved planner.
@@ -12,7 +12,7 @@ cannot express as a committed graph:
   same committed graph the reference derives, carrying ``repair_count == 1``.
 * **repair exhaustion** — every terminal proposal stays malformed; the planner
   exhausts its repair budget (2) and raises ``REPAIR_EXHAUSTED``, which the
-  freeform ``/messages`` route (Task 0) translates into the deliberate coded
+  freeform ``/messages`` route translates into the deliberate coded
   ``planner_repair_exhausted`` 500 (elspeth-5904b1683a) and one durable,
   redacted ``planner_failure_disposition`` audit row — NOT a guided lease
   terminalization.

@@ -1,4 +1,4 @@
-"""Three-surface real-path parity matrix (Plan 05 Task 3).
+"""Three-surface real-path parity matrix.
 
 Ten canonical capability fixtures x three arbitrary authoring surfaces
 (freeform, guided-full, guided-staged), for 30 real-path cases. Each case drives one surface's
@@ -20,9 +20,9 @@ canonical component *names*, so they additionally assert byte-exact public-YAML
 semantics and the fixture's exact declared capability shape. The guided-staged
 surface reviews sources/outputs through the persisted stage protocol, which
 auto-assigns positional names (``source`` / ``source_2`` / ``output`` /
-``output_2`` …) the operator cannot override; design §8.1 canonicalizes
-connection names / source keys away, so isomorphism to the shared reference is
-the complete, name-agnostic parity proof for that surface. It is paired with a
+``output_2`` …) the operator cannot override. The shared comparator
+canonicalizes connection names / source keys, so isomorphism to the reference
+is the complete, name-agnostic parity proof for that surface. It is paired with a
 positive guided-naming assertion — proving the committed graph really traversed
 the staged protocol and that the *only* delta from the reference is the expected
 renaming — rather than a weaker name-agnostic reimplementation of the semantic
@@ -196,9 +196,9 @@ async def test_surface_derives_isomorphic_committed_graph(
         # 3. The committed graph exposes the fixture's exact declared capability shape.
         _assert_semantic_expectations(committed, fixture)
     else:
-        # Guided-staged: isomorphism above is the complete parity proof (§8.1
-        # canonicalizes the auto-assigned names). Add the positive guided-naming
-        # assertion and confirm the public pipeline still compiles non-empty.
+        # Guided-staged: isomorphism above is the complete parity proof because
+        # the comparator canonicalizes auto-assigned names. Add the positive
+        # guided-naming assertion and confirm the public pipeline compiles.
         _assert_guided_staged_naming(committed, fixture)
         public = public_pipeline_semantics(committed)
         assert public.get("sources") and public.get("sinks"), f"{surface}:{fixture['class']}: public pipeline compiled empty sources/sinks"

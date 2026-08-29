@@ -1,14 +1,13 @@
 """Schema-mutation controls: narrowing the advertised terminal schema is caught
-by the capability-manifest SCHEMA-IDENTITY gate, not by graph isomorphism (Plan
-05 Task 4).
+by the capability-manifest SCHEMA-IDENTITY gate, not by graph isomorphism.
 
 Why these controls exist (the false-green trap they defend against)
 -------------------------------------------------------------------
 The generated-DAG and fixture-matrix parity tests prove that three authoring
 surfaces derive the *same committed graph* by comparing each surface's committed
 ``CompositionState`` to a shared reference with ``assert_isomorphic``. That proof
-has a blind spot the plan calls out explicitly: the committed graph is a function
-of the pipeline the LLM *emits*, not of the schema the planner *advertises* to
+has an explicit blind spot: the committed graph is a function of the pipeline
+the LLM *emits*, not of the schema the planner *advertises* to
 the LLM in the ``emit_pipeline_proposal`` terminal tool. Under this suite's
 scripted completion — which emits the full canonical payload regardless of the
 advertised schema — narrowing the advertised terminal schema (dropping a
@@ -41,8 +40,8 @@ Two layers, deliberately:
   production advertised tools (``planner_tool_definitions()``) and the genuine
   canonical schema. The baseline proves the direction (un-narrowed → hashes
   match, manifest builds); each narrowing proves detection (hashes diverge →
-  ``AuditIntegrityError``). This is the "(or the manifest-identity assertion)"
-  path the task sanctions, and it pins each control to the schema-identity
+  ``AuditIntegrityError``). This is the manifest-identity assertion path, and it
+  pins each control to the schema-identity
   compare with zero ambiguity about which check fired.
 
 * ``test_freeform_drive_narrowed_advertised_schema_trips_gate_upstream_of_graph``

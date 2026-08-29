@@ -1,17 +1,17 @@
 // ============================================================================
 // composer-capability-parity.staging.spec.ts — guided_staged live acceptance
 //
-// Plan 05 Task 5 authored / Task 6 executed. This spec drives the deployed
-// guided-staged authoring surface through the two-LLM colour hybrid pipeline
+// This spec drives the deployed guided-staged authoring surface through the
+// two-LLM colour hybrid pipeline
 // against a REAL provider, exports sanitized evidence for exactly one deployed
 // revision, and hands that evidence to the same Python oracle the freeform and
 // guided_full surfaces use (evals/composer-parity/live_acceptance.py).
 //
-// It is authored here but NOT run in the Task 5 workflow: it needs a live
-// staging deployment AND a real provider key. Like tests/.../test_bedrock_live_smoke.py
+// It is not run in deterministic offline workflows: it needs a live staging
+// deployment AND a real provider key. Like tests/.../test_bedrock_live_smoke.py
 // it is key-gated — with no ELSPETH_EVAL_API_KEY the whole describe is SKIPPED,
 // so the rest of the composer-capability-parity work stays deterministic and
-// offline. Task 6 supplies STAGING_* credentials (via the staging global-setup)
+// offline. The staging runner supplies STAGING_* credentials (via global setup)
 // and ELSPETH_EVAL_API_KEY, deploys the integrated revision, and runs:
 //
 //   STAGING_BASE_URL=https://elspeth.foundryside.dev \
@@ -21,20 +21,20 @@
 //   npx playwright test --config=playwright.staging.config.ts \
 //     tests/e2e/composer-capability-parity.staging.spec.ts --retries=0
 //
-// ── TASK 6 RECONCILIATION NOTES (do not silently paper over) ────────────────
+// ── LIVE-STAGING RECONCILIATION NOTES (do not silently paper over) ─────────
 //   1. Guided-staged stage sequence. This spec models the colour pipeline as a
 //      chat-driven guided planner: enter guided, send the outcome-only request,
 //      send an early reminder, then review the whole-graph ProposePipelineTurn.
 //      If the deployed guided-staged flow interposes source/sink SINGLE_SELECT
 //      stages before the planner chat (as composer-guided.spec.ts shows for the
-//      step wizard), Task 6 threads those with `advanceDeterministicStages`
+//      step wizard), this journey threads those with `advanceDeterministicStages`
 //      below — it is a documented seam, not a hidden assumption.
 //   2. Evidence collector endpoint. The oracle consumes six sanitized JSON
 //      documents (manifest/graph/run_llm_calls/run_accounting/business_output/
 //      input_identities). There is no single backend endpoint that emits them
 //      in the oracle's shape today; server-side assembly + redaction is where
 //      `redact_evidence` should live (live_acceptance.py). `collectStagedParityEvidence`
-//      calls the purpose-built export endpoint the Task-6 collector must expose
+//      calls the purpose-built export endpoint the staging collector must expose
 //      and FAILS LOUDLY, naming the contract, if it is absent — it never
 //      fabricates a passing document (that would defeat the oracle's whole point).
 // ============================================================================
@@ -85,8 +85,8 @@ const EVIDENCE_FILES = [
 type EvidenceBundle = Record<(typeof EVIDENCE_FILES)[number], unknown>;
 
 // Key-gate: absent a real provider key this journey cannot prove a live run, so
-// it is skipped rather than run against a fake. This keeps the Task 5 workflow
-// deterministic/offline; Task 6 supplies the key on staging.
+// it is skipped rather than run against a fake. This keeps offline verification
+// deterministic; the staging runner supplies the live key.
 const LIVE_KEY = process.env.ELSPETH_EVAL_API_KEY;
 
 test.describe("composer capability parity — guided_staged live acceptance (staging)", () => {
@@ -127,7 +127,7 @@ test.describe("composer capability parity — guided_staged live acceptance (sta
       await page.getByRole("button", { name: "Switch to guided" }).click();
       await expect(page.getByLabel(/guided composer/i)).toBeVisible();
 
-      // Task-6 seam: interpose any deterministic source/sink stages the deployed
+      // Staging seam: interpose any deterministic source/sink stages the deployed
       // guided-staged flow requires before the planner chat.
       await advanceDeterministicStages(page);
 
@@ -254,12 +254,12 @@ async function waitForGuidedIdle(page: Page): Promise<void> {
 }
 
 /**
- * Task-6 seam: advance any deterministic source/sink stages the deployed
+ * Staging seam: advance any deterministic source/sink stages the deployed
  * guided-staged flow requires before the planner chat. With the colour CSV
  * already uploaded, a source SINGLE_SELECT binds it via the upload fast-path;
  * a sink stage may default. Left intentionally permissive: it clicks a stage's
  * Continue only when one is actually presented, and is a no-op for a purely
- * chat-driven planner. Task 6 tightens this against the real staging sequence
+ * chat-driven planner. Live validation tightens this against the staging sequence
  * rather than this spec guessing it blind.
  */
 async function advanceDeterministicStages(page: Page): Promise<void> {
@@ -276,7 +276,7 @@ async function advanceDeterministicStages(page: Page): Promise<void> {
 
 /**
  * Read the just-executed run id. The execution store exposes the active run id
- * to the DOM; Task 6 confirms the exact attribute on staging if this drifts.
+ * to the DOM; the staging run confirms the exact attribute if this drifts.
  */
 async function readActiveRunId(page: Page): Promise<string> {
   const region = page.getByRole("region", { name: "Pipeline run results" });
@@ -284,13 +284,13 @@ async function readActiveRunId(page: Page): Promise<string> {
   if (runId === null || runId.trim() === "") {
     throw new Error(
       "could not read the active run id from the run-results region " +
-        "(expected a data-run-id attribute) — Task 6: wire the run-id selector to staging",
+        "(expected a data-run-id attribute) — update the selector for the staging DOM contract",
     );
   }
   return runId;
 }
 
-// ── Evidence collection (Task-6 collector seam) ──────────────────────────────
+// ── Evidence collection (staging collector seam) ─────────────────────────────
 
 interface EvidenceRef {
   sessionId: string;
@@ -308,7 +308,7 @@ interface EvidenceRef {
  * `redact_evidence` runs before anything is retained — so this helper reads a
  * purpose-built export endpoint rather than scraping and re-shaping raw audit in
  * the browser. If that endpoint is absent, it FAILS LOUDLY with the exact
- * contract Task 6 must satisfy; it never returns a hand-built passing bundle.
+ * contract the staging deployment must satisfy; it never fabricates a bundle.
  */
 async function collectStagedParityEvidence(
   ctx: APIRequestContext,
@@ -319,7 +319,7 @@ async function collectStagedParityEvidence(
   if (resp.status() === 404) {
     throw new Error(
       "composer-parity evidence export endpoint is not wired on this deployment.\n" +
-        `  Task 6 must expose GET ${path.split("?")[0]} returning the six sanitized\n` +
+        `  The deployment must expose GET ${path.split("?")[0]} returning the six sanitized\n` +
         "  documents the oracle loads, already passed through live_acceptance.redact_evidence:\n" +
         `    ${EVIDENCE_FILES.join(", ")}\n` +
         "  It must strip every credential/cookie/authorization header/resolved secret/raw\n" +
