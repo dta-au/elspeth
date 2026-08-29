@@ -255,9 +255,12 @@ class _LLMProfileResolver:
         suppresses=("R1", "R5"),
         invariant=(
             "raises ValueError('malformed_profile_schema') when $defs, discriminator, discriminator['mapping'], a "
-            "mapped provider definition, its properties, or its required list deviates from the pydantic-generated "
-            "discriminated-union shape (dict / list[str]) — the section that decides public-vs-LLM_PROFILE_PRIVATE_FIELDS "
-            "exposure never silently narrows there. The downstream $ref-closure walk that assembles public $defs, and "
+            "mapped provider definition, its properties, or its required list deviates from the shape every variant "
+            "of THIS union declares (dict / list[str], required non-empty) — the section that decides "
+            "public-vs-LLM_PROFILE_PRIVATE_FIELDS exposure never silently narrows there. An absent 'required' counts "
+            "as a deviation on that measured ground and not on a general pydantic guarantee (pydantic v2 omits "
+            "'required' for an all-defaulted model); what holds is that every LLM provider variant reachable through "
+            "discriminator['mapping'] inherits a non-empty required set from LLMConfig. The downstream $ref-closure walk that assembles public $defs, and "
             "the source knob-field projection, are unchanged pre-existing best-effort behaviour and are not covered "
             "by this invariant. An ABSENT key is not a softer path into the exposure decision: a discriminator "
             "naming a $defs entry the schema does not carry raises, and with neither $defs nor discriminator the "
@@ -302,11 +305,24 @@ class _LLMProfileResolver:
                     safe_properties[name] = deepcopy(property_schema)
         required_by_variant: list[set[str]] = []
         for definition in provider_definitions:
-            # An absent "required" is itself a shape deviation, not "nothing is
-            # required": every pydantic-generated variant of a discriminated
-            # union carries one, so its absence means the schema did not come
-            # from the declared source and the exposure decision below cannot be
-            # made from it. ``list``/``str`` are exact because the schema is
+            # An absent "required" is a shape deviation HERE, not "nothing is
+            # required" — but that rests on these variants, not on pydantic in
+            # general: pydantic v2 omits "required" entirely for a model whose
+            # fields all carry defaults (measured on 2.13.4). What holds is
+            # narrower and checkable. Measured against this tree over both
+            # unions this resolver serves, every variant reachable through
+            # ``discriminator["mapping"]`` declares a non-empty ``required``:
+            # the four ``LLMTransform`` provider configs and the four
+            # ``LLMSource`` ones each inherit ``schema`` and ``prompt_template``
+            # from ``LLMConfig`` (the source variants add
+            # ``on_validation_failure``), and ``provider`` is injected on top.
+            # Only mapping values are read, so the ``$defs`` entries that DO
+            # lack "required" (``OutputFieldType``, ``ResponseFormat``) are
+            # never reached. Should an all-defaulted provider variant ever
+            # appear, this REJECTS rather than publishing a guessed empty
+            # required set — the public-vs-private exposure decision below is
+            # not one to infer from a shape we no longer recognise.
+            # ``list``/``str`` are exact because the schema is
             # json/pydantic-generated, never a subclass or a frozen container.
             required_names = definition["required"] if "required" in definition else None
             if type(required_names) is not list or any(type(name) is not str for name in required_names):
