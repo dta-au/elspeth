@@ -136,7 +136,7 @@ Root files:
 - `components/` — reusable React primitives (see below).
 - `ui_kits/composer/` — the Web Composer recreation (login + composer shell + catalog).
 - `ui_kits/website/` — a public-facing marketing **site** for ELSPETH (net-new; the product has no site today, only the GitHub README). A few short pages — Home, Authoring, Assurance, Use cases, Get started — sharing `site.css` + `site.js`, built entirely from the brand foundations, with a working light/dark toggle.
-- `SKILL.md` — Agent-Skill front-matter wrapper so this system can be used in Claude Code.
+- The agent-skill wrapper lives at `.agents/skills/elspeth-design/SKILL.md` (Claude Code reads it through the `.claude/skills/elspeth-design` symlink); this `design/` tree is the product asset it points at.
 
 **Components** (`window.ELSPETHDesignSystem_85edbb.*`): `Button`, `TypeBadge`, `StatusBadge`, `Input`, `Textarea`, `Card`, `Tabs`, `AlertBanner`, `ChatBubble`, `PluginCard`, `Toolbar`, `WordMark`.
 
