@@ -36,6 +36,7 @@ from sqlalchemy import (
     event,
     text,
 )
+from sqlalchemy.sql.expression import false as sa_false
 from sqlalchemy.types import JSON
 
 from elspeth.core.schema_identity import create_schema_identity_table
@@ -2410,6 +2411,11 @@ user_preferences_table = Table(
     Column("tutorial_session_id", String, nullable=True),
     Column("tutorial_run_id", String, nullable=True),
     Column("tutorial_source_data_hash", String, nullable=True),
+    # Per-user detail level (elspeth-9c11df65f8). False = standard view;
+    # True = engineer/auditor detail (raw options JSON, validation stage
+    # list, advanced plugin knobs expanded). A plain boolean needs no CHECK
+    # constraint; ``server_default`` keeps pre-existing rows readable.
+    Column("show_advanced", Boolean, nullable=False, server_default=sa_false()),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(
         "default_composer_mode IN ('guided', 'freeform')",

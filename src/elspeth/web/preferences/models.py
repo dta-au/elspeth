@@ -76,6 +76,9 @@ class ComposerPreferences(BaseModel):
     tutorial_session_id: str | None
     tutorial_run_id: str | None
     tutorial_source_data_hash: str | None
+    # Detail level (elspeth-9c11df65f8): True shows engineer/auditor detail
+    # the standard view keeps behind summaries.
+    show_advanced: bool
     updated_at: datetime | None
 
 
@@ -129,6 +132,7 @@ class UpdateComposerPreferencesRequest(BaseModel):
     tutorial_session_id: str | None = None
     tutorial_run_id: str | None = None
     tutorial_source_data_hash: str | None = None
+    show_advanced: bool | None = None
     # Request-only telemetry discriminator (never persisted, not in the GET
     # payload): qualifies a completion write as an explicit tutorial exit
     # (the in-tutorial "Exit tutorial" / exit-to-freeform opt-out,

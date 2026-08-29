@@ -1073,3 +1073,27 @@ def test_patch_progress_emits_counter_with_progress_changed_label(service, prefe
     _amount, attrs = preferences_patch_counter.calls[-1]
     assert attrs["tutorial_progress_changed"] is True
     assert attrs["tutorial_changed"] is False
+
+
+def test_show_advanced_defaults_false_and_round_trips(service: PreferencesService) -> None:
+    before = asyncio.run(service.get_composer_preferences("alice-show-advanced"))
+    assert before.show_advanced is False
+
+    transition = asyncio.run(
+        service.update_composer_preferences(
+            "alice-show-advanced",
+            UpdateComposerPreferencesRequest(show_advanced=True),
+        )
+    )
+    assert transition.current.show_advanced is True
+
+    after = asyncio.run(service.get_composer_preferences("alice-show-advanced"))
+    assert after.show_advanced is True
+    # A later PATCH that does not mention the field leaves it alone.
+    asyncio.run(
+        service.update_composer_preferences(
+            "alice-show-advanced",
+            UpdateComposerPreferencesRequest(default_mode="freeform"),
+        )
+    )
+    assert asyncio.run(service.get_composer_preferences("alice-show-advanced")).show_advanced is True

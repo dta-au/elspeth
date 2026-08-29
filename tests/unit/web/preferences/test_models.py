@@ -22,6 +22,7 @@ def test_composer_preferences_valid() -> None:
         tutorial_session_id=None,
         tutorial_run_id=None,
         tutorial_source_data_hash=None,
+        show_advanced=False,
         updated_at=datetime.now(UTC),
     )
     assert payload.default_mode == "guided"
@@ -93,6 +94,7 @@ def test_composer_preferences_accepts_tutorial_completed_at() -> None:
         tutorial_session_id=None,
         tutorial_run_id=None,
         tutorial_source_data_hash=None,
+        show_advanced=False,
         updated_at=datetime.now(UTC),
     )
     assert payload.tutorial_completed_at == stamp
@@ -207,3 +209,33 @@ def test_update_request_rejects_unknown_via_value() -> None:
             tutorial_completed_at=datetime(2026, 7, 9, 10, 0, tzinfo=UTC),
             tutorial_completed_via="quit",  # type: ignore[arg-type]
         )
+
+
+def test_composer_preferences_carries_show_advanced() -> None:
+    prefs = ComposerPreferences(
+        default_mode="guided",
+        banner_dismissed_at=None,
+        freeform_intro_dismissed_at=None,
+        tutorial_completed_at=None,
+        tutorial_stage=None,
+        tutorial_session_id=None,
+        tutorial_run_id=None,
+        tutorial_source_data_hash=None,
+        show_advanced=True,
+        updated_at=None,
+    )
+    assert prefs.show_advanced is True
+
+
+def test_update_request_accepts_only_show_advanced() -> None:
+    req = UpdateComposerPreferencesRequest.model_validate({"show_advanced": True})
+    assert req.show_advanced is True
+    assert req.model_fields_set == {"show_advanced"}
+
+
+def test_update_request_rejects_non_bool_show_advanced() -> None:
+    # The request model is deliberately NOT strict (ISO datetimes must coerce,
+    # models.py:12-19), so pydantic's lax bool accepts "yes"/"1"/"true". A list
+    # is the value shape lax mode still rejects.
+    with pytest.raises(ValidationError):
+        UpdateComposerPreferencesRequest.model_validate({"show_advanced": [1, 2]})

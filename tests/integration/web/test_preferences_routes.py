@@ -460,3 +460,11 @@ def test_completion_clears_tutorial_progress_over_http(client_as_alice: TestClie
     assert body["tutorial_completed_at"] is not None
     assert body["tutorial_stage"] is None
     assert body["tutorial_session_id"] is None
+
+
+def test_patch_persists_show_advanced(client_as_alice: TestClient) -> None:
+    assert client_as_alice.get("/api/composer-preferences").json()["show_advanced"] is False
+    response = client_as_alice.patch("/api/composer-preferences", json={"show_advanced": True})
+    assert response.status_code == 200
+    assert response.json()["show_advanced"] is True
+    assert client_as_alice.get("/api/composer-preferences").json()["show_advanced"] is True

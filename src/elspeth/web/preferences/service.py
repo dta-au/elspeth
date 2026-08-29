@@ -164,6 +164,7 @@ def _select_preferences_for_user(user_id: str) -> Any:
         user_preferences_table.c.tutorial_session_id,
         user_preferences_table.c.tutorial_run_id,
         user_preferences_table.c.tutorial_source_data_hash,
+        user_preferences_table.c.show_advanced,
         user_preferences_table.c.updated_at,
     ).where(user_preferences_table.c.user_id == user_id)
 
@@ -228,6 +229,7 @@ class PreferencesService:
                 tutorial_session_id=None,
                 tutorial_run_id=None,
                 tutorial_source_data_hash=None,
+                show_advanced=False,
                 updated_at=None,
             )
 
@@ -262,6 +264,7 @@ class PreferencesService:
             tutorial_session_id=row.tutorial_session_id,
             tutorial_run_id=row.tutorial_run_id,
             tutorial_source_data_hash=row.tutorial_source_data_hash,
+            show_advanced=bool(row.show_advanced),
             updated_at=row.updated_at,
         )
 
@@ -305,6 +308,7 @@ class PreferencesService:
         tutorial_in_payload = "tutorial_completed_at" in payload.model_fields_set
         banner_in_payload = "banner_dismissed_at" in payload.model_fields_set
         intro_in_payload = "freeform_intro_dismissed_at" in payload.model_fields_set
+        advanced_in_payload = "show_advanced" in payload.model_fields_set
         # Tutorial resume fields (elspeth-918f4434b3) — each carries the same
         # absent-vs-explicit-null discrimination as the banner/tutorial
         # timestamps. See the completion-clears-progress rule below.
@@ -322,6 +326,7 @@ class PreferencesService:
             and not intro_in_payload
             and not tutorial_in_payload
             and not any_progress_in_payload
+            and not advanced_in_payload
         )
 
         def _sync() -> tuple[ComposerPreferences, bool, ComposerPreferences | None]:
@@ -358,6 +363,7 @@ class PreferencesService:
                             tutorial_session_id=None,
                             tutorial_run_id=None,
                             tutorial_source_data_hash=None,
+                            show_advanced=False,
                             updated_at=None,
                         ),
                         False,
@@ -391,6 +397,13 @@ class PreferencesService:
                     resolved_intro = prior_prefs.freeform_intro_dismissed_at
                 else:
                     resolved_intro = None
+
+                if advanced_in_payload:
+                    resolved_advanced: bool = bool(payload.show_advanced)
+                elif prior_prefs is not None:
+                    resolved_advanced = prior_prefs.show_advanced
+                else:
+                    resolved_advanced = False
 
                 if tutorial_in_payload:
                     resolved_tutorial: datetime | None = payload.tutorial_completed_at
@@ -427,6 +440,7 @@ class PreferencesService:
                     "banner_dismissed_at": resolved_banner,
                     "freeform_intro_dismissed_at": resolved_intro,
                     "tutorial_completed_at": resolved_tutorial,
+                    "show_advanced": resolved_advanced,
                     "updated_at": now,
                     **resolved_progress,
                 }
@@ -450,6 +464,8 @@ class PreferencesService:
                     update_clause["freeform_intro_dismissed_at"] = payload.freeform_intro_dismissed_at
                 if tutorial_in_payload:
                     update_clause["tutorial_completed_at"] = payload.tutorial_completed_at
+                if advanced_in_payload:
+                    update_clause["show_advanced"] = resolved_advanced
                 for name in progress_fields:
                     # Written when the caller supplied the field OR the
                     # completion-clears-progress rule applies.
@@ -466,6 +482,7 @@ class PreferencesService:
                         user_preferences_table.c.tutorial_session_id,
                         user_preferences_table.c.tutorial_run_id,
                         user_preferences_table.c.tutorial_source_data_hash,
+                        user_preferences_table.c.show_advanced,
                         user_preferences_table.c.updated_at,
                     )
                 ).one()
@@ -485,6 +502,7 @@ class PreferencesService:
                 tutorial_session_id=returned.tutorial_session_id,
                 tutorial_run_id=returned.tutorial_run_id,
                 tutorial_source_data_hash=returned.tutorial_source_data_hash,
+                show_advanced=returned.show_advanced,
                 updated_at=now,
             )
             return current, True, prior_prefs
