@@ -8,6 +8,36 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — a hand-built fixture can pin a shape NO PRODUCER EMITS, and
+  then every test agrees with a projection that never fires.** Found in B59.
+  `_tool_call_outcomes_by_call_id` (web/sessions/routes/_helpers.py) read
+  `envelope["version_after"]` / `["status"]` off the TOP level of a role="tool"
+  row's `tool_calls[0]`, but the fallback writer stores exactly
+  `redacted_tool_invocation_content_and_envelope(...)[1]`, which is
+  `{"_kind": "audit", "invocation": {...}}` — the per-call delta is one level
+  DOWN. So on every real row the fallback branch matched nothing and an applied
+  mutation fell through to COMPLETED, rendering in the transcript as a lookup:
+  precisely the dishonesty elspeth-f5e6723133 created the projection to remove.
+  Four unit tests, a route-level test, and an eval parity test were all green,
+  because each built its envelope by hand in the flat shape. Three lessons:
+  1. **Mint the fixture through the producer.** The pin that catches this is
+     `TestProducerBuiltFallbackEnvelope`, whose rows come from
+     `redacted_tool_invocation_content_and_envelope` and never restate the
+     layout. Generalises the `NodeSpec(...)`-not-a-literal rule below from
+     frozen containers to any persisted wire shape.
+  2. **A cross-check between two reimplementations proves neither.**
+     `evals/lib/battery_capture.py::tool_outcomes` re-implements this
+     projection for offline scoring and carried the IDENTICAL bug, so
+     `test_tool_outcomes_agree_with_the_server_projection` passed by agreeing
+     on the wrong answer. Its sibling `evals/lib/decode_tools.py::
+     _first_audit_invocation` unwraps `["invocation"]` correctly — when two
+     readers of one shape disagree, one of them is the bug.
+  3. **The unwrap needs `isinstance(x, Mapping)`, not the house exact-type
+     idiom.** `ChatMessageRecord.__post_init__` runs `freeze_fields(self,
+     "tool_calls")`, so a row read back from the DB is `mappingproxy` at BOTH
+     the envelope and the `invocation` level; `type(x) is dict` is permanently
+     False and would re-disable the branch. Mutation-verified both ways.
+
 - **2026-08-29 — POLARITY decides how bad a `type(x) is dict` freeze trap is,
   and an accept-gate that GATES A CONTROL BLOCK is fail-OPEN, not a
   conservative abstention.** Landed by the Wave-3 hygiene lane over the four

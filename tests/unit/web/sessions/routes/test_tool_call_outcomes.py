@@ -19,10 +19,14 @@ server-authenticated outcomes onto the assistant rows' tool_calls envelopes.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.core.canonical import canonical_json
+from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.sessions.protocol import ChatMessageRecord
 from elspeth.web.sessions.routes._helpers import (
     _tool_call_outcomes_by_call_id,
@@ -123,11 +127,103 @@ class TestPrimaryWriterRows:
         assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.CANCELLED
 
 
+def _produced_audit_envelope(*, version_before: int, version_after: int | None, status: ComposerToolStatus) -> dict[str, object]:
+    """Build a fallback-drain envelope through the REAL producer.
+
+    ``_persist_tool_invocations`` writes exactly
+    ``redacted_tool_invocation_content_and_envelope(invocation)[1]`` into the
+    row's ``tool_calls``. Hand-building the envelope in a fixture is what let
+    the shape drift go unnoticed, so this helper mints one the way production
+    does and never restates its layout.
+    """
+    arguments_canonical = canonical_json({})
+    result_canonical = canonical_json({"success": status is ComposerToolStatus.SUCCESS})
+    invocation = ComposerToolInvocation(
+        tool_call_id="call-1",
+        tool_name="upsert_node",
+        arguments_canonical=arguments_canonical,
+        arguments_hash=hashlib.sha256(arguments_canonical.encode()).hexdigest(),
+        result_canonical=result_canonical,
+        result_hash=hashlib.sha256(result_canonical.encode()).hexdigest(),
+        status=status,
+        error_class=None,
+        error_message=None,
+        version_before=version_before,
+        version_after=version_after,
+        started_at=_NOW,
+        finished_at=_NOW,
+        latency_ms=1,
+        actor="compose_loop",
+    )
+    return redacted_tool_invocation_content_and_envelope(invocation)[1]
+
+
+class TestProducerBuiltFallbackEnvelope:
+    """The projection must read the envelope the fallback writer ACTUALLY emits.
+
+    ``redacted_tool_invocation_content_and_envelope`` returns
+    ``{"_kind": "audit", "invocation": {...}}`` — the per-call delta lives
+    one level DOWN, under ``invocation``. Reading ``version_after`` off the
+    top level finds nothing on every real row, so an applied mutation
+    silently fell through to COMPLETED and rendered in the transcript as a
+    lookup: precisely the dishonesty this projection exists to remove.
+
+    ``TestFallbackWriterRows`` below pins the same behaviours against a
+    hand-built flat envelope, which is why the drift survived — these tests
+    construct through the producer instead.
+    """
+
+    def test_producer_envelope_version_advance_is_applied(self) -> None:
+        row = _tool_row(
+            tool_call_id="call-1",
+            tool_calls=[_produced_audit_envelope(version_before=1, version_after=2, status=ComposerToolStatus.SUCCESS)],
+            # The fallback writer stamps the SHARED post-compose id on every
+            # row, so the state id cannot be the per-call truth here.
+            composition_state_id=uuid4(),
+        )
+        outcomes = _tool_call_outcomes_by_call_id([row], state_versions_by_id={})
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.APPLIED
+        assert outcomes["call-1"].applied_state_version == 2
+
+    def test_producer_envelope_without_version_advance_is_not_applied(self) -> None:
+        row = _tool_row(
+            tool_call_id="call-1",
+            tool_calls=[_produced_audit_envelope(version_before=1, version_after=1, status=ComposerToolStatus.SUCCESS)],
+            composition_state_id=uuid4(),
+        )
+        outcomes = _tool_call_outcomes_by_call_id([row], state_versions_by_id={})
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.COMPLETED
+
+    def test_producer_envelope_cancelled_status_is_cancelled(self) -> None:
+        row = _tool_row(
+            tool_call_id="call-1",
+            tool_calls=[_produced_audit_envelope(version_before=1, version_after=None, status=ComposerToolStatus.CANCELLED)],
+        )
+        outcomes = _tool_call_outcomes_by_call_id([row], state_versions_by_id={})
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.CANCELLED
+
+    def test_producer_envelope_crash_status_is_failed(self) -> None:
+        row = _tool_row(
+            tool_call_id="call-1",
+            tool_calls=[_produced_audit_envelope(version_before=1, version_after=None, status=ComposerToolStatus.PLUGIN_CRASH)],
+        )
+        outcomes = _tool_call_outcomes_by_call_id([row], state_versions_by_id={})
+        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.FAILED
+
+
 class TestFallbackWriterRows:
-    """Rows from _persist_tool_invocations: audit envelope carries the delta."""
+    """Rows from _persist_tool_invocations: audit envelope carries the delta.
+
+    The per-call fields sit under ``invocation``, matching the
+    ``{"_kind": "audit", "invocation": {...}}`` shape
+    ``redacted_tool_invocation_content_and_envelope`` emits. These cases
+    cover status/content combinations the producer helper cannot mint
+    directly; ``TestProducerBuiltFallbackEnvelope`` above is the pin that
+    the layout itself is right.
+    """
 
     def _envelope(self, **overrides: object) -> dict[str, object]:
-        envelope: dict[str, object] = {
+        invocation: dict[str, object] = {
             "tool_call_id": "call-1",
             "tool_name": "set_pipeline",
             "status": "success",
@@ -136,8 +232,8 @@ class TestFallbackWriterRows:
             "error_class": None,
             "result_canonical": json.dumps({"success": True}),
         }
-        envelope.update(overrides)
-        return envelope
+        invocation.update(overrides)
+        return {"_kind": "audit", "invocation": invocation}
 
     def test_version_advance_is_applied_with_envelope_version(self) -> None:
         row = _tool_row(
