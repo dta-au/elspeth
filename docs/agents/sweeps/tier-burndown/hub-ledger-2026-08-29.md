@@ -180,3 +180,31 @@
   = the 175 findings removed — every removal is a live suppression, none a voided decorator (zero
   R_TB_NONLITERAL/MALFORMED/UNKNOWN_KWARG/STACKED tree-wide). Lane's post-merge branch commit 7852f55db (tip
   re-merge + hints reword, --no-verify with hand-run gates) was superseded by the hub's e0caff32d and deleted.
+
+## WAVE 4 AUDIT (range 99d43f87d..e0caff32d; evidence scratchpad/auditW4A, auditW4B)
+- Corpus at e0caff32d: 2594 → 2210 = 384 removed (harness 434 → 50; outside-harness identity EMPTY vs base).
+  W1–W4 total 3,898 → 2,210 = 1,688. John 2026-08-29: goal was ~2k — "I'll call it a win".
+- Lens A (code, fable, 5 sub-lanes): ALL-STOP NO. 17 exact-type sites, 120 removed guard lines, 18 membership
+  conversions, 8 restructures probed old-vs-new, 13 AST shapes for the exemption map, 31 rendered commands —
+  0 weakened controls. P1: capture.py:388 test_ref pins 1/3 invariant clauses (control measured real). P2:
+  three orphan_sweep observation_boundary "never raises" invariants false (caught by outer R4 → fail-closed).
+  P3: 18/78 map entries exempt zero sites (standing grants the liveness check accepts); `$USER` unquoted by
+  design; receipt expires_at wrong-type reports control_manifest_schema.
+- Lens B (prose/pins, fable): ALL-STOP YES by the brief's letter — 8 non_raising/observation boundaries whose
+  "never raises" is false on constructible input (orphan_sweep ×4, bedrock RecursionError under the 64 KiB cap,
+  evidence.py `_decoded_log_message` lone-surrogate/RecursionError REACHABLE from an operator evidence file,
+  textract unconstructible-shape, scenario_inventory set() before type test → acceptance_internal). P1: paged
+  token/destination TypeError holes; check_error_with_cause `str(exc)` outside suppress; FIVE B26 rationales with
+  false mechanism ("strict=True removal would make the target rootable" — measured identical; "botocore returns
+  datetime subclasses" — botocore returns exact datetime, naive when tz-less). P2: receipt invariants omit the
+  control_manifest_schema code; two s3 R6 pin claims name tests that never reach the handler; bedrock R5
+  sentence inverted; `_orphan_call` rationale omits the `else:` arm that retires the finding; B27 hint overstates
+  R_TB_NONLITERAL (voids ONE decorator, reported, not per-file); 5/6 state.py from_dict map entries inert.
+  Confirmed by probe: helper-return keeps trail, try-body loss, `_decode_or_none` R6, zip/enumerate unrootable.
+- HUB ADJUDICATION: no fail-open, no deleted gate, no composer breach; every raise is caught into a named
+  fail-closed error (only evidence.py #6 is an operator-visible crash). Downgraded from ALL-STOP to a P1 BATCH
+  owned by the hub BEFORE the re-stage; John informed. Fix lane tier-w4fix (fable, worktree, brief
+  LANE_BRIEF_W4FIX.md) dispatched from e0caff32d with 18 work items (code A.1–9, prose B.10–15, tickets C.16–18).
+- Sequencing after w4fix merges: merge fix/codex-salvage (pre-re-stage merge, own delta vs 2210, 1 sidecar key
+  on audit_export_snapshots.py to re-derive), ONE full suite on the final tip, close Wave-4 issues at that tip,
+  close the 5 codex PRs, PAUSE for the operator re-stage.
