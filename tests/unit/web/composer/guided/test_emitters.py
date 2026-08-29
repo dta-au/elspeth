@@ -659,8 +659,8 @@ class TestStep4WireEmitter:
 
         node = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "field_mapper")
         assert node["node_options_summary"] == [
-            {"key": "mapping", "value": "given_name → first_name, meta.source → origin"},
-            {"key": "select_only", "value": "only the mapped fields are kept"},
+            {"key": "mapping", "value": "given_name → first_name, meta.source → origin", "tier": "common"},
+            {"key": "select_only", "value": "only the mapped fields are kept", "tier": "common"},
         ]
         # Same hygiene rationale as ``_wire_schema``: never project adjacent
         # path/secret-shaped options, and never a knob outside the allowlist.
@@ -675,8 +675,8 @@ class TestStep4WireEmitter:
 
         node = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "field_mapper")
         assert node["node_options_summary"] == [
-            {"key": "mapping", "value": "given_name → first_name"},
-            {"key": "select_only", "value": "unmapped fields pass through"},
+            {"key": "mapping", "value": "given_name → first_name", "tier": "common"},
+            {"key": "select_only", "value": "unmapped fields pass through", "tier": "common"},
         ]
 
     def test_options_summary_is_empty_for_a_plugin_outside_the_allowlist(self) -> None:

@@ -21,6 +21,8 @@ from elspeth.web.composer.guided.protocol import (
     Turn,
     TurnResponse,
     TurnType,
+    _node_options_summary_error,
+    node_options_summary,
     validate_current_turn,
     validate_payload,
 )
@@ -35,7 +37,7 @@ def test_every_allowlisted_node_option_has_a_renderer() -> None:
     mid-guided-flow, not a lint failure. Requiring the subset makes that
     omission a red unit test instead.
     """
-    allowlisted = {key for keys in _NODE_OPTION_SUMMARY_ALLOWLIST.values() for key in keys}
+    allowlisted = {key for tiers in _NODE_OPTION_SUMMARY_ALLOWLIST.values() for key in tiers}
 
     assert allowlisted <= _NODE_OPTION_SUMMARY_RENDERERS.keys()
     # Renderers are reachable only through the allowlist; an orphan renderer is
@@ -912,3 +914,21 @@ class TestPayloadValidation:
         assert "observed" in err
         # Path-rooted nested error should NOT appear when top-level is missing.
         assert "payload.observed" not in err
+
+
+def test_node_options_summary_carries_a_tier_per_pair() -> None:
+    summary = node_options_summary("field_mapper", {"mapping": {"a": "b"}, "select_only": True})
+    assert [entry["key"] for entry in summary] == ["mapping", "select_only"]
+    for entry in summary:
+        assert entry["tier"] in ("essential", "common", "advanced")
+
+
+def test_node_options_summary_error_admits_the_pre_tier_pair_shape() -> None:
+    # Durable sessions written before the tier landed replay through this
+    # validator; {key, value} without tier stays valid by design.
+    old = [{"key": "mapping", "value": "a → b"}]
+    assert _node_options_summary_error(old, "p", plugin="field_mapper") is None
+    new = [{"key": "mapping", "value": "a → b", "tier": "common"}]
+    assert _node_options_summary_error(new, "p", plugin="field_mapper") is None
+    bad = [{"key": "mapping", "value": "a → b", "tier": "loud"}]
+    assert _node_options_summary_error(bad, "p", plugin="field_mapper") is not None
