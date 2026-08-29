@@ -395,6 +395,16 @@ for each LLM prompt, and the user reviews and approves each card before the
 pipeline proceeds. Do not mention this skill's rules, tool names, or who
 stages what.
 
+The register rule covers EVERY review kind, not just the prompt template.
+Never narrate staging mechanics for `vague_term`, `invented_source`,
+`pipeline_decision`, `llm_model_choice`, or `source_data_contract` either —
+no "I staged a requirement", "surfaced the review", "the row is pending".
+Describe cards and what the user does with them: say which decision each card
+covers ("I've added an approval card for the scoring rubric I drafted") and
+that the user reviews and approves each card before the pipeline proceeds.
+Everywhere this skill says "(register rule applies)", it means these two
+paragraphs.
+
 **`source_data_contract` — the data-contract acknowledgement for sources whose
 data cannot be checked up front** (uploaded files, path-bound, external fetch,
 continuous feeds — any bound source WITHOUT composer-authored content). When
@@ -520,7 +530,7 @@ options. If you copied the user's supplied prompt template verbatim, treat it as
 user-authored. If you created a prompt template from the user's goal, data, or prose rather than copying one verbatim, that prompt template is LLM-authored:
 the backend auto-stages the `llm_prompt_template` requirement on the LLM node and
 surfaces its review for you at finalization — do NOT call
-`request_interpretation_review` for it.
+`request_interpretation_review` for it (register rule applies).
 Small mechanical substitutions for field names still count as LLM-authored when
 you chose the surrounding prompt wording.
 
@@ -578,7 +588,7 @@ judgement/rubric semantics, author the `vague_term` entry in
 hand-author its row. Stage, wire, and surface the `vague_term` card before
 stopping; the `llm_prompt_template` card is auto-staged and backend-surfaced —
 do not surface it. When repairing, carry planner-owned pending rows forward
-unchanged; auto-staged rows re-stage themselves.
+unchanged; auto-staged rows re-stage themselves. (Register rule applies.)
 
 Wire the authored semantics into the prompt as a substitution slot — REQUIRED.
 The authored definition must occupy a substitution slot in the prompt, not be
@@ -656,7 +666,7 @@ Per the ownership matrix, the example authors ONLY the planner-owned
 backend auto-staged and never hand-authored. You MUST still surface the
 auto-staged `llm_model_choice` with `request_interpretation_review`; do NOT
 call `request_interpretation_review(kind="llm_prompt_template")` — it is
-rejected (backend-owned). The `1-10` scale here is fixed prompt wording covered
+rejected (backend-owned; register rule applies in prose). The `1-10` scale here is fixed prompt wording covered
 by the (backend-surfaced) `llm_prompt_template` review — only the criterion
 *meaning* (`"cool"`) needs the wired `vague_term` slot. The model's reply
 lands as one raw string in the node's single reply field; asking for a score
@@ -669,7 +679,8 @@ cover it. The two reviews approve different things: the prompt-template review
 approves the prompt *skeleton* (the fixed wording and where each slot sits); the
 `vague_term` review approves the *value* that fills its slot. The criterion
 definition must occupy an `interpretation_ref` slot — never fixed prose — so the
-operator's approved value governs what the model actually sees.
+operator's approved value governs what the model actually sees. (Register
+rule applies.)
 
 If your prompt asks the model to return a score, rating, rank, class, or
 pass/fail result, that output shape is authored judgement semantics when you
@@ -687,7 +698,7 @@ field, or configuration block to be reviewable. When you author them, give the
 criterion meaning its own `interpretation_ref` slot (per the wiring rule above),
 stage and surface the `vague_term` for that slot. The surrounding prompt wording
 is covered by the auto-staged, backend-surfaced `llm_prompt_template` review (not
-yours to stage or surface). The criterion meaning belongs in the slot, not baked
+yours to stage or surface; register rule applies). The criterion meaning belongs in the slot, not baked
 into the fixed text.
 
 Objective extraction does not become vague merely because the content is visual
@@ -736,6 +747,14 @@ reason to quote their decision in the draft, never a reason to omit the row.
 
 ## Assumption Review
 
+<!-- AUTHORING CONVENTION (for editors of this skill): any rule stated in
+tool-ownership/staging vocabulary — who stages, who surfaces, what a tool
+rejects — MUST ship with a paired user-register line ("when this reaches
+user prose, say only: <what the user sees and does>") or a
+"(register rule applies)" pointer to the Register rule in LLM Review
+Interactions. One canonical register body, many pointers; never restate
+mechanics without saying how to speak about them. -->
+
 Every call carries `kind`. Use the review tool, not assistant prose, as the
 confirmation surface. When `interpretation_review_disabled=true`, still call the
 tool; opt-out skips the human card, not the audit row.
@@ -749,6 +768,10 @@ tool; opt-out skips the human card, not the audit row.
 | `pipeline_decision` | YOU | YOU | REGISTERED terms only. The closed registry is delivered in the authoring aids (`review_registry`); never mint a term — an unregistered term is unresolvable and poisons the card. A decision outside the registry is recorded in `metadata.description`, not as a review. |
 | `llm_prompt_template` | backend (auto-staged on every LLM node) | backend | Never author the row; never call the review tool for it. |
 | `llm_model_choice` | backend (auto-staged when `options.model` is set) | YOU | Never author the row. A profile-bound node (`options.profile`) has NO model-choice card at all. |
+
+None of this matrix's vocabulary belongs in user prose — the register rule
+governs how every kind is described to the user (approval cards to review
+and approve).
 
 A registered `pipeline_decision` demanded by policy or this skill is NEVER
 waived because the user's instruction already made the decision — the review
@@ -773,7 +796,8 @@ authoritative matrix assigns YOU to surface, call
 `request_interpretation_review` once for each before stopping. These calls may
 be in the same assistant turn. Do not surface one review card and then stop
 while other caller-owned pending requirements remain. Never surface the
-backend-owned `llm_prompt_template` rows.
+backend-owned `llm_prompt_template` rows. (Register rule applies when you
+announce the cards.)
 
 Before stopping, enumerate pending `interpretation_requirements` from the source
 and from every node. For each pending requirement except backend-owned
@@ -809,6 +833,9 @@ on records you READ back but are owned by the backend.
 | `kind="llm_prompt_template"` | Backend auto-stages and surfaces this row. Do not call the review tool for it. | Backend-owned; no caller-authored shape. |
 | `kind="pipeline_decision"` | You make a row-shaping, retention, cleanup, routing, or filtering choice the user did not spell out mechanically. | Stage `interpretation_requirements` on the node that implements the decision. |
 | `kind="llm_model_choice"` | You author the `model` identifier on an `llm` node (the user did not name the exact slug verbatim). | `user_term="llm_model_choice:<node_id>"`; omit `llm_draft` — the server resolves the current `options.model` string. The mutation pipeline auto-stages this requirement when `options.model` is set; resolve it before stopping. A profile-bound node (`options.profile`) has no model-choice card. |
+
+(Register rule applies to every kind in this table: user prose describes
+approval cards and what the user does with them, never staging mechanics.)
 
 Data-minimization cleanup is a pipeline decision. The review belongs on the
 policy-visible transform that implements the cleanup, not on its upstream
