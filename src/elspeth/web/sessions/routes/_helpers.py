@@ -465,21 +465,30 @@ def _tool_call_outcomes_by_call_id(
             continue
         envelope = row.tool_calls[0] if row.tool_calls else None
         if envelope is None and row.composition_state_id is not None:
+            state_key = str(row.composition_state_id)
             outcomes[row.tool_call_id] = _ToolCallOutcome(
                 outcome=_ToolCallOutcomeKind.APPLIED,
-                applied_state_version=state_versions_by_id.get(str(row.composition_state_id)),
+                # ``state_versions_by_id`` covers the fetched window only; a row
+                # whose state version was not fetched still renders as applied,
+                # just without a version number.
+                applied_state_version=state_versions_by_id[state_key] if state_key in state_versions_by_id else None,
             )
             continue
         if envelope is not None:
-            version_before = envelope.get("version_before")
-            version_after = envelope.get("version_after")
-            if isinstance(version_before, int) and isinstance(version_after, int) and version_after > version_before:
+            # Absence is a legitimate envelope shape, not a damaged row, so the
+            # membership read is the honest form.
+            version_before = envelope["version_before"] if "version_before" in envelope else None
+            version_after = envelope["version_after"] if "version_after" in envelope else None
+            # Exact ``int`` rather than ``isinstance``: the envelope round-trips
+            # through the session DB's JSON column, so a real version is an exact
+            # ``int`` and a JSON ``true`` must not be admitted as version 1.
+            if type(version_before) is int and type(version_after) is int and version_after > version_before:
                 outcomes[row.tool_call_id] = _ToolCallOutcome(
                     outcome=_ToolCallOutcomeKind.APPLIED,
                     applied_state_version=version_after,
                 )
                 continue
-            status = envelope.get("status")
+            status = envelope["status"] if "status" in envelope else None
             if status == ComposerToolStatus.CANCELLED.value:
                 outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.CANCELLED, applied_state_version=None)
                 continue
@@ -490,15 +499,18 @@ def _tool_call_outcomes_by_call_id(
             content = json.loads(row.content)
         except (TypeError, ValueError):
             content = None
-        if isinstance(content, dict):
-            if content.get("error_class"):
-                cancelled = content.get("_redaction_status") == ComposerToolStatus.CANCELLED.value
+        # ``content`` is freshly decoded by ``json.loads`` above — never a value
+        # read off a ``deep_freeze``d owner — so a JSON object is an exact
+        # ``dict`` here and the exact-type form is the accurate check.
+        if type(content) is dict:
+            if "error_class" in content and content["error_class"]:
+                cancelled = "_redaction_status" in content and content["_redaction_status"] == ComposerToolStatus.CANCELLED.value
                 outcomes[row.tool_call_id] = _ToolCallOutcome(
                     outcome=_ToolCallOutcomeKind.CANCELLED if cancelled else _ToolCallOutcomeKind.FAILED,
                     applied_state_version=None,
                 )
                 continue
-            if content.get("success") is False:
+            if "success" in content and content["success"] is False:
                 outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.REJECTED, applied_state_version=None)
                 continue
         outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.COMPLETED, applied_state_version=None)
@@ -530,8 +542,15 @@ def _message_response(
     if tool_calls is not None and tool_outcomes:
         stamped: list[Any] = []
         for entry in tool_calls:
-            call_id = entry.get("id") if isinstance(entry, dict) else None
-            projected = tool_outcomes.get(call_id) if isinstance(call_id, str) else None
+            # The ``deep_thaw`` above is WHAT MAKES the exact-type form correct:
+            # ``ChatMessageRecord.__post_init__`` runs ``freeze_fields(self,
+            # "tool_calls")``, so reading ``msg.tool_calls`` directly would hand
+            # this loop ``mappingproxy`` entries for which ``type(...) is dict``
+            # is permanently False — silently disabling every stamp with no test
+            # failure. Do not move, inline, or drop that thaw without converting
+            # this guard back to ``isinstance(entry, Mapping)``.
+            call_id = entry["id"] if type(entry) is dict and "id" in entry else None
+            projected = tool_outcomes[call_id] if type(call_id) is str and call_id in tool_outcomes else None
             if projected is not None:
                 entry = {
                     **entry,
@@ -2419,7 +2438,9 @@ _FREEFORM_PLANNER_PROGRESS_REASONS: Final[dict[str, ComposerProgressReason]] = {
 
 def freeform_planner_progress_reason(planner_code: str) -> ComposerProgressReason:
     """Attribute a freeform planner failure to its actual actor for the progress snapshot."""
-    return _FREEFORM_PLANNER_PROGRESS_REASONS.get(planner_code, "provider_unavailable")
+    if planner_code in _FREEFORM_PLANNER_PROGRESS_REASONS:
+        return _FREEFORM_PLANNER_PROGRESS_REASONS[planner_code]
+    return "provider_unavailable"
 
 
 def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:

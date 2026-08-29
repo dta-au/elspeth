@@ -11761,6 +11761,65 @@ def test_compose_runtime_preflight_persists_partial_state(tmp_path) -> None:
     )
 
 
+def test_authoring_validator_crash_persists_invalid_state_and_skips_runtime_preflight(tmp_path) -> None:
+    """``_state_data_from_composer_state``'s ``except (ValueError, TypeError,
+    KeyError)`` around ``validate_authored_composition_state`` is an explicit
+    error RESULT, not a swallow, and the result is load-bearing.
+
+    Both arms are asserted because the reified ``ValidationSummary(is_valid=
+    False, ...)`` does two things and either could rot independently:
+
+    * it reaches the persisted row — ``_composer_persisted_validation`` maps
+      an invalid authoring summary with no runtime outcome to
+      ``(False, ["validation_failed"])``; and
+    * it CLOSES the ``if runtime is None and authoring.is_valid:`` gate, so a
+      state whose validator crashed is never runtime-preflighted as if it had
+      passed. A drift to ``is_valid=True`` (or a bare ``pass``) would open
+      that gate and persist the state as valid.
+    """
+    partial = _make_authoring_valid_partial("authoring-validator-crashed")
+    mock_composer = SimpleNamespace()
+    mock_composer.compose = AsyncMock(
+        spec=ComposerService.compose,
+        return_value=ComposerResult(
+            message="State mutated; the authoring validator then crashed.",
+            state=partial,
+            runtime_preflight=None,
+        ),
+    )
+
+    app, service = _make_app(tmp_path)
+    app.state.composer_service = mock_composer
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.post("/api/sessions", json={"title": "Test"})
+    session_id = uuid.UUID(resp.json()["id"])
+
+    def _validator_boom(*_args, **_kwargs):
+        raise ValueError("authoring validator blew up")
+
+    with (
+        patch("elspeth.web.sessions.routes._helpers.validate_authored_composition_state", side_effect=_validator_boom),
+        patch("elspeth.web.sessions.routes._helpers._runtime_preflight_for_state") as preflight,
+    ):
+        response = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Build me a pipeline"},
+        )
+
+    assert response.status_code == 200
+    assert preflight.call_count == 0, "an unvalidatable state must never reach the runtime preflight"
+
+    loop = asyncio.new_event_loop()
+    try:
+        persisted = loop.run_until_complete(service.get_current_state(session_id))
+    finally:
+        loop.close()
+    assert persisted is not None
+    assert persisted.is_valid is False
+    assert list(persisted.validation_errors or []) == ["validation_failed"]
+
+
 def test_recompose_runtime_preflight_persists_partial_state(tmp_path) -> None:
     """C1: recompose's ComposerRuntimePreflightError catch (routes.py:1344)
     MUST behave identically to send_message's catch — partial_state persistence
