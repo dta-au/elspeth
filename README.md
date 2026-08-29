@@ -8,8 +8,8 @@
 
 > [!IMPORTANT]
 > **Pre-release status:** ELSPETH may be suitable for carefully evaluated,
-> use-case-specific applications, but it is not yet ready for general production
-> use. Before relying on it, validate ELSPETH against your requirements and risk controls.
+> use-case-specific applications, but it is not yet ready for general production use.
+> Before relying on it, validate ELSPETH against your requirements and risk controls.
 
 Elspeth is a pipeline engine for building, validating, running, and auditing
 workflows where outputs need to be reviewed, explained, and reproduced. It

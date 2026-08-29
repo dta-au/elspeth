@@ -10,7 +10,7 @@
 | Canonical sources and cut-offs | Approved organisational resource records: **Unknown** — not supplied or checked; Filigree workstream context captured `2026-08-29T18:14:30+10:00`; ADR-024 as amended `2026-08-29` |
 | Authority boundary | This register is not an accounting record, approval, or measure of individual productivity. Organisational records remain authoritative |
 | Review cadence | Before each monthly PCR and immediately on a confirmed resource exception |
-| Controlled counterpart | **None existed at issue time.** A later controlled register remains authoritative for protected detail |
+| Controlled counterpart | **Unknown** — no controlled counterpart was supplied or checked at issue time. A later controlled register remains authoritative for protected detail |
 
 This first public register intentionally contains no numeric time, cost,
 allocation, staffing, rate-derived, or productivity figures. Future aggregates
