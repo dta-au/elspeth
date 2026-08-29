@@ -31,7 +31,8 @@ is a working document under the normal delivery posture.
   site. Deleting a DEAD entry moves the corpus by ZERO (it suppressed nothing);
   the "+3 for `_extract_runtime_model_snapshot`" expected by lens B had already
   surfaced at the package split (`routes/_helpers.py:964/970/971` are in the
-  2535 baseline at 99d43f87d).
+  2594 baseline at 99d43f87d — 2594, not 2535: the hub's earlier count dropped
+  digit-bearing filenames).
 - **2026-08-29 — masquerade resolver STOP RULES (do not re-walk the six-freeze
   road).** The sparse-SSA `flow.py` prototype (archived at
   `/home/john/codex-cleanup-archive-2026-08-16/orphaned-work/ac-masquerade-bounded/`)

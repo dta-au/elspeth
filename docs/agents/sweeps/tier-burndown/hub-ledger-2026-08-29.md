@@ -128,3 +128,10 @@
   base 2932 (not 2873) → Wave-3 close 2594 (not 2535); the 338 removed and the 1,304 W1–W3 total are
   UNCHANGED (the dropped files did not move). Wave-4 base @99d43f87d = 2594 whole-tree, harness = 434
   (B26=198, B27=215 incl. s3.py, B28=21). s3.py belongs to B27 (worklist and brief corrected in place).
+- tier-lintmap MERGED (b5a5ecc51, elspeth-0bd4fb6042): map re-keyed to qualified symbol paths (84 → 78 live
+  entries; 12 dead removed; 2 bare-name collisions made explicit: state.py from_dict ×6, redaction.py
+  provider ×2 — narrowing needs per-site evidence), single resolver backs the test pin + whole-tree ERROR.
+  Hub scan: 2594 → 2594, comm -3 EMPTY (corrected regex). CORRECTION to the prep note above: deleting a DEAD
+  entry moves the corpus by ZERO — the "+3 surfacing" never existed (routes/_helpers.py:964/970/971 were
+  already in the base). Lane committed with SKIP=elspeth-lints-trust-tier after an A/B showing the hook's
+  rc=1 is the elspeth-13f0cc04fb fail-closed state, byte-identical on base and branch.
