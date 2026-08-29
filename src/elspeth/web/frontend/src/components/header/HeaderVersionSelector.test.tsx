@@ -470,6 +470,49 @@ describe("HeaderVersionSelector", () => {
       expect(revertToVersion).toHaveBeenCalledWith("state-14");
     });
 
+    // The other direction of the same audit-required constraint: grouping is
+    // PRESENTATION ONLY, so a version selected inside a group stays selected —
+    // and stays revertable — when the group closes over it. Collapsing must
+    // never silently disarm or re-aim Revert just because the chosen row is no
+    // longer on screen.
+    it("keeps the Revert target on a member version after its group collapses", async () => {
+      const user = userEvent.setup();
+      const revertToVersion = vi.fn();
+      useSessionStore.setState({ revertToVersion } as never);
+      render(<HeaderVersionSelector />);
+      await user.click(screen.getByRole("button", { name: /Composition history/ }));
+
+      const group = screen.getByRole("treeitem", {
+        name: /Versions 15 to 18/,
+      });
+      await user.click(group); // expand
+      await user.click(screen.getByRole("treeitem", { name: /^Version 17 / }));
+      expect(
+        screen.getByRole("button", { name: "Revert to version 17" }),
+      ).toBeInTheDocument();
+
+      await user.click(group); // collapse the group back over v17
+      expect(group).toHaveAttribute("aria-expanded", "false");
+      expect(
+        screen.queryByRole("treeitem", { name: /^Version 17 / }),
+      ).not.toBeInTheDocument();
+      // The chosen version is off screen but still the target.
+      expect(
+        screen.getByRole("button", { name: "Revert to version 17" }),
+      ).toBeInTheDocument();
+
+      // And it is still genuinely revertable, not merely still labelled.
+      await user.click(
+        screen.getByRole("button", { name: "Revert to version 17" }),
+      );
+      await user.click(
+        within(
+          screen.getByRole("alertdialog", { name: "Revert pipeline" }),
+        ).getByRole("button", { name: "Revert" }),
+      );
+      expect(revertToVersion).toHaveBeenCalledWith("state-17");
+    });
+
     it("keyboard path: arrow to the group, Right expands, arrow into a member, Enter arms revert", async () => {
       const user = userEvent.setup();
       render(<HeaderVersionSelector />);

@@ -214,13 +214,22 @@ export function versionOperationIdentifier(
  * The lineage row a revert-shaped version points at, or null.
  *
  * derived_from_state_id is generic lineage, not a revert marker: every
- * non-revert writer derives from the adjacent session head, verified under
- * the write lock (proposal settlement additionally hard-requires base ==
- * current head via its Stale check), so only the revert copy paths point
- * strictly older than the adjacent predecessor. That writer-set invariant —
- * not anything on the wire — is what makes the strictly-older heuristic
- * safe. An unresolvable target (outside the paginated window) yields null
- * rather than a guess.
+ * non-revert writer in web/sessions/service.py persists either null, the
+ * current head's id, or an `expected_current_state_id` that the same
+ * transaction has just proved equal to the head under the write lock.
+ * Proposal settlement additionally hard-requires base == current head (it
+ * raises StaleComposeStateError otherwise) before writing the base as the
+ * lineage. The `wire_review` widening of `allowed_base_state_ids` relaxes
+ * only which base a PROPOSAL may name; the guided back-edit that follows it
+ * still persists the current head as its lineage, so that widening never
+ * reaches derived_from_state_id. The one writer that points strictly older
+ * than the adjacent predecessor is the state-revert copy path
+ * (`provenance="session_seed"`), which persists its revert target.
+ *
+ * That writer-set invariant — not anything on the wire — is what makes the
+ * strictly-older heuristic safe; re-audit the `_insert_composition_state`
+ * call sites before relying on it more heavily. An unresolvable target
+ * (outside the paginated window) yields null rather than a guess.
  */
 function revertLineageTarget(
   version: CompositionStateVersion,
@@ -254,10 +263,15 @@ type VersionLabelFacts =
 
 /**
  * Priority: applied tool-call stamp, then revert lineage, then the v1 seed,
- * then a generic edit. The applied join runs FIRST because revert-shaped
- * lineage is ambiguous on its own (a wire_review commit may derive from the
- * grandparent); do not weaken the applied-join-first ordering without
- * re-auditing the derived_from_state_id writers in sessions/service.py.
+ * then a generic edit — unchanged from the pre-split implementation.
+ *
+ * The applied join runs FIRST because an applied stamp is a direct
+ * server-authenticated statement about what produced this version, while
+ * strictly-older lineage is only an inference from the writer-set invariant
+ * documented on `revertLineageTarget` above. Ordering the direct evidence
+ * ahead of the inference is what keeps the inference from ever having to be
+ * load-bearing. Do not reorder these two without re-auditing the
+ * derived_from_state_id writers in web/sessions/service.py.
  */
 function versionLabelFacts(
   version: CompositionStateVersion,
