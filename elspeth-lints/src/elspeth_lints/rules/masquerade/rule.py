@@ -32,9 +32,8 @@ reviewed probe with a materially different call at the same key and count
 fires ``probe-shape-drift``.
 
 This rule carries NO signature material, NO tier_model coupling, and does
-not touch ``BoundaryRule``. It is a third, independent consumer of
-``@trust_boundary``/``@observation_boundary`` metadata (Wardline is the
-second, per AGENTS.md) — it reads ``source_param`` dataflow and never
+not touch ``BoundaryRule``. It is a second, independent consumer of
+``@trust_boundary``/``@observation_boundary`` metadata — it reads ``source_param`` dataflow and never
 suppresses a ``trust_tier.tier_model`` finding.
 """
 

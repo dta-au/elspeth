@@ -56,18 +56,6 @@
       "env": {},
       "type": "stdio"
     },
-    "wardline": {
-      "args": [
-        "mcp",
-        "--root",
-        ".",
-        "--trust-pack",
-        "scripts.wardline_pack",
-        "--allow-custom-packs"
-      ],
-      "command": "/home/john/.local/bin/wardline",
-      "type": "stdio"
-    },
     "warpline": {
       "args": [],
       "command": "/home/john/.local/bin/warpline-mcp",

@@ -68,22 +68,36 @@ def test_hook_timeouts_are_bounded_seconds() -> None:
     assert all(isinstance(timeout, int) and 0 < timeout <= 30 for timeout in timeouts)
 
 
-def test_agents_md_documents_the_granted_non_inert_gate() -> None:
-    """AGENTS.md must spell the gate with BOTH the pack grants and the inert gate.
+WARDLINE_SURFACES = (
+    REPO_ROOT / "weft.toml",
+    REPO_ROOT / "scripts" / "wardline_pack.py",
+    REPO_ROOT / ".agents" / "skills" / "wardline-gate",
+    REPO_ROOT / ".claude" / "skills" / "wardline-gate",
+)
 
-    Asserted against AGENTS.md rather than the wardline-gate skill copies: those
-    are written and overwritten by ``wardline install`` (they carry a
-    ``last-writer`` marker), so pinning project specifics there fails the moment
-    the installer runs. The ELSPETH section of AGENTS.md is ours to own.
 
-    Both halves are load-bearing. Without the grants the scan exits 2 — Wardline
-    trusts a pack only when the caller grants it. Without ``--fail-on-inert`` a
-    scan that recognised zero boundaries exits 0, indistinguishable from clean.
+def test_wardline_is_not_wired_into_the_project() -> None:
+    """Wardline was rolled back on 2026-08-29 (ADR-043) and must not leak back in.
+
+    It arrived through a Loomweave upgrade, and ``wardline install`` rewrites
+    its own AGENTS.md block, skill copies, and ``weft.toml`` on every run — so a
+    sibling-tool upgrade can silently re-add the whole surface. Pin the
+    absence of every file and instruction the installer writes, plus the MCP
+    server entry, so a re-leak fails here instead of reappearing as a standing
+    agent instruction. Historical plans, specs, and ledgers may still mention
+    Wardline; the live guidance and configuration may not.
     """
-    text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-    assert "--trust-pack scripts.wardline_pack" in text
-    assert "--allow-custom-packs" in text
-    assert "--fail-on-inert" in text
+    agents_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "wardline:instructions" not in agents_text
+    assert "wardline scan" not in agents_text
+    assert "scripts.wardline_pack" not in agents_text
+    assert "mcp__wardline__" not in agents_text
+
+    mcp_servers = json.loads((REPO_ROOT / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    assert "wardline" not in mcp_servers
+
+    for path in WARDLINE_SURFACES:
+        assert not path.exists(), path
 
 
 def test_judge_skill_copies_use_codex_readonly_signing() -> None:

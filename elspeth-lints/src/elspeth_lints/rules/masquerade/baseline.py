@@ -4,8 +4,7 @@ This is a **per-site classification ledger**, not a signed allowlist and
 not a tier_model suppression surface. It carries no signatures, no
 ``judge_metadata_signature``, and no coupling to
 ``trust_tier.tier_model`` or ``BoundaryRule`` — the masquerade gate is a
-third, independent consumer of the ``@trust_boundary`` metadata (the
-second being Wardline, per AGENTS.md), and it never suppresses a
+second, independent consumer of the ``@trust_boundary`` metadata, and it never suppresses a
 tier_model finding.
 
 Identity, and why it is not a security hole
