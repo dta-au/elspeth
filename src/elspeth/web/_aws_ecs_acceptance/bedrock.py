@@ -272,8 +272,8 @@ _MAX_GUARDRAIL_CONFIG_ENV_BYTES = 64 * 1024
     source_param="env",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns (None, None) or (alias, None) on absent, oversized, undecodable, wrongly shaped, or non-matching "
-        "rendered config; never raises on env and never invents an alias or a guardrail version"
+        "returns (None, None) or (alias, None) on absent, oversized, undecodable, too deeply nested, wrongly shaped, "
+        "or non-matching rendered config; never raises on env and never invents an alias or a guardrail version"
     ),
 )
 def _guardrail_config_defaults(env: Mapping[str, str], plugin_id: str) -> tuple[str | None, str | None]:
@@ -311,7 +311,7 @@ def _guardrail_config_defaults(env: Mapping[str, str], plugin_id: str) -> tuple[
             for profile in profiles
             if isinstance(profile, dict) and profile.get("plugin") == plugin_id and profile.get("alias") == alias
         ]
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
         return None, None
     if len(versions) != 1 or type(versions[0]) is not str:
         return alias, None
@@ -329,7 +329,7 @@ def _guardrail_config_defaults(env: Mapping[str, str], plugin_id: str) -> tuple[
         "non-empty str, a probe text longer than 1,000,000 characters, or a version outside [1-9][0-9]{0,7}"
     ),
     test_ref="tests/unit/web/aws_ecs_acceptance/test_bedrock_guardrails.py::test_guardrail_live_inputs_rejects_absent_gate_and_malformed_operator_inputs",
-    test_fingerprint="ec87e0ed5ec0f33b6ddd167ee8d27ae9a21e9a867a62addebe1927152dac3de1",
+    test_fingerprint="f275da29d8c366fa912681acc857f7695f4855e1f9c5085523f0538dd8ec3083",
 )
 def _guardrail_live_inputs(env: Mapping[str, str]) -> tuple[tuple[str, str, str, str, str], ...]:
     gate = env.get(_GUARDRAIL_GATE_ENV)

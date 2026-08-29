@@ -391,6 +391,18 @@ def test_check_error_with_cause_redacts_operator_controlled_mapping_keys() -> No
     assert any(field.startswith("llm_profiles.<redacted>.") for field in envelope["cause_fields"])
 
 
+def test_check_error_with_cause_survives_an_exception_whose_str_raises() -> None:
+    class _UnrenderableError(Exception):
+        def __str__(self) -> str:
+            raise ValueError("cannot render")
+
+    error = contracts.check_error_with_cause("storage_settings", _UnrenderableError())
+
+    assert isinstance(error, contracts.AcceptanceCheckError)
+    assert error.cause_class == "_UnrenderableError"
+    assert error.cause_fields is None
+
+
 def test_check_error_without_cause_keeps_prior_envelope_shape() -> None:
     envelope = contracts.acceptance_error_envelope(contracts.AcceptanceCheckError("storage_identity"))
     assert "cause_class" not in envelope

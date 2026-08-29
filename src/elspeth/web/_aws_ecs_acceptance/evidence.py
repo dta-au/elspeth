@@ -58,20 +58,21 @@ def _safe_projection_value(field: str, value: object) -> object | None:
     source_param="message",
     suppresses=("R1", "R5"),
     invariant=(
-        "never raises on a malformed message: a value that is not a string or mapping, an oversized string, an "
-        "undecodable string, and a string that decodes to something other than a mapping all return None, which "
+        "never raises on a malformed message: a value that is not a string or mapping, an oversized string "
+        "(measured with surrogatepass so a lone surrogate cannot fail the encode), an undecodable or too deeply "
+        "nested string, and a string that decodes to something other than a mapping all return None, which "
         "leaves the caller projecting the raw log event instead"
     ),
 )
 def _decoded_log_message(message: object) -> Mapping[str, object] | None:
     if isinstance(message, Mapping):
         return message
-    if not isinstance(message, str) or len(message.encode("utf-8")) > MAX_JSON_RESPONSE_BYTES:
+    if not isinstance(message, str) or len(message.encode("utf-8", "surrogatepass")) > MAX_JSON_RESPONSE_BYTES:
         return None
     try:
         decoded = json.loads(message)
         return decoded if isinstance(decoded, Mapping) else None
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return None
 
 
@@ -81,9 +82,11 @@ def _decoded_log_message(message: object) -> Mapping[str, object] | None:
     source_param="record",
     suppresses=("R1",),
     invariant=(
-        "never raises on a malformed record: every field is admitted only through _safe_projection_value's "
-        "closed pattern and range checks, an unparseable timestamp is dropped rather than recorded, and an "
-        "unrecognised field is omitted, so the projection carries no free-form external content"
+        "never raises on a malformed record once its caller has admitted it as a Mapping (sanitize_evidence's "
+        "isinstance checks on each event and detail, or _decoded_log_message's Mapping-only return): every field "
+        "is admitted only through _safe_projection_value's closed pattern and range checks, an unparseable "
+        "timestamp is dropped rather than recorded, and an unrecognised field is omitted, so the projection "
+        "carries no free-form external content"
     ),
 )
 def _project_log_record(record: Mapping[str, object], *, timestamp: object | None = None) -> dict[str, object]:
@@ -281,7 +284,7 @@ def _verify_stored_receipts(manifest_path: Path, manifest: Mapping[str, object])
         "tests/unit/web/aws_ecs_acceptance/test_evidence_gate_ledger.py::"
         "test_evidence_export_receipt_validators_reject_a_tampered_receipt_document"
     ),
-    test_fingerprint="536452f07491e9717123ddf54d31ac792fe8201f99290bf3444e97abee5b3b0e",
+    test_fingerprint="f88b6a15997a06224a97109ec6a912f168efe78e289ed6538b745321055bb92f",
 )
 def _validate_evidence_export_receipt(
     path: Path,
@@ -334,7 +337,7 @@ def _validate_evidence_export_receipt(
         "tests/unit/web/aws_ecs_acceptance/test_evidence_gate_ledger.py::"
         "test_evidence_export_receipt_validators_reject_a_tampered_receipt_document"
     ),
-    test_fingerprint="536452f07491e9717123ddf54d31ac792fe8201f99290bf3444e97abee5b3b0e",
+    test_fingerprint="f88b6a15997a06224a97109ec6a912f168efe78e289ed6538b745321055bb92f",
 )
 def _reverify_bound_evidence_export_receipt(
     path: Path,
